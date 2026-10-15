@@ -884,6 +884,37 @@ impl<T: RecordOrReplay> Detcore<T> {
         let pending: u64 = guest.memory().read_value(pending_addr)?;
         let call = call.with_mask(Some(Addr::from_raw(mask_copy.as_raw()).expect("non-null")));
 
+        // On a backend whose `rt_sigsuspend` never sleeps
+        // (`rt_sigsuspend_never_sleeps`), the call returns at once, so it runs
+        // in this thread's own turn, as any call that cannot block does.
+        // Backgrounded as a sleeper, it left nothing holding the scheduler
+        // between the background grant and its continuation, so the scheduler
+        // reported a deadlock or skipped virtual time to a timed waiter, as
+        // host timing decided (https://github.com/rrnewton/hermit/issues/4360).
+        //
+        // The backend refuses a wait for a signal not yet pending (ENOSYS), and
+        // a guest retries it, so that refusal hands the turn on first with a
+        // strong yield (`ResourceID::SchedYield`): the caller is not selected
+        // again until another thread has had a turn, and under chaos not until
+        // a thread that did not yield has (a yield epoch), so the threads it
+        // waits on run before it retries, in the order the scheduler gives. In
+        // its own turn alone, the caller spun and never let its child's exit
+        // be granted; a weak yield, which `sched_yield` makes under chaos,
+        // would let a caller in a higher band win every turn (the Codex
+        // review).
+        if rt_sigsuspend_never_sleeps(&self.cfg.backend) {
+            let result = self.record_or_replay(guest, call).await;
+            if result == Err(Errno::ENOSYS) && self.cfg.sequentialize_threads {
+                if self.cfg.max_timeslice.is_some() {
+                    guest
+                        .thread_state_mut()
+                        .reset_timeslice_for_explicit_yield();
+                }
+                let request = Self::sched_yield_request(guest);
+                resource_request(guest, request).await;
+            }
+            return Ok(result?);
+        }
         // The scheduler records the mask the call sleeps under, read here in
         // this thread's turn, to choose a SIGCHLD target while the thread is
         // outside the runnable set (`Resources::blocked_signal_mask`).
@@ -3084,6 +3115,21 @@ where
     })
 }
 
+/// Whether this backend's `rt_sigsuspend` returns at once rather than sleeping
+/// until a signal arrives (`Detcore::handle_rt_sigsuspend`). Reverie names no
+/// capability for it, so this derives it from the one that implies it: a
+/// backend that owns guest signal delivery (`provides_process_signal_control`,
+/// KVM) implements the call itself, and its scheduler-modeled wake does not
+/// exist, so it returns EINTR for a signal already pending under the temporary
+/// mask and refuses a wait for one that is not (ENOSYS) rather than parking
+/// the vCPU outside the schedule. Every other backend runs the kernel's call,
+/// which sleeps. `rt_sigsuspend_never_sleeps_per_backend` pins the answer for
+/// every backend Reverie defines; a backend that gains a sleeping
+/// `rt_sigsuspend` must change it.
+pub(crate) fn rt_sigsuspend_never_sleeps(backend: &reverie::BackendCapabilities) -> bool {
+    backend.provides_process_signal_control
+}
+
 /// Whether a `SIGCHLD` this thread claimed (`ThreadState::claimed_sigchld`,
 /// `claimed`) is still claimed at a syscall entry, or after a `SIGCHLD` the
 /// ledger dropped: SIGCHLD is still pending in its queue or its process's,
@@ -3894,6 +3940,29 @@ mod tests {
         libc::timeval {
             tv_sec: seconds,
             tv_usec: micros,
+        }
+    }
+
+    /// Only KVM's `rt_sigsuspend` returns at once, so only there does the call
+    /// run in the caller's own turn (https://github.com/rrnewton/hermit/issues/4360).
+    /// Every other backend runs the kernel's sleeping call outside the
+    /// runnable set.
+    #[test]
+    fn rt_sigsuspend_never_sleeps_per_backend() {
+        use reverie::BackendCapabilities;
+        for (name, backend, never_sleeps) in [
+            ("ptrace", BackendCapabilities::PTRACE, false),
+            ("e9patch", BackendCapabilities::E9PATCH, false),
+            ("kvm", BackendCapabilities::KVM, true),
+            ("sabre", BackendCapabilities::SABRE, false),
+            ("dbt", BackendCapabilities::DBT, false),
+            (
+                "liteinst in-guest",
+                BackendCapabilities::LITEINST_IN_GUEST,
+                false,
+            ),
+        ] {
+            assert_eq!(rt_sigsuspend_never_sleeps(&backend), never_sleeps, "{name}");
         }
     }
 

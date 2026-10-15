@@ -9678,6 +9678,88 @@ fn a_child_exit_is_notified_once_with_linuxs_siginfo() {
     }
 }
 
+/// The same guest on KVM, where the parent's `sigsuspend` never sleeps: the
+/// backend returns EINTR for a signal already pending under the temporary mask
+/// and refuses a wait for one that is not (ENOSYS), and the guest retries.
+/// Detcore backgrounded the call as a sleeper, and nothing held the scheduler
+/// before its continuation, so the scheduler reported a deadlock or skipped
+/// virtual time to the guest's alarm, as host timing decided. At hermit
+/// 656b74d4, 10 runs under `--verify --verify-strict` gave 5 matched, 3
+/// deadlocked and 2 diverged (https://github.com/rrnewton/hermit/issues/4360).
+/// The call now runs in the caller's own turn, and a refused wait hands the
+/// turn on with a strong yield first, so a caller in a higher chaos band
+/// cannot win every turn ahead of the child it waits on. Each mode must reach
+/// bitwise parity, with INFO messages compared, five times at the default
+/// schedule and once under each of four chaos seeds. Seed 7 is the one under
+/// which a weak yield starved the child until the run was killed.
+#[test]
+fn run_kvm_notifies_a_child_exit_once_at_bitwise_parity() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM child-exit notification: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = sigchld_once_per_child_exit_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let schedules: [&[&str]; 9] = [
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &["--chaos", "--sched-seed=1"],
+        &["--chaos", "--sched-seed=2"],
+        &["--chaos", "--sched-seed=3"],
+        &["--chaos", "--sched-seed=7"],
+    ];
+    for mode in ["exit-group", "raw-exit"] {
+        for (run, schedule) in schedules.iter().enumerate() {
+            let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+            let report = directory.path().join("verify.json");
+            let report_arg = report.to_str().expect("report path should be UTF-8");
+            let mut args = vec![
+                "--backend=kvm",
+                "run",
+                "--strict",
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+            ];
+            args.extend_from_slice(schedule);
+            args.extend([
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                report_arg,
+                "--",
+                guest,
+                mode,
+            ]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(
+                stdout(&output),
+                "sigchld=1 code=1 pid=child status=7\n",
+                "{mode} run {run} {schedule:?}"
+            );
+            let verdict: serde_json::Value = serde_json::from_slice(
+                &fs::read(&report).expect("strict verification wrote no verdict"),
+            )
+            .expect("strict verification verdict is valid JSON");
+            assert_eq!(
+                verdict["bitwise_parity"], true,
+                "{mode} run {run} {schedule:?}: {verdict}"
+            );
+            for side in ["left", "right"] {
+                assert!(
+                    verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+                    "{mode} run {run} {schedule:?}: no INFO messages compared: {verdict}"
+                );
+            }
+        }
+    }
+}
+
 /// tests/c/signal_then_sibling_exit.c on KVM: a worker signals the main thread
 /// and exits at once, while the main thread takes the signal at a system-call
 /// return (`spin`, a getpid loop) or in a `sigsuspend` loop. The waiting
