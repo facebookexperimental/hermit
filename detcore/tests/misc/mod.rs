@@ -1914,10 +1914,17 @@ fn rdrand_rdseed_is_masked() {
         features.rdrand || features.rdseed,
         "ERROR: rdrand_rdseed_is_masked requires the host to expose RDRAND or RDSEED"
     );
-    assert!(
-        cpuid_faulting_supported(),
-        "ERROR: rdrand_rdseed_is_masked requires host CPUID faulting support"
-    );
+    if !cpuid_faulting_supported() {
+        // fbcode CI schedules this test on a mix of hosts, some without CPUID
+        // faulting, and has no CPUID-faulting lane to pin it to. Elsewhere a
+        // missing capability is a failure, so a CPUID-faulting lane cannot
+        // silently skip the test.
+        if cfg!(fbcode_build) {
+            eprintln!("SKIP: rdrand_rdseed_is_masked: CPUID faulting is unavailable on this host");
+            return;
+        }
+        panic!("ERROR: rdrand_rdseed_is_masked requires host CPUID faulting support");
+    }
 
     det_test_fn_without_pmu(|| {
         let cpuid = raw_cpuid::CpuId::new();
