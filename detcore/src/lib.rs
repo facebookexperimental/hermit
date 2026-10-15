@@ -1016,6 +1016,41 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.keep_timer_across_dropped_signal(guest);
                 return Ok(None);
             }
+            // A POSIX timer's entry: delivered with its own siginfo, or, if its
+            // timer was set again since it was queued, skipped as Linux skips
+            // it inside the dequeue, with no turn
+            // (<https://github.com/rrnewton/hermit/issues/4262>).
+            if scheduler::discarded_at_send::records(&self.cfg) && (1..32).contains(&signal.raw()) {
+                use scheduler::discarded_at_send::DiscardedSignalAnswer;
+                use scheduler::discarded_at_send::DiscardedSignalControl;
+                use scheduler::posix_timer_coalesce::DeliveryAnswer;
+                let control = DiscardedSignalControl::Dequeue {
+                    signal: signal.raw(),
+                    at: guest.thread_state().thread_logical_time.as_nanos(),
+                };
+                match tool_global::discarded_signal(guest, control).await {
+                    DiscardedSignalAnswer::Delivery(DeliveryAnswer::Suppress) => {
+                        info!(
+                            "[dtid {}] signal {} is a stale POSIX timer entry; skipped",
+                            guest.thread_state().dettid,
+                            signal
+                        );
+                        self.keep_timer_across_dropped_signal(guest);
+                        return Ok(None);
+                    }
+                    DiscardedSignalAnswer::Delivery(DeliveryAnswer::Rewrite(info)) => {
+                        if let Err(errno) = guest.set_signal_info(info.to_user()) {
+                            warn!(
+                                "[dtid {}] signal {} keeps its physical siginfo: {}",
+                                guest.thread_state().dettid,
+                                signal,
+                                errno
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
             // The kernel dequeued `signal` before this stop: a hold for it ends
             // here, and this stop's hooks may end the slice
             // (`own_signal_turn_hold`).
@@ -2424,7 +2459,33 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             ))
             .await;
         }
-        let kept = async {
+        // A POSIX timer's stale entry is skipped, as Linux skips it inside the
+        // dequeue (<https://github.com/rrnewton/hermit/issues/4262>).
+        let stale_timer_entry = scheduler::discarded_at_send::records(&self.cfg)
+            && (1..32).contains(&(unreported.signal() as i32))
+            && {
+                let tid = DetTid::from_raw(unreported.tid().as_raw());
+                let control = scheduler::discarded_at_send::DiscardedSignalControl::Unreported {
+                    signal: unreported.signal() as i32,
+                };
+                // Carries no logical time; answered before any clock accounting.
+                let (_, response) = rpc
+                    .send_rpc((
+                        DetTime::default(),
+                        MmId::initial(tid),
+                        tool_global::GlobalRequest::DiscardedSignal(control),
+                    ))
+                    .await;
+                matches!(
+                    response,
+                    tool_global::GlobalResponse::DiscardedSignal(
+                        scheduler::discarded_at_send::DiscardedSignalAnswer::Delivery(
+                            scheduler::posix_timer_coalesce::DeliveryAnswer::Suppress
+                        )
+                    )
+                )
+            };
+        let kept = !stale_timer_entry && async {
             // The test-only claim fault drops the claimed copy here too, where a
             // relative `nanosleep`'s restart code makes the backend pass it on
             // unreported (`syscalls::signal::take_claim_fault`).

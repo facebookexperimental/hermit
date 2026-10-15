@@ -36,6 +36,7 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::Priority;
 use crate::scheduler::entropy_to_priority;
+use crate::tool_global::PosixTimerNotification;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::SigalrmControl;
 use crate::tool_global::posix_timer_thread;
@@ -45,6 +46,7 @@ use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::types::LogicalTime;
 use crate::types::PosixTimerThread;
+use crate::types::SigWrapper;
 
 fn time_from_resources(rsrcs: &Resources) -> Option<LogicalTime> {
     if rsrcs.resources.len() > 1 {
@@ -970,15 +972,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The kernel writes the new timer id here; a null pointer is EFAULT.
         let timerid_ptr = call.timerid().ok_or(Errno::EFAULT)?;
         let clockid = call.clockid();
-        let (signo, thread) = if let Some(event_ptr) = call.sevp() {
+        let (signo, thread, value) = if let Some(event_ptr) = call.sevp() {
             // Only the plain fields: `sigevent` holds a pointer, which must not
-            // be kept across the query below.
-            let (notify, signo, named) = {
+            // be kept across the query below. The value is kept as the 64 bits
+            // Linux copies into `si_value`.
+            let (notify, signo, named, value) = {
                 let event: libc::sigevent = guest.memory().read_value(event_ptr)?;
                 (
                     event.sigev_notify,
                     event.sigev_signo,
                     event.sigev_notify_thread_id,
+                    event.sigev_value.sival_ptr as usize as u64,
                 )
             };
             let thread = match notify {
@@ -1004,14 +1008,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 _ => return Err(Errno::EINVAL.into()),
             };
             if notify == libc::SIGEV_NONE {
-                (None, None)
+                (None, None, Some(value))
             } else if !(1..=64).contains(&signo) {
                 return Err(Errno::EINVAL.into());
             } else {
-                (Some(signo), thread)
+                (Some(signo), thread, Some(value))
             }
         } else {
-            (Some(libc::SIGALRM), None)
+            (Some(libc::SIGALRM), None, None)
         };
         // `None` for a real-time signal (32 to 64): see `handle_timer_settime`.
         let signal = signo.and_then(|signo| Signal::try_from(signo).ok());
@@ -1020,7 +1024,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let id = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
-            timers.create(signo, thread)
+            timers.create(signo, thread, value)
         };
         guest
             .memory()
@@ -1061,11 +1065,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(now + Duration::from_nanos(value_ns))
         };
 
-        let (old, signal_number, thread) = {
+        let (old, signal_number, thread, value) = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
             let old = timers.settime(id, interval_ns, deadline, now);
             let signal = timers.signal(id);
-            (old, signal, timers.thread(id))
+            (
+                old,
+                signal,
+                timers.thread(id),
+                timers.value(id).unwrap_or(0),
+            )
         };
         let (old_remaining_ns, old_interval_ns) = old.ok_or(Errno::EINVAL)?;
         let signal_number = signal_number.ok_or(Errno::EINVAL)?;
@@ -1085,8 +1094,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     id,
                     deadline,
                     LogicalTime::from_nanos(interval_ns),
-                    signo,
-                    thread,
+                    PosixTimerNotification {
+                        sig: SigWrapper(signo),
+                        thread,
+                        value,
+                        deleted: false,
+                    },
                 )
                 .await;
             } else if deadline.is_some() {
@@ -1123,7 +1136,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             let timers = guest.thread_state().posix_timers.lock().unwrap();
             timers.gettime(id, now)
         };
-        let (remaining_ns, interval_ns) = cur.ok_or(Errno::EINVAL)?;
+        let (mut remaining_ns, interval_ns) = cur.ok_or(Errno::EINVAL)?;
+        // Where the scheduler coalesces timers, it knows whether this one
+        // waits for the dequeue of its signal (4262 design §5).
+        if let Some((Some(remaining), _)) = posix_timer_readout(guest, id, now).await {
+            remaining_ns = remaining.as_nanos();
+        }
         let spec = libc::itimerspec {
             it_interval: ns_to_timespec(interval_ns),
             it_value: ns_to_timespec(remaining_ns),
@@ -1132,8 +1150,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
-    /// timer_getoverrun: coalesced expiration accounting is not modeled, so the
-    /// overrun count is always 0 for a live timer.
+    /// timer_getoverrun: the expirations the timer's last delivered signal
+    /// missed (`it_overrun_last`), where the scheduler coalesces timers
+    /// (<https://github.com/rrnewton/hermit/issues/4262>); 0 elsewhere.
     pub async fn handle_timer_getoverrun<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1146,11 +1165,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             .lock()
             .unwrap()
             .contains(id);
-        if exists {
-            Ok(0)
-        } else {
-            Err(Errno::EINVAL.into())
+        if !exists {
+            return Err(Errno::EINVAL.into());
         }
+        // The overrun is the scheduler's record alone, not a function of the
+        // caller's time, which is not observed here.
+        Ok(posix_timer_readout(guest, id, LogicalTime::ZERO)
+            .await
+            .map_or(0, |(_, overrun)| overrun as i64))
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1177,7 +1199,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             if let Some(signo) = signal_number
                 && self.posix_timer_expiry_is_registered(signo)
             {
-                register_posix_timer(guest, id, None, LogicalTime::ZERO, signo, None).await;
+                register_posix_timer(
+                    guest,
+                    id,
+                    None,
+                    LogicalTime::ZERO,
+                    PosixTimerNotification {
+                        sig: SigWrapper(signo),
+                        thread: None,
+                        value: 0,
+                        deleted: true,
+                    },
+                )
+                .await;
             }
             detlog!(
                 "[dtid {}] timer_delete(id={})",
@@ -1188,6 +1222,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             Err(Errno::EINVAL.into())
         }
+    }
+}
+
+/// The scheduler's remaining time (`None`: the caller's own answer stands)
+/// and overrun of the calling process's POSIX timer `id` at `now`, where it
+/// keeps them (`DiscardedSignalControl::TimerReadout`); `None` elsewhere.
+async fn posix_timer_readout<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    id: i32,
+    now: LogicalTime,
+) -> Option<(Option<LogicalTime>, i32)> {
+    use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
+    use crate::scheduler::discarded_at_send::DiscardedSignalControl;
+    if !crate::scheduler::discarded_at_send::records(guest.config()) {
+        return None;
+    }
+    match crate::tool_global::discarded_signal(
+        guest,
+        DiscardedSignalControl::TimerReadout { timer: id, now },
+    )
+    .await
+    {
+        DiscardedSignalAnswer::TimerReadout { remaining, overrun } => Some((remaining, overrun)),
+        _ => None,
     }
 }
 

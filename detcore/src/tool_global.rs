@@ -2539,7 +2539,7 @@ impl GlobalState {
                 // The exec caller still owns its turn: delete process-owned
                 // POSIX deadlines before the replacement image can yield or run.
                 // Failed exec takes CancelExec and never reaches this point.
-                sched.blocked.timed_waiters.remove_posix_timers(detpid);
+                sched.delete_exec_posix_timers(detpid);
                 // The exec resets the process's exit signal to SIGCHLD and turns
                 // its existing children's notifications into SIGCHLD.
                 sched.record_successful_exec(detpid);
@@ -2967,8 +2967,7 @@ impl GlobalState {
                 timer_id,
                 deadline,
                 interval,
-                sig,
-                thread,
+                notification,
             ) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
                 let response = match self
@@ -2981,7 +2980,7 @@ impl GlobalState {
                         timer_id,
                         deadline,
                         interval,
-                        (sig, thread),
+                        notification,
                     )
                     .await
                 {
@@ -4698,9 +4697,14 @@ impl GlobalState {
         timer_id: i32,
         deadline: Option<LogicalTime>,
         interval: LogicalTime,
-        notification: (SigWrapper, Option<DetTid>),
+        notification: PosixTimerNotification,
     ) -> SchedulerRpcResult<()> {
-        let (sig, thread) = notification;
+        let PosixTimerNotification {
+            sig,
+            thread,
+            value,
+            deleted,
+        } = notification;
         let RpcIncarnation { dettid, mm } = caller;
         let mut sched = self.lock_rpc_scheduler(false).await;
         if sched.thread_is_logically_killed(dettid) || !sched.rpc_incarnation_matches(dettid, mm) {
@@ -4711,6 +4715,7 @@ impl GlobalState {
             Some(thread) => SignalTarget::Thread(thread),
             None => SignalTarget::Process(dettid),
         };
+        sched.note_posix_timer_notification(detpid, timer_id, sig.raw(), value, deleted);
         sched.register_posix_timer(
             detpid,
             target,
@@ -4724,6 +4729,20 @@ impl GlobalState {
         );
         SchedulerRpcResult::Continue(())
     }
+}
+
+/// What a POSIX timer notifies (`GlobalRequest::RegisterPosixTimer`).
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+pub struct PosixTimerNotification {
+    /// The signal.
+    pub sig: SigWrapper,
+    /// The thread a `SIGEV_THREAD_ID` timer notifies, or `None` for a
+    /// process-directed one.
+    pub thread: Option<DetTid>,
+    /// The `si_value` of its signal.
+    pub value: u64,
+    /// The timer is being deleted (`timer_delete`), not set.
+    pub deleted: bool,
 }
 
 /// Identity and final accounting for an asynchronous scheduler deregistration.
@@ -5055,17 +5074,14 @@ pub enum GlobalRequest {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
-    /// Register, re-arm, or disarm one POSIX timer. The last field is the
-    /// thread a `SIGEV_THREAD_ID` timer notifies, or `None` for a
-    /// process-directed one.
+    /// Register, re-arm, or disarm one POSIX timer, or delete it.
     RegisterPosixTimer(
         DetPid,
         DetTid,
         i32,
         Option<LogicalTime>,
         LogicalTime,
-        SigWrapper,
-        Option<DetTid>,
+        PosixTimerNotification,
     ),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -7056,14 +7072,14 @@ where
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#869)
-/// Register, re-arm, or disarm a POSIX timer with the global scheduler.
+/// Register, re-arm, or disarm a POSIX timer with the global scheduler, or
+/// delete it.
 pub async fn register_posix_timer<G, T>(
     guest: &mut G,
     timer_id: i32,
     deadline: Option<LogicalTime>,
     interval: LogicalTime,
-    signo: i32,
-    thread: Option<DetTid>,
+    notification: PosixTimerNotification,
 ) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -7078,8 +7094,7 @@ pub async fn register_posix_timer<G, T>(
             timer_id,
             deadline,
             interval,
-            SigWrapper(signo),
-            thread,
+            notification,
         ),
     )
     .await;
@@ -12196,9 +12211,9 @@ mod tests {
         let t = LogicalTime::from_nanos;
         let [periodic, disarmed, silent] = {
             let mut timers = guest.thread.posix_timers.lock().unwrap();
-            let periodic = timers.create(Some(libc::SIGUSR2), None);
-            let disarmed = timers.create(Some(libc::SIGALRM), None);
-            let silent = timers.create(None, None);
+            let periodic = timers.create(Some(libc::SIGUSR2), None, None);
+            let disarmed = timers.create(Some(libc::SIGALRM), None, None);
+            let silent = timers.create(None, None, None);
             timers.settime(periodic, 50, Some(t(100)), t(0));
             timers.settime(silent, 0, Some(t(200)), t(0));
             [periodic, disarmed, silent]
@@ -12231,7 +12246,7 @@ mod tests {
             }
         }
         let mut timers = guest.thread.posix_timers.lock().unwrap();
-        let new = timers.create(Some(libc::SIGUSR1), None);
+        let new = timers.create(Some(libc::SIGUSR1), None, None);
         assert_eq!(new, 3);
         assert_eq!(timers.settime(new, 0, Some(t(300)), t(10)), Some((0, 0)));
         assert_eq!(timers.gettime(new, t(20)), Some((280, 0)));
@@ -13026,7 +13041,12 @@ mod tests {
                 1,
                 Some(now + LogicalTime::from_nanos(10)),
                 LogicalTime::ZERO,
-                (SigWrapper::from(Signal::SIGALRM), None),
+                super::PosixTimerNotification {
+                    sig: SigWrapper::from(Signal::SIGALRM),
+                    thread: None,
+                    value: 1,
+                    deleted: false,
+                },
             )
             .await;
         assert_eq!(posix, SchedulerRpcResult::ThreadExited);

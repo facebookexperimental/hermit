@@ -18,6 +18,7 @@ pub(crate) mod parked;
 mod parked_tests;
 pub(crate) mod pid_namespaces;
 mod pipe_wake;
+pub(crate) mod posix_timer_coalesce;
 pub(crate) mod real_timer;
 mod rejoin_log;
 mod replayer;
@@ -1660,6 +1661,23 @@ pub struct Scheduler {
     /// and dropped with the process; read only through that accessor.
     posix_timer_arm_generations: BTreeMap<(DetPid, i32), u64>,
 
+    /// Each live POSIX timer's `si_value`, by process and timer id
+    /// (`note_posix_timer_notification`); a deleted timer has none.
+    posix_timer_values: BTreeMap<(DetPid, i32), u64>,
+
+    /// Each POSIX timer's `it_overrun_last`: the expiries its last
+    /// delivered signal missed (`timer_getoverrun`,
+    /// <https://github.com/rrnewton/hermit/issues/4262>).
+    posix_timer_overruns: BTreeMap<(DetPid, i32), i32>,
+
+    /// The (process, signal) pairs whose timer signals stopped being
+    /// observable (`signal_observable`); sticky.
+    signal_unobservable: BTreeSet<(DetPid, i32)>,
+
+    /// The dequeue each thread's reported delivery stop identified, popped
+    /// once the stop's hooks read the queues (`finish_timer_signal_dequeue`).
+    pending_timer_dequeues: BTreeMap<DetTid, posix_timer_coalesce::PendingDequeue>,
+
     /// The mask Linux's `blocked` holds for each thread whose kernel `SigBlk`
     /// does not show it: the guest's own mask while Detcore holds the thread
     /// under a private blocking mask (`block_signals_for_disposition`,
@@ -1780,28 +1798,6 @@ pub struct Scheduler {
     /// observed, so a signal a signalfd of the process covers never counts as
     /// the timer's own (<https://github.com/rrnewton/hermit/issues/4164>).
     thread_timer_copies: BTreeMap<(DetTid, i32), timed_waiters::SignalTimerId>,
-
-    /// For each process and standard signal, a `SIGEV_SIGNAL` timer's
-    /// expiration the scheduler sent while the process's shared queue held no
-    /// copy of that signal (`fire_process_timer`), so the copy there is the
-    /// timer's own queued signal, which exec flushes (`flush_itimer_signals`;
-    /// <https://github.com/rrnewton/hermit/issues/4184>). The value says
-    /// whether every consumption of that copy is observed: it turns false
-    /// while a thread's `rt_sigtimedwait` set or a signalfd of the process
-    /// covers the signal, or for a job-control signal, which any sender's
-    /// SIGCONT or stop signal may flush unobserved. A delivery to a thread of
-    /// the process that leaves the shared queue without the signal removes
-    /// the entry, and so does a disposition that discards it.
-    process_timer_copies: BTreeMap<(DetPid, i32), bool>,
-
-    /// `SIGEV_THREAD_ID` expirations sent to a thread while their consumption
-    /// could go unobserved, so they are not in `thread_timer_copies`: sent
-    /// while an `rt_sigtimedwait` set or a signalfd covered the signal, or
-    /// recorded and then covered. An exec that finds such a signal still
-    /// pending on its survivor cannot tell the timer's copy from another
-    /// sender's (`take_exec_timer_flush`). A delivery that leaves the
-    /// thread's own queue without the signal removes the entry.
-    unproven_thread_timer_copies: BTreeSet<(DetTid, i32)>,
 
     /// Whether any guest has sent SIGSTKFLT, Reverie's timer marker
     /// (`record_guest_marker_signal`). Set in the sending call's turn and
@@ -3215,11 +3211,11 @@ fn note_real_time_expiration_kept_pending() {
     REAL_TIME_EXPIRATION_KEPT_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Set once the scheduler records a POSIX timer's copy
-/// (`Scheduler::thread_timer_copies`, `Scheduler::process_timer_copies`), so a
-/// disposition change that flushes a signal asks the scheduler to forget the
-/// copies, and an exec asks it which to flush, only in a run that has some
-/// (`timer_copies_recorded`).
+/// Set once a POSIX timer is set or a timer's copy recorded
+/// (`Scheduler::thread_timer_copies`), so a disposition change that flushes a
+/// signal asks the scheduler to forget the copies, and an exec asks it what
+/// its timer signals need (`take_exec_timer_flush`), only in a run that has
+/// timers (`timer_copies_recorded`).
 static TIMER_COPIES_RECORDED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -3880,6 +3876,10 @@ impl Scheduler {
             child_exit_sigchld: Default::default(),
             discarded_at_send: Default::default(),
             posix_timer_arm_generations: Default::default(),
+            posix_timer_values: Default::default(),
+            posix_timer_overruns: Default::default(),
+            signal_unobservable: Default::default(),
+            pending_timer_dequeues: Default::default(),
             saved_guest_sigmasks: Default::default(),
             pending_real_time_expirations: Default::default(),
             sending_child_exit: None,
@@ -3897,8 +3897,6 @@ impl Scheduler {
             sigtimedwait_sets: Default::default(),
             undelivered_scheduler_signals: Default::default(),
             thread_timer_copies: Default::default(),
-            process_timer_copies: Default::default(),
-            unproven_thread_timer_copies: Default::default(),
             guest_sent_marker_signal: false,
             #[cfg(test)]
             test_signal_masks: Default::default(),
@@ -4794,8 +4792,6 @@ impl Scheduler {
         // Its own queue goes with it; a later thread with its tid starts empty.
         self.thread_timer_copies
             .retain(|(thread, _), _| thread != dtid);
-        self.unproven_thread_timer_copies
-            .retain(|(thread, _)| thread != dtid);
         self.remove_physical_thread(dtid, mm);
         // A killed vfork parent must not leave its barrier behind: step2a
         // drops a barrier only when it can read the parent's pending request,
@@ -4808,8 +4804,11 @@ impl Scheduler {
         self.release_vfork_child(*dtid);
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
-        self.discarded_at_send
+        let retired = self
+            .discarded_at_send
             .retire(discarded_at_send::QueueId::Thread(*dtid));
+        self.note_private_entries_retired(retired);
+        self.pending_timer_dequeues.remove(dtid);
         // Its private queue dies with it, and so does a raw-exit status its
         // grant never settled (a thread killed between its report and its
         // grant).
@@ -4919,8 +4918,12 @@ impl Scheduler {
                 .retire(discarded_at_send::QueueId::Process(*detpid));
             self.posix_timer_arm_generations
                 .retain(|(owner, _), _| owner != detpid);
-            self.process_timer_copies
+            self.posix_timer_values
                 .retain(|(owner, _), _| owner != detpid);
+            self.posix_timer_overruns
+                .retain(|(owner, _), _| owner != detpid);
+            self.signal_unobservable
+                .retain(|(owner, _)| owner != detpid);
         }
     }
 
@@ -5402,7 +5405,7 @@ impl Scheduler {
         self.thread_mms.insert(new_leader, post_exec_mm);
         // Reloading backends enter thread-start before handle_post_exec. Cancel
         // old POSIX deadlines before admitting the replacement's first turn.
-        self.blocked.timed_waiters.remove_posix_timers(detpid);
+        self.delete_exec_posix_timers(detpid);
 
         let siblings = if self.exec_teardowns.contains_key(&detpid) {
             let teardown = &self.exec_teardowns[&detpid];
@@ -6097,32 +6100,9 @@ impl Scheduler {
             }
             None => self.sigtimedwait_sets.remove(&dettid).unwrap_or(0),
         };
-        // The call has ended: a covered copy no longer on the thread's own
-        // queue was taken by it (or before it), so nothing of it remains to
-        // prove.
-        if set.is_none()
-            && self.models_signal_targets
-            && let Ok(state) = self.read_sleeper_signal_state(dettid)
-        {
-            self.unproven_thread_timer_copies.retain(|(thread, signo)| {
-                let bit = kernel_signal_bit(*signo);
-                *thread != dettid || covered & bit == 0 || state.thread_pending & bit != 0
-            });
-        }
-        let unproven = &mut self.unproven_thread_timer_copies;
         self.thread_timer_copies.retain(|(thread, signo), _| {
-            let kept = *thread != dettid || covered & kernel_signal_bit(*signo) == 0;
-            if !kept {
-                unproven.insert((*thread, *signo));
-            }
-            kept
+            *thread != dettid || covered & kernel_signal_bit(*signo) == 0
         });
-        let process = self.sigchld_process(dettid);
-        for ((owner, signo), observed) in self.process_timer_copies.iter_mut() {
-            if *owner == process && covered & kernel_signal_bit(*signo) != 0 {
-                *observed = false;
-            }
-        }
         true
     }
 
@@ -7534,7 +7514,9 @@ impl Scheduler {
             thread,
             signal,
             None,
-            Some(discarded_at_send::SignalProducer::ItimerReal),
+            discarded_at_send::SendFate::Classify(Some(
+                discarded_at_send::SignalProducer::ItimerReal,
+            )),
         )
     }
 
@@ -7554,24 +7536,29 @@ impl Scheduler {
         sig: Signal,
         info: Option<[u8; 128]>,
     ) -> bool {
-        self.fire_process_alarm(dpid, dtid, sig, info, None)
+        self.fire_process_alarm(
+            dpid,
+            dtid,
+            sig,
+            info,
+            discarded_at_send::SendFate::Classify(None),
+        )
     }
 
     /// The one body of every scheduler send of a process-directed timer
-    /// signal (`fire_alarm_with`, `fire_posix_timer_alarm`), so that both
+    /// signal (`fire_alarm_with`, `fire_process_timer`), so that both
     /// keep the shared-queue record (`note_signal_left_in_shared_queue`): a
     /// `SIGEV_SIGNAL` timer that once copied this body without it left a
     /// later `sigsuspend` unarmed behind a spinner (the Claude re-check of
-    /// https://github.com/rrnewton/hermit/pull/4351, N1). `producer` names
-    /// the actual ITIMER_REAL expiry, or a periodic POSIX timer whose
-    /// discarded expiry is parked (`DiscardedAtSend::unignore`).
+    /// https://github.com/rrnewton/hermit/pull/4351, N1). `fate` says how
+    /// the discarded-at-send record classifies it (`SendFate`).
     fn fire_process_alarm(
         &mut self,
         dpid: DetPid,
         dtid: DetTid,
         sig: Signal,
         info: Option<[u8; 128]>,
-        producer: Option<discarded_at_send::SignalProducer>,
+        fate: discarded_at_send::SendFate,
     ) -> bool {
         // A guest-handled SIGALRM goes to the process's ledger, not the kernel.
         if self.divert_sigalrm(dpid, sig) {
@@ -7593,7 +7580,7 @@ impl Scheduler {
         // Linux classifies the send against the leader, whatever thread
         // takes it: `it_real_fn` sends to the leader's pid, and a
         // `SIGEV_SIGNAL` timer to the leader (`posixtimer_get_target`).
-        let sent = self.fire_alarm_at(dpid, target, sig, info, dpid, producer);
+        let sent = self.fire_alarm_at(dpid, target, sig, info, dpid, fate);
         if sent && every_thread_blocks {
             self.note_signal_left_in_shared_queue(dpid, sig as libc::c_int);
         }
@@ -7887,8 +7874,8 @@ impl Scheduler {
 
     /// Send `sig` to `target` of `dpid`, classified against `named`, the task
     /// Linux names (`discarded_when_sent_to`), never inferred from `target`,
-    /// which may be a thread Hermit chose. `producer` identifies an actual
-    /// ITIMER_REAL expiry or the periodic POSIX timer sending it.
+    /// which may be a thread Hermit chose. `fate`: how the discarded-at-send
+    /// record classifies it.
     fn fire_alarm_at(
         &mut self,
         dpid: DetPid,
@@ -7896,7 +7883,7 @@ impl Scheduler {
         sig: Signal,
         info: Option<[u8; 128]>,
         named: DetTid,
-        producer: Option<discarded_at_send::SignalProducer>,
+        fate: discarded_at_send::SendFate,
     ) -> bool {
         let Some(target) = target else {
             info!(
@@ -7909,24 +7896,22 @@ impl Scheduler {
             "[dtid {}] Alarm fired, delivering signal {} to guest.",
             target, sig
         );
-        self.send_guest_signal(target, sig, None, info, named, producer);
+        self.send_guest_signal(target, sig, None, info, named, fate);
         true
     }
 
     /// Send an expiration of a `SIGEV_SIGNAL` POSIX timer of `process`
-    /// (armed by `tid`), as [`Self::fire_alarm`] does, and record whether the
-    /// copy it leaves in the process's shared queue is the timer's own
-    /// (`process_timer_copies`). The shared pending set is read before the
-    /// send: no guest thread holds the turn at a timed dispatch, so only a
-    /// host-timed signal could change it. A copy already there means the send
-    /// merged: into this timer's own earlier copy, whose entry stays, or into
-    /// another sender's, which Linux keeps beside the timer's and exec keeps.
-    fn fire_process_timer(
+    /// (armed by `tid`) at its pop, as [`Self::fire_alarm`] does, with `info`
+    /// its `SI_TIMER` siginfo where the scheduler models signal targets. The
+    /// record's `SI_TIMER` code makes exec flush it, as Linux flushes a
+    /// queued timer signal (`flush_itimer_signals`).
+    pub(super) fn fire_process_timer(
         &mut self,
         process: DetPid,
         tid: DetTid,
         sig: Signal,
         producer: Option<discarded_at_send::TimerProducer>,
+        info: Option<[u8; 128]>,
     ) {
         // Only where the scheduler models signal targets (ptrace) is a
         // thread's `/proc` view its DetTid's.
@@ -7934,24 +7919,16 @@ impl Scheduler {
             self.fire_alarm(process, tid, sig);
             return;
         }
-        let signo = sig as libc::c_int;
-        let bit = kernel_signal_bit(signo);
-        // The shared queue is the process's: read it through any live thread,
-        // not the arming one, which may have exited (Codex review of
-        // https://github.com/rrnewton/hermit/pull/4203).
-        // A pending copy Linux discarded when it was sent is not one the
-        // timer's merges into (<https://github.com/rrnewton/hermit/issues/4293>).
-        let discarded = self
-            .discarded_at_send
-            .discarded(discarded_at_send::QueueId::Process(process));
-        let pending = self
-            .process_signal_targets(process)
-            .into_iter()
-            .next()
-            .and_then(|reader| self.read_shared_pending(reader))
-            .map(|pending| pending & !discarded);
         self.guest_send_landed = None;
-        if !self.fire_posix_timer_alarm(process, tid, sig, producer) {
+        if !self.fire_process_alarm(
+            process,
+            tid,
+            sig,
+            info,
+            discarded_at_send::SendFate::Classify(
+                producer.map(discarded_at_send::SignalProducer::Posix),
+            ),
+        ) {
             return;
         }
         // Rule 4: a scheduler send of SIGALRM into the shared queue gives a
@@ -7960,50 +7937,6 @@ impl Scheduler {
         if sig == Signal::SIGALRM && self.guest_send_landed != Some(false) {
             self.note_guest_sigalrm(tid, itimer_coalesce::GuestSigalrmTarget::Process(process));
         }
-        if pending.is_some_and(|pending| pending & bit != 0) {
-            return;
-        }
-        // An unreadable queue leaves the copy unproven.
-        let observed = pending.is_some()
-            && !is_job_control_signal(signo)
-            && self.process_signal_consumption_is_observed(process, bit);
-        TIMER_COPIES_RECORDED.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.process_timer_copies.insert((process, signo), observed);
-    }
-
-    /// [`Self::fire_alarm_with`] for an expiration of a `SIGEV_SIGNAL` POSIX
-    /// timer, which names the leader and, when periodic, is the producer of a
-    /// discarded copy (`DiscardedAtSend::unignore`).
-    fn fire_posix_timer_alarm(
-        &mut self,
-        process: DetPid,
-        tid: DetTid,
-        sig: Signal,
-        producer: Option<discarded_at_send::TimerProducer>,
-    ) -> bool {
-        self.fire_process_alarm(
-            process,
-            tid,
-            sig,
-            None,
-            producer.map(discarded_at_send::SignalProducer::Posix),
-        )
-    }
-
-    /// Whether every consumption of a shared-queue copy of the signal `bit`
-    /// in `process` is observed (`process_timer_copies`): no thread of the
-    /// process polls an `rt_sigtimedwait` set holding it, and no signalfd
-    /// covers it (`signalfd_may_read`).
-    fn process_signal_consumption_is_observed(&self, process: DetPid, bit: u64) -> bool {
-        self.thread_tree
-            .my_thread_group(&process)
-            .iter()
-            .all(|thread| {
-                self.sigtimedwait_sets
-                    .get(thread)
-                    .is_none_or(|set| set & bit == 0)
-            })
-            && !self.signalfd_may_read(bit)
     }
 
     /// Whether a signalfd could read the signal `bit` in some process. A
@@ -8016,13 +7949,12 @@ impl Scheduler {
         self.signalfd_masks.values().any(|mask| mask & bit != 0)
     }
 
-    /// `dettid` took a copy of `signo` at its delivery stop: if the copy a
-    /// `SIGEV_SIGNAL` timer left in its process's shared queue is gone, so is
-    /// the record of it (`process_timer_copies`), and so is the record of a
-    /// scheduler signal left there (`shared_queue_scheduler_signals`). The
-    /// thread's own queue is dequeued first, so the copy taken may be another:
-    /// a private take leaves the shared copy, and its record, in place (Codex
-    /// review of https://github.com/rrnewton/hermit/pull/4314).
+    /// `dettid` took a copy of `signo` at its delivery stop: if the shared
+    /// queue no longer holds it, the record of a scheduler signal left there
+    /// goes (`shared_queue_scheduler_signals`). The thread's own queue is
+    /// dequeued first, so the copy taken may be another: a private take
+    /// leaves the shared copy, and its record, in place (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4314).
     fn note_process_signal_taken(&mut self, dettid: DetTid, signo: i32) {
         let process = self.sigchld_process(dettid);
         let bit = kernel_signal_bit(signo);
@@ -8038,44 +7970,8 @@ impl Scheduler {
         {
             *waiting &= !bit;
         }
-        if self.models_signal_targets
-            && self.unproven_thread_timer_copies.contains(&(dettid, signo))
-            && self
-                .read_sleeper_signal_state(dettid)
-                .is_ok_and(|state| state.thread_pending & kernel_signal_bit(signo) == 0)
-        {
-            self.unproven_thread_timer_copies.remove(&(dettid, signo));
-        }
-        let process = self.sigchld_process(dettid);
-        if !self.process_timer_copies.contains_key(&(process, signo)) {
-            return;
-        }
-        match self.read_shared_pending(dettid) {
-            Some(pending) if pending & kernel_signal_bit(signo) == 0 => {
-                self.process_timer_copies.remove(&(process, signo));
-            }
-            Some(_) => {}
-            None => {
-                self.process_timer_copies.insert((process, signo), false);
-            }
-        }
     }
 
-    /// What a successful exec of `process`, whose surviving thread is
-    /// `survivor`, flushes of the POSIX timer copies the scheduler sent
-    /// (<https://github.com/rrnewton/hermit/issues/4184>). Linux discards
-    /// every queued timer signal at exec (`flush_itimer_signals`), from the
-    /// survivor's own queue and the shared one, and keeps every other pending
-    /// signal. Called in the exec's turn, before the new image runs. Clears
-    /// the process's records: its `SIGEV_THREAD_ID` copies (the survivor's
-    /// are flushed, its siblings' went with them), its `SIGEV_SIGNAL` copies,
-    /// and the real-time expirations kept pending, which were never sent.
-    ///
-    /// Each copy to flush must still be pending where it was queued. A shared
-    /// copy whose consumption may have gone unobserved, or one behind a copy of
-    /// the same signal in the survivor's own queue (which a dequeue would take
-    /// first), cannot be singled out: an `Err` names it, and the run is
-    /// refused.
     /// A non-leader exec's caller `former` survives as `leader`
     /// (`reconnect_exec`): its own queue, and so its timer copy records, move
     /// to the leader's tid.
@@ -8094,89 +7990,87 @@ impl Scheduler {
         for (signo, id) in moved {
             self.thread_timer_copies.insert((leader, signo), id);
         }
-        let unproven: Vec<_> = self
-            .unproven_thread_timer_copies
-            .iter()
-            .filter(|(thread, _)| *thread == former)
-            .map(|(_, signo)| *signo)
-            .collect();
-        self.unproven_thread_timer_copies
-            .retain(|(thread, _)| *thread != former && *thread != leader);
-        for signo in unproven {
-            self.unproven_thread_timer_copies.insert((leader, signo));
-        }
     }
 
+    /// What a successful exec of `process`, whose surviving thread is
+    /// `survivor`, does to its pending timer signals, in the exec's turn
+    /// before the new image runs. Linux removes every queued record whose
+    /// `si_code` is `SI_TIMER`, from the survivor's own queue and the shared
+    /// one (`flush_itimer_signals`), and keeps every other. Hermit sends each
+    /// timer's record with `SI_TIMER`, so the kernel flushes those itself; a
+    /// discarded copy carrying `SI_TIMER` goes too. What remains is where the
+    /// physical records and Linux's entries differ (`SignalLists::exec`,
+    /// <https://github.com/rrnewton/hermit/issues/4262>): a `Proxy` ordinary
+    /// entry whose `SI_TIMER` record was flushed is sent again here, and a
+    /// kept record whose entry exec removed is returned for the survivor to
+    /// take back. A shared record behind a copy of the same signal in the
+    /// survivor's own queue cannot be taken alone: an `Err` names it.
+    ///
+    /// The exec retired every other thread with its queue
+    /// (`logically_kill_thread`), and a non-leader caller's records moved to
+    /// the leader's tid with its queue (`rekey_thread`).
     pub(crate) fn take_exec_timer_flush(
         &mut self,
         survivor: DetTid,
         process: DetPid,
     ) -> Result<ExecTimerFlush, String> {
         self.pending_real_time_expirations.remove(&process);
-        // The exec retired every other thread with its queue
-        // (`logically_kill_thread`), and a non-leader caller's records moved
-        // to the leader's tid with its queue (`transfer_thread_timer_copies`),
-        // so only the survivor's own records remain.
-        let mut own = 0u64;
-        self.thread_timer_copies.retain(|(thread, signo), _| {
-            if *thread != survivor {
-                return true;
-            }
-            own |= kernel_signal_bit(*signo);
-            false
-        });
-        let mut unproven_own = 0u64;
-        self.unproven_thread_timer_copies.retain(|(thread, signo)| {
-            if *thread != survivor {
-                return true;
-            }
-            unproven_own |= kernel_signal_bit(*signo);
-            false
-        });
-        let mut shared = 0u64;
-        let mut unproven = 0u64;
-        self.process_timer_copies
-            .retain(|(owner, signo), observed| {
-                if *owner != process {
-                    return true;
+        self.thread_timer_copies
+            .retain(|(thread, _), _| *thread != survivor);
+        self.discarded_at_send.forget_parks_of(process);
+        let (private, shared) = (
+            discarded_at_send::QueueId::Thread(survivor),
+            discarded_at_send::QueueId::Process(process),
+        );
+        for queue in [private, shared] {
+            for signo in 1..32 {
+                if self.discarded_at_send.discarded_is_si_timer(queue, signo) {
+                    self.discarded_at_send.flush([queue], signo);
                 }
-                if *observed {
-                    shared |= kernel_signal_bit(*signo);
-                } else {
-                    unproven |= kernel_signal_bit(*signo);
-                }
-                false
-            });
-        // Only a backend whose signals the scheduler models (ptrace) records
-        // which copy is the timer's, from `/proc`; elsewhere the copies stay,
-        // as before (`fire_process_timer`).
-        if own | shared | unproven | unproven_own == 0 || !self.models_signal_targets {
-            return Ok(ExecTimerFlush::default());
+            }
         }
-        let state = self
-            .read_sleeper_signal_state(survivor)
-            .map_err(|failure| {
-                format!("the pending signals of thread {survivor} could not be read ({failure:?})")
-            })?;
-        let (thread_pending, shared_pending) = (state.thread_pending, state.shared_pending);
-        if let Some(signo) = first_signal(unproven_own & thread_pending & !own) {
-            return Err(format!(
-                "signal {signo} is pending in thread {survivor}'s own queue, and a SIGEV_THREAD_ID timer's copy of it may have been taken unobserved (a sigtimedwait, a signalfd or a job-control flush), so it cannot be told from another sender's"
-            ));
+        let outcome = self.discarded_at_send.lists.exec(&[private, shared]);
+        for (queue, signo, _) in &outcome.resend {
+            let Ok(sig) = Signal::try_from(*signo) else {
+                continue;
+            };
+            info!(
+                "[dtid {}] exec flushed the SI_TIMER record a kept signal {} stood on; sent again.",
+                survivor, sig
+            );
+            let thread_of =
+                matches!(queue, discarded_at_send::QueueId::Thread(_)).then_some(process);
+            self.send_guest_signal(
+                survivor,
+                sig,
+                thread_of,
+                None,
+                survivor,
+                discarded_at_send::SendFate::Kept,
+            );
         }
-        if let Some(signo) = first_signal(unproven & shared_pending) {
-            return Err(format!(
-                "signal {signo} is pending in the shared queue, and a SIGEV_SIGNAL timer's copy of it may have been taken unobserved (a sigtimedwait, a signalfd or a job-control flush), so it cannot be told from another sender's"
-            ));
+        let mut flush = ExecTimerFlush::default();
+        for (queue, signo) in outcome.take_back {
+            match queue {
+                discarded_at_send::QueueId::Thread(_) => flush.own |= kernel_signal_bit(signo),
+                discarded_at_send::QueueId::Process(_) => flush.shared |= kernel_signal_bit(signo),
+            }
         }
-        let own = own & thread_pending;
-        let shared = shared & shared_pending;
-        if let Some(signo) = first_signal(shared & thread_pending & !own) {
-            return Err(format!(
-                "a SIGEV_SIGNAL timer's copy of signal {signo} is pending in the shared queue behind another copy in thread {survivor}'s own queue, which a dequeue would take first"
-            ));
+        if flush.shared & !flush.own != 0 {
+            let state = self
+                .read_sleeper_signal_state(survivor)
+                .map_err(|failure| {
+                    format!(
+                        "the pending signals of thread {survivor} could not be read ({failure:?})"
+                    )
+                })?;
+            if let Some(signo) = first_signal(flush.shared & !flush.own & state.thread_pending) {
+                return Err(format!(
+                    "a POSIX timer's entry of signal {signo} stood on a record in the shared queue behind another copy in thread {survivor}'s own queue, which a dequeue would take first"
+                ));
+            }
         }
-        Ok(ExecTimerFlush { own, shared })
+        Ok(flush)
     }
 
     /// Deliver an expiration of a `SIGEV_THREAD_ID` POSIX timer of `process`
@@ -8236,16 +8130,30 @@ impl Scheduler {
             self.thread_timer_copies.insert((thread, signo), id);
         } else {
             self.thread_timer_copies.remove(&(thread, signo));
-            self.unproven_thread_timer_copies.insert((thread, signo));
         }
         let producer = self.posix_timer_producer(id);
+        // Its `SI_TIMER` record, with the overrun counted at the pop
+        // (`fire_posix_timer_fallback`), which exec flushes.
+        let info = match id {
+            timed_waiters::SignalTimerId::Posix(_, timer) if self.models_signal_targets => {
+                let entry = self.timer_entry_now(process, timer);
+                Some(self.timer_signal_info(
+                    signo,
+                    &entry,
+                    self.posix_timer_overrun(process, timer),
+                ))
+            }
+            _ => None,
+        };
         self.send_guest_signal(
             thread,
             sig,
             Some(process),
-            None,
+            info,
             thread,
-            producer.map(discarded_at_send::SignalProducer::Posix),
+            discarded_at_send::SendFate::Classify(
+                producer.map(discarded_at_send::SignalProducer::Posix),
+            ),
         );
     }
 
@@ -8309,9 +8217,6 @@ impl Scheduler {
         let threads: Vec<DetTid> = self.thread_tree.my_thread_group(&process);
         self.thread_timer_copies
             .retain(|(thread, signal), _| *signal != signo || !threads.contains(thread));
-        self.process_timer_copies.remove(&(process, signo));
-        self.unproven_thread_timer_copies
-            .retain(|(thread, signal)| *signal != signo || !threads.contains(thread));
     }
 
     /// Whether every consumption of a copy of the signal `bit` on `thread` is
@@ -9040,7 +8945,14 @@ impl Scheduler {
     /// kernel's `SI_USER` (it must carry a negative `si_code`).
     #[cfg(test)]
     fn signal_guest(&mut self, dettid: DetTid, signal: Signal, info: Option<[u8; 128]>) {
-        self.send_guest_signal(dettid, signal, None, info, dettid, None);
+        self.send_guest_signal(
+            dettid,
+            signal,
+            None,
+            info,
+            dettid,
+            discarded_at_send::SendFate::Classify(None),
+        );
     }
 
     /// [`Self::signal_guest`], or with `thread_of: Some(process)` a
@@ -9064,7 +8976,7 @@ impl Scheduler {
         thread_of: Option<DetPid>,
         info: Option<[u8; 128]>,
         named: DetTid,
-        producer: Option<discarded_at_send::SignalProducer>,
+        fate: discarded_at_send::SendFate,
     ) {
         debug!(
             "[dtid {}] deliver signal {} physically to guest thread.",
@@ -9081,9 +8993,20 @@ impl Scheduler {
         } else {
             discarded_at_send::QueueId::Process(self.sigchld_process(dettid))
         };
-        let token = self
-            .models_signal_targets
-            .then(|| self.discard_pre_send(named, queue, signal as libc::c_int, None));
+        let token = self.models_signal_targets.then(|| match fate {
+            discarded_at_send::SendFate::Classify(_) => {
+                self.discard_pre_send(named, queue, signal as libc::c_int, None)
+            }
+            discarded_at_send::SendFate::Kept => {
+                self.discard_kept_token(queue, signal as libc::c_int)
+            }
+        });
+        let producer = match fate {
+            discarded_at_send::SendFate::Classify(Some(
+                discarded_at_send::SignalProducer::Posix(timer),
+            )) => Some(timer),
+            _ => None,
+        };
         // Whether a SIGCHLD is already pending in the shared queue, read before
         // the send: no guest thread holds the turn at a committed send, so
         // only a host-timed copy could change it (`fire_process_timer`).
@@ -9121,13 +9044,25 @@ impl Scheduler {
             self.guest_send_landed = Some(false);
             return;
         } else if let Some(process) = thread_of {
+            // With a siginfo (a POSIX timer's `SI_TIMER` record), the
+            // thread-directed form that carries it.
             let rc = unsafe {
-                libc::syscall(
-                    libc::SYS_tgkill,
-                    process.as_raw(),
-                    dettid.as_raw(),
-                    signal as libc::c_int,
-                )
+                if info.is_some() {
+                    libc::syscall(
+                        libc::SYS_rt_tgsigqueueinfo,
+                        process.as_raw(),
+                        dettid.as_raw(),
+                        signal as libc::c_int,
+                        info_ptr,
+                    )
+                } else {
+                    libc::syscall(
+                        libc::SYS_tgkill,
+                        process.as_raw(),
+                        dettid.as_raw(),
+                        signal as libc::c_int,
+                    )
+                }
             };
             if rc < 0 {
                 Err(nix::errno::Errno::last())
@@ -9155,14 +9090,35 @@ impl Scheduler {
         if result.is_ok()
             && let Some(token) = token
         {
-            match producer {
-                Some(discarded_at_send::SignalProducer::ItimerReal) => {
-                    self.discard_note_itimer_real(token);
+            match fate {
+                // The actual ITIMER_REAL expiry keeps its origin for the
+                // reported delivery's siginfo. Its pair is not listed: an
+                // ITIMER_REAL arm ended the pair's observability.
+                discarded_at_send::SendFate::Classify(Some(
+                    discarded_at_send::SignalProducer::ItimerReal,
+                )) => self.discard_note_itimer_real(token),
+                _ => {
+                    // An ordinary send's record joins its list (A1): the
+                    // siginfo it carries, or Linux's `SI_KERNEL` for the
+                    // scheduler's own signal (`SEND_SIG_PRIV`). A timer
+                    // entry's own record does not.
+                    let record = match fate {
+                        discarded_at_send::SendFate::Classify(_) => Some(
+                            info.as_ref()
+                                .map(signal_lists::KernelSiginfo::from_user)
+                                .unwrap_or_else(|| {
+                                    signal_lists::ordinary_siginfo(
+                                        signal as libc::c_int,
+                                        0x80,
+                                        0,
+                                        0,
+                                    )
+                                }),
+                        ),
+                        discarded_at_send::SendFate::Kept => None,
+                    };
+                    self.discard_note_send(token, producer, record);
                 }
-                Some(discarded_at_send::SignalProducer::Posix(timer)) => {
-                    self.discard_note_send(token, Some(timer));
-                }
-                None => self.discard_note_send(token, None),
             }
         }
         match result {
@@ -10236,7 +10192,14 @@ impl Scheduler {
         if !self.models_signal_targets {
             let target = self.select_signal_target(parent, Some(creator));
             return self
-                .fire_alarm_at(parent, target, sig, info, creator, None)
+                .fire_alarm_at(
+                    parent,
+                    target,
+                    sig,
+                    info,
+                    creator,
+                    discarded_at_send::SendFate::Classify(None),
+                )
                 .then_some(target)?;
         }
         let every_thread_blocks = self.kernel_sigchld_target(parent, creator).is_none();
@@ -10253,7 +10216,14 @@ impl Scheduler {
                 .next()
                 .unwrap_or(creator)
         };
-        let sent = self.fire_alarm_at(parent, target, sig, info, named, None);
+        let sent = self.fire_alarm_at(
+            parent,
+            target,
+            sig,
+            info,
+            named,
+            discarded_at_send::SendFate::Classify(None),
+        );
         if sent && every_thread_blocks {
             self.note_signal_left_in_shared_queue(parent, libc::SIGCHLD);
         }
@@ -20274,7 +20244,7 @@ mod test {
     fn record_guest_send(scheduler: &mut Scheduler, target: DetTid, signal: i32) {
         let queue = discarded_at_send::QueueId::Thread(target);
         let token = scheduler.discard_pre_send(target, queue, signal, Some(target));
-        scheduler.discard_note_send(token, None);
+        scheduler.discard_note_send(token, None, None);
     }
 
     /// A signal ignored by default with no handler when it is sent (here a
@@ -24471,164 +24441,6 @@ mod test {
         assert!(scheduler.thread_timer_copies.is_empty());
     }
 
-    /// A successful exec flushes the POSIX timer copies still pending where
-    /// they were queued: the survivor's own `SIGEV_THREAD_ID` copies and the
-    /// process's proven `SIGEV_SIGNAL` copies. A copy already taken is not
-    /// flushed, every record of the process and its kept real-time
-    /// expirations go, and another process's stay
-    /// (https://github.com/rrnewton/hermit/issues/4184).
-    #[test]
-    fn an_exec_flushes_the_timer_copies_still_pending_where_they_were_queued() {
-        let (mut scheduler, parent, _creator, child) = sigchld_family(libc::SIGCHLD);
-        let process = DetPid::from_raw(parent.as_raw());
-        let other = DetPid::from_raw(child.as_raw());
-        let timer = timed_waiters::SignalTimerId::Posix(process, 0);
-        let bit = kernel_signal_bit;
-        scheduler
-            .thread_timer_copies
-            .insert((parent, libc::SIGUSR1), timer);
-        scheduler
-            .thread_timer_copies
-            .insert((parent, libc::SIGHUP), timer);
-        scheduler
-            .process_timer_copies
-            .insert((process, libc::SIGALRM), true);
-        scheduler
-            .process_timer_copies
-            .insert((process, libc::SIGTERM), true);
-        scheduler
-            .process_timer_copies
-            .insert((other, libc::SIGALRM), true);
-        scheduler
-            .pending_real_time_expirations
-            .insert(process, bit(libc::SIGRTMIN()));
-        scheduler.test_kernel_signal_states.insert(
-            parent,
-            KernelSignalState {
-                // SIGHUP's copy was taken; SIGTERM's too.
-                thread_pending: bit(libc::SIGUSR1),
-                shared_pending: bit(libc::SIGALRM),
-                ..signal_state(0, 0)
-            },
-        );
-        assert_eq!(
-            scheduler.take_exec_timer_flush(parent, process),
-            Ok(ExecTimerFlush {
-                own: bit(libc::SIGUSR1),
-                shared: bit(libc::SIGALRM),
-            })
-        );
-        assert!(scheduler.thread_timer_copies.is_empty());
-        assert_eq!(
-            scheduler.process_timer_copies.keys().collect::<Vec<_>>(),
-            vec![&(other, libc::SIGALRM)]
-        );
-        assert_eq!(scheduler.pending_real_time_expirations(process), 0);
-        assert_eq!(
-            scheduler.take_exec_timer_flush(parent, process),
-            Ok(ExecTimerFlush::default())
-        );
-    }
-
-    /// An exec refuses where a timer's copy cannot be singled out: a
-    /// `SIGEV_SIGNAL` copy whose consumption may have gone unobserved, with
-    /// its signal pending in the shared queue; one behind another copy of
-    /// its signal in the survivor's own queue, which a dequeue takes first;
-    /// a `SIGEV_THREAD_ID` copy sent while unobservable, with its signal
-    /// pending on the survivor (https://github.com/rrnewton/hermit/issues/4184).
-    #[test]
-    fn an_exec_refuses_a_timer_copy_it_cannot_single_out() {
-        let (mut scheduler, parent, _creator, _child) = sigchld_family(libc::SIGCHLD);
-        let process = DetPid::from_raw(parent.as_raw());
-        let usr1 = kernel_signal_bit(libc::SIGUSR1);
-        let pending = |scheduler: &mut Scheduler, thread_pending: u64, shared_pending: u64| {
-            scheduler.test_kernel_signal_states.insert(
-                parent,
-                KernelSignalState {
-                    thread_pending,
-                    shared_pending,
-                    ..signal_state(0, 0)
-                },
-            );
-        };
-        pending(&mut scheduler, 0, usr1);
-        scheduler.register_signalfd(process, usr1);
-        scheduler
-            .process_timer_copies
-            .insert((process, libc::SIGUSR1), true);
-        scheduler.register_signalfd(process, usr1);
-        assert!(matches!(
-            scheduler.take_exec_timer_flush(parent, process),
-            Err(reason) if reason.contains("taken unobserved")
-        ));
-        scheduler
-            .process_timer_copies
-            .insert((process, libc::SIGUSR1), true);
-        pending(&mut scheduler, usr1, usr1);
-        assert!(matches!(
-            scheduler.take_exec_timer_flush(parent, process),
-            Err(reason) if reason.contains("behind another copy")
-        ));
-        scheduler
-            .unproven_thread_timer_copies
-            .insert((parent, libc::SIGUSR1));
-        assert!(matches!(
-            scheduler.take_exec_timer_flush(parent, process),
-            Err(reason) if reason.contains("SIGEV_THREAD_ID timer's copy of it may have been taken")
-        ));
-        // Gone from where it was queued: nothing to flush or refuse.
-        scheduler
-            .process_timer_copies
-            .insert((process, libc::SIGUSR1), false);
-        pending(&mut scheduler, 0, 0);
-        assert_eq!(
-            scheduler.take_exec_timer_flush(parent, process),
-            Ok(ExecTimerFlush::default())
-        );
-    }
-
-    /// A non-leader exec's caller survives under the leader's tid with its
-    /// own queue: its records move there, and the destroyed leader's are
-    /// gone, so the flush takes the caller's own timer copy and leaves the
-    /// leader's signal alone (Claude review of
-    /// https://github.com/rrnewton/hermit/pull/4203).
-    #[test]
-    fn a_non_leader_exec_flushes_its_callers_own_copy_under_the_leaders_tid() {
-        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
-        let process = DetPid::from_raw(parent.as_raw());
-        let timer = timed_waiters::SignalTimerId::Posix(process, 0);
-        let bit = kernel_signal_bit;
-        scheduler
-            .thread_timer_copies
-            .insert((parent, libc::SIGUSR1), timer);
-        scheduler
-            .thread_timer_copies
-            .insert((creator, libc::SIGUSR2), timer);
-        scheduler
-            .unproven_thread_timer_copies
-            .insert((parent, libc::SIGHUP));
-        scheduler.transfer_thread_timer_copies(creator, parent);
-        assert_eq!(
-            scheduler.thread_timer_copies.keys().collect::<Vec<_>>(),
-            vec![&(parent, libc::SIGUSR2)]
-        );
-        assert!(scheduler.unproven_thread_timer_copies.is_empty());
-        scheduler.test_kernel_signal_states.insert(
-            parent,
-            KernelSignalState {
-                thread_pending: bit(libc::SIGUSR1) | bit(libc::SIGUSR2) | bit(libc::SIGHUP),
-                ..signal_state(0, 0)
-            },
-        );
-        assert_eq!(
-            scheduler.take_exec_timer_flush(parent, process),
-            Ok(ExecTimerFlush {
-                own: bit(libc::SIGUSR2),
-                shared: 0,
-            })
-        );
-    }
-
     /// A thread's timer-copy records go with it, so a later thread given
     /// its tid starts with none (Claude review of
     /// https://github.com/rrnewton/hermit/pull/4203).
@@ -24641,176 +24453,12 @@ mod test {
             .thread_timer_copies
             .insert((creator, libc::SIGUSR1), timer);
         scheduler
-            .unproven_thread_timer_copies
-            .insert((creator, libc::SIGUSR2));
-        scheduler
             .thread_timer_copies
             .insert((parent, libc::SIGUSR1), timer);
         scheduler.logically_kill_thread(&creator, &process, MmId::initial(process));
         assert_eq!(
             scheduler.thread_timer_copies.keys().collect::<Vec<_>>(),
             vec![&(parent, libc::SIGUSR1)]
-        );
-        assert!(scheduler.unproven_thread_timer_copies.is_empty());
-    }
-
-    /// A signalfd any process points at a signal makes every process's
-    /// records of that signal unproven: its open description may be shared,
-    /// and a read through it is not observed (Codex review of
-    /// https://github.com/rrnewton/hermit/pull/4203).
-    #[test]
-    fn a_signalfd_in_any_process_makes_every_copy_of_its_signal_unproven() {
-        let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
-        let process = DetPid::from_raw(parent.as_raw());
-        let child_process = DetPid::from_raw(child.as_raw());
-        let timer = timed_waiters::SignalTimerId::Posix(process, 0);
-        let usr1 = kernel_signal_bit(libc::SIGUSR1);
-        scheduler
-            .process_timer_copies
-            .insert((process, libc::SIGUSR1), true);
-        scheduler
-            .process_timer_copies
-            .insert((process, libc::SIGUSR2), true);
-        scheduler
-            .thread_timer_copies
-            .insert((creator, libc::SIGUSR1), timer);
-        scheduler.register_signalfd(child_process, usr1);
-        assert_eq!(
-            scheduler
-                .process_timer_copies
-                .get(&(process, libc::SIGUSR1)),
-            Some(&false)
-        );
-        assert_eq!(
-            scheduler
-                .process_timer_copies
-                .get(&(process, libc::SIGUSR2)),
-            Some(&true)
-        );
-        assert!(scheduler.thread_timer_copies.is_empty());
-        assert!(
-            scheduler
-                .unproven_thread_timer_copies
-                .contains(&(creator, libc::SIGUSR1))
-        );
-        assert!(!scheduler.process_signal_consumption_is_observed(process, usr1));
-    }
-
-    /// A process's `SIGEV_SIGNAL` copy records go when its last thread does,
-    /// so a later process given its pid starts with none (Claude re-check of
-    /// https://github.com/rrnewton/hermit/pull/4203).
-    #[test]
-    fn a_dead_processs_timer_copy_records_go_with_its_last_thread() {
-        let (mut scheduler, parent, _creator, child) = sigchld_family(libc::SIGCHLD);
-        let process = DetPid::from_raw(parent.as_raw());
-        let child_process = DetPid::from_raw(child.as_raw());
-        scheduler
-            .process_timer_copies
-            .insert((child_process, libc::SIGUSR1), true);
-        scheduler
-            .process_timer_copies
-            .insert((process, libc::SIGUSR1), true);
-        scheduler.logically_kill_thread(&child, &child_process, MmId::initial(child_process));
-        assert_eq!(
-            scheduler.process_timer_copies.keys().collect::<Vec<_>>(),
-            vec![&(process, libc::SIGUSR1)]
-        );
-    }
-
-    /// A signalfd opened after a `SIGEV_THREAD_ID` copy was recorded makes it
-    /// unproven, as its reads are not observed; an `rt_sigtimedwait` that
-    /// covered a copy and ended with it gone from the thread's queue settles
-    /// it (Claude review of https://github.com/rrnewton/hermit/pull/4203).
-    #[test]
-    fn a_thread_timer_copy_is_unproven_under_a_signalfd_and_settled_by_a_sigtimedwait() {
-        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
-        let process = DetPid::from_raw(parent.as_raw());
-        let timer = timed_waiters::SignalTimerId::Posix(process, 0);
-        let usr1 = kernel_signal_bit(libc::SIGUSR1);
-        let pending = |scheduler: &mut Scheduler, thread_pending: u64| {
-            scheduler.test_kernel_signal_states.insert(
-                creator,
-                KernelSignalState {
-                    thread_pending,
-                    ..signal_state(0, 0)
-                },
-            );
-        };
-        scheduler
-            .thread_timer_copies
-            .insert((creator, libc::SIGUSR1), timer);
-        scheduler.register_signalfd(process, usr1);
-        assert!(scheduler.thread_timer_copies.is_empty());
-        assert!(
-            scheduler
-                .unproven_thread_timer_copies
-                .contains(&(creator, libc::SIGUSR1))
-        );
-        scheduler.unproven_thread_timer_copies.clear();
-        scheduler
-            .thread_timer_copies
-            .insert((creator, libc::SIGUSR1), timer);
-        scheduler.set_sigtimedwait_set(creator, Some(usr1));
-        assert!(
-            scheduler
-                .unproven_thread_timer_copies
-                .contains(&(creator, libc::SIGUSR1))
-        );
-        pending(&mut scheduler, usr1);
-        scheduler.set_sigtimedwait_set(creator, None);
-        assert!(
-            scheduler
-                .unproven_thread_timer_copies
-                .contains(&(creator, libc::SIGUSR1))
-        );
-        scheduler.set_sigtimedwait_set(creator, Some(usr1));
-        pending(&mut scheduler, 0);
-        scheduler.set_sigtimedwait_set(creator, None);
-        assert!(scheduler.unproven_thread_timer_copies.is_empty());
-    }
-
-    /// A delivery of a signal whose `SIGEV_SIGNAL` copy is recorded removes
-    /// the record once the shared queue no longer holds the signal, and keeps
-    /// it while the copy is still there (the thread's own copy went first); a
-    /// sigtimedwait set covering it makes the record unproven
-    /// (https://github.com/rrnewton/hermit/issues/4184).
-    #[test]
-    fn a_process_timer_copy_record_follows_its_consumption() {
-        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
-        let process = DetPid::from_raw(parent.as_raw());
-        let usr1 = kernel_signal_bit(libc::SIGUSR1);
-        let shared = |scheduler: &mut Scheduler, shared_pending: u64| {
-            scheduler.test_kernel_signal_states.insert(
-                creator,
-                KernelSignalState {
-                    shared_pending,
-                    ..signal_state(0, 0)
-                },
-            );
-        };
-        scheduler
-            .process_timer_copies
-            .insert((process, libc::SIGUSR1), true);
-        shared(&mut scheduler, usr1);
-        scheduler.note_process_signal_taken(creator, libc::SIGUSR1);
-        assert_eq!(
-            scheduler
-                .process_timer_copies
-                .get(&(process, libc::SIGUSR1)),
-            Some(&true)
-        );
-        shared(&mut scheduler, 0);
-        scheduler.note_process_signal_taken(creator, libc::SIGUSR1);
-        assert!(scheduler.process_timer_copies.is_empty());
-        scheduler
-            .process_timer_copies
-            .insert((process, libc::SIGUSR1), true);
-        scheduler.set_sigtimedwait_set(creator, Some(usr1));
-        assert_eq!(
-            scheduler
-                .process_timer_copies
-                .get(&(process, libc::SIGUSR1)),
-            Some(&false)
         );
     }
 

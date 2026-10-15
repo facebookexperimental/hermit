@@ -106,7 +106,7 @@ pub struct TimerProducer {
 
 /// The causal source of a scheduler publication. Only ITIMER_REAL may select
 /// Linux's SI_KERNEL timer payload; POSIX timer metadata is a separate source.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignalProducer {
     ItimerReal,
     Posix(TimerProducer),
@@ -118,6 +118,19 @@ pub(crate) fn itimer_real_siginfo() -> [u8; reverie::SIGNAL_INFO_SIZE] {
     info[..4].copy_from_slice(&libc::SIGALRM.to_ne_bytes());
     info[8..12].copy_from_slice(&libc::SI_KERNEL.to_ne_bytes());
     info
+}
+
+/// How the record classifies a scheduler send (`Scheduler::send_guest_signal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendFate {
+    /// As Linux decides for a new send (`discard_pre_send`); the producer is
+    /// the actual ITIMER_REAL expiry or the periodic POSIX timer sending it,
+    /// if any.
+    Classify(Option<SignalProducer>),
+    /// Kept whatever the target's state: Linux queued this entry at its own
+    /// expiry or park, so this send is no new Linux send (a promotion, an
+    /// unignore resend; 4262 design §4.5).
+    Kept,
 }
 
 /// What a sender read of a queue before its send (`DiscardedAtSend::pre_send`):
@@ -195,6 +208,8 @@ pub(crate) struct DiscardedAtSend {
     /// carries `SI_TIMER` (a guest's forged `rt_sigqueueinfo`, or a timer's
     /// own discarded expiry): exec flushes such a record.
     discarded_si_timer: BTreeSet<(QueueId, i32)>,
+    /// The last `ParkedExpiry::seq` given.
+    park_seq: u64,
 }
 
 /// What a recorded send carries for the lists (`DiscardedAtSend::note_send_listed`).
@@ -216,6 +231,21 @@ struct ParkedExpiry {
     signal: i32,
     /// The timer's arming generation at the expiry.
     arm_gen: u64,
+    /// When it was first parked (`DiscardedAtSend::park_seq`): Linux adds a
+    /// parked timer at the head of the ignored list (`hlist_add_head`), so an
+    /// unignore re-queues the most recently parked first.
+    seq: u64,
+}
+
+/// What an unignore of a listed pair needs sent or woken
+/// (`DiscardedAtSend::unignore_lists`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnignoreAction {
+    /// The re-queued entry is the front of an empty list: send its record.
+    Send(QueueId, super::signal_lists::TimerEntry),
+    /// The discarded copy still pending stands for the re-queued entry:
+    /// nothing is sent, so its queue's waiter is woken.
+    Wake(QueueId),
 }
 
 impl DiscardedAtSend {
@@ -346,13 +376,12 @@ impl DiscardedAtSend {
             }
         }
         if let Some(producer) = producer {
-            self.parked.insert(
-                (producer.process, producer.timer),
-                ParkedExpiry {
-                    queue,
-                    signal,
-                    arm_gen: producer.arm_gen,
-                },
+            self.park(
+                producer.process,
+                producer.timer,
+                queue,
+                signal,
+                producer.arm_gen,
             );
         }
     }
@@ -584,6 +613,113 @@ impl DiscardedAtSend {
         resend
     }
 
+    /// Park `process`'s timer `timer`, whose expiry went to `queue` as
+    /// `signal`, with generation `arm_gen`; a timer already parked keeps its
+    /// place in the ignored list and takes the new generation.
+    fn park(&mut self, process: DetPid, timer: i32, queue: QueueId, signal: i32, arm_gen: u64) {
+        let seq = match self.parked.get(&(process, timer)) {
+            Some(parked) => parked.seq,
+            None => {
+                self.park_seq += 1;
+                self.park_seq
+            }
+        };
+        self.parked.insert(
+            (process, timer),
+            ParkedExpiry {
+                queue,
+                signal,
+                arm_gen,
+                seq,
+            },
+        );
+    }
+
+    /// Linux flushed `signal` from each of `queues` of a listed pair (4262
+    /// design §4.8): every timer entry sent periodic whose timer is `live`,
+    /// stale or not, is parked (`posixtimer_sig_ignore` tests the
+    /// `it_sig_periodic` latched at the send), walking each list from its
+    /// front; every other entry is freed. Then 4351's flush.
+    pub(crate) fn flush_lists(
+        &mut self,
+        queues: &[QueueId],
+        signal: i32,
+        live: impl Fn(DetPid, i32) -> bool,
+    ) {
+        for &queue in queues {
+            for entry in self.lists.take_all(queue, signal) {
+                if let super::signal_lists::Entry::Timer(timer) = entry
+                    && timer.periodic_at_send
+                    && live(timer.process, timer.timer)
+                {
+                    self.park(timer.process, timer.timer, queue, signal, timer.gen_at_send);
+                }
+            }
+        }
+        self.flush(queues.iter().copied(), signal);
+    }
+
+    /// `signal` stopped being ignored in `process`, a listed pair (4262
+    /// design §4.7): every parked timer of it that is `live`, current or not,
+    /// is re-queued, the most recently parked first (`posixtimer_sig_unignore`
+    /// walks the ignored list from its head). Its entry joins its queue's
+    /// list; a discarded copy still pending there stands for the first one,
+    /// as a `Proxy`, and its bit clears. Returns what must be sent or woken.
+    pub(crate) fn unignore_lists(
+        &mut self,
+        process: DetPid,
+        signal: i32,
+        live: impl Fn(DetPid, i32) -> bool,
+    ) -> Vec<UnignoreAction> {
+        use super::signal_lists::TimerAppend;
+        let mut parks: Vec<(i32, ParkedExpiry)> = self
+            .parked
+            .iter()
+            .filter(|((owner, _), parked)| *owner == process && parked.signal == signal)
+            .map(|(&(_, timer), parked)| (timer, *parked))
+            .collect();
+        for (timer, _) in &parks {
+            self.parked.remove(&(process, *timer));
+        }
+        parks.retain(|(timer, _)| live(process, *timer));
+        parks.sort_by_key(|(_, parked)| std::cmp::Reverse(parked.seq));
+        let mut actions = Vec::new();
+        for (timer, parked) in parks {
+            let entry = super::signal_lists::TimerEntry {
+                process,
+                timer,
+                gen_at_send: parked.arm_gen,
+                periodic_at_send: true,
+            };
+            let standing = self
+                .is_discarded(parked.queue, signal)
+                .then(|| self.discarded_si_timer.contains(&(parked.queue, signal)));
+            match self
+                .lists
+                .append_timer(parked.queue, signal, entry, standing)
+            {
+                TimerAppend::SendFront => actions.push(UnignoreAction::Send(parked.queue, entry)),
+                TimerAppend::ProxyFront => {
+                    self.clear_bit(parked.queue, signal);
+                    *self.kept.entry(parked.queue).or_default() |= kernel_signal_bit(signal);
+                    actions.push(UnignoreAction::Wake(parked.queue));
+                }
+                TimerAppend::Behind | TimerAppend::AlreadyPending => {}
+            }
+        }
+        actions
+    }
+
+    /// `timer_delete` of `process`'s timer `timer` removes its park.
+    pub(crate) fn forget_park(&mut self, process: DetPid, timer: i32) {
+        self.parked.remove(&(process, timer));
+    }
+
+    /// Exec deleted every timer of `process`, and their parks.
+    pub(crate) fn forget_parks_of(&mut self, process: DetPid) {
+        self.parked.retain(|&(owner, _), _| owner != process);
+    }
+
     /// The periodic timers of `process` parked for `signal`, with the arming
     /// generation of their parked expiry.
     pub(crate) fn parked_timers(&self, process: DetPid, signal: i32) -> Vec<TimerProducer> {
@@ -643,9 +779,9 @@ impl DiscardedAtSend {
     }
 
     /// Forget `queue`: its thread or process is gone. A process takes its
-    /// timer history with it.
-    pub(crate) fn retire(&mut self, queue: QueueId) {
-        self.lists.retire(queue);
+    /// timer history with it. Returns the entries its lists held.
+    pub(crate) fn retire(&mut self, queue: QueueId) -> Vec<super::signal_lists::Entry> {
+        let entries = self.lists.retire(queue);
         self.discarded_si_timer.retain(|&(owner, _)| owner != queue);
         if let QueueId::Process(process) = queue {
             self.timer_history.retain(|&(owner, _)| owner != process);
@@ -659,6 +795,7 @@ impl DiscardedAtSend {
         self.parked.retain(|&(owner, _), parked| {
             parked.queue != queue && QueueId::Process(owner) != queue
         });
+        entries
     }
 
     fn generation(&self, queue: QueueId, signal: i32) -> u64 {
@@ -708,8 +845,10 @@ pub enum DiscardedSignalControl {
         queue: QueueId,
         signal: i32,
     },
-    /// That send succeeded: record it.
-    Sent(DiscardToken),
+    /// That send succeeded: record it, with the siginfo the receiver sees
+    /// (`None`: one Detcore does not know, recorded as `SI_USER` from the
+    /// caller).
+    Sent(DiscardToken, Option<KernelSiginfo>),
     /// A stop of the calling thread consumed, or kept, a copy of `signal`,
     /// after which its private queue (`thread_holds`) and its process's shared
     /// queue (`process_holds`) were read.
@@ -749,6 +888,25 @@ pub enum DiscardedSignalControl {
     /// This process used an unreported SIGALRM resume, whose later private
     /// requeue is outside the pending-origin observation contract.
     UnreportedAlarm,
+    /// A reported delivery stop of the calling thread dequeued `signal` at
+    /// the thread's logical time `at`: identify the timer entry it took, if
+    /// any, and answer what to deliver (`Scheduler::timer_signal_dequeue`,
+    /// <https://github.com/rrnewton/hermit/issues/4262>).
+    Dequeue {
+        signal: i32,
+        at: crate::types::LogicalTime,
+    },
+    /// The backend passes `signal`, which the calling thread dequeued, on
+    /// unreported (`Tool::filter_unreported_signal`): as `Dequeue`, for a hook
+    /// that cannot replace the siginfo.
+    Unreported { signal: i32 },
+    /// `timer_gettime` or `timer_getoverrun` of the calling thread's
+    /// process's timer `timer` at the caller's time `now`
+    /// (`Scheduler::posix_timer_remaining`, `Scheduler::posix_timer_overrun`).
+    TimerReadout {
+        timer: i32,
+        now: crate::types::LogicalTime,
+    },
 }
 
 /// The answer to a [`DiscardedSignalControl`].
@@ -757,8 +915,18 @@ pub enum DiscardedSignalAnswer {
     Recorded,
     Token(DiscardToken),
     Discarded(bool),
-    Bits { thread: u64, process: u64 },
+    Bits {
+        thread: u64,
+        process: u64,
+    },
     ItimerReal(bool),
+    Delivery(super::posix_timer_coalesce::DeliveryAnswer),
+    /// The remaining time (`None`: the caller's own answer stands) and the
+    /// overrun of a POSIX timer.
+    TimerReadout {
+        remaining: Option<crate::types::LogicalTime>,
+        overrun: i32,
+    },
 }
 
 /// A sender's classification of one send, with what it read before the
@@ -928,18 +1096,63 @@ impl Scheduler {
         }
     }
 
-    /// Record a send `token` classified, now that the physical send succeeded.
+    /// The token of a send into `queue` that Linux keeps whatever the target's
+    /// state (`SendFate::Kept`): no classification, and the queue read as
+    /// for any send.
+    pub(crate) fn discard_kept_token(&self, queue: QueueId, signal: i32) -> DiscardToken {
+        let pre = self
+            .discarded_at_send
+            .pre_send(queue, signal, self.queue_holds(queue, signal));
+        DiscardToken {
+            queue,
+            signal,
+            discarded: false,
+            present: pre.present,
+            generation: pre.generation,
+        }
+    }
+
+    /// Record a send `token` classified, now that the physical send
+    /// succeeded, with `record` the siginfo the receiver sees, if the send is
+    /// an ordinary one that can join a list (A1, 4262 design §4.2); `None`
+    /// for a timer entry's own record.
     pub(crate) fn discard_note_send(
         &mut self,
         token: DiscardToken,
         producer: Option<TimerProducer>,
+        record: Option<KernelSiginfo>,
     ) {
         let pre = PreSend {
             present: token.present,
             generation: token.generation,
         };
-        self.discarded_at_send
-            .note_send(token.queue, token.signal, token.discarded, pre, producer);
+        match record {
+            Some(siginfo) => {
+                let process = match token.queue {
+                    QueueId::Thread(thread) => {
+                        self.thread_tree.process_of(thread).unwrap_or(thread)
+                    }
+                    QueueId::Process(process) => process,
+                };
+                let listed = !token.discarded && self.signal_observable(process, token.signal);
+                self.discarded_at_send.note_send_listed(
+                    process,
+                    token.queue,
+                    token.signal,
+                    token.discarded,
+                    pre,
+                    producer,
+                    SendRecord { siginfo, listed },
+                );
+            }
+            None => self.discarded_at_send.note_send(
+                token.queue,
+                token.signal,
+                token.discarded,
+                pre,
+                producer,
+            ),
+        }
         // A send of a stop signal flushes SIGCONT, and a send of SIGCONT the
         // stop signals, from every queue of the process, before Linux decides
         // whether to discard the send itself (`prepare_signal`).
@@ -1057,8 +1270,11 @@ impl Scheduler {
                     Some(dtid),
                 ))
             }
-            DiscardedSignalControl::Sent(token) => {
-                self.discard_note_send(token, None);
+            DiscardedSignalControl::Sent(token, siginfo) => {
+                let siginfo = siginfo.unwrap_or_else(|| {
+                    super::signal_lists::ordinary_siginfo(token.signal, 0, process.as_raw(), 0)
+                });
+                self.discard_note_send(token, None, Some(siginfo));
                 DiscardedSignalAnswer::Recorded
             }
             DiscardedSignalControl::Consumed {
@@ -1067,6 +1283,15 @@ impl Scheduler {
                 thread_holds,
                 process_holds,
             } => {
+                // The read must agree with the timer entries before 4351's
+                // record retires anything; the pop's promotion comes after.
+                let pending = self.finish_timer_signal_dequeue(
+                    dtid,
+                    signal,
+                    how,
+                    thread_holds,
+                    process_holds,
+                );
                 self.discarded_at_send.consume(
                     dtid,
                     process,
@@ -1075,6 +1300,9 @@ impl Scheduler {
                     thread_holds,
                     process_holds,
                 );
+                if let Some(pending) = pending {
+                    self.pop_and_promote(pending, dtid);
+                }
                 DiscardedSignalAnswer::Recorded
             }
             DiscardedSignalControl::Take { signal } => DiscardedSignalAnswer::Discarded(
@@ -1093,7 +1321,57 @@ impl Scheduler {
             )),
             DiscardedSignalControl::Flushed { signal } => {
                 let queues = self.process_queues(process);
-                self.discarded_at_send.flush(queues, signal);
+                if self.signal_observable(process, signal) {
+                    let live: std::collections::BTreeSet<i32> = self
+                        .posix_timer_values
+                        .keys()
+                        .filter(|(owner, _)| *owner == process)
+                        .map(|(_, timer)| *timer)
+                        .collect();
+                    self.discarded_at_send
+                        .flush_lists(&queues, signal, |_, timer| live.contains(&timer));
+                } else {
+                    self.discarded_at_send.flush(queues, signal);
+                }
+                DiscardedSignalAnswer::Recorded
+            }
+            DiscardedSignalControl::Unignored { signal }
+                if self.signal_observable(process, signal) =>
+            {
+                let live: std::collections::BTreeSet<i32> = self
+                    .posix_timer_values
+                    .keys()
+                    .filter(|(owner, _)| *owner == process)
+                    .map(|(_, timer)| *timer)
+                    .collect();
+                let actions = self
+                    .discarded_at_send
+                    .unignore_lists(process, signal, |_, timer| live.contains(&timer));
+                for action in actions {
+                    match action {
+                        UnignoreAction::Send(queue, entry) => {
+                            let info = self.timer_signal_info(signal, &entry, 0);
+                            let producer = TimerProducer {
+                                process,
+                                timer: entry.timer,
+                                arm_gen: entry.gen_at_send,
+                            };
+                            self.send_unignored_expiry(
+                                dtid,
+                                process,
+                                queue,
+                                signal,
+                                producer,
+                                Some(info),
+                            );
+                        }
+                        UnignoreAction::Wake(queue) => {
+                            if let Ok(sig) = nix::sys::signal::Signal::try_from(signal) {
+                                self.wake_for_entry(queue, sig, dtid);
+                            }
+                        }
+                    }
+                }
                 DiscardedSignalAnswer::Recorded
             }
             DiscardedSignalControl::Unignored { signal } => {
@@ -1107,13 +1385,25 @@ impl Scheduler {
                     .discarded_at_send
                     .unignore(process, signal, |producer| current.contains(producer));
                 for (queue, producer) in resend {
-                    self.send_unignored_expiry(dtid, process, queue, signal, producer);
+                    self.send_unignored_expiry(dtid, process, queue, signal, producer, None);
                 }
                 DiscardedSignalAnswer::Recorded
             }
             DiscardedSignalControl::Bits => {
                 let (thread, process) = self.discarded_bits(dtid);
                 DiscardedSignalAnswer::Bits { thread, process }
+            }
+            DiscardedSignalControl::Dequeue { signal, at } => {
+                DiscardedSignalAnswer::Delivery(self.timer_signal_dequeue(dtid, signal, Some(at)))
+            }
+            DiscardedSignalControl::Unreported { signal } => {
+                DiscardedSignalAnswer::Delivery(self.timer_signal_dequeue(dtid, signal, None))
+            }
+            DiscardedSignalControl::TimerReadout { timer, now } => {
+                DiscardedSignalAnswer::TimerReadout {
+                    remaining: self.posix_timer_remaining(process, timer, now),
+                    overrun: self.posix_timer_overrun(process, timer),
+                }
             }
         }
     }
@@ -1131,6 +1421,8 @@ impl Scheduler {
     /// as `fire_alarm_with` records a process timer's
     /// (https://github.com/rrnewton/hermit/issues/4234). A thread other than
     /// the caller is woken for it; the caller, running, needs no wake.
+    /// `info`, a timer entry's `SI_TIMER` record, is sent with it where given
+    /// (`rt_sigqueueinfo`, `rt_tgsigqueueinfo`).
     fn send_unignored_expiry(
         &mut self,
         caller: DetTid,
@@ -1138,6 +1430,7 @@ impl Scheduler {
         queue: QueueId,
         signal: i32,
         producer: TimerProducer,
+        info: Option<[u8; 128]>,
     ) {
         let Ok(sig) = nix::sys::signal::Signal::try_from(signal) else {
             return;
@@ -1151,26 +1444,37 @@ impl Scheduler {
         let Some(target) = target else {
             return;
         };
-        let pre = self
-            .discarded_at_send
-            .pre_send(queue, signal, self.queue_holds(queue, signal));
-        let token = DiscardToken {
-            queue,
-            signal,
-            discarded: false,
-            present: pre.present,
-            generation: pre.generation,
-        };
+        let token = self.discard_kept_token(queue, signal);
         // Decided before the send, as `fire_alarm_with` decides it.
         let every_thread_blocks = matches!(queue, QueueId::Process(_))
             && self.models_signal_targets
             && self.kernel_signal_target(process, target, signal).is_none();
-        // SAFETY: tgkill and kill take only integers.
-        let rc = match queue {
-            QueueId::Thread(thread) => unsafe {
+        // SAFETY: tgkill and kill take only integers; the siginfo forms take
+        // a pointer to `info`, which outlives the call.
+        let rc = match (queue, info.as_ref()) {
+            (QueueId::Thread(thread), None) => unsafe {
                 libc::syscall(libc::SYS_tgkill, process.as_raw(), thread.as_raw(), signal)
             },
-            QueueId::Process(_) => unsafe { libc::kill(target.as_raw(), signal) as libc::c_long },
+            (QueueId::Thread(thread), Some(info)) => unsafe {
+                libc::syscall(
+                    libc::SYS_rt_tgsigqueueinfo,
+                    process.as_raw(),
+                    thread.as_raw(),
+                    signal,
+                    info.as_ptr(),
+                )
+            },
+            (QueueId::Process(_), None) => unsafe {
+                libc::kill(target.as_raw(), signal) as libc::c_long
+            },
+            (QueueId::Process(_), Some(info)) => unsafe {
+                libc::syscall(
+                    libc::SYS_rt_sigqueueinfo,
+                    target.as_raw(),
+                    signal,
+                    info.as_ptr(),
+                )
+            },
         };
         if rc < 0 {
             tracing::info!(
@@ -1185,7 +1489,7 @@ impl Scheduler {
             target,
             sig
         );
-        self.discard_note_send(token, None);
+        self.discard_note_send(token, None, None);
         let bit = kernel_signal_bit(signal);
         match queue {
             QueueId::Thread(thread) => {
@@ -1196,16 +1500,9 @@ impl Scheduler {
                     self.thread_timer_copies.insert((thread, signal), id);
                 } else {
                     self.thread_timer_copies.remove(&(thread, signal));
-                    self.unproven_thread_timer_copies.insert((thread, signal));
                 }
             }
             QueueId::Process(_) => {
-                if !token.present {
-                    let observed = !super::is_job_control_signal(signal)
-                        && self.process_signal_consumption_is_observed(process, bit);
-                    self.process_timer_copies
-                        .insert((process, signal), observed);
-                }
                 if every_thread_blocks {
                     self.note_signal_left_in_shared_queue(process, signal);
                 }
@@ -1246,13 +1543,25 @@ impl Scheduler {
             && self.posix_timer_arm_generation(producer.process, producer.timer) == producer.arm_gen
     }
 
-    /// The discarded bits of `thread`'s private queue and of its process's
-    /// shared queue (`DiscardedAtSend::discarded`).
+    /// The bits of `thread`'s private queue and of its process's shared
+    /// queue whose pending copy no dequeue would deliver: one Linux discarded
+    /// (`DiscardedAtSend::discarded`), or one standing only for POSIX timer
+    /// entries that are all stale, which Linux skips in a single dequeue
+    /// (`SignalLists::deliverable`, <https://github.com/rrnewton/hermit/issues/4262>).
     pub(crate) fn discarded_bits(&self, thread: DetTid) -> (u64, u64) {
         let process = self.thread_tree.process_of(thread).unwrap_or(thread);
+        let undeliverable = |queue: QueueId| {
+            (1..32)
+                .filter(|&signal| {
+                    self.discarded_at_send.lists.is_listed(queue, signal)
+                        && !self.list_deliverable(queue, signal)
+                })
+                .fold(0, |bits, signal| bits | kernel_signal_bit(signal))
+        };
+        let (private, shared) = (QueueId::Thread(thread), QueueId::Process(process));
         (
-            self.discarded_at_send.discarded(QueueId::Thread(thread)),
-            self.discarded_at_send.discarded(QueueId::Process(process)),
+            self.discarded_at_send.discarded(private) | undeliverable(private),
+            self.discarded_at_send.discarded(shared) | undeliverable(shared),
         )
     }
 }

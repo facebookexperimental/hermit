@@ -40,6 +40,7 @@ use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
 use crate::scheduler::discarded_at_send::DiscardedSignalControl;
 use crate::scheduler::discarded_at_send::QueueId;
 use crate::scheduler::pid_namespaces::GuestPidAnswer;
+use crate::scheduler::signal_lists::KernelSiginfo;
 use crate::syscalls::helpers::REAL_TIME_SIGNALS;
 use crate::syscalls::helpers::act_on_pending_real_time;
 use crate::syscalls::helpers::observe_under_mask;
@@ -539,6 +540,45 @@ pub(crate) const NO_SUCH_PID: libc::pid_t = libc::pid_t::MAX;
 /// can lack read permission (`PROT_WRITE` alone), which `process_vm_readv`
 /// refuses; the tracer then reads it through `/proc/<tid>/mem`, as ptrace
 /// access does, which needs no read permission on the mapping.
+/// The siginfo a guest's send `call` of `signal` queues, as the receiver
+/// sees it (4262 design N8-5): the first 48 bytes of the caller's
+/// `siginfo_t` for `rt_sigqueueinfo` and `rt_tgsigqueueinfo`, or Linux's
+/// `SI_USER` (`kill`) or `SI_TKILL` (`tgkill`, `tkill`) record with the
+/// caller's process id and real uid. `None` when it cannot be read, or for a
+/// call Detcore does not decode, which the scheduler records as `SI_USER`.
+/// The process id is the container's, which is the receiver's unless either
+/// is in a nested PID namespace.
+fn sent_siginfo<T, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    call: &syscalls::Syscall,
+    signal: i32,
+) -> Option<KernelSiginfo>
+where
+    T: RecordOrReplay,
+{
+    if !crate::scheduler::discarded_at_send::records(guest.config()) {
+        return None;
+    }
+    let code = match call {
+        syscalls::Syscall::RtSigqueueinfo(call) => {
+            return read_siginfo(guest, call.siginfo()?)
+                .map(|bytes| KernelSiginfo::from_user(&bytes));
+        }
+        syscalls::Syscall::RtTgsigqueueinfo(call) => {
+            return read_siginfo(guest, call.siginfo()?)
+                .map(|bytes| KernelSiginfo::from_user(&bytes));
+        }
+        syscalls::Syscall::Kill(_) => libc::SI_USER,
+        syscalls::Syscall::Tgkill(_) | syscalls::Syscall::Tkill(_) => libc::SI_TKILL,
+        _ => return None,
+    };
+    let pid = guest.thread_state().detpid?.as_raw();
+    let uid = crate::syscalls::real_uid(guest.tid().as_raw())?;
+    Some(crate::scheduler::signal_lists::ordinary_siginfo(
+        signal, code, pid, uid,
+    ))
+}
+
 fn read_siginfo<T, G: Guest<Detcore<T>>>(
     guest: &mut G,
     info: AddrMut<libc::siginfo_t>,
@@ -2193,12 +2233,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         let token = self
             .discard_pre_send(guest, named, QueueId::Process(self.detpid), sig)
             .await;
+        let call: syscalls::Syscall = call.into();
+        let siginfo = sent_siginfo(guest, &call, sig);
         guest.thread_state_mut().own_signal_turn_hold = Some(sig);
         let result = self.record_or_replay(guest, call).await;
         if result.is_err() {
             guest.thread_state_mut().own_signal_turn_hold = None;
         } else {
-            self.discard_sent(guest, token).await;
+            self.discard_sent(guest, token, siginfo).await;
         }
         Ok(result?)
     }
@@ -2219,9 +2261,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         syscalls::Syscall: From<C>,
     {
         let token = self.discard_pre_send(guest, named, queue, sig).await;
+        let call: syscalls::Syscall = call.into();
+        let siginfo = sent_siginfo(guest, &call, sig);
         let result = self.record_or_replay(guest, call).await;
         if result.is_ok() {
-            self.discard_sent(guest, token).await;
+            self.discard_sent(guest, token, siginfo).await;
         }
         Ok(result?)
     }
@@ -2259,14 +2303,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Record a send `token` classified (`discard_pre_send`) once the send
-    /// succeeded.
+    /// succeeded, with the siginfo the receiver sees (`sent_siginfo`).
     pub(crate) async fn discard_sent<G: Guest<Self>>(
         &self,
         guest: &mut G,
         token: Option<DiscardToken>,
+        siginfo: Option<KernelSiginfo>,
     ) {
         if let Some(token) = token {
-            crate::tool_global::discarded_signal(guest, DiscardedSignalControl::Sent(token)).await;
+            crate::tool_global::discarded_signal(
+                guest,
+                DiscardedSignalControl::Sent(token, siginfo),
+            )
+            .await;
         }
     }
 
@@ -2884,6 +2933,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             _ => QueueId::Thread(target),
         };
         let token = self.discard_pre_send(guest, named, queue, raw_signal).await;
+        let syscall: syscalls::Syscall = syscall.into();
+        let siginfo = sent_siginfo(guest, &syscall, raw_signal);
         let result = self.record_or_replay(guest, syscall).await;
         if result.is_err()
             && let Some(undo) = undo
@@ -2891,7 +2942,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             crate::tool_global::child_exit_sigchld(guest, undo).await;
         }
         if result.is_ok() {
-            self.discard_sent(guest, token).await;
+            self.discard_sent(guest, token, siginfo).await;
         }
         Ok(result?)
     }

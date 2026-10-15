@@ -437,7 +437,19 @@ impl TimedEvents {
         inactive_with_copy: Option<bool>,
         now: LogicalTime,
     ) {
-        let id = SignalTimerId::Alarm(dp);
+        self.signal_timer_after_fire(SignalTimerId::Alarm(dp), fired_at, inactive_with_copy, now);
+    }
+
+    /// [`Self::alarm_after_fire`] for any periodic signal timer `id`: a POSIX
+    /// timer waits for the dequeue of its signal too
+    /// (<https://github.com/rrnewton/hermit/issues/4262>).
+    pub(crate) fn signal_timer_after_fire(
+        &mut self,
+        id: SignalTimerId,
+        fired_at: LogicalTime,
+        inactive_with_copy: Option<bool>,
+        now: LogicalTime,
+    ) {
         let Some(state) = self.signal_timers.get(&id).copied() else {
             return;
         };
@@ -469,7 +481,15 @@ impl TimedEvents {
     /// after `t`. Returns the new deadline, or `None` if the timer is not
     /// `Inactive`.
     pub(crate) fn alarm_rearm_after(&mut self, dp: DetPid, t: LogicalTime) -> Option<LogicalTime> {
-        let id = SignalTimerId::Alarm(dp);
+        self.signal_timer_rearm_after(SignalTimerId::Alarm(dp), t)
+    }
+
+    /// [`Self::alarm_rearm_after`] for any signal timer `id`.
+    pub(crate) fn signal_timer_rearm_after(
+        &mut self,
+        id: SignalTimerId,
+        t: LogicalTime,
+    ) -> Option<LogicalTime> {
         let state = self.signal_timers.get_mut(&id)?;
         let AlarmPhase::Inactive { .. } = state.phase else {
             return None;
@@ -480,6 +500,17 @@ impl TimedEvents {
         let evt = TimedEvent::SignalEvt(id, state.target, state.sig);
         self.map.entry(next).or_default().insert(evt);
         Some(next)
+    }
+
+    /// Signal timer `id`'s deadline (the last expiry while `Inactive`), its
+    /// interval and its phase, if it is armed.
+    pub(crate) fn signal_timer_state(
+        &self,
+        id: SignalTimerId,
+    ) -> Option<(LogicalTime, LogicalTime, AlarmPhase)> {
+        self.signal_timers
+            .get(&id)
+            .map(|state| (state.deadline, state.interval, state.phase))
     }
 
     /// The processes whose `ITIMER_REAL` is `Inactive`, in process order.

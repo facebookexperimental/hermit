@@ -219,7 +219,11 @@ impl SignalLists {
             return TimerAppend::Behind;
         }
         let (front_class, physical_si_timer, append) = match discarded_pending {
-            Some(physical_si_timer) => (FrontClass::Proxy, physical_si_timer, TimerAppend::ProxyFront),
+            Some(physical_si_timer) => (
+                FrontClass::Proxy,
+                physical_si_timer,
+                TimerAppend::ProxyFront,
+            ),
             None => (FrontClass::Own, true, TimerAppend::SendFront),
         };
         self.lists.insert(
@@ -253,7 +257,11 @@ impl SignalLists {
     }
 
     /// Whether the timer has an entry in any list.
-    pub(crate) fn timer_entry(&self, process: DetPid, timer: i32) -> Option<(QueueId, i32, TimerEntry)> {
+    pub(crate) fn timer_entry(
+        &self,
+        process: DetPid,
+        timer: i32,
+    ) -> Option<(QueueId, i32, TimerEntry)> {
         self.lists.iter().find_map(|(&(queue, signal), list)| {
             list.entries.iter().find_map(|entry| match entry {
                 Entry::Timer(t) if t.process == process && t.timer == timer => {
@@ -306,10 +314,13 @@ impl SignalLists {
         current_gen: impl Fn(DetPid, i32) -> u64,
     ) -> bool {
         self.lists.get(&(queue, signal)).is_some_and(|list| {
-            list.entries.iter().enumerate().any(|(index, entry)| match entry {
-                Entry::Plain { .. } => index == 0,
-                Entry::Timer(t) => t.gen_at_send == current_gen(t.process, t.timer),
-            })
+            list.entries
+                .iter()
+                .enumerate()
+                .any(|(index, entry)| match entry {
+                    Entry::Plain { .. } => index == 0,
+                    Entry::Timer(t) => t.gen_at_send == current_gen(t.process, t.timer),
+                })
         })
     }
 
@@ -428,16 +439,23 @@ pub(crate) fn siginfo_code(siginfo: &KernelSiginfo) -> i32 {
     i32::from_ne_bytes(siginfo.0[8..12].try_into().unwrap())
 }
 
+/// The siginfo of an ordinary send of `signal` with `code` (`SI_USER` 0,
+/// `SI_TKILL` -6, `SI_KERNEL` 0x80) from `pid` and `uid` (the `_kill`
+/// member), every other byte zero.
+pub(crate) fn ordinary_siginfo(signal: i32, code: i32, pid: i32, uid: u32) -> KernelSiginfo {
+    let mut info = [0u8; KERNEL_SIGINFO_SIZE];
+    info[0..4].copy_from_slice(&signal.to_ne_bytes());
+    info[8..12].copy_from_slice(&code.to_ne_bytes());
+    info[16..20].copy_from_slice(&pid.to_ne_bytes());
+    info[20..24].copy_from_slice(&uid.to_ne_bytes());
+    KernelSiginfo(info)
+}
+
 /// The `SI_TIMER` siginfo of a timer's entry, as Linux builds it at dequeue:
 /// `si_signo`, `si_code = SI_TIMER`, `si_tid` (the timer id), `si_overrun`
 /// and the 64-bit `si_value`, every other byte zero (`kernel_siginfo_t`; the
 /// `_timer` member's `si_sys_private` stays 0).
-pub(crate) fn timer_siginfo(
-    signal: i32,
-    timer: i32,
-    overrun: i32,
-    value: u64,
-) -> KernelSiginfo {
+pub(crate) fn timer_siginfo(signal: i32, timer: i32, overrun: i32, value: u64) -> KernelSiginfo {
     let mut info = [0u8; KERNEL_SIGINFO_SIZE];
     info[0..4].copy_from_slice(&signal.to_ne_bytes());
     info[8..12].copy_from_slice(&SI_TIMER.to_ne_bytes());
@@ -536,7 +554,10 @@ mod tests {
             TimerAppend::SendFront
         );
         assert!(!lists.append_plain(shared(), USR1, kill_info(), None, true));
-        assert_eq!(lists.entries(shared(), USR1), vec![Entry::Timer(timer(1, 1))]);
+        assert_eq!(
+            lists.entries(shared(), USR1),
+            vec![Entry::Timer(timer(1, 1))]
+        );
         assert!(lists.invariants_hold());
     }
 
@@ -596,7 +617,10 @@ mod tests {
         assert!(lists.append_plain(shared(), USR1, info, None, true));
         assert!(matches!(
             lists.entries(shared(), USR1)[0],
-            Entry::Plain { forged_si_timer: true, .. }
+            Entry::Plain {
+                forged_si_timer: true,
+                ..
+            }
         ));
         assert!(lists.front(shared(), USR1).unwrap().2);
     }
@@ -650,8 +674,15 @@ mod tests {
         let (front, class, physical_si_timer) = lists.front(private(), USR1).unwrap();
         // The stored 48 bytes, SI_QUEUE and the high half of sival_ptr.
         assert!(matches!(front, Entry::Plain { siginfo, .. } if siginfo == queue_info()));
-        assert_eq!(class, FrontClass::Proxy, "the stop and take rewrite still apply");
-        assert!(!physical_si_timer, "the physical record is now Hermit's re-send");
+        assert_eq!(
+            class,
+            FrontClass::Proxy,
+            "the stop and take rewrite still apply"
+        );
+        assert!(
+            !physical_si_timer,
+            "the physical record is now Hermit's re-send"
+        );
         assert!(lists.invariants_hold());
     }
 

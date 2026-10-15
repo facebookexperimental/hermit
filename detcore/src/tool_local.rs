@@ -364,6 +364,10 @@ struct PosixTimer {
     /// process-directed one.
     #[serde(default)]
     thread: Option<DetTid>,
+    /// The `si_value` of its signal: `sigev_value`, or `sival_int = id`
+    /// for a timer created with no `sigevent` (`do_timer_create`).
+    #[serde(default)]
+    value: u64,
 }
 
 /// The set of POSIX timers owned by a *process*.
@@ -384,8 +388,15 @@ impl PosixTimers {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
     /// Allocate a new (disarmed) timer, returning its deterministic id.
-    /// `thread` is the thread a `SIGEV_THREAD_ID` timer notifies.
-    pub(crate) fn create(&mut self, signal: Option<i32>, thread: Option<DetTid>) -> i32 {
+    /// `thread` is the thread a `SIGEV_THREAD_ID` timer notifies, and
+    /// `value` its `sigev_value`, or `None` for a timer created with no
+    /// `sigevent`, whose `si_value` is its id.
+    pub(crate) fn create(
+        &mut self,
+        signal: Option<i32>,
+        thread: Option<DetTid>,
+        value: Option<u64>,
+    ) -> i32 {
         let id = self.next_id;
         self.next_id += 1;
         self.timers.insert(
@@ -395,9 +406,15 @@ impl PosixTimers {
                 deadline: None,
                 signal,
                 thread,
+                value: value.unwrap_or(id as u32 as u64),
             },
         );
         id
+    }
+
+    /// The `si_value` of timer `id`'s signal.
+    pub(crate) fn value(&self, id: i32) -> Option<u64> {
+        self.timers.get(&id).map(|timer| timer.value)
     }
 
     /// Arm or disarm timer `id`. `interval_ns` is the periodic reload and
@@ -1440,15 +1457,15 @@ mod posix_timers_tests {
     #[test]
     fn ids_are_deterministic_and_sequential() {
         let mut timers = PosixTimers::default();
-        assert_eq!(timers.create(None, None), 0);
-        assert_eq!(timers.create(Some(libc::SIGALRM), None), 1);
-        assert_eq!(timers.create(None, None), 2);
+        assert_eq!(timers.create(None, None, None), 0);
+        assert_eq!(timers.create(Some(libc::SIGALRM), None, None), 1);
+        assert_eq!(timers.create(None, None, None), 2);
     }
 
     #[test]
     fn settime_reports_previous_arming_and_remaining_uses_virtual_clock() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None);
+        let id = timers.create(None, None, None);
 
         // Arm a one-shot timer for 100ns at t=0. A freshly created timer was
         // disarmed, so the reported old value is zero.
@@ -1464,7 +1481,7 @@ mod posix_timers_tests {
     #[test]
     fn resetting_reports_old_remaining() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None);
+        let id = timers.create(None, None, None);
         timers.settime(id, 0, Some(t(100)), t(0));
         // Re-arm at t=30 (70ns remained) with a periodic 50ns timer.
         let old = timers
@@ -1479,7 +1496,7 @@ mod posix_timers_tests {
     #[test]
     fn periodic_remaining_advances_past_each_deadline() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(Some(libc::SIGALRM), None);
+        let id = timers.create(Some(libc::SIGALRM), None, None);
         timers.settime(id, 50, Some(t(100)), t(0));
 
         assert_eq!(timers.gettime(id, t(100)), Some((50, 50)));
@@ -1491,7 +1508,7 @@ mod posix_timers_tests {
     #[test]
     fn disarm_and_unknown_ids() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None);
+        let id = timers.create(None, None, None);
         timers.settime(id, 0, Some(t(100)), t(0));
         // Disarm: value of 0 -> deadline None -> remaining 0.
         timers.settime(id, 0, None, t(10));
@@ -1506,7 +1523,7 @@ mod posix_timers_tests {
     #[test]
     fn delete_removes_timer() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None);
+        let id = timers.create(None, None, None);
         assert!(timers.contains(id));
         assert!(timers.remove(id));
         assert!(!timers.contains(id));
