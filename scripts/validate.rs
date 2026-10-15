@@ -17393,7 +17393,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "82");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "84");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -17432,10 +17432,13 @@ mod nextest_timeout_tests {
         // run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does
         // (https://github.com/rrnewton/hermit/issues/4293): 80. And
         // run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting
-        // (https://github.com/rrnewton/hermit/issues/4374): 81.
+        // (https://github.com/rrnewton/hermit/issues/4374): 81. And
+        // run_kvm_a_directory_descriptors_first_seeks and
+        // run_kvm_a_procfs_directory_keeps_its_size
+        // (https://github.com/rrnewton/hermit/pull/4369): 83.
         assert_eq!(
             names.len(),
-            81,
+            83,
             "update the exact CI inventory with new KVM tests"
         );
         let required_cases = [
@@ -18508,7 +18511,9 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // 81 selected.
         // run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting
         // (https://github.com/rrnewton/hermit/issues/4374): 81 declarations, 82 selected.
-        ("privileged-only-test.cli_kvm", 82usize),
+        // The two KVM directory/procfs-size tests of d8c4c7e3
+        // (https://github.com/rrnewton/hermit/pull/4369): 84 selected.
+        ("privileged-only-test.cli_kvm", 84usize),
     ] {
         let step = privileged
             .steps
