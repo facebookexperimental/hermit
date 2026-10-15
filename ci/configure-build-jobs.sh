@@ -1656,8 +1656,9 @@ fi
 # KVM HYPERCALL-ADDRESS-MEMO SDK-BUDGET CARRY (2026-10-15): advance from 1c514b58 to a4d18df6d14a81ee6553ed4459f4172a92c7733a (KVM memoizes the syscall trampoline's hypercall offset per thread; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # KVM LOADAVG-COPY-DELETION SDK-BUDGET CARRY (2026-10-15): advance from a4d18df6 to b5ff4dce018027502490fa4d8990bec3b143460c (deletes reverie-kvm's copy of /proc/loadavg, which Detcore renders; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # KVM LAZY-ZERO + DESCRIPTOR-FACTS SDK-BUDGET CARRY (2026-10-15): advance from b5ff4dce to da4679f359d2397442c59453497cb2bf49bedac2 (542d8457 zeroes large new and unmapped guest ranges lazily; da4679f3 records each descriptor's access mode, file type and read capability once per entry; both change only reverie-kvm, inventory unchanged), so the budgets above carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != da4679f359d2397442c59453497cb2bf49bedac2 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie da4679f359d2397442c59453497cb2bf49bedac2 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# KVM LAZY-DONTNEED + ZERO-LAZILY-REFUSAL SDK-BUDGET CARRY (2026-10-15): advance from da4679f3 to 8f6e9b816ee502cd5a91b540439bbb674f95644e (reverie-kvm drops MADV_DONTNEED runs of 2 MiB or more lazily, and zero_lazily refuses retained shared views in every build; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8f6e9b816ee502cd5a91b540439bbb674f95644e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 8f6e9b816ee502cd5a91b540439bbb674f95644e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
