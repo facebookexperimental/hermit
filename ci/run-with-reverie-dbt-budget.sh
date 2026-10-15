@@ -1565,7 +1565,15 @@ fi
 # KVM ENTRY-CHECK + SHARED-MOUNT SDK-BUDGET CARRY (2026-10-14): advance from dfb68913 to 9e0ce5768aae1e6c71697ef3dd7ce3d61a91a260 (4b633f7f: cheaper KVM per-syscall entry checks, adds one GlobalTool method skip_empty_signal_boundaries defaulting to false that Detcore does not opt into; 9e0ce576: LiteInst shared-mount setup fix for nested tmpfs targets and pinned bind restrictions in reverie-process; reverie-dbt sources and inventory unchanged), so the budgets above carry.
 # KVM READ-QUERY-DEDUP SDK-BUDGET CARRY (2026-10-14): advance from 9e0ce576 to a1fb30867b020e9a8da1fc18296d306e0dbe91a6 (KVM read queries each descriptor's access mode and type once; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # KVM PUBLISH-CHANGED-FILES SDK-BUDGET CARRY (2026-10-14): advance from a1fb3086 to 69228e48decbb554ddc832086d4fdf3b28bb4fde (KVM republishes only changed descriptors to its shared file table; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
-expected_pin=69228e48decbb554ddc832086d4fdf3b28bb4fde
+# SIGPIPE RECEIPT SDK OBSERVATION (2026-10-14): pin c18f07cb614ca404b34e131a8a912f4a7b62813c
+# changes the vendored returning-injection/signal path; source identity does not carry.
+# The maintained build script built the new Release SDK key
+# 7035b7a08e771618f7b2cf0692eb4584f10591c566577161548d23d4cda1f9f8
+# in 13.02s at 16 jobs (208.31 job-seconds; NUM_JOBS=40, available CPUs=40).
+# The rebase onto 69228e48 changes only KVM files, preserving these SDK inputs.
+# Keep the existing budgets and 16-job clamp. This single SDK observation
+# is not a full-profile calibration or whole-guest qualification.
+expected_pin=c18f07cb614ca404b34e131a8a912f4a7b62813c
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

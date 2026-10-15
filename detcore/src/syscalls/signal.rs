@@ -1742,6 +1742,44 @@ impl<T: RecordOrReplay> Detcore<T> {
                 false,
             )
             .await?
+        } else if process == self.detpid.as_raw()
+            && tid == guest.thread_state().dettid
+            && (1..=libc::SIGRTMAX()).contains(&call.sig())
+        {
+            // This backend must name the receiving thread, but an original
+            // process-directed kill still carries SI_USER, not tgkill's
+            // SI_TKILL. For the current task Linux accepts an explicit SI_USER
+            // payload. Keep the sender in the same deterministic PID namespace
+            // as getpid; obtain its real UID from this actual task, not a host
+            // lookup using the deterministic PID. Other tasks cannot accept
+            // caller-supplied SI_USER and retain the existing tgkill route.
+            let uid = guest.inject_with_retry(syscalls::Getuid::new()).await? as u32;
+            let mut info = [0_u8; 128];
+            info[0..4].copy_from_slice(&call.sig().to_ne_bytes());
+            info[8..12].copy_from_slice(&libc::SI_USER.to_ne_bytes());
+            // Linux x86-64 siginfo's sender union follows three ints and
+            // alignment padding: pid_t at 16, uid_t at 20.
+            info[16..20].copy_from_slice(&self.detpid.as_raw().to_ne_bytes());
+            info[20..24].copy_from_slice(&uid.to_ne_bytes());
+            let mut stack = guest.stack().await;
+            let info = stack.push(info);
+            let _stack_guard = stack.commit()?;
+            let targeted = syscalls::RtTgsigqueueinfo::new()
+                .with_tgid(process)
+                .with_tid(tid.as_raw())
+                .with_sig(call.sig())
+                // The syscall wrapper uses AddrMut, but Linux only reads this
+                // private siginfo. Its committed storage outlives the send.
+                .with_siginfo(Some(unsafe { info.cast().into_mut() }));
+            self.send_guest_signal(
+                guest,
+                targeted,
+                tid,
+                call.sig(),
+                Some(DetPid::from_raw(process)),
+                false,
+            )
+            .await?
         } else {
             let targeted = syscalls::Tgkill::new()
                 .with_tgid(process)
