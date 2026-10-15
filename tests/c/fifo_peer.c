@@ -79,6 +79,42 @@
  *                           which nothing opens, while the parent waits for it;
  *                           a host process kills the child (SIGKILL), and the
  *                           parent's /proc/self/maps is the same as before
+ *   fifo_peer wake-data|wake-space|wake-eof|wake-compute|wake-trickle|wake-fifo|wake-nobody|wake-zero|wake-other DIR
+ *                           the main thread counts WAKE_ITERATIONS getppid
+ *                           calls; at iteration WAKE_AT it readies a thread
+ *                           polling a pipe (writes a byte, reads one from a
+ *                           full pipe, closes the write end, writes and then
+ *                           computes without syscalls, or opens the write end
+ *                           of a FIFO in DIR another thread waits to open);
+ *                           it prints the iteration at which that thread ran
+ *                           (https://github.com/rrnewton/hermit/issues/4380).
+ *                           wake-nobody writes to a pipe no thread polls,
+ *                           wake-zero writes 0 bytes to the polled pipe and
+ *                           wake-other writes to another pipe: neither readies
+ *                           the poller. A poller that has not run when the
+ *                           loop ends is not released: the process exits. A
+ *                           third argument `clock` also prints the reader's
+ *                           CLOCK_MONOTONIC after its read
+ *   fifo_peer wake-partial|wake-partial-deep DIR
+ *                           one blocking write larger than the pipe, drained
+ *                           by a reader thread while a third thread yields
+ *                           each iteration; prints the yielding thread's
+ *                           iteration at the reader's first read;
+ *                           wake-partial-deep yields 200 times first, so the
+ *                           polling reader has backed off
+ *   fifo_peer wake-after-futex|wake-fresh-writer DIR
+ *                           a reader takes a first byte, futex-wakes the
+ *                           writer (or, in wake-fresh-writer, a second writer
+ *                           waiting on the futex), which writes a second byte
+ *                           and counts 1000 getppid calls; prints where the
+ *                           second read ran (the Codex review of
+ *                           https://github.com/rrnewton/hermit/pull/4424)
+ *   fifo_peer wake-exec|wake-exec-nonblock DIR
+ *                           wake-data across exec: two children share a pipe
+ *                           and each execs this program, the writer with the
+ *                           write end (left O_NONBLOCK by wake-exec-nonblock,
+ *                           as Node.js leaves stdout), the reader with the
+ *                           read end; they count in a file mapping in DIR
  *   fifo_peer open-killed-then-its-cleaner-killed DIR
  *                           two CLONE_VM children: "opener" waits to open a
  *                           FIFO made here for reading, "cleaner" opens it for
@@ -187,15 +223,19 @@
 #include <spawn.h>
 #include <sys/syscall.h>
 #include <linux/capability.h>
+#include <linux/futex.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <stdatomic.h>
+#include <time.h>
 #include <unistd.h>
 
 #define FILL_BYTES (3 * 65536 + 123)
@@ -455,6 +495,144 @@ static int open_in_a_sharer(void *arg) {
   return fd < 0 ? 1 : 0;
 }
 
+#define WAKE_ITERATIONS 5000
+#define WAKE_AT 100
+
+static atomic_int wake_iteration;
+static atomic_int wake_ran_at = -1;
+static atomic_int wake_spun;
+static int wake_spun_when_ran = -1;
+static int wake_pending_when_ran = -1;
+static struct timespec wake_clock;
+static int wake_fds[2];
+static char wake_fifo[4096];
+
+/* Poll the pipe: one blocking read, recording the iteration it returned at. */
+static void *wake_reader(void *arg) {
+  (void)arg;
+  char c;
+  (void)read(wake_fds[0], &c, 1);
+  clock_gettime(CLOCK_MONOTONIC, &wake_clock);
+  wake_spun_when_ran = atomic_load(&wake_spun);
+  (void)ioctl(wake_fds[0], FIONREAD, &wake_pending_when_ran);
+  atomic_store(&wake_ran_at, atomic_load(&wake_iteration));
+  return NULL;
+}
+
+/* Poll for room: one blocking write into the full pipe. */
+static void *wake_writer(void *arg) {
+  (void)arg;
+  (void)write(wake_fds[1], "w", 1);
+  atomic_store(&wake_ran_at, atomic_load(&wake_iteration));
+  return NULL;
+}
+
+/* wake-partial: a spinner that yields each iteration, and a reader that
+   drains one large write, recording the spinner's iteration at its first
+   read. */
+#define WAKE_PARTIAL_BYTES 100000
+static atomic_int wake_spinner_iteration;
+
+static void *wake_partial_reader(void *arg) {
+  (void)arg;
+  static char buffer[WAKE_PARTIAL_BYTES];
+  long total = 0;
+  while (total < WAKE_PARTIAL_BYTES) {
+    ssize_t got = read(wake_fds[0], buffer, sizeof buffer);
+    if (got <= 0) break;
+    if (total == 0) atomic_store(&wake_ran_at, atomic_load(&wake_spinner_iteration));
+    total += got;
+  }
+  return NULL;
+}
+
+static void *wake_partial_spinner(void *arg) {
+  (void)arg;
+  for (int i = 0; i < WAKE_ITERATIONS && atomic_load(&wake_ran_at) < 0; i++) {
+    atomic_store(&wake_spinner_iteration, i);
+    sched_yield();
+  }
+  return NULL;
+}
+
+/* wake-after-futex and wake-fresh-writer: a second byte written after a
+   futex wait, by the first writer or by a thread the reader woke. */
+static atomic_int wake_first_read, wake_second_at = -1;
+
+static void wake_futex_wait_for(atomic_int *word) {
+  while (!atomic_load(word))
+    if (syscall(SYS_futex, word, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0) < 0 && errno != EAGAIN &&
+        errno != EINTR)
+      die("futex wait");
+}
+
+static void *wake_two_byte_reader(void *arg) {
+  (void)arg;
+  char c;
+  if (read(wake_fds[0], &c, 1) != 1 || c != '1') die("first read");
+  atomic_store(&wake_first_read, 1);
+  if (syscall(SYS_futex, &wake_first_read, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0) < 0)
+    die("futex wake");
+  if (read(wake_fds[0], &c, 1) != 1 || c != '2') die("second read");
+  atomic_store(&wake_second_at, atomic_load(&wake_iteration));
+  return NULL;
+}
+
+/* Write the second byte, then count up to 1000 cheap syscalls, and say
+   where the second read ran. */
+static void wake_second_byte_and_count(void) {
+  if (write(wake_fds[1], "2", 1) != 1) die("second write");
+  int i;
+  for (i = 0; i < 1000 && atomic_load(&wake_second_at) < 0; i++) {
+    atomic_store(&wake_iteration, i);
+    getppid();
+  }
+  if (atomic_load(&wake_second_at) < 0)
+    printf("second read not run by 1000\n");
+  else
+    printf("second read ran at %d\n", atomic_load(&wake_second_at));
+  fflush(stdout);
+  _exit(0);
+}
+
+static void *wake_fresh_writer(void *arg) {
+  (void)arg;
+  wake_futex_wait_for(&wake_first_read);
+  wake_second_byte_and_count();
+  return NULL;
+}
+
+/* Wait to open the FIFO for reading. */
+static void *wake_opener(void *arg) {
+  (void)arg;
+  int fd = open(wake_fifo, O_RDONLY);
+  atomic_store(&wake_ran_at, atomic_load(&wake_iteration));
+  if (fd >= 0) close(fd);
+  return NULL;
+}
+
+/* wake-exec: the iteration counter the exec'd writer and reader share. */
+struct wake_shared {
+  atomic_int iteration;
+  atomic_int ran_at;
+};
+
+#define WAKE_EXEC_READ_FD 10
+#define WAKE_EXEC_WRITE_FD 11
+
+static struct wake_shared *wake_shared_map(const char *dir, int create) {
+  char path[4096];
+  snprintf(path, sizeof path, "%s/wake-shared", dir);
+  int fd = open(path, O_RDWR | (create ? O_CREAT | O_TRUNC : 0), 0600);
+  if (fd < 0) die("open wake-shared");
+  if (create && ftruncate(fd, sizeof(struct wake_shared)) != 0) die("ftruncate");
+  struct wake_shared *shared =
+      mmap(NULL, sizeof *shared, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (shared == MAP_FAILED) die("mmap wake-shared");
+  close(fd);
+  return shared;
+}
+
 /* Drop every capability, CAP_SYS_PTRACE among them. */
 static void drop_capabilities(void) {
   struct __user_cap_header_struct header = {_LINUX_CAPABILITY_VERSION_3, 0};
@@ -578,8 +756,25 @@ static void *write_fill(void *arg) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 3 && !(argc == 4 && strcmp(argv[1], "private-table") == 0)) {
-    fprintf(stderr, "usage: fifo_peer thread|signal|process|fill|shared|vector|open-writer-first|open-reader-first|open-beside-pipe|open-eintr|open-restart|open-ignored|open-two-signals|open-reader-closes|open-unpublished-reader|open-unpublished-writer|open-exclusive|open-after-sleep|exclusive-reader-beside-host|open-renamed|open-renamed-new|open-linked-unlinked|open-after-link-removed|open-after-name-removed|open-after-rename-between-links|open-after-self-rename|open-without-ptrace-capability|open-without-ptrace-capability-writer|open-chrooted|open-chrooted-writer|open-on-a-tight-stack|open-leaves-no-mapping|open-killed-beside-a-sharer|open-killed-in-a-spawned-child|open-killed-then-its-cleaner-killed|open-chrooted-beside-a-fake-proc|open-writer-chrooted-beside-a-fake-proc|open-renamed-without-ptrace-capability|guest-made-host-reader|guest-made-host-reader-renamed DIR | host|host-rdwr|host-readers|host-reader|host-reader-opath|open-host|open-host-writer|open-host-beside-poller|open-host-beside-sleeper|open-host-beside-yielder|open-host-beside-spinner|host-beside-yielder|host-beside-pause|open-host-order|open-host-eof|open-host-exclusive-reader PATH | private-table PATH DIR | private-table-guest DIR | private-writer DIR\n");
+  if (strcmp(argv[1], "wake-exec-writer") == 0 && argc == 3) {
+    struct wake_shared *shared = wake_shared_map(argv[2], 0);
+    for (int i = 0; i < WAKE_ITERATIONS && atomic_load(&shared->ran_at) < 0; i++) {
+      atomic_store(&shared->iteration, i);
+      if (i == WAKE_AT && write(WAKE_EXEC_WRITE_FD, "x", 1) != 1) die("exec'd write");
+      getppid();
+    }
+    return 0;
+  }
+  if (strcmp(argv[1], "wake-exec-reader") == 0 && argc == 3) {
+    struct wake_shared *shared = wake_shared_map(argv[2], 0);
+    char c;
+    if (read(WAKE_EXEC_READ_FD, &c, 1) == 1)
+      atomic_store(&shared->ran_at, atomic_load(&shared->iteration));
+    return 0;
+  }
+  if (argc != 3 && !(argc == 4 && strcmp(argv[1], "private-table") == 0) &&
+      !(argc == 4 && strncmp(argv[1], "wake-", 5) == 0 && strcmp(argv[3], "clock") == 0)) {
+    fprintf(stderr, "usage: fifo_peer thread|signal|process|fill|shared|vector|open-writer-first|open-reader-first|open-beside-pipe|open-eintr|open-restart|open-ignored|open-two-signals|open-reader-closes|open-unpublished-reader|open-unpublished-writer|open-exclusive|open-after-sleep|exclusive-reader-beside-host|open-renamed|open-renamed-new|open-linked-unlinked|open-after-link-removed|open-after-name-removed|open-after-rename-between-links|open-after-self-rename|open-without-ptrace-capability|open-without-ptrace-capability-writer|open-chrooted|open-chrooted-writer|open-on-a-tight-stack|open-leaves-no-mapping|open-killed-beside-a-sharer|open-killed-in-a-spawned-child|open-killed-then-its-cleaner-killed|wake-data|wake-space|wake-eof|wake-compute|wake-trickle|wake-fifo|wake-nobody|wake-zero|wake-other|wake-exec|wake-exec-nonblock|wake-partial|wake-partial-deep|wake-after-futex|wake-fresh-writer|open-chrooted-beside-a-fake-proc|open-writer-chrooted-beside-a-fake-proc|open-renamed-without-ptrace-capability|guest-made-host-reader|guest-made-host-reader-renamed DIR | host|host-rdwr|host-readers|host-reader|host-reader-opath|open-host|open-host-writer|open-host-beside-poller|open-host-beside-sleeper|open-host-beside-yielder|open-host-beside-spinner|host-beside-yielder|host-beside-pause|open-host-order|open-host-eof|open-host-exclusive-reader PATH | private-table PATH DIR | private-table-guest DIR | private-writer DIR\n");
     return 2;
   }
   const char *mode = argv[1];
@@ -988,6 +1183,162 @@ int main(int argc, char **argv) {
     read_maps(maps_after, sizeof maps_after);
     printf("child killed by signal %d; maps unchanged: %d\n",
            WIFSIGNALED(status) ? WTERMSIG(status) : 0, strcmp(maps_before, maps_after) == 0);
+  } else if (strcmp(mode, "wake-after-futex") == 0 || strcmp(mode, "wake-fresh-writer") == 0) {
+    if (pipe(wake_fds) != 0) die("pipe");
+    int fresh = strcmp(mode, "wake-fresh-writer") == 0;
+    pthread_t reader, writer;
+    if (pthread_create(&reader, NULL, wake_two_byte_reader, NULL) != 0) die("pthread_create");
+    if (fresh && pthread_create(&writer, NULL, wake_fresh_writer, NULL) != 0) die("pthread_create");
+    for (int i = 0; i < WAKE_AT; i++) getppid();
+    if (write(wake_fds[1], "1", 1) != 1) die("first write");
+    if (fresh) {
+      /* The fresh writer prints and ends the process. */
+      static atomic_int never;
+      wake_futex_wait_for(&never);
+    }
+    wake_futex_wait_for(&wake_first_read);
+    wake_second_byte_and_count();
+  } else if (strcmp(mode, "wake-partial") == 0 || strcmp(mode, "wake-partial-deep") == 0) {
+    if (pipe(wake_fds) != 0) die("pipe");
+    pthread_t reader, spinner;
+    if (pthread_create(&reader, NULL, wake_partial_reader, NULL) != 0) die("pthread_create");
+    /* wake-partial-deep: the reader polls through the writer's 200 yields
+       first, so it has backed off when the write comes. */
+    if (strcmp(mode, "wake-partial-deep") == 0)
+      for (int i = 0; i < 200; i++) sched_yield();
+    if (pthread_create(&spinner, NULL, wake_partial_spinner, NULL) != 0) die("pthread_create");
+    static char block[WAKE_PARTIAL_BYTES];
+    memset(block, 'p', sizeof block);
+    /* More than the pipe holds: the first attempt is partial. */
+    if (write(wake_fds[1], block, sizeof block) != (ssize_t)sizeof block) die("partial write");
+    pthread_join(reader, NULL);
+    pthread_join(spinner, NULL);
+    printf("wrote %d bytes; the reader first ran at the spinner's iteration %d\n", WAKE_PARTIAL_BYTES,
+           atomic_load(&wake_ran_at));
+  } else if (strcmp(mode, "wake-exec") == 0 || strcmp(mode, "wake-exec-nonblock") == 0) {
+    struct wake_shared *shared = wake_shared_map(argv[2], 1);
+    atomic_store(&shared->ran_at, -1);
+    int fds[2];
+    if (pipe(fds) != 0) die("pipe");
+    if (strcmp(mode, "wake-exec-nonblock") == 0 &&
+        fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL) | O_NONBLOCK) != 0)
+      die("O_NONBLOCK");
+    pid_t children[2];
+    const char *roles[2] = {"wake-exec-reader", "wake-exec-writer"};
+    for (int k = 0; k < 2; k++) {
+      children[k] = fork();
+      if (children[k] < 0) die("fork");
+      if (children[k] == 0) {
+        int keep = k == 0 ? fds[0] : fds[1];
+        int target = k == 0 ? WAKE_EXEC_READ_FD : WAKE_EXEC_WRITE_FD;
+        if (dup2(keep, target) != target) die("dup2");
+        close(fds[0]);
+        close(fds[1]);
+        execl("/proc/self/exe", "fifo_peer", roles[k], argv[2], (char *)NULL);
+        die("execl");
+      }
+    }
+    close(fds[0]);
+    close(fds[1]);
+    int status;
+    if (waitpid(children[1], &status, 0) != children[1]) die("wait writer");
+    int ran_at = atomic_load(&shared->ran_at);
+    if (ran_at >= 0) {
+      if (waitpid(children[0], &status, 0) != children[0]) die("wait reader");
+      printf("readied at %d, ran at %d\n", WAKE_AT, ran_at);
+    } else {
+      /* The writer's exit closed the last write end: the reader sees end of
+         file and records nothing. */
+      if (waitpid(children[0], &status, 0) != children[0]) die("wait reader");
+      printf("readied at %d, not run by %d\n", WAKE_AT, WAKE_ITERATIONS);
+    }
+  } else if (strncmp(mode, "wake-", 5) == 0) {
+    const char *what = mode + 5;
+    if (pipe(wake_fds) != 0) die("pipe");
+    int other[2];
+    if (pipe(other) != 0) die("pipe other");
+    pthread_t thread;
+    void *(*poller)(void *) = wake_reader;
+    if (strcmp(what, "space") == 0) {
+      /* Fill the pipe, so that the polled write waits for room. */
+      int flags = fcntl(wake_fds[1], F_GETFL);
+      fcntl(wake_fds[1], F_SETFL, flags | O_NONBLOCK);
+      char block[4096];
+      memset(block, 'f', sizeof block);
+      while (write(wake_fds[1], block, sizeof block) > 0) {
+      }
+      while (write(wake_fds[1], block, 1) > 0) {
+      }
+      fcntl(wake_fds[1], F_SETFL, flags);
+      poller = wake_writer;
+    } else if (strcmp(what, "fifo") == 0) {
+      snprintf(wake_fifo, sizeof wake_fifo, "%s", fresh_fifo(argv[2]));
+      poller = wake_opener;
+    }
+    int polled = strcmp(what, "nobody") != 0;
+    if (polled && pthread_create(&thread, NULL, poller, NULL) != 0) die("pthread_create");
+    int fifo_writer = -1;
+    volatile unsigned long spin = 0;
+    int i;
+    for (i = 0; i < WAKE_ITERATIONS && atomic_load(&wake_ran_at) < 0; i++) {
+      atomic_store(&wake_iteration, i);
+      if (i == WAKE_AT) {
+        char drained[4096];
+        if (strcmp(what, "data") == 0 || strcmp(what, "nobody") == 0 ||
+            strcmp(what, "compute") == 0 || strcmp(what, "trickle") == 0) {
+          if (write(wake_fds[1], "x", 1) != 1) die("write");
+        } else if (strcmp(what, "space") == 0) {
+          /* A whole buffer: Linux wakes a writer only for a free slot. */
+          if (read(wake_fds[0], drained, sizeof drained) != sizeof drained) die("drain");
+        } else if (strcmp(what, "eof") == 0) {
+          close(wake_fds[1]);
+        } else if (strcmp(what, "fifo") == 0) {
+          fifo_writer = open(wake_fifo, O_WRONLY);
+          if (fifo_writer < 0) die("fifo writer");
+        } else if (strcmp(what, "zero") == 0) {
+          if (write(wake_fds[1], "x", 0) != 0) die("write 0");
+        } else if (strcmp(what, "other") == 0) {
+          if (write(other[1], "x", 1) != 1) die("write other");
+        }
+        if (strcmp(what, "compute") == 0) {
+          /* No syscall here, and shorter than a timeslice: the hand-off
+             waits for the next syscall, after the spin, and comes at that
+             syscall's entry, before its second byte is written. */
+          for (unsigned long k = 0; k < 1000000UL; k++) spin += k;
+          atomic_store(&wake_spun, 1);
+          if (write(wake_fds[1], "y", 1) != 1) die("second write");
+        }
+      }
+      if (strcmp(what, "trickle") == 0 && i > WAKE_AT) {
+        /* One more byte each iteration: the reader's count of what is left
+           shows at which of these writes it got the turn. */
+        if (write(wake_fds[1], "t", 1) != 1) die("trickle write");
+      } else {
+        getppid();
+      }
+    }
+    if (!polled) {
+      printf("counted to %d\n", i);
+    } else if (atomic_load(&wake_ran_at) < 0) {
+      /* End the process without readying the poller: a release would be a
+         readying action of its own. */
+      printf("readied at %d, not run by %d\n", WAKE_AT, WAKE_ITERATIONS);
+      fflush(stdout);
+      _exit(0);
+    } else {
+      pthread_join(thread, NULL);
+      if (fifo_writer >= 0) close(fifo_writer);
+      printf("readied at %d, ran at %d", WAKE_AT, atomic_load(&wake_ran_at));
+      if (strcmp(what, "trickle") == 0)
+        printf(", %d byte(s) left", wake_pending_when_ran);
+      if (strcmp(what, "compute") == 0)
+        printf(" %s, %d byte(s) left", wake_spun_when_ran == 1 ? "after the spin" : "before the spin ended",
+               wake_pending_when_ran);
+      printf("\n");
+      /* `clock` as a third argument: also the reader's CLOCK_MONOTONIC. */
+      if (argc > 3 && strcmp(argv[3], "clock") == 0)
+        printf("reader clock %lld.%09ld\n", (long long)wake_clock.tv_sec, wake_clock.tv_nsec);
+    }
   } else if (strcmp(mode, "open-killed-then-its-cleaner-killed") == 0) {
     sharer_path = fresh_fifo(argv[2]);
     size_t stack_size = 1 << 16;

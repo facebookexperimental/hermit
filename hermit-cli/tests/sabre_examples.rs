@@ -1185,6 +1185,117 @@ int main(int argc, char **argv) {
     }
 }
 
+/// `--pipe-wake-latency` (https://github.com/rrnewton/hermit/issues/4380) on
+/// SaBRe, where an exec rediscovers the guest's descriptors: two children share
+/// a pipe and each execs `tests/c/fifo_peer.c`, the reader blocked in a read,
+/// the writer writing one byte at iteration 100 of a 5000-iteration loop. The
+/// exec carries each pipe end's channel, including the writer's end left
+/// `O_NONBLOCK` (`wake-exec-nonblock`), which no blocking override covers. At
+/// `L = 0` the reader runs at iteration 100 on both backends, and unset only
+/// once the writer's loop has ended. (A nonzero latency is measured on each
+/// backend's own thread time, which counts retired branches only with a PMU,
+/// so it is not pinned here.) Actions that ready no poller (a write
+/// nobody polls, a zero-byte write, a write to another pipe) change neither
+/// SaBRe's output nor its number of committed turns.
+#[test]
+fn sabre_hands_a_readied_pipe_poller_the_turn_across_exec() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-pipe-wake-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository")
+        .join("tests/c/fifo_peer.c");
+    let guest = dir.path().join("fifo_peer");
+    let build = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile fifo_peer");
+    assert!(
+        build.status.success(),
+        "fifo_peer compilation failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    let run = |sabre: bool, mode: &str, latency: Option<&str>, summary: bool| {
+        let scratch = dir.path().join(format!("{mode}-{sabre}-{latency:?}"));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mut command = Command::new(hermit_binary());
+        command.arg("--log=warn");
+        if sabre {
+            command
+                .env("HERMIT_SABRE_BINARY", &loader)
+                .args(["--backend", "sabre"]);
+        }
+        command.args(["run", "--strict", COMPARISON_EPOCH]);
+        if summary {
+            command.arg("--summary");
+        }
+        if let Some(latency) = latency {
+            command.arg(format!("--pipe-wake-latency={latency}"));
+        }
+        command
+            .args(execution_root_args(requested.as_deref()).unwrap())
+            .arg("--")
+            .arg(&guest)
+            .arg(mode)
+            .arg(&scratch);
+        let label = format!("{mode} sabre={sabre} latency={latency:?}");
+        let output = run_bounded(command, &label, None);
+        assert!(
+            output.status.success(),
+            "{label} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    for mode in ["wake-exec", "wake-exec-nonblock"] {
+        for (sabre, latency, expected) in [
+            (false, None, 4999),
+            (true, None, 4999),
+            (false, Some("0"), 100),
+            (true, Some("0"), 100),
+        ] {
+            let output = run(sabre, mode, latency, false);
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                format!("readied at 100, ran at {expected}\n"),
+                "{mode} sabre={sabre} latency={latency:?}"
+            );
+        }
+    }
+    for (mode, expected) in [
+        ("wake-nobody", "counted to 5000\n"),
+        ("wake-zero", "readied at 100, not run by 5000\n"),
+        ("wake-other", "readied at 100, not run by 5000\n"),
+    ] {
+        let mut turns = Vec::new();
+        for latency in [None, Some("0"), Some("1000000")] {
+            let output = run(true, mode, latency, true);
+            assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "{mode}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let count = stderr
+                .split("the hermit scheduler ran ")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|count| count.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("{mode}: no turn count in the summary:\n{stderr}"));
+            turns.push(count);
+        }
+        assert!(
+            turns.iter().all(|count| *count == turns[0]),
+            "{mode}: committed turns differ with the option: {turns:?}"
+        );
+    }
+}
+
 /// A guest RDTSC runs, with Detcore's virtual value, under SaBRe: both one that
 /// is the guest's first intercepted event and one that follows its syscalls.
 ///

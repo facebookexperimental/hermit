@@ -537,6 +537,12 @@ pub struct Resources {
     /// retry, for `Scheduler::nothing_else_can_run`.
     #[serde(default)]
     pub(crate) upgraded_from_attempt: u32,
+    /// The pipe or FIFO this polling request waits on, and what it waits
+    /// for, under `--pipe-wake-latency` (`crate::pipe_wake`): an action of
+    /// another thread that can satisfy it hands this thread the turn. `None`
+    /// for every other request, and always with the option unset.
+    #[serde(default)]
+    pub(crate) polls_channel: Option<(crate::pipe_wake::ChannelId, crate::pipe_wake::Wants)>,
     /// The absolute virtual deadline of the timed wait that a polling request
     /// (`poll_attempt > 0`) retries: `ppoll`, `poll`, `epoll_wait`,
     /// `epoll_pwait`, `rt_sigtimedwait`, `select`, `pselect6` or a polling
@@ -609,6 +615,9 @@ impl fmt::Debug for Resources {
         if self.upgraded_from_attempt != 0 {
             debug.field("upgraded_from_attempt", &self.upgraded_from_attempt);
         }
+        if let Some(channel) = &self.polls_channel {
+            debug.field("polls_channel", channel);
+        }
         if let Some(deadline) = self.poll_deadline {
             debug.field("poll_deadline", &deadline);
         }
@@ -654,6 +663,7 @@ impl Resources {
             waits_until_nothing_else_can_run: false,
             previous_attempt_made_progress: false,
             upgraded_from_attempt: 0,
+            polls_channel: None,
             poll_deadline: None,
             in_guest_sleep_sigalrm: None,
             signal_state_task: None,

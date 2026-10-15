@@ -62,6 +62,7 @@ mod memory;
 pub mod native_exec;
 pub mod netlink_route;
 pub mod nonwaiting_write;
+mod pipe_wake;
 mod procfs;
 mod procfs_inode;
 mod procmaps;
@@ -1096,6 +1097,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .thread_state_mut()
                 .mk_request(ResourceID::InboundSignal(signal), Permission::RW);
             resource_request(guest, request).await;
+            // Under `--pipe-wake-latency`, a delivery that ends the process
+            // dooms its threads at this committed turn, before their
+            // host-timed removal (`scheduler::pipe_wake`).
+            if self.cfg.pipe_wake_latency_in_effect().is_some()
+                && crate::syscalls::read_kernel_signal_state(guest.pid(), guest.tid())
+                    .is_ok_and(|state| state.default_action_ends_process(signal.raw()))
+            {
+                tool_global::record_fatal_signal(guest).await;
+            }
             if self
                 .end_thread_group_before_fatal_delivery(guest, signal)
                 .await
@@ -1280,6 +1290,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
 
+        self.pipe_hand_off_if_due(guest).await;
         self.end_timeslice_if_needed(guest, boundary).await;
     }
 
@@ -1344,6 +1355,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let request = Self::yield_request(guest);
             resource_request(guest, request).await;
         }
+        self.pipe_hand_off_if_due(guest).await;
         self.end_timeslice_if_needed(guest, boundary).await;
 
         let dettid = guest.thread_state().dettid;
@@ -2629,6 +2641,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     uncharged_bootstrap_syscalls: 0,
                     in_uncharged_bootstrap_syscall: false,
                     yield_after_futex_wake: false,
+                    pipe_handoff_due: None,
                     own_signal_turn_hold: None,
 
                     end_of_timeslice: None,
@@ -4264,6 +4277,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 crate::fifo_peer::forget_guest_made(fifo);
             }
             self.note_guest_made_fifo(guest, &call).await;
+        }
+        // A read or write that moved bytes through a pipe or FIFO readies the
+        // threads polling its other direction (`--pipe-wake-latency`).
+        if let Ok(moved) = res
+            && moved > 0
+            && let Some((fd, wants)) = crate::pipe_wake::progress_of(&call)
+        {
+            self.note_fd_readied(guest, fd, wants).await;
         }
         Self::unmap_orphaned_staging_pages(guest).await;
 

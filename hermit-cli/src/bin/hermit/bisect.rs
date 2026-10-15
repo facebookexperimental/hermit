@@ -142,6 +142,10 @@ impl BisectOpts {
         // Each trial's schedule is written anew without an epoch, so the
         // trials replay from the one the two schedules were recorded under.
         analyzer.adopt_recorded_epoch(&[("--good", &self.good), ("--bad", &self.bad)])?;
+        analyzer.refuse_recordings_under_another_pipe_wake_latency(&[
+            ("--good", &self.good),
+            ("--bad", &self.bad),
+        ])?;
         let good = good.into_global();
         let bad = bad.into_global();
         if good == bad {
@@ -521,6 +525,73 @@ mod tests {
             message.contains(RECORDED_RFC3339) && message.contains("2026-01-01T00:00:00+00:00"),
             "{error:#}"
         );
+    }
+
+    /// Bisect refuses, before any trial, a `--good` or `--bad` schedule, or a
+    /// record its run arguments replay, made under another
+    /// `--pipe-wake-latency` than the trials' own
+    /// (https://github.com/rrnewton/hermit/issues/4380).
+    #[test]
+    fn bisect_refuses_schedules_under_another_pipe_wake_latency() {
+        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-resources");
+        let dir = tempfile::tempdir().unwrap();
+        let write = |fixture: &str, name: &str, latency: Option<u64>| {
+            let source = resources.join(format!("flaky_cas_sequence_schedules-{fixture}.json"));
+            let mut record: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(source).unwrap()).unwrap();
+            if let Some(latency) = latency {
+                record["pipe_wake_latency"] = serde_json::Value::from(latency);
+            }
+            let path = dir.path().join(name);
+            fs::write(&path, record.to_string()).unwrap();
+            path
+        };
+        let prepare = |good: &Path, bad: &Path, run_args: &[&str]| {
+            let good = format!("--good={}", good.display());
+            let bad = format!("--bad={}", bad.display());
+            let mut argv = vec!["hermit", "bisect", good.as_str(), bad.as_str(), "--"];
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Bisect(options) = args.command else {
+                panic!("{argv:?} is not bisect")
+            };
+            options.prepare(&args.global).map(|_| ())
+        };
+        let good_off = write("passing", "good-off.json", None);
+        let bad_off = write("failing", "bad-off.json", None);
+        let good_zero = write("passing", "good-zero.json", Some(0));
+        let good_three = write("passing", "good-three.json", Some(3_000_000));
+        let bad_three = write("failing", "bad-three.json", Some(3_000_000));
+        let replayed_zero = write("passing", "replayed-zero.json", Some(0));
+        let replay_flag = format!("--replay-schedule-from={}", replayed_zero.display());
+
+        assert!(prepare(&good_off, &bad_off, &[]).is_ok());
+        assert!(prepare(&good_three, &bad_three, &["--pipe-wake-latency=3000000"]).is_ok());
+        for (good, bad, run_args, named) in [
+            (&good_zero, &bad_off, vec![], "--good"),
+            (&good_off, &bad_off, vec!["--pipe-wake-latency=0"], "--good"),
+            (
+                &good_three,
+                &bad_three,
+                vec!["--pipe-wake-latency=0"],
+                "--good",
+            ),
+            (
+                &good_off,
+                &bad_off,
+                vec![replay_flag.as_str()],
+                "--replay-schedule-from",
+            ),
+        ] {
+            let error = prepare(good, bad, &run_args).unwrap_err();
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(named) && message.contains("cannot reproduce the run"),
+                "{run_args:?}: {message}"
+            );
+        }
     }
 
     #[test]

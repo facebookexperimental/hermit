@@ -708,6 +708,73 @@ impl AnalyzeOpts {
         )
     }
 
+    /// The trials' `--pipe-wake-latency`, from their run arguments (`None`
+    /// for off).
+    pub fn trial_pipe_wake_latency(&self) -> Option<u64> {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .pipe_wake_latency
+    }
+
+    /// `record` stamped with the trials' `--pipe-wake-latency`, as every
+    /// record analyze writes must be: a record that omitted it would be
+    /// refused when replayed with the latency it was made under, and accepted
+    /// without it (<https://github.com/rrnewton/hermit/issues/4380>).
+    pub fn stamp_trial_record(&self, record: PreemptionRecord) -> PreemptionRecord {
+        record.with_pipe_wake_latency(self.trial_pipe_wake_latency())
+    }
+
+    /// Write the schedule `events` for a trial to replay, stamped
+    /// ([`Self::stamp_trial_record`]).
+    pub fn write_trial_schedule(&self, events: Vec<SchedEvent>, path: &Path) -> anyhow::Result<()> {
+        self.stamp_trial_record(PreemptionRecord::from_sched_events(events))
+            .write_to_disk(path)
+            .map_err(anyhow::Error::msg)
+    }
+
+    /// Refuse, before any trial, recordings made under another
+    /// `--pipe-wake-latency` than the trials' own, including a different
+    /// latency (https://github.com/rrnewton/hermit/issues/4380). Trials start
+    /// through `RunOpts::run`, which skips `hermit run`'s own check, so the
+    /// check is made here, as `adopt_recorded_epoch` makes the epoch's. Besides
+    /// the named `recordings`, a record the run arguments replay
+    /// (`--replay-schedule-from`, `--replay-preemptions-from`) is checked.
+    /// A record without the field was made with the option off.
+    pub fn refuse_recordings_under_another_pipe_wake_latency(
+        &self,
+        recordings: &[(&str, &Path)],
+    ) -> anyhow::Result<()> {
+        let trial = RunData::get_raw_runopts(self);
+        let config = &trial.det_opts.det_config;
+        let in_run_arguments = [
+            (
+                "--replay-schedule-from",
+                config.replay_schedule_from.as_deref(),
+            ),
+            (
+                "--replay-preemptions-from",
+                config.replay_preemptions_from.as_deref(),
+            ),
+        ];
+        for (option, path) in recordings.iter().copied().chain(
+            in_run_arguments
+                .into_iter()
+                .filter_map(|(option, path)| Some((option, path?))),
+        ) {
+            let recorded = detcore::preemptions::read_recorded_pipe_wake_latency(path)
+                .map_err(anyhow::Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::pipe_wake_latency_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.pipe_wake_latency,
+            ) {
+                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+            }
+        }
+        Ok(())
+    }
+
     /// The virtual-time epoch the target trial (run 1) starts from, in
     /// RFC 3339. It replays `--run1-preemptions` when that is given.
     #[cfg(test)]

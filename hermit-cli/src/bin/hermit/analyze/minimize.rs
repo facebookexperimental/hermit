@@ -241,7 +241,7 @@ impl AnalyzeOpts {
                             }
                             Ok(())
                         })?;
-                    PreemptionRecord::from_vecs(&btmap)
+                    self.stamp_trial_record(PreemptionRecord::from_vecs(&btmap))
                 };
                 if let Err(e) = pr_new.validate() {
                     bail!(

@@ -47,6 +47,14 @@ pub struct PreemptionRecord {
     /// before the epoch was stored, and for records synthesized in memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     epoch: Option<DateTime<Utc>>,
+    /// The `--pipe-wake-latency` of the run that produced this record
+    /// (<https://github.com/rrnewton/hermit/issues/4380>). A hand-off moves
+    /// turns and their charged time, so a replay under another value cannot
+    /// reproduce the run, and is refused. `None` when the option was off,
+    /// which writes the record exactly as before the field existed, and for
+    /// records written before it. `Some(0)` is distinct from `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pipe_wake_latency: Option<u64>,
 }
 
 impl std::fmt::Display for PreemptionRecord {
@@ -63,7 +71,22 @@ impl PreemptionRecord {
             per_thread: Default::default(),
             global: events,
             epoch: None,
+            pipe_wake_latency: None,
         }
+    }
+
+    /// The same record, stating the `--pipe-wake-latency` of the trials it
+    /// came from. Every record analyze, minimize or bisect writes from trials
+    /// carries it, so that a replay under another value is refused.
+    pub fn with_pipe_wake_latency(mut self, latency: Option<u64>) -> Self {
+        self.pipe_wake_latency = latency;
+        self
+    }
+
+    /// The `--pipe-wake-latency` this record was produced under (`None` for
+    /// off).
+    pub fn pipe_wake_latency(&self) -> Option<u64> {
+        self.pipe_wake_latency
     }
 
     /// The virtual-time epoch this record was produced under, if it was stored.
@@ -131,6 +154,7 @@ impl PreemptionRecord {
             per_thread: self.per_thread.clone(),
             global: Vec::new(),
             epoch: self.epoch,
+            pipe_wake_latency: self.pipe_wake_latency,
         }
     }
 
@@ -188,6 +212,7 @@ impl PreemptionRecord {
             per_thread: bt2,
             global: Vec::new(),
             epoch: None,
+            pipe_wake_latency: None,
         }
     }
 
@@ -576,6 +601,55 @@ mod tests {
     use super::*;
     use crate::types::RcbTimeMultiplier;
 
+    /// `--pipe-wake-latency` rides in a preemption record as the epoch does:
+    /// omitted when off, kept through JSON and through every record a run or
+    /// an analysis writes, and compared exactly, so that `Some(0)` is not off
+    /// (https://github.com/rrnewton/hermit/issues/4380).
+    #[test]
+    fn the_pipe_wake_latency_round_trips_and_is_compared_exactly() {
+        let off = PreemptionRecord::from_sched_events(Vec::new());
+        assert!(
+            !serde_json::to_string(&off)
+                .unwrap()
+                .contains("pipe_wake_latency")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        for latency in [Some(0), Some(3_000_000)] {
+            let record =
+                PreemptionRecord::from_sched_events(Vec::new()).with_pipe_wake_latency(latency);
+            let json = serde_json::to_string(&record).unwrap();
+            let back: PreemptionRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.pipe_wake_latency(), latency);
+            assert_eq!(record.clone_preemptions_only().pipe_wake_latency(), latency);
+            let minimized =
+                PreemptionRecord::from_vecs(&BTreeMap::new()).with_pipe_wake_latency(latency);
+            assert_eq!(minimized.pipe_wake_latency(), latency);
+            let path = dir.path().join("record.json");
+            std::fs::write(&path, &json).unwrap();
+            assert_eq!(read_recorded_pipe_wake_latency(&path), Ok(latency));
+            let written = PreemptionWriter::new(None)
+                .with_pipe_wake_latency(latency)
+                .into_string();
+            assert!(
+                written.contains(&format!("\"pipe_wake_latency\":{}", latency.unwrap())),
+                "{written}"
+            );
+        }
+        for (recorded, replay, refused) in [
+            (None, None, false),
+            (Some(0), Some(0), false),
+            (Some(0), None, true),
+            (None, Some(0), true),
+            (Some(0), Some(3_000_000), true),
+        ] {
+            assert_eq!(
+                pipe_wake_latency_mismatch("--replay-schedule-from=x", recorded, replay).is_some(),
+                refused,
+                "{recorded:?} replayed with {replay:?}"
+            );
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
@@ -942,6 +1016,13 @@ impl PreemptionWriter {
         self
     }
 
+    /// Store the run's `--pipe-wake-latency` (`None` for off, which leaves
+    /// the record as it was before the field existed).
+    pub fn with_pipe_wake_latency(mut self, latency: Option<u64>) -> Self {
+        self.inner.pipe_wake_latency = latency;
+        self
+    }
+
     /// Does the record have zero entries?
     pub fn is_empty(&self) -> bool {
         self.inner.per_thread.is_empty()
@@ -1131,6 +1212,46 @@ pub fn read_recorded_epoch(path: &Path) -> Result<Option<DateTime<Utc>>, String>
     let record: EpochOnly = serde_json::from_reader(std::io::BufReader::new(file))
         .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
     Ok(record.epoch)
+}
+
+/// Read only the `--pipe-wake-latency` stored in a preemption record file, as
+/// [`read_recorded_epoch`] reads the epoch. `Ok(None)` means the record was
+/// made with the option off, or before the field existed.
+pub fn read_recorded_pipe_wake_latency(path: &Path) -> Result<Option<u64>, String> {
+    #[derive(Deserialize)]
+    struct LatencyOnly {
+        #[serde(default)]
+        pipe_wake_latency: Option<u64>,
+    }
+    let file = File::open(path)
+        .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
+    let record: LatencyOnly = serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
+    Ok(record.pipe_wake_latency)
+}
+
+/// The refusal of a replay whose `--pipe-wake-latency` differs from the one a
+/// record stores, naming the record by `source` (an option and a path), or
+/// `None` when they agree. Absent and off are the same; `Some(0)` is not off.
+pub fn pipe_wake_latency_mismatch(
+    source: &str,
+    recorded: Option<u64>,
+    replay: Option<u64>,
+) -> Option<String> {
+    let show = |latency: Option<u64>| match latency {
+        Some(ns) => format!("--pipe-wake-latency={ns}"),
+        None => "no --pipe-wake-latency".to_owned(),
+    };
+    (recorded != replay).then(|| {
+        format!(
+            "{source} was recorded with {} and would be replayed with {}. A hand-off moves \
+             turns and the time they charge, so the replay cannot reproduce the run. Replay \
+             with {}.",
+            show(recorded),
+            show(replay),
+            show(recorded),
+        )
+    })
 }
 
 // TODO: eventually this should do streaming IO, and abstract it behind this interface.

@@ -33961,6 +33961,446 @@ fn an_unusable_verify_tmpdir_is_a_clean_error_naming_the_variable() {
     }
 }
 
+/// One `fifo_peer wake-*` run under `hermit run --strict`, with
+/// `--pipe-wake-latency` set to `latency` when given, and `extra` before the
+/// `--`.
+fn pipe_wake_run(mode: &str, latency: Option<&str>, extra: &[&str], guest_args: &[&str]) -> Output {
+    let args = pipe_wake_args(mode, latency, extra, guest_args);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut command = hermit_command(&args);
+    hermit_test::hermit_output(&format!("{mode} at {latency:?}"), &mut command)
+}
+
+/// [`pipe_wake_run`] with `perf_event_open` denied to Hermit, as on a host
+/// without a PMU (the hosted runners): thread time then counts no retired
+/// conditional branches, so a nonzero latency comes due at the same syscall on
+/// every host.
+fn pipe_wake_run_without_pmu(
+    mode: &str,
+    latency: Option<&str>,
+    extra: &[&str],
+    guest_args: &[&str],
+) -> Output {
+    let args = pipe_wake_args(mode, latency, extra, guest_args);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut command = hermit_command_under_host_filter(&args);
+    deny_syscall(&mut command, libc::SYS_perf_event_open);
+    hermit_test::hermit_output(
+        &format!("{mode} at {latency:?} without a PMU"),
+        &mut command,
+    )
+}
+
+fn pipe_wake_args(
+    mode: &str,
+    latency: Option<&str>,
+    extra: &[&str],
+    guest_args: &[&str],
+) -> Vec<String> {
+    let guest = fifo_peer_guest().to_str().unwrap();
+    let dir = process_build_root("fifo-peer").join("wake").join(mode);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
+    let mut args = vec!["run".to_owned(), "--strict".to_owned()];
+    args.extend(latency.map(|latency| format!("--pipe-wake-latency={latency}")));
+    args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+    args.extend(["--".to_owned(), guest.to_owned(), mode.to_owned()]);
+    args.push(dir.to_str().unwrap().to_owned());
+    args.extend(guest_args.iter().map(|arg| (*arg).to_owned()));
+    args
+}
+
+const PIPE_WAKE_NOT_RUN: &str = "readied at 100, not run by 5000\n";
+const PIPE_WAKE_AT_ONCE: &str = "readied at 100, ran at 100\n";
+
+/// A thread polling a pipe or FIFO that another thread's action has readied
+/// runs at the readying call's own syscall boundary under
+/// `--pipe-wake-latency=0` (https://github.com/rrnewton/hermit/issues/4380):
+/// written data, a freed buffer slot, end of file, and a FIFO opened for
+/// writing each ready the poller at iteration 100 of a 5000-iteration loop.
+/// Without the option it waits for the actor's timeslice to end, which the
+/// loop does not reach, so it has not run when the loop ends. The same holds
+/// without a logical timeslice, where nothing else would bound the wait.
+/// `L = 0` reads no clock, so these rows hold with or without a PMU.
+#[test]
+fn a_readied_pipe_poller_runs_at_the_readying_call_under_a_zero_latency() {
+    for mode in ["wake-data", "wake-space", "wake-eof", "wake-fifo"] {
+        for (latency, expected) in [(None, PIPE_WAKE_NOT_RUN), (Some("0"), PIPE_WAKE_AT_ONCE)] {
+            let output = pipe_wake_run(mode, latency, &[], &[]);
+            assert_success(&output, &[mode]);
+            assert_eq!(stdout(&output), expected, "{mode} at {latency:?}");
+        }
+    }
+    // One write larger than the pipe, beside a thread that yields each
+    // iteration: the reader runs within the yielder's first iterations. In
+    // `wake-partial-deep` the reader has backed off before the write, and
+    // only the readying of the write's first, partial attempt restores it
+    // early: at iteration 2, against 4 unset (and 5 if only the completed
+    // write readied it).
+    for (mode, latency, iteration) in [
+        ("wake-partial", None, 1),
+        ("wake-partial", Some("0"), 2),
+        ("wake-partial-deep", None, 4),
+        ("wake-partial-deep", Some("0"), 2),
+    ] {
+        let output = pipe_wake_run(mode, latency, &[], &[]);
+        assert_success(&output, &[mode]);
+        assert_eq!(
+            stdout(&output),
+            format!(
+                "wrote 100000 bytes; the reader first ran at the spinner's iteration {iteration}\n"
+            ),
+            "{mode} at {latency:?}"
+        );
+    }
+    for (latency, expected) in [(None, PIPE_WAKE_NOT_RUN), (Some("0"), PIPE_WAKE_AT_ONCE)] {
+        let output = pipe_wake_run("wake-data", latency, &["--max-timeslice=disabled"], &[]);
+        assert_success(&output, &["wake-data", "--max-timeslice=disabled"]);
+        assert_eq!(stdout(&output), expected, "no timeslice at {latency:?}");
+    }
+}
+
+/// The same across exec: two children share a pipe and each execs
+/// `fifo_peer`, the writer with its end blocking or left `O_NONBLOCK`. Unset,
+/// the reader runs once the writer's loop has ended. The SaBRe rows, where the
+/// exec rediscovers the descriptors, are in `sabre_examples.rs`. And a writer
+/// that computes after its write without a syscall (`wake-compute`) hands off
+/// before the computation, at the write's own boundary.
+#[test]
+fn a_readied_pipe_poller_runs_at_the_readying_call_across_exec() {
+    for mode in ["wake-exec", "wake-exec-nonblock"] {
+        for (latency, expected) in [
+            (None, "readied at 100, ran at 4999\n"),
+            (Some("0"), PIPE_WAKE_AT_ONCE),
+        ] {
+            let output = pipe_wake_run(mode, latency, &[], &[]);
+            assert_success(&output, &[mode]);
+            assert_eq!(stdout(&output), expected, "{mode} at {latency:?}");
+        }
+    }
+    for (latency, expected) in [
+        (None, PIPE_WAKE_NOT_RUN),
+        (
+            Some("0"),
+            "readied at 100, ran at 100 before the spin ended, 0 byte(s) left\n",
+        ),
+    ] {
+        let output = pipe_wake_run("wake-compute", latency, &[], &[]);
+        assert_success(&output, &["wake-compute"]);
+        assert_eq!(stdout(&output), expected, "wake-compute at {latency:?}");
+    }
+}
+
+/// Under a nonzero latency the readied thread runs once the actor's own
+/// thread time is the latency past its readying action, at the actor's next
+/// syscall boundary. These rows deny Hermit the PMU, as on the hosted runners,
+/// so thread time counts no retired branches and moves only inside syscalls:
+/// the latency comes due at a syscall's exit, the same one on every host. In
+/// `wake-compute` the writer computes without a syscall after its write and
+/// then writes a second byte, which arrives before the hand-off; in
+/// `wake-trickle` it writes one more byte each iteration, and the hand-off
+/// follows the first of them. The PMU host's rows, where branches count and
+/// the latency can come due between syscalls, are
+/// `a_readied_pipe_poller_runs_once_the_actors_branch_counted_time_is_the_latency_later`.
+#[test]
+fn a_readied_pipe_poller_runs_once_the_actors_time_is_the_latency_later() {
+    for (mode, expected) in [
+        ("wake-data", "readied at 100, ran at 107\n"),
+        ("wake-space", "readied at 100, ran at 107\n"),
+        ("wake-eof", "readied at 100, ran at 107\n"),
+        ("wake-fifo", "readied at 100, ran at 107\n"),
+        ("wake-exec", "readied at 100, ran at 107\n"),
+        ("wake-exec-nonblock", "readied at 100, ran at 107\n"),
+        (
+            "wake-compute",
+            "readied at 100, ran at 100 after the spin, 1 byte(s) left\n",
+        ),
+        (
+            "wake-trickle",
+            "readied at 100, ran at 101, 1 byte(s) left\n",
+        ),
+    ] {
+        let output = pipe_wake_run_without_pmu(mode, Some("1000000"), &[], &[]);
+        assert_success(&output, &[mode]);
+        assert_eq!(stdout(&output), expected, "{mode}");
+    }
+    let mut extra = vec!["--verify", "--verify-strict"];
+    let output = pipe_wake_run_without_pmu("wake-data", Some("1000000"), &extra, &[]);
+    assert_success(&output, &extra);
+    assert!(
+        stderr(&output).contains("Success: deterministic. Determinism verified."),
+        "verification failed:\n{}",
+        stderr(&output)
+    );
+    extra.clear();
+}
+
+/// The rows above with the PMU: thread time counts the actor's retired
+/// conditional branches, so 1 ms is 3124 iterations of the threaded loop after
+/// the write (3571 of the exec'd writer's simpler loop), and
+/// a latency that comes due in user code is handed off at the entry of the
+/// actor's next syscall. After `wake-compute`'s computation the second write
+/// has not happened yet (0 bytes left); in `wake-trickle` the reader runs
+/// before the write of iteration 199, with the 99 bytes of iterations 100 to
+/// 198 written and the first read.
+///
+/// PMU SUBJECT: without a PMU thread time counts no branches (see the rows
+/// above), so test.cli and test.cli_on_host skip this case by exact name;
+/// privileged-test.pmu_cli_cases runs it after privileged-pmu.preemption has
+/// shown the PMU works.
+#[test]
+fn a_readied_pipe_poller_runs_once_the_actors_branch_counted_time_is_the_latency_later() {
+    for (mode, expected) in [
+        ("wake-data", "readied at 100, ran at 3224\n"),
+        ("wake-exec", "readied at 100, ran at 3671\n"),
+        (
+            "wake-compute",
+            "readied at 100, ran at 100 after the spin, 0 byte(s) left\n",
+        ),
+        (
+            "wake-trickle",
+            "readied at 100, ran at 199, 99 byte(s) left\n",
+        ),
+    ] {
+        let output = pipe_wake_run(mode, Some("1000000"), &[], &[]);
+        assert_success(&output, &[mode]);
+        assert_eq!(stdout(&output), expected, "{mode}");
+    }
+}
+
+/// Two cases from the Codex review of
+/// https://github.com/rrnewton/hermit/pull/4424, a reader taking a second
+/// byte that is written after a futex turn. In `wake-after-futex` the writer
+/// of both bytes futex-waits for the first read between them: that turn ends
+/// its first window, and the second write starts a new one, whose latency
+/// counts from that write (at 10 ms the first window's deadline is still
+/// pending when the second write comes). In
+/// `wake-fresh-writer` a thread the reader woke writes the second byte, while
+/// the reader's retry is already filed: the hand-off makes that retry
+/// runnable at once. Without the option the second read waits past the
+/// writer's 1000 syscalls.
+#[test]
+fn a_readied_pipe_poller_runs_after_a_futex_turn_and_from_a_fresh_writer() {
+    let mut mismatches = Vec::new();
+    for mode in ["wake-after-futex", "wake-fresh-writer"] {
+        for (latency, without_pmu, expected) in [
+            (None, false, "second read not run by 1000\n"),
+            (Some("0"), false, "second read ran at 0\n"),
+            (Some("1000000"), true, "second read ran at 7\n"),
+            (Some("10000000"), true, "second read ran at 79\n"),
+        ] {
+            let extra = ["--max-timeslice=disabled"];
+            let output = if without_pmu {
+                pipe_wake_run_without_pmu(mode, latency, &extra, &[])
+            } else {
+                pipe_wake_run(mode, latency, &extra, &[])
+            };
+            assert_success(&output, &[mode]);
+            if stdout(&output) != expected {
+                mismatches.push(format!("{mode} at {latency:?}: {:?}", stdout(&output)));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// An action that readies no poller changes nothing under
+/// `--pipe-wake-latency`: a write to a pipe no thread polls, a zero-byte write
+/// to a polled pipe, and a write to another pipe than the polled one give
+/// today's output and today's number of scheduler turns (`--summary`).
+#[test]
+fn an_action_that_readies_no_pipe_poller_changes_no_turn() {
+    let turns_of = |output: &Output| {
+        let log = stderr(output);
+        log.split("the hermit scheduler ran ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|count| count.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("no turn count in the summary:\n{log}"))
+    };
+    for (mode, expected) in [
+        ("wake-nobody", "counted to 5000\n"),
+        ("wake-zero", "readied at 100, not run by 5000\n"),
+        ("wake-other", "readied at 100, not run by 5000\n"),
+    ] {
+        let mut turns = Vec::new();
+        for latency in [None, Some("0"), Some("1000000")] {
+            let guest = fifo_peer_guest().to_str().unwrap();
+            let dir = process_build_root("fifo-peer").join("wake-none").join(mode);
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
+            let latency = latency.map(|latency| format!("--pipe-wake-latency={latency}"));
+            let mut args = vec!["run", "--strict", "--summary"];
+            args.extend(latency.as_deref());
+            args.extend(["--", guest, mode, dir.to_str().unwrap()]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{args:?}");
+            turns.push(turns_of(&output));
+        }
+        assert!(
+            turns.iter().all(|count| *count == turns[0]),
+            "{mode}: committed turns differ with the option: {turns:?}"
+        );
+    }
+}
+
+/// The hand-off is deterministic: the strict verifier finds the two runs of a
+/// readied poller identical, with and without chaos scheduling.
+#[test]
+fn the_pipe_wake_hand_off_is_deterministic() {
+    for chaos in [&[][..], &["--chaos", "--seed=1"], &["--chaos", "--seed=2"]] {
+        let mut extra = chaos.to_vec();
+        extra.extend(["--verify", "--verify-strict"]);
+        let output = pipe_wake_run("wake-data", Some("0"), &extra, &[]);
+        assert_success(&output, &extra);
+        if chaos.is_empty() {
+            assert_eq!(stdout(&output), PIPE_WAKE_AT_ONCE);
+        }
+        let log = stderr(&output);
+        assert!(
+            log.contains("Success: deterministic. Determinism verified."),
+            "{chaos:?}: verification failed:\n{log}"
+        );
+    }
+}
+
+/// A schedule recorded under `--pipe-wake-latency` names the latency, and a
+/// replay with the same latency reproduces the run, the reader's clock
+/// included, under both replay kinds: at `L = 0`, and at `L = 1 ms` with the
+/// PMU denied so that every host gives the same run. Any other setting, off
+/// or another `L`, and a record made without the option replayed with it,
+/// are refused before launch, under both replay kinds.
+#[test]
+fn a_schedule_recorded_with_the_pipe_wake_latency_replays_only_with_it() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let run = |latency: Option<&str>, extra: &[&str], without_pmu: bool| {
+        if without_pmu {
+            pipe_wake_run_without_pmu("wake-data", latency, extra, &["clock"])
+        } else {
+            pipe_wake_run("wake-data", latency, extra, &["clock"])
+        }
+    };
+    let record = |name: &str, latency: Option<&str>, without_pmu: bool| {
+        let path = directory.path().join(name);
+        let flag = format!("--record-preemptions-to={}", path.display());
+        let output = run(latency, &[&flag], without_pmu);
+        assert_success(&output, &[&flag]);
+        (path, stdout(&output))
+    };
+    for (name, latency, without_pmu, ran_at, stored) in [
+        ("zero.json", "0", false, 100, 0),
+        ("one-ms.json", "1000000", true, 107, 1_000_000),
+    ] {
+        let (path, recorded) = record(name, Some(latency), without_pmu);
+        assert!(
+            recorded.starts_with(&format!("readied at 100, ran at {ran_at}\nreader clock ")),
+            "{recorded}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(json["pipe_wake_latency"], stored, "{json}");
+        for kind in ["--replay-preemptions-from", "--replay-schedule-from"] {
+            let replay = format!("{kind}={}", path.display());
+            let output = run(Some(latency), &[&replay], without_pmu);
+            assert_success(&output, &[&replay]);
+            assert_eq!(stdout(&output), recorded, "{replay}");
+        }
+    }
+
+    // A FIFO's hand-off under schedule replay: the replay reproduces the
+    // recorded run with the hand-off left to the trace.
+    let fifo_record = directory.path().join("fifo.json");
+    let flag = format!("--record-preemptions-to={}", fifo_record.display());
+    let recorded = pipe_wake_run("wake-fifo", Some("0"), &[&flag], &[]);
+    assert_success(&recorded, &[&flag]);
+    assert_eq!(stdout(&recorded), PIPE_WAKE_AT_ONCE);
+    let replay = format!("--replay-schedule-from={}", fifo_record.display());
+    let replayed = pipe_wake_run("wake-fifo", Some("0"), &[&replay], &[]);
+    assert_success(&replayed, &[&replay]);
+    assert_eq!(stdout(&replayed), stdout(&recorded), "{replay}");
+
+    let with = directory.path().join("zero.json");
+    let (without, _) = record("without.json", None, false);
+    assert!(
+        !fs::read_to_string(&without)
+            .unwrap()
+            .contains("pipe_wake_latency")
+    );
+    for kind in ["--replay-preemptions-from", "--replay-schedule-from"] {
+        for (path, latency) in [
+            (&with, None),
+            (&with, Some("1000000")),
+            (&without, Some("0")),
+        ] {
+            let replay = format!("{kind}={}", path.display());
+            let output = run(latency, &[&replay], false);
+            assert_eq!(
+                output.status.code(),
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                "{replay} at {latency:?}:\n{}",
+                stderr(&output)
+            );
+            assert!(
+                stderr(&output).contains("cannot reproduce the run"),
+                "{replay} at {latency:?}:\n{}",
+                stderr(&output)
+            );
+            assert_eq!(
+                stdout(&output),
+                "",
+                "{replay} at {latency:?}: the guest ran"
+            );
+        }
+    }
+}
+
+/// The hand-off verifies on every channel kind: the strict verifier finds
+/// the two runs identical with the option on for a pipe (`wake-data`), a
+/// pipe carried across exec (`wake-exec`), a partial write (`wake-partial`),
+/// and FIFOs shared by two threads (`thread`, and `fill`'s 196731 bytes in
+/// partial writes), whose channels are named by ordinal rather than by host
+/// inode, which the scheduler's logged polls would carry.
+#[test]
+fn the_pipe_wake_hand_off_verifies_on_every_channel_kind() {
+    for mode in ["wake-data", "wake-exec", "wake-partial", "thread", "fill"] {
+        let extra = ["--verify", "--verify-strict"];
+        let output = pipe_wake_run(mode, Some("0"), &extra, &[]);
+        assert_success(&output, &[mode]);
+        let log = stderr(&output);
+        assert!(
+            log.contains("Success: deterministic. Determinism verified."),
+            "{mode}: verification failed:\n{log}"
+        );
+    }
+}
+
+/// The FIFO rows of `the_pipe_wake_hand_off_verifies_on_every_channel_kind`
+/// under chaos scheduling, and at `L = 1 ms` with the PMU denied.
+#[test]
+fn the_pipe_wake_hand_off_verifies_on_fifos_under_chaos_and_a_nonzero_latency() {
+    for mode in ["thread", "fill"] {
+        for seed in ["--seed=1", "--seed=2"] {
+            let extra = ["--chaos", seed, "--verify", "--verify-strict"];
+            let output = pipe_wake_run(mode, Some("0"), &extra, &[]);
+            assert_success(&output, &extra);
+            let log = stderr(&output);
+            assert!(
+                log.contains("Success: deterministic. Determinism verified."),
+                "{mode} {seed}: verification failed:\n{log}"
+            );
+        }
+        let extra = ["--verify", "--verify-strict"];
+        let output = pipe_wake_run_without_pmu(mode, Some("1000000"), &extra, &[]);
+        assert_success(&output, &extra);
+        let log = stderr(&output);
+        assert!(
+            log.contains("Success: deterministic. Determinism verified."),
+            "{mode} at 1 ms without a PMU: verification failed:\n{log}"
+        );
+    }
+}
+
 /// A FIFO whose other end another guest holds: a read or write that must wait
 /// for that guest no longer blocks in the kernel while it holds the scheduler
 /// turn, where the guest at the other end could never run

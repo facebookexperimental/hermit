@@ -936,6 +936,10 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         target_timeslice: default_config.target_timeslice,
         target_timeslice_syscalls_only: default_config.target_timeslice_syscalls_only,
         futex_wake_yields: default_config.futex_wake_yields,
+        // Never in record mode, whatever the default: recordings made before
+        // the option existed, and record mode's own scheduling, have no
+        // hand-off (https://github.com/rrnewton/hermit/issues/4380).
+        pipe_wake_latency: None,
         scheduler_turn_cost: default_config.scheduler_turn_cost,
         seed: default_config.seed,
         rng_seed: default_config.rng_seed,
@@ -1153,6 +1157,16 @@ mod tests {
         assert!(config.panic_on_unsupported_syscalls);
         assert!(config.exit_on_unsupported_syscall);
         assert!(!config.shutdown_on_unsupported_syscall);
+    }
+
+    /// Record mode never hands the turn to a readied pipe poller, whatever
+    /// the default (https://github.com/rrnewton/hermit/issues/4380).
+    #[test]
+    fn record_and_replay_never_apply_the_pipe_wake_latency() {
+        assert_eq!(
+            record_or_replay_config(Path::new("replay-data")).pipe_wake_latency,
+            None
+        );
     }
 
     #[test]

@@ -1002,6 +1002,25 @@ impl KernelSignalState {
         self.ignored | (default_ignored_signals() & !self.caught)
     }
 
+    /// Whether delivering `signal` now ends the process: its disposition is
+    /// `SIG_DFL` and its default action terminates or dumps core, not ignores,
+    /// stops or continues. `SIGKILL` always does.
+    pub(crate) fn default_action_ends_process(&self, signal: i32) -> bool {
+        let bit = kernel_sigset_bit(signal);
+        let stops_or_continues = [
+            libc::SIGSTOP,
+            libc::SIGTSTP,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+            libc::SIGCONT,
+        ]
+        .into_iter()
+        .fold(0, |set, signal| set | kernel_sigset_bit(signal));
+        signal == libc::SIGKILL
+            || ((self.ignored | self.caught | default_ignored_signals() | stops_or_continues) & bit)
+                == 0
+    }
+
     /// The job-control stop signals `SIGTSTP`, `SIGTTIN`, and `SIGTTOU` whose
     /// disposition is still `SIG_DFL`.
     ///

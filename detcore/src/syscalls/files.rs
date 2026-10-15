@@ -1947,12 +1947,35 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(errno) => return Err(errno.into()),
         };
         info!("[detcore] the FIFO open polls for a guest peer");
+        // A waiting open is an end on Linux: it readies the opens waiting for
+        // this end (`--pipe-wake-latency`).
+        let in_effect = self.cfg.pipe_wake_latency_in_effect().is_some();
+        let channel = crate::pipe_wake::ChannelId::Fifo(if in_effect {
+            crate::fifo_peer::fifo_channel(fifo)
+        } else {
+            0
+        });
+        let (readies, waits_for) = if reading {
+            (
+                crate::pipe_wake::Wants::PeerReader,
+                crate::pipe_wake::Wants::PeerWriter,
+            )
+        } else {
+            (
+                crate::pipe_wake::Wants::PeerWriter,
+                crate::pipe_wake::Wants::PeerReader,
+            )
+        };
+        self.note_pipe_readied(guest, channel, readies).await;
 
         let mut resources = Resources::new(guest.thread_state().dettid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.fyi(call.name());
         resources.polls_guest_state_only = true;
         resources.waits_until_nothing_else_can_run = true;
+        if in_effect {
+            resources.polls_channel = Some((channel, waits_for));
+        }
         // As a polled pipe read: a signal another task sends ends the wait.
         resources.set_signal_interrupt_errno(Errno::ERESTARTSYS);
         resources.signal_state_task = crate::syscalls::helpers::guest_signal_state_task(guest);
@@ -3272,6 +3295,29 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .thread_state()
                         .with_detfd(fd, |detfd| detfd.mark_fifo_awaiting_guest_peer())?;
                     crate::fifo_peer::note_guest_open(fifo, call.flags().bits());
+                    // Name the FIFO for `--pipe-wake-latency`, and ready the
+                    // opens waiting for the end this one opened.
+                    if self.cfg.pipe_wake_latency_in_effect().is_some() {
+                        let accmode = call.flags().bits() & libc::O_ACCMODE;
+                        let end = crate::pipe_wake::ChannelEnd {
+                            channel: crate::pipe_wake::ChannelId::Fifo(
+                                crate::fifo_peer::fifo_channel(fifo),
+                            ),
+                            reads: accmode != libc::O_WRONLY,
+                            writes: accmode != libc::O_RDONLY,
+                        };
+                        guest
+                            .thread_state()
+                            .with_detfd(fd, |detfd| detfd.set_channel(end))?;
+                        for (applies, readies) in [
+                            (end.reads, crate::pipe_wake::Wants::PeerReader),
+                            (end.writes, crate::pipe_wake::Wants::PeerWriter),
+                        ] {
+                            if applies {
+                                self.note_pipe_readied(guest, end.channel, readies).await;
+                            }
+                        }
+                    }
                 }
                 if let (true, Some(stat)) = (guest.config().record_host_inputs, &host_stat) {
                     crate::tool_global::record_host_input(
@@ -3534,6 +3580,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return refusal;
         }
+        let channel_end = self.pipe_channel_end(guest, fd);
         let res = self.record_or_replay(guest, call).await;
         let fd_was_released = !matches!(res, Err(Errno::EBADF) | Err(Errno::ERESTARTSYS));
         if fd_was_released {
@@ -3544,6 +3591,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 crate::tool_global::descriptors_replaced(guest, fd, fd).await;
             }
             trace!("Closed {}", fd);
+            self.note_channel_end_closed(guest, channel_end).await;
         }
         res.map_err(Error::from)
     }
@@ -3579,6 +3627,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return refusal;
         }
 
+        let channel_ends = self.pipe_channel_ends_in(guest, first, last);
         let result = self.record_or_replay(guest, call).await;
         if result.is_ok() {
             let released = guest.thread_state_mut().remove_fd_range(first, last);
@@ -3586,6 +3635,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.release_port_for_open_file(guest, open_file_id).await;
             }
             crate::tool_global::descriptors_replaced(guest, first, last).await;
+            for end in channel_ends {
+                self.note_channel_end_closed(guest, Some(end)).await;
+            }
         }
         result.map_err(Error::from)
     }
@@ -7750,6 +7802,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return refusal;
         }
+        // `dup2` over another open descriptor closes it.
+        let closed_end = (old_fd != new_fd)
+            .then(|| self.pipe_channel_end(guest, new_fd))
+            .flatten();
         let res = self.record_or_replay(guest, call).await?;
         // Reported as soon as the kernel replaced `new_fd`, before Detcore's
         // own table update, which can still fail for a descriptor it does not
@@ -7765,6 +7821,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(open_file_id) = replaced {
             self.release_port_for_open_file(guest, open_file_id).await;
         }
+        self.note_channel_end_closed(guest, closed_end).await;
         Ok(res)
     }
 
@@ -7802,6 +7859,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return refusal;
         }
+        // `dup3` over another open descriptor closes it.
+        let closed_end = (old_fd != new_fd)
+            .then(|| self.pipe_channel_end(guest, new_fd))
+            .flatten();
         let res = self.record_or_replay(guest, call).await?;
         // Reported before Detcore's own table update, as for `dup2`.
         if let Ok(new_fd) = u32::try_from(new_fd) {
@@ -7811,6 +7872,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(open_file_id) = replaced {
             self.release_port_for_open_file(guest, open_file_id).await;
         }
+        self.note_channel_end_closed(guest, closed_end).await;
         Ok(res)
     }
 
@@ -7900,6 +7962,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             if internally_nonblocking {
                 self.maybe_set_nonblocking_fd(guest, fds[0]);
                 self.maybe_set_nonblocking_fd(guest, fds[1]);
+            }
+            // Both ends name the pipe by the read end's open file description,
+            // for `--pipe-wake-latency` only (`crate::pipe_wake`).
+            if self.cfg.pipe_wake_latency_in_effect().is_some() {
+                let read_end = guest
+                    .thread_state()
+                    .with_detfd(fds[0], |detfd| detfd.open_file_id())?;
+                let channel = crate::pipe_wake::ChannelId::Pipe(read_end);
+                for (fd, reads) in [(fds[0], true), (fds[1], false)] {
+                    let end = crate::pipe_wake::ChannelEnd {
+                        channel,
+                        reads,
+                        writes: !reads,
+                    };
+                    guest
+                        .thread_state()
+                        .with_detfd(fd, |detfd| detfd.set_channel(end))?;
+                }
             }
         }
 

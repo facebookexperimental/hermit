@@ -68,10 +68,39 @@ static GUEST_MADE: Mutex<BTreeSet<(u64, u64)>> = Mutex::new(BTreeSet::new());
 /// Record that a guest made the FIFO `fifo`.
 pub(crate) fn note_guest_made(fifo: (u64, u64)) {
     GUEST_MADE.lock().unwrap().insert(fifo);
+    forget_fifo_channel(fifo);
+}
+
+/// `--pipe-wake-latency`'s names for FIFOs ([`fifo_channel`]): each FIFO
+/// `(dev, ino)` that has had a channel end in this run, with its ordinal,
+/// and the next ordinal.
+type FifoChannelNames = (BTreeMap<(u64, u64), u64>, u64);
+static FIFO_CHANNELS: Mutex<FifoChannelNames> = Mutex::new((BTreeMap::new(), 0));
+
+/// The channel name of the FIFO `fifo` for `--pipe-wake-latency`
+/// (<https://github.com/rrnewton/hermit/issues/4380>): an ordinal assigned at
+/// its first use, which is in a guest's turn, so the name, which the
+/// scheduler's polls log, is the same in every run; a host `(dev, ino)` is
+/// not. A guest that makes a FIFO or removes the last name of one it made
+/// drops the entry ([`note_guest_made`], [`forget_guest_made`]), so a number
+/// the kernel reuses for a new FIFO gets a new ordinal. As for `GUEST_MADE`,
+/// a host's removal is not seen.
+pub(crate) fn fifo_channel(fifo: (u64, u64)) -> u64 {
+    let mut channels = FIFO_CHANNELS.lock().unwrap();
+    let (names, next) = &mut *channels;
+    *names.entry(fifo).or_insert_with(|| {
+        *next += 1;
+        *next - 1
+    })
+}
+
+fn forget_fifo_channel(fifo: (u64, u64)) {
+    FIFO_CHANNELS.lock().unwrap().0.remove(&fifo);
 }
 
 /// Forget the guest-made FIFO `fifo`, whose name a guest removed.
 pub(crate) fn forget_guest_made(fifo: (u64, u64)) {
+    forget_fifo_channel(fifo);
     if GUEST_MADE.lock().unwrap().remove(&fifo) {
         // No host inode number: the line is part of the verified log.
         tracing::info!(

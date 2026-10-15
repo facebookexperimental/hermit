@@ -211,6 +211,7 @@ pub struct InterpolateOpts {
 
 impl InterpolateOpts {
     pub fn run(&self, _common_args: &CommonOpts) -> anyhow::Result<bool> {
+        let latency = Self::common_pipe_wake_latency(&self.file_a, &self.file_b)?;
         let first_schedule = read_trace(&self.file_a);
         let second_schedule = read_trace(&self.file_b);
         // let i = 0;
@@ -231,9 +232,74 @@ impl InterpolateOpts {
             )
         };
         let sched_path = tmpdir_path.join(format!("interpolate_{}.events", self.interpolate));
-        let next_sched = PreemptionRecord::from_sched_events(requested_schedule);
+        let next_sched =
+            PreemptionRecord::from_sched_events(requested_schedule).with_pipe_wake_latency(latency);
         next_sched.write_to_disk(&sched_path).unwrap();
 
         Ok(true)
+    }
+
+    /// The `--pipe-wake-latency` both schedules were recorded under, which
+    /// the interpolated schedule carries; schedules recorded under different
+    /// values are refused (<https://github.com/rrnewton/hermit/issues/4380>).
+    fn common_pipe_wake_latency(
+        file_a: &std::path::Path,
+        file_b: &std::path::Path,
+    ) -> anyhow::Result<Option<u64>> {
+        let read = |path: &std::path::Path| {
+            detcore::preemptions::read_recorded_pipe_wake_latency(path).map_err(anyhow::Error::msg)
+        };
+        let (a, b) = (read(file_a)?, read(file_b)?);
+        if a != b {
+            anyhow::bail!(
+                "{} and {} were recorded under different --pipe-wake-latency values ({:?} and \
+                 {:?}); no interpolation of them can be replayed",
+                file_a.display(),
+                file_b.display(),
+                a,
+                b
+            );
+        }
+        Ok(a)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two schedules recorded under different `--pipe-wake-latency` values,
+    /// off and `0` included, cannot be interpolated: no replay could
+    /// reproduce the result (https://github.com/rrnewton/hermit/issues/4380).
+    #[test]
+    fn interpolate_refuses_schedules_recorded_under_different_pipe_wake_latencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, latency: Option<u64>| {
+            let path = dir.path().join(name);
+            let record =
+                PreemptionRecord::from_sched_events(Vec::new()).with_pipe_wake_latency(latency);
+            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            path
+        };
+        let off = write("off.json", None);
+        let zero = write("zero.json", Some(0));
+        let one_ms = write("one-ms.json", Some(1_000_000));
+        assert_eq!(
+            InterpolateOpts::common_pipe_wake_latency(&off, &off).unwrap(),
+            None
+        );
+        assert_eq!(
+            InterpolateOpts::common_pipe_wake_latency(&zero, &zero).unwrap(),
+            Some(0)
+        );
+        for (a, b) in [(&off, &zero), (&zero, &one_ms), (&one_ms, &off)] {
+            let error = InterpolateOpts::common_pipe_wake_latency(a, b).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("different --pipe-wake-latency values"),
+                "{error}"
+            );
+        }
     }
 }

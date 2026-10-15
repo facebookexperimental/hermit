@@ -318,7 +318,7 @@ fn with_shared_description<R>(id: OpenFileId, f: impl FnOnce(&mut OpenFileDescri
     result
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct OpenFileDescription {
     id: OpenFileId,
     /// fd type
@@ -497,6 +497,59 @@ struct OpenFileDescription {
     /// (record/replay, or no virtual time).
     #[serde(default)]
     timerfd: Option<VirtualTimerfd>,
+    /// The pipe or FIFO this description is an end of, for handing the turn
+    /// to a thread polling it once another thread readies it
+    /// (`--pipe-wake-latency`, https://github.com/rrnewton/hermit/issues/4380).
+    /// Set only while that option is on; `None` otherwise, and for a
+    /// descriptor whose channel Detcore does not know.
+    #[serde(default)]
+    channel: Option<crate::pipe_wake::ChannelEnd>,
+}
+/// Written out, not derived, so that `channel` is printed only when it is set:
+/// a run without `--pipe-wake-latency` logs every description exactly as
+/// before the field existed.
+impl std::fmt::Debug for OpenFileDescription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("OpenFileDescription");
+        debug.field("id", &self.id);
+        debug.field("ty", &self.ty);
+        debug.field("inherited_external_read", &self.inherited_external_read);
+        debug.field("pidfd_target", &self.pidfd_target);
+        debug.field("status_flags", &self.status_flags);
+        debug.field("path", &self.path);
+        debug.field("inode", &self.inode);
+        debug.field("dirty", &self.dirty);
+        debug.field("physically_nonblocking", &self.physically_nonblocking);
+        debug.field("fifo_awaiting_guest_peer", &self.fifo_awaiting_guest_peer);
+        debug.field("stat", &self.stat);
+        debug.field("random_device_offset", &self.random_device_offset);
+        debug.field("resource", &self.resource);
+        debug.field("procfs", &self.procfs);
+        debug.field("sigalrm_phase1", &self.sigalrm_phase1);
+        debug.field("directory", &self.directory);
+        debug.field("directory_host_order", &self.directory_host_order);
+        debug.field("directory_lock", &self.directory_lock);
+        debug.field("socket_receive_timestamp", &self.socket_receive_timestamp);
+        debug.field("sock_diag", &self.sock_diag);
+        debug.field("netlink_route", &self.netlink_route);
+        debug.field("loopback_peer", &self.loopback_peer);
+        debug.field("network_channel", &self.network_channel);
+        debug.field("network_lowat", &self.network_lowat);
+        debug.field("network_socket", &self.network_socket);
+        debug.field("socketpair_endpoint", &self.socketpair_endpoint);
+        debug.field("accepted_connection", &self.accepted_connection);
+        debug.field("accept_in_turn_eligible", &self.accept_in_turn_eligible);
+        debug.field("exported", &self.exported);
+        debug.field("receive_timeout", &self.receive_timeout);
+        debug.field("flock_mode", &self.flock_mode);
+        debug.field("flock_mode_known", &self.flock_mode_known);
+        debug.field("flock_mode_ever_known", &self.flock_mode_ever_known);
+        debug.field("timerfd", &self.timerfd);
+        if let Some(channel) = &self.channel {
+            debug.field("channel", channel);
+        }
+        debug.finish()
+    }
 }
 
 /// A timerfd's expirations counted on Detcore's virtual clock instead of the
@@ -724,6 +777,7 @@ impl DetFd {
                 flock_mode_known: true,
                 flock_mode_ever_known: true,
                 timerfd: None,
+                channel: None,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             }))),
@@ -894,6 +948,19 @@ impl DetFd {
     /// Return the process identity carried by this pidfd, when known.
     pub(crate) fn pidfd_target(&self) -> Option<DetPid> {
         self.with_description(|d| d.pidfd_target)
+    }
+
+    /// The pipe or FIFO this descriptor is an end of, when
+    /// `--pipe-wake-latency` is on and Detcore knows it
+    /// (`crate::pipe_wake`).
+    pub(crate) fn channel(&self) -> Option<crate::pipe_wake::ChannelEnd> {
+        self.with_description(|d| d.channel)
+    }
+
+    /// Name the pipe or FIFO this descriptor's open file description is an
+    /// end of. Shared by every alias of the description.
+    pub(crate) fn set_channel(&self, channel: crate::pipe_wake::ChannelEnd) {
+        self.with_description(|d| d.channel = Some(channel))
     }
 
     /// Resource attached to the open file description.

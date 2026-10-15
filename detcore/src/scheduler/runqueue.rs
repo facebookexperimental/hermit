@@ -165,9 +165,12 @@ struct QueueValue {
     tid: DetTid,
     /// Upgrade to this priority during polling upgrades
     poll_upgrade: Option<Priority>,
-    /// Set when `restore_poller_priority` restored this poller because its
-    /// timeout deadline passed, and the poller was at `LAST_PRIORITY` while
-    /// backed off. Until it runs, the deterministic-work-first gates
+    /// Set when `restore_poller_priority` restored this poller, and the
+    /// poller was at `LAST_PRIORITY` while backed off. It has two callers:
+    /// the poller's timeout deadline passed, or, under
+    /// `--pipe-wake-latency`, another thread's action readied its channel
+    /// (`Scheduler::ready_channel`,
+    /// <https://github.com/rrnewton/hermit/issues/4380>). Until it runs, the deterministic-work-first gates
     /// (`only_pollers`, `has_runnable_besides`) keep counting it as a poller,
     /// exactly as they did while it was backed off. A poller backed off below
     /// `LAST_PRIORITY` (after 1 to 3 retries) was already ordinary work for
@@ -848,14 +851,10 @@ impl RunQueue {
         }
     }
 
-    /// Whether selection follows priority order: `None` and `ConnectBind` pop
-    /// the first queued entry, so a backed-off poller can be starved; `Random`
-    /// and `StickyRandom` draw a uniform index into the queue and never are.
+    /// Whether selection follows priority order
+    /// ([`SchedHeuristic::is_priority_ordered`]).
     pub fn is_priority_ordered(&self) -> bool {
-        matches!(
-            self.sched_strategy,
-            SchedHeuristic::None | SchedHeuristic::ConnectBind
-        )
+        self.sched_strategy.is_priority_ordered()
     }
 
     /// The priority `tid` is queued at, if it is queued.

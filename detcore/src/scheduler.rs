@@ -17,6 +17,7 @@ pub(crate) mod parked;
 #[cfg(test)]
 mod parked_tests;
 pub(crate) mod pid_namespaces;
+mod pipe_wake;
 pub(crate) mod real_timer;
 mod rejoin_log;
 mod replayer;
@@ -1239,6 +1240,15 @@ pub struct Scheduler {
     /// no recorded process): from then on no child wait counts as part of a
     /// deadlock ([`Scheduler::record_unresolved_sigkill`]).
     unresolved_sigkill: bool,
+    /// Under `--pipe-wake-latency`, the pollers each thread's actions readied
+    /// since its last turn, which its hand-off moves it behind
+    /// (`scheduler::pipe_wake`).
+    pipe_handoff_pending: BTreeMap<DetTid, Vec<DetTid>>,
+    /// Processes a delivered signal with a fatal default action has doomed,
+    /// read only by the `--pipe-wake-latency` scan (`scheduler::pipe_wake`).
+    fatal_signal_doomed: BTreeSet<DetPid>,
+    /// Whether the `--pipe-wake-latency` hand-off has logged that it is inert.
+    pipe_wake_inert_logged: bool,
 
     /// Threads released into a background call that sleeps under a temporary
     /// mask other than their own (`rt_sigsuspend`, or a `ppoll` or `pselect6`
@@ -3559,7 +3569,11 @@ impl Scheduler {
         let (backend_failure_sender, backend_failure_wake) = oneshot::channel();
         Self {
             preemption_writer: if cfg.record_preemptions {
-                Some(PreemptionWriter::new(cfg.record_preemptions_to.clone()).with_epoch(cfg.epoch))
+                Some(
+                    PreemptionWriter::new(cfg.record_preemptions_to.clone())
+                        .with_epoch(cfg.epoch)
+                        .with_pipe_wake_latency(cfg.pipe_wake_latency_in_effect()),
+                )
             } else {
                 None
             },
@@ -3605,6 +3619,9 @@ impl Scheduler {
             #[cfg(test)]
             test_task_states: Default::default(),
             unresolved_sigkill: false,
+            pipe_handoff_pending: Default::default(),
+            fatal_signal_doomed: Default::default(),
+            pipe_wake_inert_logged: false,
             pending_run_queue_admissions: Default::default(),
             progress_epoch: 0,
             last_progress: 0,
@@ -12813,6 +12830,7 @@ impl Scheduler {
                         record_suffix,
                     );
                 }
+                self.forget_pipe_handoff(next_dtid);
                 self.unblock_guest(next_dtid, resp)?;
                 Ok(())
             }

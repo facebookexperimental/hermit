@@ -152,6 +152,28 @@ impl AnalyzeOpts {
             && self.target_exit_code == ExitStatusConstraint::NonZero
     }
 
+    /// Write analyze's final on-target and baseline schedules, stamped
+    /// ([`Self::stamp_trial_record`]), and say where.
+    pub fn write_final_schedules(
+        &self,
+        failing: Vec<SchedEvent>,
+        failing_path: &Path,
+        passing: Vec<SchedEvent>,
+        passing_path: &Path,
+    ) {
+        self.write_trial_schedule(failing, failing_path).unwrap();
+        eprintln!(
+            "Wrote final on-target ({}) schedule to {}",
+            self.display_criteria(),
+            failing_path.display()
+        );
+        self.write_trial_schedule(passing, passing_path).unwrap();
+        eprintln!(
+            "Wrote final baseline (off-target) schedule to {}",
+            passing_path.display()
+        );
+    }
+
     fn display_criteria(&self) -> String {
         let mut strs: Vec<String> = Vec::new();
         match &self.target_exit_code {
@@ -451,10 +473,7 @@ impl AnalyzeOpts {
                 .with_schedule_replay() // Default input path
                 .with_schedule_recording(); // Default output path
             // Prepare the next synthetic schedule on disk:
-            let next_sched = PreemptionRecord::from_sched_events(sched.to_owned());
-            next_sched
-                .write_to_disk(newrun.sched_path_in())
-                .map_err(Error::msg)?;
+            self.write_trial_schedule(sched.to_owned(), newrun.sched_path_in())?;
 
             if self.verbose {
                 eprintln!(
@@ -590,21 +609,12 @@ impl AnalyzeOpts {
             self.execution_context,
         );
 
-        {
-            let pr = PreemptionRecord::from_sched_events(failing_schedule);
-            pr.write_to_disk(&final_failing_path).unwrap();
-            eprintln!(
-                "Wrote final on-target ({}) schedule to {}",
-                self.display_criteria(),
-                final_failing_path.display()
-            );
-            let pr = PreemptionRecord::from_sched_events(passing_schedule);
-            pr.write_to_disk(&final_passing_path).unwrap();
-            eprintln!(
-                "Wrote final baseline (off-target) schedule to {}",
-                final_passing_path.display()
-            );
-        }
+        self.write_final_schedules(
+            failing_schedule,
+            &final_failing_path,
+            passing_schedule,
+            &final_passing_path,
+        );
 
         {
             let mut header = String::new();
@@ -771,7 +781,8 @@ impl AnalyzeOpts {
         .into_iter()
         .filter_map(|(option, path)| Some((option, path?)))
         .collect();
-        self.adopt_recorded_epoch(&recordings)
+        self.adopt_recorded_epoch(&recordings)?;
+        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
     }
 
     /// Take the settings `analyze` inherits from the global options: every
@@ -1116,6 +1127,85 @@ mod tests {
         options.prepare(&args.global)?;
         options.tmp_dir = Some(dir.to_path_buf());
         Ok(*options)
+    }
+
+    /// Analyze refuses, before any trial, a `--run1-preemptions` record made
+    /// under another `--pipe-wake-latency` than the trials' own, or one its
+    /// run arguments replay; its final schedules carry the trials' value
+    /// (https://github.com/rrnewton/hermit/issues/4380).
+    #[test]
+    fn analyze_refuses_records_under_another_pipe_wake_latency() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = |name: &str, latency: Option<u64>| {
+            let path = record_with_epoch(dir.path(), name, None);
+            let mut value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            if let Some(latency) = latency {
+                value["pipe_wake_latency"] = serde_json::Value::from(latency);
+            }
+            std::fs::write(&path, value.to_string()).unwrap();
+            path
+        };
+        let prepare = |run1: &Path, run_args: &[&str]| {
+            let run1 = format!("--run1-preemptions={}", run1.display());
+            let mut argv = vec!["hermit", "analyze", run1.as_str(), "--"];
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.prepare(&args.global).map(|_| options)
+        };
+        let off = record("off", None);
+        let zero = record("zero", Some(0));
+        let options = prepare(&zero, &["--pipe-wake-latency=0"]).unwrap();
+        assert_eq!(options.trial_pipe_wake_latency(), Some(0));
+        // Every record analyze writes carries the trials' latency: the final
+        // schedules, each trial's schedule, and minimize's records.
+        let written = |options: &AnalyzeOpts| {
+            let (failing, passing, trial) = (
+                dir.path().join("final-failing.json"),
+                dir.path().join("final-passing.json"),
+                dir.path().join("trial.json"),
+            );
+            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing);
+            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            [failing, passing, trial]
+                .map(|path| detcore::preemptions::read_recorded_pipe_wake_latency(&path).unwrap())
+        };
+        assert_eq!(written(&options), [Some(0); 3]);
+        assert_eq!(
+            options
+                .stamp_trial_record(PreemptionRecord::from_vecs(&Default::default()))
+                .pipe_wake_latency(),
+            Some(0)
+        );
+        let options_off = prepare(&off, &[]).unwrap();
+        assert_eq!(written(&options_off), [None; 3]);
+        let replay_flag = format!("--replay-preemptions-from={}", zero.display());
+        for (run1, run_args, named) in [
+            (&zero, vec![], "--run1-preemptions"),
+            (&off, vec!["--pipe-wake-latency=0"], "--run1-preemptions"),
+            (
+                &off,
+                vec![replay_flag.as_str()],
+                "--replay-preemptions-from",
+            ),
+        ] {
+            let error = prepare(run1, &run_args).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{error:#}"
+            );
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(named) && message.contains("cannot reproduce the run"),
+                "{run_args:?}: {message}"
+            );
+        }
     }
 
     /// Runs `test` (this module's test of that name) in two child processes,

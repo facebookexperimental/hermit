@@ -987,6 +987,7 @@ mod tests {
             ],
         ),
         ("futex-wake-yields", &["--futex-wake-yields"]),
+        ("pipe-wake-latency", &["--pipe-wake-latency=1000000"]),
         ("scheduler-turn-cost", &["--scheduler-turn-cost=10000"]),
         ("sigint-instakill", &["--sigint-instakill"]),
         ("warn-non-zero-binds", &["--warn-non-zero-binds"]),

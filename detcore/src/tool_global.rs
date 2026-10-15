@@ -2860,6 +2860,21 @@ impl GlobalState {
                     threads_counted: inodes.threads_counted,
                 })
             }
+            GlobalRequest::ReadyChannel(channel, wants) => R::ReadyChannel(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .ready_channel(dtid, channel, wants),
+            ),
+            GlobalRequest::HandOffTurn => {
+                R::HandOffTurn(self.lock_rpc_scheduler(false).await.hand_off_turn(dtid))
+            }
+            GlobalRequest::RecordFatalSignal => {
+                let mut scheduler = self.lock_rpc_scheduler(false).await;
+                if let Some(process) = scheduler.registered_process(dtid) {
+                    scheduler.record_committed_fatal_signal(process);
+                }
+                R::RecordFatalSignal(())
+            }
             GlobalRequest::TouchFile(ino) => R::TouchFile(self.recv_touch_file(from, ino).await),
             GlobalRequest::SetFileMtime(ino, mtime) => {
                 R::SetFileMtime(self.recv_set_file_mtime(from, ino, mtime).await)
@@ -3923,6 +3938,7 @@ impl GlobalState {
                     waits_until_nothing_else_can_run: false,
                     previous_attempt_made_progress: false,
                     upgraded_from_attempt: 0,
+                    polls_channel: None,
                     poll_deadline: None,
                     in_guest_sleep_sigalrm: None,
                     signal_state_task: None,
@@ -4978,6 +4994,16 @@ pub enum GlobalRequest {
     /// The inode pool's state, for a directory snapshot (see `SnapshotMark`).
     DirectorySnapshotMark,
 
+    /// `--pipe-wake-latency`: an action of the calling thread readied the
+    /// pollers of a channel that want this (`Scheduler::ready_channel`).
+    ReadyChannel(crate::pipe_wake::ChannelId, crate::pipe_wake::Wants),
+    /// `--pipe-wake-latency`: the calling thread's hand-off is due
+    /// (`Scheduler::hand_off_turn`).
+    HandOffTurn,
+    /// The calling thread is delivering a signal whose default action ends
+    /// its process (`Scheduler::record_committed_fatal_signal`).
+    RecordFatalSignal,
+
     /// Bump mtime
     TouchFile(RawInode),
 
@@ -5299,6 +5325,9 @@ pub enum GlobalResponse {
     RetireInode(()),
     ForgetRetiredInode(()),
     DirectorySnapshotMark(SnapshotMark),
+    ReadyChannel(crate::pipe_wake::ReadyOutcome),
+    HandOffTurn(bool),
+    RecordFatalSignal(()),
     TouchFile(()),
     SetFileMtime(()),
     GlobalTimeLowerBound(LogicalTime),
@@ -5496,6 +5525,22 @@ pub async fn prepare_exec<G, T>(
             .thread_state()
             .shared_open_files_for_exec()
             .expect("prepared exec descriptors are no longer live"),
+        channels: Default::default(),
+        open_file_namespace: None,
+    };
+    // `--pipe-wake-latency` on a backend that rediscovers its descriptors
+    // after exec: carry the channels, and reserve the old numbering at every
+    // exec (`crate::pipe_wake`).
+    let fd_state = if guest.config().pipe_wake_latency_in_effect().is_some()
+        && guest.config().backend.rediscovers_descriptors_after_exec
+    {
+        ExecFdState {
+            channels: guest.thread_state().pipe_channels_for_exec(),
+            open_file_namespace: Some(guest.thread_state().open_file_namespace_for_exec()),
+            ..fd_state
+        }
+    } else {
+        fd_state
     };
     let (_, response) =
         send_and_update_time(guest, GlobalRequest::PrepareExec(detpid, mm, fd_state)).await;
@@ -5541,6 +5586,10 @@ where
             guest
                 .thread_state_mut()
                 .set_open_file_creator(open_files.creator);
+        } else if let Some((creator, _)) = overrides.open_file_namespace {
+            // `--pipe-wake-latency`: continue the old numbering, as the
+            // random-device survivors above do.
+            guest.thread_state_mut().set_open_file_creator(creator);
         }
         let dettid = guest.thread_state().dettid;
         let metadata = Arc::clone(&guest.thread_state().file_metadata);
@@ -6001,6 +6050,9 @@ where
     // backend whose `is_backend_runtime_bootstrap` can return true ever sets it.
     r.backend_runtime_bootstrap |=
         guest.thread_state().in_uncharged_bootstrap_syscall && guest.is_backend_runtime_bootstrap();
+    // Any turn of its own is a hand-off under `--pipe-wake-latency`: the
+    // thread goes back behind the pollers it readied (`crate::pipe_wake`).
+    guest.thread_state_mut().pipe_handoff_due = None;
     if guest.config().sequentialize_threads {
         if let Some(lease) = guest.signal_observation_lease() {
             if let Some(site) = guest.parked_signal_site() {
@@ -6584,6 +6636,49 @@ where
         GlobalResponse::DirectorySnapshotMark(mark) => mark,
         _ => unreachable!(),
     }
+}
+
+/// `--pipe-wake-latency`: report that the calling thread's action readied the
+/// pollers of `channel` that want `wants` (`Scheduler::ready_channel`).
+pub async fn ready_channel<G, T>(
+    guest: &mut G,
+    channel: crate::pipe_wake::ChannelId,
+    wants: crate::pipe_wake::Wants,
+) -> crate::pipe_wake::ReadyOutcome
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp = send_and_update_time(guest, GlobalRequest::ReadyChannel(channel, wants)).await;
+    match resp.1 {
+        GlobalResponse::ReadyChannel(outcome) => outcome,
+        _ => unreachable!(),
+    }
+}
+
+/// `--pipe-wake-latency`: the calling thread's hand-off is due. Returns
+/// whether the scheduler moved it behind the pollers it readied, so that it
+/// must now yield (`Scheduler::hand_off_turn`).
+pub async fn hand_off_turn<G, T>(guest: &mut G) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp = send_and_update_time(guest, GlobalRequest::HandOffTurn).await;
+    match resp.1 {
+        GlobalResponse::HandOffTurn(yields) => yields,
+        _ => false,
+    }
+}
+
+/// Record that the calling thread is delivering a signal whose default action
+/// ends its process (`Scheduler::record_committed_fatal_signal`).
+pub async fn record_fatal_signal<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let _ = send_and_update_time(guest, GlobalRequest::RecordFatalSignal).await;
 }
 
 /// [`determinize_inode`] for an entry of a directory snapshot taken at
@@ -11497,6 +11592,8 @@ mod tests {
             initial_input: None,
             robust_wakes: Vec::new(),
             open_files: None,
+            channels: Default::default(),
+            open_file_namespace: None,
         };
         state.pending_exec_states.lock().unwrap().insert(
             detpid,

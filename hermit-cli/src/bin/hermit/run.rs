@@ -3510,6 +3510,58 @@ fn replay_networking_adopts_the_trace_epoch_and_refuses_another() {
     );
 }
 
+/// A replay of a record made under another `--pipe-wake-latency` is refused,
+/// in both directions and for a different latency, under both replay flags;
+/// `0` is not off; a record without the field is off
+/// (https://github.com/rrnewton/hermit/issues/4380).
+#[test]
+fn replay_refuses_another_pipe_wake_latency() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = |name: &str, latency: Option<u64>| {
+        let path = dir.path().join(name);
+        let record = detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+            .with_pipe_wake_latency(latency);
+        std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+        path
+    };
+    let off = record("off.json", None);
+    let zero = record("zero.json", Some(0));
+    let three = record("three.json", Some(3_000_000));
+    assert!(
+        !std::fs::read_to_string(&off)
+            .unwrap()
+            .contains("pipe_wake_latency")
+    );
+    for flag in ["--replay-schedule-from", "--replay-preemptions-from"] {
+        for (path, latency, refused) in [
+            (&off, None, false),
+            (&off, Some("0"), true),
+            (&zero, None, true),
+            (&zero, Some("0"), false),
+            (&zero, Some("3000000"), true),
+            (&three, Some("0"), true),
+            (&three, Some("3000000"), false),
+        ] {
+            let replay = format!("{flag}={}", path.display());
+            let mut argv = vec!["fakehermit".to_owned(), replay];
+            if let Some(latency) = latency {
+                argv.push(format!("--pipe-wake-latency={latency}"));
+            }
+            argv.push("fakeprog".to_owned());
+            let ro = RunOpts::parse_from(&argv);
+            let result = ro.refuse_replay_under_another_pipe_wake_latency();
+            assert_eq!(result.is_err(), refused, "{argv:?}: {result:?}");
+            if let Err(error) = result {
+                let error = format!("{error:#}");
+                assert!(
+                    error.contains(flag) && error.contains("cannot reproduce the run"),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn network_trace_is_reached_through_a_descriptor_opened_before_the_container() {
     let dir = tempfile::tempdir().unwrap();
@@ -3763,6 +3815,130 @@ fn futex_wake_yields_parses_round_trips_and_is_refused_where_inert() {
                 "fakeprog",
             ],
             "--strace-only turns sequentialization off",
+        ),
+    ] {
+        let error = run_opts_for(&argv)
+            .validate_args_with_perf_support(true)
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{argv:?}: {error}");
+    }
+}
+
+/// `--pipe-wake-latency` parses, is rendered into the reproduce command and
+/// round-trips, keeping `0` distinct from unset. It is refused wherever it
+/// would be ignored: without sequentialized threads, with `--namespace-only`
+/// (`--lite`) or `--strace-only`, under every `--sched-heuristic` that does
+/// not select by priority (the same predicate the scheduler uses), and with
+/// the DBT backend (https://github.com/rrnewton/hermit/issues/4380).
+#[test]
+fn pipe_wake_latency_parses_round_trips_and_is_refused_where_inert() {
+    for value in ["0", "3000000"] {
+        let flag = format!("--pipe-wake-latency={value}");
+        let mut opts = RunOpts::parse_from(["fakehermit", flag.as_str(), "fakeprog"]);
+        opts.validate_args_with_perf_support(true).unwrap();
+        let expected = Some(value.parse::<u64>().unwrap());
+        assert_eq!(opts.det_opts.det_config.pipe_wake_latency, expected);
+        let rendered = format!("{opts}");
+        assert!(rendered.contains(&format!(" {flag}")), "{rendered}");
+        let mut reparsed_args = vec!["fakehermit".to_owned()];
+        reparsed_args.extend(shell_words::split(&rendered).unwrap());
+        let mut reparsed = RunOpts::parse_from(reparsed_args);
+        reparsed.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(reparsed.det_opts.det_config.pipe_wake_latency, expected);
+    }
+    let mut default = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    default.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(default.det_opts.det_config.pipe_wake_latency, None);
+    assert!(!format!("{default}").contains("pipe-wake"));
+
+    for heuristic in ["none", "connectbind", "random", "stickyrandom"] {
+        let parsed: detcore::SchedHeuristic = heuristic.parse().unwrap();
+        let flag = format!("--sched-heuristic={heuristic}");
+        let argv = [
+            "hermit",
+            "run",
+            flag.as_str(),
+            "--pipe-wake-latency=0",
+            "fakeprog",
+        ];
+        let result = run_opts_for(&argv).validate_args_with_perf_support(true);
+        assert_eq!(
+            result.is_ok(),
+            parsed.is_priority_ordered(),
+            "{argv:?}: {result:?}"
+        );
+    }
+
+    for (argv, expected) in [
+        (
+            vec![
+                "hermit",
+                "run",
+                "--no-sequentialize-threads",
+                "--pipe-wake-latency=0",
+                "fakeprog",
+            ],
+            "--no-sequentialize-threads",
+        ),
+        (
+            vec![
+                "hermit",
+                "--backend=dbt",
+                "run",
+                "--pipe-wake-latency=0",
+                "fakeprog",
+            ],
+            "the dbt backend cannot apply --pipe-wake-latency",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--debug-externalize-sockets",
+                "--pipe-wake-latency=0",
+                "fakeprog",
+            ],
+            "--debug-externalize-sockets makes them block in the kernel",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--namespace-only",
+                "--pipe-wake-latency=0",
+                "fakeprog",
+            ],
+            "--namespace-only (--lite) runs the guest natively",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--lite",
+                "--pipe-wake-latency=0",
+                "fakeprog",
+            ],
+            "--namespace-only (--lite) runs the guest natively",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--strace-only",
+                "--pipe-wake-latency=0",
+                "fakeprog",
+            ],
+            "--strace-only turns sequentialization off",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--sched-heuristic=random",
+                "--pipe-wake-latency=0",
+                "fakeprog",
+            ],
+            "does not select by priority",
         ),
     ] {
         let error = run_opts_for(&argv)
@@ -5262,6 +5438,36 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Refuse to replay a preemption or schedule record made under another
+    /// `--pipe-wake-latency` than this run's, including a different latency
+    /// (https://github.com/rrnewton/hermit/issues/4380). A record without the
+    /// field was made with the option off. As for the epoch, the record is
+    /// read before anything is launched.
+    fn refuse_replay_under_another_pipe_wake_latency(&self) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        for (option, path) in [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            let recorded =
+                detcore::preemptions::read_recorded_pipe_wake_latency(path).map_err(Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::pipe_wake_latency_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.pipe_wake_latency,
+            ) {
+                return Err(Error::new(PolicyRefusal).context(refusal));
+            }
+        }
+        Ok(())
+    }
+
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the
@@ -5906,6 +6112,7 @@ impl RunOpts {
         // off, and still before stdin is read or anything is launched.
         self.refuse_happens_before_without_preemption()?;
         self.adopt_replayed_schedule_epoch()?;
+        self.refuse_replay_under_another_pipe_wake_latency()?;
         // Once every implicit input it records is resolved, and before the
         // guest starts, so a run that fails or hangs still leaves it.
         self.write_saved_config()?;
@@ -6320,6 +6527,66 @@ impl RunOpts {
                      preprocessing, which runs on it); backend `{}` is refused until its \
                      handoff is tested",
                     backend.as_str()
+                );
+            }
+        }
+        // `--pipe-wake-latency` reorders the turns of sequentialized threads
+        // by priority (https://github.com/rrnewton/hermit/issues/4380). As for
+        // `--futex-wake-yields`, every launch that would accept it and ignore
+        // it refuses it before launch.
+        if let Some(latency) = config.pipe_wake_latency {
+            if self.namespace_only {
+                anyhow::bail!(
+                    "--pipe-wake-latency={latency} needs Detcore's scheduler; --namespace-only \
+                     (--lite) runs the guest natively, without it"
+                );
+            }
+            if self.strace_only {
+                anyhow::bail!(
+                    "--pipe-wake-latency={latency} reorders the turns of sequentialized threads; \
+                     --strace-only turns sequentialization off"
+                );
+            }
+            if !config.sequentialize_threads {
+                anyhow::bail!(
+                    "--pipe-wake-latency={latency} reorders the turns of sequentialized threads; \
+                     it cannot be combined with --no-sequentialize-threads"
+                );
+            }
+            if !config.sched_heuristic.is_priority_ordered() {
+                anyhow::bail!(
+                    "--pipe-wake-latency={latency} hands the turn over by priority order; \
+                     --sched-heuristic={:?} does not select by priority, so it would be ignored",
+                    config.sched_heuristic
+                );
+            }
+            if backend == Backend::Dbt {
+                anyhow::bail!(
+                    "the dbt backend cannot apply --pipe-wake-latency: its runtime reads a \
+                     frozen configuration form that predates the option"
+                );
+            }
+            if !matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Sabre) {
+                anyhow::bail!(
+                    "--pipe-wake-latency has been tested only on the ptrace backend (and e9patch \
+                     preprocessing, which runs on it) and on sabre; backend `{}` is refused \
+                     until its hand-off is tested",
+                    backend.as_str()
+                );
+            }
+            if config.debug_externalize_sockets {
+                anyhow::bail!(
+                    "--pipe-wake-latency={latency} hands off between threads polling \
+                     scheduler-managed pipes; --debug-externalize-sockets makes them block in the \
+                     kernel instead, so it would be ignored"
+                );
+            }
+            // Whatever else makes the option inert is refused too, rather than
+            // accepted and ignored (Codex review of
+            // https://github.com/rrnewton/hermit/pull/4424).
+            if config.pipe_wake_latency_in_effect().is_none() {
+                anyhow::bail!(
+                    "--pipe-wake-latency={latency} would have no effect with these options"
                 );
             }
         }

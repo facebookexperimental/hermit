@@ -655,6 +655,29 @@ pub struct Config {
     #[clap(long)]
     pub futex_wake_yields: bool,
 
+    /// Hand the turn to a thread polling a pipe or FIFO once another thread's action has readied it
+    /// (<https://github.com/rrnewton/hermit/issues/4380>), within this many virtual nanoseconds of
+    /// the acting thread's own time. A write that moves bytes into a scheduler-managed pipe, a read
+    /// that makes room in one, an explicit close of one end, or an open of a FIFO end readies the
+    /// threads polling for that: the scheduler restores their priority, and once the acting
+    /// thread's time is this far past its first readying action, at the next point where it
+    /// returns to Detcore (a syscall's entry or exit, or a signal or trapped instruction), it is
+    /// moved behind them and yields, so they run before it continues. `0` hands off at the end of
+    /// the readying syscall. Unset (the default), nothing changes: a polled thread whose peer is
+    /// ready waits for the acting thread's slice to end, as before. Each hand-off adds at least two
+    /// charged scheduler turns that the guest can observe as time (see `--scheduler-turn-cost`).
+    /// A thread that computes after its write without returning to Detcore delays the hand-off
+    /// until it next does, or its slice ends; an implicit close (an exit, an `O_CLOEXEC` exec)
+    /// readies nothing; and an end reopened by path (`/proc/self/fd/N`, as `/dev/fd/N` process
+    /// substitution does) is a channel of its own, so the other side's actions do not ready it. Recorded
+    /// schedules store the value, and a replay under another value is refused. Refused without
+    /// sequentialized threads, on the DBT, KVM and LiteInst backends, with `--namespace-only`,
+    /// `--strace-only` or `--debug-externalize-sockets`, and
+    /// under a `--sched-heuristic` that does not select by priority; never applied in record mode.
+    #[serde(default)]
+    #[clap(long, value_name = "nanos")]
+    pub pipe_wake_latency: Option<u64>,
+
     /// Virtual nanoseconds that each committed scheduler turn adds to the global clock, before
     /// `--clock-multiplier` (default 500000). The charge keeps time moving while threads take
     /// turns without running. Every thread observes it as a jump in time across a thread switch,
@@ -1179,6 +1202,17 @@ impl Config {
         Ok(charge as u64)
     }
 
+    /// The `--pipe-wake-latency` in effect (<https://github.com/rrnewton/hermit/issues/4380>): the
+    /// option's value in run mode, with sequentialized threads and a heuristic that selects by
+    /// priority; `None` everywhere else, so nothing of the hand-off runs.
+    pub fn pipe_wake_latency_in_effect(&self) -> Option<u64> {
+        self.pipe_wake_latency.filter(|_| {
+            self.use_nonblocking_sockets()
+                && !self.recordreplay_modes
+                && self.sched_heuristic.is_priority_ordered()
+        })
+    }
+
     /// Should we convert sockets to SOCK_NONBLOCK?
     pub fn use_nonblocking_sockets(&self) -> bool {
         self.sequentialize_threads && !self.debug_externalize_sockets
@@ -1336,6 +1370,9 @@ impl fmt::Display for Config {
         }
         if self.futex_wake_yields {
             write!(f, " --futex-wake-yields")?;
+        }
+        if let Some(latency) = self.pipe_wake_latency {
+            write!(f, " --pipe-wake-latency={}", latency)?;
         }
         if let Some(cost) = self.scheduler_turn_cost {
             write!(f, " --scheduler-turn-cost={}", cost)?;
@@ -1565,6 +1602,17 @@ pub enum SchedHeuristic {
     /// executing on the same thread, or picking another one.
     StickyRandom,
     // TODO: make all sleeps "instant".
+}
+
+impl SchedHeuristic {
+    /// Whether selection follows priority order: `None` and `ConnectBind` pop
+    /// the first queued entry, so a backed-off poller can be starved; `Random`
+    /// and `StickyRandom` draw a uniform index into the queue and never are.
+    /// The scheduler's run queue and `hermit run`'s refusals share this one
+    /// definition.
+    pub fn is_priority_ordered(self) -> bool {
+        matches!(self, SchedHeuristic::None | SchedHeuristic::ConnectBind)
+    }
 }
 
 // Lame to not derive this, but even `derive_more` won't do enums.
@@ -2266,8 +2314,9 @@ mod legacy_backend_json {
     /// the behaviour every legacy reader already has.
     /// `in_guest_detlog_forward_policy` is unset for DBT (its runtime forwards
     /// no records on a socket), so it is never written and reads as unset.
-    /// `futex_wake_yields` and `scheduler_turn_cost` came after the legacy
-    /// form froze too, and `hermit run` refuses them with the DBT backend.
+    /// `futex_wake_yields`, `pipe_wake_latency` and `scheduler_turn_cost` came
+    /// after the legacy form froze too, and `hermit run` refuses them with the
+    /// DBT backend.
     /// `replaying` is never written either: only `hermit replay` sets it, and
     /// replay runs only on the ptrace backend.
     /// `in_guest_site_patching_off` is false for DBT (it is set only for
@@ -2276,7 +2325,7 @@ mod legacy_backend_json {
     /// written and reads as unknown.
     /// `cpu_profile` and `cpu_profile_host` came after it as well. DBT refuses
     /// the x86-64-v3 profile, so they are never written and read as v2.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 15] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 16] = [
         "backend",
         "record_host_inputs",
         "backend_supports_blocked_wait_signal_interruption",
@@ -2287,6 +2336,7 @@ mod legacy_backend_json {
         "in_guest_site_patching_off",
         "target_timeslice_syscalls_only",
         "futex_wake_yields",
+        "pipe_wake_latency",
         "replaying",
         "scheduler_turn_cost",
         "inherited_seccomp",
@@ -2432,7 +2482,9 @@ mod legacy_backend_json {
                     | "replaying",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Unset, as its serde default is.
-                Some("in_guest_detlog_forward_policy" | "scheduler_turn_cost") => seed
+                Some(
+                    "in_guest_detlog_forward_policy" | "scheduler_turn_cost" | "pipe_wake_latency",
+                ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
                     .map_err(<A::Error as de::Error>::custom),
@@ -2704,6 +2756,7 @@ mod legacy_backend_json {
                 | "in_guest_site_patching_off"
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
+                | "pipe_wake_latency"
                 | "replaying"
                 | "scheduler_turn_cost"
                 | "inherited_seccomp"
@@ -3326,6 +3379,7 @@ mod tests {
                 | "in_guest_site_patching_off"
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
+                | "pipe_wake_latency"
                 | "replaying"
                 | "scheduler_turn_cost"
                 | "inherited_seccomp"
@@ -3346,11 +3400,12 @@ mod tests {
         // `backend_runs_guest_code_between_injections`,
         // `guest_may_inherit_a_terminal`,
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
-        // `target_timeslice_syscalls_only`, `futex_wake_yields`, `replaying`,
-        // `scheduler_turn_cost`, `inherited_seccomp`, `cpu_profile` and
-        // `cpu_profile_host` none: fourteen more keys, and fourteen fewer.
+        // `target_timeslice_syscalls_only`, `futex_wake_yields`,
+        // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
+        // `inherited_seccomp`, `cpu_profile` and `cpu_profile_host` none:
+        // fourteen more keys, and fifteen fewer.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len());
+        assert_eq!(fields.len(), keys.len() + 1);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:

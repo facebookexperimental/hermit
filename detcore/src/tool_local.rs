@@ -191,7 +191,7 @@ pub type ExecFdBlockingOverrides = BTreeSet<RawFd>;
 /// Metadata carried by the existing exec preparation/completion exchange.
 /// Descriptor numbers are authorized by that exchange's process/image fence,
 /// not by rediscovering whichever object later occupies a numeric stdio slot.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecFdState {
     pub(crate) blocking: ExecFdBlockingOverrides,
     pub(crate) inherited_reads: BTreeMap<RawFd, crate::fd::InheritedExternalRead>,
@@ -212,6 +212,42 @@ pub struct ExecFdState {
     /// Nonrandom descriptors retain their existing exec restoration paths.
     #[serde(default)]
     pub(crate) open_files: Option<ExecOpenFiles>,
+    /// Under `--pipe-wake-latency`, on a backend that rediscovers its
+    /// descriptors after exec: the channel end each surviving descriptor is,
+    /// reattached after rediscovery (`crate::pipe_wake`).
+    #[serde(default)]
+    pub(crate) channels: BTreeMap<RawFd, crate::pipe_wake::ChannelEnd>,
+    /// Under `--pipe-wake-latency`, on such a backend, at every exec: the old
+    /// table's open-file creator and next sequence, reserved before any
+    /// rediscovery, so that no description of the new image reuses an id a
+    /// channel elsewhere may still carry.
+    #[serde(default)]
+    pub(crate) open_file_namespace: Option<(DetTid, u64)>,
+}
+
+/// Written out, not derived, so that the `--pipe-wake-latency` fields are
+/// printed only when set: an exec without the option traces as before.
+impl std::fmt::Debug for ExecFdState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("ExecFdState");
+        debug
+            .field("blocking", &self.blocking)
+            .field("inherited_reads", &self.inherited_reads)
+            .field(
+                "initialize_inherited_stdio",
+                &self.initialize_inherited_stdio,
+            )
+            .field("initial_input", &self.initial_input)
+            .field("robust_wakes", &self.robust_wakes)
+            .field("open_files", &self.open_files);
+        if !self.channels.is_empty() {
+            debug.field("channels", &self.channels);
+        }
+        if let Some(namespace) = &self.open_file_namespace {
+            debug.field("open_file_namespace", namespace);
+        }
+        debug.finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,6 +316,8 @@ impl ExecFdState {
             && !self.initialize_inherited_stdio
             && self.initial_input.is_none()
             && self.open_files.is_none()
+            && self.channels.is_empty()
+            && self.open_file_namespace.is_none()
     }
 }
 
@@ -974,6 +1012,13 @@ impl FileMetadata {
                 .next_socket_open_file_sequence
                 .max(open_files.next_socket_sequence);
             open_files.creator
+        } else if shared_guest_table
+            && let Some((creator, next_sequence)) = state.open_file_namespace
+        {
+            // `--pipe-wake-latency`: no new description may take an id that a
+            // carried channel names (`crate::pipe_wake`).
+            self.next_open_file_sequence = self.next_open_file_sequence.max(next_sequence);
+            creator
         } else {
             owner
         };
@@ -1003,6 +1048,26 @@ impl FileMetadata {
             // in particular, do not reconnect an old socket's port association.
             self.file_handles.extend(handles);
             self.has_promoted_random_files = true;
+        }
+        // Last, so that no restoration above can replace a description after
+        // its channel is set: every carried channel end, discovering a
+        // descriptor not yet rediscovered (one the guest left `O_NONBLOCK`).
+        for (fd, end) in state.channels {
+            match self.discover_fd_from_current_process(owner, fd) {
+                Ok(()) => {
+                    self.with_detfd(fd, |detfd| detfd.set_channel(end))
+                        .expect("a just-discovered descriptor must remain registered");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "[detcore, dtid {}] descriptor {} carried a pipe channel across exec \
+                         but cannot be rediscovered; it keeps none: {}",
+                        owner,
+                        fd,
+                        error,
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1485,6 +1550,8 @@ mod file_metadata_tests {
     use std::os::fd::AsRawFd;
 
     use super::*;
+    use crate::pipe_wake::ChannelEnd;
+    use crate::pipe_wake::ChannelId;
 
     #[test]
     fn shared_exec_survivors_keep_aliases_and_allocator_after_closed_high_ids() {
@@ -1778,6 +1845,215 @@ mod file_metadata_tests {
         crate::fd::intern_open_files(&mut metadata.file_handles);
         assert_eq!(metadata.file_handles[&pipe_fd].ty(), FdType::Pipe);
         assert_eq!(metadata.file_handles[&fd].ty(), FdType::Rng);
+    }
+
+    /// The channel end of a pipe made through `ThreadState::add_fd`, as
+    /// `handle_pipe2` stores it on the read end under `--pipe-wake-latency`.
+    fn pipe_with_channel(
+        state: &ThreadState<()>,
+    ) -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd, ChannelEnd) {
+        let (reader, writer) = nix::unistd::pipe2(OFlag::empty()).unwrap();
+        state
+            .add_fd(reader.as_raw_fd(), OFlag::O_RDONLY, FdType::Pipe, None)
+            .unwrap();
+        let id = state.metadata().file_handles[&reader.as_raw_fd()].open_file_id();
+        let end = ChannelEnd {
+            channel: ChannelId::Pipe(id),
+            reads: true,
+            writes: false,
+        };
+        state
+            .with_detfd(reader.as_raw_fd(), |detfd| detfd.set_channel(end))
+            .unwrap();
+        (reader, writer, end)
+    }
+
+    /// A channel lives on the open file description, so a `dup` and a forked
+    /// child's copy of the table carry it with no copy step, while a
+    /// descriptor Detcore discovers afresh, as it does one it did not create
+    /// (one received over `SCM_RIGHTS`), has none
+    /// (<https://github.com/rrnewton/hermit/issues/4380>).
+    #[test]
+    fn a_pipe_channel_follows_its_description_through_dup_and_fork() {
+        let owner = DetTid::from_raw(9018);
+        let mut parent = FileMetadata::new(owner);
+        let (reader, _writer) = nix::unistd::pipe2(OFlag::empty()).unwrap();
+        let fd = reader.as_raw_fd();
+        parent
+            .add_fd(owner, fd, OFlag::empty(), FdType::Pipe, None)
+            .unwrap();
+        let end = ChannelEnd {
+            channel: ChannelId::Pipe(parent.with_detfd(fd, |detfd| detfd.open_file_id()).unwrap()),
+            reads: true,
+            writes: false,
+        };
+        parent
+            .with_detfd(fd, |detfd| detfd.set_channel(end))
+            .unwrap();
+        let alias = fd + 100;
+        parent.dup_fd(fd, alias, OFlag::empty()).unwrap();
+        assert_eq!(
+            parent.with_detfd(alias, |detfd| detfd.channel()).unwrap(),
+            Some(end)
+        );
+        let mut child = parent.fork_for(DetTid::from_raw(9019));
+        for fd in [fd, alias] {
+            assert_eq!(
+                child.with_detfd(fd, |detfd| detfd.channel()).unwrap(),
+                Some(end)
+            );
+        }
+        let (received, _peer) = nix::unistd::pipe2(OFlag::empty()).unwrap();
+        parent
+            .discover_fd_from_current_process(owner, received.as_raw_fd())
+            .unwrap();
+        assert_eq!(
+            parent
+                .with_detfd(received.as_raw_fd(), |detfd| detfd.channel())
+                .unwrap(),
+            None
+        );
+    }
+
+    /// Under `--pipe-wake-latency` a rediscovering exec carries each surviving
+    /// descriptor's channel end and the old numbering. The same leader, whose
+    /// new image restarts its open-file sequence, rediscovers pipe A with A's
+    /// channel; a pipe B it then makes, past every id the old table allocated,
+    /// has another channel value. A descriptor left `O_NONBLOCK`, outside the
+    /// blocking set, gets its channel too
+    /// (https://github.com/rrnewton/hermit/issues/4380).
+    #[test]
+    fn a_rediscovering_exec_keeps_pipe_channels_apart() {
+        let leader = DetTid::from_raw(9015);
+        let config = Config::default();
+        let before = ThreadState::new(leader, &config, ());
+        let (a_reader, _a_writer, a_end) = pipe_with_channel(&before);
+        assert_eq!(
+            unsafe { libc::fcntl(a_reader.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
+        let channels = before.pipe_channels_for_exec();
+        assert_eq!(channels, BTreeMap::from([(a_reader.as_raw_fd(), a_end)]));
+        let namespace = before.open_file_namespace_for_exec();
+        assert_eq!(
+            namespace,
+            (leader, before.metadata().next_open_file_sequence)
+        );
+
+        let after = ThreadState::new(leader, &config, ());
+        after
+            .metadata()
+            .apply_exec_fd_state(
+                leader,
+                ExecFdState {
+                    channels,
+                    open_file_namespace: Some(namespace),
+                    ..ExecFdState::default()
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            after
+                .with_detfd(a_reader.as_raw_fd(), |detfd| detfd.channel())
+                .unwrap(),
+            Some(a_end),
+            "the carried channel survives rediscovery"
+        );
+        let (b_reader, _b_writer, b_end) = pipe_with_channel(&after);
+        assert_ne!(b_end.channel, a_end.channel);
+        let metadata = after.metadata();
+        assert_ne!(
+            metadata.file_handles[&b_reader.as_raw_fd()].open_file_id(),
+            metadata.file_handles[&a_reader.as_raw_fd()].open_file_id()
+        );
+    }
+
+    /// A channel held by another process is kept apart too: the old image
+    /// made pipe A, a child holds it, and the exec carries no channel at all;
+    /// the old numbering is still reserved, so a pipe the new image makes
+    /// cannot take A's id.
+    #[test]
+    fn an_exec_carrying_no_channel_still_reserves_the_old_numbering() {
+        let leader = DetTid::from_raw(9016);
+        let config = Config::default();
+        let before = ThreadState::new(leader, &config, ());
+        let (a_reader, _a_writer, a_end) = pipe_with_channel(&before);
+        let namespace = before.open_file_namespace_for_exec();
+        drop(a_reader);
+
+        let after = ThreadState::new(leader, &config, ());
+        let state = ExecFdState {
+            open_file_namespace: Some(namespace),
+            ..ExecFdState::default()
+        };
+        assert!(
+            !state.is_empty(),
+            "a namespace-only state survives reconnect"
+        );
+        after
+            .metadata()
+            .apply_exec_fd_state(leader, state, true)
+            .unwrap();
+        let (_b_reader, _b_writer, b_end) = pipe_with_channel(&after);
+        assert_ne!(b_end.channel, a_end.channel);
+    }
+
+    /// With the option off the exec state carries neither field: nothing is
+    /// reserved, the new image numbers as a fresh one does, and the state's
+    /// trace prints as it did before the fields existed. A channel-only state
+    /// is not empty.
+    #[test]
+    fn an_exec_without_the_pipe_wake_latency_is_unchanged() {
+        let leader = DetTid::from_raw(9017);
+        let config = Config::default();
+        let after = ThreadState::new(leader, &config, ());
+        let state = ExecFdState::default();
+        assert!(state.is_empty());
+        assert_eq!(
+            format!("{state:?}"),
+            "ExecFdState { blocking: {}, inherited_reads: {}, \
+             initialize_inherited_stdio: false, initial_input: None, \
+             robust_wakes: [], open_files: None }"
+        );
+        after
+            .metadata()
+            .apply_exec_fd_state(leader, state, true)
+            .unwrap();
+        let (reader, _writer, _) = pipe_with_channel(&after);
+        let fresh = ThreadState::new(leader, &config, ());
+        let (fresh_reader, _fresh_writer, _) = pipe_with_channel(&fresh);
+        assert_eq!(
+            after.metadata().file_handles[&reader.as_raw_fd()].open_file_id(),
+            fresh.metadata().file_handles[&fresh_reader.as_raw_fd()].open_file_id()
+        );
+        let channel_only = ExecFdState {
+            channels: BTreeMap::from([(
+                reader.as_raw_fd(),
+                ChannelEnd {
+                    channel: ChannelId::Pipe(OpenFileId::new(leader, 0)),
+                    reads: true,
+                    writes: false,
+                },
+            )]),
+            ..ExecFdState::default()
+        };
+        assert!(!channel_only.is_empty());
+        assert!(format!("{channel_only:?}").contains("channels: {"));
+
+        // A description prints its channel only when it has one.
+        let (plain, _plain_writer) = nix::unistd::pipe2(OFlag::empty()).unwrap();
+        after
+            .add_fd(plain.as_raw_fd(), OFlag::O_RDONLY, FdType::Pipe, None)
+            .unwrap();
+        let printed = format!("{:?}", after.metadata().file_handles[&plain.as_raw_fd()]);
+        assert!(!printed.contains(" channel:"), "{printed}");
+        assert!(printed.contains("timerfd: None }"), "{printed}");
+        let printed = format!("{:?}", after.metadata().file_handles[&reader.as_raw_fd()]);
+        assert!(
+            printed.contains("timerfd: None, channel: ChannelEnd {"),
+            "{printed}"
+        );
     }
 
     fn terminal_pair() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
@@ -3131,6 +3407,14 @@ pub struct ThreadState<T> {
     /// start of every handler and by that post-hook.
     #[serde(default)]
     pub(crate) yield_after_futex_wake: bool,
+    /// Under `--pipe-wake-latency` (`crate::pipe_wake`): the thread time at
+    /// which this thread hands the turn to the pollers its actions readied,
+    /// set at the readying action that the scheduler says starts a window
+    /// (`crate::pipe_wake::ReadyOutcome`), checked at syscall boundaries, and
+    /// cleared by the hand-off or by a scheduler request of its own. Always
+    /// `None` with the option unset.
+    #[serde(default)]
+    pub(crate) pipe_handoff_due: Option<LogicalTime>,
     /// A signal this thread sent to its own multi-threaded process, which it
     /// must dequeue before another thread runs: until its own delivery stop
     /// for that signal no timeslice of it ends, at the target, at the PMU
@@ -3830,6 +4114,7 @@ impl<T> ThreadState<T> {
             uncharged_bootstrap_syscalls: 0,
             in_uncharged_bootstrap_syscall: false,
             yield_after_futex_wake: false,
+            pipe_handoff_due: None,
             own_signal_turn_hold: None,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
@@ -4283,6 +4568,7 @@ impl<T> ThreadState<T> {
             waits_until_nothing_else_can_run: false,
             previous_attempt_made_progress: false,
             upgraded_from_attempt: 0,
+            polls_channel: None,
             poll_deadline: None,
             in_guest_sleep_sigalrm: None,
             signal_state_task: None,
@@ -4442,6 +4728,25 @@ impl<T> ThreadState<T> {
         metadata.file_handles = handles;
     }
 
+    /// Under `--pipe-wake-latency`: the channel end each descriptor that
+    /// survives exec is.
+    pub(crate) fn pipe_channels_for_exec(&self) -> BTreeMap<RawFd, crate::pipe_wake::ChannelEnd> {
+        self.metadata()
+            .file_handles
+            .iter()
+            .filter(|(_, detfd)| !detfd.is_cloexec())
+            .filter_map(|(&fd, detfd)| detfd.channel().map(|end| (fd, end)))
+            .collect()
+    }
+
+    /// The open-file creator and next sequence of this thread's table.
+    pub(crate) fn open_file_namespace_for_exec(&self) -> (DetTid, u64) {
+        (
+            self.open_file_creator.unwrap_or(self.dettid),
+            self.metadata().next_open_file_sequence,
+        )
+    }
+
     pub(crate) fn shared_open_files_for_exec(&self) -> Result<Option<ExecOpenFiles>, Errno> {
         let metadata = self.metadata();
         if !metadata.has_promoted_random_files {
@@ -4554,6 +4859,13 @@ impl<T> ThreadState<T> {
     /// Remove every modeled descriptor in an inclusive close_range interval.
     pub(crate) fn remove_fd_range(&self, first: u32, last: u32) -> Vec<OpenFileId> {
         self.metadata().remove_fd_range(first, last)
+    }
+
+    /// The descriptors Detcore's table holds for this thread, in order.
+    pub(crate) fn open_fds(&self) -> Vec<RawFd> {
+        let mut fds: Vec<RawFd> = self.metadata().file_handles.keys().copied().collect();
+        fds.sort_unstable();
+        fds
     }
 
     /// dup raw fds.
