@@ -2583,8 +2583,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And lit's 19 detcore/tests/lit fixtures that need no Rust or Go guest,
     // less cat.test (ignored: the pinned root has no /etc/issue), plus its
     // completeness test, in the second shard: 60 + 206 + 232 = 498.
+    // And lit's 57 fixtures whose %me is a Rust program from
+    // detcore/tests/lit-guests: 60 + 263 + 232 = 555.
     ("test.hermit_integration", 60),
-    ("test.hermit_integration_2", 206),
+    ("test.hermit_integration_2", 263),
     ("test.hermit_integration_3", 232),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
@@ -3981,7 +3983,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And lit's 18 runner and FileCheck-matcher tests: 479.
     // And lit's 19 fixtures without a Rust or Go guest, less the ignored
     // cat.test, plus its completeness test: 498.
-    ("test.hermit_integration_on_host", 498),
+    // And lit's 57 fixtures with a Rust guest: 555.
+    ("test.hermit_integration_on_host", 555),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

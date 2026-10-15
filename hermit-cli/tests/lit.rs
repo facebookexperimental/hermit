@@ -404,12 +404,21 @@ fn every_lit_fixture_is_within_the_supported_subset() {
     assert_eq!(checked, 36);
 }
 
-/// The `%me` of FIXTURE, built into DIRECTORY: its directory's `main.c`,
-/// compiled with the internal `cpp_lit_unittest` rule's flags. A fixture
-/// beside no `main` has none, so a RUN line naming `%me` is refused.
+/// The `%me` of FIXTURE: its directory's `main.c`, compiled into DIRECTORY
+/// with the internal `cpp_lit_unittest` rule's flags, or its directory's
+/// `main.rs`, built as `lit_<directory>` by detcore/tests/lit-guests. A
+/// fixture beside no `main` has none, so a RUN line naming `%me` is refused.
 fn build_me(fixture: &Path, directory: &Path) -> Option<PathBuf> {
-    let source = fixture.parent()?.join("main.c");
-    if fixture.parent()? == lit_root().as_path() || !source.is_file() {
+    let parent = fixture.parent()?;
+    if parent == lit_root().as_path() {
+        return None;
+    }
+    if parent.join("main.rs").is_file() {
+        let name = format!("lit_{}", parent.file_name()?.to_str()?);
+        return Some(lit_guest(&name));
+    }
+    let source = parent.join("main.c");
+    if !source.is_file() {
         return None;
     }
     let me = directory.join("me");
@@ -428,6 +437,52 @@ fn build_me(fixture: &Path, directory: &Path) -> Option<PathBuf> {
         String::from_utf8_lossy(&output.stderr)
     );
     Some(me)
+}
+
+#[path = "../../ci/lit-guest-binaries.rs"]
+mod lit_guests;
+
+/// The prepared lit guests, as validation's producer
+/// (ci/manifest-plan/src/nextest_binaries.rs) hands them over.
+const PREPARED_LIT_GUESTS_ENV: &str = "HERMIT_PREPARED_LIT_GUESTS";
+
+/// The lit guest NAME: the path validation prepared and verified, or, outside
+/// validation, the one `cargo build -p hermit-lit-guests --bins` puts beside
+/// this test's `hermit`.
+fn lit_guest(name: &str) -> PathBuf {
+    assert!(
+        lit_guests::LIT_GUEST_BINARIES.contains(&name),
+        "{name} is not a declared lit guest"
+    );
+    let path = match std::env::var(PREPARED_LIT_GUESTS_ENV) {
+        Ok(raw) => {
+            let guests: std::collections::BTreeMap<String, PathBuf> =
+                serde_json::from_str(&raw).expect("prepared lit guest paths must be a JSON object");
+            assert_eq!(
+                guests
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                lit_guests::LIT_GUEST_BINARIES.into_iter().collect(),
+                "prepared lit guests must be exactly the declared ones",
+            );
+            guests[name].clone()
+        }
+        Err(_) => {
+            assert!(
+                std::env::var_os("HERMIT_PREPARED_NEXTEST_REQUIRED").is_none(),
+                "validation must prepare the lit guests in {PREPARED_LIT_GUESTS_ENV}"
+            );
+            Path::new(env!("CARGO_BIN_EXE_hermit")).with_file_name(name)
+        }
+    };
+    assert!(
+        path.is_file(),
+        "{} is missing; build it with cargo build -p {} --bins",
+        path.display(),
+        lit_guests::LIT_GUEST_PACKAGE
+    );
+    path
 }
 
 /// Run the fixture at RELATIVE (under detcore/tests/lit) as lit would.
@@ -452,11 +507,9 @@ fn run_case(relative: &str) {
     }
 }
 
-/// A fixture whose `%me` is a Rust or Go program. Those run in a later step,
-/// once validation prepares their binaries.
+/// A fixture whose `%me` is a Go program; the pinned root has no Go toolchain.
 fn waits_for_its_guest(fixture: &Path) -> bool {
-    let directory = fixture.parent().unwrap();
-    directory.join("main.rs").is_file() || directory.join("main.go").is_file()
+    fixture.parent().unwrap().join("main.go").is_file()
 }
 
 macro_rules! lit_cases {
@@ -496,10 +549,67 @@ lit_cases! {
     lit_rt_sigprocmask_hermit_run => "rt_sigprocmask/hermit-run.lit",
     lit_timerfd_virtual_time_main => "timerfd_virtual_time/main.c",
     lit_timerfd_virtual_time_hermit_run_strict => "timerfd_virtual_time/hermit-run-strict.lit",
+    lit_child_should_inherit_fds_hermit_run => "child_should_inherit_fds/hermit-run.lit",
+    lit_child_should_inherit_fds_main => "child_should_inherit_fds/main.rs",
+    lit_close_on_exec_hermit_run => "close_on_exec/hermit-run.lit",
+    lit_close_on_exec_main => "close_on_exec/main.rs",
+    lit_dup2_existing_fd_hermit_run_strict => "dup2_existing_fd/hermit-run-strict.lit",
+    lit_dup2_existing_fd_hermit_run => "dup2_existing_fd/hermit-run.lit",
+    lit_dup2_existing_fd_main => "dup2_existing_fd/main.rs",
+    lit_dup_should_create_a_valid_fd_hermit_run_strict => "dup_should_create_a_valid_fd/hermit-run-strict.lit",
+    lit_dup_should_create_a_valid_fd_hermit_run => "dup_should_create_a_valid_fd/hermit-run.lit",
+    lit_dup_should_create_a_valid_fd_main => "dup_should_create_a_valid_fd/main.rs",
+    lit_fcntl_dupfd_hermit_run_strict => "fcntl_dupfd/hermit-run-strict.lit",
+    lit_fcntl_dupfd_hermit_run => "fcntl_dupfd/hermit-run.lit",
+    lit_fcntl_dupfd_main => "fcntl_dupfd/main.rs",
+    lit_fcntl_getfd_setfd_hermit_run_strict => "fcntl_getfd_setfd/hermit-run-strict.lit",
+    lit_fcntl_getfd_setfd_hermit_run => "fcntl_getfd_setfd/hermit-run.lit",
+    lit_fcntl_getfd_setfd_main => "fcntl_getfd_setfd/main.rs",
+    lit_file_race_openwrite_hermit_run_strict => "file_race_openwrite/hermit-run-strict.lit",
+    lit_file_race_openwrite_hermit_run => "file_race_openwrite/hermit-run.lit",
+    lit_file_race_openwrite_main => "file_race_openwrite/main.rs",
+    lit_file_write_race_hermit_run_strict => "file_write_race/hermit-run-strict.lit",
+    lit_file_write_race_hermit_run => "file_write_race/hermit-run.lit",
+    lit_file_write_race_main => "file_write_race/main.rs",
+    lit_fstat_hermit_run_strict => "fstat/hermit-run-strict.lit",
+    lit_fstat_hermit_run => "fstat/hermit-run.lit",
+    lit_fstat_main => "fstat/main.rs",
+    lit_hello_world_rs_hermit_run_strict => "hello_world_rs/hermit-run-strict.lit",
+    lit_hello_world_rs_hermit_run => "hello_world_rs/hermit-run.lit",
+    lit_hello_world_rs_main => "hello_world_rs/main.rs",
+    lit_no_close_on_exec_hermit_run => "no_close_on_exec/hermit-run.lit",
+    lit_no_close_on_exec_main => "no_close_on_exec/main.rs",
+    lit_open_null_ptr_hermit_run_strict => "open_null_ptr/hermit-run-strict.lit",
+    lit_open_null_ptr_hermit_run => "open_null_ptr/hermit-run.lit",
+    lit_open_null_ptr_main => "open_null_ptr/main.rs",
+    lit_openat_lowest_fd_hermit_run_strict => "openat_lowest_fd/hermit-run-strict.lit",
+    lit_openat_lowest_fd_hermit_run => "openat_lowest_fd/hermit-run.lit",
+    lit_openat_lowest_fd_main => "openat_lowest_fd/main.rs",
+    lit_openat_next_lowest_fd_hermit_run_strict => "openat_next_lowest_fd/hermit-run-strict.lit",
+    lit_openat_next_lowest_fd_hermit_run => "openat_next_lowest_fd/hermit-run.lit",
+    lit_openat_next_lowest_fd_main => "openat_next_lowest_fd/main.rs",
+    lit_pipe_creates_valid_fds_hermit_run_strict => "pipe_creates_valid_fds/hermit-run-strict.lit",
+    lit_pipe_creates_valid_fds_hermit_run => "pipe_creates_valid_fds/hermit-run.lit",
+    lit_pipe_creates_valid_fds_main => "pipe_creates_valid_fds/main.rs",
+    lit_print_race_hermit_run_strict_verify => "print_race/hermit-run-strict-verify.lit",
+    lit_print_race_hermit_run_strict => "print_race/hermit-run-strict.lit",
+    lit_print_race_main => "print_race/main.rs",
+    lit_read_badfd_hermit_run_strict => "read_badfd/hermit-run-strict.lit",
+    lit_read_badfd_hermit_run => "read_badfd/hermit-run.lit",
+    lit_read_badfd_main => "read_badfd/main.rs",
+    lit_sched_getaffinity_hermit_run_strict_verify => "sched_getaffinity/hermit-run-strict-verify.lit",
+    lit_sched_getaffinity_hermit_run_strict => "sched_getaffinity/hermit-run-strict.lit",
+    lit_sched_getaffinity_main => "sched_getaffinity/main.rs",
+    lit_utime_hermit_run_strict => "utime/hermit-run-strict.lit",
+    lit_utime_hermit_run => "utime/hermit-run.lit",
+    lit_utime_main => "utime/main.rs",
+    lit_utimes_hermit_run_strict => "utimes/hermit-run-strict.lit",
+    lit_utimes_hermit_run => "utimes/hermit-run.lit",
+    lit_utimes_main => "utimes/main.rs",
 }
 
-/// Every fixture is a case here, or waits for its Rust or Go guest; none is
-/// silently left out.
+/// Every fixture is a case here, or waits for its Go guest; none is silently
+/// left out.
 #[test]
 fn every_lit_fixture_is_a_case_or_waits_for_its_guest() {
     let root = lit_root();

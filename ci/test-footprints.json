@@ -297,6 +297,21 @@
       ]
     },
     {
+      "_why": "@generated: Cargo package `hermit-lit-guests`; reverse-dependent closure: hermit-lit-guests.",
+      "nodes": [
+        "build.workspace_on_host",
+        "doc.doctests_on_host",
+        "doc.rustdoc_on_host",
+        "lint.clippy_on_host",
+        "lint.rustfmt",
+        "test.regular_crates_on_host"
+      ],
+      "paths": [
+        "detcore/tests/lit-guests/**/*.rs",
+        "detcore/tests/lit-guests/Cargo.toml"
+      ]
+    },
+    {
       "_why": "@generated: Cargo package `detcore-testutils`; reverse-dependent closure: detcore-dbt, detcore-liteinst, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
       "e2e_all": true,
       "nodes": [

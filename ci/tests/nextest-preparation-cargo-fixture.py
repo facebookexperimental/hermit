@@ -78,6 +78,14 @@ for name, source in record_sources.items():
         "src_path": str(root / source),
     }
 
+# A profile that selects lit also builds detcore/tests/lit-guests' programs.
+lit_guest_package, lit_guest_names = json.loads(
+    (root / "lit-guest-names.json").read_text()
+)
+packages[lit_guest_package] = {
+    name: {"name": name, "kind": ["bin"], "test": False} for name in lit_guest_names
+}
+
 packages["hermit-manifest-plan"] = {
     "nextest-cpu-wrapper": {
         "name": "nextest-cpu-wrapper",
@@ -232,6 +240,23 @@ elif args[:1] == ["build"] and (
     print(json.dumps(event))
     if mode == "wrapper-ambiguous":
         print(json.dumps(event))
+elif args[:1] == ["build"] and lit_guest_package in args:
+    # `--bins` builds every lit guest.
+    for spec in packages[lit_guest_package].values():
+        path = target / "debug" / spec["name"]
+        write_binary(path)
+        print(
+            json.dumps(
+                {
+                    "reason": "compiler-artifact",
+                    "package_id": package_id(lit_guest_package),
+                    "target": {"name": spec["name"], "kind": ["bin"]},
+                    "profile": {"test": False},
+                    "executable": str(path),
+                }
+            )
+        )
+    print(json.dumps({"reason": "build-finished", "success": True}))
 elif args[:1] == ["build"] and "hermetic_infra_hermit_tests" in args:
     # `--bins` builds every binary of the package: the hermit_modes guests and
     # the record workloads' Rust targets.

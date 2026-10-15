@@ -30439,6 +30439,7 @@ mod fused_privileged_build_tests {
 
     use super::*;
     include!("../ci/cargo-guest-binaries.rs");
+    include!("../ci/lit-guest-binaries.rs");
 
     fn write_executable(path: &Path, contents: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -30471,6 +30472,13 @@ mod fused_privileged_build_tests {
         std::fs::write(
             root.path().join("guest-names.json"),
             serde_json::to_vec(&CARGO_GUEST_BINARIES).unwrap(),
+        )
+        .unwrap();
+        // A profile that selects lit also builds detcore/tests/lit-guests'
+        // programs; the Cargo fixture reports them from this list.
+        std::fs::write(
+            root.path().join("lit-guest-names.json"),
+            serde_json::to_vec(&(LIT_GUEST_PACKAGE, LIT_GUEST_BINARIES)).unwrap(),
         )
         .unwrap();
         // A profile that selects record_replay also prepares its workloads
@@ -30700,6 +30708,19 @@ output.chmod(0o755)
             1,
             "the 21 Cargo guests and the record workloads' Rust targets are built together once"
         );
+        // A profile that selects lit builds the lit guests once, by themselves.
+        let lit_selected = expected
+            .values()
+            .any(|args| args.windows(2).any(|pair| pair == ["--test", "lit"]));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|args| args.first().map(String::as_str) == Some("build")
+                    && args.iter().any(|a| a == LIT_GUEST_PACKAGE))
+                .count(),
+            usize::from(lit_selected),
+            "the lit guests are built once when a selection runs lit"
+        );
         // A profile that selects record_replay compiles each record workload C
         // source exactly once, in the producer.
         let record_selected = expected.values().any(|args| {
@@ -30736,7 +30757,7 @@ output.chmod(0o755)
                 .iter()
                 .filter(|args| args.first().map(String::as_str) == Some("build"))
                 .count(),
-            2,
+            2 + usize::from(lit_selected),
             "no other builds were introduced"
         );
         let read_only = run_build(&consumer.cmd, root.path(), &bin, &log, "current");

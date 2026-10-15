@@ -8,6 +8,7 @@ members = [
   "detcore-dbt",
   "detcore-liteinst",
   "detcore-sabre",
+  "detcore/tests/lit-guests",
   "detcore/tests/testutils",
   "flaky-tests",
   "hermit-cli",
