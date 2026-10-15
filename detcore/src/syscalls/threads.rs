@@ -1708,6 +1708,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         clone_family: syscalls::family::CloneFamily,
     ) -> Result<i64, Error> {
+        if let syscalls::family::CloneFamily::Clone3(clone) = &clone_family
+            && let Some(refusal) = self.clone3_set_tid_refusal(guest, clone).await
+        {
+            return refusal;
+        }
         let flags = clone_family.flags(&guest.memory());
         let exit_signal = match clone_family {
             #[cfg(not(target_arch = "aarch64"))]
@@ -3328,6 +3333,153 @@ impl<T: RecordOrReplay> Detcore<T> {
             GuestPidAnswer::Untranslatable(reason) => reason,
         };
         Err(self.refuse_nested_pid(guest, sysno, &refusal).await)
+    }
+
+    /// Refuse, by name and through the unsupported-operation policy, a
+    /// `clone3` whose `set_tid` asks for an id that a task of this run had
+    /// (`thread_id_refused`): a reaped child's pid or an exited thread's tid,
+    /// which Linux would give out again, or a live task's id, whose release
+    /// can race the call (https://github.com/rrnewton/hermit/issues/4370).
+    /// Detcore keeps per-task state by that id (the task's clock, its
+    /// recorded schedule and preemptions, its priority), and a new task given
+    /// it took over the old one's: the run crashed with "thread time should
+    /// never go down", or recorded two tasks as one. `None` lets the call go
+    /// ahead, and the kernel's own answer stands, whenever the call cannot
+    /// reuse such an id or the kernel would fail it first: no `set_tid`; a
+    /// `clone_args` size, exit signal or `set_tid` array the kernel rejects
+    /// (E2BIG, EINVAL, EFAULT); a caller without the capability to choose a
+    /// pid (EPERM); an id never used; or the pid of a zombie child of the
+    /// caller's process (EEXIST).
+    ///
+    /// The entry that names Detcore's id is `set_tid[0]`, or `set_tid[1]`
+    /// with `CLONE_NEWPID`, whose `set_tid[0]` is the pid inside the new
+    /// namespace; any later entries name pids in the namespaces holding
+    /// Hermit's container. Where those would make Linux fail the call, with
+    /// EINVAL for more levels than exist or EPERM for a level the caller has
+    /// no capability over, the refusal is given instead: the conservative
+    /// side, since the id is not handed out either way. So is a nonzero tail
+    /// past the fields this code knows, which a kernel that does not know
+    /// them answers with E2BIG. From a nested PID namespace, whose pids
+    /// Detcore does not translate for this, any `set_tid` the checks above
+    /// let through is refused (issue 4155).
+    async fn clone3_set_tid_refusal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        clone: &syscalls::Clone3,
+    ) -> Option<Result<i64, Error>> {
+        // Refuse only a call the kernel would accept as far as `set_tid` goes:
+        // any other shape goes to the kernel, whose own error stands, so a
+        // refusal never replaces an E2BIG, EINVAL, EFAULT or EPERM Linux
+        // would give for these arguments. `struct clone_args` gained `set_tid`
+        // (offset 64) and `set_tid_size` (offset 72) with its second version,
+        // 80 bytes.
+        const CLONE_ARGS_SIZE_VER1: usize = 80;
+        // The kernel's limit on PID namespace nesting (MAX_PID_NS_LEVEL).
+        const MAX_SET_TID: u64 = 32;
+        let size = clone.size();
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+        if size < CLONE_ARGS_SIZE_VER1 || size > page {
+            return None;
+        }
+        // The kernel copies all `size` bytes first: a fault there is its
+        // EFAULT. A nonzero tail beyond the fields this code knows is not
+        // read as a reason to let the call through, since a newer kernel may
+        // accept it.
+        let mut raw = vec![0u8; size];
+        let memory = guest.memory();
+        memory
+            .read_exact(Addr::<u8>::from_raw(clone.args()?.as_raw())?, &mut raw)
+            .ok()?;
+        let field = |offset: usize| u64::from_ne_bytes(raw[offset..offset + 8].try_into().unwrap());
+        let flags = field(0);
+        let exit_signal = field(32);
+        let set_tid = field(64);
+        let set_tid_size = field(72);
+        // An exit signal must be a signal number, with nothing in CSIGNAL.
+        if exit_signal > 64 || flags & 0xff != 0 {
+            return None;
+        }
+        if set_tid_size == 0 || set_tid_size > MAX_SET_TID {
+            return None;
+        }
+        // The kernel copies the whole array next (EFAULT) and takes no entry
+        // below 1 (EINVAL).
+        let mut tids = vec![0 as libc::pid_t; set_tid_size as usize];
+        memory
+            .read_values(Addr::<libc::pid_t>::from_raw(set_tid as usize)?, &mut tids)
+            .ok()?;
+        // With CLONE_NEWPID the first entry is the pid in the new namespace,
+        // which must be 1 since that namespace has no init yet (EINVAL).
+        let newpid = flags & libc::CLONE_NEWPID as u64 != 0;
+        if tids.iter().any(|tid| *tid < 1) || (newpid && tids[0] != 1) {
+            return None;
+        }
+        // Choosing a pid takes CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE over
+        // the namespace, and a caller with neither in its effective set gets
+        // EPERM. A set that cannot be read counts as privileged, so the
+        // refusal below still guards Detcore's state.
+        const CAP_SYS_ADMIN: u32 = 21;
+        const CAP_CHECKPOINT_RESTORE: u32 = 40;
+        let thread = guest.thread_state();
+        let status = format!(
+            "/proc/{}/task/{}/status",
+            thread.detpid.expect("detpid unset"),
+            thread.dettid
+        );
+        let capabilities = std::fs::read_to_string(status).ok().and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:"))
+                .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        });
+        let pid_capabilities = (1u64 << CAP_SYS_ADMIN) | (1u64 << CAP_CHECKPOINT_RESTORE);
+        if capabilities.is_some_and(|mask| mask & pid_capabilities == 0) {
+            return None;
+        }
+        // From a nested PID namespace the array names pids at several levels,
+        // which Detcore does not translate for this: refuse any such call.
+        if guest.thread_state().nested_pid_namespace {
+            return Some(Err(self
+                .refuse_nested_pid(
+                    guest,
+                    reverie::syscalls::Sysno::clone3,
+                    "clone3 set_tid names pids in a namespace Detcore does not translate",
+                )
+                .await));
+        }
+        // The array runs from the new task's namespace outwards, so the
+        // caller's (the container's) pid is entry 0, or entry 1 with
+        // CLONE_NEWPID. Entries after it name pids in the namespaces holding
+        // Hermit's container, which Detcore does not track.
+        if set_tid_size <= u64::from(newpid) {
+            return None;
+        }
+        let tid = tids[usize::from(newpid)];
+        if !crate::tool_global::thread_id_refused(guest, DetTid::from_raw(tid)).await {
+            return None;
+        }
+        let message = format!(
+            "hermit: clone3 set_tid asks for id {tid}, which an earlier task of this run had; \
+             Detcore keeps per-task state by that id and cannot give it to a new task \
+             (https://github.com/rrnewton/hermit/issues/4370)"
+        );
+        tracing::error!(
+            "[detcore, dtid {}] {}",
+            guest.thread_state().dettid,
+            message
+        );
+        if guest.config().panic_on_unsupported_syscalls {
+            use std::io::Write as _;
+            let _ = writeln!(crate::util::RetryingStderr, "{message}");
+        }
+        Some(
+            self.refuse_unserviceable_operation(
+                guest,
+                reverie::syscalls::Sysno::clone3,
+                Errno::EEXIST,
+            )
+            .await,
+        )
     }
 
     /// Refuse by name a call from a nested PID namespace whose pids Detcore

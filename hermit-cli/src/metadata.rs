@@ -576,7 +576,13 @@ impl RecordVersion {
 // rendered-file path for readv, preadv, preadv2 and lseek. A vectored read of
 // it records a capture where an older binary refused it with ENOSYS, so an
 // older recording containing one would replay out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x15d);
+// 0x15d -> 0x15e (taken at land time, as the reservation file's land-time
+// numbering rule gives a ready change HIGHEST_SHIPPED + 1; reserved as
+// 0x15e): clone3 with set_tid asking for an id a task of the run had, other
+// than the pid of the caller's own zombie child, is refused
+// (https://github.com/rrnewton/hermit/issues/4370). An older recording in
+// which such a clone3 succeeded would replay to the refusal.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x15e);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -601,7 +607,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x15d);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x15d;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x15e;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1589,6 +1595,15 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_uptime_is_rendered() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15c)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x15e may hold a clone3 that reused, through
+    /// set_tid, an id an earlier task had; that call is now refused
+    /// (https://github.com/rrnewton/hermit/issues/4370).
+    #[test]
+    fn record_version_rejects_streams_from_before_reused_set_tid_is_refused() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15d)));
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 

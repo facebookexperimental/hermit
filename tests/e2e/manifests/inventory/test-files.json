@@ -182,6 +182,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/clone3_set_tid_reuse.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/clone3_set_tid_reuse.c is owned by hermit-cli/tests/cli.rs: clone3 with set_tid asking for a reaped child's pid or a joined thread's tid must be refused by name rather than let a new task take over the old one's per-task state and crash Hermit, while a fresh pid works as on Linux (https://github.com/rrnewton/hermit/issues/4370). It remains a fixture because the integration test checks exit codes and stderr per mode."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/clone_exit_signal_effective.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/clone_exit_signal_effective.c is owned by hermit-cli/tests/cli.rs: A CLONE_VFORK child created with SIGUSR1 that execs, and a CLONE_PARENT | SIGUSR1 grandchild, must be reaped by a plain waitpid and notify with SIGCHLD, because exec resets and CLONE_PARENT inherits the exit signal (https://github.com/rrnewton/hermit/issues/3895); the integration test runs both modes under run --strict --verify --verify-strict with the timeslice disabled. It remains a fixture because the generic manifest cannot run one guest in two modes with different expected outputs."

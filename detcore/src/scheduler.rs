@@ -7834,6 +7834,23 @@ impl Scheduler {
         self.next_turns.contains_key(&dettid)
     }
 
+    /// Whether `dettid` is the pid of a zombie child of `caller`'s process: a
+    /// process that exited and that its parent, the caller's process, has not
+    /// reaped. Linux keeps that pid until a wait in the caller's process
+    /// consumes it (`consume_child_wait`), a committed turn, or the caller's
+    /// process dies, which ends the caller too, so for the caller this answer
+    /// cannot change at a host-timed moment. Another process's zombie can be
+    /// freed when its parent dies without a granted exit, which Detcore learns
+    /// at a host-timed deregistration. An autoreaped child or an orphan
+    /// Hermit's init reaped is not a zombie (`exited_process_is_zombie`).
+    pub(crate) fn id_is_a_zombie_child_of(&self, dettid: DetTid, caller: DetTid) -> bool {
+        let pid = DetPid::from_raw(dettid.as_raw());
+        self.exited_process_is_zombie(pid) == Some(true)
+            && self.thread_tree.parent_process(&pid).is_some()
+            && self.thread_tree.parent_process(&pid)
+                == self.thread_tree.thread_to_leader.get(&caller).copied()
+    }
+
     /// Return scheduler-owned lifecycle state for an exact child-process wait.
     ///
     /// This deliberately models direct parentage and process liveness rather

@@ -2997,6 +2997,17 @@ impl GlobalState {
             GlobalRequest::ThreadIsLive(dtid) => {
                 R::ThreadIsLive(self.lock_rpc_scheduler(false).await.thread_is_live(dtid))
             }
+            GlobalRequest::ThreadIdRefused(id) => {
+                let (registered, zombie) = {
+                    let sched = self.lock_rpc_scheduler(false).await;
+                    (
+                        sched.thread_was_registered(id),
+                        sched.id_is_a_zombie_child_of(id, dtid),
+                    )
+                };
+                let clocked = self.global_time.lock().unwrap().contains_thread(id);
+                R::ThreadIdRefused((registered || clocked) && !zombie)
+            }
             GlobalRequest::PendingRealTimeExpirations(detpid) => R::PendingRealTimeExpirations(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -5028,6 +5039,10 @@ pub enum GlobalRequest {
     /// (`Scheduler::note_descriptors_replaced`). Appended after
     /// `DiscardedSignal`, for the same reason.
     DescriptorsReplaced(detcore_model::fd::FilesId, u32, u32),
+    /// Whether a task of this run had this id and it is not a zombie's pid
+    /// (`thread_id_refused`). Appended after `DescriptorsReplaced`, for the
+    /// same reason.
+    ThreadIdRefused(DetTid),
 }
 
 /// Responses from the global object
@@ -5176,6 +5191,8 @@ pub enum GlobalResponse {
     DiscardedSignal(crate::scheduler::discarded_at_send::DiscardedSignalAnswer),
     /// Appended after `DiscardedSignal`, for the same reason.
     DescriptorsReplaced(()),
+    /// Appended after `DescriptorsReplaced`, for the same reason.
+    ThreadIdRefused(bool),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -6637,6 +6654,31 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ThreadIsLive(dettid)).await;
     match response.1 {
         GlobalResponse::ThreadIsLive(live) => live,
+        _ => unreachable!(),
+    }
+}
+
+/// Whether a `clone3` `set_tid` naming `dettid` is refused: a task of this
+/// run had that id, and it is not the pid of a zombie child of the caller's
+/// process (`Scheduler::id_is_a_zombie_child_of`). "Had" is a registration with
+/// the scheduler, which is never removed, or a clock component in the global
+/// time (which exec reassignment can move away from an id that stays
+/// registered). Such a zombie's pid is left to the kernel, which answers
+/// EEXIST, and only the caller's own process can release it. Any other used id is
+/// refused, a live task's included: whether a live thread is still alive when
+/// the kernel runs the call can depend on host timing (a thread killed
+/// without a granted exit deregisters when the host says), and a freed id
+/// given to a new task would merge two tasks' state, keyed by that id, in
+/// Detcore (`Detcore::clone3_set_tid_refusal`,
+/// https://github.com/rrnewton/hermit/issues/4370).
+pub(crate) async fn thread_id_refused<G, T>(guest: &mut G, dettid: DetTid) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::ThreadIdRefused(dettid)).await;
+    match response.1 {
+        GlobalResponse::ThreadIdRefused(refused) => refused,
         _ => unreachable!(),
     }
 }

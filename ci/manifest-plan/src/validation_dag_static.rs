@@ -1553,7 +1553,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And global_opts::tests::a_log_file_is_written_synchronously
     // (https://github.com/rrnewton/hermit/issues/4427): 1087, listed.
     // And record_version_rejects_streams_from_before_uptime_is_rendered (https://github.com/rrnewton/hermit/issues/4213): 1088.
-    ("test.hermit_unit", 1088),
+    // And metadata::tests::record_version_rejects_streams_from_before_reused_set_tid_is_refused
+    // (https://github.com/rrnewton/hermit/issues/4370): 1089, listed.
+    ("test.hermit_unit", 1089),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3240,7 +3242,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore_answers_its_procfs_links_on_every_backend (B3a-2 of
     // https://github.com/rrnewton/hermit/issues/4266): 440, by listing.
     // And +1 from a35a69ad: 440.
-    ("test.cli", 440),
+    // And clone3_set_tid_is_refused_for_an_id_a_task_already_had
+    // (https://github.com/rrnewton/hermit/issues/4370): 441, listed.
+    ("test.cli", 441),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3616,7 +3620,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 4 MiB library-launch test (https://github.com/rrnewton/hermit/issues/4389): 375, listed.
     // And detcore_answers_its_procfs_links_on_every_backend (B3a-2): 376, by listing.
     // And +1 from a35a69ad: 376.
-    ("test.cli_on_host", 376),
+    // And the 4370 clone3 set_tid refusal test: 377, listed.
+    ("test.cli_on_host", 377),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4100,7 +4105,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 4410 record-version test: 1086, listed.
     // And the 4427 synchronous log file test: 1087, listed.
     // And record_version_rejects_streams_from_before_uptime_is_rendered (https://github.com/rrnewton/hermit/issues/4213): 1088.
-    ("test.hermit_unit_on_host", 1088),
+    // And the 4370 record-version test: 1089, listed.
+    ("test.hermit_unit_on_host", 1089),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

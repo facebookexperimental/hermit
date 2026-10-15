@@ -200,6 +200,7 @@ static SIGSUSPEND_AFTER_WNOHANG_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_SHARED_MASK_REWRITE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_SHARED_STACK_MASK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_ONCE_PER_CHILD_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CLONE3_SET_TID_REUSE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_THEN_SIBLING_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_SPINNER_AND_NEW_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -2035,6 +2036,32 @@ fn chaos_spinner_and_new_thread_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "chaos-spinner-and-new-thread guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn clone3_set_tid_reuse_guest() -> &'static Path {
+    CLONE3_SET_TID_REUSE_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("clone3-set-tid-reuse");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the clone3-set-tid-reuse guest directory");
+        let guest = build_root.join("clone3_set_tid_reuse");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/clone3_set_tid_reuse.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the clone3-set-tid-reuse guest");
+        assert!(
+            output.status.success(),
+            "clone3-set-tid-reuse guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -28676,6 +28703,98 @@ fn a_namespace_only_run_on_a_terminal_keeps_its_terminal_behaviour() {
         status.signal(),
         Some(libc::SIGINT),
         "Ctrl-C must end the run as SIGINT: {status:?}\n{transcript}"
+    );
+}
+
+/// `clone3` with `set_tid` asking for an id a task of this run already had (a
+/// reaped, autoreaped or init-reaped orphan child's pid, a joined thread's
+/// tid, a reaped pid as the caller-level entry of a `CLONE_NEWPID` child or
+/// followed by an entry for an outer namespace, a live task's id, or another
+/// process's zombie child's pid) is refused by name: the run ends with the
+/// policy exit 122, or, with --allow-unsupported-syscalls, the call fails with
+/// EEXIST. The pid of the caller's own zombie child, a `set_tid` array the
+/// kernel cannot read, one it rejects, and a caller without the capability to
+/// choose a pid get the kernel's own EEXIST, EFAULT, EINVAL and EPERM, as on
+/// Linux, and a fresh pid is given as on Linux, at L2 (ptrace).
+/// Before, a reaped child's pid crashed Hermit with "thread time should never
+/// go down" (exit 125), and a joined thread's tid made the new task take over
+/// the old one's clock (https://github.com/rrnewton/hermit/issues/4370).
+#[test]
+fn clone3_set_tid_is_refused_for_an_id_a_task_already_had() {
+    let guest = clone3_set_tid_reuse_guest().to_str().unwrap().to_owned();
+    let run = |flags: &[&str], mode: &str| {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let verdict_arg = format!("--verify-json={}", verdict.display());
+        let mut argv = vec!["run", "--timeout", "60"];
+        argv.extend_from_slice(flags);
+        if flags.contains(&"--verify-strict") {
+            argv.push(verdict_arg.as_str());
+        }
+        argv.extend(["--", guest.as_str(), mode]);
+        let (status, log) = run_with_deadline(
+            hermit_command(&argv),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        let parity = fs::read(&verdict)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .map(|report| {
+                let compared = &report["compared_log_messages"];
+                report["bitwise_parity"] == true
+                    && compared["left"].as_u64().is_some_and(|count| count > 0)
+                    && compared["left"] == compared["right"]
+            });
+        (status.and_then(|status| status.code()), stdout, log, parity)
+    };
+    for mode in [
+        "reaped",
+        "thread",
+        "newpid",
+        "held",
+        "foreignzombie",
+        "autoreap",
+        "orphan",
+        "deep",
+    ] {
+        let (code, stdout, log, _) = run(&["--strict"], mode);
+        assert_eq!(code, Some(122), "{mode}: {stdout}\n{log}");
+        assert!(
+            log.contains("clone3 set_tid asks for id")
+                && log.contains("https://github.com/rrnewton/hermit/issues/4370"),
+            "{mode}: the refusal must say why:\n{log}"
+        );
+        let (code, stdout, log, _) = run(&["--allow-unsupported-syscalls"], mode);
+        assert_eq!(code, Some(1), "{mode}: {stdout}\n{log}");
+        assert!(
+            log.contains("clone3: File exists"),
+            "{mode}: the guest must see EEXIST:\n{log}"
+        );
+    }
+    for (mode, answer) in [
+        ("zombie", "clone3: File exists"),
+        ("efault", "clone3: Bad address"),
+        ("newpidzero", "clone3: Invalid argument"),
+        ("nocap", "clone3: Operation not permitted"),
+    ] {
+        let (code, stdout, log, _) = run(&["--strict"], mode);
+        assert_eq!(code, Some(1), "{mode}: {stdout}\n{log}");
+        assert!(
+            log.contains(answer) && !log.contains("clone3 set_tid asks for id"),
+            "{mode}: the kernel answers and nothing is refused:\n{log}"
+        );
+    }
+    let (code, stdout, log, parity) = run(&["--strict", "--verify", "--verify-strict"], "fresh");
+    assert_eq!(code, Some(0), "fresh: {stdout}\n{log}");
+    assert_eq!(stdout, "got the requested pid: 1\n", "fresh: {log}");
+    assert_eq!(
+        parity,
+        Some(true),
+        "fresh: no bitwise parity over equal, nonzero INFO counts:\n{log}"
     );
 }
 
