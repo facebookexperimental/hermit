@@ -7080,7 +7080,10 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"build.e2e_artifact"########, r########"check.dbt_runtime_abi"########],
+        deps: &[
+            r########"build.e2e_artifact"########,
+            r########"check.dbt_runtime_abi"########,
+        ],
         env: &[],
         hint: HintSpec {
             resources: &[],
