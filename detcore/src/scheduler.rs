@@ -1623,6 +1623,12 @@ pub struct Scheduler {
     /// child-exit ledger's send window when the send succeeds.
     sending_child_exit: Option<DetPid>,
 
+    /// Whether the scheduler is sending a parent-death signal right now
+    /// (`flush_parent_death_signals`), for `note_group_send` to enter a
+    /// `SIGCHLD` in the child-exit ledger's send window as one
+    /// (`WindowSend::ParentDeath`).
+    sending_parent_death: bool,
+
     /// The signals (a kernel sigset) of each signalfd a process created, by
     /// process; a real-time timer expiration such a descriptor could read is
     /// never kept pending (`real_time_expiration_fate`).
@@ -3688,6 +3694,7 @@ impl Scheduler {
             saved_guest_sigmasks: Default::default(),
             pending_real_time_expirations: Default::default(),
             sending_child_exit: None,
+            sending_parent_death: false,
             signalfd_masks: Default::default(),
             background_signalfd_reads: Default::default(),
             background_reads: Default::default(),
@@ -4850,7 +4857,9 @@ impl Scheduler {
     /// the run queue may change.
     fn flush_parent_death_signals(&mut self) {
         for (process, signal) in std::mem::take(&mut self.pending_parent_death_signals) {
+            self.sending_parent_death = true;
             self.fire_alarm(process, DetTid::from_raw(process.as_raw()), signal);
+            self.sending_parent_death = false;
         }
     }
 
@@ -8917,7 +8926,11 @@ impl Scheduler {
             if self.sigchld_window_usable(process) {
                 let coalesced =
                     sigchld_pending_before && self.child_exit_sigchld.window_open(process);
-                self.child_exit_sigchld.note_send(process, child);
+                if self.sending_parent_death {
+                    self.child_exit_sigchld.note_parent_death_send(process);
+                } else {
+                    self.child_exit_sigchld.note_send(process, child);
+                }
                 // Linux does not queue a standard signal already pending
                 // (`legacy_queue`), so this send never reaches
                 // `complete_signal`: it wakes no thread. Waking `dettid` would
@@ -29413,21 +29426,29 @@ mod test {
         );
     }
 
-    /// A scheduler copy that names no child (a parent-death SIGCHLD, sent by
-    /// Detcore itself) queued before a child's timer copy keeps its siginfo,
-    /// as Linux keeps the first-queued copy's: the one pending signal is
-    /// delivered as it is, and the child is notified by it
-    /// (https://github.com/rrnewton/hermit/issues/4440).
+    /// A parent-death SIGCHLD, sent by Detcore itself, queued before a
+    /// child's timer copy keeps its siginfo, as Linux keeps the first-queued
+    /// copy's: the one pending signal is delivered as it is, and the child is
+    /// notified by it (https://github.com/rrnewton/hermit/issues/4440). Any
+    /// other scheduler copy that names no child (a timer's, an untracked
+    /// child's) is delivered with the owned child's siginfo, as before
+    /// (https://github.com/rrnewton/hermit/issues/4482).
     #[test]
     fn a_scheduler_copy_queued_first_keeps_its_siginfo() {
         use child_exit_sigchld::ChildExitSigchldAnswer;
         use child_exit_sigchld::DequeuedCopy;
-        let (mut scheduler, parent, _, [first, _]) = owned_sigchld_family();
-        scheduler.child_exit_sigchld.note_send(parent, None);
+        let (mut scheduler, parent, _, [first, second]) = owned_sigchld_family();
+        scheduler.child_exit_sigchld.note_parent_death_send(parent);
         timer_sends(&mut scheduler, parent, first);
         assert_eq!(
             dequeue(&mut scheduler, parent, DequeuedCopy::Other),
             ChildExitSigchldAnswer::OwnCopy(child_exit_sigchld::OwnCopy::Unowned)
+        );
+        scheduler.child_exit_sigchld.note_send(parent, None);
+        timer_sends(&mut scheduler, parent, second);
+        assert_eq!(
+            dequeue(&mut scheduler, parent, DequeuedCopy::Other),
+            delivers(second)
         );
     }
 

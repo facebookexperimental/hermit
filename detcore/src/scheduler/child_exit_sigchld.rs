@@ -285,6 +285,9 @@ pub(crate) enum WindowSend {
     Child(DetPid),
     /// Any other copy the scheduler sent.
     Scheduler,
+    /// A parent-death signal the scheduler sent
+    /// (`Scheduler::flush_parent_death_signals`).
+    ParentDeath,
     /// A guest's process-directed copy, sent in its committed turn.
     Guest,
 }
@@ -565,6 +568,16 @@ impl ChildExitSigchldLedger {
         self.window.entry(parent).or_default().push(send);
     }
 
+    /// The scheduler sent `parent` a parent-death `SIGCHLD`
+    /// (https://github.com/rrnewton/hermit/issues/4440): it joins the window,
+    /// and keeps its siginfo if queued first (`take_window`).
+    pub(crate) fn note_parent_death_send(&mut self, parent: DetPid) {
+        self.window
+            .entry(parent)
+            .or_default()
+            .push(WindowSend::ParentDeath);
+    }
+
     /// A guest sent `parent` a process-directed `SIGCHLD`, in its committed
     /// turn: it joins the window like a scheduler send.
     pub(crate) fn note_guest_send(&mut self, parent: DetPid) {
@@ -642,11 +655,15 @@ impl ChildExitSigchldLedger {
         // A guest's copy queued first keeps its siginfo, as Linux keeps the
         // first-queued copy's (the Claude re-check of
         // <https://github.com/rrnewton/hermit/pull/4131>), and so does a
-        // scheduler copy that names no child, such as a parent-death SIGCHLD
-        // (<https://github.com/rrnewton/hermit/issues/4440>).
+        // parent-death SIGCHLD the scheduler sent
+        // (<https://github.com/rrnewton/hermit/issues/4440>). Another
+        // scheduler copy that names no child (a timer's, an untracked
+        // child's) carries Hermit's own sender, not the real one, so the
+        // owned child's siginfo stands
+        // (<https://github.com/rrnewton/hermit/issues/4482>).
         let deliver = if matches!(
             sends.first(),
-            Some(WindowSend::Guest | WindowSend::Scheduler)
+            Some(WindowSend::Guest | WindowSend::ParentDeath)
         ) {
             None
         } else {
