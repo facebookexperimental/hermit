@@ -10,20 +10,20 @@
     "all": {
       "cells": 2995,
       "applicable": 1930,
-      "selectable": 1637,
+      "selectable": 1638,
       "population": 2925,
-      "population_candidate_selected": 1637,
-      "population_candidate_not_selected": 282,
+      "population_candidate_selected": 1638,
+      "population_candidate_not_selected": 281,
       "population_candidate_disabled": 1006
     },
     "by_backend": {
       "dbt": {
         "cells": 599,
         "applicable": 254,
-        "selectable": 208,
+        "selectable": 209,
         "population": 585,
-        "population_candidate_selected": 208,
-        "population_candidate_not_selected": 45,
+        "population_candidate_selected": 209,
+        "population_candidate_not_selected": 44,
         "population_candidate_disabled": 332
       },
       "in-guest-trap": {
@@ -840,7 +840,7 @@
     {"test_id":"c-programs/pipe-multiwriter-ordering","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/pipe-multiwriter-ordering","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/pipe-multiwriter-ordering","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately"},
-    {"test_id":"c-programs/pipe2-errno-precedence","backend":"dbt","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: dbt verify is not selected by full validation: Exact-head structured verification preserved EFAULT/EINVAL precedence but exposed the host pipe capacity 65536 instead of Detcore's fixed 8192-byte capacity, so Run1 exited status 1 before comparison; this is an exact backend-parity failure, not absent DBT support."},
+    {"test_id":"c-programs/pipe2-errno-precedence","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/pipe2-errno-precedence","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/pipe2-errno-precedence","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/pipe2-errno-precedence","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

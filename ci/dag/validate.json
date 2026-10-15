@@ -6622,6 +6622,13 @@
           "category": "c-programs",
           "test": "c-programs/pipe2-errno-precedence",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pipe2-errno-precedence",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -33641,6 +33648,13 @@
           "category": "c-programs",
           "test": "c-programs/pipe2-errno-precedence",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pipe2-errno-precedence",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -52664,6 +52678,13 @@
           "test": "c-programs/pipe-multiwriter-ordering",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pipe2-errno-precedence",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",

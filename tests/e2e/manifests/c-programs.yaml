@@ -6187,13 +6187,12 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
           in-guest-trap: true
-        ci_disabled_reason:
-          dbt: {"result": "parity-failure", "evidence": "637b0b19d63facb4cc77174334ed325132b83516; task drain_hermit_2059_to", "reason": "Exact-head structured verification preserved EFAULT/EINVAL precedence but exposed the host pipe capacity 65536 instead of Detcore's fixed 8192-byte capacity, so Run1 exited status 1 before comparison; this is an exact backend-parity failure, not absent DBT support."}
+        ci_disabled_reason: {}
         backends_enabled:
           - ptrace
           - dbt
