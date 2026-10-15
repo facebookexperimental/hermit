@@ -81,6 +81,34 @@ pub fn skid_overshoot_refusal(code: Option<i32>, stderr: &str) -> Option<&str> {
     refusal.filter(|_| overshoot_reported)
 }
 
+/// The file `ci/run-nextest-counted.sh` collects retried attempts in, one line
+/// each, and counts at the end of its run, so a validate log shows how many
+/// skid refusals were retried even when every test then passed. Unset outside
+/// that runner.
+pub const SKID_RETRY_RECORD_ENV: &str = "HERMIT_SKID_RETRY_RECORD";
+
+/// Append `line`, prefixed with the running test's name, to the
+/// [`SKID_RETRY_RECORD_ENV`] file. A record that cannot be written fails the
+/// test, so the count never under-reports silently.
+pub fn record_skid_retry(line: &str) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os(SKID_RETRY_RECORD_ENV).filter(|path| !path.is_empty()) else {
+        return;
+    };
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("unnamed")
+        .to_owned();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .unwrap_or_else(|error| panic!("cannot open {SKID_RETRY_RECORD_ENV}={path:?}: {error}"));
+    // One write per line keeps concurrent tests' records whole (O_APPEND).
+    file.write_all(format!("{test}\t{line}\n").as_bytes())
+        .unwrap_or_else(|error| panic!("cannot write {SKID_RETRY_RECORD_ENV}={path:?}: {error}"));
+}
+
 /// Runs `attempt` at most `max_attempts` times, again only after an attempt
 /// whose output is a typed skid-overshoot refusal ([`skid_overshoot_refusal`])
 /// (https://github.com/rrnewton/hermit/issues/1845). Returns the attempt
@@ -98,11 +126,13 @@ pub fn retry_typed_skid_refusal<T>(
         if number < max_attempts {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if let Some(refusal) = skid_overshoot_refusal(output.status.code(), &stderr) {
-                eprintln!(
+                let line = format!(
                     "SKID-RETRY {name}: attempt {number} of at most {max_attempts} exited \
                      {HERMIT_POLICY_REFUSAL_EXIT} with `{refusal}`; running again \
                      (https://github.com/rrnewton/hermit/issues/1845)"
                 );
+                eprintln!("{line}");
+                record_skid_retry(&line);
                 continue;
             }
         }

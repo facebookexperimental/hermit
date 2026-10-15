@@ -6,7 +6,7 @@
 //! retires a root or an orphan whose direct parent has already terminated.
 
 #[path = "hermit_binary.rs"]
-mod hermit_binary;
+pub mod hermit_binary;
 
 use std::fs;
 use std::os::unix::process::ExitStatusExt;

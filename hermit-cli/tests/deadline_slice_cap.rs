@@ -22,8 +22,6 @@
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
-#[path = "common/skid_overshoot.rs"]
-mod skid_overshoot;
 
 use std::fs;
 use std::path::Path;
@@ -100,20 +98,11 @@ fn run_strict_with(
     checked(output, &rendered)
 }
 
-/// Attempts per run whose short PMU slices risk a typed skid-overshoot
-/// refusal, a property of the host's PMU interrupt latency rather than of the
-/// guest (https://github.com/rrnewton/hermit/issues/1845).
-const SKID_ATTEMPTS: u32 = 3;
-
-/// [`run_strict_with`], running again only after a typed PMU skid-overshoot
-/// refusal: a 20 ms maximum slice takes about ten precise PMU stops per run.
+/// [`run_strict_with`] for a 20 ms maximum slice, which takes about ten
+/// precise PMU stops per run. Every run here retries a typed skid-overshoot
+/// refusal ([`hermit_test::hermit_output`]).
 fn run_strict_retrying_skid(guest: &Path, guest_args: &[&str], run_args: &[&str]) -> String {
-    let name = format!("{guest_args:?} {run_args:?}");
-    let (_, output, rendered) =
-        skid_overshoot::retry_typed_skid_refusal(&name, SKID_ATTEMPTS, || {
-            strict_output(guest, guest_args, &[], run_args)
-        });
-    checked(output, &rendered).0
+    run_strict_with(guest, guest_args, &[], run_args).0
 }
 
 /// Require a clean exit and return stdout and stderr.
@@ -153,9 +142,7 @@ fn strict_output(
         .args(guest_args);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start guest: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     (output, rendered)
 }
 
@@ -395,9 +382,7 @@ fn capped_schedules_verify_bitwise() {
             .args(args);
         hermit_test::configure_guest_execution(&mut command);
         let rendered = format!("{command:?}");
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to start guest: {rendered}: {error}"));
+        let output = hermit_test::hermit_output(&rendered, &mut command);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             output.status.success(),
@@ -973,13 +958,7 @@ fn verify_bitwise(args: &[&str], run_args: &[&str]) {
         .args(args);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let (_, output, ()) =
-        skid_overshoot::retry_typed_skid_refusal(&rendered, SKID_ATTEMPTS, || {
-            let output = command
-                .output()
-                .unwrap_or_else(|error| panic!("failed to start guest: {rendered}: {error}"));
-            (output, ())
-        });
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),

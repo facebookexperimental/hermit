@@ -40,8 +40,8 @@
 //! https://github.com/rrnewton/hermit/issues/4257. Upstream programs left out
 //! of this list are tracked in `docs/rr-test-suite.md`.
 
-#[path = "common/skid_overshoot.rs"]
-mod skid_overshoot;
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
 
 use std::fs;
 use std::path::Path;
@@ -60,11 +60,6 @@ const RR_TEST_TIMEOUT: &str = "120s";
 
 /// Grace period before `timeout(1)` escalates from SIGTERM to SIGKILL.
 const RR_TEST_KILL_AFTER: &str = "10s";
-
-/// Attempts per program when Hermit refuses a run for a late PMU interrupt
-/// (https://github.com/rrnewton/hermit/issues/1845), as the other helper users
-/// under validation load allow.
-const SKID_ATTEMPTS: u32 = 5;
 
 /// rr's test harness includes these generated headers (guarded by target arch).
 const GENERATED_HEADERS: [&str; 3] = [
@@ -198,31 +193,30 @@ fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str], success_marker
     // interrupt late enough that Hermit refuses the run (exit 122,
     // cause=skid-overshoot). That measures the host, not the guest, so such an
     // attempt runs again, in a fresh scratch directory; nothing else does.
-    let (_, output, (rendered, scratch)) =
-        skid_overshoot::retry_typed_skid_refusal(basename, SKID_ATTEMPTS, || {
-            // Give every attempt a unique working directory. TempDir removes all files
-            // produced by the guest when it is dropped.
-            let scratch = fresh_scratch_dir(basename);
-            // Bound every test even if Hermit or a tracee ignores timeout's initial SIGTERM.
-            let mut command = Command::new("timeout");
-            command
-                .current_dir(scratch.path())
-                .args(["--kill-after", RR_TEST_KILL_AFTER, RR_TEST_TIMEOUT])
-                .arg(env!("CARGO_BIN_EXE_hermit"))
-                .args([
-                    "run",
-                    "--base-env=minimal",
-                    "--max-timeslice=80000000",
-                    "--",
-                ])
-                .arg(&binary)
-                .args(args);
-            let rendered = format!("{command:?}");
-            let output = command
-                .output()
-                .unwrap_or_else(|error| panic!("failed to start {basename}: {rendered}: {error}"));
-            (output, (rendered, scratch))
-        });
+    let (output, (rendered, scratch)) = hermit_test::hermit_output_with(basename, || {
+        // Give every attempt a unique working directory. TempDir removes all files
+        // produced by the guest when it is dropped.
+        let scratch = fresh_scratch_dir(basename);
+        // Bound every test even if Hermit or a tracee ignores timeout's initial SIGTERM.
+        let mut command = Command::new("timeout");
+        command
+            .current_dir(scratch.path())
+            .args(["--kill-after", RR_TEST_KILL_AFTER, RR_TEST_TIMEOUT])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "run",
+                "--base-env=minimal",
+                "--max-timeslice=80000000",
+                "--",
+            ])
+            .arg(&binary)
+            .args(args);
+        let rendered = format!("{command:?}");
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("failed to start {basename}: {rendered}: {error}"));
+        (output, (rendered, scratch))
+    });
     assert_eq!(
         output.status.code(),
         Some(expected_exit),

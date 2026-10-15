@@ -111,8 +111,6 @@
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_binary;
-#[path = "common/skid_overshoot.rs"]
-mod skid_overshoot;
 
 use std::cell::Cell;
 use std::fs;
@@ -587,14 +585,15 @@ fn cell_run_args(backend: &str) -> [&str; 5] {
 #[test]
 fn cells_give_the_guest_a_minimal_environment() {
     const MARKER: &str = "/hermit-esi-ld-library-path-marker";
-    let output = Command::new(hermit_binary::hermit_binary())
-        .args(cell_run_args("ptrace"))
-        .arg("--")
-        .arg("/usr/bin/env")
-        .env("LD_LIBRARY_PATH", MARKER)
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit");
+    let output = hermit_binary::hermit_output(
+        "hermit run",
+        Command::new(hermit_binary::hermit_binary())
+            .args(cell_run_args("ptrace"))
+            .arg("--")
+            .arg("/usr/bin/env")
+            .env("LD_LIBRARY_PATH", MARKER)
+            .stdin(Stdio::null()),
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
@@ -632,6 +631,60 @@ fn run_cell_with_run_options(
     external_signals: &[libc::c_int],
     observe: Observe,
 ) -> GuestRun {
+    // A typed PMU skid-overshoot refusal, and nothing else, runs the cell
+    // again in a fresh trial directory (hermit_binary::hermit_output_with).
+    let label = format!(
+        "{backend} {mode:?} {args:?} external_signals={external_signals:?} observe={observe:?}"
+    );
+    let (output, (_trial, verify_report, info_log)) =
+        hermit_binary::hermit_output_with(&label, || {
+            run_cell_attempt(backend, mode, run_options, args, external_signals, observe)
+        });
+    let stdout = String::from_utf8(output.stdout).expect("guest stdout should be UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let verify_report = verify_report.map(|report| {
+        let bytes = fs::read(&report).unwrap_or_else(|error| {
+            panic!(
+                "{backend} {mode:?} {args:?}: strict verification did not publish its report: \
+                 {error}\nguest stdout:\n{stdout}\nhermit stderr:\n{stderr}"
+            )
+        });
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!("{backend} {mode:?} {args:?}: invalid verification report: {error}")
+        })
+    });
+    let info_log = info_log.map(|log| {
+        fs::read_to_string(&log).unwrap_or_else(|error| {
+            panic!(
+                "{backend} {mode:?} {args:?}: Hermit did not write its INFO log: {error}\nguest \
+                 stdout:\n{stdout}\nhermit stderr:\n{stderr}"
+            )
+        })
+    });
+    GuestRun {
+        status: output.status,
+        stdout,
+        stderr,
+        verify_report,
+        info_log,
+    }
+}
+
+/// One attempt of [`run_cell_with_run_options`]: run the cell in a new trial
+/// directory and return Hermit's output, with the trial directory (kept alive
+/// for the reports) and the report and log paths.
+#[allow(clippy::type_complexity)]
+fn run_cell_attempt(
+    backend: &str,
+    mode: FutexMode,
+    run_options: &[&str],
+    args: &[&str],
+    external_signals: &[libc::c_int],
+    observe: Observe,
+) -> (
+    std::process::Output,
+    (tempfile::TempDir, Option<PathBuf>, Option<PathBuf>),
+) {
     let external = !external_signals.is_empty();
     // Compiling the guest also creates the directory that holds every trial.
     let guest = guest();
@@ -810,32 +863,12 @@ fn run_cell_with_run_options(
             "{backend} {mode:?} {args:?}: {reason}\nguest stdout:\n{stdout}\nhermit stderr:\n{stderr}"
         );
     }
-    let verify_report = verify_report.map(|report| {
-        let bytes = fs::read(&report).unwrap_or_else(|error| {
-            panic!(
-                "{backend} {mode:?} {args:?}: strict verification did not publish its report: \
-                 {error}\nguest stdout:\n{stdout}\nhermit stderr:\n{stderr}"
-            )
-        });
-        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-            panic!("{backend} {mode:?} {args:?}: invalid verification report: {error}")
-        })
-    });
-    let info_log = info_log.map(|log| {
-        fs::read_to_string(&log).unwrap_or_else(|error| {
-            panic!(
-                "{backend} {mode:?} {args:?}: Hermit did not write its INFO log: {error}\nguest \
-                 stdout:\n{stdout}\nhermit stderr:\n{stderr}"
-            )
-        })
-    });
-    GuestRun {
+    let output = std::process::Output {
         status: status.expect("hermit status should be collected"),
-        stdout,
-        stderr,
-        verify_report,
-        info_log,
-    }
+        stdout: stdout.into_bytes(),
+        stderr: stderr.into_bytes(),
+    };
+    (output, (trial, verify_report, info_log))
 }
 
 /// Why a strict verification report is not determinism evidence, or `None` when
@@ -2026,20 +2059,21 @@ fn ptrace_rt_sigtimedwait_is_ended_by_the_sigchld_of_an_exiting_child() {
             .tempdir_in(&root)
             .expect("failed to create trial directory");
         let report = trial.path().join("verify.json");
-        let output = Command::new("timeout")
-            .args(["--kill-after=5s", "120s"])
-            .arg(hermit_binary::hermit_binary())
-            .env_remove("LD_LIBRARY_PATH")
-            .arg("--log=info")
-            .args(cell_run_args("ptrace"))
-            .args(["--verify", "--verify-strict", "--verify-json"])
-            .arg(&report)
-            .arg("--")
-            .arg(&witness)
-            .arg(mode)
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run hermit");
+        let output = hermit_binary::hermit_output(
+            "hermit run",
+            Command::new("timeout")
+                .args(["--kill-after=5s", "120s"])
+                .arg(hermit_binary::hermit_binary())
+                .env_remove("LD_LIBRARY_PATH")
+                .arg("--log=info")
+                .args(cell_run_args("ptrace"))
+                .args(["--verify", "--verify-strict", "--verify-json"])
+                .arg(&report)
+                .arg("--")
+                .arg(&witness)
+                .arg(mode)
+                .stdin(Stdio::null()),
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let expected = format!("mode={mode} result=-1 errno={errno} ");
         assert!(
@@ -2096,37 +2130,36 @@ fn ptrace_a_sleep_takes_the_sigchld_of_a_child_that_exits_beside_a_running_sibli
     // other PMU-node cases do (https://github.com/rrnewton/hermit/issues/1845);
     // any other outcome is checked in full. Measured at load averages of
     // 332-340 on 316 CPUs: 11 of 91 attempts refused, about 1 in 8, and two
-    // cells refused twice in a row. So this test allows five attempts, not the
-    // usual three: three would leave about 0.7% of runs of its four cells
-    // failing on the host alone. The validate of hermit 3aae303a failed on one.
-    const SKID_ATTEMPTS: u32 = 5;
+    // cells refused twice in a row. Five attempts (hermit_binary::SKID_ATTEMPTS)
+    // bring the host's share of failures to about 1 in 10,000; three would
+    // leave about 0.7% of runs of its four cells failing on the host alone.
+    // The validate of hermit 3aae303a failed on one.
     for mode in ["pause", "nanosleep"] {
         for schedule in [&[][..], &["--chaos", "--sched-seed=2"][..]] {
             let name = format!("{mode} {schedule:?}");
-            let (_, output, (_trial, report)) =
-                skid_overshoot::retry_typed_skid_refusal(&name, SKID_ATTEMPTS, || {
-                    let trial = tempfile::Builder::new()
-                        .prefix("trial-")
-                        .tempdir_in(&root)
-                        .expect("failed to create trial directory");
-                    let report = trial.path().join("verify.json");
-                    let output = Command::new("timeout")
-                        .args(["--kill-after=5s", "120s"])
-                        .arg(hermit_binary::hermit_binary())
-                        .env_remove("LD_LIBRARY_PATH")
-                        .arg("--log=info")
-                        .args(cell_run_args("ptrace"))
-                        .args(schedule)
-                        .args(["--verify", "--verify-strict", "--verify-json"])
-                        .arg(&report)
-                        .arg("--")
-                        .arg(&witness)
-                        .arg(mode)
-                        .stdin(Stdio::null())
-                        .output()
-                        .expect("failed to run hermit");
-                    (output, (trial, report))
-                });
+            let (output, (_trial, report)) = hermit_binary::hermit_output_with(&name, || {
+                let trial = tempfile::Builder::new()
+                    .prefix("trial-")
+                    .tempdir_in(&root)
+                    .expect("failed to create trial directory");
+                let report = trial.path().join("verify.json");
+                let output = Command::new("timeout")
+                    .args(["--kill-after=5s", "120s"])
+                    .arg(hermit_binary::hermit_binary())
+                    .env_remove("LD_LIBRARY_PATH")
+                    .arg("--log=info")
+                    .args(cell_run_args("ptrace"))
+                    .args(schedule)
+                    .args(["--verify", "--verify-strict", "--verify-json"])
+                    .arg(&report)
+                    .arg("--")
+                    .arg(&witness)
+                    .arg(mode)
+                    .stdin(Stdio::null())
+                    .output()
+                    .expect("failed to run hermit");
+                (output, (trial, report))
+            });
             let stdout = String::from_utf8_lossy(&output.stdout);
             let expected = format!(
                 "mode={mode} result=-1 errno={} handler_main=1 handler_sibling=0",
@@ -2185,19 +2218,20 @@ fn ptrace_rt_sigtimedwait_takes_a_queued_signal_before_the_sigchld_of_an_exiting
         .tempdir_in(&root)
         .expect("failed to create trial directory");
     let report = trial.path().join("verify.json");
-    let output = Command::new("timeout")
-        .args(["--kill-after=5s", "120s"])
-        .arg(hermit_binary::hermit_binary())
-        .env_remove("LD_LIBRARY_PATH")
-        .arg("--log=info")
-        .args(cell_run_args("ptrace"))
-        .args(["--verify", "--verify-strict", "--verify-json"])
-        .arg(&report)
-        .arg("--")
-        .arg(&witness)
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit");
+    let output = hermit_binary::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after=5s", "120s"])
+            .arg(hermit_binary::hermit_binary())
+            .env_remove("LD_LIBRARY_PATH")
+            .arg("--log=info")
+            .args(cell_run_args("ptrace"))
+            .args(["--verify", "--verify-strict", "--verify-json"])
+            .arg(&report)
+            .arg("--")
+            .arg(&witness)
+            .stdin(Stdio::null()),
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let expected = format!("wait_result={} wait_errno=0 ", libc::SIGUSR1);
     assert!(
@@ -2252,20 +2286,21 @@ fn ptrace_large_pselect6_sleeps_under_its_entry_mask_while_a_sibling_rewrites_it
             .tempdir_in(&root)
             .expect("failed to create trial directory");
         let report = trial.path().join("verify.json");
-        let output = Command::new("timeout")
-            .args(["--kill-after=5s", "120s"])
-            .arg(hermit_binary::hermit_binary())
-            .env_remove("LD_LIBRARY_PATH")
-            .arg("--log=info")
-            .args(cell_run_args("ptrace"))
-            .args(["--verify", "--verify-strict", "--verify-json"])
-            .arg(&report)
-            .arg("--")
-            .arg(&witness)
-            .arg(mode)
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run hermit");
+        let output = hermit_binary::hermit_output(
+            "hermit run",
+            Command::new("timeout")
+                .args(["--kill-after=5s", "120s"])
+                .arg(hermit_binary::hermit_binary())
+                .env_remove("LD_LIBRARY_PATH")
+                .arg("--log=info")
+                .args(cell_run_args("ptrace"))
+                .args(["--verify", "--verify-strict", "--verify-json"])
+                .arg(&report)
+                .arg("--")
+                .arg(&witness)
+                .arg(mode)
+                .stdin(Stdio::null()),
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let expected = format!("mode={mode} result=1 errno=0 ready=1 writer_ok=1 oracle=1");
         assert!(
@@ -2330,20 +2365,21 @@ fn ptrace_large_pselect6_on_a_stack_with_no_scratch_behaves_as_natively() {
             .tempdir_in(&root)
             .expect("failed to create trial directory");
         let report = trial.path().join("verify.json");
-        let output = Command::new("timeout")
-            .args(["--kill-after=5s", "120s"])
-            .arg(hermit_binary::hermit_binary())
-            .env_remove("LD_LIBRARY_PATH")
-            .arg("--log=info")
-            .args(cell_run_args("ptrace"))
-            .args(["--verify", "--verify-strict", "--verify-json"])
-            .arg(&report)
-            .arg("--")
-            .arg(&witness)
-            .arg(mode)
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run hermit");
+        let output = hermit_binary::hermit_output(
+            "hermit run",
+            Command::new("timeout")
+                .args(["--kill-after=5s", "120s"])
+                .arg(hermit_binary::hermit_binary())
+                .env_remove("LD_LIBRARY_PATH")
+                .arg("--log=info")
+                .args(cell_run_args("ptrace"))
+                .args(["--verify", "--verify-strict", "--verify-json"])
+                .arg(&report)
+                .arg("--")
+                .arg(&witness)
+                .arg(mode)
+                .stdin(Stdio::null()),
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
         // The crowded call leaves no red-zone window on the tight stack, so
         // only adjacent and ample make it here; mode crowded covers tight.
@@ -2369,17 +2405,18 @@ fn ptrace_large_pselect6_on_a_stack_with_no_scratch_behaves_as_natively() {
     // for the private copy. A fail-closed run refuses the call by name, never
     // forwarding a mask the scheduler did not record (Codex re-check #4); a
     // run that allows unsupported operations gets Linux's answer.
-    let refused = Command::new("timeout")
-        .args(["--kill-after=5s", "120s"])
-        .arg(hermit_binary::hermit_binary())
-        .env_remove("LD_LIBRARY_PATH")
-        .args(cell_run_args("ptrace"))
-        .arg("--")
-        .arg(&witness)
-        .arg("crowded")
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit");
+    let refused = hermit_binary::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after=5s", "120s"])
+            .arg(hermit_binary::hermit_binary())
+            .env_remove("LD_LIBRARY_PATH")
+            .args(cell_run_args("ptrace"))
+            .arg("--")
+            .arg(&witness)
+            .arg("crowded")
+            .stdin(Stdio::null()),
+    );
     let refused_stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
         refused.status.code() == Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
@@ -2390,17 +2427,18 @@ fn ptrace_large_pselect6_on_a_stack_with_no_scratch_behaves_as_natively() {
         refused.status,
         String::from_utf8_lossy(&refused.stdout)
     );
-    let allowed = Command::new("timeout")
-        .args(["--kill-after=5s", "120s"])
-        .arg(hermit_binary::hermit_binary())
-        .env_remove("LD_LIBRARY_PATH")
-        .args(["--backend", "ptrace", "run", "--allow-unsupported-syscalls"])
-        .args(["--base-env=minimal", "--"])
-        .arg(&witness)
-        .arg("crowded")
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit");
+    let allowed = hermit_binary::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after=5s", "120s"])
+            .arg(hermit_binary::hermit_binary())
+            .env_remove("LD_LIBRARY_PATH")
+            .args(["--backend", "ptrace", "run", "--allow-unsupported-syscalls"])
+            .args(["--base-env=minimal", "--"])
+            .arg(&witness)
+            .arg("crowded")
+            .stdin(Stdio::null()),
+    );
     let allowed_stdout = String::from_utf8_lossy(&allowed.stdout);
     assert!(
         allowed.status.success() && allowed_stdout.contains("mode=crowded crowded=1 oracle=1"),
@@ -2442,18 +2480,19 @@ fn ptrace_record_refuses_a_crowded_pselect6_on_a_tight_stack_by_name() {
         .prefix("record-")
         .tempdir_in(&root)
         .expect("failed to create recording directory");
-    let refused = Command::new("timeout")
-        .args(["--kill-after=5s", "120s"])
-        .arg(hermit_binary::hermit_binary())
-        .env_remove("LD_LIBRARY_PATH")
-        .args(["--backend", "ptrace", "record", "start", "--strict"])
-        .arg(format!("--data-dir={}", data.path().display()))
-        .arg("--")
-        .arg(&witness)
-        .arg("crowded")
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit");
+    let refused = hermit_binary::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after=5s", "120s"])
+            .arg(hermit_binary::hermit_binary())
+            .env_remove("LD_LIBRARY_PATH")
+            .args(["--backend", "ptrace", "record", "start", "--strict"])
+            .arg(format!("--data-dir={}", data.path().display()))
+            .arg("--")
+            .arg(&witness)
+            .arg("crowded")
+            .stdin(Stdio::null()),
+    );
     let refused_stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
         refused.status.code() == Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
@@ -2523,20 +2562,21 @@ fn ptrace_ppoll_on_a_stack_with_no_scratch_behaves_as_natively() {
             .tempdir_in(&root)
             .expect("failed to create trial directory");
         let report = trial.path().join("verify.json");
-        let output = Command::new("timeout")
-            .args(["--kill-after=5s", "120s"])
-            .arg(hermit_binary::hermit_binary())
-            .env_remove("LD_LIBRARY_PATH")
-            .arg("--log=info")
-            .args(cell_run_args("ptrace"))
-            .args(["--verify", "--verify-strict", "--verify-json"])
-            .arg(&report)
-            .arg("--")
-            .arg(&witness)
-            .arg(mode)
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run hermit");
+        let output = hermit_binary::hermit_output(
+            "hermit run",
+            Command::new("timeout")
+                .args(["--kill-after=5s", "120s"])
+                .arg(hermit_binary::hermit_binary())
+                .env_remove("LD_LIBRARY_PATH")
+                .arg("--log=info")
+                .args(cell_run_args("ptrace"))
+                .args(["--verify", "--verify-strict", "--verify-json"])
+                .arg(&report)
+                .arg("--")
+                .arg(&witness)
+                .arg(mode)
+                .stdin(Stdio::null()),
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let expected = format!("{expected} red_zone_changed=000");
         assert!(
@@ -2553,17 +2593,18 @@ fn ptrace_ppoll_on_a_stack_with_no_scratch_behaves_as_natively() {
             panic!("{mode}: strict verification is not determinism evidence: {gap}");
         }
     }
-    let refused = Command::new("timeout")
-        .args(["--kill-after=5s", "120s"])
-        .arg(hermit_binary::hermit_binary())
-        .env_remove("LD_LIBRARY_PATH")
-        .args(cell_run_args("ptrace"))
-        .arg("--")
-        .arg(&witness)
-        .arg("ppoll-mask-raise-tight8")
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit");
+    let refused = hermit_binary::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after=5s", "120s"])
+            .arg(hermit_binary::hermit_binary())
+            .env_remove("LD_LIBRARY_PATH")
+            .args(cell_run_args("ptrace"))
+            .arg("--")
+            .arg(&witness)
+            .arg("ppoll-mask-raise-tight8")
+            .stdin(Stdio::null()),
+    );
     let refused_stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
         refused.status.code() == Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
@@ -3127,6 +3168,26 @@ impl InheritedTerminalRun {
 /// size on the master. This process keeps the master open until the run ends,
 /// so the terminal never hangs up.
 fn run_inherited_terminal_cell(namespace: bool, event: TerminalEvent) -> InheritedTerminalRun {
+    // A typed PMU skid-overshoot refusal, and nothing else, runs the cell
+    // again with a new terminal and trial directory.
+    let label = format!("ptrace poll {} namespace={namespace}", event.role());
+    hermit_binary::hermit_output_with(&label, || {
+        let run = run_inherited_terminal_cell_attempt(namespace, event);
+        let output = std::process::Output {
+            status: run.status,
+            stdout: run.stdout.clone().into_bytes(),
+            stderr: run.stderr.clone().into_bytes(),
+        };
+        (output, run)
+    })
+    .1
+}
+
+/// One attempt of [`run_inherited_terminal_cell`].
+fn run_inherited_terminal_cell_attempt(
+    namespace: bool,
+    event: TerminalEvent,
+) -> InheritedTerminalRun {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
 

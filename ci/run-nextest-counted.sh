@@ -550,5 +550,20 @@ if [[ -n $calibration_launch && ( -e $calibration_launch || -L $calibration_laun
     (set -o noclobber; head -c 262145 -- "$calibration_launch" >"$cpu_report.launch.json") || exit $?
     # Preserve the wrapper mount as authority; this copy only retains evidence.
 fi
+# Hermit-running tests retry a typed PMU skid-overshoot refusal and append
+# one line per retry here (hermit-cli/tests/common/skid_overshoot.rs). Report
+# the count even when every test passed, so a rising skid rate is visible in
+# the validate log rather than hidden by the retries.
+skid_retry_record="$cpu_measurement_dir/skid-retries.log"
+: >"$skid_retry_record" || exit $?
+export HERMIT_SKID_RETRY_RECORD=$skid_retry_record
+nextest_status=0
 run_nextest "$events_log" "$(configured_wall_timeout_multiplier)" "$cpu_wrapper" \
-    "$cpu_attempt_records" "$cpu_binary_map" "$cpu_inventory" "$cpu_report" "$@"
+    "$cpu_attempt_records" "$cpu_binary_map" "$cpu_inventory" "$cpu_report" "$@" \
+    || nextest_status=$?
+skid_retries=$(wc -l <"$skid_retry_record") || exit $?
+printf 'run-nextest-counted: skid-overshoot retries: %d\n' "$skid_retries" >&2
+if ((skid_retries > 0)); then
+    sed 's/^/run-nextest-counted: skid-overshoot retry: /' "$skid_retry_record" >&2
+fi
+exit "$nextest_status"

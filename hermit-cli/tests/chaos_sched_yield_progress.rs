@@ -29,8 +29,6 @@
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
-#[path = "common/skid_overshoot.rs"]
-mod skid_overshoot;
 
 use std::fs;
 use std::path::Path;
@@ -174,11 +172,7 @@ fn run_chaos_retrying_skid(
     chaos_args: &[&str],
     guest_args: &[&str],
 ) -> Output {
-    let name = format!("seed {seed} {chaos_args:?} {guest_args:?}");
-    let (_, output, rendered) =
-        skid_overshoot::retry_typed_skid_refusal(&name, SKID_ATTEMPTS, || {
-            chaos_output(guest, seed, hermit_args, chaos_args, guest_args)
-        });
+    let (output, rendered) = chaos_output(guest, seed, hermit_args, chaos_args, guest_args);
     checked_chaos_output(output, seed, &rendered)
 }
 
@@ -211,9 +205,7 @@ fn chaos_output(
 
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start guest (seed {seed}): {rendered}: {error}"));
+    let output = hermit_test::hermit_output_attempts(&rendered, SKID_ATTEMPTS, &mut command);
     (output, rendered)
 }
 
@@ -459,9 +451,7 @@ fn targeted_chaos_preemption_replay_matches_two_pinned_records() {
 
             hermit_test::configure_guest_execution(&mut command);
             let rendered = format!("{command:?}");
-            let output = command.output().unwrap_or_else(|error| {
-                panic!("failed to start chaos {phase}: {rendered}: {error}")
-            });
+            let output = hermit_test::hermit_output(&rendered, &mut command);
             assert!(
                 output.status.success(),
                 "chaos {phase} failed with seed {seed}: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -502,9 +492,7 @@ fn run_strict_guest(args: &[&str]) {
 
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start strict guest: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
 
     assert_ne!(
         output.status.code(),
@@ -564,9 +552,7 @@ fn preemption_replay_preserves_vfork_sched_yield_progress() {
 
         hermit_test::configure_guest_execution(&mut command);
         let rendered = format!("{command:?}");
-        let output = command.output().unwrap_or_else(|error| {
-            panic!("failed to start preemption {phase}: {rendered}: {error}")
-        });
+        let output = hermit_test::hermit_output(&rendered, &mut command);
         assert_ne!(
             output.status.code(),
             Some(124),

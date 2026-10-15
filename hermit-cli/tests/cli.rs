@@ -15,8 +15,10 @@ mod fault_sites;
 #[path = "common/timerfd_virtual_time.rs"]
 mod timerfd_virtual_time;
 
-#[path = "common/skid_overshoot.rs"]
-mod skid_overshoot;
+// The binary loads hermit_binary.rs once, through kvm_synchronous_fault, and
+// skid_overshoot.rs once, through hermit_binary.rs.
+use hermit_test::skid_overshoot;
+use kvm_synchronous_fault::hermit_binary as hermit_test;
 use skid_overshoot::SKID_OVERSHOOT_REFUSAL_PREFIX;
 use skid_overshoot::retry_typed_skid_refusal;
 use skid_overshoot::skid_overshoot_refusal;
@@ -368,29 +370,31 @@ fn hermit_command_under_host_filter(args: &[&str]) -> Command {
 }
 
 fn hermit(args: &[&str]) -> Output {
-    hermit_command(args)
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"))
+    hermit_test::hermit_output(&format!("hermit {args:?}"), &mut hermit_command(args))
 }
 
 fn hermit_with_stdin(args: &[&str], input: &[u8]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    append_hermit_args(&mut command, args);
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
-    child
-        .stdin
-        .take()
-        .expect("hermit stdin should be piped")
-        .write_all(input)
-        .expect("failed to write hermit stdin");
-    child
-        .wait_with_output()
-        .unwrap_or_else(|error| panic!("failed to wait for hermit with {args:?}: {error}"))
+    hermit_test::hermit_output_with(&format!("hermit {args:?}"), || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        append_hermit_args(&mut command, args);
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+        child
+            .stdin
+            .take()
+            .expect("hermit stdin should be piped")
+            .write_all(input)
+            .expect("failed to write hermit stdin");
+        let output = child
+            .wait_with_output()
+            .unwrap_or_else(|error| panic!("failed to wait for hermit with {args:?}: {error}"));
+        (output, ())
+    })
+    .0
 }
 
 /// A directory under `CARGO_TARGET_TMPDIR` owned by this test process. Nextest
@@ -2612,9 +2616,7 @@ fn hermit_with_closed_stdin(args: &[&str]) -> Output {
             }
         });
     }
-    command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"))
+    hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command)
 }
 
 fn assert_success(output: &Output, args: &[&str]) {
@@ -10630,11 +10632,12 @@ fn run_chaos_preemption_replay_reuses_the_recorded_epoch() {
     ];
     // Both runs must see only the epochs this test gives them: a harness that
     // pins HERMIT_EPOCH would otherwise supply the replay's epoch too.
-    let recorded = hermit_command(&recording_args)
-        .env_remove("HERMIT_EPOCH")
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit");
+    let recorded = hermit_test::hermit_output(
+        "chaos preemption record",
+        hermit_command(&recording_args)
+            .env_remove("HERMIT_EPOCH")
+            .stdin(Stdio::null()),
+    );
     assert_success(&recorded, &recording_args);
 
     // The premise: real preemption points, at absolute instants after the epoch.
@@ -10665,11 +10668,12 @@ fn run_chaos_preemption_replay_reuses_the_recorded_epoch() {
         "--",
         guest,
     ];
-    let replayed = hermit_command(&replay_args)
-        .env_remove("HERMIT_EPOCH")
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit");
+    let replayed = hermit_test::hermit_output(
+        "chaos preemption replay",
+        hermit_command(&replay_args)
+            .env_remove("HERMIT_EPOCH")
+            .stdin(Stdio::null()),
+    );
     let replay_stderr = stderr(&replayed);
     assert!(
         !replay_stderr.contains("Cannot set end of timeslice"),
@@ -11124,21 +11128,40 @@ fn exit_status_with_full_unread_stderr(command: &mut Command) -> std::process::E
 /// expiry), and return its exit status (`None` when it was killed), the time
 /// waited and its stderr.
 fn stderr_when_read(command: &mut Command) -> (Option<std::process::ExitStatus>, Duration, String) {
-    let mut child = command
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut pipe = child.stderr.take().unwrap();
-    let reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
-        bytes
-    });
-    let bound = LOG_CAP_RUN_WAIT_BOUND.mul_f64(dap_wall_timeout_multiplier());
-    let (status, elapsed) = wait_at_most(&mut child, bound);
-    let stderr = String::from_utf8_lossy(&reader.join().unwrap()).into_owned();
-    (status, elapsed, stderr)
+    // A typed skid-overshoot refusal, and nothing else, runs the command again.
+    let label = format!("{command:?}");
+    hermit_test::hermit_output_with(&label, || {
+        let mut child = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut pipe = child.stderr.take().unwrap();
+        let reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
+            bytes
+        });
+        let bound = LOG_CAP_RUN_WAIT_BOUND.mul_f64(dap_wall_timeout_multiplier());
+        let (status, elapsed) = wait_at_most(&mut child, bound);
+        let stderr = String::from_utf8_lossy(&reader.join().unwrap()).into_owned();
+        (
+            output_of(status, Vec::new(), stderr.clone().into_bytes()),
+            (status, elapsed, stderr),
+        )
+    })
+    .1
+}
+
+/// An `Output` for the skid-retry classifier from a status that may be absent
+/// (a run killed at its deadline, which is never a skid refusal).
+fn output_of(status: Option<std::process::ExitStatus>, stdout: Vec<u8>, stderr: Vec<u8>) -> Output {
+    use std::os::unix::process::ExitStatusExt;
+    Output {
+        status: status.unwrap_or_else(|| std::process::ExitStatus::from_raw(libc::SIGKILL)),
+        stdout,
+        stderr,
+    }
 }
 
 /// The options [`run_uses_readonly_proc_after_permission_denial`] runs with
@@ -12931,9 +12954,29 @@ fn happens_before_version_2_without_perf_counters_is_refused_before_stdin() {
 /// that writes more than a pipe holds before it exits would block on the full
 /// pipe and look like a hang. With `open_stdin`, stdin is a pipe whose writer
 /// stays open for the whole wait, so a child that reads its input first never
-/// returns.
+/// returns. A typed skid-overshoot refusal, and nothing else, runs the command
+/// again into fresh files ([`hermit_test::hermit_output_with`]).
 fn run_with_deadline(
     mut command: Command,
+    directory: &Path,
+    limit: Duration,
+    open_stdin: bool,
+) -> (Option<std::process::ExitStatus>, String) {
+    let label = format!("{command:?}");
+    hermit_test::hermit_output_with(&label, || {
+        let (status, stderr) = run_with_deadline_once(&mut command, directory, limit, open_stdin);
+        (
+            output_of(status, Vec::new(), stderr.clone().into_bytes()),
+            (status, stderr),
+        )
+    })
+    .1
+}
+
+/// One attempt of [`run_with_deadline`], for a caller that handles a skid
+/// refusal itself ([`run_pmu_spinner_retrying_skid`]).
+fn run_with_deadline_once(
+    command: &mut Command,
     directory: &Path,
     limit: Duration,
     open_stdin: bool,
@@ -13022,7 +13065,7 @@ fn run_pmu_spinner_retrying_skid(
     for attempt in 1..=SKID_RETRY_MAX_ATTEMPTS {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let (status, stderr) =
-            run_with_deadline(hermit_command(args), directory.path(), limit, false);
+            run_with_deadline_once(&mut hermit_command(args), directory.path(), limit, false);
         let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
             .expect("failed to read the guest's stdout");
         let code = status.and_then(|status| status.code());
@@ -13045,11 +13088,13 @@ fn run_pmu_spinner_retrying_skid(
                 stderr,
             };
         }
-        eprintln!(
+        let line = format!(
             "SKID-RETRY {test}: attempt {attempt} of at most {SKID_RETRY_MAX_ATTEMPTS} exited \
              {HERMIT_POLICY_REFUSAL_EXIT} with `{refusal}`; retrying once its guest stdout passes \
              the case's checks (https://github.com/rrnewton/hermit/issues/1845)"
         );
+        eprintln!("{line}");
+        skid_overshoot::record_skid_retry(&line);
         check_stdout(&stdout);
     }
     unreachable!("the last attempt always returns")
@@ -13100,6 +13145,14 @@ fn skid_retry_loop_returns_any_other_failure_at_once() {
 /// is returned, not retried, for the caller to fail.
 #[test]
 fn skid_retry_loop_retries_only_typed_refusals_up_to_its_bound() {
+    // Each retry is recorded for ci/run-nextest-counted.sh's count. Send this
+    // test's synthetic refusals to a file of its own, so they never reach that
+    // count, and check them there.
+    let record_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let record = record_dir.path().join("skid-retries.log");
+    // SAFETY: Nextest runs each test in a process of its own, and this test
+    // starts no thread before it sets the variable.
+    unsafe { std::env::set_var(skid_overshoot::SKID_RETRY_RECORD_ENV, &record) };
     let mut calls = 0;
     let (attempt, output, ()) = retry_typed_skid_refusal("loop test", 5, || {
         calls += 1;
@@ -13125,6 +13178,17 @@ fn skid_retry_loop_retries_only_typed_refusals_up_to_its_bound() {
     assert_eq!(
         (attempt, calls, output.status.code()),
         (5, 5, Some(HERMIT_POLICY_REFUSAL_EXIT))
+    );
+
+    // Two retries before the pass, four before the refusal at the bound: one
+    // record each, named for this test.
+    let records = fs::read_to_string(&record).expect("the retries were not recorded");
+    let lines = records.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 6, "{records}");
+    assert!(
+        lines.iter().all(|line| line
+            .starts_with("skid_retry_loop_retries_only_typed_refusals_up_to_its_bound\tSKID-RETRY loop test: attempt ")),
+        "{records}"
     );
 }
 
