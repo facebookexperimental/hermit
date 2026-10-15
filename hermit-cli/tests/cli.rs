@@ -4078,6 +4078,12 @@ const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
         "a rendered file's position is not shared across fork, and the chroot \
          checks fail (https://github.com/rrnewton/hermit/issues/4450)",
     ),
+    (
+        "detcore_renders_its_procfs_files_on_every_backend",
+        "sabre",
+        "a thread makes a varying number of futex waits, so the runs diverge \
+         (https://github.com/rrnewton/hermit/issues/4473)",
+    ),
 ];
 
 /// The backends `test` runs on here, ptrace first: every backend in

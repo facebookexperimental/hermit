@@ -1882,7 +1882,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/rendered_procfs_files.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/rendered_procfs_files.c is owned by hermit-cli/tests/cli.rs: the CLI test detcore_renders_its_procfs_files_on_every_backend runs it on ptrace, DBT, KVM, SaBRe and e9patch preprocessing with ptrace (LiteInst and in-guest-trap are named as not yet, https://github.com/rrnewton/hermit/issues/4450) and requires every backend to give Linux's answers for /proc/sys/kernel/random/uuid and /proc/sys/kernel/pty/nr, which Detcore renders without the backend opening them, and the same device and inode on each (https://github.com/rrnewton/hermit/issues/4213). It stays a fixture because a generic manifest cannot pass the KVM-only option or compare stdout across backends."
+      "why": "tests/c/rendered_procfs_files.c is owned by hermit-cli/tests/cli.rs: the CLI test detcore_renders_its_procfs_files_on_every_backend runs it on ptrace, DBT, KVM and e9patch preprocessing with ptrace (SaBRe, LiteInst and in-guest-trap are named as not yet, with their issues) and requires every backend to give Linux's answers for /proc/sys/kernel/random/uuid and /proc/sys/kernel/pty/nr, which Detcore renders without the backend opening them, and the same device and inode on each (https://github.com/rrnewton/hermit/issues/4213). It stays a fixture because a generic manifest cannot pass the KVM-only option or compare stdout across backends."
     },
     {
       "disposition": "cargo-integration-test-fixture",
