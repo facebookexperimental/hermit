@@ -275,6 +275,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "sqlite_veryquick",
             "--test",
+            "standalone",
+            "--test",
             "stress_suite",
             "--test",
             "swaps_determinism",
@@ -865,7 +867,7 @@ mod tests {
             } else {
                 executed(tag)
             };
-            assert_eq!(population, 555);
+            assert_eq!(population, 567);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

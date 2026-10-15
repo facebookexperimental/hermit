@@ -71,6 +71,7 @@ enum Mode {
     TraceReplayChaos,
     Strict,
     Chaos,
+    TraceReplaySplit,
 }
 
 impl Mode {
@@ -101,6 +102,14 @@ impl Mode {
                 "--hermit-arg=--chaos",
                 "--hermit-arg=--env=HERMIT_MODE=chaos",
                 "--hermit-arg=--preemption-timeout=1000000",
+            ],
+            // The internal `just_spin_trace_replay_split` target: trace replay
+            // that splits each block of branch events in half, with a shorter
+            // preemption timeout.
+            Mode::TraceReplaySplit => &[
+                "trace-replay",
+                "--split-branches",
+                "--hermit-arg=--preemption-timeout=10000000",
             ],
         }
     }
@@ -3050,4 +3059,12 @@ shell_replay_case!(
     trace_replay_chaos_shell_taskset,
     "taskset.sh",
     Mode::TraceReplayChaos
+);
+
+// The internal trace_replay_split target, which only just_spin has.
+replay_case!(
+    trace_replay_split_just_spin,
+    "just_spin",
+    None,
+    Mode::TraceReplaySplit
 );

@@ -4515,26 +4515,26 @@
     {
       "disposition": "integration-helper",
       "path": "tests/standalone/cat_proc_uptime.sh",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "tests/standalone/cat_proc_uptime.sh is owned by hermit-cli/tests integration targets: The `cat_proc_uptime` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+      "runner": "none: the internal Buck matrix's standalone target only",
+      "why": "tests/standalone/cat_proc_uptime.sh is the source of an internal standalone target that is not ported: it expects run --verify to find differences in /proc/uptime, which Detcore now renders deterministically, and the relaxed --verify it uses is refused before any comparison, so it would pass without measuring anything."
     },
     {
       "disposition": "integration-helper",
       "path": "tests/standalone/curl_client_only.sh",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "tests/standalone/curl_client_only.sh is owned by hermit-cli/tests integration targets: The `curl_client_only` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+      "runner": "none: the internal Buck matrix's standalone target only",
+      "why": "tests/standalone/curl_client_only.sh is the source of an internal standalone target that is not ported: it fetches from a local HTTP server with --network=host, which validation's no-network rule excludes."
     },
     {
       "disposition": "integration-helper",
       "path": "tests/standalone/env_var_passthru.sh",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "tests/standalone/env_var_passthru.sh is owned by hermit-cli/tests integration targets: The `env_var_passthru` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+      "runner": "hermit-cli/tests/standalone.rs",
+      "why": "tests/standalone/env_var_passthru.sh is owned by hermit-cli/tests/standalone.rs: it runs the internal Buck matrix's standalone target for this script as its buck_sh_test does, with Hermit as its first argument and in HERMIT_BIN."
     },
     {
       "disposition": "integration-helper",
       "path": "tests/standalone/minimal_hello_backtraces.sh",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "tests/standalone/minimal_hello_backtraces.sh is owned by hermit-cli/tests integration targets: The `minimal_hello_backtraces` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+      "runner": "hermit-cli/tests/standalone.rs",
+      "why": "tests/standalone/minimal_hello_backtraces.sh is owned by hermit-cli/tests/standalone.rs: it runs the internal Buck matrix's standalone target for this script as its buck_sh_test does, with Hermit as its first argument and in HERMIT_BIN."
     },
     {
       "disposition": "cargo-binary",
@@ -4551,20 +4551,20 @@
     {
       "disposition": "integration-helper",
       "path": "tests/standalone/replay_and_print_stacktraces.sh",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "tests/standalone/replay_and_print_stacktraces.sh is owned by hermit-cli/tests integration targets: The `replay_and_print_stacktraces` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+      "runner": "hermit-cli/tests/standalone.rs",
+      "why": "tests/standalone/replay_and_print_stacktraces.sh is owned by hermit-cli/tests/standalone.rs: it runs the internal Buck matrix's standalone target for this script as its buck_sh_test does, with Hermit as its first argument and in HERMIT_BIN."
     },
     {
       "disposition": "integration-helper",
       "path": "tests/standalone/replay_chaos_trace.sh",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "tests/standalone/replay_chaos_trace.sh is owned by hermit-cli/tests integration targets: The `replay_chaos_trace` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+      "runner": "hermit-cli/tests/standalone.rs",
+      "why": "tests/standalone/replay_chaos_trace.sh is owned by hermit-cli/tests/standalone.rs: it runs the internal Buck matrix's standalone target for this script as its buck_sh_test does, with Hermit as its first argument and in HERMIT_BIN."
     },
     {
       "disposition": "integration-helper",
       "path": "tests/standalone/replay_trace.sh",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "tests/standalone/replay_trace.sh is owned by hermit-cli/tests integration targets: The `replay_trace` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+      "runner": "hermit-cli/tests/standalone.rs",
+      "why": "tests/standalone/replay_trace.sh is owned by hermit-cli/tests/standalone.rs: it runs the internal Buck matrix's standalone target for this script as its buck_sh_test does, with Hermit as its first argument and in HERMIT_BIN."
     },
     {
       "disposition": "cargo-binary",
@@ -4575,8 +4575,8 @@
     {
       "disposition": "integration-helper",
       "path": "tests/standalone/stacktrace_signal.sh",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "tests/standalone/stacktrace_signal.sh is owned by hermit-cli/tests integration targets: The `stacktrace_signal` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+      "runner": "hermit-cli/tests/standalone.rs",
+      "why": "tests/standalone/stacktrace_signal.sh is owned by hermit-cli/tests/standalone.rs: it runs the internal Buck matrix's standalone target for this script as its buck_sh_test does, with Hermit as its first argument and in HERMIT_BIN."
     },
     {
       "disposition": "integration-helper",
@@ -4593,14 +4593,14 @@
     {
       "disposition": "integration-helper",
       "path": "tests/standalone/test_no_networking_network_bind.sh",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "tests/standalone/test_no_networking_network_bind.sh is owned by hermit-cli/tests integration targets: The `test_no_networking_network_bind` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+      "runner": "hermit-cli/tests/standalone.rs",
+      "why": "tests/standalone/test_no_networking_network_bind.sh is owned by hermit-cli/tests/standalone.rs: it runs the internal Buck matrix's standalone target for this script as its buck_sh_test does, with Hermit as its first argument and in HERMIT_BIN."
     },
     {
       "disposition": "integration-helper",
       "path": "tests/standalone/validate_race_example_properties.sh",
-      "runner": "hermit-cli/tests integration targets",
-      "why": "tests/standalone/validate_race_example_properties.sh is owned by hermit-cli/tests integration targets: The `validate_race_example_properties` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+      "runner": "hermit-cli/tests/standalone.rs",
+      "why": "tests/standalone/validate_race_example_properties.sh is owned by hermit-cli/tests/standalone.rs: it runs the internal Buck matrix's standalone target for this script as its buck_sh_test does, with Hermit as its first argument and in HERMIT_BIN."
     },
     {
       "disposition": "support-data",
@@ -4659,8 +4659,8 @@
     {
       "disposition": "special-driver",
       "path": "tests/util/hermit_verify_trace_replay.sh",
-      "runner": "manual trace/replay comparison entrypoint",
-      "why": "tests/util/hermit_verify_trace_replay.sh is owned by manual trace/replay comparison entrypoint: This executable records one Hermit schedule, replays it in a second process, and compares exit status, stdout, stderr, and normalized syscall histories before cleaning its logs. It remains a manual driver because its cross-run trace artifacts and four-part comparison exceed a single manifest observation."
+      "runner": "hermit-cli/tests/standalone.rs",
+      "why": "tests/util/hermit_verify_trace_replay.sh is owned by hermit-cli/tests/standalone.rs: it runs the internal verify_replay__nanosleep-threads-simple target, which records a chaotic run's preemptions, replays them and requires identical output."
     },
     {
       "disposition": "integration-helper",
