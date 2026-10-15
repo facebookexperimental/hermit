@@ -1260,6 +1260,13 @@
           "category": "c-programs",
           "test": "c-programs/adjtimex-deterministic",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/adjtimex-deterministic",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -1610,6 +1617,13 @@
           "category": "c-programs",
           "test": "c-programs/clock-adjtime-deterministic",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/clock-adjtime-deterministic",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -1681,6 +1695,13 @@
           "test": "c-programs/close-range-fds",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/copy-file-range-refusal-probe",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -3129,6 +3150,13 @@
           "category": "c-programs",
           "test": "c-programs/get-robust-list-self",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/get-robust-list-self",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -3760,6 +3788,13 @@
           "test": "c-programs/io-uring-ring-determinism",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ioctl-fioclex",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -9877,6 +9912,13 @@
           "category": "c-programs",
           "test": "c-programs/splice-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/splice-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -10409,6 +10451,13 @@
           "category": "c-programs",
           "test": "c-programs/syslog-deterministic",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syslog-deterministic",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -10655,6 +10704,13 @@
           "test": "c-programs/tcp-info-client4",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/tee-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -31009,6 +31065,13 @@
           "category": "c-programs",
           "test": "c-programs/adjtimex-deterministic",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/adjtimex-deterministic",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -31170,6 +31233,13 @@
           "category": "c-programs",
           "test": "c-programs/clock-adjtime-deterministic",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/clock-adjtime-deterministic",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -31199,6 +31269,13 @@
           "test": "c-programs/close-range-fds",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/copy-file-range-refusal-probe",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -31926,6 +32003,13 @@
           "category": "c-programs",
           "test": "c-programs/get-robust-list-self",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/get-robust-list-self",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -32270,6 +32354,13 @@
           "test": "c-programs/io-uring-ring-determinism",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ioctl-fioclex",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -35349,6 +35440,13 @@
           "category": "c-programs",
           "test": "c-programs/splice-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/splice-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -35608,6 +35706,13 @@
           "category": "c-programs",
           "test": "c-programs/syslog-deterministic",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syslog-deterministic",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -35707,6 +35812,13 @@
           "test": "c-programs/tcp-info-client4",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/tee-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -47378,6 +47490,13 @@
           "category": "c-programs",
           "test": "c-programs/adjtimex-deterministic",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/adjtimex-deterministic",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -47728,6 +47847,13 @@
           "category": "c-programs",
           "test": "c-programs/clock-adjtime-deterministic",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/clock-adjtime-deterministic",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -47799,6 +47925,13 @@
           "test": "c-programs/close-range-fds",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/copy-file-range-refusal-probe",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -49247,6 +49380,13 @@
           "category": "c-programs",
           "test": "c-programs/get-robust-list-self",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/get-robust-list-self",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -49878,6 +50018,13 @@
           "test": "c-programs/io-uring-ring-determinism",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ioctl-fioclex",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -55995,6 +56142,13 @@
           "category": "c-programs",
           "test": "c-programs/splice-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/splice-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -56527,6 +56681,13 @@
           "category": "c-programs",
           "test": "c-programs/syslog-deterministic",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syslog-deterministic",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -56773,6 +56934,13 @@
           "test": "c-programs/tcp-info-client4",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/tee-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
