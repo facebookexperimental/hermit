@@ -8,6 +8,11 @@
 
 //! Offline discovery of nondeterministic x86 instructions in ELF binaries.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 use std::fs;
 use std::fs::File;
 use std::io::Read;
@@ -603,6 +608,10 @@ mod tests {
     /// therefore builds iced-x86 without overflow checks; this places the
     /// instructions at the boundary on purpose so that the setting is tested
     /// on every run rather than once in a few thousand.
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: iced-x86 integer overflow under fbcode overflow checks"
+    )]
     #[test]
     fn decodes_instructions_that_end_at_or_cross_a_4gib_host_address() {
         const NOP: u8 = 0x90;

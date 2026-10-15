@@ -3161,6 +3161,10 @@ mod tests {
     /// Runs from a temporary working directory so the target really is a bare
     /// relative name. Under the old code this failed on any host where the
     /// working directory and `TMPDIR` are on different filesystems.
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: compile-time CARGO_MANIFEST_DIR is not present at test runtime"
+    )]
     #[test]
     fn a_bare_filename_target_is_overwritten_not_left_stale() {
         // `set_current_dir` is process-global; serialize against any other test
