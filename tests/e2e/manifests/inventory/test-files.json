@@ -2623,6 +2623,12 @@
       "why": "tests/c/timer_coalesce.c is owned by hermit-cli/tests/cli.rs: posix_timer_entries_are_delivered_as_on_linux_at_bitwise_parity runs each mode (a POSIX timer's entry beside an ordinary copy of its signal, overruns, stale entries, parked and unignored expiries, the order of a signalfd read, the forged SI_TIMER rows) and requires Linux's output at bitwise parity, and posix_timer_entries_hermit_refuses_or_diverges_on_are_named requires the named refusal and the known divergence (https://github.com/rrnewton/hermit/issues/4262). It stays a fixture because a generic manifest cannot assert these per-mode outputs."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/timer_coalesce_signals.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/timer_coalesce_signals.c is owned by hermit-cli/tests/cli.rs: posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity runs each mode (a POSIX timer's entry beside other signals and consumers: a storm's recurrence, a discarded copy's raw bytes, signals taken before a timer entry, ppoll past a stale entry, rt_sigsuspend, faulting takes, timer-free controls, a non-leader exec) and requires Linux's output at bitwise parity, and posix_timer_signal_rows_hermit_refuses_or_diverges_on_are_named requires the named refusals and the known divergences (https://github.com/rrnewton/hermit/issues/4262). It stays a fixture because a generic manifest cannot assert these per-mode outputs."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/timer_create_determinism.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

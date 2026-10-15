@@ -86,6 +86,10 @@ pub enum DeliveryAnswer {
     Rewrite(KernelSiginfo),
     /// Linux skips this entry inside the dequeue: deliver nothing.
     Suppress,
+    /// A valid timer entry: deliver it with its own siginfo, asked for once
+    /// the delivery's turn is granted (`Scheduler::timer_delivery_info`), so
+    /// its overrun is counted at the time its handler begins.
+    TimerEntry,
 }
 
 /// What a take (`rt_sigtimedwait`, a signalfd record) does with the copy it
@@ -112,6 +116,9 @@ pub(crate) struct PendingDequeue {
     /// For a valid timer entry: the timer, the consuming thread's time, and
     /// the overrun its delivery reports.
     reconcile: Option<(i32, LogicalTime, i32)>,
+    /// A valid timer entry whose siginfo the delivery's turn has yet to ask
+    /// for (`DeliveryAnswer::TimerEntry`).
+    awaiting_info: Option<TimerEntry>,
 }
 
 /// End the run with a named refusal (`exit_on_scheduler_refusal`); a unit
@@ -643,16 +650,15 @@ impl Scheduler {
                 FrontClass::Proxy => (DeliveryAnswer::Rewrite(siginfo), None),
             },
             Entry::Timer(_) if stale => (DeliveryAnswer::Suppress, None),
+            Entry::Timer(_) if reported => (DeliveryAnswer::TimerEntry, None),
             Entry::Timer(entry) => {
                 let overrun = self.dequeue_overrun(&entry, at);
-                let answer = if reported {
-                    let info = self.timer_signal_info(signal, &entry, overrun);
-                    DeliveryAnswer::Rewrite(KernelSiginfo::from_user(&info))
-                } else {
-                    DeliveryAnswer::AsIs
-                };
-                (answer, Some((entry.timer, at, overrun)))
+                (DeliveryAnswer::AsIs, Some((entry.timer, at, overrun)))
             }
+        };
+        let awaiting_info = match (answer, front) {
+            (DeliveryAnswer::TimerEntry, Entry::Timer(entry)) => Some(entry),
+            _ => None,
         };
         self.pending_timer_dequeues.insert(
             thread,
@@ -661,9 +667,34 @@ impl Scheduler {
                 signal,
                 delivery: true,
                 reconcile,
+                awaiting_info,
             },
         );
         answer
+    }
+
+    /// The siginfo of the valid timer entry `thread`'s delivery stop took
+    /// (`DeliveryAnswer::TimerEntry`), asked for once the delivery's turn is
+    /// granted, at the thread's time `at` then: Linux counts the overrun as it
+    /// dequeues, just before the handler runs, so it is counted where the
+    /// handler's time begins. Counted at the stop instead, it trailed the
+    /// handler's own clock by the delivery's turn: the T1 storm row measured
+    /// 197 against the 198 grid points the handler's clock showed.
+    pub(crate) fn timer_delivery_info(
+        &mut self,
+        thread: DetTid,
+        signal: i32,
+        at: LogicalTime,
+    ) -> Option<KernelSiginfo> {
+        let pending = self.pending_timer_dequeues.get(&thread)?;
+        let entry = pending.awaiting_info.filter(|_| pending.signal == signal)?;
+        let at = at.max(self.committed_time);
+        let overrun = self.dequeue_overrun(&entry, at);
+        let pending = self.pending_timer_dequeues.get_mut(&thread)?;
+        pending.awaiting_info = None;
+        pending.reconcile = Some((entry.timer, at, overrun));
+        let info = self.timer_signal_info(signal, &entry, overrun);
+        Some(KernelSiginfo::from_user(&info))
     }
 
     /// A take of `signal` by `thread` at its time `at` (4262 design §4.4,
@@ -742,6 +773,7 @@ impl Scheduler {
                 signal,
                 delivery: false,
                 reconcile,
+                awaiting_info: None,
             },
             thread,
         );
@@ -817,6 +849,7 @@ impl Scheduler {
                 signal,
                 delivery: false,
                 reconcile,
+                awaiting_info: None,
             },
             thread,
         );
@@ -881,9 +914,15 @@ impl Scheduler {
         thread_holds: bool,
         process_holds: bool,
     ) -> Option<PendingDequeue> {
-        let pending = self.pending_timer_dequeues.remove(&thread)?;
+        let mut pending = self.pending_timer_dequeues.remove(&thread)?;
         if pending.signal != signal || how == (Consumption::KeptResume { blocked: true }) {
             return None;
+        }
+        // A delivery that never asked for its siginfo (it ended the thread
+        // group first) still re-arms its timer, at the committed time.
+        if let Some(entry) = pending.awaiting_info.take() {
+            let at = self.committed_time;
+            pending.reconcile = Some((entry.timer, at, self.dequeue_overrun(&entry, at)));
         }
         self.check_taken_queues(thread, pending.queue, signal, thread_holds, process_holds);
         Some(pending)

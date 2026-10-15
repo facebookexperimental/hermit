@@ -14729,6 +14729,12 @@ mod test {
         register_known_thread(sched, tid);
     }
 
+    /// [`queued_poller`] for the scheduler's sibling test modules.
+    #[cfg(test)]
+    pub(crate) fn queued_poller_for(sched: &mut Scheduler, tid: DetTid) {
+        queued_poller(sched, tid, true);
+    }
+
     /// A queued polling thread whose request carries `polls_guest_state_only`
     /// as given and retries after an attempt that moved nothing, with its
     /// latest grant recorded as the latest committed turn.

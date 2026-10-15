@@ -26,14 +26,17 @@ use super::signal_lists::KernelSiginfo;
 use super::signal_lists::SI_TIMER;
 use super::signal_lists::ordinary_siginfo;
 use super::signal_lists::siginfo_code;
+use super::test::queued_poller_for;
 use super::test::register_known_thread_for;
 use super::timed_waiters::SignalTarget;
 use super::timed_waiters::TimedEvent;
 use crate::config::Config;
+use crate::resources::ResourceID;
 use crate::syscalls::KernelSignalState;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
+use crate::types::SigWrapper;
 
 const USR1: i32 = libc::SIGUSR1;
 const SI_QUEUE: i32 = -1;
@@ -152,9 +155,17 @@ impl Family {
     /// A reported delivery stop of the leader at `at`, whose hooks then read
     /// the queues as scripted.
     fn stop(&mut self, at: u64, private_after: bool, shared_after: bool) -> DeliveryAnswer {
-        let answer =
+        let mut answer =
             self.sched
                 .timer_signal_dequeue(self.leader, USR1, Some(LogicalTime::from_nanos(at)));
+        // The delivery's turn asks for a timer entry's siginfo.
+        if answer == DeliveryAnswer::TimerEntry {
+            let info = self
+                .sched
+                .timer_delivery_info(self.leader, USR1, LogicalTime::from_nanos(at))
+                .expect("a timer entry's siginfo");
+            answer = DeliveryAnswer::Rewrite(info);
+        }
         self.sched.discarded_signal_control(
             self.leader,
             DiscardedSignalControl::Consumed {
@@ -165,6 +176,29 @@ impl Family {
             },
         );
         answer
+    }
+
+    /// Whether `thread`'s request now carries a delivery of USR1, as a wake
+    /// of a polling thread substitutes it (`force_unblock_thread_at`).
+    fn woken(&self, thread: DetTid) -> bool {
+        self.sched.next_turns[&thread]
+            .req
+            .try_read()
+            .is_some_and(|request| {
+                matches!(request, Ok(resources)
+                    if resources.resources.contains_key(&ResourceID::InboundSignal(SigWrapper(USR1))))
+            })
+    }
+
+    /// The leader blocks USR1, so a process-directed wake goes to the sibling,
+    /// which polls.
+    fn sibling_polls(&mut self) {
+        self.sched
+            .test_kernel_signal_states
+            .get_mut(&self.leader)
+            .unwrap()
+            .blocked = kernel_signal_bit(USR1);
+        queued_poller_for(&mut self.sched, self.sibling);
     }
 
     fn entries(&self, queue: QueueId) -> Vec<Entry> {
@@ -572,5 +606,68 @@ fn a_dead_threads_entries_go_and_their_timer_rearms() {
     assert_eq!(
         f.sched.blocked.timed_waiters.next_deadline(),
         Some(LogicalTime::from_nanos(20))
+    );
+}
+
+/// R5-2 (rev 7 F): a stale entry refreshed in place by its timer's next
+/// expiry makes the signal deliverable with no physical send, so the single
+/// target is woken in that turn.
+#[test]
+fn a_stale_entry_refreshed_in_place_wakes_the_target() {
+    let mut f = family();
+    f.sibling_polls();
+    f.arm(0, SignalTarget::Process(f.leader), 10, 0);
+    f.pop(10);
+    assert_eq!(f.sent().len(), 1);
+    // Set again while queued: the entry is stale and nothing is deliverable.
+    f.arm(0, SignalTarget::Process(f.leader), 15, 0);
+    assert!(!f.woken(f.sibling));
+    f.pop(15);
+    assert!(f.sent().is_empty(), "refreshed in place, nothing sent");
+    assert!(f.woken(f.sibling), "the refresh wakes the sibling");
+}
+
+/// R5-2 (rev 7 F): a timer's entry appended behind a stale head is
+/// deliverable with no physical send, so the single target is woken.
+#[test]
+fn an_entry_appended_behind_a_stale_head_wakes_the_target() {
+    let mut f = family();
+    f.sibling_polls();
+    f.arm(0, SignalTarget::Process(f.leader), 10, 0);
+    f.pop(10);
+    f.arm(0, SignalTarget::Process(f.leader), 1_000, 0);
+    f.arm(1, SignalTarget::Process(f.leader), 15, 0);
+    f.sent();
+    f.pop(15);
+    assert!(f.sent().is_empty(), "behind the head, nothing sent");
+    assert_eq!(f.entries(shared(&f)).len(), 2);
+    assert!(f.woken(f.sibling), "the append wakes the sibling");
+}
+
+/// `timer_delete` removes the timer's park (PT:1006-1011).
+#[test]
+fn a_deleted_timers_park_goes() {
+    let mut f = family();
+    for thread in [f.leader, f.sibling] {
+        let state = f.sched.test_kernel_signal_states.get_mut(&thread).unwrap();
+        state.caught = 0;
+        state.ignored = kernel_signal_bit(USR1);
+    }
+    f.arm(0, SignalTarget::Process(f.leader), 10, 10);
+    f.pop(10);
+    assert_eq!(
+        f.sched
+            .discarded_at_send
+            .parked_timers(f.process, USR1)
+            .len(),
+        1
+    );
+    f.sched
+        .note_posix_timer_notification(f.process, 0, USR1, 0, true);
+    assert!(
+        f.sched
+            .discarded_at_send
+            .parked_timers(f.process, USR1)
+            .is_empty()
     );
 }

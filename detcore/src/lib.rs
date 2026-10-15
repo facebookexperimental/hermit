@@ -1020,6 +1020,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // timer was set again since it was queued, skipped as Linux skips
             // it inside the dequeue, with no turn
             // (<https://github.com/rrnewton/hermit/issues/4262>).
+            let mut timer_entry = false;
             if scheduler::discarded_at_send::records(&self.cfg) && (1..32).contains(&signal.raw()) {
                 use scheduler::discarded_at_send::DiscardedSignalAnswer;
                 use scheduler::discarded_at_send::DiscardedSignalControl;
@@ -1028,7 +1029,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     signal: signal.raw(),
                     at: guest.thread_state().thread_logical_time.as_nanos(),
                 };
-                match tool_global::discarded_signal(guest, control).await {
+                let answer = tool_global::discarded_signal(guest, control).await;
+                timer_entry = answer == DiscardedSignalAnswer::Delivery(DeliveryAnswer::TimerEntry);
+                match answer {
                     DiscardedSignalAnswer::Delivery(DeliveryAnswer::Suppress) => {
                         info!(
                             "[dtid {}] signal {} is a stale POSIX timer entry; skipped",
@@ -1130,6 +1133,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .is_ok_and(|state| state.default_action_ends_process(signal.raw()))
             {
                 tool_global::record_fatal_signal(guest).await;
+            }
+            // A timer entry's siginfo, with its overrun counted now that the
+            // delivery's turn is granted, where the handler's time begins.
+            if timer_entry {
+                use scheduler::discarded_at_send::DiscardedSignalAnswer;
+                use scheduler::posix_timer_coalesce::DeliveryAnswer;
+                let control = scheduler::discarded_at_send::DiscardedSignalControl::DeliveryInfo {
+                    signal: signal.raw(),
+                    at: guest.thread_state().thread_logical_time.as_nanos(),
+                };
+                if let DiscardedSignalAnswer::Delivery(DeliveryAnswer::Rewrite(info)) =
+                    tool_global::discarded_signal(guest, control).await
+                    && let Err(errno) = guest.set_signal_info(info.to_user())
+                {
+                    warn!(
+                        "[dtid {}] signal {} keeps its physical siginfo: {}",
+                        guest.thread_state().dettid,
+                        signal,
+                        errno
+                    );
+                }
             }
             if self
                 .end_thread_group_before_fatal_delivery(guest, signal)

@@ -179,6 +179,7 @@ static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_SIGEV_THREAD_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_EXEC_FLUSH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_COALESCE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static TIMER_COALESCE_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LEADER_PTHREAD_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static THREAD_JOIN_AFTER_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_PROFILE_V3_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1261,6 +1262,31 @@ fn timer_coalesce_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "timer-coalesce guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn timer_coalesce_signals_guest() -> &'static Path {
+    TIMER_COALESCE_SIGNALS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("timer-coalesce-signals");
+        fs::create_dir_all(&build_root).expect("failed to create timer-coalesce-signals directory");
+        let guest = build_root.join("timer_coalesce_signals");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/timer_coalesce_signals.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile timer-coalesce-signals guest");
+        assert!(
+            output.status.success(),
+            "timer-coalesce-signals guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -32103,6 +32129,255 @@ fn posix_timer_entries_hermit_refuses_or_diverges_on_are_named() {
         "forged_notimer on_worker=1\nforged deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=0 value=0x7\n",
         "forged_notimer: stderr:\n{log}"
     );
+}
+
+/// The rows of https://github.com/rrnewton/hermit/issues/4262 about where a
+/// POSIX timer's entry meets other signals and other consumers, in
+/// `tests/c/timer_coalesce_signals.c`. Each mode is strict-verified at
+/// bitwise parity and must print what Linux printed (5 native runs of each,
+/// identical, 2026-10-15):
+/// - `storm`: a periodic timer through a syscall-free loop, where the
+///   deliveries plus their overruns fall between the grid points around the
+///   last handler's clock read (T1).
+/// - `d1`: a discarded `SI_QUEUE` copy with bytes 32 to 47 set is pending
+///   first, yet the handler sees exactly the timer's own 48-byte record.
+/// - The selection rows (R4-1, R5-1): a private `tgkill` USR2, a shared
+///   SIGHUP and a private SIGRTMIN are each taken before a shared USR1
+///   timer entry, valid or stale, by `rt_sigtimedwait` (also with a faulting
+///   buffer) and by signalfd.
+/// - R4-4: `[stale T1, valid T2]` ends a `ppoll` with EINTR and one handler
+///   run with T2's value; both stale, it times out.
+/// - R3-4 `armed_promoted`: the promotion of the second entry reaches a
+///   sibling in `rt_sigsuspend`.
+/// - `susp_valid` (rev 8 B'): a single valid entry falls back when
+///   `rt_sigsuspend` makes the pair unobservable, delivered with overrun 0.
+/// - rev 8 `rt2_fault`, by `rt_sigtimedwait` and by signalfd.
+/// - `setsig_usr2`: an `F_SETSIG` source of another signal leaves USR1
+///   followed.
+/// - The timer-free controls `two_kills` (H') and signalfd `read` and `readv`
+///   (N8-7).
+/// - N9-5 `nonleader_exec`: a worker's kept private copy survives its exec
+///   and is delivered with its own siginfo.
+#[test]
+fn posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity() {
+    let guest = timer_coalesce_signals_guest().to_str().unwrap().to_owned();
+    let cases = [
+        (
+            "armed_promoted",
+            "armed_promoted deliveries=2 first_on_main=1 second_on_sibling=1\narmed_promoted deliveries=2\n  0 sig=10 SI_TIMER timer=0 overrun=0 value=0x1\n  1 sig=10 SI_TIMER timer=1 overrun=0 value=0x1122334455667788\n",
+        ),
+        (
+            "d1",
+            "d1 deliveries=1 on_worker=1 raw_is_the_timers_record=1\nd1 deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
+        ),
+        (
+            "nonleader_exec",
+            "nonleader_exec pending_after_exec=1\nnonleader_exec deliveries=1\n  0 sig=10 code=-6 own_pid=1 value=0\n",
+        ),
+        (
+            "ppoll_both_stale",
+            "ppoll_both_stale ret=0 errno=-\nppoll_both_stale deliveries=0\n",
+        ),
+        (
+            "ppoll_stale_valid",
+            "ppoll_stale_valid ret=-1 errno=EINTR\nppoll_stale_valid deliveries=1\n  0 sig=10 SI_TIMER timer=1 overrun=0 value=0x2\n",
+        ),
+        (
+            "rt2_fault",
+            "rt2_fault first=EFAULT\n  sig_is_rtmin=1 code=-1 int=22\n  sig_is_rtmin=0 code=-2 int=111\n  take=EAGAIN\n",
+        ),
+        (
+            "rt2_fault_sfd",
+            "rt2_fault_sfd first=EFAULT\n  sig_is_rtmin=1 code=-1 int=22\n  sig_is_rtmin=0 code=-2 int=111\n  read=EAGAIN\n",
+        ),
+        (
+            "sel_fault",
+            "sel_fault first=EFAULT\nsel_fault second=10 code=SI_TIMER timer=0 overrun=0 value=0x1122334455667788\nsel_fault third=EAGAIN\n",
+        ),
+        (
+            "sel_hup",
+            "sel_hup first=1 code=0 own_pid=1 value=0\nsel_hup second=10 code=SI_TIMER timer=0 overrun=0 value=0x1122334455667788\nsel_hup third=EAGAIN\n",
+        ),
+        (
+            "sel_rtmin",
+            "sel_rtmin first=34 code=-1 own_pid=0 value=0x15\nsel_rtmin second=10 code=SI_TIMER timer=0 overrun=0 value=0x1122334455667788\nsel_rtmin third=EAGAIN\n",
+        ),
+        (
+            "sel_sfd",
+            "sel_sfd records=2\n  0 sig=12 code=-6 own_pid=1 ptr=0\n  1 sig=10 SI_TIMER timer=0 overrun=0 ptr=0x1122334455667788\n",
+        ),
+        (
+            "sel_stale",
+            "sel_stale first=12 code=0 own_pid=1 value=0\nsel_stale second=EAGAIN\nsel_stale third=EAGAIN\n",
+        ),
+        (
+            "sel_valid",
+            "sel_valid first=12 code=0 own_pid=1 value=0\nsel_valid second=10 code=SI_TIMER timer=0 overrun=0 value=0x1122334455667788\nsel_valid third=EAGAIN\n",
+        ),
+        (
+            "setsig_usr2",
+            "setsig_usr2 fcntl=0\nsetsig_usr2 deliveries=2\n  0 sig=10 code=0 own_pid=1 value=0\n  1 sig=10 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
+        ),
+        (
+            "sfd_notimer_read",
+            "sfd_notimer_read records=1\n  0 sig=10 code=0 own_pid=1 ptr=0\n",
+        ),
+        (
+            "sfd_notimer_readv",
+            "sfd_notimer_readv records=1\n  0 sig=10 code=0 own_pid=1 ptr=0\n",
+        ),
+        (
+            "storm",
+            "storm deliveries_positive=1 all_si_timer=1 recurrence_ok=1\n",
+        ),
+        (
+            "susp_valid",
+            "susp_valid pending_after=0\nsusp_valid deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=0 value=0x1\n",
+        ),
+        (
+            "two_kills",
+            "two_kills deliveries=1\n  0 sig=10 code=0 own_pid=1 value=0\n",
+        ),
+    ];
+    for (mode, expected) in cases {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "--log=info",
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                verdict.to_str().unwrap(),
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{mode}: stderr:\n{log}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+                .expect("the verdict must be JSON");
+        assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
+    }
+}
+
+/// What `tests/c/timer_coalesce_signals.c` shows Hermit refusing or
+/// diverging on (https://github.com/rrnewton/hermit/issues/4262), each
+/// asserted as Hermit's present answer so a change to it is seen.
+/// Refused by name, as the design says:
+/// - `susp_stale`, `susp_behind_stale` and `susp_two`: a thread enters
+///   `rt_sigsuspend`, a call outside the schedule, while the timer signal's
+///   front is stale or has an entry behind it (disclosure 8);
+/// - `setsig_usr1`: `F_SETSIG` arms a host-timed source of USR1 while a timer
+///   entry waits behind a kill's;
+/// - `forged_shared`: the shared-queue form of the forged row, refused by the
+///   https://github.com/rrnewton/hermit/issues/4034 rule.
+///
+/// Known divergences, with Linux's answer beside Hermit's:
+/// - `fallback_pipe`, `fallback_cont` and `fallback_alrm`: SIGPIPE and SIGCONT
+///   are excluded, and SIGALRM after `alarm()` is not followed, so a timer
+///   beside a pending kill takes the fallback, where the sends merge
+///   (disclosures 2 and 6);
+/// - `d2`: a copy Linux discarded while ignored, still queued for a parked
+///   worker, is delivered to a handler installed later: the late-handler
+///   residual of https://github.com/rrnewton/hermit/issues/4293, as on main.
+#[test]
+fn posix_timer_signal_rows_hermit_refuses_or_diverges_on_are_named() {
+    let guest = timer_coalesce_signals_guest().to_str().unwrap().to_owned();
+    let transition = "Linux would deliver them one by one, which the fallback cannot";
+    for (mode, reason) in [
+        ("susp_stale", transition),
+        ("susp_behind_stale", transition),
+        ("susp_two", transition),
+        ("setsig_usr1", transition),
+        (
+            "forged_shared",
+            "the sending thread blocks the signal (https://github.com/rrnewton/hermit/issues/4034)",
+        ),
+    ] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "--log=error",
+                "run",
+                "--strict",
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}: {log}"
+        );
+        assert!(log.contains(reason), "{mode}: {log}");
+    }
+    // (mode, Hermit's output, Linux's output)
+    let divergences = [
+        ("d2", "d2 deliveries=1\n", "d2 deliveries=0\n"),
+        (
+            "fallback_alrm",
+            "fallback_alrm deliveries=1\n  0 sig=14 code=0 own_pid=1 value=0\n",
+            "fallback_alrm deliveries=2\n  0 sig=14 code=0 own_pid=1 value=0\n  1 sig=14 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
+        ),
+        (
+            "fallback_cont",
+            "fallback_cont deliveries=1\n  0 sig=18 code=0 own_pid=1 value=0\n",
+            "fallback_cont deliveries=2\n  0 sig=18 code=0 own_pid=1 value=0\n  1 sig=18 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
+        ),
+        (
+            "fallback_pipe",
+            "fallback_pipe deliveries=1\n  0 sig=13 code=0 own_pid=1 value=0\n",
+            "fallback_pipe deliveries=2\n  0 sig=13 code=0 own_pid=1 value=0\n  1 sig=13 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
+        ),
+    ];
+    for (mode, hermit, linux) in divergences {
+        assert_ne!(hermit, linux, "{mode} is listed as a divergence");
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "run",
+                "--strict",
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, hermit, "{mode}: stderr:\n{log}");
+    }
 }
 
 /// Exec discards a POSIX timer's queued signal and keeps every other pending

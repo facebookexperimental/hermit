@@ -424,6 +424,7 @@ impl DiscardedAtSend {
             let timer_pair = self.has_timer_history(process, signal);
             self.lists
                 .append_plain(queue, signal, record.siginfo, standing, timer_pair);
+            debug_assert!(self.lists.invariants_hold());
         }
     }
 
@@ -907,6 +908,13 @@ pub enum DiscardedSignalControl {
     /// any, and answer what to deliver (`Scheduler::timer_signal_dequeue`,
     /// <https://github.com/rrnewton/hermit/issues/4262>).
     Dequeue {
+        signal: i32,
+        at: crate::types::LogicalTime,
+    },
+    /// The delivery stop of `signal` that answered `DeliveryAnswer::TimerEntry`
+    /// has its turn, at the calling thread's time `at`: answer the entry's
+    /// siginfo (`Scheduler::timer_delivery_info`).
+    DeliveryInfo {
         signal: i32,
         at: crate::types::LogicalTime,
     },
@@ -1490,6 +1498,16 @@ impl Scheduler {
             }
             DiscardedSignalControl::Dequeue { signal, at } => {
                 DiscardedSignalAnswer::Delivery(self.timer_signal_dequeue(dtid, signal, Some(at)))
+            }
+            DiscardedSignalControl::DeliveryInfo { signal, at } => {
+                match self.timer_delivery_info(dtid, signal, at) {
+                    Some(info) => DiscardedSignalAnswer::Delivery(
+                        super::posix_timer_coalesce::DeliveryAnswer::Rewrite(info),
+                    ),
+                    None => DiscardedSignalAnswer::Delivery(
+                        super::posix_timer_coalesce::DeliveryAnswer::AsIs,
+                    ),
+                }
             }
             DiscardedSignalControl::Unreported { signal } => {
                 DiscardedSignalAnswer::Delivery(self.timer_signal_dequeue(dtid, signal, None))
