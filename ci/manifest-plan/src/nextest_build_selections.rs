@@ -847,12 +847,11 @@ mod tests {
             // the five process-cgroup tests
             // (https://github.com/rrnewton/hermit/issues/4378).
             // Plus robust_futex_owner_death's two DBT fatal-signal tests
-            // (https://github.com/rrnewton/hermit/issues/4278), and
-            // signal_determinism's DBT unfenceable-SIGKILL refusal test
-            // (https://github.com/rrnewton/hermit/issues/4411).
+            // (https://github.com/rrnewton/hermit/issues/4278).
             // Plus lit's 18 runner and FileCheck-matcher tests, its 19
             // fixtures without a Rust or Go guest less the ignored cat.test,
             // its completeness test, and its 57 fixtures with a Rust guest.
+            // Plus signal_determinism's DBT thread-directed SIGKILL refusal test.
             // The local node runs in shards, which together execute the same.
             let executed = |tag: &str| -> u64 {
                 let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();

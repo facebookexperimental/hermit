@@ -995,17 +995,135 @@ static int test_sigkill_observed(int threaded, int by_pipe) {
   return test_sigkill_observed_how(threaded, by_pipe, SIGKILL_BY_KILL);
 }
 
+static pthread_t sigkill_exited_leader;
+
 static void* sigkill_leader_exit_waiter(void* ready) {
-  /* Give the leader's pthread_exit time to finish under any schedule before
-   * the parent is told, as the 4400 re-check's probe does. */
-  for (int i = 0; i < 200; ++i) {
-    sched_yield();
+  /* The kernel clears the leader's CLONE_CHILD_CLEARTID word only once its
+   * pthread_exit has finished, so after this join the leader is a zombie
+   * thread on every schedule and host (natively, a fixed count of yields was
+   * not enough on a large host). */
+  if (pthread_join(sigkill_exited_leader, NULL) != 0) {
+    _exit(3);
   }
   atomic_store((_Atomic int*)ready, 1);
   for (;;) {
     pause();
   }
   return NULL;
+}
+
+/* A pidfd SIGKILL to a child that has already exited, before its parent
+ * reaps it: Linux sends nothing that matters, and the parent then reaps the
+ * child's own exit status (https://github.com/rrnewton/hermit/issues/4411). */
+static int test_sigkill_pidfd_zombie(void) {
+  pid_t child = fork();
+  if (child < 0) {
+    perror("fork");
+    return 1;
+  }
+  if (child == 0) {
+    _exit(7);
+  }
+  siginfo_t info;
+  memset(&info, 0, sizeof(info));
+  if (waitid(P_PID, (id_t)child, &info, WEXITED | WNOWAIT) != 0) {
+    perror("waitid");
+    return 1;
+  }
+  int pidfd = (int)syscall(SYS_pidfd_open, child, 0);
+  int sent = pidfd < 0 ? -1 : (int)syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, NULL, 0);
+  int status;
+  if (waitpid(child, &status, 0) != child) {
+    perror("waitpid");
+    return 1;
+  }
+  printf(
+      "sigkill pidfd zombie send=%d exited=%d code=%d\n",
+      sent,
+      WIFEXITED(status),
+      WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+  return 0;
+}
+
+/* A tgkill SIGKILL to a child's leader thread after that thread has exited,
+ * while a sibling runs on. Linux does not end the group for a SIGKILL that
+ * names an exited thread, so the child is still alive after a bounded wait;
+ * the parent then kills it by process (Claude review of
+ * https://github.com/rrnewton/hermit/pull/4439, R1). */
+#ifndef PIDFD_SIGNAL_THREAD
+#define PIDFD_SIGNAL_THREAD (1UL << 0)
+#endif
+
+/* `how` names the thread-directed route of the SIGKILL to the exited leader:
+ * "tgkill", "tkill", "tgsigqueue" (rt_tgsigqueueinfo), or "pidfd-thread" (a
+ * process pidfd with PIDFD_SIGNAL_THREAD). Each names only that one thread
+ * (Claude re-checks of https://github.com/rrnewton/hermit/pull/4439, N1 and
+ * N4). */
+static int test_sigkill_thread_scope_exited_leader(const char* how);
+
+static int test_sigkill_tgkill_exited_leader(void) {
+  return test_sigkill_thread_scope_exited_leader("tgkill");
+}
+
+static int test_sigkill_thread_scope_exited_leader(const char* how) {
+  _Atomic int* ready = mmap(
+      NULL, sizeof(*ready), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (ready == MAP_FAILED) {
+    perror("mmap");
+    return 1;
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    perror("fork");
+    return 1;
+  }
+  if (child == 0) {
+    pthread_t thread;
+    sigkill_exited_leader = pthread_self();
+    if (pthread_create(&thread, NULL, sigkill_leader_exit_waiter, (void*)ready) != 0) {
+      _exit(2);
+    }
+    pthread_exit(NULL);
+  }
+  while (!atomic_load(ready)) {
+    sched_yield();
+  }
+  int sent;
+  if (strcmp(how, "pidfd-thread") == 0) {
+    int pidfd = (int)syscall(SYS_pidfd_open, child, 0);
+    sent = pidfd < 0
+        ? -1
+        : (int)syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, NULL, PIDFD_SIGNAL_THREAD);
+  } else if (strcmp(how, "tkill") == 0) {
+    sent = (int)syscall(SYS_tkill, child, SIGKILL);
+  } else if (strcmp(how, "tgsigqueue") == 0) {
+    siginfo_t info;
+    memset(&info, 0, sizeof(info));
+    info.si_signo = SIGKILL;
+    info.si_code = SI_QUEUE;
+    info.si_pid = getpid();
+    info.si_uid = getuid();
+    sent = (int)syscall(SYS_rt_tgsigqueueinfo, child, child, SIGKILL, &info);
+  } else {
+    sent = (int)syscall(SYS_tgkill, child, child, SIGKILL);
+  }
+  pid_t reaped = 0;
+  int status = 0;
+  for (int i = 0; i < 200 && reaped == 0; ++i) {
+    reaped = waitpid(child, &status, WNOHANG);
+    sched_yield();
+  }
+  int alive = reaped == 0;
+  if (alive) {
+    kill(child, SIGKILL);
+    waitpid(child, &status, 0);
+  }
+  printf(
+      "sigkill %s exited leader send=%d alive=%d\n",
+      how,
+      sent,
+      alive);
+  return 0;
 }
 
 static int test_sigkill_observed_how(int threaded, int by_pipe, enum sigkill_how how) {
@@ -1047,6 +1165,7 @@ static int test_sigkill_observed_how(int threaded, int by_pipe, enum sigkill_how
     }
     if (how == SIGKILL_BY_PIDFD_LEADER_EXITED) {
       pthread_t thread;
+      sigkill_exited_leader = pthread_self();
       if (pthread_create(&thread, NULL, sigkill_leader_exit_waiter, (void*)ready) != 0) {
         _exit(2);
       }
@@ -1178,6 +1297,21 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "sigkill-threaded-pipe-eof") == 0) {
     return test_sigkill_observed(1, 1);
+  }
+  if (strcmp(argv[1], "sigkill-tgkill-exited-leader") == 0) {
+    return test_sigkill_tgkill_exited_leader();
+  }
+  if (strcmp(argv[1], "sigkill-pidfd-thread-exited-leader") == 0) {
+    return test_sigkill_thread_scope_exited_leader("pidfd-thread");
+  }
+  if (strcmp(argv[1], "sigkill-tkill-exited-leader") == 0) {
+    return test_sigkill_thread_scope_exited_leader("tkill");
+  }
+  if (strcmp(argv[1], "sigkill-tgsigqueue-exited-leader") == 0) {
+    return test_sigkill_thread_scope_exited_leader("tgsigqueue");
+  }
+  if (strcmp(argv[1], "sigkill-pidfd-zombie") == 0) {
+    return test_sigkill_pidfd_zombie();
   }
   if (strcmp(argv[1], "sigkill-pidfd-leader-exited-sigchld") == 0) {
     return test_sigkill_observed_how(1, 0, SIGKILL_BY_PIDFD_LEADER_EXITED);

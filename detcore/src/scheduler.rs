@@ -3846,6 +3846,69 @@ impl Scheduler {
         (ready >= 0).then_some(ready > 0)
     }
 
+    /// Whether the scheduler granted the exit of process `detpid` and its
+    /// parent has not reaped it: a zombie whose death the schedule fixed.
+    pub(crate) fn process_exit_granted(&self, detpid: DetPid) -> bool {
+        self.thread_tree.granted_exits.contains(&detpid)
+    }
+
+    /// Record that the scheduler granted `detpid`'s exit, as its final Exit
+    /// grant does.
+    #[cfg(test)]
+    pub(crate) fn grant_exit_for_test(&mut self, detpid: DetPid) {
+        self.thread_tree.granted_exits.insert(detpid);
+    }
+
+    /// The registered thread through which a SIGKILL's victim `detpid` is
+    /// known on the host: `named`, the thread the kill named, when it is
+    /// registered, or else, for a kill that named the process
+    /// (`process_directed`: kill or a pidfd), the victim's lowest registered
+    /// thread. A pidfd names the victim's leader, which may have exited while
+    /// its siblings run on (https://github.com/rrnewton/hermit/issues/4411).
+    /// A thread-directed SIGKILL (tkill, tgkill, rt_tgsigqueueinfo) to an
+    /// exited thread gets no fallback: Linux does not end the group for it
+    /// (Claude review of https://github.com/rrnewton/hermit/pull/4439, R1).
+    pub(crate) fn sigkill_victim_registered_thread(
+        &self,
+        named: DetTid,
+        detpid: DetPid,
+        process_directed: bool,
+    ) -> Option<DetTid> {
+        if self.physical_thread_pidfds.contains_key(&named) {
+            return Some(named);
+        }
+        if !process_directed {
+            return None;
+        }
+        self.live_group_members(detpid)
+            .into_iter()
+            .find(|tid| self.physical_thread_pidfds.contains_key(tid))
+    }
+
+    /// The threads the thread tree lists in `detpid`'s group that still lead
+    /// back to it, in DetTid order. The tree never drops an edge, so after a
+    /// thread id is reused it can also be listed under its old group (Claude
+    /// review of https://github.com/rrnewton/hermit/pull/4439, R3).
+    fn live_group_members(&self, detpid: DetPid) -> Vec<DetTid> {
+        if !self.thread_tree.contains(&detpid) {
+            return Vec::new();
+        }
+        let leader = DetTid::from_raw(detpid.as_raw());
+        let mut group: Vec<DetTid> = self
+            .thread_tree
+            .my_thread_group(&detpid)
+            .into_iter()
+            .filter(|tid| {
+                self.thread_tree
+                    .thread_to_leader
+                    .get(tid)
+                    .is_none_or(|owner| *owner == leader)
+            })
+            .collect();
+        group.sort();
+        group
+    }
+
     fn remove_physical_thread(&mut self, dettid: &DetTid, mm: MmId) {
         if self
             .physical_thread_pidfds
@@ -3931,11 +3994,33 @@ impl Scheduler {
         self.namespace_zap_victims.remove(&dettid);
     }
 
-    pub(crate) fn note_process_sigkill(&mut self, dettid: DetTid, detpid: DetPid) {
+    pub(crate) fn note_process_sigkill(
+        &mut self,
+        dettid: DetTid,
+        detpid: DetPid,
+        process_directed: bool,
+    ) {
         if !self.backend.requires_thread_directed_process_signals {
             return;
         }
-        let Some((mm, _, _, _)) = self.physical_thread_pidfds.get(&dettid) else {
+        let threads: Vec<DetTid> = self
+            .live_group_members(detpid)
+            .into_iter()
+            .filter(|tid| self.next_turns.contains_key(tid))
+            .collect();
+        // A zombie whose exit the schedule granted has nothing left to retire:
+        // Linux sends the signal and nothing changes
+        // (https://github.com/rrnewton/hermit/issues/4411).
+        if process_directed && threads.is_empty() && self.process_exit_granted(detpid) {
+            return;
+        }
+        let named_mm = self.physical_thread_pidfds.get(&dettid).map(|(mm, ..)| *mm);
+        // The named thread may be an exited leader, as a pidfd names it: for a
+        // kill that named the process, any registered live thread of the
+        // victim is enough to know it (https://github.com/rrnewton/hermit/issues/4411).
+        // A thread-directed SIGKILL to an exited thread gets no such fallback
+        // (Claude review of https://github.com/rrnewton/hermit/pull/4439, R1).
+        if named_mm.is_none() && !process_directed {
             self.terminal_deadlock.get_or_insert_with(|| {
                 format!(
                     "HERMIT_DEADLOCK: scheduler cannot complete SIGKILL for dettid {} without its host thread pidfd",
@@ -3943,30 +4028,33 @@ impl Scheduler {
                 )
             });
             return;
-        };
-        let mm = *mm;
+        }
+        if named_mm.is_none()
+            && !threads
+                .iter()
+                .any(|tid| self.physical_thread_pidfds.contains_key(tid))
+        {
+            self.terminal_deadlock.get_or_insert_with(|| {
+                format!(
+                    "HERMIT_DEADLOCK: scheduler cannot complete SIGKILL for dettid {} without its host thread pidfd",
+                    dettid,
+                )
+            });
+            return;
+        }
         // SIGKILL ends the whole thread group, whichever thread it names.
-        // Retire the group's other live threads too, in DetTid order, at this
-        // same committed point: none of them runs guest code again, and on
-        // this backend a killed thread's pending request is answered
-        // (`needs_killed_thread_rpc_cancellation`). Before, only the named
-        // thread was retired, and a multi-threaded victim's other threads
-        // stayed modeled as live until the deadlock detector fired
+        // Retire every live thread of the group, the named one first, then in
+        // DetTid order, at this same committed point: none of them runs guest
+        // code again, and on this backend a killed thread's pending request is
+        // answered (`needs_killed_thread_rpc_cancellation`)
         // (https://github.com/rrnewton/hermit/issues/4362).
-        let siblings: Vec<DetTid> = if self.thread_tree.contains(&detpid) {
-            let mut group: Vec<DetTid> = self
-                .thread_tree
-                .my_thread_group(&detpid)
-                .into_iter()
-                .filter(|tid| *tid != dettid && self.next_turns.contains_key(tid))
-                .collect();
-            group.sort();
-            group
-        } else {
-            Vec::new()
-        };
-        self.logically_kill_thread(&dettid, &detpid, mm);
-        for tid in siblings {
+        if let Some(mm) = named_mm {
+            self.logically_kill_thread(&dettid, &detpid, mm);
+        }
+        for tid in threads
+            .into_iter()
+            .filter(|tid| *tid != dettid || named_mm.is_none())
+        {
             let mm = self
                 .physical_thread_pidfds
                 .get(&tid)
@@ -15394,7 +15482,7 @@ mod test {
             .register_physical_thread(child, child_mm, physical_pid, physical_tid)
             .expect("PIDFD_THREAD must bind the current test thread");
 
-        scheduler.note_process_sigkill(child, child);
+        scheduler.note_process_sigkill(child, child, true);
 
         assert!(!scheduler.next_turns.contains_key(&child));
         assert!(!scheduler.physical_thread_pidfds.contains_key(&child));
@@ -15432,7 +15520,7 @@ mod test {
             .put(Ok(Resources::new(sibling)));
         let sibling_response = scheduler.next_turns[&sibling].resp.clone();
 
-        scheduler.note_process_sigkill(child, child);
+        scheduler.note_process_sigkill(child, child, true);
 
         assert!(!scheduler.next_turns.contains_key(&child));
         assert!(!scheduler.next_turns.contains_key(&sibling));
@@ -15442,6 +15530,108 @@ mod test {
             sibling_response.try_read(),
             Some(SchedResponse::Signaled(None))
         ));
+    }
+
+    /// A pidfd SIGKILL names the victim's leader. When that leader has exited
+    /// while a sibling runs on, the kill notice retires the group through the
+    /// sibling's registration; when the victim is a zombie whose exit was
+    /// granted, there is nothing to retire and no deadlock
+    /// (https://github.com/rrnewton/hermit/issues/4411).
+    #[test]
+    fn dbt_process_sigkill_finds_an_exited_leaders_group_and_leaves_a_zombie_alone() {
+        let config = Config::default().with_backend(|backend| {
+            *backend = reverie::BackendCapabilities::DBT;
+        });
+        let mut scheduler = Scheduler::new(&config);
+        let parent = DetTid::from_raw(37);
+        let leader = DetTid::from_raw(38);
+        let sibling = DetTid::from_raw(39);
+        let child_mm = MmId::for_clone(MmId::initial(parent), leader, false);
+        let physical_pid = std::process::id() as i32;
+        let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, leader, true);
+        scheduler.thread_tree.add_child(leader, sibling, false);
+        register_known_thread(&mut scheduler, parent);
+        register_known_thread(&mut scheduler, sibling);
+        scheduler
+            .register_physical_thread(sibling, child_mm, physical_pid, physical_tid)
+            .expect("PIDFD_THREAD must bind the current test thread");
+        let leader_process = DetPid::from_raw(leader.as_raw());
+
+        // A thread-directed SIGKILL to the exited leader does not end the
+        // group (Claude review of https://github.com/rrnewton/hermit/pull/4439,
+        // R1): nothing is retired, and the notice reports it loudly.
+        scheduler.note_process_sigkill(leader, leader_process, false);
+        assert!(scheduler.next_turns.contains_key(&sibling));
+        assert!(scheduler.terminal_deadlock.take().is_some());
+
+        scheduler.note_process_sigkill(leader, leader_process, true);
+
+        assert!(scheduler.terminal_deadlock.is_none());
+        assert!(!scheduler.next_turns.contains_key(&sibling));
+        assert!(scheduler.next_turns.contains_key(&parent));
+
+        let zombie = DetTid::from_raw(41);
+        let zombie_process = DetPid::from_raw(zombie.as_raw());
+        scheduler.thread_tree.add_child(parent, zombie, true);
+        scheduler.grant_exit_for_test(zombie_process);
+        scheduler.note_process_sigkill(zombie, zombie_process, true);
+        assert!(scheduler.terminal_deadlock.is_none());
+
+        // Without a granted exit, a victim no registration names stays the
+        // loud false deadlock it was.
+        let unknown = DetTid::from_raw(43);
+        scheduler.thread_tree.add_child(parent, unknown, true);
+        scheduler.note_process_sigkill(unknown, DetPid::from_raw(unknown.as_raw()), true);
+        assert!(scheduler.terminal_deadlock.is_some());
+    }
+
+    /// The thread tree never drops an edge, so a thread id reused by another
+    /// process stays listed under the group it left. A process-directed
+    /// SIGKILL to that old, exited group must not find the reused thread and
+    /// retire it (Claude review of https://github.com/rrnewton/hermit/pull/4439,
+    /// R3; re-check N2).
+    #[test]
+    fn a_process_sigkill_does_not_take_a_reused_thread_id_from_another_group() {
+        let config = Config::default().with_backend(|backend| {
+            *backend = reverie::BackendCapabilities::DBT;
+        });
+        let mut scheduler = Scheduler::new(&config);
+        let parent = DetTid::from_raw(37);
+        let old_leader = DetTid::from_raw(38);
+        let reused = DetTid::from_raw(39);
+        let new_leader = DetTid::from_raw(50);
+        let new_mm = MmId::for_clone(MmId::initial(parent), new_leader, false);
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, old_leader, true);
+        scheduler.thread_tree.add_child(old_leader, reused, false);
+        // The old group has exited; its thread id now names a thread of 50.
+        scheduler.thread_tree.add_child(parent, new_leader, true);
+        scheduler.thread_tree.add_child(new_leader, reused, false);
+        register_known_thread(&mut scheduler, parent);
+        register_known_thread(&mut scheduler, reused);
+        scheduler
+            .register_physical_thread(reused, new_mm, std::process::id() as i32, unsafe {
+                libc::syscall(libc::SYS_gettid) as i32
+            })
+            .expect("PIDFD_THREAD must bind the current test thread");
+        let old_process = DetPid::from_raw(old_leader.as_raw());
+        assert!(
+            scheduler
+                .thread_tree
+                .my_thread_group(&old_process)
+                .contains(&reused),
+            "the stale edge this test is about must exist"
+        );
+
+        assert_eq!(
+            scheduler.sigkill_victim_registered_thread(old_leader, old_process, true),
+            None
+        );
+        scheduler.note_process_sigkill(old_leader, old_process, true);
+        assert!(scheduler.next_turns.contains_key(&reused));
+        assert!(scheduler.terminal_deadlock.is_some());
     }
 
     fn install_runnable_exec_group(

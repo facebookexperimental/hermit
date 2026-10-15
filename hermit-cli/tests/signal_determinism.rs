@@ -321,6 +321,11 @@ fn dbt_sigsuspend_invalid_pointer_does_not_fault_in_the_tool() {
 /// the child held is at EOF before the parent's next instruction, so each
 /// count is 0 in every run. Before the fence these counts varied from run to
 /// run (Claude review of https://github.com/rrnewton/hermit/pull/4400, F1).
+/// The same holds for a pidfd SIGKILL to a process whose leader thread has
+/// exited, which stopped with a false deadlock and then a named refusal: the
+/// kill notice now finds the victim through a surviving thread. A pidfd
+/// SIGKILL to a zombie leaves the parent its child's own exit status
+/// (https://github.com/rrnewton/hermit/issues/4411).
 /// These are plain runs: `--verify` of a run whose child is SIGKILLed fails
 /// DBT's evidence check, which requires a FINAL frame that a killed process
 /// cannot write (https://github.com/rrnewton/hermit/issues/4396).
@@ -332,20 +337,31 @@ fn dbt_sigkill_ends_every_thread_of_the_target() {
     }
 }
 
-/// On DBT, a pidfd SIGKILL names the victim's leader. When that leader has
-/// already exited, Hermit cannot find the victim's host process from it, so it
-/// cannot hold the sender until the victim is gone. The run is then refused by
-/// name before the sender is answered, never left to see the death at a
-/// host-chosen moment. Before, it ended in a false deadlock (rc 125)
-/// (https://github.com/rrnewton/hermit/issues/4411; Claude review of
-/// https://github.com/rrnewton/hermit/pull/4423, F2). The refusal must not
-/// depend on how far the victim's exits got before the notice, so chaos
-/// schedules give it too (Claude re-check of 4423, N1).
+/// On DBT, a tgkill SIGKILL that names a child's leader after that thread has
+/// exited, while a sibling runs on, does not end the group on Linux: the
+/// child is still alive. Hermit cannot find the victim's host process from
+/// that thread, and a thread-directed kill gets no fallback through a
+/// sibling, so the run is refused by name before the sender is answered,
+/// never ended as if the group had been killed (Claude review of
+/// https://github.com/rrnewton/hermit/pull/4439, R1). The same holds for a
+/// pidfd SIGKILL with PIDFD_SIGNAL_THREAD, which also names one thread
+/// (Claude re-check of 4439, N1), and for tkill and rt_tgsigqueueinfo (N4).
 #[cfg(feature = "dbt")]
 #[test]
-fn dbt_refuses_a_sigkill_whose_sender_cannot_be_held() {
+fn dbt_refuses_a_thread_directed_sigkill_to_an_exited_thread() {
     let _guard = hermit_signal_lock();
-    for seed in [None, Some(1), Some(2), Some(3)] {
+    for (mode, seed) in [
+        ("sigkill-tgkill-exited-leader", None),
+        ("sigkill-tgkill-exited-leader", Some(1)),
+        ("sigkill-tgkill-exited-leader", Some(2)),
+        ("sigkill-tgkill-exited-leader", Some(3)),
+        ("sigkill-pidfd-thread-exited-leader", None),
+        ("sigkill-pidfd-thread-exited-leader", Some(1)),
+        ("sigkill-tkill-exited-leader", None),
+        ("sigkill-tkill-exited-leader", Some(1)),
+        ("sigkill-tgsigqueue-exited-leader", None),
+        ("sigkill-tgsigqueue-exited-leader", Some(1)),
+    ] {
         let mut command = Command::new(hermit_test::hermit_binary());
         command.args([
             "--backend=dbt",
@@ -359,11 +375,8 @@ fn dbt_refuses_a_sigkill_whose_sender_cannot_be_held() {
             None => command.arg("--max-timeslice=disabled"),
         };
         command.arg("--");
-        command
-            .arg(signal_guest())
-            .arg("sigkill-pidfd-leader-exited-sigchld");
-        let label =
-            format!("DBT pidfd SIGKILL to a process whose leader exited, chaos seed {seed:?}");
+        command.arg(signal_guest()).arg(mode);
+        let label = format!("DBT {mode}, chaos seed {seed:?}");
         let (output, timed_out, elapsed) = bounded_command_output(command, &label);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -378,7 +391,7 @@ fn dbt_refuses_a_sigkill_whose_sender_cannot_be_held() {
         );
         for expected in [
             "cannot be held until it is gone",
-            "has no registered host process",
+            "a SIGKILL to that thread alone does not end its group",
         ] {
             assert!(
                 stderr.contains(expected),
@@ -400,7 +413,7 @@ fn ptrace_sigkill_ends_every_thread_of_the_target() {
     }
 }
 
-const SIGKILL_SCENARIOS: [(&str, &str); 8] = [
+const SIGKILL_SCENARIOS: [(&str, &str); 10] = [
     (
         "sigkill-child",
         "sigkill child threaded=0 signaled=1 sig=9\n",
@@ -432,6 +445,14 @@ const SIGKILL_SCENARIOS: [(&str, &str); 8] = [
     (
         "sigkill-threaded-pipe-eof",
         "sigkill pipe-eof threaded=1 iterations=0 signaled=1 sig=9\n",
+    ),
+    (
+        "sigkill-pidfd-leader-exited-sigchld",
+        "sigkill sigchld by pidfd after leader exit threaded=1 iterations=0 signaled=1 sig=9\n",
+    ),
+    (
+        "sigkill-pidfd-zombie",
+        "sigkill pidfd zombie send=0 exited=1 code=7\n",
     ),
 ];
 

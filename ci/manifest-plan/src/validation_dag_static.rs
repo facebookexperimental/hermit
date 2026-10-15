@@ -2312,7 +2312,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 072f557c: 1716.
     // And scheduler::test::a_parent_death_parent_moves_as_linux_moves_real_parent
     // (https://github.com/rrnewton/hermit/issues/4440): 1718, listed.
-    ("test.detcore_unit", 1718),
+    // And scheduler::test::dbt_process_sigkill_finds_an_exited_leaders_group_and_leaves_a_zombie_alone,
+    // tool_global::tests::a_dbt_sigkill_notice_with_no_host_registration_refuses_before_answering
+    // (https://github.com/rrnewton/hermit/issues/4411) and
+    // scheduler::test::a_process_sigkill_does_not_take_a_reused_thread_id_from_another_group
+    // (Claude re-check of https://github.com/rrnewton/hermit/pull/4439, N2): 1721, listed.
+    ("test.detcore_unit", 1721),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2605,6 +2610,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // completeness test, in the second shard: 60 + 206 + 232 = 498.
     // And lit's 57 fixtures whose %me is a Rust program from
     // detcore/tests/lit-guests: 60 + 263 + 232 = 555.
+    // Less signal_determinism's unfenceable-SIGKILL refusal test, whose case
+    // now passes in the SIGKILL scenarios
+    // (https://github.com/rrnewton/hermit/issues/4411): 60 + 263 + 231 = 554.
+    // And signal_determinism::dbt_refuses_a_thread_directed_sigkill_to_an_exited_thread
+    // (Claude review of https://github.com/rrnewton/hermit/pull/4439, R1):
+    // 60 + 263 + 232 = 555.
     ("test.hermit_integration", 60),
     ("test.hermit_integration_2", 263),
     ("test.hermit_integration_3", 232),
@@ -3947,7 +3958,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 072f557c: 1716.
     // And the 4440 parent-death parent test
     // (https://github.com/rrnewton/hermit/issues/4440): 1718, listed.
-    ("test.detcore_unit_on_host", 1718),
+    // And the two 4411 tests and the 4439 reused-thread-id test: 1721.
+    ("test.detcore_unit_on_host", 1721),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4018,6 +4030,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And lit's 19 fixtures without a Rust or Go guest, less the ignored
     // cat.test, plus its completeness test: 498.
     // And lit's 57 fixtures with a Rust guest: 555.
+    // Less the DBT unfenceable-SIGKILL refusal test again (https://github.com/rrnewton/hermit/issues/4411): 554.
+    // And the DBT thread-directed SIGKILL refusal test (4439 review, R1): 555.
     ("test.hermit_integration_on_host", 555),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode

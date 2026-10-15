@@ -9199,11 +9199,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                         thread,
                         SigWrapper(libc::SIGKILL),
                         Some(process),
+                        crate::tool_global::SignalScope::Thread,
                     )
                     .await;
                 } else {
-                    self.notify_cross_task_signal(guest, thread, signal, Some(process))
-                        .await;
+                    self.notify_cross_task_signal(
+                        guest,
+                        thread,
+                        signal,
+                        Some(process),
+                        crate::tool_global::SignalScope::Thread,
+                    )
+                    .await;
                 }
             }
             return Ok(value);
@@ -9259,8 +9266,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Tell the scheduler, as `kill` does, so a receiver parked in a
             // blocking call (pause(), a futex wait) is woken to take it
             // (https://github.com/rrnewton/hermit/issues/4099).
-            self.notify_cross_task_signal(guest, thread, signal, Some(process))
-                .await;
+            self.notify_cross_task_signal(
+                guest,
+                thread,
+                signal,
+                Some(process),
+                crate::tool_global::SignalScope::Process,
+            )
+            .await;
         }
         if signal == libc::SIGKILL {
             // A process killed through a pidfd will die; the scheduler must
@@ -9273,6 +9286,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         DetTid::from_raw(target.as_raw()),
                         SigWrapper(libc::SIGKILL),
                         Some(target),
+                        crate::tool_global::SignalScope::Process,
                     )
                     .await
                 }

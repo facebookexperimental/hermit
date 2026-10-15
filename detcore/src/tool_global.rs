@@ -2959,14 +2959,24 @@ impl GlobalState {
                     .await
                     .hold_turn_for_group_exit(dettid),
             ),
-            GlobalRequest::NotifySignalPending(dettid, SigWrapper(signal), target_process) => {
+            GlobalRequest::NotifySignalPending(
+                dettid,
+                SigWrapper(signal),
+                target_process,
+                scope,
+            ) => {
                 let (fence, valve) = {
                     let mut scheduler = self.lock_rpc_scheduler(false).await;
                     scheduler.notify_signal_pending(dettid, SigWrapper(signal));
                     let dbt = self.cfg.backend.requires_thread_directed_process_signals;
-                    // tgkill, tkill and rt_tgsigqueueinfo name a thread, but a
-                    // SIGKILL ends that thread's whole group
-                    // (https://github.com/rrnewton/hermit/issues/4362).
+                    // kill, rt_sigqueueinfo and a pidfd without
+                    // PIDFD_SIGNAL_THREAD name a process; tgkill, tkill,
+                    // rt_tgsigqueueinfo and a pidfd with PIDFD_SIGNAL_THREAD
+                    // name a thread (the notice's SignalScope), whose SIGKILL ends its
+                    // whole group only while that thread is alive
+                    // (https://github.com/rrnewton/hermit/issues/4362; Claude
+                    // review of https://github.com/rrnewton/hermit/pull/4439, R1).
+                    let process_directed = scope == SignalScope::Process;
                     let target_process = if signal == libc::SIGKILL && dbt {
                         target_process.or_else(|| scheduler.registered_process(dettid))
                     } else {
@@ -2977,9 +2987,10 @@ impl GlobalState {
                         scheduler.record_committed_sigkill(dettid, target_process);
                         if let Some(detpid) = target_process {
                             if dbt {
-                                fence = fence_or_refuse(&scheduler, dettid, detpid);
+                                fence =
+                                    fence_or_refuse(&scheduler, dettid, detpid, process_directed);
                             }
-                            scheduler.note_process_sigkill(dettid, detpid);
+                            scheduler.note_process_sigkill(dettid, detpid, process_directed);
                         }
                     }
                     (fence, scheduler.sigkill_fence_valve)
@@ -4723,6 +4734,20 @@ pub enum SigalrmControl {
 
 /// Messages to the global object.
 ///
+/// Whether a signal send named a process (kill, rt_sigqueueinfo, a pidfd
+/// without `PIDFD_SIGNAL_THREAD`) or one thread (tkill, tgkill,
+/// rt_tgsigqueueinfo, a pidfd with `PIDFD_SIGNAL_THREAD`). A SIGKILL ends its
+/// group either way while the named thread is alive; for an exited thread only
+/// a process-directed one does (Claude re-check of
+/// <https://github.com/rrnewton/hermit/pull/4439>, N1).
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+pub enum SignalScope {
+    /// The send named a process.
+    Process,
+    /// The send named one thread.
+    Thread,
+}
+
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.
 #[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
@@ -4960,8 +4985,9 @@ pub enum GlobalRequest {
     /// Whether a pid or tid that a guest task named (with the thread group it
     /// named, if any) is one of Hermit's own tasks; see `hermit_task_named`.
     NamesHermitTask(DetTid, Option<i32>, i32),
-    /// A successful kill(2) queued a physical signal for this sole target.
-    NotifySignalPending(DetTid, SigWrapper, Option<DetPid>),
+    /// A successful kill(2) queued a physical signal for this sole target,
+    /// sent with the given scope.
+    NotifySignalPending(DetTid, SigWrapper, Option<DetPid>, SignalScope),
     /// The sender, holding the serial grant in its signal-delivery turn,
     /// decided that a default action ends its thread group: its next request,
     /// the group `Exit`, is granted before any other thread runs
@@ -5707,40 +5733,63 @@ pub(crate) fn open_process_pidfd(pid: i32) -> std::io::Result<std::os::fd::Owned
 }
 
 /// The pidfd that holds a SIGKILL's sender until victim `detpid` is gone, or
-/// none when there is nothing left to wait for. The victim's host process is
-/// the one registered for `named`, the thread the kill named. The sender is
-/// never left unfenced (Codex design review of
+/// none when there is nothing left to wait for. The sender is never left
+/// unfenced (Codex design review of
 /// https://github.com/rrnewton/hermit/issues/4362 part 2, P2-3):
-/// - `named` has no registration: the run is refused. Whether the victim
-///   still has a live thread cannot decide this, because the kill may already
-///   have reached the kernel and the victim's threads' exits race this notice
+/// - for a kill that named the process (`process_directed`: kill or a pidfd),
+///   a zombie whose exit the schedule granted: nothing to wait for
+///   (https://github.com/rrnewton/hermit/issues/4411);
+/// - otherwise the victim's host process is the one registered for `named`,
+///   the thread the kill named, or else, for a kill that named the process,
+///   for the victim's lowest registered thread, as when a pidfd names a leader
+///   that has exited while its siblings run on
+///   (https://github.com/rrnewton/hermit/issues/4411). A thread-directed
+///   SIGKILL to an exited thread gets no fallback, because Linux does not end
+///   the group for it (Claude review of
+///   https://github.com/rrnewton/hermit/pull/4439, R1). With no such
+///   thread, the run is refused: whether the victim still has a live thread
+///   cannot decide it, because the kill may already have reached the kernel
 ///   (Claude re-check of https://github.com/rrnewton/hermit/pull/4423, N1);
 /// - opening the process pidfd fails with ESRCH (or EINVAL, which some older
 ///   kernels gave for a reaped process whose pid number lived on as a process
-///   group or session id): the process is gone only if `named`'s own
-///   `PIDFD_THREAD` pidfd, held since it registered, reports that thread
-///   exited; otherwise the run is refused;
+///   group or session id): the process is gone only if that thread's own
+///   `PIDFD_THREAD` pidfd, held since it registered, reports that it exited;
+///   otherwise the run is refused;
 /// - any other open failure, such as EMFILE: the run is refused.
 fn sigkill_fence_for(
     scheduler: &Scheduler,
     named: DetTid,
     detpid: DetPid,
+    process_directed: bool,
     open: impl Fn(i32) -> std::io::Result<std::os::fd::OwnedFd>,
 ) -> Result<Option<std::os::fd::OwnedFd>, crate::scheduler::sigkill_retirement::UnfencedSigkill> {
     let unfenced = |reason: String| crate::scheduler::sigkill_retirement::UnfencedSigkill {
         process: detpid,
         reason,
     };
-    let Some(host) = scheduler.physical_process_of(named) else {
-        return Err(unfenced(format!(
-            "the thread it named (dettid {named}) has no registered host process"
-        )));
+    if process_directed && scheduler.process_exit_granted(detpid) {
+        return Ok(None);
+    }
+    let Some(via) = scheduler.sigkill_victim_registered_thread(named, detpid, process_directed)
+    else {
+        return Err(unfenced(if process_directed {
+            format!(
+                "neither the thread it named (dettid {named}) nor any other thread of it has a registered host process"
+            )
+        } else {
+            format!(
+                "the thread it named (dettid {named}) has no registered host process, and a SIGKILL to that thread alone does not end its group"
+            )
+        }));
     };
+    let host = scheduler
+        .physical_process_of(via)
+        .expect("a registered thread has a host process");
     match open(host) {
         Ok(pidfd) => Ok(Some(pidfd)),
         Err(error)
             if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::EINVAL))
-                && scheduler.registered_thread_has_exited(named) == Some(true) =>
+                && scheduler.registered_thread_has_exited(via) == Some(true) =>
         {
             Ok(None)
         }
@@ -5756,8 +5805,15 @@ fn fence_or_refuse(
     scheduler: &Scheduler,
     named: DetTid,
     detpid: DetPid,
+    process_directed: bool,
 ) -> Option<(DetPid, std::os::fd::OwnedFd)> {
-    match sigkill_fence_for(scheduler, named, detpid, open_process_pidfd) {
+    match sigkill_fence_for(
+        scheduler,
+        named,
+        detpid,
+        process_directed,
+        open_process_pidfd,
+    ) {
         Ok(fence) => fence.map(|pidfd| (detpid, pidfd)),
         Err(refusal) => crate::scheduler::exit_on_scheduler_refusal(&refusal),
     }
@@ -7604,13 +7660,14 @@ pub async fn notify_signal_pending<G, T>(
     dettid: DetTid,
     signal: SigWrapper,
     target_process: Option<DetPid>,
+    scope: SignalScope,
 ) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
     let response = send_and_update_time(
         guest,
-        GlobalRequest::NotifySignalPending(dettid, signal, target_process),
+        GlobalRequest::NotifySignalPending(dettid, signal, target_process, scope),
     )
     .await;
     match response.1 {
@@ -7780,16 +7837,26 @@ mod tests {
         scheduler
             .register_physical_thread(live, MmId::initial(live_process), me, my_tid)
             .unwrap();
-        let refusal =
-            sigkill_fence_for(&scheduler, live, live_process, errno(libc::EMFILE)).unwrap_err();
+        let refusal = sigkill_fence_for(&scheduler, live, live_process, true, errno(libc::EMFILE))
+            .unwrap_err();
         assert_eq!(refusal.process, live_process);
         assert!(refusal.reason.contains("pidfd_open"), "{}", refusal.reason);
-        assert!(sigkill_fence_for(&scheduler, live, live_process, errno(libc::ESRCH)).is_err());
-        assert!(sigkill_fence_for(&scheduler, live, live_process, errno(libc::EINVAL)).is_err());
         assert!(
-            sigkill_fence_for(&scheduler, live, live_process, super::open_process_pidfd)
-                .unwrap()
-                .is_some()
+            sigkill_fence_for(&scheduler, live, live_process, true, errno(libc::ESRCH)).is_err()
+        );
+        assert!(
+            sigkill_fence_for(&scheduler, live, live_process, true, errno(libc::EINVAL)).is_err()
+        );
+        assert!(
+            sigkill_fence_for(
+                &scheduler,
+                live,
+                live_process,
+                true,
+                super::open_process_pidfd
+            )
+            .unwrap()
+            .is_some()
         );
         // A registered thread that has exited: an ESRCH means the victim is gone.
         let gone = DetTid::from_raw(43);
@@ -7820,28 +7887,120 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(
-            sigkill_fence_for(&scheduler, gone, gone_process, errno(libc::EINVAL))
+            sigkill_fence_for(&scheduler, gone, gone_process, true, errno(libc::EINVAL))
                 .unwrap()
                 .is_none()
         );
         assert!(
-            sigkill_fence_for(&scheduler, gone, gone_process, errno(libc::ESRCH))
+            sigkill_fence_for(&scheduler, gone, gone_process, true, errno(libc::ESRCH))
                 .unwrap()
                 .is_none()
         );
-        assert!(sigkill_fence_for(&scheduler, gone, gone_process, errno(libc::EMFILE)).is_err());
+        assert!(
+            sigkill_fence_for(&scheduler, gone, gone_process, true, errno(libc::EMFILE)).is_err()
+        );
         // A named thread with no registration refuses, even when the victim
         // seems to have no live thread left: that can be its threads' exits
         // racing this notice after the kill reached the kernel (Claude
         // re-check of https://github.com/rrnewton/hermit/pull/4423, N1).
         let unregistered = DetTid::from_raw(47);
         let empty = DetPid::from_raw(47);
-        let refusal =
-            sigkill_fence_for(&scheduler, unregistered, empty, errno(libc::EMFILE)).unwrap_err();
+        let refusal = sigkill_fence_for(&scheduler, unregistered, empty, true, errno(libc::EMFILE))
+            .unwrap_err();
         assert!(
-            refusal.reason.contains("no registered host process"),
+            refusal.reason.contains("has a registered host process"),
             "{}",
             refusal.reason
+        );
+        // A zombie whose exit the schedule granted needs no fence
+        // (https://github.com/rrnewton/hermit/issues/4411).
+        scheduler.grant_exit_for_test(empty);
+        assert!(
+            sigkill_fence_for(&scheduler, unregistered, empty, true, errno(libc::EMFILE))
+                .unwrap()
+                .is_none()
+        );
+        // A named leader that has exited while a sibling runs on: the fence
+        // goes through the sibling's registration, and an ESRCH counts as gone
+        // only once that sibling has exited
+        // (https://github.com/rrnewton/hermit/issues/4411).
+        let leader = DetTid::from_raw(51);
+        let process = DetPid::from_raw(51);
+        let sibling = DetTid::from_raw(52);
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, sibling, false);
+        // SAFETY: as above.
+        let my_tid = unsafe { libc::gettid() };
+        scheduler
+            .register_physical_thread(sibling, MmId::initial(process), me, my_tid)
+            .unwrap();
+        assert!(
+            sigkill_fence_for(&scheduler, leader, process, true, super::open_process_pidfd)
+                .unwrap()
+                .is_some()
+        );
+        assert!(sigkill_fence_for(&scheduler, leader, process, true, errno(libc::ESRCH)).is_err());
+        // A thread-directed SIGKILL (tgkill, tkill, rt_tgsigqueueinfo) to the
+        // exited leader gets no fallback and refuses; Linux does not end the
+        // group for it (Claude review of
+        // https://github.com/rrnewton/hermit/pull/4439, R1). Nor does a
+        // thread-directed kill to a zombie skip the fence.
+        assert!(
+            sigkill_fence_for(
+                &scheduler,
+                leader,
+                process,
+                false,
+                super::open_process_pidfd
+            )
+            .is_err()
+        );
+        assert!(
+            sigkill_fence_for(&scheduler, unregistered, empty, false, errno(libc::EMFILE)).is_err()
+        );
+        // An exited leader whose surviving sibling has since exited too: an
+        // ESRCH counts as gone, confirmed through the sibling's own
+        // registration pidfd, not the leader's (Claude review of 4439, R2).
+        let late_leader = DetTid::from_raw(61);
+        let late_process = DetPid::from_raw(61);
+        let late_sibling = DetTid::from_raw(62);
+        scheduler
+            .thread_tree
+            .add_child(late_leader, late_leader, true);
+        scheduler
+            .thread_tree
+            .add_child(late_leader, late_sibling, false);
+        let (send, receive) = std::sync::mpsc::channel();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // SAFETY: as above.
+            send.send(unsafe { libc::gettid() }).unwrap();
+            let _ = stopped.recv();
+        });
+        let sibling_tid = receive.recv().unwrap();
+        scheduler
+            .register_physical_thread(late_sibling, MmId::initial(late_process), me, sibling_tid)
+            .unwrap();
+        stop.send(()).unwrap();
+        thread.join().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while scheduler.registered_thread_has_exited(late_sibling) != Some(true) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the joined thread's pidfd never reported its exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            sigkill_fence_for(
+                &scheduler,
+                late_leader,
+                late_process,
+                true,
+                errno(libc::ESRCH)
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -9511,43 +9670,38 @@ mod tests {
         assert!(!guest.retired.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    /// On DBT, a SIGKILL notice whose victim is not gone within the fence
-    /// valve ends the run with the named refusal before the sender is
-    /// answered (shortened valve). The refusal exits the process, so the body
-    /// runs in a child copy of this test binary (Claude re-check of
-    /// https://github.com/rrnewton/hermit/pull/4423, N3).
-    #[tokio::test]
-    async fn a_dbt_sigkill_notice_past_its_valve_refuses_before_answering() {
-        const CHILD: &str = "HERMIT_TEST_DBT_SIGKILL_VALVE_CHILD";
-        let name = "a_dbt_sigkill_notice_past_its_valve_refuses_before_answering";
+    /// Runs the calling test's body in a child copy of this test binary, and
+    /// requires the child to exit with the policy-refusal status and print
+    /// `expected`. Returns whether this is the child, which runs the body.
+    /// Used where the body ends the process by refusing.
+    fn in_child_expecting_refusal(name: &str, expected: &str) -> bool {
+        const CHILD: &str = "HERMIT_TEST_REFUSAL_CHILD";
         let test = format!("{}::{name}", module_path!().split_once("::").unwrap().1);
-        if std::env::var(CHILD).is_err() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", &test, "--nocapture"])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert_eq!(
-                output.status.code(),
-                Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
-                "the child was not refused\n{stderr}"
-            );
-            assert!(
-                stderr.contains("cannot be held until it is gone: it was not gone within"),
-                "{stderr}"
-            );
-            return;
+        if std::env::var(CHILD).as_deref() == Ok(test.as_str()) {
+            return true;
         }
-        // Its stdio is not this child's, which the parent reads to the end.
-        let mut victim = std::process::Command::new("sleep")
-            .arg("3")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(CHILD, &test)
+            .output()
             .unwrap();
-        let victim_pid = victim.id() as i32;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "{test}: the child was not refused\n{stderr}"
+        );
+        assert!(
+            stderr.contains(expected),
+            "{test}: missing {expected:?}\n{stderr}"
+        );
+        false
+    }
+
+    /// Sends the DBT SIGKILL notice for process 3, from process 1, with a
+    /// 20 ms fence valve. Process 3's thread is registered on the host as
+    /// `victim`'s, when given, and otherwise only modelled.
+    async fn send_dbt_sigkill_notice(victim: Option<i32>) {
         let config = Config {
             sequentialize_threads: true,
             ..Config::default()
@@ -9571,9 +9725,11 @@ mod tests {
         {
             let mut sched = state.sched.lock().unwrap();
             sched.sigkill_fence_valve = std::time::Duration::from_millis(20);
-            sched
-                .register_physical_thread(target, MmId::initial(target), victim_pid, victim_pid)
-                .unwrap();
+            if let Some(pid) = victim {
+                sched
+                    .register_physical_thread(target, MmId::initial(target), pid, pid)
+                    .unwrap();
+            }
         }
         let rpc = state.receive_rpc(
             Tid::from_raw(root.as_raw()),
@@ -9582,13 +9738,73 @@ mod tests {
                     .thread_logical_time
                     .clone(),
                 MmId::initial(root),
-                GlobalRequest::NotifySignalPending(target, SigWrapper(libc::SIGKILL), Some(target)),
+                GlobalRequest::NotifySignalPending(
+                    target,
+                    SigWrapper(libc::SIGKILL),
+                    Some(target),
+                    super::SignalScope::Process,
+                ),
             ),
         );
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), rpc).await;
+    }
+
+    /// On DBT, a SIGKILL notice whose victim is not gone within the fence
+    /// valve ends the run with the named refusal before the sender is
+    /// answered (shortened valve; Claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/4423, N3).
+    #[tokio::test]
+    async fn a_dbt_sigkill_notice_past_its_valve_refuses_before_answering() {
+        if !in_child_expecting_refusal(
+            "a_dbt_sigkill_notice_past_its_valve_refuses_before_answering",
+            "cannot be held until it is gone: it was not gone within",
+        ) {
+            return;
+        }
+        // The victim outlives the valve by far, and dies with this child
+        // (PR_SET_PDEATHSIG) rather than outliving it (Claude re-check of
+        // 4423 at 858d81ec, N5). Its stdio is not this child's, which the
+        // parent reads to the end.
+        let mut victim = std::process::Command::new("sleep");
+        victim
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: prctl is async-signal-safe and touches no shared state.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            victim.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let mut victim = victim.spawn().unwrap();
+        send_dbt_sigkill_notice(Some(victim.id() as i32)).await;
         let _ = victim.kill();
         let _ = victim.wait();
         panic!("the SIGKILL notice answered its sender although the victim was not gone");
+    }
+
+    /// On DBT, a SIGKILL notice for a victim with a live thread but no thread
+    /// registered on the host ends the run with the named refusal before the
+    /// sender is answered, never left unfenced (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4423, F2: the end-to-end form
+    /// of this case became a passing run with
+    /// https://github.com/rrnewton/hermit/issues/4411's fix).
+    #[tokio::test]
+    async fn a_dbt_sigkill_notice_with_no_host_registration_refuses_before_answering() {
+        if !in_child_expecting_refusal(
+            "a_dbt_sigkill_notice_with_no_host_registration_refuses_before_answering",
+            "nor any other thread of it has a registered host process",
+        ) {
+            return;
+        }
+        send_dbt_sigkill_notice(None).await;
+        panic!("the SIGKILL notice answered its sender without a fence");
     }
 
     /// A returning sender's wait for its victims is bounded by the valve: a
@@ -10198,6 +10414,7 @@ mod tests {
                 DetTid::from_raw(41),
                 SigWrapper(libc::SIGKILL),
                 Some(victim),
+                super::SignalScope::Process,
             ))
             .await
             .1,
@@ -10212,6 +10429,7 @@ mod tests {
             DetTid::from_raw(43),
             SigWrapper(libc::SIGTERM),
             Some(other),
+            super::SignalScope::Process,
         ))
         .await;
         assert_eq!(

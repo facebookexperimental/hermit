@@ -2019,8 +2019,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await?
         };
-        self.notify_cross_task_signal(guest, tid, call.sig(), Some(DetPid::from_raw(process)))
-            .await;
+        self.notify_cross_task_signal(
+            guest,
+            tid,
+            call.sig(),
+            Some(DetPid::from_raw(process)),
+            crate::tool_global::SignalScope::Process,
+        )
+        .await;
         Ok(value)
     }
 
@@ -2611,8 +2617,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         // guest THREAD signals a sibling. Like `kill`, a successful cross-task
         // send must tell the scheduler, or a target parked in a child wait is
         // never woken and the wait hangs.
-        self.notify_cross_task_signal(guest, DetTid::from_raw(tid), call.sig(), None)
-            .await;
+        self.notify_cross_task_signal(
+            guest,
+            DetTid::from_raw(tid),
+            call.sig(),
+            None,
+            crate::tool_global::SignalScope::Thread,
+        )
+        .await;
         Ok(value)
     }
 
@@ -2688,8 +2700,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await?;
         // Same wakeup obligation as `tgkill`; `tkill` is the older two-argument
         // spelling of the same thread-directed send.
-        self.notify_cross_task_signal(guest, DetTid::from_raw(tid), call.sig(), None)
-            .await;
+        self.notify_cross_task_signal(
+            guest,
+            DetTid::from_raw(tid),
+            call.sig(),
+            None,
+            crate::tool_global::SignalScope::Thread,
+        )
+        .await;
         Ok(value)
     }
 
@@ -2852,6 +2870,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         target: DetTid,
         raw_signal: i32,
         target_process: Option<DetPid>,
+        scope: crate::tool_global::SignalScope,
     ) {
         // ⚠️ NO `Signal::try_from` GATE. It used to stand here, and because
         // `nix`'s `Signal` models only 1..=31 it rejected EVERY realtime signal:
@@ -2862,7 +2881,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // can be represented and none is dropped for being unnameable. Signal
         // zero is only an existence/permission probe and queues no signal.
         if should_notify_cross_task_signal(guest.thread_state().dettid, target, raw_signal) {
-            notify_signal_pending(guest, target, SigWrapper(raw_signal), target_process).await;
+            notify_signal_pending(guest, target, SigWrapper(raw_signal), target_process, scope)
+                .await;
         }
     }
 
@@ -2977,8 +2997,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Thread-directed like `tgkill`, so it carries the same wakeup
         // obligation. `sigqueue`/`pthread_sigqueue` reach a parked sibling
         // through here.
-        self.notify_cross_task_signal(guest, DetTid::from_raw(tid), call.sig(), None)
-            .await;
+        self.notify_cross_task_signal(
+            guest,
+            DetTid::from_raw(tid),
+            call.sig(),
+            None,
+            crate::tool_global::SignalScope::Thread,
+        )
+        .await;
         Ok(value)
     }
 
@@ -3200,8 +3226,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await?
         };
-        self.notify_cross_task_signal(guest, tid, call.sig(), Some(DetPid::from_raw(process)))
-            .await;
+        self.notify_cross_task_signal(
+            guest,
+            tid,
+            call.sig(),
+            Some(DetPid::from_raw(process)),
+            crate::tool_global::SignalScope::Process,
+        )
+        .await;
         Ok(value)
     }
 
