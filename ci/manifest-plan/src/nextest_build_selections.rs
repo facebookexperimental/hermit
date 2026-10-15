@@ -131,6 +131,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "fp_reduction_determinism",
             "--test",
+            "frontier_app_benchmarks",
+            "--test",
             "full_summary_futex_order",
             "--test",
             "futex2_refusal",
@@ -160,6 +162,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "kvm_harder",
             "--test",
             "kvm_lifecycle_timing_log_level",
+            "--test",
+            "language_runtime_determinism",
             "--test",
             "leveldb",
             "--test",
@@ -833,7 +837,9 @@ mod tests {
             // one and stress_suite's two non-ignored tests
             // (https://github.com/rrnewton/hermit/issues/2791), plus
             // flock_exclusion's 23 (its 24th is ignored until
-            // https://github.com/rrnewton/hermit/issues/4173 is fixed).
+            // https://github.com/rrnewton/hermit/issues/4173 is fixed), plus
+            // frontier_app_benchmarks' 3 and language_runtime_determinism's 4
+            // whose programs the pinned root has.
             // The local node runs in shards, which together execute the same.
             let executed = |tag: &str| -> u64 {
                 let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
@@ -847,7 +853,7 @@ mod tests {
             } else {
                 executed(tag)
             };
-            assert_eq!(population, 444);
+            assert_eq!(population, 451);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

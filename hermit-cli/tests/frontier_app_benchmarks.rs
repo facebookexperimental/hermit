@@ -208,12 +208,14 @@ fn unused_loopback_port() -> u16 {
 }
 
 #[test]
-#[ignore = "requires PMU, mount namespaces, and sqlite3"]
 fn sqlite_transaction_is_nondeterministic_natively_and_l2_under_hermit() {
     let workload = Workload {
         name: "SQLite transaction benchmark",
         nondeterminism: "clock-and-entropy",
-        program: required_app("sqlite3", &["/usr/bin/sqlite3", "/usr/local/bin/sqlite3"]),
+        program: required_app(
+            "sqlite3",
+            &["/usr/bin/sqlite3", "/usr/local/bin/sqlite3", "/bin/sqlite3"],
+        ),
         args: vec![":memory:".into(), SQLITE_WORKLOAD.into()],
         output_marker: "memory\n44|",
     };
@@ -223,16 +225,23 @@ fn sqlite_transaction_is_nondeterministic_natively_and_l2_under_hermit() {
 }
 
 #[test]
-#[ignore = "requires PMU, mount namespaces, redis-server, and redis-cli"]
 fn redis_commands_are_nondeterministic_natively_and_l2_under_hermit() {
     let script = repository().join("hermit-cli/tests/fixtures/frontier-apps/redis-workload.sh");
     let redis_server = required_app(
         "redis-server",
-        &["/usr/bin/redis-server", "/usr/local/bin/redis-server"],
+        &[
+            "/usr/bin/redis-server",
+            "/usr/local/bin/redis-server",
+            "/bin/redis-server",
+        ],
     );
     let redis_cli = required_app(
         "redis-cli",
-        &["/usr/bin/redis-cli", "/usr/local/bin/redis-cli"],
+        &[
+            "/usr/bin/redis-cli",
+            "/usr/local/bin/redis-cli",
+            "/bin/redis-cli",
+        ],
     );
     let root = format!("/tmp/hermit-frontier-redis-{}", std::process::id());
     let workload = Workload {
@@ -259,14 +268,16 @@ fn redis_deep_session_is_nondeterministic_natively_and_l2_under_hermit() {
 }
 
 #[test]
-#[ignore = "requires PMU, mount namespaces, and Python 3"]
 fn http_server_is_nondeterministic_natively_and_l2_under_hermit() {
     let script = repository().join("hermit-cli/tests/fixtures/frontier-apps/http_server.py");
     let port = unused_loopback_port().to_string();
     let workload = Workload {
         name: "Python HTTP server benchmark",
         nondeterminism: "response-clock-and-entropy",
-        program: required_app("python3", &["/usr/bin/python3", "/usr/local/bin/python3"]),
+        program: required_app(
+            "python3",
+            &["/usr/bin/python3", "/usr/local/bin/python3", "/bin/python3"],
+        ),
         args: vec![script.into_os_string(), port.into()],
         output_marker: "status=200 path=/frontier time=",
     };
