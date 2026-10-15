@@ -501,7 +501,32 @@ env_args+=(-e GIT_OPTIONAL_LOCKS=0)
 # command; util-linux/taskset is already in the pinned image. This preserves
 # placement as well as the outer cgroup limits. Calibration still independently
 # compares the resulting live affinity with its earlier host observation.
-caller_affinity=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0)))))')
+#
+# Read with bash builtins from /proc/self/status (the kernel's
+# Cpus_allowed_list, ascending ranges such as 0-3,8) and expanded to the
+# explicit ascending list sched_getaffinity(2) gives. Not by starting python3:
+# on a loaded host that interpreter start took 16.8 s, every second of it on a
+# node's critical path, and validate_pinned_image's forced-stop test failed at
+# 20.2 s against its 20 s bound when five validations ran at once (f9d81a69).
+caller_affinity=
+while IFS=$'\t' read -r status_key status_value; do
+    if [[ $status_key == Cpus_allowed_list: ]]; then
+        IFS=, read -r -a affinity_ranges <<< "$status_value"
+        for affinity_range in "${affinity_ranges[@]}"; do
+            if [[ $affinity_range =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                for ((cpu = BASH_REMATCH[1]; cpu <= BASH_REMATCH[2]; cpu++)); do
+                    caller_affinity+=${caller_affinity:+,}$cpu
+                done
+            elif [[ $affinity_range =~ ^[0-9]+$ ]]; then
+                caller_affinity+=${caller_affinity:+,}$affinity_range
+            else
+                caller_affinity=
+                break
+            fi
+        done
+        break
+    fi
+done < /proc/self/status
 [[ $caller_affinity =~ ^[0-9]+(,[0-9]+)*$ ]] || {
     echo "run-in-pinned-root: cannot read a nonempty caller CPU affinity" >&2
     exit 2
