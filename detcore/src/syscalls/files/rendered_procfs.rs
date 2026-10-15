@@ -803,7 +803,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // on every backend (KVM's own procfs resolves the spelling).
         if let Some((subject, fd)) = proc_fd_target_with_leading_zeros(path) {
             let own = match subject {
-                Some(subject) => guest.inject(syscalls::Getpid::new()).await? == i64::from(subject),
+                Some(subject) => self.guest_visible_own_pid(guest).await? == i64::from(subject),
                 None => true,
             };
             let rendered = guest
@@ -819,7 +819,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(None);
         };
         if let Some(subject) = subject
-            && guest.inject(syscalls::Getpid::new()).await? != i64::from(subject)
+            && self.guest_visible_own_pid(guest).await? != i64::from(subject)
         {
             return Ok(None);
         }
@@ -1418,14 +1418,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(target) = self.rendered_procfs_at(guest, path).await? else {
             return Ok(None);
         };
-        if !target.via_link || buffer_len == 0 || buffer_len > i32::MAX as usize {
+        let size = crate::syscalls::namespace::readlink_size(buffer_len)?;
+        if !target.via_link {
             return Err(Errno::EINVAL.into());
         }
         let link = target
             .procfs
             .rendered_path()
             .expect("a rendered procfs file has a path");
-        write_link(&mut guest.memory(), link, buffer, buffer_len).map(Some)
+        write_link(&mut guest.memory(), link, buffer, size).map(Some)
     }
 
     /// Rewrite a descriptor link that the kernel wrote to `buffer`, `result`

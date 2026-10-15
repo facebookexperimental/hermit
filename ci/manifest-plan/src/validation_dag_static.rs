@@ -1534,7 +1534,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/4266): 1079, listed.
     // And +1 from the discarded-at-send record (https://github.com/rrnewton/hermit/issues/4293): 1080, listed.
     // And the_peer_loop_runs_with_and_without_pkru_instructions: 1081, listed.
-    ("test.hermit_unit", 1081),
+    // And record_version_rejects_streams_from_before_decided_procfs_links
+    // (B3a-2 of https://github.com/rrnewton/hermit/issues/4266): 1082, listed.
+    // And +1 from a35a69ad: 1082.
+    ("test.hermit_unit", 1082),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2252,7 +2255,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler::test::dbt_process_sigkill_retires_every_thread_of_the_target_group
     // and tool_global::tests::the_dbt_sigkill_fence_waits_until_the_victim_process_is_gone
     // (https://github.com/rrnewton/hermit/issues/4362): 1700, listed.
-    ("test.detcore_unit", 1700),
+    // And +1 from a35a69ad: 1701.
+    ("test.detcore_unit", 1701),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3190,7 +3194,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4162): 438.
     // And library_runs_return_on_a_four_mib_thread
     // (https://github.com/rrnewton/hermit/issues/4389): 439, listed.
-    ("test.cli", 439),
+    // And detcore_answers_its_procfs_links_on_every_backend (B3a-2 of
+    // https://github.com/rrnewton/hermit/issues/4266): 440, by listing.
+    // And +1 from a35a69ad: 440.
+    ("test.cli", 440),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3564,7 +3571,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the chaos spinner-bound and bounded-replay tests (https://github.com/rrnewton/hermit/issues/4374): 366, listed.
     // And the eight directory-size tests: 374.
     // And the 4 MiB library-launch test (https://github.com/rrnewton/hermit/issues/4389): 375, listed.
-    ("test.cli_on_host", 375),
+    // And detcore_answers_its_procfs_links_on_every_backend (B3a-2): 376, by listing.
+    // And +1 from a35a69ad: 376.
+    ("test.cli_on_host", 376),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3810,7 +3819,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three chaos starvation-bound tests (https://github.com/rrnewton/hermit/issues/4374): 1696, listed.
     // And the two procfs-device tests (https://github.com/rrnewton/hermit/issues/4162): 1698.
     // And the DBT SIGKILL group-retirement and fence tests: 1700.
-    ("test.detcore_unit_on_host", 1700),
+    // And +1 from a35a69ad: 1701.
+    ("test.detcore_unit_on_host", 1701),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4031,7 +4041,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the per-process-levels record-version test (B3a-1): 1079.
     // And +1 from the discarded-at-send record (https://github.com/rrnewton/hermit/issues/4293): 1080, listed.
     // And the peer-loop PKRU guard test: 1081.
-    ("test.hermit_unit_on_host", 1081),
+    // And the decided-procfs-links record-version test (B3a-2): 1082.
+    // And +1 from a35a69ad: 1082.
+    ("test.hermit_unit_on_host", 1082),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

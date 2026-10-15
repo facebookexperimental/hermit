@@ -245,6 +245,106 @@ pub(crate) fn proc_fd_target_with_leading_zeros(path: &Path) -> Option<(Option<u
     Some((subject, fd.parse().ok()?))
 }
 
+/// A `/proc` link whose target Detcore decides itself
+/// ([`decided_procfs_link`]).
+#[derive(Debug, PartialEq, Eq)]
+enum DecidedLink {
+    /// The link's target.
+    Target(Vec<u8>),
+    /// The caller's own descriptor link, by a spelling the backend may not
+    /// answer (`/proc/self/task/<tid>/fd/N`): read as `/proc/self/fd/N`.
+    SelfFd(i32),
+    /// A spelling that follows a decided link (a trailing slash or `.`) and
+    /// so names no link: `EINVAL` where the target is a directory, `ENOTDIR`
+    /// where it is a file.
+    Followed(Errno),
+}
+
+/// The number of bytes `readlink` may copy for a `bufsiz` argument of
+/// `buffer_len`, which Linux takes as an `int`: EINVAL unless positive.
+pub(crate) fn readlink_size(buffer_len: usize) -> Result<usize, Errno> {
+    let size = buffer_len as u32 as i32;
+    if size <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(size as usize)
+}
+
+/// The link at the absolute spelling `path` whose target Detcore decides from
+/// its own model, for a caller whose pid and tid, as the guest sees them, are
+/// `pid` and `tid`: `self` names the pid and `thread-self` the pid's task
+/// `tid`; the `mounts` and `net` links name `self/mounts` and `self/net`; the
+/// caller's namespace links name their canonical constants; and the caller's
+/// own descriptor link spelled through its thread is its `fd/N`. A trailing
+/// slash or `.` follows the link, so such a spelling of a decided target is
+/// [`DecidedLink::Followed`]. `None` for any other path, for a spelling with
+/// `..`, and for a followed descriptor link, which the kernel resolves.
+fn decided_procfs_link(path: &[u8], pid: i32, tid: i32) -> Option<DecidedLink> {
+    let rest = path.strip_prefix(b"/proc/")?;
+    let mut parts = Vec::new();
+    let mut follows = false;
+    for part in rest.split(|byte| *byte == b'/') {
+        match part {
+            b"" | b"." => follows = !parts.is_empty(),
+            b".." => return None,
+            part => {
+                parts.push(part);
+                follows = false;
+            }
+        }
+    }
+    if follows {
+        // `self`, `thread-self` and `net` name directories; `mounts` and the
+        // namespace links name files.
+        return match decided_procfs_link_parts(&parts, pid, tid)? {
+            DecidedLink::Target(_) => Some(DecidedLink::Followed(
+                if matches!(parts.as_slice(), [b"self" | b"thread-self" | b"net"]) {
+                    Errno::EINVAL
+                } else {
+                    Errno::ENOTDIR
+                },
+            )),
+            _ => None,
+        };
+    }
+    decided_procfs_link_parts(&parts, pid, tid)
+}
+
+/// [`decided_procfs_link`] of the components below `/proc` of a spelling
+/// that does not follow its last one.
+fn decided_procfs_link_parts(parts: &[&[u8]], pid: i32, tid: i32) -> Option<DecidedLink> {
+    let pid_name = pid.to_string();
+    let tid_name = tid.to_string();
+    let own_process = |part: &[u8]| part == b"self" || part == pid_name.as_bytes();
+    let own_thread = |part: &[u8]| part == tid_name.as_bytes();
+    let namespace = |parts: &[&[u8]]| {
+        let spelled = std::iter::once(b"/proc".as_slice())
+            .chain(parts.iter().copied())
+            .collect::<Vec<_>>()
+            .join(b"/".as_slice());
+        canonical_namespace_target(Path::new(OsStr::from_bytes(&spelled)))
+            .map(|target| DecidedLink::Target(target.to_vec()))
+    };
+    match parts {
+        [b"self"] => Some(DecidedLink::Target(pid_name.into_bytes())),
+        [b"thread-self"] => Some(DecidedLink::Target(
+            format!("{pid}/task/{tid}").into_bytes(),
+        )),
+        [b"mounts"] => Some(DecidedLink::Target(b"self/mounts".to_vec())),
+        [b"net"] => Some(DecidedLink::Target(b"self/net".to_vec())),
+        [process, b"ns", _] if own_process(process) || *process == b"thread-self" => {
+            namespace(parts)
+        }
+        [process, b"task", thread, b"ns", _] if own_process(process) && own_thread(thread) => {
+            namespace(parts)
+        }
+        [process, b"task", thread, b"fd", fd] if own_process(process) && own_thread(thread) => {
+            decimal_fd(OsStr::from_bytes(fd)).map(DecidedLink::SelfFd)
+        }
+        _ => None,
+    }
+}
+
 // TODO-HUMAN-REVIEW(PR-1079): Review numeric virtual-self proc-fd path rewriting.
 fn host_self_proc_fd_alias(path: &Path, current_pid: i64) -> Option<PathBuf> {
     let (Some(subject), fd) = proc_fd_target(path)? else {
@@ -540,7 +640,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             target.to_vec()
         } else if let Some((subject, fd)) = proc_fd_target(&path) {
             if let Some(subject) = subject {
-                let current_pid = guest.inject(syscalls::Getpid::new()).await?;
+                let current_pid = self.guest_visible_own_pid(guest).await?;
                 if current_pid != i64::from(subject) {
                     return self
                         .canonicalize_other_proc_fd_readlink(
@@ -769,6 +869,31 @@ impl<T: RecordOrReplay> Detcore<T> {
     {
         let saved = saved_link_bytes(guest, buffer, buffer_len);
         let result = self.record_or_replay(guest, syscall).await?;
+        self.finish_namespace_readlink_result(
+            guest,
+            link,
+            path,
+            buffer,
+            buffer_len,
+            (result, saved.as_deref()),
+        )
+        .await
+    }
+
+    /// [`Self::finish_namespace_readlink`] after the call, which returned
+    /// `result` over a buffer that held `saved` before it.
+    async fn finish_namespace_readlink_result<G>(
+        &self,
+        guest: &mut G,
+        link: (i32, Option<PathPtr<'_>>),
+        path: PathBuf,
+        buffer: Option<AddrMut<'_, libc::c_char>>,
+        buffer_len: usize,
+        (result, saved): (i64, Option<&[u8]>),
+    ) -> Result<i64, Error>
+    where
+        G: Guest<Self>,
+    {
         // A link that filled a buffer too short for a placeholder's link,
         // spelled as a task's descriptor link (`task/<tid>/fd/N`) or starting
         // as a placeholder's link does: the whole link shows whether it was
@@ -800,26 +925,155 @@ impl<T: RecordOrReplay> Detcore<T> {
                         guest
                             .memory()
                             .write_exact(address.cast(), &link[..written])?;
-                        restore_link_tail(guest, address, written, length, saved.as_deref())?;
+                        restore_link_tail(guest, address, written, length, saved)?;
                         written as i64
                     }
                     _ => result,
                 }
             }
             _ => {
-                self.rewrite_placeholder_link(
-                    guest,
-                    link,
-                    buffer,
-                    buffer_len,
-                    result,
-                    saved.as_deref(),
-                )
-                .await?
+                self.rewrite_placeholder_link(guest, link, buffer, buffer_len, result, saved)
+                    .await?
             }
         };
         self.canonicalize_namespace_readlink_result(guest, path, buffer, buffer_len, result)
             .await
+    }
+
+    /// The calling process's pid as the guest sees it, which a `/proc/<pid>`
+    /// spelling names: Detcore's pid for the process outside a nested PID
+    /// namespace (under DBT the kernel's differs), the kernel's answer
+    /// inside one. Detcore's pid is the thread's own record of it, as at
+    /// thread exit: a DBT fork child keeps its parent's tool.
+    pub(crate) async fn guest_visible_own_pid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<i64, Error> {
+        if guest.thread_state().nested_pid_namespace {
+            Ok(guest.inject(syscalls::Getpid::new()).await?)
+        } else {
+            Ok(i64::from(self.own_detpid(guest).as_raw()))
+        }
+    }
+
+    /// Detcore's pid for the calling thread's process.
+    fn own_detpid<G: Guest<Self>>(&self, guest: &G) -> crate::types::DetPid {
+        guest.thread_state().detpid.unwrap_or(self.detpid)
+    }
+
+    /// Answer `readlink` of a `/proc` link whose target Detcore decides from
+    /// its own model ([`decided_procfs_link`]), at the guest's absolute
+    /// spelling `path` (for a guest pathname `spelled`), without asking the
+    /// backend, so every backend answers alike (KVM's own `/proc` refuses
+    /// `thread-self` and the namespace links). The caller's own descriptor
+    /// link spelled through its thread is answered as `/proc/self/fd/N` is,
+    /// with the kernel reading `/proc/thread-self/fd/N`, the calling thread's
+    /// own table. Not in a nested PID namespace, where the caller's pid is
+    /// not Detcore's, nor after a guest `chroot`, where `/proc` need not be
+    /// procfs, nor for a pathname too long for Linux to look up.
+    async fn readlink_decided_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &Path,
+        (spelled, link): (&Path, (i32, Option<PathPtr<'_>>)),
+        buffer: Option<AddrMut<'_, libc::c_char>>,
+        buffer_len: usize,
+    ) -> Result<Option<i64>, Error> {
+        let state = guest.thread_state();
+        if state.nested_pid_namespace
+            || state.changed_root.load(std::sync::atomic::Ordering::SeqCst)
+            || spelled.as_os_str().len() >= libc::PATH_MAX as usize
+        {
+            return Ok(None);
+        }
+        let decided = decided_procfs_link(
+            path.as_os_str().as_bytes(),
+            self.own_detpid(guest).as_raw(),
+            state.dettid.as_raw(),
+        );
+        let Some(decided) = decided else {
+            return Ok(None);
+        };
+        // Linux takes the size as an int, and refuses one that is not
+        // positive before it looks up the path.
+        let size = readlink_size(buffer_len)?;
+        if let DecidedLink::SelfFd(fd) = decided {
+            return self
+                .readlink_own_descriptor_link(guest, fd, link, buffer, size)
+                .await
+                .map(Some);
+        }
+        match decided {
+            DecidedLink::Target(target) => {
+                let copied = target.len().min(size);
+                let address = buffer.ok_or(Errno::EFAULT)?;
+                // Linux gives EFAULT for a buffer it cannot write; a backend's
+                // write can fail otherwise (ptrace's EIO).
+                guest
+                    .memory()
+                    .write_exact(address.cast::<u8>(), &target[..copied])
+                    .map_err(|_| Errno::EFAULT)?;
+                Ok(Some(copied as i64))
+            }
+            DecidedLink::Followed(errno) => Err(errno.into()),
+            DecidedLink::SelfFd(_) => unreachable!("answered above"),
+        }
+    }
+
+    /// Answer `readlink` of the caller's own descriptor link `fd` spelled
+    /// through its thread directory, into a buffer of `size` bytes, as
+    /// `/proc/self/fd/N` is answered (a rendered procfs file's path, a
+    /// placeholder's, or the kernel's link canonicalized), but by
+    /// `/proc/thread-self/fd/N`, which every lookup here reads: a thread
+    /// made without `CLONE_FILES`, or after `unshare(CLONE_FILES)`, has a
+    /// table of its own, and the leader's may be gone. KVM's own `/proc`
+    /// refuses `thread-self`, so there they read `/proc/self/fd/N`.
+    async fn readlink_own_descriptor_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+        link: (i32, Option<PathPtr<'_>>),
+        buffer: Option<AddrMut<'_, libc::c_char>>,
+        size: usize,
+    ) -> Result<i64, Error> {
+        let directory = if crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend) {
+            "thread-self"
+        } else {
+            "self"
+        };
+        let physical = PathBuf::from(format!("/proc/{directory}/fd/{fd}"));
+        if let Some(result) = self
+            .readlink_rendered_procfs(guest, &physical, buffer, size)
+            .await?
+        {
+            return Ok(result);
+        }
+        let bytes = physical.as_os_str().as_bytes();
+        let mut path_buffer = [0_u8; 64];
+        path_buffer[..bytes.len()].copy_from_slice(bytes);
+        let saved = saved_link_bytes(guest, buffer, size);
+        let mut stack = guest.stack().await;
+        let path_address = stack.push(path_buffer).cast::<libc::c_char>();
+        let stack_guard = stack.commit()?;
+        let call = syscalls::Readlink::new()
+            .with_path(PathPtr::from_ptr(
+                path_address.as_raw() as *const libc::c_char
+            ))
+            .with_buf(buffer)
+            .with_bufsize(size);
+        let result = self.record_or_replay(guest, call).await?;
+        // The stack is released before anything else uses it; a placeholder
+        // is confirmed through the guest's own pathname, as before.
+        drop(stack_guard);
+        self.finish_namespace_readlink_result(
+            guest,
+            link,
+            physical,
+            buffer,
+            size,
+            (result, saved.as_deref()),
+        )
+        .await
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -837,8 +1091,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(result);
         }
+        if let Some(result) = self
+            .readlink_decided_link(
+                guest,
+                &path,
+                (&path, (libc::AT_FDCWD, call.path())),
+                call.buf(),
+                call.bufsize(),
+            )
+            .await?
+        {
+            return Ok(result);
+        }
         let (host_path, other_proc_fd) = if let Some((Some(subject), _)) = proc_fd_target(&path) {
-            let current_pid = guest.inject(syscalls::Getpid::new()).await?;
+            let current_pid = self.guest_visible_own_pid(guest).await?;
             (
                 host_self_proc_fd_alias(&path, current_pid),
                 current_pid != i64::from(subject),
@@ -892,12 +1158,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
         let observed_path = if path.is_absolute() || call.dirfd() == libc::AT_FDCWD {
-            path
+            path.clone()
         } else {
             guest
                 .thread_state()
                 .with_detfd(call.dirfd(), |detfd| detfd.path())?
-                .map_or(path.clone(), |directory| directory.join(path))
+                .map_or(path.clone(), |directory| directory.join(&path))
         };
         if let Some(result) = self
             .readlink_rendered_procfs(guest, &observed_path, call.buf(), call.buf_len())
@@ -905,8 +1171,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(result);
         }
+        // A relative pathname is decided only below a descriptor on `/proc`
+        // itself, a directory: one on `/proc/self` may be the link (an
+        // `O_PATH | O_NOFOLLOW` open), and an empty pathname reads the
+        // descriptor's own link, which the kernel answers (an inherited one
+        // keeps its opener's binding).
+        let decidable = path.is_absolute()
+            || (!path.as_os_str().is_empty()
+                && call.dirfd() != libc::AT_FDCWD
+                && guest
+                    .thread_state()
+                    .with_detfd(call.dirfd(), |detfd| detfd.path())
+                    .ok()
+                    .flatten()
+                    .is_some_and(|directory| directory == Path::new("/proc")));
+        if decidable
+            && let Some(result) = self
+                .readlink_decided_link(
+                    guest,
+                    &observed_path,
+                    (&path, (call.dirfd(), call.path())),
+                    call.buf(),
+                    call.buf_len(),
+                )
+                .await?
+        {
+            return Ok(result);
+        }
         if let Some((Some(subject), _)) = proc_fd_target(&observed_path) {
-            let current_pid = guest.inject(syscalls::Getpid::new()).await?;
+            let current_pid = self.guest_visible_own_pid(guest).await?;
             if current_pid != i64::from(subject) {
                 return self.finish_other_proc_fd_readlinkat(guest, call).await;
             }
@@ -960,6 +1253,81 @@ mod tests {
             let error = anonymous_object_device(&unread, kind).unwrap_err();
             assert!(matches!(error, Error::Tool(_)), "{error:?}");
             assert!(error.to_string().contains("os error 24"), "{error}");
+        }
+    }
+
+    #[test]
+    fn decides_the_links_detcore_knows_the_targets_of() {
+        let decided = |path: &str| decided_procfs_link(path.as_bytes(), 3, 5);
+        let target = |bytes: &[u8]| Some(DecidedLink::Target(bytes.to_vec()));
+        assert_eq!(decided("/proc/self"), target(b"3"));
+        assert_eq!(decided("/proc/./self"), target(b"3"));
+        assert_eq!(decided("/proc/thread-self"), target(b"3/task/5"));
+        assert_eq!(decided("/proc/mounts"), target(b"self/mounts"));
+        assert_eq!(decided("/proc/net"), target(b"self/net"));
+        assert_eq!(decided("/proc/self/ns/pid"), target(b"pid:[4026531836]"));
+        assert_eq!(decided("/proc/3/ns/mnt"), target(b"mnt:[4026531841]"));
+        assert_eq!(
+            decided("/proc/thread-self/ns/user"),
+            target(b"user:[4026531837]")
+        );
+        assert_eq!(
+            decided("/proc/3/task/5/ns/net"),
+            decided("/proc/self/ns/net")
+        );
+        assert_eq!(
+            decided("/proc/self/task/5/fd/7"),
+            Some(DecidedLink::SelfFd(7))
+        );
+        assert_eq!(decided("/proc/3/task/5/fd/0"), Some(DecidedLink::SelfFd(0)));
+        assert_eq!(decided("/proc//self"), target(b"3"));
+        // Linux takes the size as an int.
+        assert_eq!(readlink_size(0), Err(Errno::EINVAL));
+        assert_eq!(readlink_size(1 << 31), Err(Errno::EINVAL));
+        assert_eq!(readlink_size((1 << 32) + 5), Ok(5));
+        assert_eq!(readlink_size(i32::MAX as usize), Ok(i32::MAX as usize));
+        assert_eq!(decided("/proc/self/ns/./pid"), decided("/proc/self/ns/pid"));
+        // A trailing slash or `.` follows the link: to a directory, EINVAL; to
+        // a file, ENOTDIR.
+        let followed = |errno| Some(DecidedLink::Followed(errno));
+        for path in [
+            "/proc/self/",
+            "/proc/self/.",
+            "/proc/self//",
+            "/proc/thread-self/",
+            "/proc/net/",
+        ] {
+            assert_eq!(decided(path), followed(Errno::EINVAL), "{path}");
+        }
+        for path in [
+            "/proc/mounts/",
+            "/proc/mounts/.",
+            "/proc/self/ns/pid/",
+            "/proc/thread-self/ns/pid/.",
+            "/proc/3/task/5/ns/net/",
+        ] {
+            assert_eq!(decided(path), followed(Errno::ENOTDIR), "{path}");
+        }
+        // Left to the kernel: `..`, a followed descriptor link, another
+        // process's or thread's links, unknown namespaces, and links Detcore
+        // does not decide yet.
+        for path in [
+            "/proc/self/task/5/fd/7/",
+            "/proc/4/",
+            "/proc/",
+            "/proc/self/../self",
+            "/proc/4/ns/pid",
+            "/proc/self/task/6/ns/pid",
+            "/proc/self/task/6/fd/7",
+            "/proc/self/ns/unknown",
+            "/proc/self/fd/7",
+            "/proc/self/exe",
+            "/proc/self/cwd",
+            "/proc/selfx",
+            "/tmp/self",
+            "proc/self",
+        ] {
+            assert_eq!(decided(path), None, "{path}");
         }
     }
 

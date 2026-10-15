@@ -531,7 +531,15 @@ impl RecordVersion {
 // send's fate in its turn (https://github.com/rrnewton/hermit/issues/4293).
 // Replay recomputes these results, so an older recording of such a send would
 // replay with the wait ended early: a successful replay with different output.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x157);
+// 0x157 -> 0x158 (taken at land time, as the reservation file's land-time
+// numbering rule gives a ready change HIGHEST_SHIPPED + 1): Detcore answers
+// readlink of the /proc links it knows the targets of (self, thread-self,
+// mounts, net, the caller's namespace links) without a system call, and reads
+// the caller's descriptor link spelled through its thread as
+// /proc/thread-self/fd/N (https://github.com/rrnewton/hermit/issues/4266). An
+// older recording holds a kernel readlink of the guest's own spelling for each
+// of those.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x158);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -556,7 +564,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x157);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x157;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x158;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1507,7 +1515,7 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x154)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x155)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x156)));
-        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x157)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 
     #[test]
@@ -1579,6 +1587,14 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_per_process_levels() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x155)));
+    }
+
+    /// A recording older than 0x158 holds a kernel readlink for each /proc
+    /// link whose target Detcore now decides itself
+    /// (https://github.com/rrnewton/hermit/issues/4266).
+    #[test]
+    fn record_version_rejects_streams_from_before_decided_procfs_links() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x157)));
     }
 
     #[test]

@@ -183,6 +183,7 @@ static VFORK_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCFS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PROCFS_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VIRTUAL_KERNEL_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OMITTED_PROCFS_NAMES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1245,6 +1246,31 @@ fn timer_exec_flush_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "timer-exec-flush guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn procfs_links_guest() -> &'static Path {
+    PROCFS_LINKS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("procfs-links");
+        fs::create_dir_all(&build_root).expect("failed to create procfs-links directory");
+        let guest = build_root.join("procfs_links");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/procfs_links.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile procfs-links guest");
+        assert!(
+            output.status.success(),
+            "procfs-links guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -4704,6 +4730,200 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
     );
     eprintln!(
         "detcore_omits_the_procfs_names_outside_the_level_on_every_backend compared {compared:?}"
+    );
+}
+
+/// The `/proc` links whose targets Detcore decides itself read the same by
+/// every spelling and on every backend
+/// (https://github.com/rrnewton/hermit/issues/4266, slice B3a-2): `self`
+/// names getpid() (under DBT the kernel's pid differs), `thread-self` names
+/// `<pid>/task/<tid>` (KVM's own /proc refused it), the `mounts` and `net`
+/// links name `self/mounts` and `self/net`, and the namespace links and a
+/// pipe's and a socket's descriptor links read alike through every spelling
+/// (through the thread's directory, ptrace gave the host's inode, DBT and
+/// KVM ENOENT), also on a second thread and on a thread made without
+/// CLONE_FILES, whose links read its own descriptor table. The guest checks
+/// the same relations natively first. Each backend's run reaches bitwise
+/// parity, and all print the same targets, but for the thread with its own
+/// table, which KVM does not have and so does not run, and the empty
+/// pathname on an `O_PATH` descriptor of the `/proc/self` link, which KVM's
+/// own /proc cannot open and which DBT's kernel answers with its own pid
+/// (named as not checked). Record and replay on ptrace give the same output
+/// and match (but for that empty pathname: the recorder does not record
+/// readlinkat). A backend that is not available here is named as not compared.
+#[test]
+fn detcore_answers_its_procfs_links_on_every_backend() {
+    let test = "detcore_answers_its_procfs_links_on_every_backend";
+    let guest = procfs_links_guest();
+    let native = Command::new(guest)
+        .arg("--host")
+        .output()
+        .expect("run procfs-links natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut outputs = Vec::new();
+    for backend in ["ptrace", "dbt", "kvm"] {
+        if (backend == "dbt" && dbt_unavailable(test))
+            || (backend == "kvm" && kvm_unavailable(test))
+        {
+            eprintln!(
+                "{test}: NOT COMPARED: {backend} is not available on this host or in this build"
+            );
+            continue;
+        }
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let mut args = vec![
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+        ];
+        // KVM has no thread with a descriptor table of its own, and its own
+        // /proc refuses an `O_PATH` open of the /proc/self link. That link's
+        // descriptor is read by the kernel, which under DBT names its own
+        // pid, not getpid()'s (B3a-3).
+        match backend {
+            "kvm" => args.extend(["--no-private-table", "--no-link-descriptor"]),
+            "dbt" => args.push("--no-link-descriptor"),
+            _ => {}
+        }
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                .expect("parse the verification report");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+        let compared = &verdict["compared_log_messages"];
+        assert!(
+            compared["left"].as_u64().is_some_and(|count| count > 0)
+                && compared["left"] == compared["right"],
+            "{backend} compared no INFO messages: {verdict}"
+        );
+        outputs.push((backend, stdout(&output)));
+    }
+    let (first_backend, first) = &outputs[0];
+    assert!(
+        first.contains("self names getpid()\n")
+            && first.contains("pipe pipe:[")
+            && first.contains("socket socket:[")
+            && first.contains("a second thread names itself\n")
+            && first.contains("own-table descriptor /dev/zero\n")
+            && first.contains("a thread with its own descriptor table names that table\n"),
+        "{first_backend}: {first}"
+    );
+    // The lines the thread with its own descriptor table prints, which
+    // KVM's run skips.
+    let without_private_table = |output: &str| {
+        output
+            .lines()
+            .filter(|line| {
+                !line.starts_with("own-table descriptor ")
+                    && *line != "a thread with its own descriptor table names that table"
+            })
+            .map(|line| format!("{line}\n"))
+            .collect::<String>()
+    };
+    // Record and replay on ptrace give the guest the same answers. The
+    // recorder does not record readlinkat, so a replayed readlinkat of a
+    // descriptor that replay could not recreate (the O_PATH link) is not
+    // checked.
+    eprintln!(
+        "{test}: record: NOT CHECKED: readlinkat on an O_PATH descriptor of the \
+         /proc/self link"
+    );
+    let args = [
+        "record",
+        "--verify",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        "--no-link-descriptor",
+    ];
+    let recorded = hermit(&args);
+    assert_success(&recorded, &args);
+    assert!(
+        stderr(&recorded).contains("Success: replay matched recording."),
+        "replay must match the recording: {recorded:?}"
+    );
+    // A recording numbers its canonical pipe and socket inodes from its own
+    // start, so only those numbers may differ from the run's, and by the same
+    // offset for both (a host inode would not); replay matched the recording
+    // itself above.
+    let inode_numbers = |output: &str| {
+        let mut numbers = Vec::new();
+        let text = output
+            .lines()
+            .map(|line| {
+                let canonical = ["pipe pipe:[", "socket socket:["]
+                    .iter()
+                    .find_map(|prefix| {
+                        let digits = line.strip_prefix(prefix)?.strip_suffix(']')?;
+                        let number = digits
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit())
+                            .then(|| digits.parse::<u64>().ok())??;
+                        Some((prefix, number))
+                    });
+                match canonical {
+                    Some((prefix, number)) => {
+                        numbers.push(number);
+                        format!("{prefix}N]\n")
+                    }
+                    None => format!("{line}\n"),
+                }
+            })
+            .collect::<String>();
+        (text, numbers)
+    };
+    let (recorded_text, recorded_numbers) = inode_numbers(&stdout(&recorded));
+    let (run_text, run_numbers) = inode_numbers(first);
+    assert_eq!(
+        recorded_text, run_text,
+        "record differs from {first_backend}"
+    );
+    assert!(
+        run_numbers.len() == 2
+            && recorded_numbers.len() == 2
+            && recorded_numbers[1].wrapping_sub(recorded_numbers[0])
+                == run_numbers[1].wrapping_sub(run_numbers[0]),
+        "record's pipe and socket inodes {recorded_numbers:?} are not {first_backend}'s \
+         {run_numbers:?} moved by one offset"
+    );
+    for (backend, output) in &outputs[1..] {
+        if *backend == "dbt" {
+            eprintln!(
+                "{test}: dbt: NOT CHECKED: readlinkat on an O_PATH descriptor of the \
+                 /proc/self link"
+            );
+            assert_eq!(output, first, "{backend} differs from {first_backend}");
+        } else if *backend == "kvm" {
+            eprintln!(
+                "{test}: kvm: NOT CHECKED: a thread with its own descriptor table; \
+                 readlinkat on an O_PATH descriptor of the /proc/self link"
+            );
+            assert_eq!(
+                output,
+                &without_private_table(first),
+                "{backend} differs from {first_backend}"
+            );
+        } else {
+            assert_eq!(output, first, "{backend} differs from {first_backend}");
+        }
+    }
+    eprintln!(
+        "{test} compared {:?}",
+        outputs
+            .iter()
+            .map(|(backend, _)| *backend)
+            .chain(["ptrace/record"])
+            .collect::<Vec<_>>()
     );
 }
 
