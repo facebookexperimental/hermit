@@ -33811,7 +33811,7 @@ fn a_fifo_shared_by_guests_does_not_hold_the_turn() {
         let _ = fs::remove_file(&fifo);
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo failed");
         // Read-write, so this open does not wait for the guest's.
-        let mut host_end = fs::OpenOptions::new()
+        let host_end = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&fifo)
@@ -33826,20 +33826,31 @@ fn a_fifo_shared_by_guests_does_not_hold_the_turn() {
             .expect("failed to start hermit");
         // On its own thread, so that `wait_with_output` drains Hermit's log
         // meanwhile: a full stderr pipe would stop the tracer, and the guest.
+        // The thread works through a duplicate: `host_end` itself stays open
+        // until Hermit has exited. Linux frees a FIFO's buffer when its last
+        // descriptor closes, so if Hermit had not reached the guest's open
+        // when the host's only descriptor closed (under load, 500 ms is not
+        // enough), the byte was lost: the guest read end of file, or, through
+        // its own read-write descriptor (`host-rdwr`), waited forever
+        // (https://github.com/rrnewton/hermit/issues/4426).
+        let mut host_io = host_end
+            .try_clone()
+            .expect("failed to duplicate the host end of the FIFO");
         let host = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(500));
             if matches!(mode, "host-reader" | "host-reader-opath") {
                 let mut buffer = vec![0u8; FILL_BYTES];
-                std::io::Read::read_exact(&mut host_end, &mut buffer)
+                std::io::Read::read_exact(&mut host_io, &mut buffer)
                     .expect("failed to read what the guest wrote");
             } else {
-                host_end
+                host_io
                     .write_all(b"h")
                     .expect("failed to write the host end of the FIFO");
             }
         });
         let output = child.wait_with_output().expect("failed to wait for hermit");
         host.join().expect("the host end of the FIFO failed");
+        drop(host_end);
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{args:?}");
         assert!(
