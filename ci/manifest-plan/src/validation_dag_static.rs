@@ -2286,7 +2286,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tool_global::tests::the_dbt_sigkill_fence_refuses_rather_than_leave_the_sender_unfenced
     // and tool_global::tests::a_dbt_sigkill_notice_past_its_valve_refuses_before_answering
     // (https://github.com/rrnewton/hermit/issues/4362): 1709, listed.
-    ("test.detcore_unit", 1709),
+    // And +4 from b909e36d: 1713.
+    ("test.detcore_unit", 1713),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3252,7 +3253,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from a35a69ad: 440.
     // And clone3_set_tid_is_refused_for_an_id_a_task_already_had
     // (https://github.com/rrnewton/hermit/issues/4370): 441, listed.
-    ("test.cli", 441),
+    // And detcore_lists_procfs_from_its_model_on_every_backend (B3a-3 of
+    // https://github.com/rrnewton/hermit/issues/4266): 442, listed.
+    // And +1 from b909e36d: 442.
+    ("test.cli", 442),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3633,7 +3637,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore_answers_its_procfs_links_on_every_backend (B3a-2): 376, by listing.
     // And +1 from a35a69ad: 376.
     // And the 4370 clone3 set_tid refusal test: 377, listed.
-    ("test.cli_on_host", 377),
+    // And detcore_lists_procfs_from_its_model_on_every_backend (B3a-3): 378, listed.
+    // And +1 from b909e36d: 378.
+    ("test.cli_on_host", 378),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3890,7 +3896,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 4410 replaced-descriptor test: 1706, listed.
     // And a_seq_file_refuses_mappings_and_positioned_writes_as_linux (https://github.com/rrnewton/hermit/issues/4213): 1707.
     // And the two fail-closed SIGKILL fence tests: 1709.
-    ("test.detcore_unit_on_host", 1709),
+    // And +4 from b909e36d: 1713.
+    ("test.detcore_unit_on_host", 1713),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

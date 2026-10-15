@@ -184,6 +184,7 @@ static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCFS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PROCFS_LISTINGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VIRTUAL_KERNEL_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OMITTED_PROCFS_NAMES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1272,6 +1273,31 @@ fn procfs_links_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "procfs-links guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn procfs_listings_guest() -> &'static Path {
+    PROCFS_LISTINGS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("procfs-listings");
+        fs::create_dir_all(&build_root).expect("failed to create procfs-listings directory");
+        let guest = build_root.join("procfs_listings");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/procfs_listings.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile procfs-listings guest");
+        assert!(
+            output.status.success(),
+            "procfs-listings guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -4945,6 +4971,174 @@ fn detcore_answers_its_procfs_links_on_every_backend() {
             .iter()
             .map(|(backend, _)| *backend)
             .chain(["ptrace/record"])
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Detcore lists the `/proc` root, a process's and a thread's directories and
+/// a process's `task` from its own model
+/// (https://github.com/rrnewton/hermit/issues/4266, slice B3a-3): the root
+/// names the caller, a live child and the level's names, but no thread that
+/// leads no process and no reaped child (by a wait with or without status,
+/// or automatically); `task` names the threads, also through a descriptor a
+/// child inherited; every listed entry exists with the inode a stat of it
+/// reports. The guest checks the same relations natively first. The ptrace
+/// and KVM runs reach bitwise parity and print the same listings, with pids
+/// shown by role (before this, KVM's root listed nothing); KVM's own /proc
+/// cannot open a process's directory yet, so its run checks the root only,
+/// named as not checked (slice B3a-4). DBT, whose kernel numbers processes
+/// otherwise than its guest, keeps the kernel's listing until `/proc/<pid>`
+/// is translated (slice B3a-4): its run reaches bitwise parity with the
+/// checks of listed numbers skipped, and without the automatically reaped
+/// child, which DBT does not reap
+/// (https://github.com/rrnewton/hermit/issues/4413), both named as not
+/// checked. A ptrace run at
+/// `--proc=standard` covers that level's process and thread directories.
+/// Record and replay on ptrace, where Detcore leaves listings to the
+/// kernel unfiltered by the level, keep the other relations and match (the
+/// lookups of listed entries are named as not checked). A backend that is
+/// not available here is named as not compared.
+#[test]
+fn detcore_lists_procfs_from_its_model_on_every_backend() {
+    let test = "detcore_lists_procfs_from_its_model_on_every_backend";
+    let guest = procfs_listings_guest();
+    let native = Command::new(guest)
+        .arg("--host")
+        .output()
+        .expect("run procfs-listings natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut outputs = Vec::new();
+    for (backend, level) in [
+        ("ptrace", "minimal"),
+        ("dbt", "minimal"),
+        ("kvm", "minimal"),
+        ("ptrace", "standard"),
+    ] {
+        if (backend == "dbt" && dbt_unavailable(test))
+            || (backend == "kvm" && kvm_unavailable(test))
+        {
+            eprintln!(
+                "{test}: NOT COMPARED: {backend} is not available on this host or in this build"
+            );
+            continue;
+        }
+        let report = directory.path().join(format!("{backend}-{level}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let level_arg = format!("--proc={level}");
+        let mut args = vec![
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            &level_arg,
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+        ];
+        match backend {
+            "kvm" => args.push("--no-process-directories"),
+            "dbt" => args.extend(["--kernel-numbering", "--no-autoreap"]),
+            _ => {}
+        }
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                .expect("parse the verification report");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+        let compared = &verdict["compared_log_messages"];
+        assert!(
+            compared["left"].as_u64().is_some_and(|count| count > 0)
+                && compared["left"] == compared["right"],
+            "{backend} compared no INFO messages: {verdict}"
+        );
+        outputs.push((backend, level, stdout(&output)));
+    }
+    let (first_backend, _, first) = &outputs[0];
+    assert!(
+        first.contains("root: . .. 1 <pid> <child> ")
+            && first.contains(" self ")
+            && first.contains("task: . .. <main> <thread>\n")
+            && first.contains("an O_PATH descriptor lists nothing\n")
+            && first.contains("a reaped child is not listed\n"),
+        "{first_backend}: {first}"
+    );
+    for (backend, level, output) in &outputs[1..] {
+        if *level == "standard" {
+            assert!(
+                output.contains("thread: ") && output.contains(" io "),
+                "{backend} at {level}: {output}"
+            );
+        } else if *backend == "dbt" {
+            eprintln!(
+                "{test}: dbt: NOT CHECKED: listed numbers against the guest's pids and tids, \
+                 and the root and `task` listings (DBT keeps the kernel's listing until \
+                 /proc/<pid> is translated); an automatically reaped child \
+                 (https://github.com/rrnewton/hermit/issues/4413)"
+            );
+            // A process's and a thread's directories hold no numbers.
+            let directories = |output: &str| {
+                output
+                    .lines()
+                    .filter(|line| line.starts_with("process:") || line.starts_with("thread:"))
+                    .map(|line| format!("{line}\n"))
+                    .collect::<String>()
+            };
+            assert_eq!(
+                directories(output),
+                directories(first),
+                "{backend}'s process and thread directories differ from {first_backend}'s"
+            );
+        } else if *backend == "kvm" {
+            eprintln!(
+                "{test}: kvm: NOT CHECKED: a process's directory, a thread's and `task`, and \
+                 the inodes of the root's directories and links (KVM's own /proc cannot open \
+                 or look them up yet)"
+            );
+            let root_only = first
+                .lines()
+                .filter(|line| {
+                    !line.starts_with("task:")
+                        && !line.starts_with("process:")
+                        && !line.starts_with("thread:")
+                        && *line != "an O_PATH descriptor lists nothing"
+                        && *line != "an inherited task descriptor lists the opener's threads"
+                })
+                .map(|line| format!("{line}\n"))
+                .collect::<String>();
+            assert_eq!(output, &root_only, "{backend} differs from {first_backend}");
+        } else {
+            assert_eq!(output, first, "{backend} differs from {first_backend}");
+        }
+    }
+    eprintln!(
+        "{test}: record: NOT CHECKED: listed entries looked up (under record and \
+         replay listings are the kernel's, not filtered by the level)"
+    );
+    let args = [
+        "record",
+        "--verify",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        "--recorded",
+    ];
+    let recorded = hermit(&args);
+    assert_success(&recorded, &args);
+    assert!(
+        stderr(&recorded).contains("Success: replay matched recording."),
+        "replay must match the recording: {recorded:?}"
+    );
+    eprintln!(
+        "{test} compared {:?}",
+        outputs
+            .iter()
+            .map(|(backend, level, _)| format!("{backend}/{level}"))
+            .chain(["ptrace/record".to_string()])
             .collect::<Vec<_>>()
     );
 }

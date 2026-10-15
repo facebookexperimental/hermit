@@ -7866,6 +7866,65 @@ impl Scheduler {
                 == self.thread_tree.thread_to_leader.get(&caller).copied()
     }
 
+    /// Forget the exit of the process that last had pid `pid`, which a new
+    /// process now has. Linux reuses a pid only once its last holder is
+    /// gone, so its holder was reaped automatically or by init, and the
+    /// record that it exited (`exited_process_is_zombie`) would otherwise
+    /// describe the new process (<https://github.com/rrnewton/hermit/issues/4266>).
+    pub fn forget_previous_process_exit(&mut self, pid: DetPid) {
+        self.logically_exited_processes.remove(&pid);
+        self.autoreaped_exits.remove(&pid);
+    }
+
+    /// The processes `/proc` lists, and, for `process`, the threads its
+    /// `task` directory lists, as the container's PID namespace numbers them
+    /// (`procfs::listing`). As on Linux, a process is listed from its
+    /// creation until it is reaped, zombie included: while its wait record
+    /// exists (every process gets one when created, the root and a
+    /// `CLONE_PARENT` child of it included, and a reap removes it,
+    /// `consume_child_wait`, before the backend has necessarily reported its
+    /// threads' exits), unless it exited and is no zombie a guest can reap:
+    /// an automatically reaped child, an orphan of the namespace's init
+    /// (`exited_process_is_zombie`), or a process with no guest parent (the
+    /// root process, a `CLONE_PARENT` child of it), which Hermit itself
+    /// reaps. Its `task` lists its live threads and its leader while the
+    /// process is listed.
+    pub fn procfs_listing(&self, process: Option<DetPid>) -> crate::procfs::listing::ListingFacts {
+        let listed = |leader: DetPid| {
+            self.thread_tree.process_wait.contains_key(&leader)
+                && match self.exited_process_is_zombie(leader) {
+                    None => true,
+                    Some(zombie) => zombie && self.thread_tree.parent_process(&leader).is_some(),
+                }
+        };
+        let mut processes: Vec<i32> = self
+            .thread_tree
+            .thread_group_leaders
+            .iter()
+            .copied()
+            .filter(|leader| listed(*leader))
+            .map(|leader| leader.as_raw())
+            .collect();
+        processes.sort_unstable();
+        let threads = match process {
+            Some(process)
+                if self.thread_tree.thread_group_leaders.contains(&process) && listed(process) =>
+            {
+                let mut threads: Vec<i32> = self
+                    .thread_tree
+                    .my_thread_group(&process)
+                    .into_iter()
+                    .filter(|tid| *tid == process || self.next_turns.contains_key(tid))
+                    .map(|tid| tid.as_raw())
+                    .collect();
+                threads.sort_unstable();
+                threads
+            }
+            _ => Vec::new(),
+        };
+        crate::procfs::listing::ListingFacts { processes, threads }
+    }
+
     /// Return scheduler-owned lifecycle state for an exact child-process wait.
     ///
     /// This deliberately models direct parentage and process liveness rather
@@ -14375,6 +14434,73 @@ mod test {
     fn exit_process(scheduler: &mut Scheduler, pid: DetPid) {
         scheduler.thread_tree.granted_exits.insert(pid);
         scheduler.logically_kill_thread(&pid, &pid, MmId::initial(pid));
+    }
+
+    /// `/proc` lists every process from its creation until it is reaped,
+    /// zombie included, and none of the threads that lead no process; a
+    /// process's `task` lists its threads (`procfs_listing`,
+    /// https://github.com/rrnewton/hermit/issues/4266).
+    #[test]
+    fn procfs_lists_processes_until_they_are_reaped_and_their_threads() {
+        let mut scheduler = process_chain();
+        let [_, inner, middle, orphan] = [1, 2, 3, 4].map(DetPid::from_raw);
+        let thread = DetTid::from_raw(5);
+        scheduler.thread_tree.add_child(inner, thread, false);
+        register_known_thread(&mut scheduler, thread);
+        let listing = scheduler.procfs_listing(Some(inner));
+        assert_eq!(listing.processes, [1, 2, 3, 4]);
+        assert_eq!(listing.threads, [2, 5]);
+        // A zombie is listed until its parent reaps it.
+        exit_process(&mut scheduler, orphan);
+        assert_eq!(scheduler.procfs_listing(None).processes, [1, 2, 3, 4]);
+        assert!(scheduler.consume_child_wait(middle, orphan));
+        assert_eq!(scheduler.procfs_listing(None).processes, [1, 2, 3]);
+        assert!(scheduler.procfs_listing(Some(orphan)).threads.is_empty());
+        // Not a process: no `task`.
+        assert!(scheduler.procfs_listing(Some(thread)).threads.is_empty());
+        // A child reaped automatically is gone at its exit, before any wait.
+        let ignored = DetPid::from_raw(6);
+        scheduler
+            .thread_tree
+            .set_sigchld_disposition(inner, true, false);
+        scheduler.thread_tree.add_child(inner, ignored, true);
+        register_known_thread(&mut scheduler, ignored);
+        assert_eq!(scheduler.procfs_listing(None).processes, [1, 2, 3, 6]);
+        exit_process(&mut scheduler, ignored);
+        assert_eq!(scheduler.procfs_listing(None).processes, [1, 2, 3]);
+        // A new process that reuses its pid is listed.
+        scheduler
+            .thread_tree
+            .set_sigchld_disposition(inner, false, false);
+        scheduler.thread_tree.add_child(inner, ignored, true);
+        scheduler.forget_previous_process_exit(ignored);
+        assert_eq!(scheduler.procfs_listing(None).processes, [1, 2, 3, 6]);
+        // So is an orphan of the namespace's init once it exits.
+        let grandchild = DetPid::from_raw(7);
+        scheduler.thread_tree.add_child(middle, grandchild, true);
+        register_known_thread(&mut scheduler, grandchild);
+        exit_process(&mut scheduler, middle);
+        assert!(scheduler.thread_tree.is_init_orphan(grandchild));
+        assert!(scheduler.procfs_listing(None).processes.contains(&7));
+        exit_process(&mut scheduler, grandchild);
+        assert!(!scheduler.procfs_listing(None).processes.contains(&7));
+        // A `CLONE_PARENT` child of the root has no guest parent: Hermit
+        // reaps it, so it is gone at its exit; so is the root itself.
+        let root = DetPid::from_raw(1);
+        let sibling = DetPid::from_raw(8);
+        scheduler.thread_tree.add_child_with_wait_metadata(
+            root,
+            sibling,
+            true,
+            true,
+            libc::SIGCHLD,
+        );
+        register_known_thread(&mut scheduler, sibling);
+        assert!(scheduler.procfs_listing(None).processes.contains(&8));
+        exit_process(&mut scheduler, sibling);
+        assert!(!scheduler.procfs_listing(None).processes.contains(&8));
+        exit_process(&mut scheduler, root);
+        assert!(!scheduler.procfs_listing(None).processes.contains(&1));
     }
 
     /// `logically_kill_thread` runs again for a process that is already dead,

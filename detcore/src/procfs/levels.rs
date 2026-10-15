@@ -259,6 +259,79 @@ fn process_name(names: &[&[u8]]) -> ProcfsName {
     }
 }
 
+/// The names the table gives the system-wide directory `/proc/<names>` at
+/// `level` (the root for no names), each with its `d_type`, in the table's
+/// order; `None` when the table holds no directory there. A name with names
+/// below it is a directory; the root's `mounts` and `net` are links into the
+/// caller's own directory.
+pub(crate) fn system_entries(names: &[&[u8]], level: ProcLevel) -> Option<Vec<(Vec<u8>, u8)>> {
+    let tables: &[&[&str]] = match level {
+        ProcLevel::Minimal => &[MINIMAL],
+        ProcLevel::Standard => &[MINIMAL, STANDARD],
+    };
+    let mut entries: Vec<(Vec<u8>, u8)> = Vec::new();
+    let mut found = names.is_empty();
+    for entry in tables.iter().flat_map(|table| table.iter()) {
+        let mut parts = entry.split('/');
+        if !names
+            .iter()
+            .all(|name| parts.next().is_some_and(|part| part.as_bytes() == *name))
+        {
+            continue;
+        }
+        let Some(child) = parts.next() else {
+            // `names` is this entry itself, a file.
+            return None;
+        };
+        found = true;
+        let ty = if parts.next().is_some() {
+            libc::DT_DIR
+        } else if names.is_empty() && (child == "mounts" || child == "net") {
+            libc::DT_LNK
+        } else {
+            libc::DT_REG
+        };
+        match entries
+            .iter_mut()
+            .find(|(name, _)| name == child.as_bytes())
+        {
+            Some(existing) if ty == libc::DT_DIR => existing.1 = ty,
+            Some(_) => {}
+            None => entries.push((child.as_bytes().to_vec(), ty)),
+        }
+    }
+    found.then_some(entries)
+}
+
+/// The names in a process's directory, or a thread's (`thread`), at
+/// `level`, each with its `d_type`: the level's names and the kernel's
+/// ([`PROCESS_KERNEL`]), less `task` and `timerslack_ns` in a thread's
+/// directory and `children` in a process's, as on Linux
+/// (`tgid_base_stuff`, `tid_base_stuff`).
+pub(crate) fn process_entries(thread: bool, level: ProcLevel) -> Vec<(&'static str, u8)> {
+    let mut names: Vec<&'static str> = PROCESS_MINIMAL.to_vec();
+    if level >= ProcLevel::Standard {
+        names.extend_from_slice(PROCESS_STANDARD);
+    }
+    names.extend_from_slice(PROCESS_KERNEL);
+    names
+        .into_iter()
+        .filter(|name| match *name {
+            "task" | "timerslack_ns" => !thread,
+            "children" => thread,
+            _ => true,
+        })
+        .map(|name| {
+            let ty = match name {
+                "fd" | "fdinfo" | "net" | "ns" | "task" => libc::DT_DIR,
+                "cwd" | "exe" | "root" => libc::DT_LNK,
+                _ => libc::DT_REG,
+            };
+            (name, ty)
+        })
+        .collect()
+}
+
 /// Whether the entry `name` of the directory at the canonical path
 /// `directory` is absent at `level`.
 pub(crate) fn absent_entry(directory: &Path, name: &[u8], level: ProcLevel) -> bool {

@@ -30,6 +30,7 @@ use crate::syscalls::VIRTUAL_CPUSET_BYTES;
 
 mod fixed;
 pub(crate) mod levels;
+pub(crate) mod listing;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProcfsKind {

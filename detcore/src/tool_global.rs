@@ -3106,6 +3106,9 @@ impl GlobalState {
                 let sched = self.lock_rpc_scheduler(false).await;
                 R::GuestPid(sched.guest_pid(caller, pid))
             }
+            GlobalRequest::ProcfsListing(process) => {
+                R::ProcfsListing(self.lock_rpc_scheduler(false).await.procfs_listing(process))
+            }
             GlobalRequest::LocalPid(caller, task) => R::LocalPid(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -3574,6 +3577,9 @@ impl GlobalState {
                     flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_PARENT)),
                     exit_signal,
                 );
+                if is_group_leader {
+                    sched.forget_previous_process_exit(child_dettid);
+                }
                 let new_pid_namespace = is_group_leader
                     && flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_NEWPID));
                 if new_pid_namespace {
@@ -5041,6 +5047,10 @@ pub enum GlobalRequest {
     /// (`thread_id_refused`). Appended after `DescriptorsReplaced`, for the
     /// same reason.
     ThreadIdRefused(DetTid),
+    /// The processes `/proc` lists, and the threads the `task` directory of
+    /// the given process lists (`Scheduler::procfs_listing`). Appended after
+    /// `ThreadIdRefused`, for the same reason.
+    ProcfsListing(Option<DetPid>),
 }
 
 /// Responses from the global object
@@ -5191,6 +5201,8 @@ pub enum GlobalResponse {
     DescriptorsReplaced(()),
     /// Appended after `DescriptorsReplaced`, for the same reason.
     ThreadIdRefused(bool),
+    /// Appended after `ThreadIdRefused`, for the same reason.
+    ProcfsListing(crate::procfs::listing::ListingFacts),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -7189,6 +7201,24 @@ where
     let response = send_and_update_time(guest, GlobalRequest::GuestPid(caller, pid)).await;
     match response.1 {
         GlobalResponse::GuestPid(answer) => answer,
+        _ => unreachable!(),
+    }
+}
+
+/// The processes `/proc` lists and, for `process`, the threads its `task`
+/// directory lists, as a thread in the container's PID namespace numbers
+/// them (`Scheduler::procfs_listing`).
+pub async fn procfs_listing<G, T>(
+    guest: &mut G,
+    process: Option<DetPid>,
+) -> crate::procfs::listing::ListingFacts
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::ProcfsListing(process)).await;
+    match response.1 {
+        GlobalResponse::ProcfsListing(facts) => facts,
         _ => unreachable!(),
     }
 }

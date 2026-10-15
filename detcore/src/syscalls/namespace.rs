@@ -957,7 +957,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Detcore's pid for the calling thread's process.
-    fn own_detpid<G: Guest<Self>>(&self, guest: &G) -> crate::types::DetPid {
+    pub(crate) fn own_detpid<G: Guest<Self>>(&self, guest: &G) -> crate::types::DetPid {
         guest.thread_state().detpid.unwrap_or(self.detpid)
     }
 

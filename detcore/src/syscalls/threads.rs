@@ -3753,10 +3753,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             false
         } else if let Some(status) = call.wstatus() {
             wait_status_is_termination(guest.memory().read_value(status)?)
+        } else if !call
+            .options()
+            .intersects(WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED)
+        {
+            // Without them, wait4 reports only a child that terminated. (The
+            // exited child's CPU time is recorded where its own Tool runs,
+            // which on the in-guest backends is not the parent's, so it
+            // cannot tell; https://github.com/rrnewton/hermit/issues/4266.)
+            true
         } else {
+            // A stop or continue report leaves the child running; once it
+            // has exited, the report was its termination.
             guest
                 .thread_state()
                 .has_exited_child_process_cpu_time(reaped)
+                || matches!(
+                    crate::tool_global::exact_child_wait_state(guest, reaped).await,
+                    ExactChildWaitState::LogicallyExited
+                        | ExactChildWaitState::PhysicalExitPending
+                        | ExactChildWaitState::PhysicallyExited
+                )
         };
         if consumed_termination {
             guest.thread_state_mut().reap_child_process_cpu_time(reaped);

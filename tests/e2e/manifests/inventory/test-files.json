@@ -1537,6 +1537,12 @@
       "why": "tests/c/procfs_links.c is owned by hermit-cli/tests/cli.rs: the CLI test detcore_answers_its_procfs_links_on_every_backend runs it natively, where it checks the relations Linux gives the /proc links, then on ptrace, DBT and KVM (verified at L2) and requires the same output from every backend. It checks that self names getpid() and thread-self <pid>/task/<tid>, that mounts and net name self/mounts and self/net, that each namespace link and a pipe's and a socket's descriptor link read the same by every spelling, and Linux's answers to a short buffer, an empty one and a trailing slash, for the links whose targets Detcore decides itself (B3a-2 of https://github.com/rrnewton/hermit/issues/4266). It stays a fixture because a generic manifest cannot compare one guest's output across backends."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/procfs_listings.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/procfs_listings.c is owned by hermit-cli/tests/cli.rs: the CLI test detcore_lists_procfs_from_its_model_on_every_backend runs it natively, where it checks the relations Linux gives /proc listings, then at L2 on ptrace and KVM, which must print the same listings (KVM checks the root only, as its own /proc cannot open a process's directory yet), on ptrace at --proc=standard, on DBT (which keeps the kernel's listing until /proc/<pid> is translated, so its numbers are not checked and only its process and thread directories are compared), and under ptrace record and replay (where listings are the kernel's, so listed entries are not looked up). It checks that the root lists the caller, a live child, a zombie and self/thread-self but no thread that leads no process and no reaped child (reaped with or without its status, or automatically), that task lists exactly the threads (also through a descriptor a child inherited), the shape of a process's and a thread's directory, that every listed entry exists with the inode a stat reports, and that an O_PATH descriptor lists nothing, for the listings Detcore builds from its own model (B3a-3 of https://github.com/rrnewton/hermit/issues/4266). It stays a fixture because a generic manifest cannot compare one guest's output across backends."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/procfs_positioned_probe.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

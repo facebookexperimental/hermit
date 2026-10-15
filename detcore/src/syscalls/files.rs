@@ -9614,6 +9614,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self.serve_next_batch(guest, call).await;
         }
         let mark = directory_snapshot_mark(guest).await;
+        if let Some((entries, inodes)) = self.modeled_directory_snapshot(guest, call).await? {
+            let mut entries = Some(entries);
+            guest.thread_state().with_detfd(call.fd, |detfd| {
+                detfd.install_directory_snapshot(
+                    entries.take().unwrap_or_default(),
+                    mark,
+                    inodes.clone(),
+                )
+            })?;
+            return self.serve_next_batch(guest, call).await;
+        }
         // How to key the entries' numbers is decided with the snapshot, as a
         // procfs directory loses its name once its task exits (see
         // `DirectoryStream`).
@@ -9686,8 +9697,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             None | Some((0, true)) => return Ok(kernel.map(|_| 0)?),
             Some((_, true)) => {
                 let mark = directory_snapshot_mark(guest).await;
-                let inodes = self.directory_inodes(guest, call.fd).await?;
-                match self.snapshot_directory_privately(guest, call).await {
+                let modeled = self.modeled_directory_snapshot(guest, call).await?;
+                let (snapshot, inodes) = match modeled {
+                    Some((entries, inodes)) => (Ok(Some(entries)), inodes),
+                    None => {
+                        let inodes = self.directory_inodes(guest, call.fd).await?;
+                        (self.snapshot_directory_privately(guest, call).await, inodes)
+                    }
+                };
+                match snapshot {
                     Ok(Some(entries)) => {
                         let mut entries = Some(entries);
                         let target = guest.thread_state().with_detfd(call.fd, |detfd| {
@@ -9782,6 +9800,311 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
         Ok(copied.map(|len| len as i64)?)
+    }
+
+    /// The entries of the `/proc` directory open as `fd`, and how to key their
+    /// inode numbers, if Detcore lists it from its own model (see
+    /// [`crate::procfs::listing`]): the root, the level table's other
+    /// directories, a process's or a thread's directory, or a process's
+    /// `task`, with processes and threads as the guest numbers them, so that
+    /// every backend lists the same.
+    ///
+    /// The directory is the one the descriptor was opened on: where guest
+    /// thread IDs name host tasks (ptrace), the kernel's canonical name for
+    /// it (`procfs_entry`), which bound `self` and `thread-self` to the
+    /// opener, so an inherited or passed descriptor keeps listing the
+    /// opener's; on a backend that serves its own `/proc` (KVM), the guest's
+    /// spelling, and only a directory with no process in its path (the root
+    /// and the table's system directories), as its process directories cannot
+    /// be opened yet (slice B3a-4).
+    ///
+    /// Each entry is looked up by its spelling below the directory, as the
+    /// guest's own `lstat` of it would be: on the kernel's procfs an entry the
+    /// lookup does not find (a name the level lists but this kernel lacks,
+    /// such as `children` without `CONFIG_PROC_CHILDREN`) is left out, unless
+    /// Detcore renders it; on a backend's own /proc (KVM), whose lookups
+    /// follow its executor's process table at host-timed moments, a lookup
+    /// decides no entry. One the lookup finds is
+    /// numbered by the inode it reports, which a stat of it pools under too
+    /// (with the entry's name and its task's incarnation), so the two agree. A
+    /// file Detcore renders is numbered by its rendered inode
+    /// ([`Self::serve_next_batch`]), and an entry the backend refuses to look
+    /// up (KVM) by its path's key.
+    ///
+    /// The kernel's directory is still read once, as for any other directory
+    /// ([`Self::snapshot_directory_privately`]), for its `d_off` cookies: each
+    /// entry carries the cookie of the host entry of its name, so that the
+    /// stream leaves the kernel position where a descriptor Detcore does not
+    /// track reads on from (at the end, the kernel's own end). A descriptor
+    /// whose position the guest moved before its first read is then read in
+    /// host order, as any other is.
+    ///
+    /// `None`, so that the kernel's listing is served as before: for any other
+    /// directory; an `O_PATH` descriptor, which lists nothing (the kernel's
+    /// `EBADF`); under record and replay, where the replayer's descriptor
+    /// does not name the recorded directory; in a nested PID namespace, whose
+    /// numbers are not Detcore's; after a guest `chroot`, where `/proc` need
+    /// not be procfs; for a descriptor not on the guest's procfs (a user bind
+    /// over part of it); on the in-guest backends whose kernel numbers
+    /// processes otherwise than Detcore (DBT,
+    /// <https://github.com/rrnewton/hermit/issues/4009>), where a listed guest
+    /// pid would open the kernel's process of that number until `/proc/<pid>`
+    /// is translated (slice B3a-4); and for a process or thread the scheduler
+    /// does not list, which the kernel's directory then answers for.
+    async fn modeled_directory_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: GetdentsCall<'_>,
+    ) -> Result<Option<(Vec<DirEntry>, DirectoryInodes)>, Error> {
+        let fd = call.fd;
+        use std::os::unix::ffi::OsStrExt;
+
+        use crate::procfs::listing;
+        use crate::procfs::listing::ModeledDirectory;
+        let state = guest.thread_state();
+        if self.cfg.recordreplay_modes
+            || state.nested_pid_namespace
+            || state.changed_root.load(Ordering::SeqCst)
+        {
+            return Ok(None);
+        }
+        let Ok((spelled, status_flags)) =
+            state.with_detfd(fd, |detfd| (detfd.path(), detfd.status_flags()))
+        else {
+            return Ok(None);
+        };
+        // Only a descriptor the guest opened by a spelling of such a
+        // directory is one, which spares every other directory's listing the
+        // naming below.
+        if status_flags & libc::O_PATH != 0 {
+            return Ok(None);
+        }
+        if spelled
+            .as_deref()
+            .and_then(|spelled| listing::classify(spelled, 0, 0))
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let tid = state.dettid.as_raw();
+        let names_tasks =
+            procfs_inode::guest_tids_name_host_tasks(&self.cfg.backend, state.physical_tid);
+        let pid = self.own_detpid(guest).as_raw();
+        let cached = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.stat())
+            .ok()
+            .flatten();
+        let stat = match cached {
+            Some(stat) => stat,
+            None => DetStat::from(self.inject_fstat(guest, fd).await?),
+        };
+        if stat.mode & libc::S_IFMT != libc::S_IFDIR {
+            return Ok(None);
+        }
+        let backend_procfs =
+            procfs_inode::is_backend_procfs_device(&self.cfg.backend, stat.dev, stat.blksize);
+        let path = if names_tasks && rendered_procfs::proc_device() == Some(stat.dev) {
+            match Self::procfs_entry(guest, &stat, StatTarget::Descriptor(fd)).await {
+                ProcfsEntry::At(within) => {
+                    Path::new("/proc").join(within.strip_prefix("/").unwrap_or(&within))
+                }
+                ProcfsEntry::NotProcfs | ProcfsEntry::Unnamed | ProcfsEntry::Unknown => {
+                    return Ok(None);
+                }
+            }
+        } else if backend_procfs && let Some(spelled) = spelled {
+            spelled
+        } else {
+            return Ok(None);
+        };
+        let Some(directory) = listing::classify(&path, pid, tid) else {
+            return Ok(None);
+        };
+        if backend_procfs && !matches!(directory, ModeledDirectory::System(_)) {
+            return Ok(None);
+        }
+        let process = match directory {
+            ModeledDirectory::System(_) => None,
+            ModeledDirectory::Process(process)
+            | ModeledDirectory::Thread(process, _)
+            | ModeledDirectory::Tasks(process) => Some(DetPid::from_raw(process)),
+        };
+        let facts = crate::tool_global::procfs_listing(guest, process).await;
+        let listed = match directory {
+            ModeledDirectory::System(_) => true,
+            // The namespace's init is Hermit's own process unless a guest
+            // holds pid 1; its threads are the kernel's to list.
+            ModeledDirectory::Process(process) => {
+                process == 1 || facts.processes.contains(&process)
+            }
+            ModeledDirectory::Thread(_, thread) => facts.threads.contains(&thread),
+            ModeledDirectory::Tasks(_) => !facts.threads.is_empty(),
+        };
+        if !listed {
+            return Ok(None);
+        }
+        let Some(names) = listing::entries(&directory, self.cfg.proc_level, &facts) else {
+            return Ok(None);
+        };
+        // The host's cookies, where the kernel lists the directory. A
+        // backend's own /proc (KVM) lists nothing of it and may not answer
+        // the guest's form of the call (legacy `getdents`), so there only a
+        // position the guest moved before its first read is the kernel's to
+        // keep, as for any other directory.
+        let host = if backend_procfs {
+            let known = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.has_directory_stream())?;
+            let position = syscalls::Lseek::new()
+                .with_fd(fd)
+                .with_offset(0)
+                .with_whence(Whence::SEEK_CUR);
+            if !known && self.record_or_replay(guest, position).await != Ok(0) {
+                return Ok(None);
+            }
+            Vec::new()
+        } else {
+            let Some(host) = self.snapshot_directory_privately(guest, call).await? else {
+                return Ok(None);
+            };
+            host
+        };
+        let host_cookies: std::collections::HashMap<&[u8], i64> = host
+            .iter()
+            .map(|entry| (entry.name.as_slice(), entry.off))
+            .collect();
+        let host_cookie = |name: &[u8]| host_cookies.get(name).copied().unwrap_or(0);
+        let host_end = host.last().map_or(0, |entry| entry.off);
+        // Looked up from the guest's own descriptor where it names the
+        // kernel's directory, and by the guest's spelling on KVM, whose own
+        // /proc looks up only absolute paths.
+        let (lookup_dir, spellings): (RawFd, Vec<PathBuf>) = if backend_procfs {
+            let spellings = names
+                .iter()
+                .map(|(name, _)| path.join(std::ffi::OsStr::from_bytes(name)))
+                .collect();
+            (libc::AT_FDCWD, spellings)
+        } else {
+            let spellings = names
+                .iter()
+                .map(|(name, _)| PathBuf::from(std::ffi::OsStr::from_bytes(name)))
+                .collect();
+            (fd, spellings)
+        };
+        let looked_up = self.looked_up_inodes(guest, lookup_dir, &spellings).await?;
+        let within = listing::within(&directory);
+        let entries = names
+            .into_iter()
+            .zip(looked_up)
+            .filter_map(|((name, ty), looked_up)| {
+                let entry = match name.as_slice() {
+                    b"." => within.clone(),
+                    b".." => within.parent().unwrap_or(&within).to_path_buf(),
+                    name => within.join(std::ffi::OsStr::from_bytes(name)),
+                };
+                // A file Detcore renders exists whatever the kernel has.
+                let rendered = crate::procfs::ProcfsFile::from_path(
+                    &Path::new("/proc").join(entry.strip_prefix("/").unwrap_or(&entry)),
+                )
+                .is_some_and(|file| file.rendered_path().is_some());
+                // On a backend's own /proc (KVM), what a lookup finds is the
+                // backend's, at a moment the host decides (a process's
+                // directory goes when its executor learns of the exit), so
+                // there it numbers an entry but decides none.
+                let ino = match looked_up {
+                    Ok(ino) => ino,
+                    Err(Errno::ENOENT)
+                        if name != b"." && name != b".." && !rendered && !backend_procfs =>
+                    {
+                        return None;
+                    }
+                    Err(_) => procfs_inode::path_inode(stat.dev, &entry).ino,
+                };
+                Some(DirEntry {
+                    ino,
+                    off: host_cookie(&name),
+                    ty,
+                    name,
+                })
+            })
+            .collect::<Vec<_>>();
+        // In host order, which `DirectoryStream::install` takes them in, and
+        // ending where the host's listing ends, so the stream's end is the
+        // kernel's.
+        let mut entries = entries;
+        entries.sort_by_key(|entry| entry.off);
+        if let Some(last) = entries.last_mut() {
+            last.off = last.off.max(host_end);
+        }
+        let inodes = DirectoryInodes::new(stat.dev, Some(ProcfsDirectory::new(within)));
+        Ok(Some((entries, inodes)))
+    }
+
+    /// The inode number a lookup of each of `paths` from the directory open as
+    /// `dir` (or absolute, with `AT_FDCWD`), without following a final link,
+    /// gives in the guest, as the guest's own `fstatat` of it would, or the
+    /// lookup's error. The paths are staged in an
+    /// anonymous mapping injected for the purpose and unmapped before the guest
+    /// runs again, as a directory snapshot's reads are (see
+    /// [`Self::snapshot_directory_privately`]); without one, every lookup is
+    /// `ENOMEM`. A mapping that cannot be unmapped would be visible to the
+    /// guest, so that is an error.
+    async fn looked_up_inodes<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        dir: RawFd,
+        paths: &[PathBuf],
+    ) -> Result<Vec<Result<u64, Errno>>, Error> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let mapped = guest
+            .inject_with_retry(Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(DIRECTORY_PAGE)
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await;
+        let Some(page) = mapped
+            .ok()
+            .and_then(|addr| usize::try_from(addr).ok())
+            .and_then(AddrMut::<u8>::from_raw)
+        else {
+            return Ok(vec![Err(Errno::ENOMEM); paths.len()]);
+        };
+        let mut inodes = Vec::with_capacity(paths.len());
+        for path in paths {
+            let mut bytes = path.as_os_str().as_bytes().to_vec();
+            bytes.push(0);
+            let staged =
+                bytes.len() <= DIRECTORY_PAGE && guest.memory().write_exact(page, &bytes).is_ok();
+            let staged_path = PathPtr::from_ptr(page.as_raw() as *const libc::c_char);
+            let inode = match (staged, staged_path) {
+                (true, Some(staged_path)) => Self::inject_statat(
+                    guest,
+                    dir,
+                    staged_path,
+                    [Some(staged_path), None],
+                    AtFlags::AT_SYMLINK_NOFOLLOW,
+                )
+                .await
+                .map(|stat| stat.st_ino),
+                _ => Err(Errno::ENAMETOOLONG),
+            };
+            inodes.push(inode);
+        }
+        guest
+            .inject_with_retry(Syscall::Munmap(
+                syscalls::Munmap::new()
+                    .with_addr(Some(Addr::from(page).cast()))
+                    .with_len(DIRECTORY_PAGE),
+            ))
+            .await?;
+        Ok(inodes)
     }
 
     /// How to key the inode numbers of the entries of the directory open as
