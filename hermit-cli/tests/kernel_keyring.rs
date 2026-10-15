@@ -33,7 +33,8 @@ fn kernel_keyring_is_deterministically_unavailable() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kernel-keyring");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("kernel-keyring-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     let cases = [
@@ -107,7 +108,8 @@ fn kernel_keyring_passes_through_with_compatibility_opt_out() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kernel-keyring-passthrough");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("kernel-keyring-passthrough-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     let source = repository.join("tests/c/keyctl_passthrough.c");

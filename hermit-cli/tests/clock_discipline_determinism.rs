@@ -95,7 +95,10 @@ fn clock_discipline_and_kernel_log_are_host_independent() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("clock-discipline-determinism");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "clock-discipline-determinism-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     for (source, marker, syscall) in CASES {

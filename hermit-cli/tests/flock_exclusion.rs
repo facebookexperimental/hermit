@@ -72,7 +72,8 @@ fn repository() -> &'static Path {
 fn guest() -> &'static Path {
     static GUEST: OnceLock<PathBuf> = OnceLock::new();
     GUEST.get_or_init(|| {
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("flock-exclusion");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("flock-exclusion-{}", std::process::id()));
         fs::create_dir_all(&build_root).expect("failed to create the flock guest build directory");
         let binary = build_root.join("flock_exclusion");
         let source = repository().join("tests/c/flock_exclusion.c");

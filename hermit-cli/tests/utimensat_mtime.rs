@@ -42,7 +42,8 @@ fn explicit_mtimes_are_reported_by_stat_and_verify_strictly() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("utimensat-mtime");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("utimensat-mtime-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     let guest = build_root.join("utimensat_mtime");
     let mut compile = Command::new("cc");
@@ -115,7 +116,8 @@ fn a_renamed_over_target_does_not_get_the_explicit_mtime() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("utimensat-rename-race");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("utimensat-rename-race-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     let guest = build_root.join("utimensat_rename_race");
     let mut compile = Command::new("cc");

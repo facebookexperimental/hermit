@@ -57,7 +57,8 @@ PRAGMA integrity_check;";
 fn sqlite_fast_subset_is_deterministic_under_hermit() {
     let hermit = Path::new(env!("CARGO_BIN_EXE_hermit"));
     let sqlite = sqlite3();
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sqlite-fast");
+    let root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sqlite-fast-{}", std::process::id()));
     if root.exists() {
         fs::remove_dir_all(&root).expect("failed to remove stale fast SQLite directory");
     }
@@ -87,7 +88,8 @@ fn sqlite_veryquick_is_deterministic_under_strict_hermit() {
     let runner = repo_root.join("hermit-cli/tests/fixtures/sqlite-veryquick/run.sh");
     let hermit =
         std::env::var_os("HERMIT_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_hermit").into());
-    let artifact_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sqlite-veryquick");
+    let artifact_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("sqlite-veryquick-{}", std::process::id()));
 
     let output = hermit_test::hermit_output(
         "hermit run",

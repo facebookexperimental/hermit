@@ -252,7 +252,8 @@ fn proc_locks_consumers_are_deterministic_under_strict_verify() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("proc-locks");
+    let build_root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("proc-locks-{}", std::process::id()));
 
     for (name, api) in [("fcntl", "1"), ("lockf", "2"), ("ofd-fcntl", "3")] {
         let guest = build_guest(repository, &build_root, name, api);

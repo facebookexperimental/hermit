@@ -108,7 +108,8 @@ fn build_guest(cell: &'static OnceLock<PathBuf>, source: &str, extra: &[&str]) -
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("chaos-sched-yield-progress");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("chaos-sched-yield-progress-{}", std::process::id()));
         fs::create_dir_all(&build_root).expect("failed to create build directory");
         let source = repository.join(source);
         let output = build_root.join(source.file_stem().expect("a C source file"));
@@ -520,7 +521,10 @@ fn strict_vfork_child_sched_yield_is_deterministic() {
 
 #[test]
 fn preemption_replay_preserves_vfork_sched_yield_progress() {
-    let schedule = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sched-yield-preemptions.json");
+    let schedule = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "sched-yield-preemptions.json-{}",
+        std::process::id()
+    ));
     let _ = fs::remove_file(&schedule);
 
     for (phase, option) in [

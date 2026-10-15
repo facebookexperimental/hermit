@@ -160,7 +160,8 @@ fn signal_guest() -> &'static Path {
             let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("hermit-cli should be inside the repository");
-            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("signal-determinism");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("signal-determinism-{}", std::process::id()));
             fs::create_dir_all(&build_root)
                 .expect("failed to create signal determinism build directory");
             let binary = build_root.join("signal_determinism");
@@ -610,7 +611,8 @@ fn verify_reports_the_last_records_of_a_run_1_killed_by_a_signal() {
 /// A marker file named `name` that does not exist yet, which a guest creates
 /// in run 1 so that run 2 can behave differently.
 fn run_1_marker(name: &str) -> PathBuf {
-    let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join("verify-signal-report");
+    let directory = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("verify-signal-report-{}", std::process::id()));
     fs::create_dir_all(&directory).expect("failed to create the marker directory");
     let marker = directory.join(name);
     match fs::remove_file(&marker) {

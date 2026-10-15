@@ -32,7 +32,8 @@ fn sysv_and_legacy_filesystem_features_fall_back_deterministically() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sysv-legacy-fallbacks");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("sysv-legacy-fallbacks-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     let cases = [

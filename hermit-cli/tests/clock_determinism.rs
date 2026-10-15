@@ -53,7 +53,8 @@ fn clock_guest() -> &'static Path {
             let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("hermit-cli should be inside the repository");
-            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("clock-determinism");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("clock-determinism-{}", std::process::id()));
             fs::create_dir_all(&build_root)
                 .expect("failed to create clock determinism build directory");
             let binary = build_root.join("clock_determinism");
@@ -86,7 +87,8 @@ fn replay_epoch_guest() -> &'static Path {
             let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("hermit-cli should be inside the repository");
-            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("clock-determinism");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("clock-determinism-{}", std::process::id()));
             fs::create_dir_all(&build_root)
                 .expect("failed to create clock determinism build directory");
             let binary = build_root.join("replay_epoch_probe");
@@ -173,7 +175,8 @@ fn assert_full_trajectory(output: &Output) {
 }
 
 fn schedule_path(name: &str) -> PathBuf {
-    let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join("clock-determinism");
+    let directory = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("clock-determinism-{}", std::process::id()));
     fs::create_dir_all(&directory).expect("failed to create schedule directory");
     let path = directory.join(name);
     let _ = fs::remove_file(&path);

@@ -22,7 +22,8 @@ fn compile_guest(name: &str, source: &str, extra_args: &[&str]) -> PathBuf {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-harder");
+    let build_root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("kvm-harder-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create KVM guest build directory");
     let binary = build_root.join(name);
     let output = Command::new("cc")

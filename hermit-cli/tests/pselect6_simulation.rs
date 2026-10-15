@@ -32,7 +32,8 @@ fn pselect6_preserves_kernel_abi_and_unblocks_scheduler() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("pselect6-simulation");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("pselect6-simulation-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create pselect6 guest build directory");
     let guest = build_root.join("pselect6_simulation");
 
@@ -118,7 +119,8 @@ fn pselect6_sleeps_under_its_temporary_mask() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("pselect-temporary-mask");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("pselect-temporary-mask-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create pselect guest build directory");
     let guest = build_root.join("pselect_temporary_mask");
     let mut compile = Command::new("cc");

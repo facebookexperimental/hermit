@@ -17,7 +17,8 @@ fn dumpability_controls_are_deterministic() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("prctl-dumpable");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("prctl-dumpable-{}", std::process::id()));
     std::fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     let guest = build_root.join("prctl-dumpable");
 

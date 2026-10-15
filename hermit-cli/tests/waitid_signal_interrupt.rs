@@ -77,7 +77,8 @@ fn waitid_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("waitid-signal-interrupt");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("waitid-signal-interrupt-{}", std::process::id()));
         fs::create_dir_all(&build_root).expect("failed to create waitid guest build directory");
 
         // The guest must not live under /tmp: Hermit replaces guest /tmp with

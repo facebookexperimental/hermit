@@ -47,7 +47,8 @@ fn ipc_guest() -> &'static Path {
             let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("hermit-cli should be inside the repository");
-            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ipc-determinism");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("ipc-determinism-{}", std::process::id()));
             fs::create_dir_all(&build_root).expect("failed to create IPC build directory");
             let output = build_root.join("ipc-determinism");
             let mut command = Command::new("cc");

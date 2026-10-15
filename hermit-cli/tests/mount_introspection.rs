@@ -32,7 +32,8 @@ fn mount_introspection_syscalls_fall_back_deterministically() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("mount-introspection");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("mount-introspection-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     let cases = [
@@ -141,7 +142,8 @@ fn guest_mounts_receive_no_host_propagation() {
 /// (https://github.com/rrnewton/hermit/issues/4167).
 #[test]
 fn host_mount_events_during_a_run_leave_the_guest_mountinfo_unchanged() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("mountinfo-propagation");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("mountinfo-propagation-{}", std::process::id()));
     let guest = mountinfo_reread_guest(&build_root);
     let mount_point = build_root.join("churn");
     fs::create_dir_all(&mount_point).expect("failed to create the churn mount point");

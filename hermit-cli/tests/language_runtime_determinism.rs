@@ -62,7 +62,10 @@ fn source(name: &str) -> PathBuf {
 
 fn fresh_build_dir(name: &str) -> PathBuf {
     let directory = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("language-runtime-determinism")
+        .join(format!(
+            "language-runtime-determinism-{}",
+            std::process::id()
+        ))
         .join(name);
     if directory.exists() {
         fs::remove_dir_all(&directory).expect("failed to clean runtime test build directory");

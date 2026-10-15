@@ -1590,21 +1590,19 @@ pub const HERMIT_INTEGRATION_TAG: &str = "test.hermit_integration";
 /// The shards of the local [`HERMIT_INTEGRATION_TAG`], as (job, first binary,
 /// estimated seconds).
 ///
-/// Its binaries run one test at a time: nextest's `hermit-serialized` group
-/// (.config/nextest.toml) has one thread, so the node's wall time is the sum
-/// of its tests' times. On 2bf536af the 407 tests took 312.5 s of a 312.6 s
+/// Until 2026-10-15 its binaries ran one test at a time, under nextest's
+/// former `hermit-serialized` group, so the node's wall time was the sum of
+/// its tests' times: on 2bf536af the 407 tests took 312.5 s of a 312.6 s
 /// nextest run, and the node ended the DAG's portable tail at +723 s, 327 s
-/// after it started. The group keeps cargo's contract: binaries one after
-/// another, and the tests inside a binary behind that binary's process-local
-/// mutexes. It does not need two binaries kept apart: each writes its
-/// fixtures under CARGO_TARGET_TMPDIR in directories named for itself, and
-/// test.pmu_integration_cases already runs deadline_slice_cap and
-/// external_signal_interrupt beside this node.
+/// after it started. Each shard now runs eight tests at a time (its width
+/// channel is NEXTEST_TEST_THREADS): every guest these binaries build under
+/// CARGO_TARGET_TMPDIR goes to a `<name>-<pid>` path, so two test processes
+/// of one binary never overwrite each other's program.
 ///
-/// So each shard takes a contiguous range of binary names, from its first
+/// Each shard takes a contiguous range of binary names, from its first
 /// binary up to the next shard's. Every shard runs the authored command, with
 /// its prepared selection, and narrows the authored filter to its own
-/// binaries, so a binary runs in exactly one shard and stays serialized there.
+/// binaries, so a binary runs in exactly one shard.
 /// A binary added to the node joins the shard whose range holds its name; the
 /// shard's NEXTEST_EXPECTED_COUNTS entry then fails until it is updated. The
 /// hosted twin is made before this split and runs the whole node.

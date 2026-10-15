@@ -18,7 +18,10 @@ fn copy_file_range_refusal_is_deterministic() {
         .parent()
         .expect("hermit-cli should be inside the repository");
     let source = repository.join("tests/c/copy_file_range_refusal_probe.c");
-    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join("copy-file-range-refusal-probe");
+    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "copy-file-range-refusal-probe-{}",
+        std::process::id()
+    ));
 
     let compile = Command::new("cc")
         .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])

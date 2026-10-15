@@ -32,7 +32,8 @@ fn incoming_cpu_is_the_virtual_cpu_under_strict_verify() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("so-incoming-cpu");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("so-incoming-cpu-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     for transport in ["tcp4", "tcp6", "udp4"] {

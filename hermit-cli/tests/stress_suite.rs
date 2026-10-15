@@ -153,8 +153,10 @@ fn chaos_demo_binary() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let output =
-            Path::new(env!("CARGO_TARGET_TMPDIR")).join("hermit-stress-workloads/order-violation");
+        let output = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "hermit-stress-workloads/order-violation-{}",
+            std::process::id()
+        ));
         compile_c(&repository.join("tests/chaos/order_violation.c"), &output);
         output
     })
@@ -165,7 +167,8 @@ fn stress_binaries() -> &'static StressBinaries {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hermit-stress-workloads");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("hermit-stress-workloads-{}", std::process::id()));
         let concurrency = build_root.join("concurrency");
         let cas = build_root.join("cas-sequence");
         compile_rust(

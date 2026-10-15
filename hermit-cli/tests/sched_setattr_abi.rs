@@ -38,7 +38,8 @@ fn build_fixture() -> PathBuf {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sched-setattr-abi");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("sched-setattr-abi-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     let guest = build_root.join("sched_setattr_abi");
 

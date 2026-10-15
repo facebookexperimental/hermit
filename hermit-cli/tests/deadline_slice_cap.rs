@@ -62,7 +62,8 @@ fn fixture(cell: &'static OnceLock<PathBuf>, name: &str) -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("deadline-slice-cap");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("deadline-slice-cap-{}", std::process::id()));
         fs::create_dir_all(&build_root).expect("failed to create build directory");
         let source = repository.join(format!("hermit-cli/tests/fixtures/{name}.c"));
         let output = build_root.join(name);
@@ -1025,7 +1026,8 @@ fn itimer_coalescing_verifies_under_chaos() {
 #[test]
 fn itimer_a_recorded_schedule_replays() {
     let guest = fixture(&ITIMER_COALESCE, "itimer_coalesce");
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("itimer-coalesce-replay");
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("itimer-coalesce-replay-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("failed to create the replay directory");
     let preemptions = dir.join("preemptions.json");
     let _ = std::fs::remove_file(&preemptions);

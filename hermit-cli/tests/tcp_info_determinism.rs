@@ -32,7 +32,8 @@ fn tcp_info_hides_host_transport_counters_under_strict_verify() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("tcp-info-determinism");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("tcp-info-determinism-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     for case in ["accept4", "client4", "accept6"] {

@@ -57,7 +57,8 @@ fn meminfo_fields_and_free_use_guest_memory() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("meminfo-determinism");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("meminfo-determinism-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     for name in ["meminfo_free", "meminfo_available", "meminfo_cached"] {

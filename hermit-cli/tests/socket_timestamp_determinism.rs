@@ -83,7 +83,8 @@ fn socket_timestamp_edge_cases_hold_at_every_epoch_fraction() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("socket-timestamp-epochs");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("socket-timestamp-epochs-{}", std::process::id()));
     std::fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     let guest = build_root.join("socket_timestamp_edge_cases");
     let compile = Command::new("cc")
@@ -131,7 +132,10 @@ fn socket_receive_timestamps_use_logical_time() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("socket-timestamp-determinism");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "socket-timestamp-determinism-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     for name in [
@@ -226,7 +230,8 @@ fn socket_receive_timestamps_use_logical_time_in_guest_liteinst() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("socket-timestamp-in-guest");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("socket-timestamp-in-guest-{}", std::process::id()));
     std::fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     for (name, expected) in [
         ("socket_timestamp_timeval", "timestamp=ok\n"),

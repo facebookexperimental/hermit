@@ -33,7 +33,8 @@ fn zero_copy_pipe_syscalls_fail_closed_by_default_and_allow_compatibility_opt_ou
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("zero-copy-pipe-fallback");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("zero-copy-pipe-fallback-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     let cases = [

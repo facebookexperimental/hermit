@@ -34,7 +34,10 @@ static KVM_RUN_LOCK: Mutex<()> = Mutex::new(());
 const LIFECYCLE_TIMING_EVENT: &str = "reverie-kvm lifecycle phase timings";
 
 fn compile_guest() -> PathBuf {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-lifecycle-timing-log-level");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "kvm-lifecycle-timing-log-level-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     let source = build_root.join("guest.c");
     fs::write(&source, "int main(void) { return 0; }\n").expect("failed to write guest source");

@@ -54,7 +54,8 @@ fn pty_nr_consumers_verify() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("pty-nr");
+    let build_root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("pty-nr-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create pty-nr build directory");
     let probe = build_root.join("pty-nr-count");
     let compile = Command::new("cc")

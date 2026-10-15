@@ -59,7 +59,8 @@ fn mmap_stress_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("mmap-stress-determinism");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("mmap-stress-determinism-{}", std::process::id()));
         fs::create_dir_all(&build_root)
             .expect("failed to create mmap-stress guest build directory");
         let output = build_root.join("mmap_stress_determinism");

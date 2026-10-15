@@ -32,7 +32,10 @@ fn ppoll_readonly_zero_timeout_preserves_ready_result() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ppoll-readonly-zero-timeout");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "ppoll-readonly-zero-timeout-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&build_root).expect("failed to create ppoll guest build directory");
     let guest = build_root.join("ppoll_simulation");
 
@@ -122,7 +125,8 @@ fn ppoll_masked_waits_poll_under_their_mask() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ppoll-masked-waits");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ppoll-masked-waits-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create ppoll guest build directory");
     let guest = build_root.join("ppoll_simulation");
 
@@ -211,7 +215,8 @@ fn dbt_masked_ppoll_that_would_block_fails_closed() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ppoll-dbt-fail-closed");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ppoll-dbt-fail-closed-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create ppoll guest build directory");
     let guest = build_root.join("ppoll_simulation");
     let mut compile = Command::new("cc");
@@ -253,8 +258,10 @@ fn ppoll_nonsequentialized_kernel_wait_checks_mask_access() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("ppoll-inaccessible-kernel-wait-mask");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "ppoll-inaccessible-kernel-wait-mask-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&build_root).expect("failed to create ppoll guest build directory");
     let guest = build_root.join("ppoll_simulation");
 
@@ -324,7 +331,8 @@ fn ppoll_waits_use_nonblocking_probes_and_verify() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ppoll-simulation");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ppoll-simulation-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create ppoll guest build directory");
     let guest = build_root.join("ppoll_simulation");
 

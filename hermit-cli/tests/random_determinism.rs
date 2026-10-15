@@ -94,7 +94,10 @@ fn assert_guest_l2(guest: &Path, backend: Option<&str>) {
 
 #[test]
 fn random_sources_repeat_across_runs_and_change_with_seed() {
-    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join("random-determinism/random-sources");
+    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "random-determinism/random-sources-{}",
+        std::process::id()
+    ));
     compile_guest(&guest);
 
     let expected = run_guest(&guest, 17);
@@ -108,8 +111,10 @@ fn random_sources_repeat_across_runs_and_change_with_seed() {
 #[test]
 #[ignore = "e2e: requires hermit + mount namespaces"]
 fn random_sources_are_deterministic_under_strict_verify() {
-    let guest =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("random-determinism/random-sources-strict");
+    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "random-determinism/random-sources-strict-{}",
+        std::process::id()
+    ));
     compile_guest(&guest);
     assert_guest_l2(&guest, None);
 }
@@ -118,8 +123,10 @@ fn random_sources_are_deterministic_under_strict_verify() {
 // TODO-HUMAN-REVIEW(PR-1060): Review DBT child identity and RNG lifecycle coverage.
 #[test]
 fn dbt_random_sources_are_deterministic_under_strict_verify() {
-    let guest =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("random-determinism/dbt-random-sources");
+    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "random-determinism/dbt-random-sources-{}",
+        std::process::id()
+    ));
     compile_guest(&guest);
     assert_guest_l2(&guest, Some("dbt"));
 }

@@ -32,7 +32,8 @@ fn deterministic_passthrough_syscalls_verify() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("syscall-quick-wins");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("syscall-quick-wins-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create syscall guest build directory");
     let guest = build_root.join("syscall_quick_wins");
 

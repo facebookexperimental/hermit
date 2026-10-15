@@ -32,7 +32,8 @@ fn futex2_feature_probes_receive_deterministic_enosys() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("futex2-refusal");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("futex2-refusal-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create futex2 guest build directory");
 
     for (source, marker, syscall) in CASES {

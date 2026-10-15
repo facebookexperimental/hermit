@@ -44,8 +44,10 @@ fn guest() -> &'static Path {
             let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("hermit-cli should be inside the repository");
-            let build_root =
-                Path::new(env!("CARGO_TARGET_TMPDIR")).join("epoll-pwait-zero-timeout-progress");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+                "epoll-pwait-zero-timeout-progress-{}",
+                std::process::id()
+            ));
             fs::create_dir_all(&build_root).expect("failed to create build directory");
             let output = build_root.join("epoll_pwait_zero_timeout_progress");
             let mut command = Command::new("cc");

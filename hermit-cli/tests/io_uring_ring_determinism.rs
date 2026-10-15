@@ -60,7 +60,8 @@ fn io_uring_ring_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("io-uring-ring-determinism");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("io-uring-ring-determinism-{}", std::process::id()));
         fs::create_dir_all(&build_root)
             .expect("failed to create io_uring-ring guest build directory");
         let output = build_root.join("io_uring_ring_determinism");

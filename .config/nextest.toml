@@ -30,38 +30,20 @@ final-status-level = "slow"
 [profile.ci.junit]
 path = "junit.xml"
 
-# Cargo runs integration test binaries one after another, and these binaries
-# also use process-local mutexes to serialize Hermit executions. Nextest runs
-# each test in a separate process, so keep their shared contract explicit.
-#
-# The `cli` binary is outside the group. Its HERMIT_RUN_LOCK is a
-# process-local mutex, so under nextest it never serialized two tests; while
-# the binary was in the group, the group (and test.cli's -j 1) did. Every
-# fixture the binary writes under CARGO_TARGET_TMPDIR, including those in the
-# tests/common modules it includes, therefore goes in a directory named for
-# the test process (process_build_root), so two tests running at once never
-# write, or run, the same file. test.cli and its hosted twin test.cli_on_host
-# run at the width the DAG assigns through NEXTEST_TEST_THREADS; every other
-# node that runs the cli binary passes -j 1.
-#
-# The `rr_suite` binary is outside the group too. Each of its tests runs one rr
-# program in a fresh scratch directory, compiles that program into, and
-# generates rr's headers into, a directory named for the test process
-# (process_build_root), and retries a typed PMU skid refusal on its own.
-# test.rr_suite_contract runs it with -j 8 (measured 2026-10-15: 171-179 s at
-# -j 1, 31-40 s at -j 8, every one of 192 tests passing in every run); its
-# hosted twin keeps -j 1.
-#
-# The `record_replay` binary is outside it as well: each test records into its
-# own tempdir and runs prepared, read-only workloads, and test.record_replay
-# runs eight at a time (measured 2026-10-15: 390 s at -j 1, 40-48 s at -j 8).
-# ci/nextest-timeout-config.rs accepts exactly this filter.
-[test-groups.hermit-serialized]
-max-threads = 1
-
-[[profile.default.overrides]]
-filter = "package(=hermit) & kind(=test) & !binary(=cli) & !binary(=rr_suite) & !binary(=record_replay)"
-test-group = "hermit-serialized"
+# No group serializes the hermit integration binaries any more. Nextest runs
+# every test in its own process, and the process-local HERMIT_RUN_LOCK mutexes
+# some binaries keep never serialized two tests under it. What two tests
+# running at once could share was the files they write under
+# CARGO_TARGET_TMPDIR, so every such file now goes in a path named for the test
+# process: process_build_root in cli and rr_suite, and a `<name>-<pid>` suffix
+# on the fixed guest paths of the binaries test.hermit_integration selects.
+# record_replay records into tempdirs and runs prepared, read-only workloads.
+# Each DAG node sets its own width: test.cli, test.rr_suite_contract,
+# test.record_replay, privileged-test.cli_kvm and the test.hermit_integration
+# shards run several tests at once (measured on 2026-10-06 and 2026-10-15; see
+# their descriptions), and every other node, the PMU-timing ones among them,
+# passes -j 1. Until 2026-10-15 a hermit-serialized group (max-threads 1) held
+# every hermit integration binary but cli, rr_suite and record_replay.
 
 # Stopgap for https://github.com/rrnewton/hermit/issues/3827. `hermit record
 # start --verify-with-gdbex` binds its replay gdbserver to host port
@@ -70,7 +52,7 @@ test-group = "hermit-serialized"
 # replay stage; the other --verify-with-gdbex cases fault during recording,
 # before the port is chosen. The group keeps the two from overlapping each
 # other. The general fix is a design item on that issue.
-# ci/nextest-timeout-config.rs accepts exactly this filter too.
+# ci/nextest-timeout-config.rs accepts exactly this filter.
 [test-groups.cli-gdbserver-port]
 max-threads = 1
 

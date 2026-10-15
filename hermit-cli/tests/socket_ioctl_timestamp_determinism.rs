@@ -76,7 +76,8 @@ fn socket_timestamp_ioctls_use_logical_time() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("socket-ioctl-timestamp");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("socket-ioctl-timestamp-{}", std::process::id()));
     std::fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     let guest = build_root.join("socket-ioctl-timestamp");
 

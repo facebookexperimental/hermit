@@ -310,7 +310,8 @@ impl GuestRun {
 }
 
 fn build_root() -> PathBuf {
-    Path::new(env!("CARGO_TARGET_TMPDIR")).join("external-signal-interrupt")
+    Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("external-signal-interrupt-{}", std::process::id()))
 }
 
 /// The guest binary, compiled on first use within the test's wall budget, which

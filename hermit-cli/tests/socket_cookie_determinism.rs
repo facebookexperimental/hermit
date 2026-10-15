@@ -32,7 +32,8 @@ fn socket_cookies_verify_for_distinct_socket_families() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("socket-cookie-determinism");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("socket-cookie-determinism-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     for name in ["tcp", "udp", "unix"] {

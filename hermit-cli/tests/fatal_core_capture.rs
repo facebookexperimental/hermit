@@ -32,7 +32,7 @@ fn guest(test: &str) -> (PathBuf, PathBuf) {
         .parent()
         .expect("hermit-cli should be inside the repository");
     let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("fatal-core-capture")
+        .join(format!("fatal-core-capture-{}", std::process::id()))
         .join(test);
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("failed to create the test directory");

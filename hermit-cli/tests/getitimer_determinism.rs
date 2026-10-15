@@ -18,7 +18,10 @@ fn getitimer_tracks_logical_alarm_state() {
         .parent()
         .expect("hermit-cli should be inside the repository");
     let source = repository.join("tests/c/getitimer_determinism_probe.c");
-    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join("getitimer-determinism-probe");
+    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "getitimer-determinism-probe-{}",
+        std::process::id()
+    ));
 
     let compile = Command::new("cc")
         .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])

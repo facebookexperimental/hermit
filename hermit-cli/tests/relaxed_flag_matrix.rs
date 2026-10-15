@@ -171,7 +171,8 @@ fn observation_guest() -> &'static Path {
             let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("hermit-cli should be inside the repository");
-            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("relaxed-flag-matrix");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("relaxed-flag-matrix-{}", std::process::id()));
             fs::create_dir_all(&build_root)
                 .expect("failed to create relaxed flag matrix build directory");
             let output = build_root.join("observation-guest");
@@ -205,7 +206,7 @@ fn report_path() -> PathBuf {
             .expect("hermit-cli should be inside the repository")
             .join(path),
         None => Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("relaxed-flag-matrix")
+            .join(format!("relaxed-flag-matrix-{}", std::process::id()))
             .join("results.tsv"),
     }
 }

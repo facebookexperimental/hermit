@@ -44,8 +44,8 @@ fn fairness_guest() -> &'static Path {
             let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("hermit-cli should be inside the repository");
-            let build_root =
-                Path::new(env!("CARGO_TARGET_TMPDIR")).join("thread-scheduling-fairness");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("thread-scheduling-fairness-{}", std::process::id()));
             fs::create_dir_all(&build_root).expect("failed to create fairness build directory");
             let output = build_root.join("scheduling-fairness");
             let mut command = Command::new("rustc");

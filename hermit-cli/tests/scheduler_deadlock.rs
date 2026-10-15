@@ -901,7 +901,8 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("scheduler-deadlock");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("scheduler-deadlock-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     let guest = build_root.join("scheduler_deadlock");
 

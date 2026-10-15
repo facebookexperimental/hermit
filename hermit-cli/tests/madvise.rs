@@ -41,7 +41,8 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("madvise-determinism");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("madvise-determinism-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create madvise guest build directory");
     let guest = build_root.join("madvise_determinism");
 

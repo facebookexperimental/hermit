@@ -200,7 +200,8 @@ fn build_lifecycle_guest(build_root: &Path) -> PathBuf {
 /// Hermit result would be meaningless.
 #[test]
 fn robust_futex_owner_death_passes_natively() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-native");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("robust-futex-native-{}", std::process::id()));
     let guest = build_guest(&build_root);
 
     let mut native = Command::new("timeout");
@@ -223,7 +224,8 @@ fn robust_futex_owner_death_passes_natively() {
 
 #[test]
 fn robust_futex_owner_death_wakes_the_waiter_at_l2() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-owner-death");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("robust-futex-owner-death-{}", std::process::id()));
     let guest = build_guest(&build_root);
     let verify_json = build_root.join("ptrace.verify.json");
     let _ = fs::remove_file(&verify_json);
@@ -277,7 +279,10 @@ fn robust_futex_owner_death_wakes_the_waiter_at_l2() {
 /// leg of the same behavior; the L2 leg is asserted above.
 #[test]
 fn detcore_wakes_the_modeled_waiter_before_linux_finishes_exit() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-detcore-evidence");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-detcore-evidence-{}",
+        std::process::id()
+    ));
     let guest = build_guest(&build_root);
 
     let mut run = Command::new("timeout");
@@ -327,7 +332,10 @@ fn detcore_wakes_the_modeled_waiter_before_linux_finishes_exit() {
 
 #[test]
 fn linux_wakes_process_shared_waiters_for_all_three_owner_death_paths() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-native");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-lifecycle-native-{}",
+        std::process::id()
+    ));
     let guest = build_lifecycle_guest(&build_root);
 
     for mode in [
@@ -361,7 +369,10 @@ fn linux_wakes_process_shared_waiters_for_all_three_owner_death_paths() {
 
 #[test]
 fn ptrace_wakes_after_guest_observed_fatal_signal_and_exit_group_cleanup() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-ptrace");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-lifecycle-ptrace-{}",
+        std::process::id()
+    ));
     let guest = build_lifecycle_guest(&build_root);
 
     for mode in ["signal", "exit-group"] {
@@ -459,8 +470,10 @@ fn ptrace_wakes_after_guest_observed_fatal_signal_and_exit_group_cleanup() {
 /// (`thread-tgid-exec`). Before the fix each left the waiter parked for good.
 #[test]
 fn ptrace_wakes_the_waiter_when_an_exec_ends_the_owner() {
-    let build_root =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-ptrace-exec");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-lifecycle-ptrace-exec-{}",
+        std::process::id()
+    ));
     let guest = build_lifecycle_guest(&build_root);
 
     for mode in ["de-thread", "owner-exec", "leader-exec", "thread-tgid-exec"] {
@@ -556,8 +569,10 @@ fn ptrace_wakes_the_waiter_when_an_exec_ends_the_owner() {
 /// Detcore must make no modeled owner-death wake in either case.
 #[test]
 fn ptrace_wakes_nobody_when_an_exec_leaves_the_owner_word_alone() {
-    let build_root =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-ptrace-exec-nowake");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-lifecycle-ptrace-exec-nowake-{}",
+        std::process::id()
+    ));
     let guest = build_lifecycle_guest(&build_root);
 
     for (mode, required) in [
@@ -679,7 +694,10 @@ fn ptrace_wakes_nobody_when_an_exec_leaves_the_owner_word_alone() {
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_wakes_the_waiter_when_an_exec_ends_the_owner() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-dbt-exec");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-lifecycle-dbt-exec-{}",
+        std::process::id()
+    ));
     let guest = build_lifecycle_guest(&build_root);
     for mode in ["de-thread", "owner-exec", "leader-exec", "thread-tgid-exec"] {
         for verify in [true, false] {
@@ -746,8 +764,10 @@ fn ptrace_an_exec_wakes_one_waiter_per_word_it_marks() {
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_wakes_nobody_when_an_exec_leaves_the_owner_word_alone() {
-    let build_root =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-dbt-exec-nowake");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-lifecycle-dbt-exec-nowake-{}",
+        std::process::id()
+    ));
     let guest = build_lifecycle_guest(&build_root);
     for (mode, required) in [
         (
@@ -779,7 +799,10 @@ fn dbt_wakes_nobody_when_an_exec_leaves_the_owner_word_alone() {
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_robust_futex_owner_death_wakes_the_waiter_at_l2() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-owner-death-dbt");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-owner-death-dbt-{}",
+        std::process::id()
+    ));
     let guest = build_guest(&build_root);
     let verify_json = build_root.join("dbt.verify.json");
     let _ = fs::remove_file(&verify_json);
@@ -826,7 +849,8 @@ fn dbt_robust_futex_owner_death_wakes_the_waiter_at_l2() {
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_detcore_leaves_the_owner_word_to_linux_and_wakes_the_waiter() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-dbt-evidence");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("robust-futex-dbt-evidence-{}", std::process::id()));
     let guest = build_guest(&build_root);
 
     let mut run = Command::new("timeout");
@@ -890,7 +914,8 @@ fn dbt_detcore_leaves_the_owner_word_to_linux_and_wakes_the_waiter() {
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_wakes_the_waiter_when_an_exit_group_ends_the_owner() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-dbt");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("robust-futex-lifecycle-dbt-{}", std::process::id()));
     let guest = build_lifecycle_guest(&build_root);
     let verify_json = build_root.join("dbt-exit-group.verify.json");
     let _ = fs::remove_file(&verify_json);
@@ -988,8 +1013,10 @@ fn dbt_wakes_the_waiter_when_an_exit_group_ends_the_owner() {
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_wakes_the_waiter_when_a_fatal_signal_ends_the_owner() {
-    let build_root =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-dbt-signal");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-lifecycle-dbt-signal-{}",
+        std::process::id()
+    ));
     let guest = build_lifecycle_guest(&build_root);
     for verify in [true, false] {
         let run = run_dbt_lifecycle_mode(&build_root, &guest, "signal", verify);
@@ -1036,7 +1063,8 @@ fn dbt_wakes_the_waiter_when_a_fatal_signal_ends_the_owner() {
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_a_default_fatal_signal_ends_a_threaded_process_and_a_handler_still_runs() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fatal-signal-threads-dbt");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("fatal-signal-threads-dbt-{}", std::process::id()));
     let guest = build_fatal_signal_guest(&build_root);
     for (mode, expected) in [
         (
@@ -1203,8 +1231,10 @@ fn owner_death_wakes(stderr: &str) -> Vec<&str> {
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_wakes_a_blocked_siblings_mutex_once_under_its_owner() {
-    let build_root =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-blocked-sibling-dbt");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-blocked-sibling-dbt-{}",
+        std::process::id()
+    ));
     let guest = build_lifecycle_guest(&build_root);
     let verified = run_dbt_lifecycle_mode(&build_root, &guest, "blocked-sibling", true);
     assert!(
@@ -1242,8 +1272,10 @@ fn dbt_wakes_a_blocked_siblings_mutex_once_under_its_owner() {
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_walks_a_registration_made_after_the_exit_group_is_filed() {
-    let build_root =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-late-registration-dbt");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-late-registration-dbt-{}",
+        std::process::id()
+    ));
     let guest = build_lifecycle_guest(&build_root);
     let run = run_dbt_lifecycle_mode(&build_root, &guest, "late-registration", false);
     assert!(
@@ -1273,7 +1305,8 @@ fn dbt_walks_a_registration_made_after_the_exit_group_is_filed() {
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_wakes_a_shared_alias_once_and_each_pending_slot_once_as_linux_does() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-boundary-dbt");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("robust-futex-boundary-dbt-{}", std::process::id()));
     let guest = build_lifecycle_guest(&build_root);
     for (mode, expected) in [
         (
@@ -1325,7 +1358,10 @@ fn dbt_wakes_a_shared_alias_once_and_each_pending_slot_once_as_linux_does() {
 /// test noticed (Claude review of 65138a17, N2).
 #[test]
 fn ptrace_wakes_a_shared_alias_once_and_each_pending_slot_once_as_linux_does() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-boundary-ptrace");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-boundary-ptrace-{}",
+        std::process::id()
+    ));
     let guest = build_lifecycle_guest(&build_root);
     for (mode, expected) in [
         (
@@ -1378,7 +1414,10 @@ fn ptrace_wakes_a_shared_alias_once_and_each_pending_slot_once_as_linux_does() {
 /// with one waiter fewer timed out.
 #[test]
 fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-self-alias-record");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-self-alias-record-{}",
+        std::process::id()
+    ));
     let guest = build_lifecycle_guest(&build_root);
     let expected = "BOUNDARY: mode=self-alias woken=1 timed_out=1 word=0xc0000000";
     let mut native = Command::new(&guest);
@@ -1554,7 +1593,10 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_wakes_an_owners_pending_word_under_its_owner() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-pending-owner-dbt");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-pending-owner-dbt-{}",
+        std::process::id()
+    ));
     let guest = build_lifecycle_guest(&build_root);
     let verified = run_dbt_lifecycle_mode(&build_root, &guest, "pending-owner", true);
     assert!(
@@ -1597,8 +1639,10 @@ fn dbt_wakes_an_owners_pending_word_under_its_owner() {
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_wakes_both_owners_waiters_when_two_threads_call_exit_group() {
-    let build_root =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-concurrent-exit-group-dbt");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-concurrent-exit-group-dbt-{}",
+        std::process::id()
+    ));
     let guest = build_lifecycle_guest(&build_root);
     let verified = run_dbt_lifecycle_mode(&build_root, &guest, "concurrent-exit-group", true);
     assert!(
@@ -1654,7 +1698,10 @@ fn dbt_wakes_both_owners_waiters_when_two_threads_call_exit_group() {
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_wakes_a_reversed_owner_registration_as_linux_does() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-reversed-owner-dbt");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-reversed-owner-dbt-{}",
+        std::process::id()
+    ));
     let guest = build_lifecycle_guest(&build_root);
     let verified = run_dbt_lifecycle_mode(&build_root, &guest, "reversed-owner", true);
     assert!(

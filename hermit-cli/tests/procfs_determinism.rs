@@ -2247,7 +2247,8 @@ fn compile_fdinfo_mount_classes_guest() -> PathBuf {
         .parent()
         .expect("hermit-cli should be inside the repository")
         .to_path_buf();
-    let output = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("proc-fdinfo-mount-classes");
+    let output = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("proc-fdinfo-mount-classes-{}", std::process::id()));
     let compile = Command::new("cc")
         .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
         .arg(repository.join("tests/c/proc_fdinfo_mount_classes.c"))

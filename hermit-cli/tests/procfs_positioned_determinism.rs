@@ -27,7 +27,8 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
         .parent()
         .expect("hermit-cli should be inside the repository");
     let source = repository.join("tests/c/procfs_positioned_probe.c");
-    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join("procfs-positioned-probe");
+    let guest = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("procfs-positioned-probe-{}", std::process::id()));
 
     let compile = Command::new("cc")
         .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])

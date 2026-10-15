@@ -111,7 +111,8 @@ fn thread_self_fd_keeps_the_opener_identity() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("thread-self-procfs-handoff");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("thread-self-procfs-handoff-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create thread-self build directory");
     let guest = build_root.join("thread-self-procfs-handoff");
     let compile = Command::new("cc")

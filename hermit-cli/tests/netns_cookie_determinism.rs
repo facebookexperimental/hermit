@@ -32,7 +32,8 @@ fn network_namespace_cookie_verifies_for_distinct_socket_programs() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("netns-cookie-determinism");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("netns-cookie-determinism-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     for name in ["tcp4", "udp4", "tcp6"] {

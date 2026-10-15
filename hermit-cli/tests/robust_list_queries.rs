@@ -32,7 +32,8 @@ fn robust_list_queries_verify() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-list-queries");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("robust-list-queries-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     let cases = [

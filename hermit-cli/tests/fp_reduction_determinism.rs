@@ -43,8 +43,8 @@ fn fp_reduction_guest() -> &'static Path {
             let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("hermit-cli should be inside the repository");
-            let build_root =
-                Path::new(env!("CARGO_TARGET_TMPDIR")).join("fp-reduction-determinism");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("fp-reduction-determinism-{}", std::process::id()));
             fs::create_dir_all(&build_root).expect("failed to create FP reduction build directory");
             let binary = build_root.join("fp-reduction");
 

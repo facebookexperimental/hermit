@@ -41,7 +41,8 @@ fn arch_prctl_controls_verify_in_run_and_record_modes() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("arch-prctl-determinism");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("arch-prctl-determinism-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create arch_prctl guest build directory");
     let guest = build_root.join("arch_prctl_determinism");
 

@@ -119,7 +119,10 @@ fn hermit_run(extra: &[&str], script: &str, args: &[&Path]) -> Output {
 
 #[test]
 fn canonical_host_mtimes_survive_first_sight_and_others_read_as_epoch() {
-    let root = TestDirectory::new(Path::new(env!("CARGO_TARGET_TMPDIR")).join("first-seen-mtime"));
+    let root = TestDirectory::new(
+        Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("first-seen-mtime-{}", std::process::id())),
+    );
     let inputs = root.path().join("inputs");
     fs::create_dir_all(&inputs).expect("failed to create the input directory");
     for (name, secs, nanos, _) in FIXTURES {
@@ -191,8 +194,10 @@ fn canonical_host_mtimes_survive_first_sight_and_others_read_as_epoch() {
 /// it was written.
 #[test]
 fn cp_preserve_copies_a_canonical_mtime_to_the_host() {
-    let root =
-        TestDirectory::new(Path::new(env!("CARGO_TARGET_TMPDIR")).join("first-seen-mtime-cp"));
+    let root = TestDirectory::new(
+        Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("first-seen-mtime-cp-{}", std::process::id())),
+    );
     let source = root.path().join("source");
     fs::write(&source, "store file").expect("failed to write the source");
     set_mtime(&source, 1, 0);

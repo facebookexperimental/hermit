@@ -33,7 +33,8 @@ fn selector_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("terminal-child-selectors");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("terminal-child-selectors-{}", std::process::id()));
         fs::create_dir_all(&build_root).expect("failed to create selector guest build directory");
         let guest = build_root.join("terminal_child_selectors");
         let source = repository.join("tests/c/terminal_child_selectors.c");

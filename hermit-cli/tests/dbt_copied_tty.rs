@@ -18,7 +18,8 @@ fn copied_child_tiocgpgrp_verifies_under_dbt_strict() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-copied-tiocgpgrp");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("dbt-copied-tiocgpgrp-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create DBT TIOCGPGRP guest directory");
     let guest = build_root.join("dbt_copied_tiocgpgrp");
     let compile = Command::new("cc")

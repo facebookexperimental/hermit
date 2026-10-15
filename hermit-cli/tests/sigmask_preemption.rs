@@ -23,7 +23,8 @@ fn compile_guest() -> std::path::PathBuf {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sigmask-preemption");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("sigmask-preemption-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create sigmask build directory");
     let binary = build_root.join("sigmask_preemption");
     let output = Command::new("cc")

@@ -32,7 +32,8 @@ fn compression_tools_are_deterministic_under_strict_hermit() {
         .parent()
         .expect("hermit-cli should be inside the repository root");
     let runner = repo_root.join("hermit-cli/tests/fixtures/compression/run.sh");
-    let artifact_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("compression");
+    let artifact_root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("compression-{}", std::process::id()));
 
     let (_, output, ()) =
         skid_overshoot::retry_typed_skid_refusal("compression", SKID_ATTEMPTS, || {

@@ -120,7 +120,8 @@ fn proc_fd_link_aliases_and_truncation_verify() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("proc-fd-link-aliases");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("proc-fd-link-aliases-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create proc-fd link build directory");
     let guest = build_root.join("proc-fd-link-aliases");
     let compile = Command::new("cc")

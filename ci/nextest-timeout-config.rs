@@ -350,11 +350,7 @@ fn exact_filter(identity: &nextest_cpu::AttemptIdentity) -> String {
 
 /// The only overrides a regular configuration may carry, as (filter,
 /// test-group) pairs. Each group only lowers how many of its tests run at once.
-const REGULAR_GROUP_OVERRIDES: [(&str, &str); 2] = [
-    (
-        "package(=hermit) & kind(=test) & !binary(=cli) & !binary(=rr_suite) & !binary(=record_replay)",
-        "hermit-serialized",
-    ),
+const REGULAR_GROUP_OVERRIDES: [(&str, &str); 1] = [
     (
         "package(=hermit) & binary(=cli) & (test(=record_classifies_a_gdbserver_replay_stage_container_child_failure) | test(=every_record_container_site_classifies_a_child_fault_by_name))",
         "cli-gdbserver-port",
@@ -1117,12 +1113,6 @@ mod tests {
         assert!(!regular_config_compatible(
             &changed_default.parse::<DocumentMut>().unwrap()
         ));
-        let widened_group =
-            include_str!("../.config/nextest.toml").replace(" & !binary(=record_replay)\"", "\"");
-        assert_ne!(widened_group, include_str!("../.config/nextest.toml"));
-        assert!(!regular_config_compatible(
-            &widened_group.parse::<DocumentMut>().unwrap()
-        ));
         let widened_gdb_group = include_str!("../.config/nextest.toml").replace(
             "binary(=cli) & (test(=record_classifies",
             "binary(=cli) | (test(=record_classifies",
@@ -1133,7 +1123,7 @@ mod tests {
         ));
         let swapped_groups = include_str!("../.config/nextest.toml").replace(
             "test-group = \"cli-gdbserver-port\"",
-            "test-group = \"hermit-serialized\"",
+            "test-group = \"serial\"",
         );
         assert_ne!(swapped_groups, include_str!("../.config/nextest.toml"));
         assert!(!regular_config_compatible(

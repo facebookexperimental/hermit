@@ -32,7 +32,8 @@ fn host_security_identity_probes_fall_back_deterministically() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("host-security-identity");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("host-security-identity-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     let cases = [

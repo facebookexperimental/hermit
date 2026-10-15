@@ -53,7 +53,8 @@ fn deterministic_file_io_syscalls_verify() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("syscall-file-io");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("syscall-file-io-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create syscall guest build directory");
     let guest = build_root.join("syscall_file_io");
     let guest_tmp = TestDirectory::new(build_root.join("guest-tmp"));
