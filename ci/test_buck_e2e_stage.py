@@ -17,7 +17,13 @@ is copied into target/validate only after its build ends, even when it ends last
 failed background build stops stage with its exit status and its log; a failed
 detcore-dbt build stops stage and both running background builds with it, and each
 background build's own child gets the SIGTERM too (cargo does not pass it on, so stage
-signals the build's whole process group).
+signals the build's whole process group). The fake cargo creates a missing target
+directory as cargo does, renaming a temporary directory onto it; forced into the
+interleaving that failed a validation, the release build replaces the empty target/ the
+hermit build has just made as its target directory's parent, and the hermit build fails
+with ENOENT at its temporary directory. Stage makes both target directories before any
+build starts, so the forced interleaving cannot arise, and the fake alone, without them,
+reproduces the failure.
 
 Both classes above stage in place (HERMIT_BUCK_STAGE_REPRODUCIBLE=0): the check and the
 builds are the same code under reproducible staging, which only re-runs stage from a
@@ -139,17 +145,74 @@ class StagePrerequisiteTest(unittest.TestCase):
 
 
 FAKE_CARGO = r"""#!/usr/bin/env python3
-import json, os, signal, subprocess, sys, time
+import json, os, signal, subprocess, sys, tempfile, time
 args = sys.argv[1:]
 if "--release" in args:
     label = "release"
 else:
     label = "+".join(args[i + 1] for i, a in enumerate(args) if a == "-p")
 target_dir = args[args.index("--target-dir") + 1]
+log = os.environ["FAKE_CARGO_LOG"]
+def wait_for(event, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while not os.path.exists(log) or event not in open(log).read():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.02)
+    return True
+def mark(event):
+    with open(log, "a") as f:
+        f.write(f"{event} {label} {time.monotonic():.3f} {target_dir}\n")
+# Like cargo (cargo_util::paths::create_dir_all_excluded_from_backups_atomic), a missing
+# target directory is created by making its parent, then renaming a temporary directory
+# made in that parent onto it; a failed rename is ignored if the directory now exists.
+# FAKE_CARGO_RACE_TARGET forces the interleaving a concurrent stage can hit: the hermit
+# build makes $target_dir (its target directory's parent) after the release build has
+# found $target_dir missing, and the release build's rename then replaces it. Each
+# pause happens only on the branch where the build found its target directory missing,
+# except that the other builds wait for the release build's to exist, so they cannot
+# create $target_dir first and hide the interleaving.
+race = os.environ.get("FAKE_CARGO_RACE_TARGET") == "1"
+if race and label not in ("release", "hermit"):
+    wait_for("created release ")
+if not os.path.isdir(target_dir):
+    if race and label == "hermit":
+        wait_for("checked release ")
+    parent = os.path.dirname(target_dir)
+    os.makedirs(parent, exist_ok=True)
+    # The kernel resolves the parent before it creates the temporary directory in it.
+    # If a rename replaces the parent in between, the creation lands in a removed
+    # directory and fails with ENOENT. The forced interleaving holds the resolved
+    # parent open across the other build's rename to make that window certain.
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    if race and label == "hermit":
+        mark("parent-made")
+        wait_for("created release ")
+    elif race and label == "release":
+        mark("checked")
+    try:
+        name = os.path.basename(tempfile.mktemp(prefix=os.path.basename(target_dir), dir=parent))
+        os.mkdir(name, dir_fd=parent_fd)
+        tmp = os.path.join(parent, name)
+        with open(os.path.join(tmp, "CACHEDIR.TAG"), "w") as f:
+            f.write("Signature: 8a477f597d28d172789f06886806bc55\n")
+    except FileNotFoundError:
+        print(f"error: No such file or directory (os error 2) at path \"{parent}/{name}\"", file=sys.stderr)
+        sys.exit(101)
+    if race and label == "release":
+        wait_for("parent-made hermit ")
+    try:
+        os.rename(tmp, target_dir)
+    except OSError:
+        if not os.path.exists(target_dir):
+            raise
+        os.remove(os.path.join(tmp, "CACHEDIR.TAG"))
+        os.rmdir(tmp)
+if race and label == "release":
+    mark("created")
 # Like cargo, every build creates its profile directory.
 os.makedirs(os.path.join(target_dir, "release" if "--release" in args else args[args.index("--profile") + 1]),
             exist_ok=True)
-log = os.environ["FAKE_CARGO_LOG"]
 def note(event):
     with open(log, "a") as f:
         f.write(f"{event} {label} {time.monotonic():.3f} {target_dir}\n")
@@ -318,6 +381,37 @@ class StageCargoOverlapTest(unittest.TestCase):
         self.assertLess(names.index(("end", "hermit")), names.index(copy), names)
         self.assertEqual((Path(target) / "validate" / "hermit").read_text(),
                          f"fake hermit built in {target}/stage-hermit\n")
+
+    def test_a_missing_target_directory_cannot_be_replaced_under_the_hermit_build(self) -> None:
+        # Reproducible staging starts with no target directory. Forced into the bad
+        # interleaving, the release build would rename its temporary directory onto the
+        # empty target/ the hermit build had just made as its target directory's parent.
+        target = self.stage.parent.parent.parent / "target"
+        self.assertFalse(target.exists())
+        proc = self.run_stage(FAKE_CARGO_RACE_TARGET="1")
+        # (Stage itself stops later, at the install bundle the fake cargo does not make.)
+        self.assertNotIn("the validate-profile build of hermit failed", proc.stderr)
+        self.assertNotIn("No such file or directory (os error 2)", proc.stderr)
+        names = [(event, label) for event, label, _ in self.events()]
+        self.assertNotIn(("checked", "release"), names, "the release build found target/ missing")
+        self.assertEqual((target / "validate" / "hermit").read_text(),
+                         f"fake hermit built in {target}/stage-hermit\n")
+
+    def test_the_fake_cargo_reproduces_the_replaced_target_directory(self) -> None:
+        # Without the directories stage makes first, the same interleaving fails the
+        # hermit build exactly as validation saw it, so the test above is not vacuous.
+        target = self.tmp / "bare-target"
+        env = {"PATH": str(self.bin), "FAKE_CARGO_LOG": str(self.log), "FAKE_CARGO_RACE_TARGET": "1"}
+        cargo = [str(self.bin / "cargo"), "build"]
+        release = subprocess.Popen(cargo + ["--release", "--target-dir", str(target)], env=env,
+                                   stderr=subprocess.PIPE, text=True)
+        hermit = subprocess.run(cargo + ["--profile", "validate", "-p", "hermit", "--target-dir",
+                                         f"{target}/stage-hermit"], env=env, capture_output=True, text=True,
+                                timeout=60)
+        release.communicate(timeout=60)
+        self.assertEqual(hermit.returncode, 101, hermit.stderr)
+        self.assertIn("No such file or directory (os error 2) at path", hermit.stderr)
+        self.assertEqual(release.returncode, 0)
 
     def test_a_failed_release_build_stops_stage_with_its_status_and_log(self) -> None:
         proc = self.run_stage(FAKE_CARGO_FAIL="release", FAKE_CARGO_FAIL_STATUS="7")

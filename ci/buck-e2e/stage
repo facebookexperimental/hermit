@@ -170,6 +170,13 @@ trap 'stop_background_builds; rm -rf "${tmp:?}"' EXIT
 # binary differs from a target/validate build only in the build-time DynamoRIO paths
 # reverie-dbt bakes in as a fallback (hermit finds its runtime through install_pkg).
 hermit_target_dir=$target_dir/stage-hermit
+# Both target directories exist before any build starts. Cargo creates a missing target
+# directory by renaming a temporary directory onto it, and rename() replaces an empty
+# directory, so with neither present a build in $target_dir could replace the empty
+# $target_dir another build had just made as the parent of its own target directory;
+# that build then fails with "No such file or directory" at its temporary directory
+# under the replaced one. Reproducible staging always starts with neither present.
+mkdir -p "$hermit_target_dir"
 setsid -w cargo build --manifest-path "$root/Cargo.toml" --locked --release -p hermit-manifest-plan --bins \
     --target-dir "$target_dir" >"$tmp/release-build.log" 2>&1 &
 release_build=$!
