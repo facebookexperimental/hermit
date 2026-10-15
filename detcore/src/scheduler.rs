@@ -1189,10 +1189,16 @@ pub struct Scheduler {
     /// never part of a deadlock. An entry is dropped when its process is
     /// reaped.
     sigkilled_processes: BTreeSet<DetPid>,
+    /// Whether the backend reports every process's children
+    /// (`BackendCapabilities::tracks_process_children`). Without it, a wait
+    /// may have a child Detcore has no record of, so the children it knows
+    /// being stuck does not make the wait stuck
+    /// ([`Scheduler::child_waits_wait_only_on_stuck_children`]).
+    complete_child_lineage: bool,
     /// Threads granted their `Exit` (an `exit` or `exit_group`), inside their
     /// own committed turn. A thread that leaves the scheduler without one died
     /// of a signal or with its process, so its process is going down
-    /// ([`Scheduler::child_waits_wait_only_on_held_children`]). Cleared when
+    /// ([`Scheduler::child_waits_wait_only_on_stuck_children`]). Cleared when
     /// the tid is registered again.
     committed_exits: BTreeSet<DetTid>,
     /// Thread-group leaders retired at their own `exit` while a sibling still
@@ -3516,6 +3522,7 @@ impl Scheduler {
             dead_parent_vfork_barriers: Default::default(),
             released_vfork_barriers: Default::default(),
             sigkilled_processes: Default::default(),
+            complete_child_lineage: cfg.backend.tracks_process_children,
             committed_exits: Default::default(),
             retired_exited_leaders: Default::default(),
             exited_leader_barriers: Default::default(),
@@ -3794,7 +3801,7 @@ impl Scheduler {
     /// Record, in the sender's committed turn, that a SIGKILL to `dettid` (or
     /// to process `target_process`) succeeded. The process will die even
     /// while one of its threads is held at a happens-before gate, so
-    /// [`Scheduler::child_waits_wait_only_on_held_children`] never counts a
+    /// [`Scheduler::child_waits_wait_only_on_stuck_children`] never counts a
     /// wait for it as part of a deadlock. On ptrace its retirement comes later,
     /// at its host-timed deregistration
     /// (https://github.com/rrnewton/hermit/issues/3994); this record is
@@ -8047,25 +8054,40 @@ impl Scheduler {
             }
     }
 
-    /// True, in a happens-before run with a thread held at a gate, when there
-    /// is at least one child wait and every one of them can only be satisfied
-    /// by stuck children: children whose live threads are all held at gates,
-    /// parked in a futex wait, or themselves in a child wait on stuck
-    /// children. None of these runs again until some other thread does (an
-    /// anchor firing, a futex wake, a child exit), so with nothing runnable,
-    /// no timer and no outstanding external I/O, such waits can never end
+    /// True when there is at least one child wait and every one of them can
+    /// only be satisfied by stuck children: children whose live threads are
+    /// all held at happens-before gates, parked in a futex wait, waiting with
+    /// no deadline (`pause`, or a timer beyond the end of logical time), or
+    /// themselves in a child wait on stuck children. (A futex wait with a
+    /// timeout counts too, but both callers decide only when no timer is
+    /// reachable: any finite deadline fast-forwards the clock first.) None of these runs again
+    /// until some other thread does (an anchor firing, a futex wake, a signal,
+    /// a child exit), so with nothing runnable, no reachable timer and no
+    /// outstanding external I/O, such waits can never end
     /// (https://github.com/rrnewton/hermit/issues/3904). A chain of waits
-    /// down to a held child is stuck too, so an ancestor's ordinary wait does
+    /// down to a stuck child is stuck too, so an ancestor's ordinary wait does
     /// not hide the cycle below it. A wait with no matching child, a child
     /// with any other live thread or none, a child that has already exited,
     /// and a child a committed SIGKILL has doomed (it will die at a host-timed
     /// point, so its wait is real) are treated as able to end, as before.
-    fn child_waits_wait_only_on_held_children(&self) -> bool {
-        let Some(hb) = self.happens_before.as_ref() else {
+    ///
+    /// This held only in happens-before runs with a held thread until
+    /// https://github.com/rrnewton/hermit/issues/4430: elsewhere a parent
+    /// waiting for a child in `pause()` (or in a futex wait nothing can wake)
+    /// spun until the outer deadline, where the same child without the wait is
+    /// reported as a deadlock at once. A signal from outside the container
+    /// could end such a wait, as it could a lone `pause`, which is reported.
+    ///
+    /// Outside a happens-before run with a held thread (where it applied
+    /// before 4430, and still does), it needs a backend that reports every
+    /// child (`complete_child_lineage`): elsewhere a wait may match a child
+    /// Detcore has no record of, which could still exit.
+    fn child_waits_wait_only_on_stuck_children(&self) -> bool {
+        let hb = self.happens_before.as_ref();
+        if self.unresolved_sigkill || self.blocked.child_waiters.is_empty() {
             return false;
-        };
-        if self.unresolved_sigkill || hb.parked.is_empty() || self.blocked.child_waiters.is_empty()
-        {
+        }
+        if !self.complete_child_lineage && hb.is_none_or(|hb| hb.parked.is_empty()) {
             return false;
         }
         // The stuck processes, as a least fixed point: a process becomes stuck
@@ -8113,15 +8135,25 @@ impl Scheduler {
 
     /// True when process `child` can run again only after some other thread
     /// does, given the processes already known to be `stuck`
-    /// ([`Scheduler::child_waits_wait_only_on_held_children`]).
-    fn child_is_stuck(&self, hb: &HbRuntime, child: DetPid, stuck: &BTreeSet<DetPid>) -> bool {
+    /// ([`Scheduler::child_waits_wait_only_on_stuck_children`]).
+    fn child_is_stuck(
+        &self,
+        hb: Option<&HbRuntime>,
+        child: DetPid,
+        stuck: &BTreeSet<DetPid>,
+    ) -> bool {
         let leader = DetTid::from_raw(child.as_raw());
         // A process armed with PR_SET_PDEATHSIG(SIGKILL) is killed by the
         // kernel when its parent thread exits, at a moment set by host
         // timing. The arming is recorded as a host-timed signal in the
         // caller's committed turn and never forgotten, so such a process
         // never counts as stuck (the second Claude re-check of
-        // https://github.com/rrnewton/hermit/pull/4013).
+        // https://github.com/rrnewton/hermit/pull/4013). Another host-timed
+        // signal is held off the stuck thread's wait, so it cannot end it
+        // under Hermit; Linux would deliver a parent-death SIGTERM to a
+        // paused child, which Hermit holds (a hang before
+        // https://github.com/rrnewton/hermit/issues/4430, a deadlock report
+        // since; https://github.com/rrnewton/hermit/issues/4440).
         if self.logically_exited_processes.contains(&child)
             || self.sigkilled_processes.contains(&child)
             || !self.thread_tree.thread_group_leaders.contains(&leader)
@@ -8144,8 +8176,13 @@ impl Scheduler {
         gone.iter().all(|tid| self.committed_exits.contains(tid))
             && !live.is_empty()
             && live.iter().all(|tid| {
-                hb.parked.contains(tid)
+                hb.is_some_and(|hb| hb.parked.contains(tid))
                     || self.parked_futex_waiter(*tid).is_some()
+                    || self
+                        .blocked
+                        .timed_waiters
+                        .thread_deadline(*tid)
+                        .is_some_and(|deadline| deadline.is_indefinite())
                     || self
                         .blocked
                         .child_waiters
@@ -10553,6 +10590,11 @@ impl Scheduler {
         if !self.blocked.rt_sigsuspend_blockers.is_empty() {
             classes.push("thread(s) waiting in rt_sigsuspend with no possible signal");
         }
+        // A deadlock is reported with child waits only when each waits for
+        // children that cannot run again (`child_waits_wait_only_on_stuck_children`).
+        if !self.blocked.child_waiters.is_empty() {
+            classes.push("thread(s) waiting for a child that cannot exit");
+        }
         if self
             .happens_before
             .as_ref()
@@ -10840,6 +10882,18 @@ impl Scheduler {
         decision
     }
 
+    /// Whether no outstanding external wait can still produce input: none at
+    /// all (`external_waits_empty`), or only child waits on children that
+    /// cannot exit (`child_waits_wait_only_on_stuck_children`). Called only
+    /// where a deadlock verdict needs it, since that analysis walks every
+    /// process.
+    fn external_waits_settled(&self, external_waits_empty: bool) -> bool {
+        external_waits_empty
+            || (self.blocked.external_io_blockers.is_empty()
+                && self.blocked.physical_child_waiters.is_empty()
+                && self.child_waits_wait_only_on_stuck_children())
+    }
+
     fn step2d_decide_empty_queue(
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
@@ -10862,10 +10916,6 @@ impl Scheduler {
         let external_waits_empty = self.blocked.external_io_blockers.is_empty()
             && self.blocked.child_waiters.is_empty()
             && self.blocked.physical_child_waiters.is_empty();
-        let external_waits_settled = external_waits_empty
-            || (self.blocked.external_io_blockers.is_empty()
-                && self.blocked.physical_child_waiters.is_empty()
-                && self.child_waits_wait_only_on_held_children());
         let rt_sigsuspend_empty = self.blocked.rt_sigsuspend_blockers.is_empty();
         let futex_empty = self.blocked.no_futex_waiters();
 
@@ -10965,8 +11015,8 @@ impl Scheduler {
             if logically_empty {
                 return Err(SkipTurn);
             } else if timed_empty
-                && external_waits_settled
                 && (!futex_empty || !rt_sigsuspend_empty || !hb_parked_empty)
+                && self.external_waits_settled(external_waits_empty)
             {
                 return Err(self.report_terminal_deadlock_unless_zap_pending());
             } else if !timed_empty {
@@ -10985,10 +11035,14 @@ impl Scheduler {
                     .next_deadline()
                     .expect("internal error: no timed events found");
                 if next_deadline.is_indefinite() {
-                    if !external_waits_empty {
+                    if !self.external_waits_settled(external_waits_empty) {
                         // Blocking external IO may still complete and produce the
-                        // signal/wake the indefinite waiter needs, so this is not a
-                        // deadlock yet. Spin as step2c does for the same reason.
+                        // signal/wake the indefinite waiter needs, and a child
+                        // that can still run may exit and end a child wait, so
+                        // this is not a deadlock yet. Spin as step2c does for the
+                        // same reason. A child wait on stuck children only
+                        // (`child_waits_wait_only_on_stuck_children`) cannot end
+                        // (https://github.com/rrnewton/hermit/issues/4430).
                         trace!(
                             "[scheduler] empty run-queue with only indefinite waiters, but external IO is outstanding for dtids {:?}. SPINNING!",
                             &self.blocked.external_io_blockers
@@ -27734,13 +27788,15 @@ mod test {
         assert!(!scheduler.take_retired_exited_leader(leader));
     }
 
-    /// A child wait is part of a happens-before deadlock only when every child
-    /// it could reap has all its live threads held at gates or parked in a
-    /// futex wait (https://github.com/rrnewton/hermit/issues/3904). A child
-    /// thread doing anything else, an exited child, a child a committed
-    /// SIGKILL has doomed, a wait with no matching child, an unnamed SIGKILL,
-    /// and a run with no held thread keep the wait counted as input that may
-    /// still arrive; a thread that has exited no longer counts.
+    /// A child wait is part of a deadlock only when every child it could reap
+    /// has all its live threads held at gates, parked in a futex wait, or
+    /// waiting with no deadline (https://github.com/rrnewton/hermit/issues/3904,
+    /// https://github.com/rrnewton/hermit/issues/4430). A child thread doing
+    /// anything else (a wait with a deadline included), an exited child, a
+    /// child a committed SIGKILL has doomed, a wait with no matching child,
+    /// and an unnamed SIGKILL keep the wait counted as input that may still
+    /// arrive; a thread that has exited no longer counts. Whether a thread is
+    /// held elsewhere in the run does not matter (it did until 4430).
     #[test]
     fn a_child_wait_settles_only_on_children_held_or_in_futex_waits() {
         let mut scheduler = Scheduler::new(&Config::default());
@@ -27771,19 +27827,35 @@ mod test {
                 .or_default()
                 .push(futex_waiter(tid.as_raw(), u32::MAX));
         };
-        // No held thread: the wait still counts as input, even with the
-        // child's only thread parked in a futex wait (the held-thread guard,
-        // not the child's state, decides this case).
+        // No held thread: the child's only thread parked in a futex wait
+        // settles the wait, as it would with a held thread elsewhere; the
+        // child's state decides (https://github.com/rrnewton/hermit/issues/4430).
         park_in_futex(&mut scheduler, child, 0x404000);
-        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        assert!(scheduler.child_waits_wait_only_on_stuck_children());
         scheduler.blocked.futex_waiters.clear();
         scheduler.next_turns.get_mut(&child).unwrap().req = Ivar::new();
-        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        // Doing anything else, it could still run.
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
+        // Waiting with no deadline (`pause`) it is stuck; with a deadline it
+        // will wake.
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, child);
+        assert!(scheduler.child_waits_wait_only_on_stuck_children());
+        scheduler.blocked.timed_waiters.remove(child);
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(5_000_000), child);
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
+        scheduler.blocked.timed_waiters.remove(child);
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
         let hold = |s: &mut Scheduler, tid| {
             s.happens_before.as_mut().unwrap().parked.insert(tid);
         };
         hold(&mut scheduler, child);
-        assert!(scheduler.child_waits_wait_only_on_held_children());
+        assert!(scheduler.child_waits_wait_only_on_stuck_children());
 
         // A thread the child had that is no longer registered: if it left by
         // its own committed exit it is gone harmlessly; if it left without one
@@ -27791,18 +27863,18 @@ mod test {
         // down and the wait is real.
         let gone = DetTid::from_raw(8);
         scheduler.thread_tree.add_child(child, gone, false);
-        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
         scheduler.committed_exits.insert(gone);
-        assert!(scheduler.child_waits_wait_only_on_held_children());
+        assert!(scheduler.child_waits_wait_only_on_stuck_children());
         // A new thread on that tid has not exited.
         scheduler.forget_committed_exit(gone);
-        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
         scheduler.committed_exits.insert(gone);
 
         // A committed SIGKILL dooms the child: it will die, so the wait is
         // real, whenever its host-timed retirement arrives.
         scheduler.record_committed_sigkill(child, Some(DetPid::from_raw(5)));
-        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
         scheduler.sigkilled_processes.clear();
         // A SIGKILL named by thread maps to its process.
         scheduler.record_committed_sigkill(child, None);
@@ -27811,24 +27883,24 @@ mod test {
         // A process-group kill dooms every process in the group.
         scheduler.record_unresolved_sigkill(Some(DetPid::from_raw(3)));
         assert!(scheduler.sigkilled_processes.contains(&DetPid::from_raw(5)));
-        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
         scheduler.sigkilled_processes.clear();
-        assert!(scheduler.child_waits_wait_only_on_held_children());
+        assert!(scheduler.child_waits_wait_only_on_stuck_children());
 
         // A second child thread that is neither held nor in a futex wait could
         // still run.
         scheduler.thread_tree.add_child(child, child_worker, false);
         register_known_thread(&mut scheduler, child_worker);
-        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
         // Parked in a futex wait, it can only be woken by another thread.
         park_in_futex(&mut scheduler, child_worker, 0x404110);
-        assert!(scheduler.child_waits_wait_only_on_held_children());
+        assert!(scheduler.child_waits_wait_only_on_stuck_children());
 
         // A child that has exited logically is reapable.
         scheduler
             .logically_exited_processes
             .insert(DetPid::from_raw(5));
-        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
         scheduler
             .logically_exited_processes
             .remove(&DetPid::from_raw(5));
@@ -27844,16 +27916,16 @@ mod test {
                 },
             ),
         );
-        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
 
         // A SIGKILL whose victim cannot be named disables settling for good.
         scheduler
             .blocked
             .child_waiters
             .insert(parent, (DetPid::from_raw(3), spec));
-        assert!(scheduler.child_waits_wait_only_on_held_children());
+        assert!(scheduler.child_waits_wait_only_on_stuck_children());
         scheduler.record_unresolved_sigkill(None);
-        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
 
         // Reaping a doomed process drops its record (last: reaping also drops
         // the child's wait entry).
@@ -27865,6 +27937,65 @@ mod test {
         assert!(scheduler.sigkilled_processes.contains(&DetPid::from_raw(5)));
         scheduler.consume_child_wait(DetPid::from_raw(3), DetPid::from_raw(5));
         assert!(!scheduler.sigkilled_processes.contains(&DetPid::from_raw(5)));
+    }
+
+    /// Without a happens-before runtime, a child wait settles on a child whose
+    /// only thread waits with no deadline or in a futex wait, and not on one
+    /// that could run (https://github.com/rrnewton/hermit/issues/4430).
+    #[test]
+    fn a_child_wait_settles_without_happens_before_on_a_paused_child() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        assert!(scheduler.happens_before.is_none());
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, child, true);
+        register_known_thread(&mut scheduler, child);
+        scheduler.blocked.child_waiters.insert(
+            parent,
+            (
+                DetPid::from_raw(3),
+                ChildWaitSpec {
+                    selector: ChildWaitSelector::Exact(DetPid::from_raw(5)),
+                    owner: None,
+                    exit_class: ChildWaitExitClass::Sigchld,
+                },
+            ),
+        );
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
+        // In rt_sigsuspend it runs the real call, which a host-timed signal
+        // can end, so it is not stuck.
+        scheduler
+            .blocked
+            .rt_sigsuspend_blockers
+            .insert(child, ExternalOpId::new(child, 1));
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
+        scheduler.blocked.rt_sigsuspend_blockers.clear();
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, child);
+        assert!(scheduler.child_waits_wait_only_on_stuck_children());
+        assert!(
+            scheduler
+                .describe_terminal_waiters()
+                .contains("thread(s) waiting for a child that cannot exit")
+        );
+        // A parent-death SIGKILL may still end it at a host-timed moment.
+        scheduler
+            .host_timed_signals
+            .insert(DetPid::from_raw(5), kernel_signal_bit(libc::SIGKILL));
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
+        scheduler.host_timed_signals.clear();
+        assert!(scheduler.child_waits_wait_only_on_stuck_children());
+        // On a backend that does not report every child, the wait may have
+        // one Detcore does not know of.
+        scheduler.complete_child_lineage = false;
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
+        scheduler.complete_child_lineage = true;
+        // A committed SIGKILL dooms it, so the wait will end.
+        scheduler.record_committed_sigkill(child, Some(DetPid::from_raw(5)));
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
     }
 
     /// A chain of child waits down to a held child is stuck: the root waits
@@ -27900,14 +28031,14 @@ mod test {
             .child_waiters
             .insert(middle, (DetPid::from_raw(5), any));
         // The leaf runs: nothing is stuck.
-        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
         scheduler
             .happens_before
             .as_mut()
             .unwrap()
             .parked
             .insert(leaf);
-        assert!(scheduler.child_waits_wait_only_on_held_children());
+        assert!(scheduler.child_waits_wait_only_on_stuck_children());
 
         // The middle process's wait matches no child: it may still end.
         scheduler.blocked.child_waiters.insert(
@@ -27920,19 +28051,19 @@ mod test {
                 },
             ),
         );
-        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
         scheduler
             .blocked
             .child_waiters
             .insert(middle, (DetPid::from_raw(5), any));
-        assert!(scheduler.child_waits_wait_only_on_held_children());
+        assert!(scheduler.child_waits_wait_only_on_stuck_children());
 
         // A second middle thread that could run keeps the root's wait open.
         scheduler
             .thread_tree
             .add_child(middle, middle_worker, false);
         register_known_thread(&mut scheduler, middle_worker);
-        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        assert!(!scheduler.child_waits_wait_only_on_stuck_children());
     }
 
     /// A process armed with PR_SET_PDEATHSIG(SIGKILL) is never stuck: the
@@ -27979,20 +28110,20 @@ mod test {
                 .unwrap()
                 .parked
                 .insert(held);
-            assert!(scheduler.child_waits_wait_only_on_held_children());
+            assert!(scheduler.child_waits_wait_only_on_stuck_children());
             let doomed = if armed == 7 { child } else { held };
             scheduler.record_host_timed_signals(
                 doomed,
                 HostTimedSignalScope::Caller,
                 kernel_signal_bit(libc::SIGTERM),
             );
-            assert!(scheduler.child_waits_wait_only_on_held_children());
+            assert!(scheduler.child_waits_wait_only_on_stuck_children());
             scheduler.record_host_timed_signals(
                 doomed,
                 HostTimedSignalScope::Caller,
                 kernel_signal_bit(libc::SIGKILL),
             );
-            assert!(!scheduler.child_waits_wait_only_on_held_children());
+            assert!(!scheduler.child_waits_wait_only_on_stuck_children());
         }
     }
 

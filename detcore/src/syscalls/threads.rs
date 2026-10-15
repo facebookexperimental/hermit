@@ -1713,23 +1713,41 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return refusal;
         }
-        let flags = clone_family.flags(&guest.memory());
-        let exit_signal = match clone_family {
+        // clone3's `struct clone_args` is read field by field
+        // (`clone3_field`): Reverie's whole-struct read fails for a valid
+        // 64-byte one at the end of a mapping, which lost its flags, exit
+        // signal and child tid address.
+        let (flags, exit_signal, child_tid) = match &clone_family {
+            syscalls::family::CloneFamily::Clone3(clone) => {
+                let memory = guest.memory();
+                (
+                    clone3_field(&memory, clone, 0)
+                        .map_or_else(CloneFlags::empty, CloneFlags::from_bits_truncate),
+                    clone3_field(&memory, clone, 32).map_or(0, |signal| signal as libc::c_int),
+                    clone3_field(&memory, clone, 16).map_or(0, |address| address as usize),
+                )
+            }
+            syscalls::family::CloneFamily::Clone(clone) => (
+                clone_family.flags(&guest.memory()),
+                (clone.flags().bits() & 0xff) as libc::c_int,
+                clone_family.child_tid(&guest.memory()),
+            ),
             #[cfg(not(target_arch = "aarch64"))]
-            syscalls::family::CloneFamily::Fork(_) | syscalls::family::CloneFamily::Vfork(_) => {
-                libc::SIGCHLD
-            }
-            syscalls::family::CloneFamily::Clone(clone) => {
-                (clone.flags().bits() & 0xff) as libc::c_int
-            }
-            syscalls::family::CloneFamily::Clone3(clone) => clone
-                .args()
-                .and_then(|address| guest.memory().read_value(address).ok())
-                .map_or(0, |args: syscalls::CloneArgs| {
-                    args.exit_signal as libc::c_int
-                }),
+            _ => (
+                clone_family.flags(&guest.memory()),
+                libc::SIGCHLD,
+                clone_family.child_tid(&guest.memory()),
+            ),
         };
-        let ctid = child_tid_clear_address(flags, clone_family.child_tid(&guest.memory()));
+        let ctid = child_tid_clear_address(flags, child_tid);
+        // Without sequentialized threads a sibling can run while this call
+        // does, and rewrite the clone's arguments after they are read here or
+        // the pidfd word before it is read back, so no pidfd is tracked then.
+        let pidfd_address = guest
+            .config()
+            .sequentialize_threads
+            .then(|| clone_pidfd_address(&clone_family, &guest.memory(), flags))
+            .flatten();
         // Only a CLONE_VFORK parent waits for its child. Every backend runs a
         // forked process child concurrently with its parent and dispatches a
         // cloned thread's syscalls through this tool.
@@ -1851,6 +1869,11 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if !is_vfork {
             create_child_thread(guest, child_dettid, ctid, Some(flags), exit_signal, None).await;
+        }
+
+        if let Some(address) = pidfd_address {
+            self.register_clone_pidfd(guest, address, child_dettid)
+                .await;
         }
 
         {
@@ -3333,6 +3356,74 @@ impl<T: RecordOrReplay> Detcore<T> {
             GuestPidAnswer::Untranslatable(reason) => reason,
         };
         Err(self.refuse_nested_pid(guest, sysno, &refusal).await)
+    }
+
+    /// Track the pidfd a `CLONE_PIDFD` clone wrote at `address` as
+    /// `pidfd_open`'s is tracked: a close-on-exec pidfd naming the new
+    /// process, `child`, so that `pidfd_send_signal`, `waitid(P_PIDFD)` and
+    /// the descriptor calls know it. Before, Detcore did not know the
+    /// descriptor, and `pidfd_send_signal` on it failed with EBADF
+    /// (https://github.com/rrnewton/hermit/issues/4430). The kernel installs it
+    /// in the caller's descriptor table after copying that table for the
+    /// child, so the child does not have it; the child's Detcore table was
+    /// copied while the clone ran, so the same holds there.
+    ///
+    /// Only a child that shares neither the caller's memory nor its
+    /// descriptor table, and is no vfork child, gets here
+    /// (`clone_pidfd_address`), and only with sequentialized threads: no other
+    /// task can then run between the kernel's clone and this, in the caller's
+    /// own turn, so neither the clone's arguments nor the word nor the
+    /// descriptor can change in between. The clone has
+    /// succeeded whatever happens here, so nothing here fails it: a pidfd
+    /// that cannot be tracked stays open and unknown to Detcore (EBADF through
+    /// it, as before), and the reason is logged.
+    async fn register_clone_pidfd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        address: usize,
+        child: DetTid,
+    ) {
+        let dettid = guest.thread_state().dettid;
+        let skip = |reason: String| {
+            tracing::error!(
+                "[detcore, dtid {}] the pidfd of CLONE_PIDFD child {} is not tracked: {}; pidfd \
+                 calls through it answer EBADF (https://github.com/rrnewton/hermit/issues/4430)",
+                dettid,
+                child,
+                reason,
+            );
+        };
+        let fd: libc::c_int = match Addr::<libc::c_int>::from_raw(address)
+            .map(|address| guest.memory().read_value(address))
+        {
+            Some(Ok(fd)) => fd,
+            // The kernel wrote it, or the clone would have failed with EFAULT;
+            // a task sharing the memory may have unmapped it since.
+            _ => return skip(format!("its word at {address:#x} cannot be read back")),
+        };
+        // The kernel has just allocated it, so a number Detcore already
+        // tracks means another thread of the caller rewrote the word.
+        if guest.thread_state().with_detfd(fd, |_| ()).is_ok() {
+            return skip(format!(
+                "its word names descriptor {fd}, which Detcore already tracks"
+            ));
+        }
+        if let Err(errno) = self
+            .track_held_fd(
+                guest,
+                fd,
+                nix::fcntl::OFlag::O_CLOEXEC,
+                crate::fd::FdType::Pidfd,
+            )
+            .await
+        {
+            return skip(format!("tracking descriptor {fd} failed with {errno}"));
+        }
+        if let Err(error) = guest.thread_state().with_detfd(fd, |detfd| {
+            detfd.set_pidfd_target(DetPid::from_raw(child.as_raw()))
+        }) {
+            skip(format!("descriptor {fd} has no Detcore entry: {error}"));
+        }
     }
 
     /// Refuse, by name and through the unsupported-operation policy, a
@@ -6958,4 +7049,59 @@ pub(crate) fn real_uid(tid: i32) -> Option<u32> {
         .next()?
         .parse()
         .ok()
+}
+
+/// The 8-byte field at `offset` of a clone3 call's `struct clone_args`,
+/// which may be any size the kernel accepts from 64 bytes (its first
+/// version) up: read alone, so that a shorter struct at the end of a mapping
+/// is read as the kernel reads it. `None` for a size below 64, a field past
+/// the size, or an unreadable field.
+fn clone3_field<M: MemoryAccess>(
+    memory: &M,
+    clone: &syscalls::Clone3,
+    offset: usize,
+) -> Option<u64> {
+    const CLONE_ARGS_SIZE_VER0: usize = 64;
+    if clone.size() < CLONE_ARGS_SIZE_VER0 || offset + 8 > clone.size() {
+        return None;
+    }
+    let base = clone.args()?.as_raw();
+    memory
+        .read_value(Addr::<u64>::from_raw(base + offset)?)
+        .ok()
+}
+
+/// Where a `CLONE_PIDFD` clone writes the new process's pidfd (`clone`'s
+/// `parent_tid` argument, or `clone3`'s `pidfd` field), for a child Detcore
+/// tracks the pidfd of (`Detcore::register_clone_pidfd`): one that shares
+/// neither the caller's memory nor its descriptor table and is no vfork
+/// child. Such a child could rewrite the word, or close or replace the
+/// descriptor, before the caller tracks it, and a vfork parent resumes, and
+/// tracks it, only after its child is done, while a sibling may already
+/// use the pidfd; Detcore leaves those pidfds untracked, as before
+/// https://github.com/rrnewton/hermit/issues/4430
+/// (https://github.com/rrnewton/hermit/issues/4443).
+fn clone_pidfd_address<M: MemoryAccess>(
+    clone_family: &syscalls::family::CloneFamily,
+    memory: &M,
+    flags: CloneFlags,
+) -> Option<usize> {
+    let (flags, address) = match clone_family {
+        syscalls::family::CloneFamily::Clone(clone) => {
+            (flags, clone.ptid().map(|ptid| ptid.as_raw()))
+        }
+        syscalls::family::CloneFamily::Clone3(clone) => (
+            flags,
+            Some(usize::try_from(clone3_field(memory, clone, 8)?).ok()?),
+        ),
+        #[cfg(not(target_arch = "aarch64"))]
+        _ => return None,
+    };
+    if !flags.contains(CloneFlags::CLONE_PIDFD)
+        || flags
+            .intersects(CloneFlags::CLONE_VM | CloneFlags::CLONE_FILES | CloneFlags::CLONE_VFORK)
+    {
+        return None;
+    }
+    address
 }

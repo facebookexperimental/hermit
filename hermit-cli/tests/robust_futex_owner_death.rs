@@ -1512,12 +1512,12 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // https://github.com/rrnewton/hermit/issues/4343, 0x15c
     // https://github.com/rrnewton/hermit/issues/4410, 0x15d /proc/uptime
     // rendered by Detcore for https://github.com/rrnewton/hermit/issues/4213,
-    // 0x15e https://github.com/rrnewton/hermit/issues/4370, 0x15f R2b-1 of
-    // https://github.com/rrnewton/hermit/issues/4273, 0x160 its revert),
-    // and a recording from before the change, 0x14f, is still refused by
-    // the exact-match gate.
+    // 0x15e https://github.com/rrnewton/hermit/issues/4370, 0x15f and 0x160
+    // R2b-1 of https://github.com/rrnewton/hermit/issues/4273 and its revert,
+    // 0x161 https://github.com/rrnewton/hermit/issues/4430), and a recording
+    // from before the change, 0x14f, is still refused by the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x160,
+        metadata["version"], 0x161,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);

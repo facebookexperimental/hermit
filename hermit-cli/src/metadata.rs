@@ -591,7 +591,13 @@ impl RecordVersion {
 // full-pipe case: 4096 of 4096+ written, Linux blocks and completes it). Pipe
 // calls woken by signals decide as they did at 0x15e; a 0x15f recording of
 // such a wake would replay to another result, so the version moves forward.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x160);
+// 0x160 -> 0x161 (taken at land time, HIGHEST_SHIPPED + 1; reserved as
+// 0x160): a pidfd from clone(CLONE_PIDFD) or clone3's pidfd field is tracked
+// as pidfd_open's is (https://github.com/rrnewton/hermit/issues/4430), so
+// pidfd_send_signal through it is forwarded and recorded where Detcore
+// answered EBADF without recording anything. An older recording holding such
+// a send would replay out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x161);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -616,7 +622,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x160);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x160;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x161;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1604,6 +1610,15 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_uptime_is_rendered() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15c)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x161 may hold a pidfd_send_signal through a
+    /// clone pidfd that Detcore answered EBADF unrecorded; it is now forwarded
+    /// and recorded (https://github.com/rrnewton/hermit/issues/4430).
+    #[test]
+    fn record_version_rejects_streams_from_before_clone_pidfds_are_known() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x160)));
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 

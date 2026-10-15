@@ -140,6 +140,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/child_wait_deadlock.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/child_wait_deadlock.c is owned by hermit-cli/tests/cli.rs: a parent waiting for a child that cannot exit (paused forever, in a futex wait no one wakes, or waiting for a paused grandchild) must end the run with Detcore's deadlock report rather than spin until the outer timeout, while a wait a sibling's kill or the child's alarm ends still completes as on Linux (https://github.com/rrnewton/hermit/issues/4430). It remains a fixture because the integration test checks exit codes and stderr per mode."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/chown_virtual_root_identity.c",
       "runner": "hermit-cli/tests/chown_virtual_root_identity.rs",
       "why": "tests/c/chown_virtual_root_identity.c is owned by hermit-cli/tests/chown_virtual_root_identity.rs: Guest asserting all three parts of the determinized chown-family contract -- a virtual root's ownership change succeeds for any uid, errors unrelated to identity (ENOENT, ordinary and O_PATH EBADF, ENOTDIR, and the fchownat flag EINVAL) still reach the guest, and validation does not mutate ownership, mode bits, or raw ctime. It is the behavioural bracket the syscall_classification unit tests cannot be: those pin set membership, and stay green when the dispatch arm's result regresses. The Rust integration test disables metadata virtualization and runs the guest under hermit in both namespace configurations. Driven only by its own integration test, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
@@ -191,6 +197,12 @@
       "path": "tests/c/clone_exit_signal_effective.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/clone_exit_signal_effective.c is owned by hermit-cli/tests/cli.rs: A CLONE_VFORK child created with SIGUSR1 that execs, and a CLONE_PARENT | SIGUSR1 grandchild, must be reaped by a plain waitpid and notify with SIGCHLD, because exec resets and CLONE_PARENT inherits the exit signal (https://github.com/rrnewton/hermit/issues/3895); the integration test runs both modes under run --strict --verify --verify-strict with the timeslice disabled. It remains a fixture because the generic manifest cannot run one guest in two modes with different expected outputs."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/clone_pidfd.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/clone_pidfd.c is owned by hermit-cli/tests/cli.rs: a pidfd from a fork-like clone(CLONE_PIDFD) or clone3's pidfd field must be a pidfd Detcore knows, so pidfd_send_signal through it kills the child, a polled waitid(P_PIDFD) reaps it, it is close-on-exec and the child lacks it, while CLONE_VM, vfork and CLONE_FILES clones, whose pidfds stay untracked, still run as on Linux (https://github.com/rrnewton/hermit/issues/4430). It remains a fixture because the integration test checks exit codes and stdout per mode, one of them at L2."
     },
     {
       "disposition": "manifest-test",

@@ -2638,6 +2638,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.add_fd_with_stat(guest, fd, flags, ty).await.map(drop)
     }
 
+    /// Track `fd`, which the guest already holds from a call that has
+    /// succeeded whatever happens here (a clone's pidfd), as [`Self::add_fd`]
+    /// does, except that a failure leaves the descriptor open and untracked
+    /// rather than closing it: the guest keeps what Linux gave it.
+    pub(crate) async fn track_held_fd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        flags: OFlag,
+        ty: FdType,
+    ) -> Result<(), Errno> {
+        let host_stat = if guest.config().virtualize_metadata {
+            Some(self.inject_fstat(guest, fd).await?)
+        } else {
+            None
+        };
+        guest
+            .thread_state()
+            .add_fd(fd, flags, ty, host_stat.map(Into::into))
+    }
+
     /// [`Self::add_fd`], also returning the host `fstat` it took of `fd`, which
     /// it takes only when metadata is virtualized.
     async fn add_fd_with_stat<G: Guest<Self>>(

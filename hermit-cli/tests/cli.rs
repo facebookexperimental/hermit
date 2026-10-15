@@ -202,6 +202,8 @@ static SIGSUSPEND_SHARED_MASK_REWRITE_GUEST: OnceLock<PathBuf> = OnceLock::new()
 static SIGSUSPEND_SHARED_STACK_MASK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_ONCE_PER_CHILD_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE3_SET_TID_REUSE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CLONE_PIDFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CHILD_WAIT_DEADLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_THEN_SIBLING_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_SPINNER_AND_NEW_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -2062,6 +2064,57 @@ fn chaos_spinner_and_new_thread_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "chaos-spinner-and-new-thread guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn clone_pidfd_guest() -> &'static Path {
+    CLONE_PIDFD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("clone-pidfd");
+        fs::create_dir_all(&build_root).expect("failed to create the clone-pidfd guest directory");
+        let guest = build_root.join("clone_pidfd");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/clone_pidfd.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the clone-pidfd guest");
+        assert!(
+            output.status.success(),
+            "clone-pidfd guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn child_wait_deadlock_guest() -> &'static Path {
+    CHILD_WAIT_DEADLOCK_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("child-wait-deadlock");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the child-wait-deadlock guest directory");
+        let guest = build_root.join("child_wait_deadlock");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/child_wait_deadlock.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the child-wait-deadlock guest");
+        assert!(
+            output.status.success(),
+            "child-wait-deadlock guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -29098,6 +29151,149 @@ fn clone3_set_tid_is_refused_for_an_id_a_task_already_had() {
         Some(true),
         "fresh: no bitwise parity over equal, nonzero INFO counts:\n{log}"
     );
+}
+
+/// A pidfd from `clone(CLONE_PIDFD)` or `clone3`'s pidfd field is a pidfd
+/// Detcore knows, as `pidfd_open`'s is: `pidfd_send_signal(SIGKILL)` through
+/// it kills the child, a polled `waitid(P_PIDFD)` reaps it, the pidfd is
+/// close-on-exec, and a child that does not share the descriptor table does
+/// not have it, all as on Linux (ptrace, `--strict`; the `clone` mode at L2).
+/// Before, `pidfd_send_signal` failed with EBADF and the run hung waiting for
+/// the child (https://github.com/rrnewton/hermit/issues/4430). The pidfd of a
+/// child sharing the caller's memory or descriptor table, or of a vfork
+/// child, is still untracked (https://github.com/rrnewton/hermit/issues/4443),
+/// but such clones run as on Linux: a vfork child (glibc's pidfd_spawn
+/// flags) and a CLONE_FILES child are created and reaped, and a vfork child
+/// that rewrites the pidfd word cannot make another descriptor (stdout) a
+/// pidfd.
+#[test]
+fn a_clone_pidfd_is_known_to_detcore() {
+    let guest = clone_pidfd_guest().to_str().unwrap().to_owned();
+    let run = |flags: &[&str], mode: &str| {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let verdict_arg = format!("--verify-json={}", verdict.display());
+        let mut argv = vec!["run", "--timeout", "60"];
+        argv.extend_from_slice(flags);
+        if flags.contains(&"--verify-strict") {
+            argv.push(verdict_arg.as_str());
+        }
+        argv.extend(["--", guest.as_str(), mode]);
+        let (status, log) = run_with_deadline(
+            hermit_command(&argv),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        let parity = fs::read(&verdict)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .map(|report| {
+                let compared = &report["compared_log_messages"];
+                report["bitwise_parity"] == true
+                    && compared["left"].as_u64().is_some_and(|count| count > 0)
+                    && compared["left"] == compared["right"]
+            });
+        (status.and_then(|status| status.code()), stdout, log, parity)
+    };
+    for (mode, expected) in [
+        ("clone3", "clone3: send 0, killed by 9\n"),
+        ("clone3v0", "clone3v0: send 0, killed by 9\n"),
+        ("waitid", "waitid: pid matches 1, code 1, status 5\n"),
+        ("flags", "cloexec 1, child status 7\n"),
+        ("vfork", "vfork: pidfd 1, status 4\n"),
+        (
+            "rewrite",
+            "rewrite: word 1, send -1 (Bad file descriptor), status 4\n",
+        ),
+        ("files", "files: pidfd 1, status 6\n"),
+    ] {
+        let (code, stdout, log, _) = run(&["--strict"], mode);
+        assert_eq!(code, Some(0), "{mode}: {stdout}\n{log}");
+        assert_eq!(stdout, expected, "{mode}: {log}");
+    }
+    let (code, stdout, log, parity) = run(&["--strict", "--verify", "--verify-strict"], "clone");
+    assert_eq!(code, Some(0), "clone: {stdout}\n{log}");
+    assert_eq!(stdout, "clone: send 0, killed by 9\n", "clone: {log}");
+    assert_eq!(
+        parity,
+        Some(true),
+        "clone: no bitwise parity over equal, nonzero INFO counts:\n{log}"
+    );
+}
+
+/// A parent waiting for a child that cannot exit (its only thread paused
+/// forever, waiting on a futex no one wakes, or itself waiting for a paused
+/// grandchild) ends the run with Detcore's deadlock report, exit 125, as the
+/// same child without the wait does. Before, the run spun until the outer
+/// timeout (https://github.com/rrnewton/hermit/issues/4430). The report is
+/// the same in two runs with the same epoch. A wait that can end (a second
+/// parent thread kills the child after a sleep; the child's alarm wakes it)
+/// still ends as on Linux (ptrace, `--strict`).
+#[test]
+fn a_wait_for_a_child_that_cannot_exit_is_a_deadlock() {
+    let guest = child_wait_deadlock_guest().to_str().unwrap().to_owned();
+    let run = |mode: &str| {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "run",
+                "--strict",
+                "--timeout",
+                "60",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        (status.and_then(|status| status.code()), stdout, log)
+    };
+    for (mode, class) in [
+        ("pause", "thread(s) waiting indefinitely"),
+        ("futex", "thread(s) waiting on futex"),
+        ("chain", "thread(s) waiting indefinitely"),
+    ] {
+        let (code, stdout, log) = run(mode);
+        assert_eq!(code, Some(125), "{mode}: {stdout}\n{log}");
+        assert!(
+            log.contains("Deadlock detected")
+                && log.contains(class)
+                && log.contains("thread(s) waiting for a child that cannot exit"),
+            "{mode}: the deadlock report must name the wait:\n{log}"
+        );
+    }
+    // The whole report: its headline through the blank line that ends it.
+    let report = |log: &str| {
+        log.lines()
+            .skip_while(|line| !line.contains("Deadlock detected"))
+            .take_while(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let (_, _, first) = run("chain");
+    let (_, _, second) = run("chain");
+    assert!(report(&first).len() > 2, "chain: no full report:\n{first}");
+    assert_eq!(
+        report(&first),
+        report(&second),
+        "chain: the deadlock report must not change between runs"
+    );
+    for (mode, expected) in [
+        ("killer", "killer: child signal 9\n"),
+        ("alarm", "alarm: child exit 3\n"),
+    ] {
+        let (code, stdout, log) = run(mode);
+        assert_eq!(code, Some(0), "{mode}: {stdout}\n{log}");
+        assert_eq!(stdout, expected, "{mode}: {log}");
+    }
 }
 
 /// A parent waiting in `pause()` for a child's `SIGCHLD` returns from it, as
