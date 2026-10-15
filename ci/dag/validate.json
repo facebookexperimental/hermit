@@ -22538,6 +22538,13 @@
           "category": "system-utils",
           "test": "system-utils/proc-uptime",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/proc-uptime",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -39380,6 +39387,13 @@
           "test": "system-utils/proc-random-uuid",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/proc-uptime",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -64074,6 +64088,13 @@
           "test": "system-utils/proc-random-uuid",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/proc-uptime",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
