@@ -22,8 +22,8 @@ use tracing::metadata::LevelFilter;
 use super::tracing::CappedWriter;
 use super::tracing::LogBudget;
 use super::tracing::TracingGuard;
-use super::tracing::init_file_tracing;
 use super::tracing::init_stderr_tracing;
+use super::tracing::init_sync_file_tracing;
 use super::tracing::log_max_bytes;
 use super::tracing::parse_max_log_bytes;
 
@@ -294,7 +294,7 @@ impl GlobalOpts {
                 .expect("cannot duplicate the host log file descriptor");
             let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
             let file_writer = CappedWriter::file(file_writer, limit, self.log_budget());
-            Some(init_file_tracing(self.log, file_writer))
+            Some(init_sync_file_tracing(self.log, file_writer, backend))
         } else if let Some(path) = &self.log_file {
             // An internal caller set the path directly rather than going through
             // `open_log_file` -- today that is verify's double-run setup, which
@@ -310,7 +310,7 @@ impl GlobalOpts {
             // re-enable it.
             let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
             let file_writer = CappedWriter::file(file_writer, limit, self.log_budget());
-            Some(init_file_tracing(self.log, file_writer))
+            Some(init_sync_file_tracing(self.log, file_writer, backend))
         } else {
             init_stderr_tracing(self.log, backend, self.log_budget());
             None
@@ -334,6 +334,79 @@ mod tests {
             unsafe_ignore_host_seccomp: false,
             backend: None,
         }
+    }
+
+    /// Names the log file `a_log_file_is_written_synchronously` gives the copy
+    /// of this test binary it starts.
+    const SYNCHRONOUS_LOG_CHILD_ENV: &str = "HERMIT_TEST_SYNCHRONOUS_LOG_FILE";
+
+    /// A `--log-file` log is synchronous: each line is in the file when the
+    /// call that logged it returns, and no queue can drop one. The
+    /// non-blocking queue it used before dropped lines once 128,000 were
+    /// waiting, which on a loaded host made run-to-run log comparisons report
+    /// divergences that were only missing lines
+    /// (https://github.com/rrnewton/hermit/issues/4427). The logger is global
+    /// and the log size bound reads the environment, so the check runs in a
+    /// fresh copy of this test binary
+    /// (`a_log_file_is_written_synchronously_in_its_own_process`), bounded by
+    /// `timeout`.
+    #[test]
+    fn a_log_file_is_written_synchronously() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("run.log");
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=5s", "60s"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "global_opts::tests::a_log_file_is_written_synchronously_in_its_own_process",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SYNCHRONOUS_LOG_CHILD_ENV, &path)
+            .env_remove(crate::tracing::LOG_MAX_BYTES_ENV)
+            .env_remove("RUST_LOG")
+            .output()
+            .unwrap();
+        let rendered = format!(
+            "status {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{rendered}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the check did not run:\n{rendered}"
+        );
+    }
+
+    /// The body of `a_log_file_is_written_synchronously`, which runs it alone
+    /// in its own process; run directly, it does nothing.
+    #[test]
+    #[ignore = "run by a_log_file_is_written_synchronously in its own process"]
+    fn a_log_file_is_written_synchronously_in_its_own_process() {
+        let Some(path) = std::env::var_os(SYNCHRONOUS_LOG_CHILD_ENV) else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let mut options = log_options(path.clone());
+        options.log = Some(::tracing::metadata::LevelFilter::INFO);
+        options.open_log_file().unwrap();
+        let guard = options
+            .init_tracing_for_backend(Backend::Ptrace)
+            .expect("a log file installs a guard");
+        assert!(
+            guard.is_synchronous(),
+            "the log file's guard keeps a writer thread"
+        );
+        ::tracing::info!("the line under test");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("the line under test"),
+            "the line was not in the file when info! returned:\n{written}"
+        );
     }
 
     #[test]

@@ -945,11 +945,23 @@ impl TracingGuard {
     fn synchronous() -> Self {
         Self { _worker: None }
     }
+
+    /// Whether the logger this guard keeps writes each line as it is logged,
+    /// with no queue to a writer thread that could drop it.
+    #[cfg(test)]
+    pub(crate) fn is_synchronous(&self) -> bool {
+        self._worker.is_none()
+    }
 }
 
-/// Returns a non-blocking subscriber for logging to a file.
+/// Returns a non-blocking subscriber for logging to a file: the
+/// `tracing_appender` subscriber every `--log-file` log used until
+/// <https://github.com/rrnewton/hermit/issues/4427>. Kept only for the test
+/// that pins the guest identity its writer thread gave the root guest
+/// (`align_tracing_pid_baseline`).
 ///
 /// NOTE: Writes to `f` are unbuffered, so this may be slow.
+#[cfg(test)]
 fn file_subscriber<W: Write + Send + 'static>(
     level: LevelFilter,
     f: W,
@@ -987,6 +999,15 @@ fn file_subscriber<W: Write + Send + 'static>(
 /// COST, measured rather than assumed, on a 477 KB verify log:
 /// synchronous 1.77s versus non-blocking 1.73s -- inside noise, identical
 /// output size. The queue was buying nothing and losing the diagnostic.
+///
+/// Every `--log-file` log is synchronous too
+/// (<https://github.com/rrnewton/hermit/issues/4427>). The non-blocking queue
+/// also DROPS a line, silently, once its 128,000 lines are full. A trace-level
+/// run of a small guest logs about 150,000 lines in seven seconds, so on a
+/// loaded host its writer fell behind and whole syscalls and scheduler commits
+/// vanished from the log at random points. Run-to-run log comparisons
+/// (`hermit log-diff`, `hermit-verify`) then reported the first gap as a
+/// divergence, with the recorded schedules identical.
 fn sync_file_subscriber<W: Write + Send + 'static>(level: LevelFilter, f: W) -> impl Subscriber {
     let filter = env_filter(level);
     tracing_subscriber::fmt()
@@ -1014,34 +1035,15 @@ pub fn init_sync_file_tracing<W: Write + Send + 'static>(
     TracingGuard::synchronous()
 }
 
-/// Initializes tracing to the given file `f`.
-///
-/// NOTE: Writes to `f` are unbuffered, so this may be slow.
-#[must_use = "This function returns a guard that should not be immediately dropped"]
-pub fn init_file_tracing<W: Write + Send + 'static>(
-    level: Option<LevelFilter>,
-    f: W,
-) -> TracingGuard {
-    let level = level.unwrap_or(DEFAULT_TRACE_LEVEL);
-
-    let (subscriber, guard) = file_subscriber(level, f);
-
-    subscriber
-        .try_init()
-        .expect("global tracing subscriber to install");
-
-    TracingGuard {
-        _worker: Some(guard),
-    }
-}
-
 /// Make the next guest task use the same identity as the asynchronous logger.
 ///
-/// `init_file_tracing` starts a nonblocking writer thread inside the fresh PID
-/// namespace. The namespace init is PID 1, that worker consumes PID 2, and the
-/// root guest consequently starts at [`detcore::ROOT_DETPID`] (PID 3). The
-/// synchronous and stderr subscribers have no worker, but their guests still
-/// need the same identity baseline.
+/// The non-blocking file subscriber that `--log-file` used until
+/// <https://github.com/rrnewton/hermit/issues/4427> (`file_subscriber`) started
+/// a writer thread inside the fresh PID namespace. The namespace init is PID 1,
+/// that worker consumed PID 2, and the root guest consequently started at
+/// [`detcore::ROOT_DETPID`] (PID 3). The synchronous file and stderr
+/// subscribers have no worker, but their guests still need the same identity
+/// baseline.
 ///
 /// Creating and joining a dummy host thread to consume PID 2 is not equivalent:
 /// the thread participates in the parent's signal/timer state and made KVM's
