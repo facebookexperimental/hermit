@@ -1128,6 +1128,12 @@ pub struct Scheduler {
     /// from removing a replacement image's descriptor.
     physical_thread_pidfds: BTreeMap<DetTid, (MmId, i32, i32, OwnedFd)>,
 
+    /// Whole-process observations owned by authenticated physical registration.
+    /// The Arc identity distinguishes reused PIDs even when CLONE_VM shares MmId.
+    process_exit_observation_enabled: bool,
+    process_exit_watches: BTreeMap<DetPid, Arc<ProcessExitWatch>>,
+    process_exit_watches_changed: Ivar<()>,
+
     /// The current set of actions in the background.
     #[allow(dead_code)]
     pub bg_action_pool: HashMap<ActionID, Action>,
@@ -2486,6 +2492,25 @@ impl Default for Backoff {
 
 pub(crate) type SchedulerObserver = Arc<dyn Fn(&'static str) + Send + Sync>;
 
+/// A process pidfd authenticates whole-group death without consuming wait status.
+#[derive(Debug)]
+pub(crate) struct ProcessExitWatch {
+    pub(crate) process: DetPid,
+    mm: MmId,
+    physical_pid: i32,
+    pidfd: OwnedFd,
+}
+
+impl ProcessExitWatch {
+    pub(crate) async fn wait(&self) -> std::io::Result<()> {
+        let fd = tokio::io::unix::AsyncFd::with_interest(
+            self.pidfd.try_clone()?,
+            tokio::io::Interest::READABLE,
+        )?;
+        fd.readable().await.map(|_| ())
+    }
+}
+
 pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<GlobalTime>>) {
     sched_loop_inner(sched, timer, false, None).await;
 }
@@ -3482,6 +3507,9 @@ impl Scheduler {
             turn: 0,
             next_turns: Default::default(),
             physical_thread_pidfds: Default::default(),
+            process_exit_observation_enabled: false,
+            process_exit_watches: Default::default(),
+            process_exit_watches_changed: Default::default(),
             bg_action_pool: Default::default(),
             committed_time: Default::default(),
             previous_turn_tid: None,
@@ -3643,6 +3671,17 @@ impl Scheduler {
         }
     }
 
+    /// Enable only when the owner also runs the internal process-exit observer.
+    /// External executors retain their existing descriptor and lifecycle policy.
+    pub(crate) fn enable_process_exit_observation(&mut self) {
+        assert!(self.physical_thread_pidfds.is_empty());
+        self.process_exit_observation_enabled = true;
+    }
+
+    /// With internal process observation enabled, the backend must complete
+    /// normal shared deregistration before physical exit. DBT does this before
+    /// its raw exit syscall; ptrace does not supply physical registrations here.
+    /// Pidfd readiness alone does not guarantee that a backend's exit hook ran.
     pub(crate) fn register_physical_thread(
         &mut self,
         dettid: DetTid,
@@ -3682,9 +3721,71 @@ impl Scheduler {
         }
         // SAFETY: pidfd_open returned a new descriptor owned by this process.
         let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) };
+        if self.process_exit_observation_enabled
+            && let Some(process) = self.registered_process(dettid)
+        {
+            let same_live_binding =
+                self.process_exit_watches
+                    .get(&process)
+                    .is_some_and(|watch| {
+                        watch.mm == mm
+                            && watch.physical_pid == physical_pid
+                            && self.physical_thread_pidfds.iter().any(
+                                |(tid, (known_mm, pid, ..))| {
+                                    self.registered_process(*tid) == Some(process)
+                                        && *known_mm == mm
+                                        && *pid == physical_pid
+                                },
+                            )
+                    });
+            if !same_live_binding {
+                let process_pidfd = crate::tool_global::open_process_pidfd(physical_pid)
+                    .ok_or_else(|| std::io::Error::other("cannot bind registered process pidfd"))?;
+                self.process_exit_watches.insert(
+                    process,
+                    Arc::new(ProcessExitWatch {
+                        process,
+                        mm,
+                        physical_pid,
+                        pidfd: process_pidfd,
+                    }),
+                );
+                std::mem::take(&mut self.process_exit_watches_changed).try_put(());
+            }
+        }
         self.physical_thread_pidfds
             .insert(dettid, (mm, physical_pid, physical_tid, pidfd));
         Ok(())
+    }
+
+    pub(crate) fn process_exit_watches(&self) -> (Vec<Arc<ProcessExitWatch>>, Ivar<()>) {
+        (
+            self.process_exit_watches
+                .values()
+                .filter(|watch| self.process_exit_watch_is_current(watch))
+                .cloned()
+                .collect(),
+            self.process_exit_watches_changed.clone(),
+        )
+    }
+
+    /// Called under the same mutex as registration, exec and deregistration.
+    /// Normal leader exit leaves this process watch alive for its siblings.
+    pub(crate) fn process_exit_watch_is_current(&self, watch: &Arc<ProcessExitWatch>) -> bool {
+        self.process_exit_watches
+            .get(&watch.process)
+            .is_some_and(|current| Arc::ptr_eq(current, watch))
+            && self.thread_tree.contains(&watch.process)
+            && self
+                .thread_tree
+                .my_thread_group(&watch.process)
+                .iter()
+                .any(|tid| self.thread_mm(*tid) == Some(watch.mm))
+    }
+
+    pub(crate) fn finish_process_exit_watch(&mut self, watch: &Arc<ProcessExitWatch>) {
+        assert!(self.process_exit_watch_is_current(watch));
+        self.process_exit_watches.remove(&watch.process);
     }
 
     /// The host process ID registered for `dettid`'s host thread, if any.
@@ -5762,6 +5863,13 @@ impl Scheduler {
         !unreported.is_empty()
     }
 
+    pub(crate) fn has_unreported_exit(&self, detpid: DetPid) -> bool {
+        self.thread_tree.contains(&detpid)
+            && self.thread_tree.my_thread_group(&detpid).iter().any(|tid| {
+                self.next_turns.contains_key(tid) && !self.deregistration_accounted.contains(tid)
+            })
+    }
+
     /// Release every physical-exit barrier after the backend supervisor has drained all tracees.
     pub(crate) fn release_all_physical_process_exits(&mut self) -> usize {
         // Nothing can report a publication once every tracee is drained.
@@ -6151,7 +6259,17 @@ impl Scheduler {
         );
         // Wakes only one thread, as per:
         // https://man7.org/linux/man-pages/man2/set_tid_address.2.html
-        self.wake_futex_waiters(dettid, futid, 1, u32::MAX);
+        if self.backend_failed() {
+            // Failure closed the selection transaction permanently. Account
+            // cleanup now: the stopped scheduler will never drain admissions,
+            // and no waiter can receive another grant.
+            assert!(!self.run_queue.tentative_pop_in_progress());
+            self.wake_futex_waiters(dettid, futid, 1, u32::MAX);
+        } else {
+            // Physical retirement can arrive during a tentative scheduler turn.
+            // Keep the same one-waiter choice, but admit it at the existing drain.
+            self.wake_futex_waiters_after_exit(&[(dettid, futid)]);
+        }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -13976,6 +14094,8 @@ mod test {
         let mm = MmId::initial(detpid);
         let physical_pid = std::process::id() as i32;
         let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        scheduler.thread_tree.add_child(dettid, dettid, true);
+        scheduler.record_thread_mm(dettid, mm);
 
         scheduler
             .register_physical_thread(dettid, mm, physical_pid, physical_tid)
@@ -13987,6 +14107,10 @@ mod test {
             (physical_pid, physical_tid)
         );
         assert!(pidfd.as_raw_fd() >= 0);
+        assert!(
+            scheduler.process_exit_watches.is_empty(),
+            "a scheduler without an internal observer must not open process watches"
+        );
 
         let conflicting = scheduler
             .register_physical_thread(dettid, mm, physical_pid, physical_tid + 1)
@@ -14026,6 +14150,46 @@ mod test {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(scheduler.physical_thread_pidfds.is_empty());
+    }
+
+    #[test]
+    fn process_exit_watch_survives_leader_exit_and_rejects_reused_identity() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.enable_process_exit_observation();
+        let leader = DetTid::from_raw(37);
+        let sibling = DetTid::from_raw(38);
+        let mm = MmId::initial(leader);
+        let physical_pid = std::process::id() as i32;
+        let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        let (handle, stop, other_tid) = spawn_host_thread_until_told();
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, sibling, false);
+        for (thread, physical) in [(leader, physical_tid), (sibling, other_tid)] {
+            register_known_thread(&mut scheduler, thread);
+            scheduler.record_thread_mm(thread, mm);
+            scheduler
+                .register_physical_thread(thread, mm, physical_pid, physical)
+                .unwrap();
+        }
+        let old = scheduler.process_exit_watches[&leader].clone();
+        scheduler.logically_kill_thread(&leader, &leader, mm);
+        assert!(scheduler.process_exit_watch_is_current(&old));
+        assert!(scheduler.next_turns.contains_key(&sibling));
+        scheduler.logically_kill_thread(&sibling, &leader, mm);
+        assert!(
+            scheduler.process_exit_watch_is_current(&old),
+            "normal death still needs cleanup"
+        );
+        register_known_thread(&mut scheduler, leader);
+        scheduler
+            .register_physical_thread(leader, mm, physical_pid, physical_tid)
+            .unwrap();
+        let replacement = scheduler.process_exit_watches[&leader].clone();
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        assert!(!scheduler.process_exit_watch_is_current(&old));
+        assert!(scheduler.process_exit_watch_is_current(&replacement));
+        stop.send(()).unwrap();
+        handle.join().unwrap();
     }
 
     /// A host thread that reports its TID and then waits until it is told to
@@ -14151,6 +14315,7 @@ mod test {
             }
         }
         let _reap = Reap(child);
+        let process_pidfd = crate::tool_global::open_process_pidfd(child).unwrap();
         let started = std::time::Instant::now();
         loop {
             let stat = std::fs::read(format!("/proc/{child}/task/{child}/stat")).unwrap();
@@ -14183,6 +14348,19 @@ mod test {
         assert!(scheduler.step2a_wait_for_exited_threads().is_ok());
         assert!(scheduler.exited_thread_barriers.is_empty());
         assert!(scheduler.terminal_deadlock.is_none());
+        let mut process_poll = libc::pollfd {
+            fd: process_pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut process_poll, 1, 0) },
+            0,
+            "leader-only exit is not whole-process death"
+        );
+        assert_eq!(unsafe { libc::kill(child, libc::SIGKILL) }, 0);
+        assert_eq!(unsafe { libc::poll(&mut process_poll, 1, 5000) }, 1);
+        assert_ne!(process_poll.revents & libc::POLLIN, 0);
     }
 
     /// An exit_group's grant ends every thread of the group, and the threads it
@@ -15675,6 +15853,7 @@ mod test {
             backend.requires_thread_directed_process_signals = true;
         });
         let mut sched = Scheduler::new(&config);
+        sched.enable_process_exit_observation();
         let leader = DetTid::from_raw(17);
         let caller = DetTid::from_raw(18);
         let detpid = DetPid::from_raw(leader.as_raw());
@@ -15694,6 +15873,7 @@ mod test {
         sched
             .register_physical_thread(leader, pre_exec_mm, physical_pid, physical_tid)
             .expect("old leader PIDFD_THREAD registration must succeed");
+        let old_process_watch = sched.process_exit_watches[&detpid].clone();
         sched
             .register_physical_thread(leader, post_exec_mm, physical_pid, physical_tid)
             .expect("post-exec PIDFD_THREAD registration must replace the old address space");
@@ -15716,6 +15896,8 @@ mod test {
             Some((post_exec_mm, physical_pid, physical_tid)),
             "old-leader cleanup must not remove the replacement leader's PIDFD_THREAD"
         );
+        assert!(!sched.process_exit_watch_is_current(&old_process_watch));
+        assert!(sched.process_exit_watch_is_current(&sched.process_exit_watches[&detpid]));
 
         sched.drain_pending_run_queue_removals();
         sched.drain_pending_run_queue_admissions();
@@ -24530,6 +24712,50 @@ mod test {
         assert!(!scheduler.note_deregistration_accounted(dead));
         // Consuming twice is a no-op.
         assert!(!scheduler.consume_unreported_exit(dead));
+    }
+
+    #[test]
+    fn unreported_exit_defers_clear_tid_wake_during_tentative_selection() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let anchor = DetTid::from_raw(5);
+        let dead = DetTid::from_raw(9);
+        let waiters = [11, 12].map(DetTid::from_raw);
+        let mm = MmId::initial(dead);
+        let address = 0x404100;
+        let futex = FutexID::private(mm, address);
+        for process in [anchor, dead, waiters[0]] {
+            scheduler.thread_tree.add_child(process, process, true);
+        }
+        scheduler
+            .thread_tree
+            .add_child(waiters[0], waiters[1], false);
+        for tid in [anchor, dead, waiters[0], waiters[1]] {
+            register_known_thread(&mut scheduler, tid);
+            scheduler.record_thread_mm(tid, mm);
+        }
+        // A CLONE_VM process can leave a clear-TID waiter in a different,
+        // surviving thread group that shares its address space.
+        scheduler.next_turns.get_mut(&dead).unwrap().child_tid_addr = address;
+        scheduler.runqueue_push_back(anchor);
+        scheduler.runqueue_push_back(dead);
+        for waiter in waiters {
+            scheduler.sleep_futex_waiter(&waiter, futex, None, u32::MAX, None);
+        }
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(anchor));
+        assert!(scheduler.consume_unreported_exit(dead));
+        assert!(scheduler.run_queue.tentative_pop_in_progress());
+        assert!(scheduler.child_tid_was_cleared(futex, dead.as_raw()));
+        assert!(scheduler.admission_pending(waiters[0]));
+        assert!(!scheduler.admission_pending(waiters[1]));
+        assert!(!scheduler.is_parked_futex_waiter(waiters[0]));
+        assert!(scheduler.is_parked_futex_waiter(waiters[1]));
+        scheduler.run_queue.undo_tentative_pop();
+        scheduler.drain_pending_run_queue_removals();
+        scheduler.drain_pending_run_queue_admissions();
+        assert_eq!(
+            scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+            vec![anchor, waiters[0]]
+        );
     }
 
     #[test]

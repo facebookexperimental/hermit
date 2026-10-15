@@ -2277,7 +2277,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from e45ad547: 1705.
     // And scheduler::test::a_background_reads_descriptor_replaced_before_it_runs_may_take_sigchld
     // (https://github.com/rrnewton/hermit/issues/4410): 1706, listed.
-    ("test.detcore_unit", 1706),
+    // And +4 from d8a99b5b: 1710.
+    ("test.detcore_unit", 1710),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3863,7 +3864,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the default-action classification and group-exit selection tests: 1704.
     // And +1 from e45ad547: 1705.
     // And the 4410 replaced-descriptor test: 1706, listed.
-    ("test.detcore_unit_on_host", 1706),
+    // And +4 from d8a99b5b: 1710.
+    ("test.detcore_unit_on_host", 1710),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
