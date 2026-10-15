@@ -31,6 +31,11 @@ pub const GUESTS_ENV: &str = "HERMIT_PREPARED_CARGO_GUESTS";
 pub const CPU_WRAPPER_ENV: &str = "HERMIT_NEXTEST_CPU_WRAPPER_BIN";
 const CPU_WRAPPER_PACKAGE: &str = "hermit-manifest-plan";
 const CPU_WRAPPER_TARGET: &str = "nextest-cpu-wrapper";
+/// Graph profiles whose CPU wrapper comes from the producer's unified build
+/// (`prepare_cpu_wrapper`). Not hosted-portable: .github/workflows/ci-portable.yml
+/// carries the wrapper between jobs at target/debug/nextest-cpu-wrapper, and
+/// ci/check-shard-coverage.sh pins that path.
+const UNIFIED_CPU_WRAPPER_PROFILES: &[&str] = &["full"];
 
 #[path = "../../cargo-guest-binaries.rs"]
 mod cargo_guests;
@@ -446,6 +451,13 @@ fn cpu_wrapper_artifact(
         if event["reason"] != "compiler-artifact" || event["target"]["name"] != CPU_WRAPPER_TARGET {
             continue;
         }
+        // An all-targets build (the unified selection, see prepare_cpu_wrapper)
+        // also compiles the bin's own unit tests under the same target name.
+        // That is not the wrapper; a build that reports no normal artifact
+        // still fails below.
+        if event["profile"]["test"] == true && event["package_id"] == package_id {
+            continue;
+        }
         if event["package_id"] != package_id
             || event["target"]["kind"] != serde_json::json!(["bin"])
             || event["profile"]["test"] != false
@@ -475,10 +487,31 @@ fn verify_cpu_wrapper(record: &PreparedRecord, cargo: &Value) -> Result<(), Stri
     Ok(())
 }
 
-fn prepare_cpu_wrapper(root: &Path, destination: &Path) -> Result<(), PreparationError> {
-    cargo_output(
-        root,
-        &[
+/// Build the nextest CPU wrapper, reporting its artifact in DESTINATION.
+///
+/// With UNIFIED (the Cargo profile and unified selection of a graph profile in
+/// UNIFIED_CPU_WRAPPER_PROFILES) the wrapper is built by the very command its
+/// producer already ran, so every unit is fresh and Cargo only reports them. Built on its own,
+/// `-p hermit-manifest-plan --bin nextest-cpu-wrapper` resolved features by
+/// itself in the dev profile and recompiled the package and its Reverie
+/// dependencies whenever the Reverie pin had moved, which is most runs: 25.96 s
+/// of build.workspace_in_pinned_root on the critical path of dfce652d
+/// (2026-10-15). See `unified_selection` for why separate selections rebuild.
+fn prepare_cpu_wrapper(
+    root: &Path,
+    destination: &Path,
+    unified: Option<(&str, &[String])>,
+) -> Result<(), PreparationError> {
+    let args = match unified {
+        Some((cargo_profile, selection)) => {
+            let mut args = ["build", "--locked", "--profile", cargo_profile]
+                .map(String::from)
+                .to_vec();
+            args.extend(selection.iter().cloned());
+            args.push("--message-format=json-render-diagnostics".into());
+            args
+        }
+        None => [
             "build",
             "--locked",
             "--message-format=json-render-diagnostics",
@@ -487,9 +520,10 @@ fn prepare_cpu_wrapper(root: &Path, destination: &Path) -> Result<(), Preparatio
             "--bin",
             CPU_WRAPPER_TARGET,
         ]
-        .map(String::from),
-        destination,
-    )
+        .map(String::from)
+        .to_vec(),
+    };
+    cargo_output(root, &args, destination)
 }
 
 /// Explicit standalone preparation. Official test consumers never call this.
@@ -507,7 +541,7 @@ pub fn build_cpu_wrapper(root: &Path) -> Result<PathBuf, PreparationError> {
     )?;
     let cargo = read_json(&cargo_path)?;
     let events = artifacts.root.join("standalone-cpu-wrapper.jsonl");
-    prepare_cpu_wrapper(&root, &events)?;
+    prepare_cpu_wrapper(&root, &events, None)?;
     Ok(cpu_wrapper_artifact(
         &fs::read_to_string(events).map_err(|e| e.to_string())?,
         &cargo,
@@ -1730,7 +1764,27 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         cargo_output(&root, &args, &guest_path)?;
     }
     let cpu_wrapper_path = generation.join("cpu-wrapper.jsonl");
-    prepare_cpu_wrapper(&root, &cpu_wrapper_path)?;
+    // Only a whole-workspace unified selection builds the wrapper's bin; a
+    // profile with a single selection is its own union and may not.
+    let unified = match cargo_profile {
+        Some(cargo_profile)
+            if unifies(profile) && UNIFIED_CPU_WRAPPER_PROFILES.contains(&profile) =>
+        {
+            let selection = unified_selection(&selections)?;
+            selection
+                .iter()
+                .any(|arg| arg == "--workspace")
+                .then_some((cargo_profile, selection))
+        }
+        _ => None,
+    };
+    prepare_cpu_wrapper(
+        &root,
+        &cpu_wrapper_path,
+        unified
+            .as_ref()
+            .map(|(cargo_profile, selection)| (*cargo_profile, selection.as_slice())),
+    )?;
     // Hash only after every Cargo selection has completed. Shared paths may be
     // rebuilt by another selection; every published record names the final files.
     let mut recorded_selections = BTreeMap::new();
@@ -2646,6 +2700,21 @@ mod tests {
         ] {
             assert!(cpu_wrapper_artifact(&bad, &cargo, &f.target).is_err());
         }
+        // An all-targets build also reports the bin's own unit-test build
+        // under the target name; the normal executable is still the one taken.
+        let mut unit_test: Value = serde_json::from_str(&events).unwrap();
+        unit_test["profile"] = serde_json::json!({"test": true});
+        unit_test["executable"] = serde_json::json!(f.target.join("deps/nextest_cpu_wrapper-0123"));
+        for listing in [
+            format!("{unit_test}\n{events}\n"),
+            format!("{events}\n{unit_test}\n"),
+        ] {
+            assert_eq!(
+                cpu_wrapper_artifact(&listing, &cargo, &f.target).unwrap(),
+                wrapper.executable
+            );
+        }
+        assert!(cpu_wrapper_artifact(&unit_test.to_string(), &cargo, &f.target).is_err());
         let mut ambiguous = cargo.clone();
         ambiguous["packages"]
             .as_array_mut()

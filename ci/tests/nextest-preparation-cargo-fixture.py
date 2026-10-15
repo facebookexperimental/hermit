@@ -188,18 +188,38 @@ elif (
         for binary in metadata["rust-binaries"].values()
     )
     print(json.dumps({"rust-suites": {}}))
-elif args[:1] == ["build"] and "hermit-manifest-plan" in args:
-    assert args == [
-        "build",
-        "--locked",
-        "--message-format=json-render-diagnostics",
-        "-p",
-        "hermit-manifest-plan",
-        "--bin",
-        "nextest-cpu-wrapper",
-    ], args
+elif args[:1] == ["build"] and (
+    "hermit-manifest-plan" in args or ("--workspace" in args and "--all-targets" in args)
+):
+    # The CPU wrapper: built by itself, or (validate-profile graph profiles) by
+    # the producer's unified workspace build, which also reports the bin's own
+    # unit-test build under the same target name.
+    unified = "--workspace" in args
+    if unified:
+        assert args[:4] == ["build", "--locked", "--profile", "validate"], args
+        assert args[-1] == "--message-format=json-render-diagnostics", args
+    else:
+        assert args == [
+            "build",
+            "--locked",
+            "--message-format=json-render-diagnostics",
+            "-p",
+            "hermit-manifest-plan",
+            "--bin",
+            "nextest-cpu-wrapper",
+        ], args
     mode = os.environ.get("CARGO_ARTIFACT_MODE", "current")
-    path = target / "debug" / "nextest-cpu-wrapper"
+    if unified and mode == "current":
+        unit_test = target / "validate" / "deps" / "nextest_cpu_wrapper-0123"
+        write_binary(unit_test)
+        print(json.dumps({
+            "reason": "compiler-artifact",
+            "package_id": package_id("hermit-manifest-plan"),
+            "target": {"name": "nextest-cpu-wrapper", "kind": ["bin"]},
+            "profile": {"test": True},
+            "executable": str(unit_test),
+        }))
+    path = target / ("validate" if unified else "debug") / "nextest-cpu-wrapper"
     if mode != "wrapper-missing":
         write_binary(path)
     event = {

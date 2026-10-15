@@ -30710,12 +30710,16 @@ output.chmod(0o755)
             },
             "record workload C compilations"
         );
+        // The full profile takes the wrapper from the producer's own unified
+        // validate build (prepare_cpu_wrapper), so that build is reported once
+        // more, exactly, and recompiles nothing.
+        let mut wrapper_build = ["build", "--locked", "--profile", "validate"]
+            .map(String::from)
+            .to_vec();
+        wrapper_build.extend(unified.iter().cloned());
+        wrapper_build.push("--message-format=json-render-diagnostics".into());
         assert_eq!(
-            calls
-                .iter()
-                .filter(|args| args.first().map(String::as_str) == Some("build")
-                    && args.iter().any(|a| a == "nextest-cpu-wrapper"))
-                .count(),
+            calls.iter().filter(|args| **args == wrapper_build).count(),
             1,
             "the normal measurement wrapper is built once, outside every test consumer"
         );
@@ -30753,10 +30757,11 @@ output.chmod(0o755)
             String::from_utf8_lossy(&wrapper_query.stderr)
         );
         let wrapper = PathBuf::from(String::from_utf8(wrapper_query.stdout).unwrap().trim());
+        // From the unified validate build (prepare_cpu_wrapper).
         assert_eq!(
             wrapper,
             root.path()
-                .join("custom-cargo-target/debug/nextest-cpu-wrapper")
+                .join("custom-cargo-target/validate/nextest-cpu-wrapper")
         );
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
