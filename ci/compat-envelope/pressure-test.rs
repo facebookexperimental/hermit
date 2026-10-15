@@ -16944,19 +16944,6 @@ fn self_test(root: &Path) -> Result<(), String> {
         );
     }
     let green_replay_results = scratch.join("green-replay-plan");
-    let green_replay_selection = CellSelection {
-        green: true,
-        mode: Some("replay".into()),
-        repetitions: Some(2),
-        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
-        ..CellSelection::default()
-    };
-    let (green_replay_metadata, _) = write_plan_after_scorecard_check(
-        &checked_scorecard,
-        &green_replay_results,
-        &green_replay_results.join("dag.json"),
-        &green_replay_selection,
-    )?;
     let expected_green_replay_ids: BTreeSet<_> = tracked
         .cells
         .iter()
@@ -16965,6 +16952,47 @@ fn self_test(root: &Path) -> Result<(), String> {
         })
         .map(|tracked| tracked.id.clone())
         .collect();
+    // This plan checks that an unsampled mode-only selection takes the whole
+    // live green replay population. That population grows whenever replay
+    // cells are enabled, so a fixed whole-run bound turned this selector check
+    // into a cap on the manifest: at 51417c0e the 34 green replay cells, at two
+    // repetitions, declared 9452s of occupancy at -j 2 against the 7200s
+    // default, and the plan was refused. The bound here is the population's
+    // own declared total, the sum of every run's outer timeout, which no
+    // guest width can exceed. The refusal of a plan that cannot fit its bound
+    // is checked separately, against fixed fixture budgets.
+    let green_replay_keys: BTreeSet<_> = expected_green_replay_ids
+        .iter()
+        .map(|id| (id.test.clone(), id.mode.clone(), id.backend.clone()))
+        .collect();
+    let green_replay_budgets = resolve_budgets(
+        load_budgets(root)?,
+        PressureTimeoutPolicy::from_env()?,
+        &green_replay_keys,
+    )?;
+    if green_replay_budgets.len() != green_replay_keys.len() {
+        return Err("a green replay cell has no manifest budget".into());
+    }
+    let mut green_replay_declared = 0_i64;
+    for budget in green_replay_budgets.values() {
+        green_replay_declared = pressure_timeout(budget, None)?
+            .checked_mul(2)
+            .and_then(|runs| green_replay_declared.checked_add(runs))
+            .ok_or("the green replay population's declared occupancy overflows")?;
+    }
+    let green_replay_selection = CellSelection {
+        green: true,
+        mode: Some("replay".into()),
+        repetitions: Some(2),
+        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS.max(green_replay_declared + 1)),
+        ..CellSelection::default()
+    };
+    let (green_replay_metadata, _) = write_plan_after_scorecard_check(
+        &checked_scorecard,
+        &green_replay_results,
+        &green_replay_results.join("dag.json"),
+        &green_replay_selection,
+    )?;
     let selected_green_replay_ids: BTreeSet<_> =
         green_replay_metadata.cells.iter().cloned().collect();
     if selected_green_replay_ids != expected_green_replay_ids

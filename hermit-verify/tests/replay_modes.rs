@@ -157,7 +157,15 @@ fn run_replay(binary: &Path, scenario: Option<&str>, mode: Mode) {
         .arg("--hermit-arg=--base-env=empty")
         .arg("--")
         .arg(binary)
-        .args(scenario);
+        .args(scenario)
+        // hermit-verify runs Hermit at --log=trace, where Reverie's timer
+        // logs a register dump for every instruction it single-steps to reach
+        // a preemption point. These modes compare DETLOG records, stdout,
+        // stderr, exit statuses and schedules, never those lines, and they
+        // dominated the cost: chaos_replay_rust_futex_and_print logged 219,878
+        // of them (133 MB) per run for 3 preemptions, and took 44-53 s on a
+        // debug build against nextest's 57 s limit; 16 s without them.
+        .env("RUST_LOG", "reverie_ptrace::timer=debug");
     let rendered = format!("{command:?}");
     let output = command
         .output()
