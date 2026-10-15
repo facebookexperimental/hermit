@@ -1577,7 +1577,8 @@ fi
 # KVM RPC-KEPT-FAILURE SDK-BUDGET CARRY (2026-10-15): advance from 4bfe8b8f to df6a4e5c30d7782141392e328e6a56bb368982ae (KVM keeps one RPC failure wait per thread instead of one per RPC; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # KVM SIGPIPE-PRIVATE-PIPE SDK-BUDGET CARRY (2026-10-15): advance from df6a4e5c to 1c514b58e8600d4bb003e5174b3d99e35b20d5dc (KVM skips the SIGPIPE check after a complete write to a guest-private pipe; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # KVM HYPERCALL-ADDRESS-MEMO SDK-BUDGET CARRY (2026-10-15): advance from 1c514b58 to a4d18df6d14a81ee6553ed4459f4172a92c7733a (KVM memoizes the syscall trampoline's hypercall offset per thread; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
-expected_pin=a4d18df6d14a81ee6553ed4459f4172a92c7733a
+# KVM LOADAVG-COPY-DELETION SDK-BUDGET CARRY (2026-10-15): advance from a4d18df6 to b5ff4dce018027502490fa4d8990bec3b143460c (deletes reverie-kvm's copy of /proc/loadavg, which Detcore renders; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
+expected_pin=b5ff4dce018027502490fa4d8990bec3b143460c
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
