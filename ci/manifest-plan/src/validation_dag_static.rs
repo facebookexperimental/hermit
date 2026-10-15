@@ -1556,7 +1556,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And metadata::tests::record_version_rejects_streams_from_before_reused_set_tid_is_refused
     // (https://github.com/rrnewton/hermit/issues/4370): 1089, listed.
     // And +1 from R2b-1 of https://github.com/rrnewton/hermit/issues/4273: 1090, listed.
-    ("test.hermit_unit", 1090),
+    // And +1 from 3fab1ec4: 1091.
+    ("test.hermit_unit", 1091),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4143,7 +4144,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And record_version_rejects_streams_from_before_uptime_is_rendered (https://github.com/rrnewton/hermit/issues/4213): 1088.
     // And the 4370 record-version test: 1089, listed.
     // And +1 from R2b-1 of https://github.com/rrnewton/hermit/issues/4273: 1090, listed.
-    ("test.hermit_unit_on_host", 1090),
+    // And +1 from 3fab1ec4: 1091.
+    ("test.hermit_unit_on_host", 1091),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

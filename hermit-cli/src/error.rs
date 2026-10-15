@@ -143,10 +143,15 @@ impl SerializableError {
 /// be the thing `kind` exists to avoid, and it would break the moment the message
 /// is reworded. This reaches through the one wrapper that hides the type.
 fn is_policy_refusal(err: &Error) -> bool {
-    if err
-        .chain()
-        .any(|cause| cause.is::<detcore::UnsupportedSyscallError>())
-    {
+    // Detcore's refusal of an unsupported syscall, and reverie-ptrace's end of
+    // a run in which the guest made a syscall through Reverie's untraced
+    // private-page stub, which no tool saw
+    // (https://github.com/rrnewton/reverie/issues/1064).
+    fn refuses(cause: &(dyn std::error::Error + 'static)) -> bool {
+        cause.is::<detcore::UnsupportedSyscallError>()
+            || cause.is::<reverie_ptrace::UntracedStubSyscall>()
+    }
+    if err.chain().any(refuses) {
         return true;
     }
     // The wrapper case: reverie hands the tool's error back inside `Tool`, whose
@@ -154,13 +159,10 @@ fn is_policy_refusal(err: &Error) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<reverie::Error>()
-            .and_then(|reverie_error| match reverie_error {
-                reverie::Error::Tool(inner) => {
-                    inner.downcast_ref::<detcore::UnsupportedSyscallError>()
-                }
-                _ => None,
+            .is_some_and(|reverie_error| match reverie_error {
+                reverie::Error::Tool(inner) => inner.chain().any(refuses),
+                _ => false,
             })
-            .is_some()
     })
 }
 
@@ -314,6 +316,33 @@ mod tests {
             refusal.error,
             "--backend=liteinst (in-guest LiteInst) refuses this run: guest program /static is \
              statically linked"
+        );
+    }
+
+    /// reverie-ptrace ends a run whose guest made a syscall through Reverie's
+    /// untraced private-page stub; that is a policy refusal (exit 122), not
+    /// an internal failure, both as the backend's primary cause and wrapped
+    /// (https://github.com/rrnewton/reverie/issues/1064).
+    #[test]
+    fn an_untraced_stub_syscall_is_a_policy_refusal() {
+        let refusal = || reverie_ptrace::UntracedStubSyscall {
+            tid: 7,
+            address: 0x7100_0002,
+        };
+        let primary = reverie::Error::Tool(Error::new(refusal()));
+        assert_eq!(
+            classify_ptrace_primary(&primary),
+            FailureKind::PolicyRefusal
+        );
+        let wrapped = Error::new(reverie::Error::Tool(Error::new(refusal())))
+            .context("the ptrace backend failed");
+        assert_eq!(classify_unwrapped(&wrapped), FailureKind::PolicyRefusal);
+        let serialized = SerializableError::from(Error::new(refusal()));
+        assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+        assert!(
+            serialized.error.contains("0x71000002"),
+            "{}",
+            serialized.error
         );
     }
 

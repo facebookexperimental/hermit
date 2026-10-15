@@ -261,6 +261,74 @@ fn open_fifo_writer(fifo: &Path, deadline: std::time::Instant) -> std::fs::File 
 /// 1 and `lines[1]` to run 2; before sending to run 1, it replaces `F` with
 /// an identical copy when `replace_in_run1` is set. Returns the input
 /// directory, stderr, and the typed report.
+/// [`verify_across_host_action`]'s setup for a run that hermit ends during run
+/// 1: run 1 gets `line`, and run 2 must never start. Returns hermit's exit
+/// status and stderr; fails fast if run 2 starts.
+pub fn verify_ended_in_run_1(
+    hermit: &Path,
+    name: &str,
+    guest: &str,
+    line: &str,
+) -> (Option<i32>, String) {
+    use std::io::Write;
+
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create test directory");
+    std::fs::write(root.join("F"), "input\n").expect("write F");
+    std::fs::write(root.join("A"), "input\n").expect("write A");
+    std::fs::write(root.join("B"), "input\n").expect("write B");
+    let fifo = root.join("fifo");
+    nix::unistd::mkfifo(
+        &fifo,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .expect("mkfifo");
+    let stderr_path = root.join("stderr");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create stderr file");
+    let mut child = Command::new("timeout")
+        .args(["--kill-after", "5s", "180s"])
+        .arg(hermit)
+        .arg("run")
+        .args(["--verify", "--verify-strict", "--verify-json"])
+        .arg(root.join("verify.json"))
+        .args([
+            "--base-env=minimal",
+            "--mount=type=tmpfs,target=/test",
+            "--workdir=/test",
+            "--",
+            "/bin/sh",
+            "-c",
+            guest,
+            "sh",
+        ])
+        .arg(&root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr_file)
+        .spawn()
+        .expect("failed to start hermit");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(170);
+    let mut writer = open_fifo_writer(&fifo, deadline);
+    writeln!(writer, "{line}").expect("send run 1 its line");
+    drop(writer);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll hermit") {
+            break status;
+        }
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        if stderr.contains("Run2") {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("run 2 started after run 1 should have ended the run:\n{stderr}");
+        }
+        assert!(std::time::Instant::now() < deadline, "hermit did not exit");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    (status.code(), stderr)
+}
+
 pub fn verify_across_host_action(
     hermit: &Path,
     global_args: &[&str],

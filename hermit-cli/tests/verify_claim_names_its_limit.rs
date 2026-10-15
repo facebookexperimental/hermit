@@ -339,24 +339,34 @@ fn a_guest_that_rebinds_the_path_itself_names_no_host_input_change() {
 
 /// A syscall issued from the untraced stub of Reverie's private page passes
 /// the ptrace backend unobserved, so a guest that rebinds `F` that way leaves
-/// no record of it. It cannot avoid the illegal instruction after the stub,
-/// and Detcore reports that SIGILL as a change it could not establish, so no
-/// host input change is named and the run stays a divergence.
+/// no record of it. Its forked child then takes the SIGILL of the `ud2` after
+/// the stub, and Reverie ends the run there with its named failure
+/// (`UntracedStubSyscall`, at 0x71000002), which hermit reports as a policy
+/// refusal: exit 122 in run 1, with no run 2 and no host input change named
+/// (https://github.com/rrnewton/reverie/issues/1064). Before that, Reverie
+/// delivered the SIGILL and the run went on to a divergence.
 #[test]
-fn a_rebinding_through_reverie_private_page_names_no_host_input_change() {
+fn a_rebinding_through_reverie_private_page_ends_the_run_with_a_refusal() {
     let guest = host_input::private_page_rebinding_guest(&host_input::python_interpreter());
-    let (_root, stderr, report) =
-        verify_across_host_action("host-input-private-page", &guest, false, ["go", "go"]);
+    let (status, stderr) = host_input::verify_ended_in_run_1(
+        Path::new(env!("CARGO_BIN_EXE_hermit")),
+        "host-input-private-page",
+        &guest,
+        "go",
+    );
     assert_eq!(
-        report.verdict,
-        hermit::canonical_verdict::Verdict::Diverged,
+        status,
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
         "{stderr}"
     );
-    assert_eq!(report.infrastructure_error, None, "{stderr}");
-    assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
+    assert!(
+        stderr.contains("untraced private-page stub") && stderr.contains("0x71000002"),
+        "the refusal must name the stub and its address:\n{stderr}"
+    );
+    assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGE"), "{stderr}");
 }
 
-/// [`a_rebinding_through_reverie_private_page_names_no_host_input_change`]
+/// [`a_rebinding_through_reverie_private_page_ends_the_run_with_a_refusal`]
 /// with the page changed first, as `rewrite` says, so that the stub returns
 /// and no SIGILL occurs. Detcore reports the change to the page, so no host
 /// input change is named and the run stays a divergence.
