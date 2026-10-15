@@ -609,10 +609,10 @@ jobs:
           echo "archive_count=$archive_count" >> "$GITHUB_OUTPUT"
           echo "Fanning out $count constructed portable E2E steps:" >&2
           jq -r '.include[] | "  - \(.node)"' <<<"$matrix" >&2
-      # build.workspace_on_host already builds detcore-dbt (in its
-      # feature-unified workspace build, after a `cargo build --locked --profile
-      # validate -p hermit-install` that publishes the DynamoRIO cache, both in the
-      # validate profile since the one-build change d44bbbb79ac) and then hashes
+      # build.workspace_on_host already builds detcore-dbt (its first command is
+      # `cargo build --locked --profile validate -p detcore-dbt`, followed by
+      # the feature-unified workspace build, both in the validate profile since
+      # the one-build change d44bbbb79ac) and then hashes
       # target/validate/deps/libdetcore_dbt.{so,rlib} into the prepared-Nextest
       # record as runtime files of every -p hermit and --workspace selection.
       # A step here used to re-run
