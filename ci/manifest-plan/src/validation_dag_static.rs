@@ -1527,7 +1527,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // start and reply, PKRU guards, AMX refusal; https://github.com/rrnewton/hermit/issues/4243): 1077, listed.
     // The floating-point write admission test became the launch-certificate
     // test, and the calibration-sum test was added: 1078, listed.
-    ("test.hermit_unit", 1078),
+    // And record_version_rejects_streams_from_before_per_process_levels (B3a-1,
+    // https://github.com/rrnewton/hermit/issues/4266): 1079, listed.
+    ("test.hermit_unit", 1079),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3959,7 +3961,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the probe-CPU choice test: 1070.
     // And the seven review-fix unit tests: 1077.
     // And the calibration-sum test: 1078.
-    ("test.hermit_unit_on_host", 1078),
+    // And the per-process-levels record-version test (B3a-1): 1079.
+    ("test.hermit_unit_on_host", 1079),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

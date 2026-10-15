@@ -99,6 +99,7 @@ fn read_procfs_at_epoch(path: &str, epoch: Option<&str>) -> Vec<u8> {
 /// (https://github.com/rrnewton/hermit/issues/4266); every other file is
 /// read at the default level.
 const STANDARD_LEVEL_FILES: &[&str] = &[
+    "/proc/1/io",
     "/proc/diskstats",
     "/proc/driver/rtc",
     "/proc/interrupts",

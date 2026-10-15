@@ -1791,7 +1791,7 @@ corpus:
     - {label: "uptime", argv: ["/usr/bin/uptime", "-p"]}
     - {label: "iostat", argv: ["/usr/bin/iostat", "-d", "-x", "1", "1"]}
     - {label: "vmstat-disk", argv: ["/usr/bin/vmstat", "-d", "1", "2"], proc: standard}
-    - {label: "pidstat-disk", argv: ["/usr/bin/pidstat", "-d", "-p", "1", "1", "1"]}
+    - {label: "pidstat-disk", argv: ["/usr/bin/pidstat", "-d", "-p", "1", "1", "1"], proc: standard}
     - {label: "findmnt", argv: ["/usr/bin/findmnt", "--fstab", "--tab-file", "{{ROOT_DIR}}/ci/compat/findmnt.fixture", "--nocanonicalize", "--list", "--output", "TARGET,SOURCE,FSTYPE,OPTIONS"]}
     - {label: "sysctl-random-uuid", argv: ["/usr/sbin/sysctl", "kernel.random.uuid"]}
     - {label: "sar-resource-tables", argv: ["/usr/bin/sar", "-v", "1", "1"], proc: standard}

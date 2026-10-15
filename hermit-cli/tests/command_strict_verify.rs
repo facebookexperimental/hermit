@@ -473,11 +473,23 @@ fn process_accounting_commands_are_deterministic_under_strict_verify() {
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + sysstat tools"]
 fn io_accounting_commands_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
-    let cases = [
+    let cases = [StrictCommandCase {
+        name: "iostat disk",
+        candidates: &["/usr/bin/iostat"],
+        args: &["-d", "-x", "1", "1"],
+        stdin: None,
+    }];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+
+    // These read names only the `standard` /proc level has.
+    let standard_cases = [
         StrictCommandCase {
-            name: "iostat disk",
-            candidates: &["/usr/bin/iostat"],
-            args: &["-d", "-x", "1", "1"],
+            name: "vmstat disk",
+            candidates: &["/usr/bin/vmstat"],
+            args: &["-d", "1", "2"],
             stdin: None,
         },
         StrictCommandCase {
@@ -487,18 +499,6 @@ fn io_accounting_commands_are_deterministic_under_strict_verify() {
             stdin: None,
         },
     ];
-
-    for case in &cases {
-        assert_l2_under_strict_verify(case);
-    }
-
-    // These read names only the `standard` /proc level has.
-    let standard_cases = [StrictCommandCase {
-        name: "vmstat disk",
-        candidates: &["/usr/bin/vmstat"],
-        args: &["-d", "1", "2"],
-        stdin: None,
-    }];
     for case in &standard_cases {
         assert_l2_under_strict_verify_at_standard(case);
     }

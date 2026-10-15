@@ -4445,18 +4445,28 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
         "/proc/sys/kernel/random/poolsize",
         "/proc/sys/fs/binfmt_misc",
         "/proc/sys/user",
+        "/proc/self/limits",
+        "/proc/self/attr",
+        "/proc/self/oom_score_adj",
+        "/proc/thread-self/wchan",
     ];
     let standard_only = [
         "/proc/interrupts",
         "/proc/sys/fs",
         "/proc/sys/fs/file-nr",
         "/proc/sys/kernel/random/entropy_avail",
+        "/proc/self/io",
     ];
     let minimal = [
         "/proc/version",
         "/proc/sys/kernel/osrelease",
         "/proc/sys/vm/overcommit_memory",
+        "/proc/self/status",
+        "/proc/self/task",
     ];
+    // KVM's own /proc refuses these level names: its directories, and the
+    // per-process files it does not serve (design note, slices B3 and B4).
+    let kvm_refuses = ["/proc/sys/fs", "/proc/self/task", "/proc/self/io"];
     // What KVM's own /proc (until slice B4 of
     // https://github.com/rrnewton/hermit/issues/4266 removes it) and its
     // missing inotify leave unchecked, which the guest names in its output.
@@ -4477,9 +4487,11 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
     }
     let expected = |level_is_minimal: bool, backend: &str, mode: Mode| {
         let kvm = backend == "kvm";
-        let standard = |path: &str| match (level_is_minimal, kvm && path == "/proc/sys/fs") {
+        let unchecked = "unchecked (KVM's own /proc refuses it)";
+        let refused = |path: &str| kvm && kvm_refuses.contains(&path);
+        let standard = |path: &str| match (level_is_minimal, refused(path)) {
             (true, _) => "absent",
-            (false, true) => "unchecked (KVM's own /proc refuses directories)",
+            (false, true) => unchecked,
             (false, false) => "present",
         };
         let mut lines = omitted
@@ -4490,8 +4502,15 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
                     .iter()
                     .map(|path| format!("{} {path}\n", standard(path))),
             )
-            .chain(minimal.iter().map(|path| format!("present {path}\n")))
+            .chain(minimal.iter().map(|path| {
+                format!(
+                    "{} {path}\n",
+                    if refused(path) { unchecked } else { "present" }
+                )
+            }))
             .collect::<String>();
+        lines
+            .push_str("a process's names by its pid, its threads and a descriptor: as the level\n");
         lines.push_str("creating, removing, renaming and linking: as Linux\n");
         lines.push_str("arguments and lookups in Linux's order: as Linux\n");
         lines.push_str("socket addresses: absent\n");
@@ -4499,11 +4518,12 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
             lines.push_str("unchecked: listings (no virtualized metadata)\n");
         }
         lines.push_str(if mode == Mode::Recorded {
-            "unchecked: listings, spellings through a link or `..`, datagram sends, a thread \
-             with its own descriptor table, chroot (record and replay)\n"
+            "unchecked: listings, spellings through a link or `..` of a name only root may \
+             open, datagram sends, a thread with its own descriptor table, chroot (record \
+             and replay)\n"
         } else if kvm {
-            "unchecked: listings, /proc as the working directory, renames and links (KVM's \
-             own /proc); stat sync flags (KVM's executor, \
+            "unchecked: listings, /proc as the working directory, process directory \
+             descriptors, renames and links (KVM's own /proc); stat sync flags (KVM's executor, \
              https://github.com/rrnewton/reverie/issues/1047); inotify, a thread with its \
              own descriptor table, chroot (no KVM support)\n"
         } else {

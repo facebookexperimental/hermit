@@ -130,6 +130,21 @@ where
     det_test_fn_sequential_without_pmu_with_post_fork(detcore::RunsPostFork::Child, f);
 }
 
+/// As [`det_test_fn_sequential_without_pmu`], at the `standard` /proc level,
+/// for a guest that reads a name only that level has.
+fn det_test_fn_sequential_without_pmu_at_standard<F>(f: F)
+where
+    F: Fn() + Send + Sync,
+{
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        proc_level: detcore_model::config::ProcLevel::Standard,
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(true, f, config, detcore_testutils::expect_success)
+}
+
 fn det_test_fn_sequential_without_pmu_with_post_fork<F>(runs_post_fork: detcore::RunsPostFork, f: F)
 where
     F: Fn() + Send + Sync,
@@ -315,7 +330,7 @@ fn prctl_keepcaps_round_trips_deterministically() {
 #[test]
 fn timer_slack_prctl_and_procfs_share_virtual_state() {
     const DEFAULT_TIMER_SLACK_NS: libc::c_int = 50_000;
-    det_test_fn_sequential_without_pmu(|| unsafe {
+    det_test_fn_sequential_without_pmu_at_standard(|| unsafe {
         assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), DEFAULT_TIMER_SLACK_NS);
 
         // Detcore exposes one guest scheduling policy (SCHED_OTHER). Even a
@@ -443,7 +458,7 @@ fn timer_slack_prctl_and_procfs_share_virtual_state() {
 
 #[test]
 fn timer_slack_procfs_vector_io_matches_linux() {
-    det_test_fn_sequential_without_pmu(|| unsafe {
+    det_test_fn_sequential_without_pmu_at_standard(|| unsafe {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -629,7 +644,7 @@ fn timer_slack_procfs_vector_io_matches_linux() {
 
 #[test]
 fn timer_slack_procfs_binds_target_at_open() {
-    det_test_fn_sequential_without_pmu(|| unsafe {
+    det_test_fn_sequential_without_pmu_at_standard(|| unsafe {
         const PARENT_SLACK_NS: libc::c_int = 1_000_000;
         assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, PARENT_SLACK_NS), 0);
 
@@ -728,6 +743,7 @@ fn timer_slack_is_mediated_under_passthru_opt() {
         max_timeslice: None,
         sequentialize_threads: true,
         passthru_opt: true,
+        proc_level: detcore_model::config::ProcLevel::Standard,
         ..Default::default()
     };
     detcore_testutils::det_test_fn_with_config(
@@ -795,6 +811,7 @@ fn timer_slack_virtual_state_is_isolated_from_physical_tracee() {
     let config = detcore::Config {
         max_timeslice: None,
         sequentialize_threads: true,
+        proc_level: detcore_model::config::ProcLevel::Standard,
         ..Default::default()
     };
     let runtime = tokio::runtime::Builder::new_current_thread()

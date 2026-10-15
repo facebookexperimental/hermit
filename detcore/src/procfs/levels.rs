@@ -9,13 +9,16 @@
 //! Which system-wide `/proc` names exist at each `--proc` level.
 //!
 //! A system-wide or `/proc/sys` name exists only if this table lists it, or
-//! lists a name below it; every other name is ENOENT and missing from
-//! listings, on every backend. Per-process names (`self`, `thread-self`,
-//! `<pid>` and everything below them, and the `net` link's targets) are not
-//! decided here yet: the kernel, or the KVM executor, still answers them.
-//! The table is the checklist in the dev-hermit design note
-//! `ai_docs/proc-virtualization-design.md` (section 5): its V and F
-//! system-wide entries, split into the two levels of its section 1b.
+//! lists a name below it; so does a name in a process's directory
+//! (`/proc/<pid>`, `/proc/self`) or a thread's (`/proc/<pid>/task/<tid>`,
+//! `/proc/thread-self`). Every other name is ENOENT and missing from
+//! listings, on every backend. Still not decided here, so still answered by
+//! the kernel or the KVM executor: whether a process or thread directory
+//! exists, the entries of `fd`, `fdinfo`, `ns` and `net`, what the `cwd`,
+//! `root` and `exe` links reach, and the few names Hermit's own tests and
+//! tools still need the kernel to answer ([`PROCESS_KERNEL`]). The table is the checklist in the
+//! dev-hermit design note `ai_docs/proc-virtualization-design.md` (section
+//! 5): its V and F entries, split into the two levels of its section 1b.
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -96,6 +99,64 @@ const STANDARD: &[&str] = &[
     "zoneinfo",
 ];
 
+/// The names in a process's directory at the `minimal` level. A thread's
+/// directory has the same names, except that Linux gives it no `task` (and
+/// gives `children` only to it), which the kernel then refuses itself.
+const PROCESS_MINIMAL: &[&str] = &[
+    "auxv",
+    "cgroup",
+    "cmdline",
+    "comm",
+    "cwd",
+    "environ",
+    "exe",
+    "fd",
+    "fdinfo",
+    "maps",
+    "mountinfo",
+    "mounts",
+    "net",
+    "ns",
+    "root",
+    "smaps",
+    "stat",
+    "statm",
+    "status",
+    "task",
+];
+
+/// The names `standard` adds to a process's or a thread's directory.
+const PROCESS_STANDARD: &[&str] = &[
+    "arch_status",
+    "children",
+    "io",
+    "numa_maps",
+    "sched",
+    "schedstat",
+    "smaps_rollup",
+    "timerslack_ns",
+];
+
+/// The names in a process's directory below which this table decides
+/// nothing: links that leave `/proc` (`cwd`, `root`, `exe`), the directories
+/// whose entries are a process's descriptors (`fd`, `fdinfo`), and `ns` and
+/// `net`, whose entries are not decided yet (design note, slices B3a and B3b).
+const PROCESS_UNDECIDED_BELOW: &[&str] = &["cwd", "exe", "fd", "fdinfo", "net", "ns", "root"];
+
+/// The names in a process's directory that the checklist omits but that
+/// stay the kernel's for now, because something Hermit runs needs the
+/// kernel's answer and Detcore does not serve one yet:
+/// - `mem`: Detcore's guard on writes through it, and its test
+///   (`verify_claim_names_its_limit`), rr's suite and debuggers;
+/// - `uid_map`: the DBT isolation test reads it in the guest
+///   (`run_dbt_binds_in_a_user_namespace_of_its_own`);
+/// - `gid_map`, `setgroups`: kept with `uid_map`, the files a user-namespace
+///   setup writes together, until Detcore models user namespaces. Their
+///   writers in this repository run before Hermit or stop at Detcore's
+///   refusal of `unshare` before writing, so nothing intercepted needs them
+///   yet (https://github.com/rrnewton/hermit/issues/4263).
+const PROCESS_KERNEL: &[&str] = &["gid_map", "mem", "setgroups", "uid_map"];
+
 /// What the table says about a path under `/proc`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcfsName {
@@ -143,7 +204,7 @@ pub(crate) fn procfs_name(path: &Path) -> Option<ProcfsName> {
         return Some(ProcfsName::From(ProcLevel::Minimal));
     };
     if *first == b"self" || *first == b"thread-self" || first.iter().all(u8::is_ascii_digit) {
-        return Some(ProcfsName::Undecided);
+        return Some(process_name(&names[1..]));
     }
     // Below the `net` and `mounts` links is the process's own directory.
     if names.len() > 1 && (*first == b"net" || *first == b"mounts") {
@@ -166,6 +227,36 @@ pub(crate) fn procfs_name(path: &Path) -> Option<ProcfsName> {
     } else {
         ProcfsName::Omitted
     })
+}
+
+/// What the table says about the names below a process's or a thread's
+/// directory.
+fn process_name(names: &[&[u8]]) -> ProcfsName {
+    let Some((first, rest)) = names.split_first() else {
+        // Whether the process or thread exists is the kernel's.
+        return ProcfsName::Undecided;
+    };
+    let is = |table: &[&str]| table.iter().any(|entry| entry.as_bytes() == *first);
+    if *first == b"task" {
+        return match rest.split_first() {
+            None => ProcfsName::From(ProcLevel::Minimal),
+            // A thread's directory and the names below it.
+            Some((tid, below)) if tid.iter().all(u8::is_ascii_digit) => process_name(below),
+            // `task` holds only threads.
+            Some(_) => ProcfsName::Omitted,
+        };
+    }
+    if (!rest.is_empty() && is(PROCESS_UNDECIDED_BELOW)) || is(PROCESS_KERNEL) {
+        return ProcfsName::Undecided;
+    }
+    // A name below a file stays the file's (the kernel's ENOTDIR).
+    if is(PROCESS_MINIMAL) {
+        ProcfsName::From(ProcLevel::Minimal)
+    } else if is(PROCESS_STANDARD) {
+        ProcfsName::From(ProcLevel::Standard)
+    } else {
+        ProcfsName::Omitted
+    }
 }
 
 /// Whether the entry `name` of the directory at the canonical path
@@ -222,9 +313,36 @@ mod tests {
             ("/proc/sys/net/ipv4/tcp_rmem", Omitted),
             ("/proc/versionx", Omitted),
             ("/proc/self", Undecided),
-            ("/proc/self/limits", Undecided),
-            ("/proc/thread-self/status", Undecided),
-            ("/proc/1/stat", Undecided),
+            ("/proc/thread-self", Undecided),
+            ("/proc/1", Undecided),
+            ("/proc/1/stat", From(Minimal)),
+            ("/proc/self/status", From(Minimal)),
+            ("/proc/thread-self/status", From(Minimal)),
+            ("/proc/self/task", From(Minimal)),
+            ("/proc/self/task/7", Undecided),
+            ("/proc/self/task/7/comm", From(Minimal)),
+            ("/proc/self/task/7/children", From(Standard)),
+            ("/proc/self/task/x", Omitted),
+            ("/proc/self/io", From(Standard)),
+            ("/proc/1/timerslack_ns", From(Standard)),
+            ("/proc/self/limits", Omitted),
+            ("/proc/self/mem", Undecided),
+            ("/proc/1/task/1/mem", Undecided),
+            ("/proc/thread-self/wchan", Omitted),
+            ("/proc/self/uid_map", Undecided),
+            ("/proc/self/setgroups", Undecided),
+            ("/proc/self/oom_score_adj", Omitted),
+            ("/proc/self/loginuid", Omitted),
+            ("/proc/1/task/1/attr/current", Omitted),
+            ("/proc/self/map_files", Omitted),
+            ("/proc/self/status/x", From(Minimal)),
+            ("/proc/self/fd", From(Minimal)),
+            ("/proc/self/fd/3", Undecided),
+            ("/proc/self/fdinfo/3", Undecided),
+            ("/proc/self/ns/pid", Undecided),
+            ("/proc/self/net/tcp", Undecided),
+            ("/proc/self/root/proc/kallsyms", Undecided),
+            ("/proc/self/cwd/x", Undecided),
             ("/proc/net/tcp", Undecided),
             ("/proc/mounts/x", Undecided),
             ("/proc/self/../kallsyms", Undecided),
@@ -293,7 +411,15 @@ mod tests {
             b"core_pattern",
             level
         ));
-        assert!(!absent_entry(Path::new("/proc/self"), b"limits", level));
+        assert!(absent_entry(Path::new("/proc/self"), b"limits", level));
+        assert!(!absent_entry(Path::new("/proc/42"), b"status", level));
+        assert!(absent_entry(
+            Path::new("/proc/42"),
+            b"io",
+            ProcLevel::Minimal
+        ));
+        assert!(!absent_entry(Path::new("/proc/42/task"), b"43", level));
+        assert!(!absent_entry(Path::new("/proc/42/fd"), b"3", level));
         assert!(!absent_entry(Path::new("/tmp"), b"kallsyms", level));
         assert!(absent_entry(proc, b"\xff", level));
     }

@@ -3347,7 +3347,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // classify the open by the link the recording read
                 // (`recorded_open_path`).
                 let mut procfs = ProcfsFile::from_path(&observed_path);
-                if procfs.is_none() {
+                // Under record and replay the link is read for every open,
+                // also one whose spelling classifies: a spelling through `..`
+                // (`/proc/self/../self/io`) classifies as the file it reaches,
+                // which may be outside the level.
+                if procfs.is_none() || self.cfg.recordreplay_modes {
                     let resolved = if self.cfg.recordreplay_modes {
                         self.recorded_open_path(guest, fd).await?
                     } else {
@@ -3355,19 +3359,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                     };
                     // Under record and replay, a `/proc` name outside the
                     // run's level that a spelling the lookup check does not
-                    // resolve reached, named by the link the recording read,
-                    // so both runs refuse it alike (outside record and replay
-                    // the check after the open above does it). Not after a
-                    // `chroot`, where `/proc` need not be procfs.
+                    // resolve reached, named by the link the recording read
+                    // (in the guest's view, also after a `chroot`), so both
+                    // runs refuse it alike (outside record and replay the
+                    // check after the open above does it). Only where the
+                    // recording saw that the descriptor is procfs: after a
+                    // `chroot`, or under a user bind, `/proc` need not be.
                     if self.cfg.recordreplay_modes
-                        && !guest
-                            .thread_state()
-                            .changed_root
-                            .load(std::sync::atomic::Ordering::SeqCst)
                         && resolved.as_deref().is_some_and(|resolved| {
                             levels::procfs_name(resolved)
                                 .is_some_and(|name| name.absent_at(self.cfg.proc_level))
                         })
+                        // And the descriptor is procfs, not a user bind over
+                        // part of `/proc`, as the recording saw it.
+                        && self.recorded_descriptor_is_on_procfs(guest, fd).await
                     {
                         guest.thread_state().remove_fd(fd);
                         let _ = self
@@ -3376,9 +3381,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                         resource_release_all(guest).await;
                         return Err(Errno::ENOENT.into());
                     }
-                    procfs = resolved
-                        .filter(|resolved| resolved != &observed_path)
-                        .and_then(|resolved| ProcfsFile::from_path(&resolved));
+                    if procfs.is_none() {
+                        procfs = resolved
+                            .filter(|resolved| resolved != &observed_path)
+                            .and_then(|resolved| ProcfsFile::from_path(&resolved));
+                    }
                 }
                 if procfs
                     .as_ref()
@@ -3954,8 +3961,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<Option<PathBuf>, Error> {
         const LINK_CAPACITY: usize = 32;
         const TARGET_CAPACITY: usize = 256;
-        let link_name =
-            rendered_procfs::c_string::<LINK_CAPACITY>(format!("/proc/self/fd/{fd}").as_bytes());
+        let link_name = rendered_procfs::c_string::<LINK_CAPACITY>(
+            format!("/proc/thread-self/fd/{fd}").as_bytes(),
+        );
         let mut stack = guest.stack().await;
         let link = stack.push(link_name);
         let target = stack.reserve::<[u8; TARGET_CAPACITY]>();
@@ -9592,25 +9600,51 @@ impl<T: RecordOrReplay> Detcore<T> {
         if self.cfg.recordreplay_modes {
             return;
         }
+        let link = format!("{}/fd/{fd}", self.caller_proc_directory(guest));
+        // Names are dropped as outside the level only from a directory the
+        // tool sees is on procfs: not from a user bind over part of `/proc`,
+        // and not where the tool cannot tell (its `/proc` entry for the
+        // caller is not the caller's where the guest's threads are no host
+        // tasks, KVM, or is unreadable after a `chroot`).
+        let tool_sees_caller =
+            crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend);
+        let on_procfs = match (
+            tool_sees_caller
+                .then(|| std::fs::metadata(&link).ok())
+                .flatten(),
+            rendered_procfs::proc_device(),
+        ) {
+            (Some(metadata), Some(device)) => metadata.dev() == device,
+            _ => false,
+        };
         // The kernel's path for the descriptor; or, where the tool cannot
         // read it (after a `chroot` into a root without `/proc`, where the
         // tool runs inside the guest), the path the guest opened it by.
-        let directory =
-            std::fs::read_link(format!("{}/fd/{fd}", self.caller_proc_directory(guest)))
+        let directory = std::fs::read_link(&link)
+            .ok()
+            .or_else(|| {
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.path())
+                    .ok()
+                    .flatten()
+            })
+            .filter(|path| path.is_absolute());
+        // After a `chroot` into another root, the kernel names the directory
+        // in the tool's view, below that root.
+        let directory = match (directory, self.guest_root_in_view(guest)) {
+            (Some(directory), Some(Some(root))) if !directory.starts_with("/proc") => directory
+                .strip_prefix(&root)
                 .ok()
-                .or_else(|| {
-                    guest
-                        .thread_state()
-                        .with_detfd(fd, |detfd| detfd.path())
-                        .ok()
-                        .flatten()
-                })
-                .filter(|path| path.is_absolute());
+                .map(|below| Path::new("/").join(below))
+                .or(Some(directory)),
+            (directory, _) => directory,
+        };
         if let Some(directory) = directory {
             let level = self.cfg.proc_level;
             entries.retain(|entry| {
                 !is_absent_cpu_entry(&directory, &entry.name)
-                    && !levels::absent_entry(&directory, &entry.name, level)
+                    && !(on_procfs && levels::absent_entry(&directory, &entry.name, level))
             });
         }
     }

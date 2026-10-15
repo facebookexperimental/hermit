@@ -517,7 +517,12 @@ impl RecordVersion {
 // (https://github.com/rrnewton/hermit/issues/4243). An older replayer would
 // ignore them and replay a v3 recording against the v2 table, so its guest
 // would see a different CPU.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x155);
+// 0x155 -> 0x156: a call that looks up a name in a process's or a thread's
+// directory outside the --proc level (limits, wchan, mem, attr, ...) is
+// issued with that name replaced by one procfs cannot hold, as for the
+// system-wide names at 0x152 (https://github.com/rrnewton/hermit/issues/4266).
+// An older recording holds the kernel's answer for the name itself.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x156);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -542,7 +547,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x155);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x155;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x156;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1546,6 +1551,14 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_cpu_profiles() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x154)));
+    }
+
+    /// A recording older than 0x156 holds the kernel's answers for the names
+    /// in a process's directory that Detcore now has the kernel answer as
+    /// missing (https://github.com/rrnewton/hermit/issues/4266).
+    #[test]
+    fn record_version_rejects_streams_from_before_per_process_levels() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x155)));
     }
 
     #[test]

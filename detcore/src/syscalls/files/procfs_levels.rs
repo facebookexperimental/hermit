@@ -161,10 +161,15 @@ fn looked_up(sysno: Sysno) -> Option<Lookups> {
 
 /// The prefix of the absolute `path` that ends at the first component the
 /// lookup finds absent at `level`, walking its normal components from the
-/// left, or `None` where it finds none absent. The walk stops, deciding
-/// nothing, at a `..` or at a per-process name (whose links the kernel
-/// resolves), and where a component it reaches, the absent one included, is
-/// longer than `NAME_MAX` (the kernel's ENAMETOOLONG comes first).
+/// left, or `None` where it finds none absent. A component the table leaves
+/// undecided (a process's or a thread's directory, an entry of `fd`) decides
+/// nothing but does not stop the walk: the names in a process's directory
+/// are decided whichever link (`self`, `thread-self`) reached it, and below
+/// a link out of `/proc` (`fd/N`, `cwd`, `root`, `exe`) every name stays
+/// undecided. The walk stops, deciding nothing, at a `..` (the kernel's to
+/// resolve, through any link before it), and where a component it reaches,
+/// the absent one included, is longer than `NAME_MAX` (the kernel's
+/// ENAMETOOLONG comes first).
 fn absent_prefix(path: &Path, level: detcore_model::config::ProcLevel) -> Option<PathBuf> {
     let mut components = path.components();
     if components.next() != Some(Component::RootDir) {
@@ -181,11 +186,8 @@ fn absent_prefix(path: &Path, level: detcore_model::config::ProcLevel) -> Option
             return None;
         }
         prefix.push(name);
-        match procfs_name(&prefix) {
-            None => {}
-            Some(ProcfsName::Undecided) => return None,
-            Some(name) if name.absent_at(level) => return Some(prefix),
-            Some(_) => {}
+        if procfs_name(&prefix).is_some_and(|name| name.absent_at(level)) {
+            return Some(prefix);
         }
     }
     None
@@ -353,8 +355,9 @@ struct Decision {
     /// The absolute path, in the guest's view, to give the kernel instead:
     /// up to the omitted name, which is replaced by dashes.
     substituted: Option<Vec<u8>>,
-    /// The path is a decided system-wide procfs name (not per-process).
-    system_wide: bool,
+    /// The path is a procfs name the table decides (not one it leaves to the
+    /// kernel, such as a process's directory or an entry of `fd`).
+    decided: bool,
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -362,7 +365,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// the run's level (see the module documentation), as the guest spelled
     /// it: absolute, relative to its working directory, or relative to a
     /// directory descriptor Detcore knows the path of. A spelling Detcore
-    /// cannot place, or one with `..` or a per-process name before the
+    /// cannot place, or one with `..` or a link out of `/proc` before the
     /// omitted one, is the kernel's to resolve; an open that so reaches such
     /// a name is refused once the kernel names what it opened, or, if it
     /// refused the open, once Detcore resolves the spelling (see
@@ -398,7 +401,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         }
                         None => Decision::default(),
                     };
-                    confined &= decision.system_wide;
+                    confined &= decision.decided;
                     if let Some(bytes) = decision.substituted {
                         replacements.push(Replacement {
                             argument: Some(path),
@@ -521,10 +524,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             None => observed.clone(),
             Some(root) => root.join(observed.strip_prefix("/").unwrap_or(&observed)),
         };
-        let system_wide = procfs_name(&in_view).is_some_and(|name| name != ProcfsName::Undecided);
-        let substituted = absent_prefix(&in_view, self.cfg.proc_level).and_then(|prefix| {
+        // The path the table judges, with procfs at `/proc`: the tool's view
+        // of the guest's path (also after a `chroot` into `/proc`), or, after
+        // a `chroot` into another root, the guest's own path, whose `/proc` is
+        // that root's (checked below to be procfs).
+        let guest_view = root.is_some() && procfs_name(&in_view).is_none();
+        let named = if guest_view { &observed } else { &in_view };
+        let to_tool = |path: &Path| match root {
+            Some(root) if guest_view => root.join(path.strip_prefix("/").unwrap_or(path)),
+            _ => path.to_path_buf(),
+        };
+        let decided = procfs_name(named).is_some_and(|name| name != ProcfsName::Undecided);
+        let substituted = absent_prefix(named, self.cfg.proc_level).and_then(|prefix| {
             let parent = prefix.parent()?;
-            let on_procfs = std::fs::metadata(parent)
+            let checked = self.parent_in_tool_view(guest, &to_tool(parent), root);
+            let on_procfs = std::fs::metadata(&checked)
                 .ok()
                 .is_some_and(|metadata| Some(metadata.dev()) == rendered_procfs::proc_device());
             if !on_procfs {
@@ -532,8 +546,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             // Back in the guest's view.
             let parent = match root {
-                None => parent.to_path_buf(),
-                Some(root) => Path::new("/").join(parent.strip_prefix(root).ok()?),
+                Some(root) if !guest_view => Path::new("/").join(parent.strip_prefix(root).ok()?),
+                _ => parent.to_path_buf(),
             };
             let name_length = prefix.file_name()?.len();
             let mut substituted = parent.as_os_str().as_bytes().to_vec();
@@ -544,7 +558,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // What follows the omitted name stays: the kernel's walk ends at
             // it, before them, but which name is the last decides how a call
             // treats it (rename looks up the last one's directory first).
-            let rest = in_view.strip_prefix(&prefix).ok()?;
+            let rest = named.strip_prefix(&prefix).ok()?;
             if !rest.as_os_str().is_empty() {
                 substituted.push(b'/');
                 substituted.extend_from_slice(rest.as_os_str().as_bytes());
@@ -557,8 +571,57 @@ impl<T: RecordOrReplay> Detcore<T> {
         });
         Decision {
             substituted,
-            system_wide,
+            decided,
         }
+    }
+
+    /// The directory the tool looks at to tell whether `parent`, the
+    /// directory of an omitted name in the tool's view of the guest's path,
+    /// is procfs (and not, say, a user bind over part of `/proc`). A process's
+    /// or a thread's directory is named for the guest: the tool's own `self`
+    /// is not the guest's, so `self` and `thread-self` become the calling
+    /// guest thread's pid and tid where those name host tasks the tool can
+    /// see. Where the tool runs on the guest's own thread (DBT), its view is
+    /// the guest's. Where the guest's threads are no host tasks (KVM), the
+    /// guest's process directory has no name in the tool's view, and the
+    /// guest's `/proc` itself is looked at. After a guest `chroot` to `root`,
+    /// the guest's `/proc` is `root`'s.
+    fn parent_in_tool_view<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        parent: &Path,
+        root: &Option<PathBuf>,
+    ) -> PathBuf {
+        let proc_root = match root {
+            None => PathBuf::from("/proc"),
+            Some(root) => root.join("proc"),
+        };
+        let Ok(below) = parent.strip_prefix(&proc_root) else {
+            return parent.to_path_buf();
+        };
+        let mut components = below.components();
+        let Some(first) = components.next() else {
+            return parent.to_path_buf();
+        };
+        let first = first.as_os_str().as_bytes();
+        let is_process =
+            first == b"self" || first == b"thread-self" || first.iter().all(u8::is_ascii_digit);
+        if !is_process || self.cfg.backend.tool_shares_guest_descriptor_table {
+            return parent.to_path_buf();
+        }
+        if !crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend) {
+            return proc_root;
+        }
+        let process = match first {
+            b"self" => proc_root.join(guest.pid().as_raw().to_string()),
+            b"thread-self" => proc_root.join(format!(
+                "{}/task/{}",
+                guest.pid().as_raw(),
+                guest.tid().as_raw()
+            )),
+            _ => proc_root.join(OsStr::from_bytes(first)),
+        };
+        process.join(components.as_path())
     }
 
     /// An `AF_UNIX` address naming the substituted path, if the address at
@@ -599,8 +662,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// nothing it did is Detcore's. With no room for the page, the call is
     /// refused with ENOENT unasked.
     ///
-    /// Where every path the call looks up is a decided system-wide procfs
-    /// name (`confined`), a refusal for permission is ENOENT: Linux's procfs
+    /// Where every path the call looks up is a procfs name the table decides
+    /// (`confined`), a refusal for permission is ENOENT: Linux's procfs
     /// directories are searchable, and its procfs lookup of a missing name
     /// fails with ENOENT before any permission is checked, so the refusal is
     /// the KVM executor's, which refuses what reaches procfs.
@@ -707,7 +770,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// where it cannot be known alike in record and replay (a `chroot` under
     /// record or replay, whose replay root is the replayer's own), or at all
     /// (the tool's `/proc` unreadable from inside the new root).
-    fn guest_root_in_view<G: Guest<Self>>(&self, guest: &G) -> Option<Option<PathBuf>> {
+    pub(crate) fn guest_root_in_view<G: Guest<Self>>(&self, guest: &G) -> Option<Option<PathBuf>> {
         if !guest
             .thread_state()
             .changed_root
@@ -782,10 +845,55 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         match visible.then(|| std::fs::read_link(&link)) {
             Some(Ok(path)) if path.is_absolute() => {
-                procfs_name(&path).is_some_and(|name| name.absent_at(self.cfg.proc_level))
+                let absent = |path: &Path| {
+                    procfs_name(path).is_some_and(|name| name.absent_at(self.cfg.proc_level))
+                };
+                // After a `chroot` into another root, the kernel names the
+                // file in the tool's view, below that root.
+                absent(&path)
+                    || matches!(self.guest_root_in_view(guest), Some(Some(root))
+                    if path.strip_prefix(&root).is_ok_and(|below| {
+                        absent(&Path::new("/").join(below))
+                    }))
             }
             _ => true,
         }
+    }
+
+    /// Whether the descriptor `fd` is on procfs, as the descriptor said in
+    /// the recording (`fstatfs` through the recording, into a transient
+    /// page), so record and replay decide alike. Where there is no page for
+    /// the question, `true`: the caller asks only about a descriptor whose
+    /// link names a `/proc` name outside the level, which is then refused
+    /// rather than admitted unasked (as a substituted call is).
+    /// Under record and replay, where the descriptor's link alone does not
+    /// show that it is procfs (a user bind over part of `/proc`).
+    pub(crate) async fn recorded_descriptor_is_on_procfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> bool {
+        const LENGTH: usize = std::mem::size_of::<libc::statfs>();
+        let Some(page) = map_transient(guest, LENGTH).await else {
+            return true;
+        };
+        let mut contents = [0u8; LENGTH];
+        let answered = self
+            .record_or_replay(
+                guest,
+                Syscall::from_raw(
+                    Sysno::fstatfs,
+                    raw_args([fd as usize, page.as_raw(), 0, 0, 0, 0]),
+                ),
+            )
+            .await
+            .is_ok()
+            && guest.memory().read_exact(page, &mut contents).is_ok();
+        unmap_transient(guest, page, LENGTH).await;
+        // `f_type` is the first field.
+        answered
+            && i64::from_ne_bytes(contents[..8].try_into().expect("8 bytes"))
+                == libc::PROC_SUPER_MAGIC
     }
 
     /// Whether the descriptor `fd` is on procfs, as the descriptor says
@@ -962,10 +1070,40 @@ mod tests {
             at("/proc/sysvipc/../version").as_deref(),
             Some("/proc/sysvipc")
         );
-        // A `..` or a per-process name first decides nothing.
+        // A `..` first decides nothing.
         assert_eq!(at("/proc/version/../kallsyms"), None);
         assert_eq!(at("/proc/self/../kallsyms"), None);
         assert_eq!(at("/proc/net/../status"), None);
+        // The names in a process's or a thread's directory are decided,
+        // whichever spelling reaches it; below a link out of /proc, none is.
+        assert_eq!(
+            at("/proc/self/limits").as_deref(),
+            Some("/proc/self/limits")
+        );
+        assert_eq!(
+            at("/proc/thread-self/attr/current").as_deref(),
+            Some("/proc/thread-self/attr")
+        );
+        assert_eq!(
+            at("/proc/1/task/1/limits").as_deref(),
+            Some("/proc/1/task/1/limits")
+        );
+        // A name still left to the kernel is not substituted.
+        assert_eq!(at("/proc/self/mem"), None);
+        assert_eq!(at("/proc/1/task/1/uid_map"), None);
+        assert_eq!(
+            at("/proc/1/task/1/wchan").as_deref(),
+            Some("/proc/1/task/1/wchan")
+        );
+        assert_eq!(at("/proc/self/status"), None);
+        assert_eq!(at("/proc/self/task/1/status"), None);
+        assert_eq!(at("/proc/self/fd/3/x"), None);
+        assert_eq!(at("/proc/self/root/proc/kallsyms"), None);
+        assert_eq!(at("/proc/self/cwd/limits"), None);
+        assert_eq!(
+            absent_prefix(Path::new("/proc/self/io"), ProcLevel::Minimal),
+            Some(PathBuf::from("/proc/self/io"))
+        );
         assert_eq!(at("/tmp/x"), None);
         assert_eq!(at("proc/kallsyms"), None);
         // A name longer than NAME_MAX that the lookup reaches first, or the

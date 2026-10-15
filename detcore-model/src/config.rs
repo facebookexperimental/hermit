@@ -839,8 +839,12 @@ pub struct Config {
     /// backend and host. `minimal` (the default) shows a small set, modelled
     /// on gVisor's; `standard` shows every system-wide name Detcore serves or
     /// plans to serve. A system-wide or `/proc/sys` name outside the chosen level
-    /// does not exist: lookups give ENOENT and listings leave it out.
-    /// Per-process names (`/proc/self`, `/proc/<pid>`) are not yet filtered.
+    /// does not exist: lookups give ENOENT and listings leave it out. So does
+    /// a name in a process's or a thread's directory, except a few that Hermit
+    /// still leaves to the kernel (`mem`, `uid_map`, `gid_map`, `setgroups`),
+    /// as are whether a process exists and the entries of its `fd`,
+    /// `fdinfo`, `ns` and `net`. A spelling through a symbolic link or `..` is
+    /// checked only when it opens a file.
     #[serde(default)]
     #[clap(
         long = "proc",

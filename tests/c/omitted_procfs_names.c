@@ -30,9 +30,11 @@
  *   (https://github.com/rrnewton/reverie/issues/1047), and the KVM backend
  *   does not implement inotify or chroot (ENOSYS), or a clone without
  *   CLONE_FILES (EINVAL). Those checks are skipped, and the output says so.
- *   --recorded: Hermit records and replays the run, where only the check
- *   before a call applies, so listings, spellings through a link or `..`,
- *   datagram sends, the thread and chroot checks are skipped.
+ *   --recorded: Hermit records and replays the run, where the check before
+ *   a call and the recorded link of an opened file apply, so listings,
+ *   spellings through a link or `..` of a name only root may open (refused
+ *   for permission before its link is read), datagram sends, the thread and
+ *   chroot checks are skipped.
  *   --chroot-into-proc: instead, chroot into /proc (a root in which /proc is
  *   not where Hermit's tool finds it) and check that omitted names are
  *   absent there, printing nothing.
@@ -95,6 +97,11 @@ static const char* const omitted[] = {
     "/proc/sys/kernel/random/poolsize",
     "/proc/sys/fs/binfmt_misc",
     "/proc/sys/user",
+    /* In a process's and a thread's directory. */
+    "/proc/self/limits",
+    "/proc/self/attr",
+    "/proc/self/oom_score_adj",
+    "/proc/thread-self/wchan",
 };
 
 /* Names in the standard level, not in minimal. */
@@ -103,6 +110,7 @@ static const char* const standard_only[] = {
     "/proc/sys/fs",
     "/proc/sys/fs/file-nr",
     "/proc/sys/kernel/random/entropy_avail",
+    "/proc/self/io",
 };
 
 /* Names in both levels. */
@@ -110,6 +118,8 @@ static const char* const minimal[] = {
     "/proc/version",
     "/proc/sys/kernel/osrelease",
     "/proc/sys/vm/overcommit_memory",
+    "/proc/self/status",
+    "/proc/self/task",
 };
 
 /* What a call that should have failed with ENOENT did instead. */
@@ -136,6 +146,13 @@ static int is_enoent(long result) {
       close((int)result_);                                      \
     }                                                           \
   } while (0)
+
+/* The omitted names only root may open, which the kernel refuses for
+ * permission before Detcore can see what a link or `..` reached. */
+static int refused_for_permission(const char* path) {
+  return strcmp(path, "/proc/kcore") == 0 ||
+      strcmp(path, "/proc/slabinfo") == 0;
+}
 
 /* Every lookup of `path` fails with ENOENT. */
 static void check_absent(const char* path, int kvm_local_procfs) {
@@ -175,10 +192,12 @@ static void check_absent(const char* path, int kvm_local_procfs) {
     ABSENT(open(relative, O_RDONLY), "open %s in /proc", relative);
     CHECK(chdir("/") == 0, "chdir /: %s", strerror(errno));
   }
-  if (recorded) {
+  /* What the kernel reaches through a link or `..`. Under record and
+   * replay a name the kernel refuses for permission is not named after the
+   * kernel refuses it, so it stays Linux's refusal there. */
+  if (recorded && refused_for_permission(path)) {
     return;
   }
-  /* What the kernel reaches through a link or `..`. */
   char dotdot[256];
   snprintf(dotdot, sizeof dotdot, "/proc/self/../%s", relative);
   ABSENT(open(dotdot, O_RDONLY), "open %s", dotdot);
@@ -192,14 +211,17 @@ static void check_absent(const char* path, int kvm_local_procfs) {
   unlink(link);
 }
 
-/* The directories among the level's names, which KVM's own /proc refuses. */
-static int names_a_directory(const char* path) {
-  return strcmp(path, "/proc/sys/fs") == 0;
+/* The level's names that KVM's own /proc refuses: its directories, and the
+ * per-process files it does not serve. */
+static int kvm_refuses(const char* path) {
+  return strcmp(path, "/proc/sys/fs") == 0 ||
+      strcmp(path, "/proc/self/task") == 0 ||
+      strcmp(path, "/proc/self/io") == 0;
 }
 
 /* `path` opens; returns whether it was checked. */
 static int check_present(const char* path, int kvm_local_procfs) {
-  if (kvm_local_procfs && names_a_directory(path)) {
+  if (kvm_local_procfs && kvm_refuses(path)) {
     return 0;
   }
   int fd = open(path, O_RDONLY);
@@ -398,6 +420,36 @@ static int chroot_into_proc(void) {
   return failures ? 1 : 0;
 }
 
+/* The names in a process's directory by its other spellings: its pid, a
+ * thread's directory below `task`, and a descriptor on the directory. */
+static void check_process_spellings(int kvm_local_procfs) {
+  char path[64];
+  snprintf(path, sizeof path, "/proc/%d/limits", (int)getpid());
+  ABSENT(open(path, O_RDONLY), "open %s", path);
+  ABSENT(access(path, F_OK), "access %s", path);
+  snprintf(path, sizeof path, "/proc/self/task/%ld/personality",
+      (long)syscall(SYS_gettid));
+  ABSENT(open(path, O_RDONLY), "open %s", path);
+  snprintf(path, sizeof path, "/proc/%d/status", (int)getpid());
+  int fd = open(path, O_RDONLY);
+  CHECK(fd >= 0, "open %s: %s", path, strerror(errno));
+  if (fd >= 0) {
+    close(fd);
+  }
+  if (kvm_local_procfs) {
+    return;
+  }
+  int dir = open("/proc/self", O_RDONLY | O_DIRECTORY);
+  CHECK(dir >= 0, "open /proc/self: %s", strerror(errno));
+  ABSENT(openat(dir, "limits", O_RDONLY), "openat /proc/self limits");
+  fd = openat(dir, "status", O_RDONLY);
+  CHECK(fd >= 0, "openat /proc/self status: %s", strerror(errno));
+  if (fd >= 0) {
+    close(fd);
+  }
+  close(dir);
+}
+
 /* Whether the listing of `directory` shows `name`; a directory that does
  * not exist shows nothing. */
 static int listed(const char* directory, const char* name) {
@@ -485,18 +537,23 @@ int main(int argc, char** argv) {
     }
     printf(
         "%s %s\n",
-        !checked ? "unchecked (KVM's own /proc refuses directories)"
+        !checked ? "unchecked (KVM's own /proc refuses it)"
                  : minimal_level ? "absent"
                                  : "present",
         path);
   }
   for (size_t i = 0; i < sizeof minimal / sizeof minimal[0]; i++) {
-    check_present(minimal[i], kvm_local_procfs);
+    int checked = check_present(minimal[i], kvm_local_procfs);
     if (!kvm_local_procfs && !kernel_listings && !recorded) {
       check_listed(minimal[i], 1);
     }
-    printf("present %s\n", minimal[i]);
+    printf(
+        "%s %s\n",
+        checked ? "present" : "unchecked (KVM's own /proc refuses it)",
+        minimal[i]);
   }
+  check_process_spellings(kvm_local_procfs);
+  printf("a process's names by its pid, its threads and a descriptor: as the level\n");
   check_changes(kvm_local_procfs);
   printf("creating, removing, renaming and linking: as Linux\n");
   check_linux_order(kvm_local_procfs);
@@ -508,15 +565,15 @@ int main(int argc, char** argv) {
   }
   if (recorded) {
     printf(
-        "unchecked: listings, spellings through a link or `..`, datagram "
-        "sends, a thread with its own descriptor table, chroot (record and "
-        "replay)\n");
+        "unchecked: listings, spellings through a link or `..` of a name only "
+        "root may open, datagram sends, a thread with its own descriptor "
+        "table, chroot (record and replay)\n");
     return failures ? 1 : 0;
   }
   if (kvm_local_procfs) {
     printf(
-        "unchecked: listings, /proc as the working directory, renames and "
-        "links (KVM's own /proc); stat sync flags (KVM's executor, "
+        "unchecked: listings, /proc as the working directory, process "
+        "directory descriptors, renames and links (KVM's own /proc); stat sync flags (KVM's executor, "
         "https://github.com/rrnewton/reverie/issues/1047); inotify, a thread "
         "with its own descriptor table, chroot (no KVM support)\n");
     return failures ? 1 : 0;

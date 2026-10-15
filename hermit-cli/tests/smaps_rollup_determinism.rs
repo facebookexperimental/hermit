@@ -37,6 +37,7 @@ fn assert_l2(case: &ProgramCase) {
             "--backend=ptrace",
             "run",
             "--strict",
+            "--proc=standard",
             "--verify",
             "--base-env=minimal",
             "--",
@@ -102,6 +103,7 @@ fn smaps_rollup_consumers_are_deterministic_under_strict_verify() {
             "--backend=ptrace",
             "run",
             "--strict",
+            "--proc=standard",
             "--base-env=minimal",
             "--",
         ])

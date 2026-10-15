@@ -681,11 +681,17 @@ fn workload(name: &str) -> &Workload {
 }
 
 fn record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
-    record_replay_command_with_policy(name, program, args, false);
+    record_replay_command_with_policy(name, program, args, false, &[]);
 }
 
 fn record_replay_strict_command(name: &str, program: &Path, args: &[&OsStr]) {
-    record_replay_command_with_policy(name, program, args, true);
+    record_replay_command_with_policy(name, program, args, true, &[]);
+}
+
+/// As [`record_replay_strict_command`], at the `standard` /proc level, for a
+/// workload that reads a name only that level has.
+fn record_replay_strict_command_at_standard(name: &str, program: &Path, args: &[&OsStr]) {
+    record_replay_command_with_policy(name, program, args, true, &["--proc=standard"]);
 }
 
 fn record_replay_command_with_policy(
@@ -693,6 +699,7 @@ fn record_replay_command_with_policy(
     program: &Path,
     args: &[&OsStr],
     verify_strict: bool,
+    record_args: &[&str],
 ) {
     let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
     let verdict = data_dir.path().join("verdict.json");
@@ -702,7 +709,8 @@ fn record_replay_command_with_policy(
         .env("HERMIT_MODE", "record")
         .args(["--kill-after=5s", "45s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["record", "start", "--verify"]);
+        .args(["record", "start", "--verify"])
+        .args(record_args);
     if verify_strict {
         command
             .args(["--strict", "--verify-strict"])
@@ -3547,7 +3555,7 @@ fn record_epoll_pwait2_checks_its_timeout_before_its_mask() {
 #[test]
 fn record_timer_slack_proc_read_write() {
     let _guard = hermit_record_lock();
-    record_replay_strict_command(
+    record_replay_strict_command_at_standard(
         "timer-slack-proc-read-write",
         &workload("c_timerslack_proc_record_replay").path,
         &[],
