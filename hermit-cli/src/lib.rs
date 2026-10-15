@@ -2637,7 +2637,18 @@ fn sabre_uninstrumented_guest_message(status: &ExitStatus) -> String {
 /// Guest-physical memory available to the single-process KVM personality.
 // The KVM personality is a sparse MAP_NORESERVE address space. QEMU needs room
 // for its own ELF mappings in addition to the nested machine's RAM mapping.
-const KVM_GUEST_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
+// reverie-kvm places every guest mapping in this window, even a PROT_NONE
+// reservation, so a runtime that reserves address space up front needs room
+// here: node's V8 reserves 256, 128 and then 512 MiB twice, which 1 GiB could
+// not hold (https://github.com/rrnewton/hermit/issues/4366). 3 GiB is the
+// largest window reverie-kvm's bootstrap identity-maps. The window costs the
+// host only the pages a guest touches, and mmap and munmap discard ranges of
+// 2 MiB or more rather than writing zeros over them
+// (https://github.com/rrnewton/reverie/pull/1059). madvise(MADV_DONTNEED)
+// still writes zeros over every page, and node calls it over its 512 MiB
+// reservation, so a node run peaks near 880 MB of host memory until that is
+// made lazy too (https://github.com/rrnewton/hermit/issues/4366).
+const KVM_GUEST_MEMORY_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
 /// Maximum `#!` interpreter indirection levels, matching the Linux kernel's
 /// `BINPRM_MAX_RECURSION` limit for chained script interpreters.

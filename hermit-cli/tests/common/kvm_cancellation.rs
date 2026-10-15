@@ -232,7 +232,8 @@ fn bounded_command_polling(
         .stderr(Stdio::piped())
         .process_group(0);
     // Limit the captured streams, not all file descriptors: RLIMIT_FSIZE also
-    // rejects the KVM backend's required 1 GiB anonymous memory backing file.
+    // rejects the KVM backend's required anonymous memory backing file (the
+    // KVM_GUEST_MEMORY_BYTES window).
     let start = Instant::now();
     let mut child = ProcessGroup {
         child: command.spawn().expect("start bounded command"),
