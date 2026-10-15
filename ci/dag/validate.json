@@ -6286,6 +6286,13 @@
           "category": "c-programs",
           "test": "c-programs/perf-event-software-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/perf-event-software-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -6315,6 +6322,13 @@
           "test": "c-programs/perf-event-software-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/perf-event-watchpoint-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -7393,6 +7407,13 @@
           "test": "c-programs/proc-locks",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/process-mrelease-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -7679,6 +7700,13 @@
           "category": "c-programs",
           "test": "c-programs/ptrace-eperm",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ptrace-eperm",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -7750,6 +7778,13 @@
           "test": "c-programs/ptrace-seize-eperm",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ptrace-traceme-eperm",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -8302,6 +8337,13 @@
           "category": "c-programs",
           "test": "c-programs/remap-file-pages-anonymous-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/remap-file-pages-anonymous-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -8331,6 +8373,13 @@
           "test": "c-programs/remap-file-pages-anonymous-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/remap-file-pages-memfd-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -8492,6 +8541,13 @@
           "test": "c-programs/renameat2-flags",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/request-key-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -33760,6 +33816,13 @@
           "category": "c-programs",
           "test": "c-programs/perf-event-software-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/perf-event-software-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -33774,6 +33837,13 @@
           "category": "c-programs",
           "test": "c-programs/perf-event-watchpoint-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/perf-event-watchpoint-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -34321,6 +34391,13 @@
           "test": "c-programs/proc-locks",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/process-mrelease-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -34467,6 +34544,13 @@
           "category": "c-programs",
           "test": "c-programs/ptrace-eperm",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ptrace-eperm",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -34496,6 +34580,13 @@
           "test": "c-programs/ptrace-seize-eperm",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ptrace-traceme-eperm",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -34775,6 +34866,13 @@
           "category": "c-programs",
           "test": "c-programs/remap-file-pages-anonymous-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/remap-file-pages-anonymous-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -34789,6 +34887,13 @@
           "category": "c-programs",
           "test": "c-programs/remap-file-pages-memfd-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/remap-file-pages-memfd-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -34860,6 +34965,13 @@
           "test": "c-programs/renameat2-flags",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/request-key-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -52740,6 +52852,13 @@
           "category": "c-programs",
           "test": "c-programs/perf-event-software-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/perf-event-software-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -52769,6 +52888,13 @@
           "test": "c-programs/perf-event-software-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/perf-event-watchpoint-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -53847,6 +53973,13 @@
           "test": "c-programs/proc-locks",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/process-mrelease-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -54133,6 +54266,13 @@
           "category": "c-programs",
           "test": "c-programs/ptrace-eperm",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ptrace-eperm",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -54204,6 +54344,13 @@
           "test": "c-programs/ptrace-seize-eperm",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ptrace-traceme-eperm",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -54756,6 +54903,13 @@
           "category": "c-programs",
           "test": "c-programs/remap-file-pages-anonymous-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/remap-file-pages-anonymous-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -54785,6 +54939,13 @@
           "test": "c-programs/remap-file-pages-anonymous-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/remap-file-pages-memfd-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -54946,6 +55107,13 @@
           "test": "c-programs/renameat2-flags",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/request-key-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
