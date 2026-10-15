@@ -1,0 +1,1739 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! Runs the C guest corpus of Hermit's internal Buck matrix through
+//! `hermit-verify trace-replay` and `hermit-verify chaos-replay`.
+//!
+//! Internally, `build_test` in fbsource's `hermetic_infra/hermit/tests/helpers.bzl`
+//! gives every `tests/c/*.c` guest a `chaosreplay`, a `tracereplay` and a
+//! `tracereplay_chaos` target. Each records one run's schedule and its
+//! preemptions and then replays them, so it covers the schedule recording and
+//! replay that race exposure and localization depend on. The flags below are
+//! those targets' own. The guest list is the internal `tests/c` glob, less
+//! `fp_reduction_nondeterminism.c` (excluded there too) and `dbi_mmap_exec.c`
+//! (not in this repository), with the internal exemptions: `vforkExec` has no
+//! trace replay, and `just_spin` has no chaotic trace replay. A guest whose
+//! `main` takes a scenario name runs once per scenario that stands alone; the
+//! exec target `pending-exec-check` and the deliberate deadlock
+//! `blocking-sigsuspend-no-signal` of `signal_determinism` do not.
+//!
+//! The internal `tests/rust` guests get the same three modes, with that
+//! matrix's exemptions: thread_random and poll_spin have no chaos replay;
+//! bind_connect_race, clock_total_order, exit_group, futex_and_print,
+//! futex_wake_some, poll_spin and thread_random have no trace replay; and the
+//! four print_*nanosleep*_race guests have no chaotic trace replay. They are
+//! this workspace's `rustbin_<name>` binaries (package
+//! hermetic_infra_hermit_tests), found beside `hermit-verify`.
+//!
+//! The Hermit binary is `HERMIT_BIN`, or the `hermit` built beside this
+//! package's `hermit-verify`. Both need the PMU and user and mount namespaces,
+//! as every Hermit integration test does.
+
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Output;
+
+/// Wall bound for one hermit-verify run, which runs Hermit twice.
+const VERIFY_TIMEOUT: &str = "240s";
+
+#[derive(Clone, Copy)]
+enum Mode {
+    ChaosReplay,
+    TraceReplay,
+    TraceReplayChaos,
+}
+
+impl Mode {
+    /// The internal target's hermit-verify arguments for this mode.
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            Mode::ChaosReplay => &["chaos-replay", "--isolate-workdir", "--hermit-arg=--chaos"],
+            Mode::TraceReplay => &["trace-replay", "--strip-times", "--isolate-workdir"],
+            Mode::TraceReplayChaos => &[
+                "trace-replay",
+                "--strip-times",
+                "--chaos",
+                "--isolate-workdir",
+            ],
+        }
+    }
+}
+
+fn repository() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-verify should be inside the repository")
+}
+
+fn hermit_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("HERMIT_BIN").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+    let sibling = Path::new(env!("CARGO_BIN_EXE_hermit-verify")).with_file_name("hermit");
+    assert!(
+        sibling.is_file(),
+        "no Hermit binary: set HERMIT_BIN, or build hermit beside {} (cargo build -p hermit)",
+        env!("CARGO_BIN_EXE_hermit-verify")
+    );
+    sibling
+}
+
+fn render(output: &Output) -> String {
+    fn tail(bytes: &[u8]) -> String {
+        const LIMIT: usize = 16 * 1024;
+        let start = bytes.len().saturating_sub(LIMIT);
+        String::from_utf8_lossy(&bytes[start..]).into_owned()
+    }
+    format!(
+        "status: {}\nstdout (tail):\n{}\nstderr (tail):\n{}",
+        output.status,
+        tail(&output.stdout),
+        tail(&output.stderr)
+    )
+}
+
+/// Compiles `tests/c/<guest>.c` into a directory of this test process's own.
+fn compile_guest(guest: &str, directory: &Path) -> PathBuf {
+    let source = repository().join("tests/c").join(format!("{guest}.c"));
+    let binary = directory.join(guest);
+    let output = Command::new("cc")
+        .args(["-O2", "-g", "-pthread", "-D_GNU_SOURCE", "-I"])
+        .arg(repository().join("tests/c"))
+        .arg("-o")
+        .arg(&binary)
+        .arg(&source)
+        .arg("-lm")
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start cc for {}: {error}", source.display()));
+    assert!(
+        output.status.success(),
+        "failed to compile {}:\n{}",
+        source.display(),
+        render(&output)
+    );
+    binary
+}
+
+/// The workspace's `rustbin_<guest>`, built beside `hermit-verify`.
+fn rust_guest(guest: &str) -> PathBuf {
+    let binary =
+        Path::new(env!("CARGO_BIN_EXE_hermit-verify")).with_file_name(format!("rustbin_{guest}"));
+    assert!(
+        binary.is_file(),
+        "{} is missing; build it with cargo build -p hermetic_infra_hermit_tests",
+        binary.display()
+    );
+    binary
+}
+
+fn run_replay_case(guest: &str, scenario: Option<&str>, mode: Mode) {
+    let directory = tempfile::Builder::new()
+        .prefix(&format!("replay-{guest}-"))
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let binary = compile_guest(guest, directory.path());
+    run_replay(&binary, scenario, mode);
+}
+
+fn run_rust_replay_case(guest: &str, mode: Mode) {
+    run_replay(&rust_guest(guest), None, mode);
+}
+
+fn run_replay(binary: &Path, scenario: Option<&str>, mode: Mode) {
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "10s", VERIFY_TIMEOUT])
+        .arg(env!("CARGO_BIN_EXE_hermit-verify"))
+        .arg("--hermit-bin")
+        .arg(hermit_binary())
+        .arg("--verbose")
+        .args(mode.args())
+        .arg("--hermit-arg=--base-env=empty")
+        .arg("--")
+        .arg(binary)
+        .args(scenario);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "{rendered} did not replay its recording\n{}",
+        render(&output)
+    );
+}
+
+macro_rules! rust_replay_case {
+    (#[ignore = $reason:literal] $name:ident, $guest:literal, $mode:expr) => {
+        #[test]
+        #[ignore = $reason]
+        fn $name() {
+            run_rust_replay_case($guest, $mode);
+        }
+    };
+    ($name:ident, $guest:literal, $mode:expr) => {
+        #[test]
+        fn $name() {
+            run_rust_replay_case($guest, $mode);
+        }
+    };
+}
+
+macro_rules! replay_case {
+    (#[ignore = $reason:literal] $name:ident, $guest:literal, $scenario:expr, $mode:expr) => {
+        #[test]
+        #[ignore = $reason]
+        fn $name() {
+            run_replay_case($guest, $scenario, $mode);
+        }
+    };
+    ($name:ident, $guest:literal, $scenario:expr, $mode:expr) => {
+        #[test]
+        fn $name() {
+            run_replay_case($guest, $scenario, $mode);
+        }
+    };
+}
+
+replay_case!(
+    chaos_replay_arch_prctl_determinism,
+    "arch_prctl_determinism",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_arch_prctl_determinism,
+    "arch_prctl_determinism",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_arch_prctl_determinism,
+    "arch_prctl_determinism",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_clock_determinism,
+    "clock_determinism",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_clock_determinism,
+    "clock_determinism",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_clock_determinism,
+    "clock_determinism",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(chaos_replay_clone, "clone", None, Mode::ChaosReplay);
+replay_case!(trace_replay_clone, "clone", None, Mode::TraceReplay);
+replay_case!(
+    trace_replay_chaos_clone,
+    "clone",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_epoll_determinism_multi,
+    "epoll_determinism",
+    Some("multi"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_epoll_determinism_edge,
+    "epoll_determinism",
+    Some("edge"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_epoll_determinism_oneshot,
+    "epoll_determinism",
+    Some("oneshot"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_epoll_determinism_mixed,
+    "epoll_determinism",
+    Some("mixed"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_epoll_determinism_nested,
+    "epoll_determinism",
+    Some("nested"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_epoll_determinism_control_fds,
+    "epoll_determinism",
+    Some("control-fds"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_epoll_determinism_dupfd,
+    "epoll_determinism",
+    Some("dupfd"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_epoll_determinism_multi,
+    "epoll_determinism",
+    Some("multi"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_epoll_determinism_edge,
+    "epoll_determinism",
+    Some("edge"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_epoll_determinism_oneshot,
+    "epoll_determinism",
+    Some("oneshot"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_epoll_determinism_mixed,
+    "epoll_determinism",
+    Some("mixed"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_epoll_determinism_nested,
+    "epoll_determinism",
+    Some("nested"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_epoll_determinism_control_fds,
+    "epoll_determinism",
+    Some("control-fds"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_epoll_determinism_dupfd,
+    "epoll_determinism",
+    Some("dupfd"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_epoll_determinism_multi,
+    "epoll_determinism",
+    Some("multi"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_epoll_determinism_edge,
+    "epoll_determinism",
+    Some("edge"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_epoll_determinism_oneshot,
+    "epoll_determinism",
+    Some("oneshot"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_epoll_determinism_mixed,
+    "epoll_determinism",
+    Some("mixed"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_epoll_determinism_nested,
+    "epoll_determinism",
+    Some("nested"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_epoll_determinism_control_fds,
+    "epoll_determinism",
+    Some("control-fds"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_epoll_determinism_dupfd,
+    "epoll_determinism",
+    Some("dupfd"),
+    Mode::TraceReplayChaos
+);
+replay_case!(chaos_replay_get_cpu, "getCpu", None, Mode::ChaosReplay);
+replay_case!(trace_replay_get_cpu, "getCpu", None, Mode::TraceReplay);
+replay_case!(
+    trace_replay_chaos_get_cpu,
+    "getCpu",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(chaos_replay_getpid, "getpid", None, Mode::ChaosReplay);
+replay_case!(trace_replay_getpid, "getpid", None, Mode::TraceReplay);
+replay_case!(
+    trace_replay_chaos_getpid,
+    "getpid",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_getsockopt_null,
+    "getsockopt_null",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_getsockopt_null,
+    "getsockopt_null",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_getsockopt_null,
+    "getsockopt_null",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_hello_alarm,
+    "hello_alarm",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_hello_alarm,
+    "hello_alarm",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_hello_alarm,
+    "hello_alarm",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_hello_signals,
+    "hello_signals",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_hello_signals,
+    "hello_signals",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_hello_signals,
+    "hello_signals",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_io_uring_fallback,
+    "io_uring_fallback",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_io_uring_fallback,
+    "io_uring_fallback",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_io_uring_fallback,
+    "io_uring_fallback",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_ioctl_fioclex,
+    "ioctl_fioclex",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_ioctl_fioclex,
+    "ioctl_fioclex",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_ioctl_fioclex,
+    "ioctl_fioclex",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_ioctl_siocethtool,
+    "ioctl_siocethtool",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_ioctl_siocethtool,
+    "ioctl_siocethtool",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_ioctl_siocethtool,
+    "ioctl_siocethtool",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_ipc_determinism_pipe_order,
+    "ipc_determinism",
+    Some("pipe-order"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_ipc_determinism_pipe_capacity,
+    "ipc_determinism",
+    Some("pipe-capacity"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_ipc_determinism_socketpair,
+    "ipc_determinism",
+    Some("socketpair"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_ipc_determinism_eventfd,
+    "ipc_determinism",
+    Some("eventfd"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_ipc_determinism_epoll,
+    "ipc_determinism",
+    Some("epoll"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_ipc_determinism_pipe_order,
+    "ipc_determinism",
+    Some("pipe-order"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_ipc_determinism_pipe_capacity,
+    "ipc_determinism",
+    Some("pipe-capacity"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_ipc_determinism_socketpair,
+    "ipc_determinism",
+    Some("socketpair"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_ipc_determinism_eventfd,
+    "ipc_determinism",
+    Some("eventfd"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_ipc_determinism_epoll,
+    "ipc_determinism",
+    Some("epoll"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_ipc_determinism_pipe_order,
+    "ipc_determinism",
+    Some("pipe-order"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_ipc_determinism_pipe_capacity,
+    "ipc_determinism",
+    Some("pipe-capacity"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_ipc_determinism_socketpair,
+    "ipc_determinism",
+    Some("socketpair"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_ipc_determinism_eventfd,
+    "ipc_determinism",
+    Some("eventfd"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_ipc_determinism_epoll,
+    "ipc_determinism",
+    Some("epoll"),
+    Mode::TraceReplayChaos
+);
+replay_case!(chaos_replay_just_spin, "just_spin", None, Mode::ChaosReplay);
+replay_case!(trace_replay_just_spin, "just_spin", None, Mode::TraceReplay);
+replay_case!(
+    chaos_replay_madvise_determinism,
+    "madvise_determinism",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_madvise_determinism,
+    "madvise_determinism",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_madvise_determinism,
+    "madvise_determinism",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_memory_press,
+    "memoryPress",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_memory_press,
+    "memoryPress",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_memory_press,
+    "memoryPress",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_mmap_determinism_multiple,
+    "mmap_determinism",
+    Some("multiple"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_mmap_determinism_fixed,
+    "mmap_determinism",
+    Some("fixed"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_mmap_determinism_heap,
+    "mmap_determinism",
+    Some("heap"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_mmap_determinism_shared,
+    "mmap_determinism",
+    Some("shared"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_mmap_determinism_reuse,
+    "mmap_determinism",
+    Some("reuse"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_mmap_determinism_multiple,
+    "mmap_determinism",
+    Some("multiple"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_mmap_determinism_fixed,
+    "mmap_determinism",
+    Some("fixed"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_mmap_determinism_heap,
+    "mmap_determinism",
+    Some("heap"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_mmap_determinism_shared,
+    "mmap_determinism",
+    Some("shared"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_mmap_determinism_reuse,
+    "mmap_determinism",
+    Some("reuse"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_mmap_determinism_multiple,
+    "mmap_determinism",
+    Some("multiple"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_mmap_determinism_fixed,
+    "mmap_determinism",
+    Some("fixed"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_mmap_determinism_heap,
+    "mmap_determinism",
+    Some("heap"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_mmap_determinism_shared,
+    "mmap_determinism",
+    Some("shared"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_mmap_determinism_reuse,
+    "mmap_determinism",
+    Some("reuse"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    chaos_replay_nanosleep_par,
+    "nanosleep-par",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_nanosleep_par,
+    "nanosleep-par",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_nanosleep_par,
+    "nanosleep-par",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_ppoll_readv,
+    "ppoll_readv",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_ppoll_readv,
+    "ppoll_readv",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_ppoll_readv,
+    "ppoll_readv",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    chaos_replay_ppoll_simulation,
+    "ppoll_simulation",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_ppoll_simulation,
+    "ppoll_simulation",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_ppoll_simulation,
+    "ppoll_simulation",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_print_memaddrs,
+    "print_memaddrs",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_print_memaddrs,
+    "print_memaddrs",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_print_memaddrs,
+    "print_memaddrs",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_printf_with_threads,
+    "printf_with_threads",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_printf_with_threads,
+    "printf_with_threads",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_printf_with_threads,
+    "printf_with_threads",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_random_sources,
+    "random_sources",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_random_sources,
+    "random_sources",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_random_sources,
+    "random_sources",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_rcx_canonicalization,
+    "rcx_canonicalization",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_rcx_canonicalization,
+    "rcx_canonicalization",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_rcx_canonicalization,
+    "rcx_canonicalization",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_record_replay_fd_close,
+    "record_replay_fd_close",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_record_replay_fd_close,
+    "record_replay_fd_close",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_record_replay_fd_close,
+    "record_replay_fd_close",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_recvmsg_scm_rights_mmap,
+    "recvmsg_scm_rights_mmap",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_recvmsg_scm_rights_mmap,
+    "recvmsg_scm_rights_mmap",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_recvmsg_scm_rights_mmap,
+    "recvmsg_scm_rights_mmap",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_resource_determinism,
+    "resource_determinism",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    #[ignore = "replay diverged twice in the pinned validate root (the guest makes a different number of syscalls, around times and dup), never on a developer host; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_resource_determinism,
+    "resource_determinism",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    #[ignore = "replay diverged twice in the pinned validate root (the guest makes a different number of syscalls, around times and dup), never on a developer host; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_chaos_resource_determinism,
+    "resource_determinism",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_sched_yield_progress,
+    "sched_yield_progress",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_sched_yield_progress,
+    "sched_yield_progress",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_sched_yield_progress,
+    "sched_yield_progress",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_setitimer_determinism,
+    "setitimer_determinism",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_setitimer_determinism,
+    "setitimer_determinism",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_setitimer_determinism,
+    "setitimer_determinism",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_signal_determinism_itimer_delivery,
+    "signal_determinism",
+    Some("itimer-delivery"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_signal_determinism_itimer_exit,
+    "signal_determinism",
+    Some("itimer-exit"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_signal_determinism_blocking_sigsuspend,
+    "signal_determinism",
+    Some("blocking-sigsuspend"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_signal_determinism_pending_sigsuspend,
+    "signal_determinism",
+    Some("pending-sigsuspend"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_signal_determinism_sigsuspend_invalid_arguments,
+    "signal_determinism",
+    Some("sigsuspend-invalid-arguments"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_signal_determinism_masks_fork_clone,
+    "signal_determinism",
+    Some("masks-fork-clone"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_signal_determinism_blocking_read_interrupted,
+    "signal_determinism",
+    Some("blocking-read-interrupted"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_signal_determinism_blocking_read_restarted,
+    "signal_determinism",
+    Some("blocking-read-restarted"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_signal_determinism_poll_sa_restart,
+    "signal_determinism",
+    Some("poll-sa-restart"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_signal_determinism_epoll_wait_sa_restart,
+    "signal_determinism",
+    Some("epoll-wait-sa-restart"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_signal_determinism_sigtimedwait_sa_restart,
+    "signal_determinism",
+    Some("sigtimedwait-sa-restart"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_signal_determinism_handler_reentrance,
+    "signal_determinism",
+    Some("handler-reentrance"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_signal_determinism_altstack_preservation,
+    "signal_determinism",
+    Some("altstack-preservation"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_signal_determinism_pending_exec,
+    "signal_determinism",
+    Some("pending-exec"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_signal_determinism_itimer_delivery,
+    "signal_determinism",
+    Some("itimer-delivery"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_signal_determinism_itimer_exit,
+    "signal_determinism",
+    Some("itimer-exit"),
+    Mode::TraceReplay
+);
+replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_signal_determinism_blocking_sigsuspend,
+    "signal_determinism",
+    Some("blocking-sigsuspend"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_signal_determinism_pending_sigsuspend,
+    "signal_determinism",
+    Some("pending-sigsuspend"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_signal_determinism_sigsuspend_invalid_arguments,
+    "signal_determinism",
+    Some("sigsuspend-invalid-arguments"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_signal_determinism_masks_fork_clone,
+    "signal_determinism",
+    Some("masks-fork-clone"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_signal_determinism_blocking_read_interrupted,
+    "signal_determinism",
+    Some("blocking-read-interrupted"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_signal_determinism_blocking_read_restarted,
+    "signal_determinism",
+    Some("blocking-read-restarted"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_signal_determinism_poll_sa_restart,
+    "signal_determinism",
+    Some("poll-sa-restart"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_signal_determinism_epoll_wait_sa_restart,
+    "signal_determinism",
+    Some("epoll-wait-sa-restart"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_signal_determinism_sigtimedwait_sa_restart,
+    "signal_determinism",
+    Some("sigtimedwait-sa-restart"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_signal_determinism_handler_reentrance,
+    "signal_determinism",
+    Some("handler-reentrance"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_signal_determinism_altstack_preservation,
+    "signal_determinism",
+    Some("altstack-preservation"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_signal_determinism_pending_exec,
+    "signal_determinism",
+    Some("pending-exec"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_signal_determinism_itimer_delivery,
+    "signal_determinism",
+    Some("itimer-delivery"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_signal_determinism_itimer_exit,
+    "signal_determinism",
+    Some("itimer-exit"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_signal_determinism_blocking_sigsuspend,
+    "signal_determinism",
+    Some("blocking-sigsuspend"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_signal_determinism_pending_sigsuspend,
+    "signal_determinism",
+    Some("pending-sigsuspend"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_signal_determinism_sigsuspend_invalid_arguments,
+    "signal_determinism",
+    Some("sigsuspend-invalid-arguments"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_signal_determinism_masks_fork_clone,
+    "signal_determinism",
+    Some("masks-fork-clone"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_signal_determinism_blocking_read_interrupted,
+    "signal_determinism",
+    Some("blocking-read-interrupted"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_signal_determinism_blocking_read_restarted,
+    "signal_determinism",
+    Some("blocking-read-restarted"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_signal_determinism_poll_sa_restart,
+    "signal_determinism",
+    Some("poll-sa-restart"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_signal_determinism_epoll_wait_sa_restart,
+    "signal_determinism",
+    Some("epoll-wait-sa-restart"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_signal_determinism_sigtimedwait_sa_restart,
+    "signal_determinism",
+    Some("sigtimedwait-sa-restart"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_signal_determinism_handler_reentrance,
+    "signal_determinism",
+    Some("handler-reentrance"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_signal_determinism_altstack_preservation,
+    "signal_determinism",
+    Some("altstack-preservation"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_signal_determinism_pending_exec,
+    "signal_determinism",
+    Some("pending-exec"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_sigpipe_siginfo,
+    "sigpipe_siginfo",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_sigpipe_siginfo,
+    "sigpipe_siginfo",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_sigpipe_siginfo,
+    "sigpipe_siginfo",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_sigtimedwait_no_timeout,
+    "sigtimedwait-no-timeout",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_sigtimedwait_no_timeout,
+    "sigtimedwait-no-timeout",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_sigtimedwait_no_timeout,
+    "sigtimedwait-no-timeout",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_sigtimedwait_timeout_0s,
+    "sigtimedwait-timeout-0s",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_sigtimedwait_timeout_0s,
+    "sigtimedwait-timeout-0s",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_sigtimedwait_timeout_0s,
+    "sigtimedwait-timeout-0s",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_sigtimedwait_timeout_1s,
+    "sigtimedwait-timeout-1s",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_sigtimedwait_timeout_1s,
+    "sigtimedwait-timeout-1s",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_sigtimedwait_timeout_1s,
+    "sigtimedwait-timeout-1s",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(chaos_replay_sysinfo, "sysinfo", None, Mode::ChaosReplay);
+replay_case!(trace_replay_sysinfo, "sysinfo", None, Mode::TraceReplay);
+replay_case!(
+    trace_replay_chaos_sysinfo,
+    "sysinfo",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_sysinfo_uptime,
+    "sysinfo_uptime",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_sysinfo_uptime,
+    "sysinfo_uptime",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_sysinfo_uptime,
+    "sysinfo_uptime",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_thread_exhaustion,
+    "threadExhaustion",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_thread_exhaustion,
+    "threadExhaustion",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_thread_exhaustion,
+    "threadExhaustion",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_thread_sync_determinism_barrier,
+    "thread_sync_determinism",
+    Some("barrier"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_thread_sync_determinism_condvar,
+    "thread_sync_determinism",
+    Some("condvar"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_thread_sync_determinism_rwlock,
+    "thread_sync_determinism",
+    Some("rwlock"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_thread_sync_determinism_semaphore,
+    "thread_sync_determinism",
+    Some("semaphore"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_thread_sync_determinism_cancellation,
+    "thread_sync_determinism",
+    Some("cancellation"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_thread_sync_determinism_tls_fork,
+    "thread_sync_determinism",
+    Some("tls-fork"),
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_thread_sync_determinism_barrier,
+    "thread_sync_determinism",
+    Some("barrier"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_thread_sync_determinism_condvar,
+    "thread_sync_determinism",
+    Some("condvar"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_thread_sync_determinism_rwlock,
+    "thread_sync_determinism",
+    Some("rwlock"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_thread_sync_determinism_semaphore,
+    "thread_sync_determinism",
+    Some("semaphore"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_thread_sync_determinism_cancellation,
+    "thread_sync_determinism",
+    Some("cancellation"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_thread_sync_determinism_tls_fork,
+    "thread_sync_determinism",
+    Some("tls-fork"),
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_thread_sync_determinism_barrier,
+    "thread_sync_determinism",
+    Some("barrier"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_thread_sync_determinism_condvar,
+    "thread_sync_determinism",
+    Some("condvar"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_thread_sync_determinism_rwlock,
+    "thread_sync_determinism",
+    Some("rwlock"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_thread_sync_determinism_semaphore,
+    "thread_sync_determinism",
+    Some("semaphore"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_thread_sync_determinism_cancellation,
+    "thread_sync_determinism",
+    Some("cancellation"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    trace_replay_chaos_thread_sync_determinism_tls_fork,
+    "thread_sync_determinism",
+    Some("tls-fork"),
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_timer_create_determinism,
+    "timer_create_determinism",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_timer_create_determinism,
+    "timer_create_determinism",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_timer_create_determinism,
+    "timer_create_determinism",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(chaos_replay_uname, "uname", None, Mode::ChaosReplay);
+replay_case!(trace_replay_uname, "uname", None, Mode::TraceReplay);
+replay_case!(
+    trace_replay_chaos_uname,
+    "uname",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    chaos_replay_vfork_exec,
+    "vforkExec",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    chaos_replay_wait_on_child,
+    "wait_on_child",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    trace_replay_wait_on_child,
+    "wait_on_child",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    trace_replay_chaos_wait_on_child,
+    "wait_on_child",
+    None,
+    Mode::TraceReplayChaos
+);
+replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    chaos_replay_writev_determinism,
+    "writev_determinism",
+    None,
+    Mode::ChaosReplay
+);
+replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_writev_determinism,
+    "writev_determinism",
+    None,
+    Mode::TraceReplay
+);
+replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_chaos_writev_determinism,
+    "writev_determinism",
+    None,
+    Mode::TraceReplayChaos
+);
+
+// The internal tests/rust guests.
+rust_replay_case!(
+    chaos_replay_rust_bind_connect_race,
+    "bind_connect_race",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    chaos_replay_rust_clock_gettime,
+    "clock_gettime",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_clock_gettime,
+    "clock_gettime",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_clock_gettime,
+    "clock_gettime",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_clock_total_order,
+    "clock_total_order",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    chaos_replay_rust_exit_group,
+    "exit_group",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    chaos_replay_rust_futex_and_print,
+    "futex_and_print",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    chaos_replay_rust_futex_timeout,
+    "futex_timeout",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_futex_timeout,
+    "futex_timeout",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_futex_timeout,
+    "futex_timeout",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_futex_wait_child,
+    "futex_wait_child",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_futex_wait_child,
+    "futex_wait_child",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_futex_wait_child,
+    "futex_wait_child",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_futex_wake_some,
+    "futex_wake_some",
+    Mode::ChaosReplay
+);
+rust_replay_case!(chaos_replay_rust_heap_ptrs, "heap_ptrs", Mode::ChaosReplay);
+rust_replay_case!(trace_replay_rust_heap_ptrs, "heap_ptrs", Mode::TraceReplay);
+rust_replay_case!(
+    trace_replay_chaos_rust_heap_ptrs,
+    "heap_ptrs",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_interrogate_tty,
+    "interrogate_tty",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_interrogate_tty,
+    "interrogate_tty",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_interrogate_tty,
+    "interrogate_tty",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    #[ignore = "a mem_race recording runs about 150 s under the PMU timer (7 s without it), far past the 57 s per-test budget"]
+    chaos_replay_rust_mem_race,
+    "mem_race",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_rust_mem_race,
+    "mem_race",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    #[ignore = "a mem_race recording runs about 150 s under the PMU timer (7 s without it), far past the 57 s per-test budget"]
+    trace_replay_chaos_rust_mem_race,
+    "mem_race",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(chaos_replay_rust_nanosleep, "nanosleep", Mode::ChaosReplay);
+rust_replay_case!(trace_replay_rust_nanosleep, "nanosleep", Mode::TraceReplay);
+rust_replay_case!(
+    trace_replay_chaos_rust_nanosleep,
+    "nanosleep",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_network_hello_world,
+    "network_hello_world",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_network_hello_world,
+    "network_hello_world",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_network_hello_world,
+    "network_hello_world",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_pipe_basics,
+    "pipe_basics",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_pipe_basics,
+    "pipe_basics",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_pipe_basics,
+    "pipe_basics",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    chaos_replay_rust_poll,
+    "poll",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_rust_poll,
+    "poll",
+    Mode::TraceReplay
+);
+rust_replay_case!(trace_replay_chaos_rust_poll, "poll", Mode::TraceReplayChaos);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    chaos_replay_rust_print_clock_nanosleep_monotonic_abs_race,
+    "print_clock_nanosleep_monotonic_abs_race",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_rust_print_clock_nanosleep_monotonic_abs_race,
+    "print_clock_nanosleep_monotonic_abs_race",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    chaos_replay_rust_print_clock_nanosleep_monotonic_race,
+    "print_clock_nanosleep_monotonic_race",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_rust_print_clock_nanosleep_monotonic_race,
+    "print_clock_nanosleep_monotonic_race",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    chaos_replay_rust_print_clock_nanosleep_realtime_abs_race,
+    "print_clock_nanosleep_realtime_abs_race",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_rust_print_clock_nanosleep_realtime_abs_race,
+    "print_clock_nanosleep_realtime_abs_race",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    chaos_replay_rust_print_nanosleep_race,
+    "print_nanosleep_race",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_rust_print_nanosleep_race,
+    "print_nanosleep_race",
+    Mode::TraceReplay
+);
+rust_replay_case!(chaos_replay_rust_rdtsc, "rdtsc", Mode::ChaosReplay);
+rust_replay_case!(trace_replay_rust_rdtsc, "rdtsc", Mode::TraceReplay);
+rust_replay_case!(
+    trace_replay_chaos_rust_rdtsc,
+    "rdtsc",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_sched_yield,
+    "sched_yield",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_sched_yield,
+    "sched_yield",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_sched_yield,
+    "sched_yield",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_socketpair,
+    "socketpair",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_socketpair,
+    "socketpair",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_socketpair,
+    "socketpair",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(chaos_replay_rust_stack_ptr, "stack_ptr", Mode::ChaosReplay);
+rust_replay_case!(trace_replay_rust_stack_ptr, "stack_ptr", Mode::TraceReplay);
+rust_replay_case!(
+    trace_replay_chaos_rust_stack_ptr,
+    "stack_ptr",
+    Mode::TraceReplayChaos
+);

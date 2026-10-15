@@ -1050,7 +1050,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's the_cpu_profile_never_enters_the_legacy_form: 1100, listed.
     // detcore-dbt::tests::current_abi_preserves_queued_signal_targets_for_tool_resolution
     // retains all 1100 prior identities: 1101.
-    ("test.regular_crates", 1101),
+    // And hermit-verify's replay_modes: the internal Buck matrix's C guests
+    // (212) and Rust guests (42) through trace-replay and chaos-replay, 254
+    // cases; 21 more are ignored for
+    // https://github.com/rrnewton/hermit/issues/4399 and 2 for the per-test
+    // budget: 1355, listed.
+    ("test.regular_crates", 1355),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4195,7 +4200,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the CpuProfile name test: 1099.
     // And the cpu_profile legacy-form test: 1100.
     // The same Current-ABI queued-signal target regression: 1101.
-    ("test.regular_crates_on_host", 1101),
+    // And hermit-verify's 254 replay_modes cases, less the nine PMU-timer
+    // chaos-replay cases the twin excludes by name
+    // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS): 1346.
+    ("test.regular_crates_on_host", 1346),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),
@@ -6488,7 +6496,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"regular_crates"########,
         desc: r########"Test regular workspace crates (nextest, excludes hermit-detcore/hermit/flaky)"########,
-        description: r########"MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 via the scheduler-controlled CARGO_BUILD_JOBS channel (build phase). rss_baseline=measured_peak@j8=2.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=3.5GiB (was 6GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-31 (task remove-the-hermit-guest-serialisation-and-expose-what-actually-breaks): preferred_inner_jobs=8 is the enforced cgroup width and jobs_flag=-j passes the same admitted width to nextest. Without the flag, nextest used all 316 visible CPUs inside an 8-core cgroup; after removing hermit_guest serialization, three hard-wall-clock runner fixtures launched together and stretched from their 1-2s contracts to 8.427-8.460s. Solo and three-way reruns of the already-built test binary passed in 1.03/2.21/1.05s. Coupling nextest to the admitted width removes the oversubscription without widening any timeout or changing the selected tests."########,
+        description: r########"REPLAY MODES 2026-10-15: hermit-verify/tests/replay_modes.rs runs here with the rest of hermit-verify, 254 cases: the C and Rust guests of the internal Buck matrix through `hermit-verify trace-replay` and `chaos-replay`, each recording a schedule and its preemptions and replaying them, with the internal targets' flags. Each finds Hermit through HERMIT_BIN or beside its own hermit-verify, which the workspace build puts in the same profile directory. 21 more are ignored for https://github.com/rrnewton/hermit/issues/4399, and Rust mem_race's two chaos modes for the per-test budget (about 150 s under the PMU timer). The hosted twin excludes 9 chaos-replay cases that fail without the PMU timer (validation_dag::HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS). MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 via the scheduler-controlled CARGO_BUILD_JOBS channel (build phase). rss_baseline=measured_peak@j8=2.0GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=3.5GiB (was 6GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-31 (task remove-the-hermit-guest-serialisation-and-expose-what-actually-breaks): preferred_inner_jobs=8 is the enforced cgroup width and jobs_flag=-j passes the same admitted width to nextest. Without the flag, nextest used all 316 visible CPUs inside an 8-core cgroup; after removing hermit_guest serialization, three hard-wall-clock runner fixtures launched together and stretched from their 1-2s contracts to 8.427-8.460s. Solo and three-way reruns of the already-built test binary passed in 1.03/2.21/1.05s. Coupling nextest to the admitted width removes the oversubscription without widening any timeout or changing the selected tests."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,

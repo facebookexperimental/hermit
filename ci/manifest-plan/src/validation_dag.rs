@@ -332,6 +332,30 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
 /// [`HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS`].
 pub const HOSTED_PORTABLE_PMU_TIMER_RR_TESTS: &[&str] = &["rr_no_mask_timeslice"];
 
+/// hermit-verify replay-mode cases the GitHub-hosted portable profile
+/// excludes by exact name.
+///
+/// GitHub-hosted runners have no PMU, so hermit continues with
+/// `--max-timeslice=disabled`. Measured 2026-10-15 on the validation host by
+/// passing that flag to every hermit-verify/tests/replay_modes.rs case: these
+/// nine chaos-replay cases (six C guests, three Rust guests) then fail or time
+/// out, and every other case that runs locally still passes. The local `test.regular_crates` keeps running them in the
+/// pinned root.
+pub const HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS: &[&str] = &[
+    "chaos_replay_ipc_determinism_eventfd",
+    "chaos_replay_ipc_determinism_pipe_order",
+    "chaos_replay_ipc_determinism_socketpair",
+    "chaos_replay_sched_yield_progress",
+    "chaos_replay_thread_sync_determinism_barrier",
+    "chaos_replay_thread_sync_determinism_rwlock",
+    "chaos_replay_rust_futex_and_print",
+    "chaos_replay_rust_futex_wake_some",
+    "chaos_replay_rust_sched_yield",
+];
+
+/// Where the hosted regular-crates twin's filterset goes: after its selection.
+const REGULAR_CRATES_SELECTION_END: &str = "--exclude hermetic_infra_hermit_flaky-tests";
+
 /// The exact-name filterset that keeps `names` out of a hosted twin.
 fn hosted_exclusion_filterset(names: &[&str]) -> String {
     let exclusions = names
@@ -2608,6 +2632,20 @@ fn materialize_regular_calibration_launch(cfg: &mut DagConfig) -> Result<(), Str
                 step.cmd = step
                     .cmd
                     .replace(RUNNER, &format!("{RUNNER} --calibration-host"));
+                if step.cmd.matches(REGULAR_CRATES_SELECTION_END).count() != 1 {
+                    return Err(format!(
+                        "test.regular_crates_on_host must end its selection with \
+                         `{REGULAR_CRATES_SELECTION_END}` once"
+                    ));
+                }
+                step.cmd = step.cmd.replacen(
+                    REGULAR_CRATES_SELECTION_END,
+                    &format!(
+                        "{REGULAR_CRATES_SELECTION_END}{}",
+                        hosted_exclusion_filterset(HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS)
+                    ),
+                    1,
+                );
             }
             _ => {}
         }
@@ -6503,7 +6541,23 @@ sys.exit(37)
                 assert_eq!(local_payload.matches(PINNED).count(), 1);
                 assert_eq!(hosted.cmd.matches("--calibration-host").count(), 1);
                 assert!(local.deps.iter().any(|dep| dep == "build.rust_scripts"));
-                local_payload.replace(PINNED, "--calibration-host")
+                // The hosted twin also excludes exactly the PMU-timer replay
+                // cases, which the local selection must keep running.
+                assert!(!local_payload.contains(" -E "));
+                assert_eq!(
+                    local_payload.matches(REGULAR_CRATES_SELECTION_END).count(),
+                    1
+                );
+                local_payload
+                    .replace(PINNED, "--calibration-host")
+                    .replacen(
+                        REGULAR_CRATES_SELECTION_END,
+                        &format!(
+                            "{REGULAR_CRATES_SELECTION_END}{}",
+                            hosted_exclusion_filterset(HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS)
+                        ),
+                        1,
+                    )
             } else if local_tag == "test.cli" {
                 // The hosted twin excludes exactly the CPUID-faulting cases,
                 // by exact name, which the local selection must keep running:
@@ -6590,6 +6644,7 @@ sys.exit(37)
             let hosted_only_skips = match local_tag.as_str() {
                 "test.cli" => HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS.len(),
                 "test.rr_suite_contract" => HOSTED_PORTABLE_PMU_TIMER_RR_TESTS.len(),
+                "test.regular_crates" => HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS.len(),
                 _ => 0,
             };
             let count =
