@@ -825,11 +825,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// Run rt_sigsuspend without holding the deterministic scheduler turn.
+    /// Run rt_sigsuspend, without holding the deterministic scheduler turn where
+    /// the call sleeps.
     ///
     /// The kernel must perform the temporary mask swap atomically and restore the
     /// original mask after signal delivery, so execute the real blocking syscall
     /// while marking this thread as blocked outside the runnable set.
+    ///
+    /// On a backend whose `rt_sigsuspend` never sleeps
+    /// (`rt_sigsuspend_never_sleeps`: KVM), the call instead runs in the
+    /// caller's own turn, and a refused wait yields the turn
+    /// (<https://github.com/rrnewton/hermit/issues/4360>).
     pub async fn handle_rt_sigsuspend<G: Guest<Self>>(
         &self,
         guest: &mut G,
