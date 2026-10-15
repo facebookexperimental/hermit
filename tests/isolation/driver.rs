@@ -1873,25 +1873,26 @@ impl Prepared {
         )
     }
 
+    /// Runs every command through `capture`, which `entry_source` defines,
+    /// instead of SafeHermit: the route a runner that already bounds its
+    /// children, such as the validation DAG, takes.
     pub fn build_integration(
         repository: &Path,
         hermit: &Path,
         artifacts: &Path,
         capture: CaptureCommand,
         entry_source: &Path,
+        installation: Option<&Path>,
+        descriptor_registry: Option<DescriptorRegistry>,
     ) -> Result<Self, String> {
         let binary = std::env::current_exe()
             .map_err(|error| format!("integration executor binary: {error}"))?;
-        let sources = [
-            repository.join("hermit-cli/tests/common/bounded_command.rs"),
-            repository.join(entry_source),
-        ]
-        .into_iter()
-        .map(|path| {
-            path.canonicalize()
-                .map_err(|error| format!("integration executor source: {error}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        let sources = vec![
+            repository
+                .join(entry_source)
+                .canonicalize()
+                .map_err(|error| format!("integration executor source: {error}"))?,
+        ];
         Self::prepare(
             repository,
             hermit,
@@ -1901,8 +1902,8 @@ impl Prepared {
                 binary,
             },
             artifacts,
-            None,
-            None,
+            installation,
+            descriptor_registry,
         )
     }
 

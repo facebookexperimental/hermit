@@ -1,0 +1,135 @@
+# Expected mismatches of the backend isolation matrix (tests/isolation/conformance.rs
+# --expected), measured in the pinned root where validate runs. Tab-separated:
+#   backends  selector  verdicts  issue  why
+# A selector root:path:policy (with * for any) names cells that collect no guest
+# observations (verdict `uncollected`). Any other selector names an assertion family
+# (digits written N), optionally @root:path:policy, that may be mismatch and/or
+# no_result in a collected cell; `match` added means it matches where the host hides
+# the defect. The matrix fails on any non-match no row expects, and on any row that
+# no longer describes a failure on a backend it names: fix the issue, then delete the
+# backend from its row. Regenerate by measuring; never widen a row to make a run pass.
+sabre	host:*:*	uncollected	https://github.com/rrnewton/hermit/issues/4447	SaBRe aborts on the probe's blocking read of its stdin pipe
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:*:none	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:cwd-missing-refusal:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:cwd-under-tmp:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:explicit-workdir-hidden-caller:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:image-root:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:interpreter-hidden-by-tmp:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:mount-bind:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:program-hidden-by-tmp:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+dbt,liteinst,in-guest-trap,kvm	host:record-gdb-host:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4470	Hermit refuses record and replay on this backend by design
+dbt,liteinst,in-guest-trap,kvm	host:record-gdb-host:private	uncollected	https://github.com/rrnewton/hermit/issues/4470	Hermit refuses record and replay on this backend by design
+dbt,liteinst,in-guest-trap,kvm	host:record-gdb-local-refusal:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4470	Hermit refuses record and replay on this backend by design
+dbt,liteinst,in-guest-trap,kvm	host:record-gdb-local-refusal:private	uncollected	https://github.com/rrnewton/hermit/issues/4470	Hermit refuses record and replay on this backend by design
+dbt,liteinst,in-guest-trap,kvm	host:record-verify:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4470	Hermit refuses record and replay on this backend by design
+ptrace,e9patch	host:record-verify:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4471	the probe prints raw host identities, so the two verify runs differ
+dbt,liteinst,in-guest-trap,kvm	host:record-verify:private	uncollected	https://github.com/rrnewton/hermit/issues/4470	Hermit refuses record and replay on this backend by design
+ptrace,e9patch	host:record-verify:private	uncollected	https://github.com/rrnewton/hermit/issues/4471	the probe prints raw host identities, so the two verify runs differ
+dbt,liteinst,in-guest-trap,kvm	host:record:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4470	Hermit refuses record and replay on this backend by design
+dbt,liteinst,in-guest-trap,kvm	host:record:private	uncollected	https://github.com/rrnewton/hermit/issues/4470	Hermit refuses record and replay on this backend by design
+dbt,liteinst,in-guest-trap,kvm	host:replay-autopilot:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4470	Hermit refuses record and replay on this backend by design
+dbt,liteinst,in-guest-trap,kvm	host:replay-autopilot:private	uncollected	https://github.com/rrnewton/hermit/issues/4470	Hermit refuses record and replay on this backend by design
+dbt,liteinst,in-guest-trap,kvm	host:replay-gdb-host:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4470	Hermit refuses record and replay on this backend by design
+dbt,liteinst,in-guest-trap,kvm	host:replay-gdb-host:private	uncollected	https://github.com/rrnewton/hermit/issues/4470	Hermit refuses record and replay on this backend by design
+dbt,liteinst,in-guest-trap,kvm	host:replay-gdb-local-refusal:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4470	Hermit refuses record and replay on this backend by design
+dbt,liteinst,in-guest-trap,kvm	host:replay-gdb-local-refusal:private	uncollected	https://github.com/rrnewton/hermit/issues/4470	Hermit refuses record and replay on this backend by design
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:run-gdb-host:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:run-gdb-local-refusal:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:run-raw:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:stderr-closed:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:stdin-closed:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:stdin-finite:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:stdin-tty:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:stdout-closed:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:tmp-explicit:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:verify-normal:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,e9patch	host:verify-normal:private	uncollected	https://github.com/rrnewton/hermit/issues/4471	the probe prints raw host identities, so the two verify runs differ
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:verify-raw:host-network	uncollected	https://github.com/rrnewton/hermit/issues/4469	--strict refuses --network=host and --no-namespace, and record takes no --no-namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	host:verify-raw:private	uncollected	https://github.com/rrnewton/hermit/issues/4471	the probe prints raw host identities, so the two verify runs differ
+ptrace,dbt,sabre,liteinst,in-guest-trap,kvm,e9patch	pinned:*:*	uncollected	https://github.com/rrnewton/hermit/issues/4468	the driver implements no pinned-root cell
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	coverage.required_path	no_result	https://github.com/rrnewton/hermit/issues/4466	the driver emits these evidence rows as no_result by construction
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	descriptors.capability.FD_OPENAT.self/N	no_result	https://github.com/rrnewton/hermit/issues/4464	the probe's descriptor inventory gets EBADF
+kvm	descriptors.inherited_objects	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,e9patch	descriptors.inherited_objects	no_result	https://github.com/rrnewton/hermit/issues/4464	the probe's descriptor inventory gets EBADF
+kvm	descriptors.original_objects.FD_PROC_OBJECT.pidN/N	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	descriptors.original_objects.FD_PROC_OBJECT.pidN_task/N/N	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	descriptors.original_objects.FD_PROC_OBJECT.self/N	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	descriptors.pidN.complete	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,e9patch	descriptors.pidN.complete	no_result	https://github.com/rrnewton/hermit/issues/4464	the probe's descriptor inventory gets EBADF
+kvm	descriptors.pidN.cwd_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,e9patch	descriptors.pidN.cwd_alias	mismatch	https://github.com/rrnewton/hermit/issues/4463	/proc/1/cwd is the launcher's working directory
+ptrace,dbt,liteinst,in-guest-trap,e9patch	descriptors.pidN.fdN.complete	no_result	https://github.com/rrnewton/hermit/issues/4464	the probe's descriptor inventory gets EBADF
+kvm	descriptors.pidN.root_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	descriptors.pidN_task/N.complete	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,e9patch	descriptors.pidN_task/N.complete	no_result	https://github.com/rrnewton/hermit/issues/4464	the probe's descriptor inventory gets EBADF
+kvm	descriptors.pidN_task/N.cwd_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,e9patch	descriptors.pidN_task/N.cwd_alias	mismatch	https://github.com/rrnewton/hermit/issues/4463	/proc/1/cwd is the launcher's working directory
+ptrace,dbt,liteinst,in-guest-trap,e9patch	descriptors.pidN_task/N.fdN.complete	no_result	https://github.com/rrnewton/hermit/issues/4464	the probe's descriptor inventory gets EBADF
+kvm	descriptors.pidN_task/N.root_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	descriptors.proc_and_direct_capabilities	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,e9patch	descriptors.proc_and_direct_capabilities	no_result	https://github.com/rrnewton/hermit/issues/4464	the probe's descriptor inventory gets EBADF
+kvm	descriptors.self.complete	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+liteinst,in-guest-trap	descriptors.self.complete	no_result	https://github.com/rrnewton/hermit/issues/4464	the probe's descriptor inventory gets EBADF
+kvm	descriptors.self.cwd_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+liteinst,in-guest-trap	descriptors.self.fdN.complete	no_result	https://github.com/rrnewton/hermit/issues/4464	the probe's descriptor inventory gets EBADF
+kvm	descriptors.self.root_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,e9patch	filesystem.cgroup.empty	mismatch	https://github.com/rrnewton/hermit/issues/4388	the cgroup mount is writable, unmasked and, with host networking, not empty
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	filesystem.cgroup.readonly	mismatch	https://github.com/rrnewton/hermit/issues/4388	the cgroup mount is writable, unmasked and, with host networking, not empty
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	filesystem.cgroup.tmpfs_mask	mismatch	https://github.com/rrnewton/hermit/issues/4388	the cgroup mount is writable, unmasked and, with host networking, not empty
+kvm	filesystem.proc.visible	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	filesystem.shm.empty	match,mismatch	https://github.com/rrnewton/hermit/issues/4274	the host's /dev/shm is visible; it matches only where the host's /dev/shm is empty
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	filesystem.sys.readonly	mismatch	https://github.com/rrnewton/hermit/issues/4460	/sys is not mounted read-only
+kvm	hostname.kernel	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	namespace.cgroup.host_separation	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,e9patch	namespace.cgroup.host_separation	mismatch	https://github.com/rrnewton/hermit/issues/4378	the container makes no cgroup namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	namespace.cgroup.native_guest	no_result	https://github.com/rrnewton/hermit/issues/4465	the native census needs /proc/<pid>/task/<tid>/children, which the kernel lacks
+kvm	namespace.cgroup.pidN_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	namespace.cgroup.pidN_task/N_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	namespace.ipc.host_separation	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,e9patch	namespace.ipc.host_separation	mismatch	https://github.com/rrnewton/hermit/issues/4459	the container makes no IPC namespace
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	namespace.ipc.native_guest	no_result	https://github.com/rrnewton/hermit/issues/4465	the native census needs /proc/<pid>/task/<tid>/children, which the kernel lacks
+kvm	namespace.ipc.pidN_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	namespace.ipc.pidN_task/N_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	namespace.mnt.host_separation	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	namespace.mnt.native_guest	no_result	https://github.com/rrnewton/hermit/issues/4465	the native census needs /proc/<pid>/task/<tid>/children, which the kernel lacks
+kvm	namespace.mnt.pidN_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	namespace.mnt.pidN_task/N_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	namespace.net.host_separation	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	namespace.net.native_guest	no_result	https://github.com/rrnewton/hermit/issues/4465	the native census needs /proc/<pid>/task/<tid>/children, which the kernel lacks
+kvm	namespace.net.pidN_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	namespace.net.pidN_task/N_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	namespace.pid.host_separation	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	namespace.pid.native_guest	no_result	https://github.com/rrnewton/hermit/issues/4465	the native census needs /proc/<pid>/task/<tid>/children, which the kernel lacks
+kvm	namespace.pid.pidN_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	namespace.pid.pidN_task/N_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	namespace.user.host_separation	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	namespace.user.native_guest	no_result	https://github.com/rrnewton/hermit/issues/4465	the native census needs /proc/<pid>/task/<tid>/children, which the kernel lacks
+kvm	namespace.user.pidN_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	namespace.user.pidN_task/N_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	namespace.uts.host_separation	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	namespace.uts.native_guest	no_result	https://github.com/rrnewton/hermit/issues/4465	the native census needs /proc/<pid>/task/<tid>/children, which the kernel lacks
+kvm	namespace.uts.pidN_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	namespace.uts.pidN_task/N_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	native.complete	no_result	https://github.com/rrnewton/hermit/issues/4465	the native census needs /proc/<pid>/task/<tid>/children, which the kernel lacks
+kvm	pid.private_init	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	processes.pidN_tasks.complete	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	receipt.cohort_complete_input	no_result	https://github.com/rrnewton/hermit/issues/4466	the driver emits these evidence rows as no_result by construction
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	receipt.cohort_fixture	no_result	https://github.com/rrnewton/hermit/issues/4466	the driver emits these evidence rows as no_result by construction
+dbt,liteinst,in-guest-trap	scratch.complete_contents	mismatch	https://github.com/rrnewton/hermit/issues/4462	the backend leaves its own entries in the guest's /tmp
+ptrace,e9patch	scratch.complete_contents@host:record-gdb-host:*	mismatch	https://github.com/rrnewton/hermit/issues/4461	record and replay give the guest the host's /tmp
+ptrace,e9patch	scratch.complete_contents@host:record-gdb-local-refusal:*	mismatch	https://github.com/rrnewton/hermit/issues/4461	record and replay give the guest the host's /tmp
+ptrace,e9patch	scratch.complete_contents@host:record:*	mismatch	https://github.com/rrnewton/hermit/issues/4461	record and replay give the guest the host's /tmp
+ptrace,e9patch	scratch.complete_contents@host:replay-autopilot:*	mismatch	https://github.com/rrnewton/hermit/issues/4461	record and replay give the guest the host's /tmp
+ptrace,e9patch	scratch.complete_contents@host:replay-gdb-host:*	mismatch	https://github.com/rrnewton/hermit/issues/4461	record and replay give the guest the host's /tmp
+ptrace,e9patch	scratch.complete_contents@host:replay-gdb-local-refusal:*	mismatch	https://github.com/rrnewton/hermit/issues/4461	record and replay give the guest the host's /tmp
+ptrace,e9patch	scratch.host_separation@host:record-gdb-host:*	mismatch	https://github.com/rrnewton/hermit/issues/4461	record and replay give the guest the host's /tmp
+ptrace,e9patch	scratch.host_separation@host:record-gdb-local-refusal:*	mismatch	https://github.com/rrnewton/hermit/issues/4461	record and replay give the guest the host's /tmp
+ptrace,e9patch	scratch.host_separation@host:record:*	mismatch	https://github.com/rrnewton/hermit/issues/4461	record and replay give the guest the host's /tmp
+ptrace,e9patch	scratch.host_separation@host:replay-autopilot:*	mismatch	https://github.com/rrnewton/hermit/issues/4461	record and replay give the guest the host's /tmp
+ptrace,e9patch	scratch.host_separation@host:replay-gdb-host:*	mismatch	https://github.com/rrnewton/hermit/issues/4461	record and replay give the guest the host's /tmp
+ptrace,e9patch	scratch.host_separation@host:replay-gdb-local-refusal:*	mismatch	https://github.com/rrnewton/hermit/issues/4461	record and replay give the guest the host's /tmp
+ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	sentinel.ipc.reachability	no_result	https://github.com/rrnewton/hermit/issues/4467	Detcore answers shmctl with ENOSYS, so IPC reachability cannot be observed
+kvm	verification.physical_phases	no_result	https://github.com/rrnewton/hermit/issues/4466	the driver emits these evidence rows as no_result by construction
+kvm	view.cgroup.complete	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	view.net_dev.complete	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
+kvm	view.net_route.complete	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation

@@ -531,6 +531,8 @@ fn every_manifest_node_with_a_dbt_cell_orders_after_the_dbt_runtime_abi_check() 
     // manifest buckets, so it must also wait for the same ABI check.
     let mut expected_dependents = needs;
     expected_dependents.insert("test.inherited_terminal_read".to_string());
+    // So does the isolation matrix node that runs the DBT cells.
+    expected_dependents.insert("test.isolation_matrix_dbt_in_guest".to_string());
     assert_eq!(has, expected_dependents);
 }
 

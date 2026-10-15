@@ -24042,6 +24042,83 @@
     },
     {
       "group": "test",
+      "job": "isolation_matrix_ptrace_runtime",
+      "desc": "Isolation matrix on ptrace, e9patch and SaBRe, held to its expected-mismatch ledger",
+      "description": "Runs the backend isolation matrix (tests/isolation/conformance.rs, the container contract of https://github.com/rrnewton/hermit/issues/4009) for every required cell of ptrace, e9patch preprocessing with ptrace and SaBRe (the backends on ptrace's runtime); measured 218 s in the pinned root: the probe tests/isolation/backend_isolation.c beside a native baseline, each command a bounded child of the local executor, every assertion row checked by hermit-cli/tests/common/backend_isolation.rs. No cell fully matches on any backend yet, so the node holds the matrix to tests/isolation/expected-mismatches.tsv: every cell that collects no guest observations, and every assertion that does not match, must be a ledger row naming its backend and linking its issue, and a row that no longer describes a failure on a backend it names fails the node until it is deleted, so what now matches stays matched. The ledger was measured in this pinned root; two host runs agreed cell for cell. Artifacts (assertion rows, per-backend totals, the required-cell ledger) are kept in target/ci/isolation-matrix/ptrace-runtime.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; rm -rf target/ci/isolation-matrix/ptrace-runtime && mkdir -p target/ci/isolation-matrix && ./tests/isolation/conformance.rs --hermit target/ci/hermit --executor local --expected tests/isolation/expected-mismatches.tsv --backends ptrace,e9patch,sabre --artifacts target/ci/isolation-matrix/ptrace-runtime'",
+      "result_manifests": [],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 900,
+      "cpu_timeout": 3600,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 220.0,
+        "rss_baseline_bytes": 2147483648,
+        "hard_mem_max_bytes": 8589934592,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "test.isolation_matrix_ptrace_runtime"
+    },
+    {
+      "group": "test",
+      "job": "isolation_matrix_dbt_in_guest",
+      "desc": "Isolation matrix on DBT, LiteInst and in-guest-trap, held to its expected-mismatch ledger",
+      "description": "Runs the backend isolation matrix (tests/isolation/conformance.rs, the container contract of https://github.com/rrnewton/hermit/issues/4009) for every required cell of DBT, LiteInst and in-guest-trap; measured 219 s in the pinned root: the probe tests/isolation/backend_isolation.c beside a native baseline, each command a bounded child of the local executor, every assertion row checked by hermit-cli/tests/common/backend_isolation.rs. No cell fully matches on any backend yet, so the node holds the matrix to tests/isolation/expected-mismatches.tsv: every cell that collects no guest observations, and every assertion that does not match, must be a ledger row naming its backend and linking its issue, and a row that no longer describes a failure on a backend it names fails the node until it is deleted, so what now matches stays matched. The ledger was measured in this pinned root; two host runs agreed cell for cell. Artifacts (assertion rows, per-backend totals, the required-cell ledger) are kept in target/ci/isolation-matrix/dbt-in-guest.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; rm -rf target/ci/isolation-matrix/dbt-in-guest && mkdir -p target/ci/isolation-matrix && ./tests/isolation/conformance.rs --hermit target/ci/hermit --executor local --expected tests/isolation/expected-mismatches.tsv --backends dbt,liteinst,in-guest-trap --artifacts target/ci/isolation-matrix/dbt-in-guest'",
+      "result_manifests": [],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 900,
+      "cpu_timeout": 3600,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 220.0,
+        "rss_baseline_bytes": 2147483648,
+        "hard_mem_max_bytes": 8589934592,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "test.isolation_matrix_dbt_in_guest"
+    },
+    {
+      "group": "test",
       "job": "arbitrary_binaries",
       "desc": "Portable arbitrary-binary cases",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 255152128 bytes; the larger 1936408576-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
@@ -25820,6 +25897,45 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "privileged-test.cli_kvm"
+    },
+    {
+      "group": "privileged-test",
+      "job": "isolation_matrix_kvm",
+      "desc": "Isolation matrix on KVM, held to its expected-mismatch ledger",
+      "description": "Runs the backend isolation matrix (tests/isolation/conformance.rs, the container contract of https://github.com/rrnewton/hermit/issues/4009) for every required cell of KVM, after requiring /dev/kvm; measured 61 s in the pinned root: the probe tests/isolation/backend_isolation.c beside a native baseline, each command a bounded child of the local executor, every assertion row checked by hermit-cli/tests/common/backend_isolation.rs. No cell fully matches on any backend yet, so the node holds the matrix to tests/isolation/expected-mismatches.tsv: every cell that collects no guest observations, and every assertion that does not match, must be a ledger row naming its backend and linking its issue, and a row that no longer describes a failure on a backend it names fails the node until it is deleted, so what now matches stays matched. The ledger was measured in this pinned root; two host runs agreed cell for cell. Artifacts (assertion rows, per-backend totals, the required-cell ledger) are kept in target/ci/isolation-matrix/kvm.",
+      "labels": [
+        "full",
+        "kvm"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf '\\''%s: /dev/kvm is required\\n'\\'' privileged-test.isolation_matrix_kvm >&2; exit 2; fi; exec 9>&-; rm -rf target/ci/isolation-matrix/kvm && mkdir -p target/ci/isolation-matrix && ./tests/isolation/conformance.rs --hermit target/ci/hermit --executor local --expected tests/isolation/expected-mismatches.tsv --backends kvm --artifacts target/ci/isolation-matrix/kvm'",
+      "result_manifests": [],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 600,
+      "cpu_timeout": 3600,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 60.0,
+        "rss_baseline_bytes": 2147483648,
+        "hard_mem_max_bytes": 8589934592,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "privileged-test.isolation_matrix_kvm"
     },
     {
       "group": "full-scorecard",

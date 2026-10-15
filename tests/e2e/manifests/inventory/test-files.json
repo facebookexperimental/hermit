@@ -4083,14 +4083,20 @@
     {
       "disposition": "special-driver",
       "path": "tests/isolation/conformance.rs",
-      "runner": "manual rust-script tests/isolation/conformance.rs",
-      "why": "This standalone reporter selects isolation cells, invokes the driver, retains full-checker assertion rows and publishes the complete required-cell ledger. Its diagnostic red verdict is collected explicitly by operators."
+      "runner": "ci/dag/validate.json test.isolation_matrix_ptrace_runtime, test.isolation_matrix_dbt_in_guest and privileged-test.isolation_matrix_kvm",
+      "why": "This reporter selects isolation cells, invokes the driver, retains full-checker assertion rows and publishes the complete required-cell ledger. In validate it runs with --executor local (each command a bounded child, no SafeHermit inside the DAG) and --expected tests/isolation/expected-mismatches.tsv, which turns the matrix into a gate: every non-matching cell or assertion must be a ledger row with an issue, and a row that stops describing a failure fails the node."
     },
     {
       "disposition": "suite-helper",
       "path": "tests/isolation/driver.rs",
       "runner": "tests/isolation/conformance.rs",
       "why": "This included Rust module builds the probes, runs the bounded native executor and Hermit command, and retains input, output and cleanup evidence for the full isolation checker."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/isolation/expected-mismatches.tsv",
+      "runner": "tests/isolation/conformance.rs --expected",
+      "why": "The isolation matrix's expected-mismatch ledger, measured in the pinned root: each row names backends, a cell pattern or an assertion family, its verdicts and the GitHub issue that tracks it. conformance.rs fails on any non-match no row expects and on any row that no longer describes a failure."
     },
     {
       "disposition": "suite-helper",

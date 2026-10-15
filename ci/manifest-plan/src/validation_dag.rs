@@ -516,6 +516,8 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.liteinst_stacks",
     "test.isolated_dbt_workdir",
     "test.inherited_terminal_read",
+    "test.isolation_matrix_ptrace_runtime",
+    "test.isolation_matrix_dbt_in_guest",
     "test.isolated_detcore_workdir",
     "test.sabre_examples",
     "test.hermit_modes",
@@ -541,6 +543,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.pmu_integration_cases",
     "test.pmu_integration_cases_2",
     "privileged-test.cli_kvm",
+    "privileged-test.isolation_matrix_kvm",
     "privileged-only-cpuid.faulting",
     "privileged-only-pmu.preemption",
     "privileged-only-test.pmu_buck_chaos_cases",
@@ -650,9 +653,12 @@ const PROFILES: [Profile; 11] = [
         // privileged-cpuid.cpu_profile_v3 adds another
         // (https://github.com/rrnewton/hermit/issues/4243).
         // test.pmu_integration_cases_2 adds one full-only node: 97/98 before.
+        // The backend isolation matrix adds three full-only nodes
+        // (test.isolation_matrix_ptrace_runtime, test.isolation_matrix_dbt_in_guest
+        // and privileged-test.isolation_matrix_kvm): 98/99 before.
         label: "full",
-        direct_steps: 98,
-        selected_steps: 99,
+        direct_steps: 101,
+        selected_steps: 102,
     },
     Profile {
         label: "portable",
@@ -4229,9 +4235,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // CLI cases on a host that must qualify
     // (https://github.com/rrnewton/hermit/issues/4243).
     // 438 since test.pmu_integration_cases runs as two shards (437 + 1).
-    if cfg.steps.len() != 438 {
+    // 441 with the backend isolation matrix: test.isolation_matrix_ptrace_runtime,
+    // test.isolation_matrix_dbt_in_guest and privileged-test.isolation_matrix_kvm
+    // (438 + 3; https://github.com/rrnewton/hermit/issues/4009).
+    if cfg.steps.len() != 441 {
         return Err(format!(
-            "superset has {} steps, expected 438",
+            "superset has {} steps, expected 441",
             cfg.steps.len()
         ));
     }
@@ -6729,8 +6738,10 @@ sys.exit(37)
         // 94 since the local test.hermit_integration runs as three shards,
         // and 95 with privileged-cpuid.cpu_profile_v3 (98 full nodes;
         // https://github.com/rrnewton/hermit/issues/4243), and 96 since
-        // test.pmu_integration_cases runs as two shards (99 full nodes).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 96);
+        // test.pmu_integration_cases runs as two shards (99 full nodes),
+        // and 99 with the three backend isolation matrix nodes (102 full
+        // nodes).
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 99);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps
