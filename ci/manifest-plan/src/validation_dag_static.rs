@@ -1557,7 +1557,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4370): 1089, listed.
     // And +1 from R2b-1 of https://github.com/rrnewton/hermit/issues/4273: 1090, listed.
     // And +1 from 3fab1ec4: 1091.
-    ("test.hermit_unit", 1091),
+    // The revert of 4273 R2b-1 (ade0e7dd) removes its tests: 1090.
+    ("test.hermit_unit", 1090),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2290,7 +2291,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4362): 1709, listed.
     // And +4 from b909e36d: 1713.
     // And +7 from R2b-1 of https://github.com/rrnewton/hermit/issues/4273: 1720, listed.
-    ("test.detcore_unit", 1720),
+    // The revert of 4273 R2b-1 (ade0e7dd) removes its tests: 1713.
+    ("test.detcore_unit", 1713),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3263,7 +3265,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/4266): 442, listed.
     // And +1 from b909e36d: 442.
     // And +3 from R2b-1 of https://github.com/rrnewton/hermit/issues/4273: 445, listed.
-    ("test.cli", 445),
+    // The revert of 4273 R2b-1 (ade0e7dd) removes its tests: 442.
+    ("test.cli", 442),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3647,7 +3650,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore_lists_procfs_from_its_model_on_every_backend (B3a-3): 378, listed.
     // And +1 from b909e36d: 378.
     // And +3 from R2b-1 of https://github.com/rrnewton/hermit/issues/4273: 381, listed.
-    ("test.cli_on_host", 381),
+    // The revert of 4273 R2b-1 (ade0e7dd) removes its tests: 378.
+    ("test.cli_on_host", 378),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3906,7 +3910,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two fail-closed SIGKILL fence tests: 1709.
     // And +4 from b909e36d: 1713.
     // And +7 from R2b-1 of https://github.com/rrnewton/hermit/issues/4273: 1720, listed.
-    ("test.detcore_unit_on_host", 1720),
+    // The revert of 4273 R2b-1 (ade0e7dd) removes its tests: 1713.
+    ("test.detcore_unit_on_host", 1713),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4145,7 +4150,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 4370 record-version test: 1089, listed.
     // And +1 from R2b-1 of https://github.com/rrnewton/hermit/issues/4273: 1090, listed.
     // And +1 from 3fab1ec4: 1091.
-    ("test.hermit_unit_on_host", 1091),
+    // The revert of 4273 R2b-1 (ade0e7dd) removes its tests: 1090.
+    ("test.hermit_unit_on_host", 1090),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

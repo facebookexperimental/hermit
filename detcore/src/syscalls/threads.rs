@@ -871,6 +871,7 @@ where
     use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
     use crate::scheduler::discarded_at_send::DiscardedSignalControl;
     use crate::scheduler::discarded_at_send::STANDARD_SIGNALS;
+    let _ = committed;
     if pending & STANDARD_SIGNALS == 0
         || !crate::scheduler::discarded_at_send::records(guest.config())
     {
@@ -881,24 +882,6 @@ where
     else {
         return pending;
     };
-    with_kept_copies(state, thread, process, pending, committed)
-}
-
-/// `pending` without each signal whose only pending copies the record marks
-/// as discarded at send (`thread` for the thread's queue, `process` for the
-/// shared queue). The pure part of `without_discarded`. No signal is exempt,
-/// not even one in `committed`, the set the wake's answer names, which can
-/// hold a drain batch's copy that was flushed and sent again, discarded
-/// (R4-1 of the R2b-1 design re-checks,
-/// <https://github.com/rrnewton/hermit/issues/4273>).
-pub(crate) fn with_kept_copies(
-    state: &KernelSignalState,
-    thread: u64,
-    process: u64,
-    pending: KernelSigset,
-    committed: KernelSigset,
-) -> KernelSigset {
-    let _ = committed;
     let kept = (state.thread_pending & !thread) | (state.shared_pending & !process);
     pending & kept
 }
@@ -1418,13 +1401,10 @@ where
         .with_sigsetsize(KERNEL_SIGSET_SIZE);
     guest.inject_with_retry(block_signals).await?;
     let guest_mask: KernelSigset = guest.memory().read_value(old_mask_addr)?;
-    if guest.config().backend.reports_child_exit_publication
-        || crate::scheduler::discarded_at_send::records(guest.config())
-    {
+    if guest.config().backend.reports_child_exit_publication {
         // While the private mask is installed, the kernel reports Detcore's
-        // mask for this thread; the scheduler's child-exit classification and
-        // its record of copies Linux discarded at send must read the guest's
-        // own (the Claude re-check of the R2b-1 design, R4-3).
+        // mask for this thread; the scheduler's child-exit classification must
+        // read the guest's own.
         crate::tool_global::set_saved_guest_sigmask(guest, Some(guest_mask)).await;
     }
     Ok(guest_mask)
@@ -1451,9 +1431,7 @@ where
             .with_sigsetsize(KERNEL_SIGSET_SIZE);
         guest.inject_with_retry(restore_signals).await?;
     }
-    if guest.config().backend.reports_child_exit_publication
-        || crate::scheduler::discarded_at_send::records(guest.config())
-    {
+    if guest.config().backend.reports_child_exit_publication {
         crate::tool_global::set_saved_guest_sigmask(guest, None).await;
     }
     Ok(())
@@ -5298,26 +5276,6 @@ impl FutexWakeOp {
 
 #[cfg(test)]
 mod tests {
-
-    /// A copy the record marks as discarded at send is left out even when the
-    /// wake's answer names its signal (`committed`), as for a drain batch's
-    /// copy that was flushed and sent again, discarded (R4-1 of the R2b-1
-    /// design re-checks, https://github.com/rrnewton/hermit/issues/4273; arm
-    /// A9). A kept copy in either queue stays.
-    #[test]
-    fn a_discarded_copy_is_left_out_even_when_committed() {
-        let chld = kernel_sigset_bit(libc::SIGCHLD);
-        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
-        let state = KernelSignalState {
-            pending: chld | usr1,
-            thread_pending: chld,
-            shared_pending: usr1,
-            ..Default::default()
-        };
-        assert_eq!(with_kept_copies(&state, chld, 0, chld | usr1, chld), usr1);
-        assert_eq!(with_kept_copies(&state, 0, usr1, chld | usr1, usr1), chld);
-        assert_eq!(with_kept_copies(&state, 0, 0, chld | usr1, 0), chld | usr1);
-    }
     use std::io::Read;
     use std::io::Seek;
     use std::os::fd::AsRawFd;
