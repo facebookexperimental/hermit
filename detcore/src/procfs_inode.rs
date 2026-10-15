@@ -148,6 +148,20 @@ pub(crate) fn guest_tids_name_host_tasks(
     !backend.provides_process_signal_control && physical_tid.is_none()
 }
 
+/// Whether the tool can look up a guest's open descriptors through host
+/// procfs at all: wherever guest threads are host tasks, so a host task's
+/// `/proc/<pid>/fd` or the tool's own `/proc/thread-self/fd` is the guest's
+/// table (ptrace and in-guest LiteInst through the guest's IDs; DBT and SaBRe,
+/// which share the guest's table, through their host process ID or their own
+/// thread). Not where the backend owns signal delivery because guest threads
+/// are not host tasks (`provides_process_signal_control`, KVM): there
+/// `/proc/<pid>` is whatever host task has that ID, if any. Keyed on that one
+/// fact rather than on the table-sharing or thread-ID flags, which a DBT run
+/// started without its configuration leaves at ptrace's values.
+pub(crate) fn tool_can_name_guest_descriptors(backend: &BackendCapabilities) -> bool {
+    !backend.provides_process_signal_control
+}
+
 /// The key for the procfs entry at `path` within procfs on `device`: the
 /// 64-bit FNV-1a hash of the path's bytes, with [`PATH_KEY_BIT`] set.
 pub(crate) fn path_inode(device: u64, path: &Path) -> RawInode {
@@ -1182,6 +1196,18 @@ mod tests {
             &BackendCapabilities::PTRACE,
             Some(4_321)
         ));
+        // Descriptor lookups work wherever guest threads are host tasks
+        // (a DBT run without its configuration keeps PTRACE's facts), and
+        // never under KVM.
+        for backend in [
+            BackendCapabilities::PTRACE,
+            BackendCapabilities::LITEINST_IN_GUEST,
+            BackendCapabilities::SABRE,
+            BackendCapabilities::DBT,
+        ] {
+            assert!(tool_can_name_guest_descriptors(&backend));
+        }
+        assert!(!tool_can_name_guest_descriptors(&BackendCapabilities::KVM));
     }
 
     /// Once its task has exited, an entry is not named: following the link

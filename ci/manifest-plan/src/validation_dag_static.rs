@@ -2205,7 +2205,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4367): 1643.
     // And syscalls::signal::tests::rt_sigsuspend_never_sleeps_per_backend
     // (https://github.com/rrnewton/hermit/issues/4360): 1644, listed.
-    ("test.detcore_unit", 1644),
+    // And +1 from 927aa185: 1645.
+    ("test.detcore_unit", 1645),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3680,7 +3681,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three exec robust-wake tests: 1640.
     // And the three exit-waits-for-a-sibling-permit tests (https://github.com/rrnewton/hermit/issues/4367): 1643.
     // And the rt_sigsuspend-never-sleeps test (https://github.com/rrnewton/hermit/issues/4360): 1644, listed.
-    ("test.detcore_unit_on_host", 1644),
+    // And +1 from 927aa185: 1645.
+    ("test.detcore_unit_on_host", 1645),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

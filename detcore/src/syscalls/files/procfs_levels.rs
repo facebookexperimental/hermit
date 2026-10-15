@@ -759,8 +759,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             return false;
         }
         let link = format!("{}/fd/{fd}", self.caller_proc_directory(guest));
-        let entry = std::fs::metadata(&link)
-            .ok()
+        // Under KVM the link is an unrelated host task's, if any: neither look
+        // at it, and leave the answer to the caller's identity, as when the
+        // link is unreadable. DBT and SaBRe read their own `thread-self`.
+        let visible = crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend);
+        let entry = visible
+            .then(|| std::fs::metadata(&link).ok())
+            .flatten()
             .map(|metadata| (metadata.dev(), metadata.ino()));
         if let (Some(identity), Some(entry)) = (identity, entry)
             && identity != entry
@@ -775,8 +780,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !on_procfs {
             return false;
         }
-        match std::fs::read_link(&link) {
-            Ok(path) if path.is_absolute() => {
+        match visible.then(|| std::fs::read_link(&link)) {
+            Some(Ok(path)) if path.is_absolute() => {
                 procfs_name(&path).is_some_and(|name| name.absent_at(self.cfg.proc_level))
             }
             _ => true,

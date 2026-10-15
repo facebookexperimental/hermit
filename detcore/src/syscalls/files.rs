@@ -763,7 +763,17 @@ const DETERMINISTIC_NETLINK_PORT_ID_BASE: u32 = 0x4000_0000;
 /// matches: a host writer is outside the scheduler and must not be polled as if
 /// it were a guest
 /// (<https://github.com/rrnewton/hermit/pull/3534#issuecomment-5962369261>).
-fn reopens_scheduler_managed_pipe(pid: i32, fd: RawFd, managed_pipe_fds: &[RawFd]) -> bool {
+fn reopens_scheduler_managed_pipe(
+    backend: &reverie::BackendCapabilities,
+    pid: i32,
+    fd: RawFd,
+    managed_pipe_fds: &[RawFd],
+) -> bool {
+    // Under KVM `/proc/<pid>` is an unrelated host task, if any, and its
+    // links say nothing about this guest's pipes.
+    if !crate::procfs_inode::tool_can_name_guest_descriptors(backend) {
+        return false;
+    }
     let link = |fd: RawFd| std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok();
     let Some(opened) = link(fd) else {
         return false;
@@ -790,8 +800,17 @@ fn reopens_scheduler_managed_pipe(pid: i32, fd: RawFd, managed_pipe_fds: &[RawFd
 /// defined by the spelling and resolve to a different numeric path.
 ///
 /// `None` when the link cannot be read (the descriptor is gone, or procfs is
-/// unavailable), in which case the lexical result stands unchanged.
-fn resolved_open_path(pid: i32, fd: RawFd) -> Option<PathBuf> {
+/// unavailable), in which case the lexical result stands unchanged. Also
+/// `None` under KVM, where `/proc/<pid>` does not name the guest (see
+/// [`crate::procfs_inode::tool_can_name_guest_descriptors`]).
+fn resolved_open_path(
+    backend: &reverie::BackendCapabilities,
+    pid: i32,
+    fd: RawFd,
+) -> Option<PathBuf> {
+    if !crate::procfs_inode::tool_can_name_guest_descriptors(backend) {
+        return None;
+    }
     let link = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
     // A deleted or anonymous target is not a stable object name.
     link.is_absolute().then_some(link)
@@ -2501,8 +2520,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // Under a network trace mode only; the run ends before the
                 // guest sees the descriptor.
                 let pid = guest.pid().as_raw();
-                self.network_check_open(guest, &observed_path, || resolved_open_path(pid, fd))
-                    .await;
+                let backend = self.cfg.backend;
+                self.network_check_open(guest, &observed_path, || {
+                    resolved_open_path(&backend, pid, fd)
+                })
+                .await;
                 let fd_type = path.to_str().map_or(FdType::Regular, |fname| {
                     if fname == "/dev/random" || fname == "/dev/urandom" {
                         FdType::Rng
@@ -2529,6 +2551,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     && !self.cfg.recordreplay_modes
                     && !call.flags().contains(OFlag::O_PATH)
                     && reopens_scheduler_managed_pipe(
+                        &self.cfg.backend,
                         guest.pid().as_raw(),
                         fd,
                         &guest.thread_state().scheduler_managed_pipe_fds(),
@@ -2726,7 +2749,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let resolved = if self.cfg.recordreplay_modes {
                         self.recorded_open_path(guest, fd).await?
                     } else {
-                        resolved_open_path(guest.pid().as_raw(), fd)
+                        resolved_open_path(&self.cfg.backend, guest.pid().as_raw(), fd)
                     };
                     // Under record and replay, a `/proc` name outside the
                     // run's level that a spelling the lookup check does not
@@ -9685,6 +9708,56 @@ fn signalfd_range_is_covered(maps: &str, address: usize, len: usize, writable: b
         }
     }
     false
+}
+
+#[cfg(test)]
+mod guest_proc_visibility_tests {
+    use std::os::fd::AsRawFd;
+
+    use reverie::BackendCapabilities;
+
+    use super::reopens_scheduler_managed_pipe;
+    use super::resolved_open_path;
+
+    /// The open-path helpers read `/proc/<pid>/fd/<fd>` wherever guest
+    /// threads are host tasks: ptrace (whose facts a DBT run without its
+    /// configuration keeps), in-guest LiteInst, DBT and SaBRe.
+    /// With this process's own pipe and file, those read the links. KVM, whose
+    /// guest is not a host task, never consults them and gives the helpers'
+    /// "unknown" answers.
+    #[test]
+    fn host_proc_links_are_read_except_under_kvm() {
+        let pid = std::process::id() as i32;
+        let (reader, _writer) = nix::unistd::pipe().unwrap();
+        let alias = nix::unistd::dup(&reader).unwrap();
+        let file = std::fs::File::open("/proc/self/exe").unwrap();
+        let (pipe_fd, alias_fd) = (reader.as_raw_fd(), alias.as_raw_fd());
+        let file_fd = file.as_raw_fd();
+
+        for backend in [
+            BackendCapabilities::PTRACE,
+            BackendCapabilities::LITEINST_IN_GUEST,
+            BackendCapabilities::DBT,
+            BackendCapabilities::SABRE,
+        ] {
+            assert!(
+                reopens_scheduler_managed_pipe(&backend, pid, alias_fd, &[pipe_fd]),
+                "{backend:?}"
+            );
+            assert!(
+                resolved_open_path(&backend, pid, file_fd).is_some(),
+                "{backend:?}"
+            );
+        }
+        let kvm = BackendCapabilities::KVM;
+        assert!(!reopens_scheduler_managed_pipe(
+            &kvm,
+            pid,
+            alias_fd,
+            &[pipe_fd]
+        ));
+        assert_eq!(resolved_open_path(&kvm, pid, file_fd), None);
+    }
 }
 
 #[cfg(test)]
