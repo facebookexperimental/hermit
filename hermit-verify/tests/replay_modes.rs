@@ -47,10 +47,19 @@
 //! package's `hermit-verify`. Both need the PMU and user and mount namespaces,
 //! as every Hermit integration test does.
 
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::ExitStatus;
 use std::process::Output;
+
+#[path = "../../hermit-cli/tests/common/skid_overshoot.rs"]
+mod skid_overshoot;
+
+/// Attempts at one case when its Hermit runs are refused for PMU skid
+/// overshoot, as hermit-cli's tests allow (`hermit_test::hermit_output`).
+const SKID_ATTEMPTS: u32 = 5;
 
 /// Wall bound for one hermit-verify run, which runs Hermit twice.
 const VERIFY_TIMEOUT: &str = "240s";
@@ -221,9 +230,28 @@ fn run_replay_with(binary: &Path, scenario: Option<&str>, mode: Mode, hermit_arg
         // debug build against nextest's 57 s limit; 16 s without them.
         .env("RUST_LOG", "reverie_ptrace::timer=debug");
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    // hermit-verify exits with its own status, not its Hermit run's, so the
+    // typed classifier judges the run hermit-verify reports as failed: its own
+    // exit status and its own stderr. Only such a refusal is retried; the
+    // retry is recorded, and credited a CPU budget, like hermit_output's.
+    let name = std::thread::current()
+        .name()
+        .unwrap_or("replay case")
+        .to_owned();
+    let (_, _, output) = skid_overshoot::retry_typed_skid_refusal(&name, SKID_ATTEMPTS, || {
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+        let judged = match refused_run_stderr(&output) {
+            Some(stderr) => Output {
+                status: ExitStatus::from_raw(detcore_model::HERMIT_POLICY_REFUSAL_EXIT << 8),
+                stdout: Vec::new(),
+                stderr: stderr.into_bytes(),
+            },
+            None => output.clone(),
+        };
+        (judged, output)
+    });
     assert!(
         output.status.success(),
         "{rendered} did not replay its recording\n{}",
@@ -245,6 +273,91 @@ macro_rules! shell_replay_case {
             run_shell_replay_case($script, $mode);
         }
     };
+}
+
+/// The stderr of the Hermit run a failed hermit-verify reports, when exactly
+/// one of its runs failed and that run exited with Hermit's policy-refusal
+/// status. hermit-verify prints each run's `Executed command with status: N`
+/// and, for a failed run, its stderr between `:: ------------------Stderr`
+/// and `:: ----------------End Stderr` lines.
+fn refused_run_stderr(output: &Output) -> Option<String> {
+    if output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let failed: Vec<(usize, i32)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let status = line.trim().strip_prefix("Executed command with status: ")?;
+            Some((index, status.trim().parse::<i32>().ok()?))
+        })
+        .filter(|(_, status)| *status != 0)
+        .collect();
+    let [(index, status)] = failed[..] else {
+        return None;
+    };
+    if status != detcore_model::HERMIT_POLICY_REFUSAL_EXIT {
+        return None;
+    }
+    let start = (index..lines.len())
+        .find(|&i| lines[i].trim() == ":: ------------------Stderr----------------------")?;
+    let end = (start..lines.len())
+        .find(|&i| lines[i].trim() == ":: ----------------End Stderr--------------------")?;
+    Some(lines[start + 1..end].join("\n"))
+}
+
+#[test]
+fn a_refused_run_is_found_only_when_it_is_the_one_failure() {
+    let report = |runs: &[(i32, &str)]| -> Output {
+        let mut stdout = String::from("Preparing temporary environment to run experiments\n");
+        for (number, (status, stderr)) in runs.iter().enumerate() {
+            stdout.push_str(&format!(
+                ":: Run #{}...\n   hermit run -- guest\nExecuted command with status: {status}\n",
+                number + 1
+            ));
+            if *status != 0 {
+                stdout.push_str(&format!(
+                    "Failing run because of non-zero exit code.\n\
+                     :: ------------------Stdout----------------------\nout\n\
+                     :: ----------------End Stdout--------------------\n\
+                     :: ------------------Stderr----------------------\n{stderr}\n\
+                     :: ----------------End Stderr--------------------\n"
+                ));
+            }
+        }
+        Output {
+            status: ExitStatus::from_raw(1 << 8),
+            stdout: stdout.into_bytes(),
+            stderr: b"Error: Nonzero exit not allowed.\n".to_vec(),
+        }
+    };
+    // The refusal from the 3703be04 validation, with Hermit's own lines.
+    let refusal = "HERMIT_SKID_OVERSHOOT rcb_actual=240935 rcb_target=240682 skid_margin=1000 overshoot=253\n\
+                   HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2\n\
+                   Error: Hermit refused the run: a fail-closed policy stopped it before completion.";
+    let found = refused_run_stderr(&report(&[(122, refusal)])).expect("the refused run");
+    assert_eq!(
+        skid_overshoot::skid_overshoot_refusal(Some(122), &found),
+        Some("HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2")
+    );
+    assert!(refused_run_stderr(&report(&[(0, ""), (122, refusal)])).is_some());
+    // Another failing status, two failures, or no failed run is not one.
+    assert!(refused_run_stderr(&report(&[(125, refusal)])).is_none());
+    assert!(refused_run_stderr(&report(&[(122, refusal), (122, refusal)])).is_none());
+    assert!(refused_run_stderr(&report(&[(0, ""), (0, "")])).is_none());
+    // A refusal for another cause is found, and the classifier rejects it.
+    let other = "HERMIT_POLICY_REFUSAL class=policy-refusal cause=unsupported-syscall count=1";
+    let found = refused_run_stderr(&report(&[(122, other)])).unwrap();
+    assert_eq!(
+        skid_overshoot::skid_overshoot_refusal(Some(122), &found),
+        None
+    );
+    // hermit-verify's own success is never a refusal.
+    let mut passed = report(&[(122, refusal)]);
+    passed.status = ExitStatus::from_raw(0);
+    assert!(refused_run_stderr(&passed).is_none());
 }
 
 macro_rules! rust_replay_case {
