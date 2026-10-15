@@ -439,6 +439,12 @@
       "why": "tests/c/fatal_core_capture.c is owned by hermit-cli/tests/fatal_core_capture.rs: Guest that dies of a core-dumping signal in several shapes (a segfault after marking its heap, forked children dirtying incompressible heap, a child that segfaults under a parent that exits 0, and a non-main thread that faults with a marker in r12) so the integration test can check what hermit run --fatal-core-dir keeps: one core per dying process from the faulting thread, within the per-core and total caps, nothing on a green run, and unchanged --verify parity. Driven only by its own integration test, which compiles it with -pthread, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "disposition": "integration-fixture",
+      "path": "tests/c/fatal_signal_threads.c",
+      "runner": "hermit-cli/tests/robust_futex_owner_death.rs",
+      "why": "tests/c/fatal_signal_threads.c is owned by hermit-cli/tests/robust_futex_owner_death.rs: the integration test compiles this guest, whose forked child raises SIGTERM with one thread, with a second thread blocked in pause(), or with a SIGTERM handler installed, and requires the parent's report of how the child ended to match the native run on DBT, at L2 and in a plain run (https://github.com/rrnewton/hermit/issues/4278)"
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/fchmod_bits.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

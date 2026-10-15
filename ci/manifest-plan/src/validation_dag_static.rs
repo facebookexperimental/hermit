@@ -2266,7 +2266,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from a35a69ad: 1701.
     // And procfs::tests::a_process_cgroup_reads_as_the_root_cgroup
     // (https://github.com/rrnewton/hermit/issues/4378): 1702.
-    ("test.detcore_unit", 1702),
+    // And syscalls::threads::tests::default_actions_that_end_the_process and
+    // scheduler::test::a_group_exit_decided_in_a_turn_is_granted_before_any_other_thread_runs
+    // (https://github.com/rrnewton/hermit/issues/4278): 1704, listed.
+    ("test.detcore_unit", 1704),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2546,9 +2549,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_bind_of_proc_reads_cgroup_as_root_and_leaves_mountinfo_alone and
     // a_bind_mounted_status_file_keeps_its_seeks in the third
     // (https://github.com/rrnewton/hermit/issues/4378): 60 + 169 + 229 = 458.
+    // And robust_futex_owner_death's two DBT fatal-signal tests in the third
+    // shard (https://github.com/rrnewton/hermit/issues/4278): 60 + 169 + 231
+    // = 460.
     ("test.hermit_integration", 60),
     ("test.hermit_integration_2", 169),
-    ("test.hermit_integration_3", 229),
+    ("test.hermit_integration_3", 231),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3837,7 +3843,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the DBT SIGKILL group-retirement and fence tests: 1700.
     // And +1 from a35a69ad: 1701.
     // And the process-cgroup test (https://github.com/rrnewton/hermit/issues/4378): 1702.
-    ("test.detcore_unit_on_host", 1702),
+    // And the default-action classification and group-exit selection tests: 1704.
+    ("test.detcore_unit_on_host", 1704),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3902,7 +3909,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 451.
     // And the DBT and ptrace SIGKILL tests: 453.
     // And the five process-cgroup tests (https://github.com/rrnewton/hermit/issues/4378): 458.
-    ("test.hermit_integration_on_host", 458),
+    // And the two DBT fatal-signal tests: 460.
+    ("test.hermit_integration_on_host", 460),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

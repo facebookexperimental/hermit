@@ -844,6 +844,8 @@ mod tests {
             // (https://github.com/rrnewton/hermit/issues/4362), plus
             // the five process-cgroup tests
             // (https://github.com/rrnewton/hermit/issues/4378).
+            // Plus robust_futex_owner_death's two DBT fatal-signal tests
+            // (https://github.com/rrnewton/hermit/issues/4278).
             // The local node runs in shards, which together execute the same.
             let executed = |tag: &str| -> u64 {
                 let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
@@ -857,7 +859,7 @@ mod tests {
             } else {
                 executed(tag)
             };
-            assert_eq!(population, 458);
+            assert_eq!(population, 460);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

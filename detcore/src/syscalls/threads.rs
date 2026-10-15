@@ -65,6 +65,7 @@ use crate::tool_global::child_tid_clear_address;
 use crate::tool_global::consume_child_wait;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
+use crate::tool_global::hold_turn_for_group_exit;
 use crate::tool_global::host_timed_signals;
 use crate::tool_global::prepare_exec;
 use crate::tool_global::process_group;
@@ -709,6 +710,26 @@ fn signal_default_disposition_does_not_interrupt_child_wait(signal: SigWrapper) 
     matches!(
         signal.raw(),
         libc::SIGCHLD | libc::SIGCONT | libc::SIGURG | libc::SIGWINCH
+    )
+}
+
+/// Whether `signal`'s default action ends the process, by terminating it or
+/// dumping core (signal(7)): every signal except those whose default is to be
+/// ignored, to stop or to continue. SIGKILL, which no handler or callback
+/// sees, is left out as well. On DBT, real-time signals do not reach
+/// Detcore's signal path today (<https://github.com/rrnewton/hermit/issues/4192>).
+fn signal_default_action_ends_the_process(signal: SigWrapper) -> bool {
+    !matches!(
+        signal.raw(),
+        libc::SIGCHLD
+            | libc::SIGCONT
+            | libc::SIGURG
+            | libc::SIGWINCH
+            | libc::SIGSTOP
+            | libc::SIGTSTP
+            | libc::SIGTTIN
+            | libc::SIGTTOU
+            | libc::SIGKILL
     )
 }
 
@@ -2296,6 +2317,166 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
+    }
+
+    /// On DBT, end the thread group in the schedule before a signal that
+    /// ends it by default is delivered natively
+    /// (<https://github.com/rrnewton/hermit/issues/4278>). DynamoRIO carries
+    /// out such a default action itself, and before the process exits it
+    /// synchronizes with every other thread of it. A thread waiting for its
+    /// turn is blocked in the client's call to the coordinator, inside a
+    /// DynamoRIO event callback, where DynamoRIO cannot suspend it, so the
+    /// dying thread waited for it forever. The `Exit` grant of an exit_group
+    /// logically kills the group's other threads and cancels their pending
+    /// requests, so each returns from its callback and can be synchronized;
+    /// the robust lists are walked as an exit_group's are. Returns whether it
+    /// ended the group.
+    ///
+    /// The decision is the action read in this thread's `InboundSignal` turn.
+    /// Linux commits it under the signal lock: for an unblocked signal,
+    /// `complete_signal` sets `SIGNAL_GROUP_EXIT` and queues SIGKILL to every
+    /// other thread of the group, so no sibling runs another user instruction
+    /// after the decision. Filing the `Exit` request ends this thread's turn,
+    /// so the thread first asks that the request be granted at the very next
+    /// turn (`Scheduler::hold_turn_for_group_exit`). No sibling takes a turn
+    /// between the decision and the grant, which logically kills the siblings,
+    /// so none runs guest code before the native delivery (Claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/4387).
+    ///
+    /// One path can still run a sibling first: an exit parked behind a
+    /// sibling's signal-delivery permit (`Scheduler::exit_awaits_sibling_permit`).
+    /// DynamoRIO reads the action again when it delivers, so after the grant
+    /// the action is read again and, if a sibling changed it, set back to
+    /// `SIG_DFL` in this dying process, and the delivery carries out the
+    /// committed decision (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4387, P1).
+    ///
+    /// The gate is this backend's: DynamoRIO carries out a default action in
+    /// the process and synchronizes every thread before it exits. Today only
+    /// DBT sends process signals to a named thread
+    /// (`requires_thread_directed_process_signals`), so that flag selects it.
+    pub(crate) async fn end_thread_group_before_fatal_delivery<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+    ) -> bool {
+        if !(self.cfg.sequentialize_threads
+            && self.cfg.backend.requires_thread_directed_process_signals)
+            || !signal_default_action_ends_the_process(signal)
+        {
+            return false;
+        }
+        match self.signal_is_left_at_default(guest, signal).await {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    "[detcore, dtid {}] cannot read the disposition of {}: {}",
+                    guest.thread_state().dettid,
+                    signal,
+                    error
+                );
+                return false;
+            }
+        }
+        info!(
+            "[detcore, dtid {}] {} ends its thread group by default",
+            guest.thread_state().dettid,
+            signal
+        );
+        let barrier = self.robust_owner_death_path() == Some(OwnerDeathPath::Barrier);
+        if barrier {
+            guest.thread_state().file_exit_group_for_robust_lists();
+        }
+        let dettid = guest.thread_state().dettid;
+        if !hold_turn_for_group_exit(guest, dettid).await {
+            tracing::warn!(
+                "[detcore, dtid {}] the scheduler did not hold the turn for the group exit of {}",
+                dettid,
+                signal
+            );
+        }
+        let request = guest.thread_state().mk_request(
+            ResourceID::Exit {
+                group: true,
+                process: guest.thread_state().detpid.expect("detpid unset"),
+                mm: guest.thread_state().mm_id,
+            },
+            Permission::RW,
+        );
+        resource_request(guest, request).await;
+        match self.signal_is_left_at_default(guest, signal).await {
+            Ok(true) => {}
+            changed => {
+                info!(
+                    "[detcore, dtid {}] the action for {} changed after the delivery decision \
+                     ({:?}); restoring SIG_DFL in the dying process",
+                    guest.thread_state().dettid,
+                    signal,
+                    changed.map(|default| !default)
+                );
+                if let Err(error) = self.restore_default_action(guest, signal).await {
+                    tracing::warn!(
+                        "[detcore, dtid {}] cannot restore SIG_DFL for {}: {}",
+                        guest.thread_state().dettid,
+                        signal,
+                        error
+                    );
+                }
+            }
+        }
+        if barrier {
+            guest.thread_state().begin_exit_group_robust_walk();
+            let owners = guest.thread_state().robust_list_owners_for_exit_group();
+            self.run_thread_group_robust_list_owner_death(guest, owners)
+                .await;
+            guest.thread_state().finish_exit_group_robust_walk();
+        }
+        true
+    }
+
+    /// Set the guest's action for `signal` to `SIG_DFL`.
+    async fn restore_default_action<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+    ) -> Result<(), Error> {
+        let default = KernelSigaction {
+            handler: libc::SIG_DFL as u64,
+            flags: 0,
+            restorer: 0,
+            mask: 0,
+        };
+        let mut stack = guest.stack().await;
+        let action_addr = stack.push(default);
+        let _guard = stack.commit()?;
+        let call = syscalls::RtSigaction::new()
+            .with_signum(signal.raw())
+            .with_action(Some(action_addr.cast()))
+            .with_old_action(None)
+            .with_sigsetsize(std::mem::size_of::<u64>());
+        guest.inject_with_retry(call).await?;
+        Ok(())
+    }
+
+    /// Whether the guest's action for `signal` is the default (`SIG_DFL`),
+    /// as the backend reports it to the guest.
+    async fn signal_is_left_at_default<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+    ) -> Result<bool, Error> {
+        let mut stack = guest.stack().await;
+        let action_addr = stack.reserve::<KernelSigaction>();
+        let _guard = stack.commit()?;
+        let call = syscalls::RtSigaction::new()
+            .with_signum(signal.raw())
+            .with_action(None)
+            .with_old_action(Some(action_addr.cast()))
+            .with_sigsetsize(std::mem::size_of::<u64>());
+        guest.inject_with_retry(call).await?;
+        let action: KernelSigaction = guest.memory().read_value(action_addr)?;
+        Ok(action.handler == libc::SIG_DFL as u64)
     }
 
     /// Futex system call, which can block.
@@ -5590,6 +5771,52 @@ mod tests {
             assert!(!signal_default_disposition_does_not_interrupt_child_wait(
                 SigWrapper(signal)
             ));
+        }
+    }
+
+    /// signal(7): the signals whose default action is to terminate or dump
+    /// core end the process; those ignored, stopping or continuing by
+    /// default do not, and SIGKILL never reaches a delivery callback
+    /// (https://github.com/rrnewton/hermit/issues/4278).
+    #[test]
+    fn default_actions_that_end_the_process() {
+        for signal in [
+            libc::SIGTERM,
+            libc::SIGINT,
+            libc::SIGHUP,
+            libc::SIGQUIT,
+            libc::SIGABRT,
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGFPE,
+            libc::SIGILL,
+            libc::SIGPIPE,
+            libc::SIGALRM,
+            libc::SIGUSR1,
+            libc::SIGUSR2,
+            libc::SIGRTMIN(),
+            libc::SIGRTMAX(),
+        ] {
+            assert!(
+                signal_default_action_ends_the_process(SigWrapper(signal)),
+                "{signal}"
+            );
+        }
+        for signal in [
+            libc::SIGCHLD,
+            libc::SIGCONT,
+            libc::SIGURG,
+            libc::SIGWINCH,
+            libc::SIGSTOP,
+            libc::SIGTSTP,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+            libc::SIGKILL,
+        ] {
+            assert!(
+                !signal_default_action_ends_the_process(SigWrapper(signal)),
+                "{signal}"
+            );
         }
     }
 

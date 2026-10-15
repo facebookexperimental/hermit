@@ -157,6 +157,26 @@ fn build_guest(build_root: &Path) -> PathBuf {
     guest
 }
 
+#[cfg(feature = "dbt")]
+fn build_fatal_signal_guest(build_root: &Path) -> PathBuf {
+    fs::create_dir_all(build_root).expect("failed to create fatal-signal guest build directory");
+    let guest = build_root.join("fatal_signal_threads");
+    let mut compile = Command::new("cc");
+    compile
+        .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository().join("tests/c/fatal_signal_threads.c"))
+        .args(["-pthread", "-o"])
+        .arg(&guest);
+    run_captured(
+        compile,
+        "fatal-signal guest compilation",
+        &build_root.join("compile-fatal-signal.out"),
+        &build_root.join("compile-fatal-signal.err"),
+        true,
+    );
+    guest
+}
+
 fn build_lifecycle_guest(build_root: &Path) -> PathBuf {
     fs::create_dir_all(build_root).expect("failed to create lifecycle guest build directory");
     let guest = build_root.join("robust_futex_owner_lifecycle");
@@ -956,6 +976,153 @@ fn dbt_wakes_the_waiter_when_an_exit_group_ends_the_owner() {
         "DBT took the staged path that waits for exit callbacks\nstderr:\n{}",
         captured.stderr,
     );
+}
+
+/// The DBT leg of the `signal` mode of
+/// `ptrace_wakes_after_guest_observed_fatal_signal_and_exit_group_cleanup`: a
+/// thread of the owner's process raises SIGTERM, whose default action ends the
+/// process, and the waiter is woken with EOWNERDEAD, at L2 and in a plain run.
+/// Before, DynamoRIO's process exit waited forever to synchronize with the
+/// owner thread, which was blocked waiting for its turn, and the run was
+/// killed at its deadline (https://github.com/rrnewton/hermit/issues/4278).
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_wakes_the_waiter_when_a_fatal_signal_ends_the_owner() {
+    let build_root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-dbt-signal");
+    let guest = build_lifecycle_guest(&build_root);
+    for verify in [true, false] {
+        let run = run_dbt_lifecycle_mode(&build_root, &guest, "signal", verify);
+        assert!(
+            run.stdout.contains("PASS: waiter received EOWNERDEAD"),
+            "DBT signal (verify {verify}) did not wake the waiter\nstdout:\n{}\nstderr:\n{}",
+            run.stdout,
+            run.stderr,
+        );
+        if !verify {
+            // Exactly one owner-death wake, reaching one modeled waiter, as
+            // for an exit_group (Claude review of
+            // https://github.com/rrnewton/hermit/pull/4387, finding 3).
+            let wakes = owner_death_wakes(&run.stderr);
+            assert_eq!(
+                wakes.len(),
+                1,
+                "Detcore must issue exactly one owner-death wake: {wakes:#?}\nstderr:\n{}",
+                run.stderr,
+            );
+            assert!(
+                wakes[0].contains("woke 1 waiter(s)"),
+                "the owner-death wake did not reach exactly one modeled waiter: {wakes:#?}"
+            );
+        }
+    }
+}
+
+/// The same fatal SIGTERM with no robust mutex at all: a forked child with a
+/// second thread blocked in pause() is ended by the signal's default action,
+/// and its parent sees it killed by SIGTERM, at L2 and in a plain run. The
+/// child with one thread, and a child with a SIGTERM handler, whose handler
+/// must still run, are the controls. Each output must match the native run
+/// (https://github.com/rrnewton/hermit/issues/4278).
+///
+/// In `threaded-race` the sibling's next turn falls right after the
+/// delivery's decision. It would install a SIGTERM handler and then store to
+/// a page the parent prints. Linux kills every other thread when it commits
+/// the default action, so "signaled sig=15 shm=1" never happens there. Hermit
+/// grants the group exit before any other thread's turn, so the sibling never
+/// runs after the decision: "shm=0", and the action never needs restoring
+/// (Codex review and Claude re-check of
+/// https://github.com/rrnewton/hermit/pull/4387).
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_a_default_fatal_signal_ends_a_threaded_process_and_a_handler_still_runs() {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fatal-signal-threads-dbt");
+    let guest = build_fatal_signal_guest(&build_root);
+    for (mode, expected) in [
+        (
+            "single-default",
+            "FATAL-SIGNAL single-default: signaled sig=15\n",
+        ),
+        (
+            "threaded-default",
+            "FATAL-SIGNAL threaded-default: signaled sig=15\n",
+        ),
+        (
+            "threaded-caught",
+            "FATAL-SIGNAL threaded-caught: exited code=0\n",
+        ),
+    ] {
+        let mut native = Command::new("timeout");
+        native
+            .args(["--kill-after", "5s", "30s"])
+            .arg(&guest)
+            .arg(mode);
+        let control = run_captured(
+            native,
+            &format!("native fatal-signal {mode} control"),
+            &build_root.join(format!("native-{mode}.out")),
+            &build_root.join(format!("native-{mode}.err")),
+            true,
+        );
+        assert_eq!(control.stdout, expected, "native {mode} control");
+        for verify in [true, false] {
+            let run = run_dbt_lifecycle_mode(&build_root, &guest, mode, verify);
+            assert_eq!(
+                run.stdout, expected,
+                "DBT {mode} (verify {verify})\nstderr:\n{}",
+                run.stderr
+            );
+        }
+    }
+
+    let mut native = Command::new("timeout");
+    native
+        .args(["--kill-after", "5s", "30s"])
+        .arg(&guest)
+        .arg("threaded-race");
+    let control = run_captured(
+        native,
+        "native fatal-signal threaded-race control",
+        &build_root.join("native-threaded-race.out"),
+        &build_root.join("native-threaded-race.err"),
+        true,
+    );
+    assert!(
+        [
+            "FATAL-SIGNAL threaded-race: signaled sig=15 shm=0\n",
+            "FATAL-SIGNAL threaded-race: exited code=0 shm=1\n",
+            "FATAL-SIGNAL threaded-race: exited code=0 shm=0\n",
+        ]
+        .contains(&control.stdout.as_str()),
+        "native threaded-race control: {}",
+        control.stdout
+    );
+    for verify in [true, false] {
+        let run = run_dbt_lifecycle_mode(&build_root, &guest, "threaded-race", verify);
+        assert_eq!(
+            run.stdout, "FATAL-SIGNAL threaded-race: signaled sig=15 shm=0\n",
+            "DBT threaded-race (verify {verify})\nstderr:\n{}",
+            run.stderr
+        );
+        if !verify {
+            assert_eq!(
+                run.stderr
+                    .matches("ends its thread group by default")
+                    .count(),
+                1,
+                "the delivery did not decide the default action\nstderr:\n{}",
+                run.stderr
+            );
+            assert_eq!(
+                run.stderr
+                    .matches("changed after the delivery decision")
+                    .count(),
+                0,
+                "a sibling ran between the decision and the group exit\nstderr:\n{}",
+                run.stderr
+            );
+        }
+    }
 }
 
 /// Runs the lifecycle guest's `mode` under Hermit DBT with `--strict` and

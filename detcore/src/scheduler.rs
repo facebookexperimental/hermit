@@ -1390,6 +1390,12 @@ pub struct Scheduler {
     /// The bound on the SIGKILL fence and a sender's wait:
     /// `SIGKILL_FENCE_VALVE`, shortened only by tests that expire it.
     pub(crate) sigkill_fence_valve: Duration,
+
+    /// A thread that, in its signal-delivery turn, decided that a fatal
+    /// default action ends its thread group, and whose group `Exit` request
+    /// is therefore granted at the very next turn, before any other thread
+    /// runs (`hold_turn_for_group_exit`).
+    group_exit_decider: Option<DetTid>,
     /// `hermit record`: where `step2c_process_io_blockers` logs each
     /// readmission of a backgrounded call (see `rejoin_log`).
     rejoin_writer: Option<RejoinWriter>,
@@ -3484,6 +3490,7 @@ impl Scheduler {
             sigkill_fence_wait_since: None,
             sigkill_fence_refusal: None,
             sigkill_fence_valve: Self::SIGKILL_FENCE_VALVE,
+            group_exit_decider: None,
             rejoin_writer: match &cfg.replay_data {
                 Some(dir) if cfg.recordreplay_modes && !cfg.replaying => {
                     Some(RejoinWriter::create(dir).unwrap_or_else(|err| {
@@ -5017,6 +5024,43 @@ impl Scheduler {
     pub(crate) fn thread_is_logically_killed(&self, dettid: DetTid) -> bool {
         self.backend.needs_killed_thread_rpc_cancellation
             && self.logically_killed_threads.contains(&dettid)
+    }
+
+    /// Grant `dettid`'s next request, its group `Exit`, at the very next
+    /// turn, before any other thread runs. Sent by a thread that holds the
+    /// serial grant in its signal-delivery turn, after it read that the
+    /// signal's default action ends the process. Linux commits that decision
+    /// under the signal lock and queues SIGKILL to every other thread of the
+    /// group at once (`complete_signal`), so no sibling runs another user
+    /// instruction after it; here, no sibling takes a turn between the
+    /// decision and the grant that ends the group
+    /// (https://github.com/rrnewton/hermit/issues/4278, Claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/4387). Returns whether
+    /// `dettid` holds the grant; a thread that does not is ignored.
+    pub(crate) fn hold_turn_for_group_exit(&mut self, dettid: DetTid) -> bool {
+        let holds = self.holds_serial_grant(dettid);
+        if holds {
+            self.group_exit_decider = Some(dettid);
+        } else {
+            tracing::warn!(
+                "[scheduler] dettid {dettid} asked to keep its turn for a group exit without holding the serial grant"
+            );
+        }
+        holds
+    }
+
+    /// The thread whose group `Exit` must be granted next
+    /// (`hold_turn_for_group_exit`), if it is queued with that request. A
+    /// decider that left the run set otherwise is forgotten.
+    fn queued_group_exit_decider(&mut self) -> Option<DetTid> {
+        let decider = self.group_exit_decider?;
+        if !self.next_turns.contains_key(&decider) {
+            self.group_exit_decider = None;
+            return None;
+        }
+        self.run_queue
+            .contains_non_polling_tid(decider)
+            .then_some(decider)
     }
 
     /// Whether `dettid` is running in a turn the scheduler granted it, now:
@@ -10760,7 +10804,7 @@ impl Scheduler {
             // caller), so it is the thread that takes the process-directed
             // copy (`sigchld_takers`).
             let taker = self.first_sigchld_taker();
-            let next_dtid = match taker.or(gated_child) {
+            let next_dtid = match self.queued_group_exit_decider().or(taker).or(gated_child) {
                 Some(child) => self
                     .run_queue
                     .tentative_pop_tid(child)
@@ -11167,6 +11211,9 @@ impl Scheduler {
             // SI_TKILL for one child, so only the scheduler wait readiness is
             // synthesized on that path.
             ResourceID::Exit { group, process, mm } => {
+                if self.group_exit_decider == Some(dettid) {
+                    self.group_exit_decider = None;
+                }
                 if self.exit_awaits_sibling_permit(dettid, *process) {
                     info!(
                         "[scheduler] NONCOMMIT turn {}, parking dettid {}'s exit behind a sibling's signal delivery",
@@ -13717,6 +13764,41 @@ mod test {
                 protocol: Default::default(),
             },
         );
+    }
+
+    /// A thread that decided, in its own turn, that a default action ends its
+    /// group runs its group `Exit` next, ahead of a thread queued before it;
+    /// a thread that does not hold the turn cannot ask for that
+    /// (https://github.com/rrnewton/hermit/issues/4278).
+    #[test]
+    fn a_group_exit_decided_in_a_turn_is_granted_before_any_other_thread_runs() {
+        let mut sched = Scheduler::new(&Config::default());
+        let sibling = DetTid::from_raw(41);
+        let decider = DetTid::from_raw(43);
+        for tid in [sibling, decider] {
+            register_known_thread(&mut sched, tid);
+        }
+        sched.next_turns[&sibling]
+            .req
+            .put(Ok(Resources::new(sibling)));
+        sched.run_queue.push_back(sibling, DEFAULT_PRIORITY);
+        assert!(!sched.hold_turn_for_group_exit(decider));
+        sched.set_running_for_test(decider);
+        assert!(!sched.hold_turn_for_group_exit(sibling));
+        assert!(sched.hold_turn_for_group_exit(decider));
+        sched.next_turns[&decider]
+            .req
+            .put(Ok(Resources::new(decider)));
+        sched.run_queue.push_back(decider, DEFAULT_PRIORITY);
+        let (chosen, ..) = sched.select_test_turn().unwrap();
+        assert_eq!(chosen, decider);
+        sched.run_queue.undo_tentative_pop();
+        // Once the decider has left the run set, it is forgotten.
+        assert!(sched.run_queue.remove_tid(decider));
+        sched.next_turns.remove(&decider);
+        let (chosen, ..) = sched.select_test_turn().unwrap();
+        assert_eq!(chosen, sibling);
+        assert_eq!(sched.group_exit_decider, None);
     }
 
     #[test]

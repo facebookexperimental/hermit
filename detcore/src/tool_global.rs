@@ -2890,6 +2890,11 @@ impl GlobalState {
             GlobalRequest::NamesHermitTask(caller, tgid, tid) => {
                 R::NamesHermitTask(hermit_task_named(caller, tgid, tid))
             }
+            GlobalRequest::HoldTurnForGroupExit(dettid) => R::HoldTurnForGroupExit(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .hold_turn_for_group_exit(dettid),
+            ),
             GlobalRequest::NotifySignalPending(dettid, SigWrapper(signal), target_process) => {
                 let fence = {
                     let mut scheduler = self.lock_rpc_scheduler(false).await;
@@ -4864,6 +4869,11 @@ pub enum GlobalRequest {
     NamesHermitTask(DetTid, Option<i32>, i32),
     /// A successful kill(2) queued a physical signal for this sole target.
     NotifySignalPending(DetTid, SigWrapper, Option<DetPid>),
+    /// The sender, holding the serial grant in its signal-delivery turn,
+    /// decided that a default action ends its thread group: its next request,
+    /// the group `Exit`, is granted before any other thread runs
+    /// (`Scheduler::hold_turn_for_group_exit`).
+    HoldTurnForGroupExit(DetTid),
     /// A successful SIGKILL whose victims the scheduler is not told one by
     /// one: a process-group kill (`Some(group)`), or a pidfd whose process
     /// Detcore did not record (`None`).
@@ -5085,6 +5095,7 @@ pub enum GlobalResponse {
     ResolveKillTargets(Vec<DetTid>, Option<bool>),
     NamesHermitTask(bool),
     NotifySignalPending(()),
+    HoldTurnForGroupExit(bool),
     NotifyUnresolvedSigkill(()),
     ThreadIsLive(bool),
     PendingRealTimeExpirations(u64),
@@ -7309,6 +7320,22 @@ fn alarm_signal(sig: SigWrapper) -> Signal {
             sig.raw()
         )
     })
+}
+
+/// Ask that this thread's next request, its group `Exit`, be granted before
+/// any other thread runs (`GlobalRequest::HoldTurnForGroupExit`). Returns
+/// whether the scheduler agreed, which it does only for the thread holding the
+/// serial grant.
+pub async fn hold_turn_for_group_exit<G, T>(guest: &mut G, dettid: DetTid) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::HoldTurnForGroupExit(dettid)).await;
+    match response.1 {
+        GlobalResponse::HoldTurnForGroupExit(held) => held,
+        _ => unreachable!(),
+    }
 }
 
 pub async fn notify_signal_pending<G, T>(

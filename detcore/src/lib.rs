@@ -1089,6 +1089,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .thread_state_mut()
                 .mk_request(ResourceID::InboundSignal(signal), Permission::RW);
             resource_request(guest, request).await;
+            if self
+                .end_thread_group_before_fatal_delivery(guest, signal)
+                .await
+            {
+                // As an exit_group does after its grant, file nothing more:
+                // the group's turns are held until it has ended, which needs
+                // this thread to die (Claude review of
+                // https://github.com/rrnewton/hermit/pull/4387, finding 4).
+                info!(
+                    "[dtid {}] finish delivering signal (#{}) {}",
+                    dettid, mycount, signal
+                );
+                return Ok(Some(signal));
+            }
             // A delivered signal may be caught, ignored, or terminate the
             // thread group. Reading the lists is harmless; the collected
             // wakes remain inert unless the ptrace exit callback later reports
