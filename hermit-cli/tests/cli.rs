@@ -29970,7 +29970,9 @@ fn cpu_profile_v3_refuses_backends_and_flags_it_cannot_qualify() {
 /// A library caller cannot run a v3 guest by supplying host facts of its own:
 /// this process never ran the qualification, so the library's launch refuses
 /// by name before any backend starts, whatever the facts say. (`hermit run`
-/// qualifies first; the library does not.)
+/// qualifies first; the library does not.) Both launch families are checked:
+/// `run` (exit status) and `run_with_output` (captured output) reach the guest
+/// through different dispatchers.
 #[test]
 fn cpu_profile_v3_library_run_with_unqualified_facts_is_refused() {
     let facts = detcore_model::cpu_profile::HostXstate {
@@ -29992,13 +29994,35 @@ fn cpu_profile_v3_library_run_with_unqualified_facts_is_refused() {
         ..Default::default()
     };
     let guest = cpuid_profile_v3_guest();
-    let refusal =
-        hermit::run_with_output(reverie::process::Command::new(guest), config, false, &None)
-            .expect_err("the library ran a v3 guest on facts it never qualified");
-    assert_eq!(
-        format!("{refusal:#}"),
-        "--cpu-profile x86-64-v3 refused: this process did not qualify the host"
-    );
+    // On the test's default thread a launch that got past the check would
+    // overflow the stack before returning, so the calls run on a thread with
+    // room for a real run, and a missing check fails at `expect_err`.
+    let refusals = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || {
+            let status = hermit::run(
+                reverie::process::Command::new(guest),
+                config.clone(),
+                false,
+                &None,
+            );
+            let status =
+                status.expect_err("the library ran a v3 guest on facts it never qualified");
+            let output = hermit::run_with_output(
+                reverie::process::Command::new(guest),
+                config,
+                false,
+                &None,
+            );
+            let output =
+                output.expect_err("the library ran a v3 guest on facts it never qualified");
+            [format!("{status:#}"), format!("{output:#}")]
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let expected = "--cpu-profile x86-64-v3 refused: this process did not qualify the host";
+    assert_eq!(refusals, [expected, expected]);
 }
 
 /// Under `--cpu-profile x86-64-v3` the guest sees the v3 CPU: every v3 feature

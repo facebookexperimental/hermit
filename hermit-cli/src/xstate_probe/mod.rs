@@ -1489,6 +1489,109 @@ mod tests {
         }
     }
 
+    /// The peer loop's PKRU guards, both ways, as for the arm: in the two
+    /// states that write PKRU with WRPKRU, a peer with the flag clear leaves
+    /// its thread's PKRU alone, and one with the flag set restores it at the
+    /// end. Where this host has OSPKE the thread's PKRU starts at a value
+    /// neither state writes, so an unguarded WRPKRU or a missing restore shows.
+    #[test]
+    fn the_peer_loop_runs_with_and_without_pkru_instructions() {
+        if std::arch::x86_64::__cpuid(1).ecx & (1 << 27) == 0 {
+            return; // no OSXSAVE: not an x86-64-v3 host
+        }
+        // SAFETY: OSXSAVE is set.
+        let xcr0 = unsafe { std::arch::x86_64::_xgetbv(0) };
+        let ospke = native_ospke();
+        for pkru in [false, true] {
+            if pkru && !ospke {
+                continue;
+            }
+            for state in [PeerState::DirtyPkruDiffers, PeerState::DirtyWrpkruZero] {
+                let (mut to_peer, mut from_peer) = ([0i32; 2], [0i32; 2]);
+                // SAFETY: each array has room for the two descriptors.
+                unsafe {
+                    assert_eq!(libc::pipe2(to_peer.as_mut_ptr(), libc::O_CLOEXEC), 0);
+                    assert_eq!(libc::pipe2(from_peer.as_mut_ptr(), libc::O_CLOEXEC), 0);
+                }
+                // One handshake, then the byte that ends the loop.
+                let bytes = [1u8, asm::PEER_EXIT];
+                // SAFETY: writes two bytes from a live buffer into an empty pipe.
+                assert_eq!(
+                    unsafe { libc::write(to_peer[1], bytes.as_ptr().cast(), 2) },
+                    2
+                );
+                let (fd_in, fd_out) = (to_peer[0], from_peer[1]);
+                // PKRU is per thread, so the peer runs on a thread of its own,
+                // as in the probe.
+                let (status, rounds, after) = std::thread::spawn(move || {
+                    // Keys 0 to 2 stay fully accessible, and neither state
+                    // writes this value.
+                    const THREAD_PKRU: u32 = 0x5555_5540;
+                    let image = Area::boxed();
+                    let mut ones = Area::boxed();
+                    ones.0[..64].fill(0xa5);
+                    let mut ctx = PeerCtx {
+                        state: state as u32,
+                        fd_in,
+                        fd_out,
+                        avx512: (xcr0 & AVX512_COMPONENTS != 0) as u32,
+                        image: image.0.as_ptr(),
+                        xcr0,
+                        ones: ones.0.as_ptr(),
+                        tgid: 0,
+                        tid: 0,
+                        expected_cpu: 0,
+                        wrong_cpu: 0,
+                        status: 0,
+                        rounds: 0,
+                        byte: 0,
+                        reply: 0,
+                        pkru: u8::from(pkru),
+                        _pad: 0,
+                        cpu_out: 0,
+                        saved_pkru: 0,
+                        saved_mxcsr: 0,
+                    };
+                    // SAFETY: OSPKE is set, so RDPKRU and WRPKRU are enabled.
+                    let original = ospke.then(|| unsafe {
+                        let original = rdpkru();
+                        wrpkru(THREAD_PKRU);
+                        original
+                    });
+                    // SAFETY: the context and its buffers outlive the call; the
+                    // two states use neither the image nor tgid and tid.
+                    let status = unsafe { asm::hermit_xinuse_peer_loop(&mut ctx) };
+                    // SAFETY: as above.
+                    let after = original.map(|original| unsafe {
+                        let after = rdpkru();
+                        wrpkru(original);
+                        (after, THREAD_PKRU)
+                    });
+                    (status, ctx.rounds, after)
+                })
+                .join()
+                .unwrap();
+                let mut reply = [0u8; 1];
+                // SAFETY: reads one byte into a live buffer; the peer wrote it.
+                let read = unsafe { libc::read(from_peer[0], reply.as_mut_ptr().cast(), 1) };
+                // SAFETY: the four descriptors were created above.
+                unsafe {
+                    for fd in to_peer.into_iter().chain(from_peer) {
+                        libc::close(fd);
+                    }
+                }
+                assert_eq!(status, 0, "pkru {pkru} {state:?}");
+                assert_eq!((rounds, read, reply[0]), (1, 1, 2), "pkru {pkru} {state:?}");
+                if let Some((after, before)) = after {
+                    assert_eq!(
+                        after, before,
+                        "pkru {pkru} {state:?}: the thread's PKRU changed"
+                    );
+                }
+            }
+        }
+    }
+
     /// A peer that fails before it serves a handshake is refused, not waited
     /// on.
     #[test]
