@@ -3014,6 +3014,12 @@ impl GlobalState {
                     .register_signalfd(detpid, mask);
                 R::RegisterSignalfd(())
             }
+            GlobalRequest::DescriptorsReplaced(files, first, last) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .note_descriptors_replaced(files, first, last);
+                R::DescriptorsReplaced(())
+            }
             GlobalRequest::DiscardPendingRealTimeExpirations(detpid, signals) => {
                 self.lock_rpc_scheduler(false)
                     .await
@@ -5017,6 +5023,11 @@ pub enum GlobalRequest {
     /// answered before any clock or scheduler accounting. Appended after
     /// `RetireExitedLeader`, for the same reason.
     DiscardedSignal(crate::scheduler::discarded_at_send::DiscardedSignalControl),
+    /// A `close`, `close_range`, `dup2` or `dup3` released or replaced the
+    /// descriptors `first..=last` of the caller's table, named by its identity
+    /// (`Scheduler::note_descriptors_replaced`). Appended after
+    /// `DiscardedSignal`, for the same reason.
+    DescriptorsReplaced(detcore_model::fd::FilesId, u32, u32),
 }
 
 /// Responses from the global object
@@ -5163,6 +5174,8 @@ pub enum GlobalResponse {
     RetireExitedLeader(bool),
     /// Appended after `RetireExitedLeader`, for the same reason.
     DiscardedSignal(crate::scheduler::discarded_at_send::DiscardedSignalAnswer),
+    /// Appended after `DiscardedSignal`, for the same reason.
+    DescriptorsReplaced(()),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -6684,6 +6697,33 @@ where
             GlobalResponse::RegisterSignalfd(()) | GlobalResponse::ThreadExited
         ),
         "unexpected response to RegisterSignalfd: {:?}",
+        response.1
+    );
+}
+
+/// Record, under record and replay, that the calling thread's `close`,
+/// `close_range`, `dup2` or `dup3` released or replaced its descriptors
+/// `first..=last`; see `Scheduler::note_descriptors_replaced`.
+pub(crate) async fn descriptors_replaced<G, T>(guest: &mut G, first: u32, last: u32)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !guest.config().recordreplay_modes {
+        return;
+    }
+    let files = guest.thread_state().files_id();
+    let response = send_and_update_time(
+        guest,
+        GlobalRequest::DescriptorsReplaced(files, first, last),
+    )
+    .await;
+    assert!(
+        matches!(
+            response.1,
+            GlobalResponse::DescriptorsReplaced(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to DescriptorsReplaced: {:?}",
         response.1
     );
 }

@@ -561,7 +561,14 @@ impl RecordVersion {
 // (https://github.com/rrnewton/hermit/issues/4343). An older recording of such
 // an exit holds the sleep returning 0 or never waking, and would replay
 // against a schedule in which it returns EINTR.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x15b);
+// 0x15b -> 0x15c (taken at land time, as the reservation file's land-time
+// numbering rule gives a ready change HIGHEST_SHIPPED + 1): under record and
+// replay a background read whose descriptor number a later close,
+// close_range, dup2 or dup3 replaces before the read enters the kernel, or
+// which was not open at its grant, keeps a woken sleep from claiming its
+// SIGCHLD (https://github.com/rrnewton/hermit/issues/4410). An older
+// recording of such a sleep holds the claim, which a new replay would not make.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x15c);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -586,7 +593,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x15b);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x15b;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x15c;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1555,6 +1562,16 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_a_recorded_sleep_claims_its_sigchld() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15a)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x15c may hold a claim of a woken sleep's
+    /// SIGCHLD made while a background read's descriptor had been replaced
+    /// before the read entered the kernel
+    /// (https://github.com/rrnewton/hermit/issues/4410).
+    #[test]
+    fn record_version_rejects_streams_from_before_replaced_read_descriptors_block_the_claim() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15b)));
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 

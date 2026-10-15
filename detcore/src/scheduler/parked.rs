@@ -906,8 +906,10 @@ impl Scheduler {
         // SIGCHLD whatever its descriptor read when it began
         // (`outside_call_may_take_sigchld`).
         if mask & super::kernel_signal_bit(libc::SIGCHLD) != 0 {
-            for (_, read_mask) in self.background_kernel_signalfd_reads.values_mut() {
-                *read_mask = None;
+            for read in self.background_reads.values_mut() {
+                if matches!(read.signals, super::BackgroundReadSignals::Signalfd(_)) {
+                    read.signals = super::BackgroundReadSignals::Unknown;
+                }
             }
         }
         // Its reads are not observed (`process_timer_copies`,

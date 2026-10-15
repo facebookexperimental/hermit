@@ -3519,6 +3519,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             if let Some(open_file_id) = guest.thread_state_mut().remove_fd(fd) {
                 self.release_port_for_open_file(guest, open_file_id).await;
             }
+            if let Ok(fd) = u32::try_from(fd) {
+                crate::tool_global::descriptors_replaced(guest, fd, fd).await;
+            }
             trace!("Closed {}", fd);
         }
         res.map_err(Error::from)
@@ -3561,6 +3564,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             for open_file_id in released {
                 self.release_port_for_open_file(guest, open_file_id).await;
             }
+            crate::tool_global::descriptors_replaced(guest, first, last).await;
         }
         result.map_err(Error::from)
     }
@@ -7711,6 +7715,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             return refusal;
         }
         let res = self.record_or_replay(guest, call).await?;
+        // Reported as soon as the kernel replaced `new_fd`, before Detcore's
+        // own table update, which can still fail for a descriptor it does not
+        // track (`Scheduler::note_descriptors_replaced`).
+        if old_fd != new_fd
+            && let Ok(new_fd) = u32::try_from(new_fd)
+        {
+            crate::tool_global::descriptors_replaced(guest, new_fd, new_fd).await;
+        }
         let replaced = guest
             .thread_state_mut()
             .dup_fd(old_fd, new_fd, OFlag::empty())?;
@@ -7755,6 +7767,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             return refusal;
         }
         let res = self.record_or_replay(guest, call).await?;
+        // Reported before Detcore's own table update, as for `dup2`.
+        if let Ok(new_fd) = u32::try_from(new_fd) {
+            crate::tool_global::descriptors_replaced(guest, new_fd, new_fd).await;
+        }
         let replaced = guest.thread_state_mut().dup_fd(old_fd, new_fd, flags)?;
         if let Some(open_file_id) = replaced {
             self.release_port_for_open_file(guest, open_file_id).await;

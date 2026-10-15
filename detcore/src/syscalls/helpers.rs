@@ -289,7 +289,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             rsrcs.reads_signalfd = matches!(blocking_resource, ResourceID::BlockingExternalIO(_))
                 && call_reads_signalfd(guest, call);
             if matches!(blocking_resource, ResourceID::BlockingExternalIO(_)) {
-                rsrcs.read_fd = read_family_fd(call);
+                rsrcs.read_fd =
+                    read_family_fd(call).map(|fd| (guest.thread_state().files_id(), fd));
             }
             rsrcs.insert(blocking_resource, Permission::RW);
             rsrcs.fyi(call.name());

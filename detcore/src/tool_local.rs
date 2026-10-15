@@ -4083,6 +4083,11 @@ impl<T> ThreadState<T> {
         self.file_metadata.lock().unwrap()
     }
 
+    /// Identity of this thread's descriptor table.
+    pub(crate) fn files_id(&self) -> detcore_model::fd::FilesId {
+        self.metadata().files_id
+    }
+
     /// Add a new fd, with optional stat data, have side effects on other
     /// threads.
     ///

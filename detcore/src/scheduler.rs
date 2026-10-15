@@ -1064,6 +1064,42 @@ struct BackgroundEntry {
     since: std::time::Instant,
 }
 
+/// A background read under record/replay (`Scheduler::background_reads`).
+#[derive(Debug, Clone, Copy)]
+struct BackgroundRead {
+    /// Its call.
+    op: ExternalOpId,
+    /// The descriptor table it reads from.
+    files: detcore_model::fd::FilesId,
+    /// The descriptor number it reads.
+    fd: i32,
+    /// What that descriptor reads.
+    signals: BackgroundReadSignals,
+}
+
+/// What a background read's descriptor reads (`Scheduler::background_reads`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundReadSignals {
+    /// Not a signalfd.
+    NotSignalfd,
+    /// A signalfd for these signals (a kernel sigset).
+    Signalfd(u64),
+    /// Not known: it may be, or become before the read enters the kernel, a
+    /// signalfd for any signal.
+    Unknown,
+}
+
+impl BackgroundReadSignals {
+    /// Whether the read may take the signal `bit` (a kernel sigset bit).
+    fn may_read(self, bit: u64) -> bool {
+        match self {
+            Self::NotSignalfd => false,
+            Self::Signalfd(mask) => mask & bit != 0,
+            Self::Unknown => true,
+        }
+    }
+}
+
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
 pub struct Scheduler {
@@ -1571,15 +1607,18 @@ pub struct Scheduler {
     /// a signalfd (`Resources::reads_signalfd`). An entry counts only while
     /// that op is still the thread's `external_io_blockers` entry.
     background_signalfd_reads: BTreeMap<DetTid, ExternalOpId>,
-    /// Under record and replay, threads whose background read
-    /// (`Resources::read_fd`) is of a descriptor the kernel names a signalfd
-    /// as the scheduler grants it, tracked by Detcore or not
-    /// (`kernel_signalfd_read_mask`), with the signals it reads: `None` where
-    /// unknown, or where a later `signalfd4` for SIGCHLD may have changed them
-    /// (`register_signalfd`). An entry counts only while its op is still the
-    /// thread's `external_io_blockers` entry. Read only by
-    /// `outside_call_may_take_sigchld`.
-    background_kernel_signalfd_reads: BTreeMap<DetTid, (ExternalOpId, Option<u64>)>,
+    /// Under record and replay, every thread's background read
+    /// (`Resources::read_fd`, `BackgroundRead`): its op, descriptor table and
+    /// number, and what that descriptor reads (`BackgroundReadSignals`),
+    /// judged as the scheduler grants the read (`kernel_signalfd_read_mask`)
+    /// and made `Unknown` by a later `signalfd4` for SIGCHLD
+    /// (`register_signalfd`) or by a later `close`, `close_range`, `dup2` or
+    /// `dup3` of that number in that table (`note_descriptors_replaced`),
+    /// since the read enters the kernel at a host-timed moment after the grant
+    /// (<https://github.com/rrnewton/hermit/issues/4410>). An entry counts only
+    /// while its op is still the thread's `external_io_blockers` entry. Read
+    /// only by `outside_call_may_take_sigchld`.
+    background_reads: BTreeMap<DetTid, BackgroundRead>,
 
     /// The real-time signals (a kernel sigset) that the mask a signal handler's
     /// return restores leaves unblocked, by process: the thread's mask when a
@@ -3557,7 +3596,7 @@ impl Scheduler {
             sending_child_exit: None,
             signalfd_masks: Default::default(),
             background_signalfd_reads: Default::default(),
-            background_kernel_signalfd_reads: Default::default(),
+            background_reads: Default::default(),
             handler_restore_unblocked: Default::default(),
             background_call_processes: Default::default(),
             alarm_unobservable: Default::default(),
@@ -7044,14 +7083,70 @@ impl Scheduler {
         sigtimedwait || signalfd_read
     }
 
+    /// What the descriptor `fd` of `thread` reads, asked of the kernel: if the
+    /// kernel names it a signalfd (`anon_inode:[signalfd]`), the signals (a
+    /// kernel sigset) in the `sigmask` line of its `fdinfo`, which only the
+    /// guest's own `signalfd4` calls set. `Unknown` where the mask cannot be
+    /// read, where the descriptor cannot be read at all, and where it is not
+    /// open, since a later call may install a signalfd at that number before
+    /// the read enters the kernel.
+    fn kernel_signalfd_read_mask(&self, thread: DetTid, fd: i32) -> BackgroundReadSignals {
+        if crate::syscalls::host_signal_state_reads_refused() {
+            return BackgroundReadSignals::Unknown;
+        }
+        let task = format!(
+            "/proc/{}/task/{}",
+            self.sigchld_process(thread).as_raw(),
+            thread.as_raw()
+        );
+        match std::fs::read_link(format!("{task}/fd/{fd}")) {
+            Ok(target) if target == std::path::Path::new("anon_inode:[signalfd]") => {}
+            Ok(_) => return BackgroundReadSignals::NotSignalfd,
+            Err(_) => return BackgroundReadSignals::Unknown,
+        }
+        std::fs::read_to_string(format!("{task}/fdinfo/{fd}"))
+            .ok()
+            .and_then(|info| {
+                info.lines()
+                    .find_map(|line| line.strip_prefix("sigmask:"))
+                    .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+            })
+            .map_or(
+                BackgroundReadSignals::Unknown,
+                BackgroundReadSignals::Signalfd,
+            )
+    }
+
+    /// `close`, `close_range`, `dup2` or `dup3` released or replaced the
+    /// descriptors `first..=last` of the descriptor table `files`, in its
+    /// caller's turn: a background read of one of those numbers in that table
+    /// that has not yet entered the kernel may now read another description,
+    /// so what it reads becomes `Unknown` (`background_reads`,
+    /// https://github.com/rrnewton/hermit/issues/4410). Every thread sharing
+    /// the table (`CLONE_FILES`) names it by the same identity.
+    pub(crate) fn note_descriptors_replaced(
+        &mut self,
+        files: detcore_model::fd::FilesId,
+        first: u32,
+        last: u32,
+    ) {
+        for read in self.background_reads.values_mut() {
+            if read.files == files
+                && u32::try_from(read.fd).is_ok_and(|fd| (first..=last).contains(&fd))
+            {
+                read.signals = BackgroundReadSignals::Unknown;
+            }
+        }
+    }
+
     /// Whether a thread of `dtid`'s process other than `dtid` sleeps outside the
     /// schedule in a call that could take its process's SIGCHLD at a moment
     /// host timing chooses: a call whose recorded mask
     /// (`BlockedPool::out_of_scheduler_masks`) leaves SIGCHLD unblocked or is
-    /// unknown, so the kernel may deliver it there, or a background read of a
-    /// signalfd, tracked or not, that reads SIGCHLD or whose signals are
-    /// unknown (`background_kernel_signalfd_reads`). Membership is fixed at commit points: an
-    /// entry is made when the call is granted and removed when it rejoins.
+    /// unknown, so the kernel may deliver it there, or a background read whose
+    /// descriptor may read SIGCHLD (`background_reads`). Membership is fixed
+    /// at commit points: an entry is made when the call is granted and removed
+    /// when it rejoins.
     ///
     /// Under record and replay, a woken sleep claims its SIGCHLD only when this
     /// is false (`ChildExitSigchldControl::WindowUnusable`). While such a call
@@ -7062,39 +7157,6 @@ impl Scheduler {
     /// (https://github.com/rrnewton/hermit/issues/4343). Without the claim the
     /// sleep stays parked, and the outside call takes the copy as it did
     /// before the claim existed.
-    /// If `thread`'s descriptor `fd` is one the kernel names a signalfd
-    /// (`anon_inode:[signalfd]`), the signals (a kernel sigset) it reads, from
-    /// the `sigmask` line of its `fdinfo`, which only the guest's own
-    /// `signalfd4` calls set: `Some(None)` where they cannot be read, and also
-    /// where the descriptor cannot be read at all except because it is not
-    /// open. `None` for any other descriptor. Asked while `thread` is stopped
-    /// at its request and no other guest thread runs in the schedule.
-    fn kernel_signalfd_read_mask(&self, thread: DetTid, fd: i32) -> Option<Option<u64>> {
-        if crate::syscalls::host_signal_state_reads_refused() {
-            return Some(None);
-        }
-        let task = format!(
-            "/proc/{}/task/{}",
-            self.sigchld_process(thread).as_raw(),
-            thread.as_raw()
-        );
-        match std::fs::read_link(format!("{task}/fd/{fd}")) {
-            Ok(target) if target == std::path::Path::new("anon_inode:[signalfd]") => {}
-            Ok(_) => return None,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(_) => return Some(None),
-        }
-        Some(
-            std::fs::read_to_string(format!("{task}/fdinfo/{fd}"))
-                .ok()
-                .and_then(|info| {
-                    info.lines()
-                        .find_map(|line| line.strip_prefix("sigmask:"))
-                        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
-                }),
-        )
-    }
-
     pub(crate) fn outside_call_may_take_sigchld(&self, dtid: DetTid) -> bool {
         let bit = kernel_signal_bit(libc::SIGCHLD);
         let process = self.sigchld_process(dtid);
@@ -7108,13 +7170,10 @@ impl Scheduler {
                         .out_of_scheduler_masks
                         .get(thread)
                         .is_some_and(|mask| mask.is_none_or(|mask| mask & bit == 0))
-                        || self
-                            .background_kernel_signalfd_reads
-                            .get(thread)
-                            .is_some_and(|(op, mask)| {
-                                self.blocked.external_io_blockers.get(thread) == Some(op)
-                                    && mask.is_none_or(|mask| mask & bit != 0)
-                            }))
+                        || self.background_reads.get(thread).is_some_and(|read| {
+                            self.blocked.external_io_blockers.get(thread) == Some(&read.op)
+                                && read.signals.may_read(bit)
+                        }))
             })
     }
 
@@ -11020,20 +11079,29 @@ impl Scheduler {
                         } else {
                             self.background_signalfd_reads.remove(&dettid);
                         }
-                        // Asked now, as the call is granted: no other thread's
-                        // turn can change the descriptor before the call runs.
-                        let signalfd_mask = rs
-                            .read_fd
-                            .filter(|_| {
-                                self.recordreplay_modes
-                                    && self.blocked.external_io_blockers.get(&dettid) == Some(op)
-                            })
-                            .and_then(|fd| self.kernel_signalfd_read_mask(dettid, fd));
-                        if let Some(mask) = signalfd_mask {
-                            self.background_kernel_signalfd_reads
-                                .insert(dettid, (*op, mask));
-                        } else {
-                            self.background_kernel_signalfd_reads.remove(&dettid);
+                        // Judged as the call is granted. Other threads' turns may
+                        // run before the call enters the kernel; the ones that
+                        // could change what the descriptor reads update the
+                        // entry (`background_reads`).
+                        match rs.read_fd.filter(|_| {
+                            self.recordreplay_modes
+                                && self.blocked.external_io_blockers.get(&dettid) == Some(op)
+                        }) {
+                            Some((files, fd)) => {
+                                let signals = self.kernel_signalfd_read_mask(dettid, fd);
+                                self.background_reads.insert(
+                                    dettid,
+                                    BackgroundRead {
+                                        op: *op,
+                                        files,
+                                        fd,
+                                        signals,
+                                    },
+                                );
+                            }
+                            None => {
+                                self.background_reads.remove(&dettid);
+                            }
                         }
                     }
                     if rs.blocked_signal_mask_unknown
@@ -28088,6 +28156,22 @@ mod test {
         assert_eq!(ask(&mut scheduler), ChildExitSigchldAnswer::Placed(false));
     }
 
+    /// A background read by `thread` of descriptor `fd` in the table `thread`
+    /// created (`Scheduler::background_reads`).
+    fn background_read(
+        op: ExternalOpId,
+        thread: DetTid,
+        fd: i32,
+        signals: BackgroundReadSignals,
+    ) -> BackgroundRead {
+        BackgroundRead {
+            op,
+            files: detcore_model::fd::FilesId::initial(thread),
+            fd,
+            signals,
+        }
+    }
+
     /// Under record and replay, `WindowUnusable` also says no while another
     /// thread of the process is outside the schedule in a call that could take
     /// its `SIGCHLD` (`outside_call_may_take_sigchld`): one sleeping with
@@ -28118,9 +28202,10 @@ mod test {
             .blocked
             .out_of_scheduler_masks
             .insert(parent, Some(chld | usr2));
-        scheduler
-            .background_kernel_signalfd_reads
-            .insert(parent, (op, Some(usr2)));
+        scheduler.background_reads.insert(
+            parent,
+            background_read(op, parent, 9, BackgroundReadSignals::Signalfd(usr2)),
+        );
         assert_eq!(
             ask(&mut scheduler),
             ChildExitSigchldAnswer::Placed(true),
@@ -28138,25 +28223,34 @@ mod test {
             ChildExitSigchldAnswer::Placed(false),
             "a signalfd4 for SIGCHLD after the read began may have re-armed its descriptor"
         );
-        for read in [Some(chld | usr2), None] {
+        for read in [
+            BackgroundReadSignals::Signalfd(chld | usr2),
+            BackgroundReadSignals::Unknown,
+        ] {
             scheduler
-                .background_kernel_signalfd_reads
-                .insert(parent, (op, read));
+                .background_reads
+                .insert(parent, background_read(op, parent, 9, read));
             assert_eq!(
                 ask(&mut scheduler),
                 ChildExitSigchldAnswer::Placed(false),
                 "a sibling reading a signalfd for {read:?}"
             );
         }
-        scheduler
-            .background_kernel_signalfd_reads
-            .insert(parent, (ExternalOpId::new(parent, 6), Some(chld)));
+        scheduler.background_reads.insert(
+            parent,
+            background_read(
+                ExternalOpId::new(parent, 6),
+                parent,
+                9,
+                BackgroundReadSignals::Signalfd(chld),
+            ),
+        );
         assert_eq!(
             ask(&mut scheduler),
             ChildExitSigchldAnswer::Placed(true),
             "a signalfd read that has ended, the sibling now in another call"
         );
-        scheduler.background_kernel_signalfd_reads.remove(&parent);
+        scheduler.background_reads.remove(&parent);
         for mask in [Some(usr2), None] {
             scheduler
                 .blocked
@@ -28173,6 +28267,83 @@ mod test {
             ask(&mut scheduler),
             ChildExitSigchldAnswer::Placed(true),
             "run mode claims as before"
+        );
+    }
+
+    /// A background read is judged at its grant but enters the kernel later, so
+    /// a later turn's `close`, `close_range`, `dup2` or `dup3` of its
+    /// descriptor number may hand it another description, a signalfd for
+    /// SIGCHLD among them: that read then counts as one that may take SIGCHLD
+    /// (`note_descriptors_replaced`). Another number, or the same number in
+    /// another descriptor table, leaves it alone. A read
+    /// of a descriptor that was not a signalfd at its grant does not count
+    /// until then (https://github.com/rrnewton/hermit/issues/4410).
+    #[test]
+    fn a_background_reads_descriptor_replaced_before_it_runs_may_take_sigchld() {
+        use child_exit_sigchld::ChildExitSigchldAnswer;
+        use child_exit_sigchld::ChildExitSigchldControl;
+        let (mut scheduler, parent, creator, _) = owned_sigchld_family();
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let usr2 = kernel_signal_bit(libc::SIGUSR2);
+        let ask = |scheduler: &mut Scheduler| {
+            scheduler.child_exit_sigchld_control(creator, ChildExitSigchldControl::WindowUnusable)
+        };
+        scheduler.recordreplay_modes = true;
+        scheduler.signalfd_masks.insert(parent, chld | usr2);
+        scheduler.note_outside_blocker(parent, Some(chld | usr2), true);
+        let op = ExternalOpId::new(parent, 7);
+        let table = detcore_model::fd::FilesId::initial(parent);
+        let other_table = detcore_model::fd::FilesId::initial(creator);
+        scheduler.blocked.external_io_blockers.insert(parent, op);
+        scheduler
+            .blocked
+            .out_of_scheduler_masks
+            .insert(parent, Some(chld | usr2));
+        for (read, label) in [
+            (BackgroundReadSignals::NotSignalfd, "a read of a pipe"),
+            (
+                BackgroundReadSignals::Signalfd(usr2),
+                "a read of a signalfd for SIGUSR2 only",
+            ),
+        ] {
+            scheduler
+                .background_reads
+                .insert(parent, background_read(op, parent, 9, read));
+            assert_eq!(
+                ask(&mut scheduler),
+                ChildExitSigchldAnswer::Placed(true),
+                "{label}"
+            );
+            scheduler.note_descriptors_replaced(table, 3, 8);
+            scheduler.note_descriptors_replaced(table, 10, 10);
+            scheduler.note_descriptors_replaced(other_table, 9, 9);
+            assert_eq!(
+                ask(&mut scheduler),
+                ChildExitSigchldAnswer::Placed(true),
+                "{label}, other descriptors, or the same number in another table, replaced"
+            );
+            scheduler.note_descriptors_replaced(table, 9, 9);
+            assert_eq!(
+                ask(&mut scheduler),
+                ChildExitSigchldAnswer::Placed(false),
+                "{label}, its descriptor replaced before the read runs"
+            );
+        }
+        scheduler.background_reads.insert(
+            parent,
+            background_read(op, parent, 9, BackgroundReadSignals::NotSignalfd),
+        );
+        scheduler.register_signalfd(parent, chld);
+        assert_eq!(
+            ask(&mut scheduler),
+            ChildExitSigchldAnswer::Placed(true),
+            "a signalfd4 cannot turn a read of a pipe into one of a signalfd"
+        );
+        scheduler.note_descriptors_replaced(table, 0, u32::MAX);
+        assert_eq!(
+            ask(&mut scheduler),
+            ChildExitSigchldAnswer::Placed(false),
+            "close_range over every descriptor"
         );
     }
 
