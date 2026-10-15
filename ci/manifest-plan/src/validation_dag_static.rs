@@ -1048,7 +1048,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's CpuProfile name test
     // (https://github.com/rrnewton/hermit/issues/4243): 1099, listed.
     // And detcore-model's the_cpu_profile_never_enters_the_legacy_form: 1100, listed.
-    ("test.regular_crates", 1100),
+    // detcore-dbt::tests::current_abi_preserves_queued_signal_targets_for_tool_resolution
+    // retains all 1100 prior identities: 1101.
+    ("test.regular_crates", 1101),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4158,7 +4160,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +4 from f4e27a59: 1098.
     // And the CpuProfile name test: 1099.
     // And the cpu_profile legacy-form test: 1100.
-    ("test.regular_crates_on_host", 1100),
+    // The same Current-ABI queued-signal target regression: 1101.
+    ("test.regular_crates_on_host", 1101),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),
