@@ -847,8 +847,18 @@ __attribute__((constructor)) static void wait_for_worker(void) {
             (start..end).contains(&pc),
             "{start:#x}..{end:#x} misses {pc:#x}"
         );
+        // The unwind tables are the object's own PT_GNU_EH_FRAME, read here
+        // from its program headers. They need not lie in start..end: glibc's
+        // `_dl_find_object` reports the mapping that contains `pc`, and when
+        // the linker starts the code segment on a fresh page the tables sit in
+        // the read-only segment before it. Measured with glibc 2.42 in the
+        // pinned root: one build of this test, whose read-only segment ends
+        // at 0xe1fec with code at 0xe3000, got only the code segment, while
+        // one whose segments share a page got the whole object. libgcc reads
+        // only `dlfo_eh_frame`.
         let eh_frame = result.dlfo_eh_frame as usize;
-        assert!((start..end).contains(&eh_frame), "eh_frame {eh_frame:#x}");
+        let headers = loaded_object_containing(pc).expect("pc is in a loaded object");
+        assert_eq!(eh_frame, headers.eh_frame, "eh_frame {eh_frame:#x}");
         // The `.eh_frame_hdr` section starts with version 1.
         assert_eq!(unsafe { *(eh_frame as *const u8) }, 1);
         let mut unused = std::mem::MaybeUninit::<DlFindObject>::uninit();
