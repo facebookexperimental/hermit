@@ -23179,7 +23179,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1355",
+        "NEXTEST_EXPECTED_EXECUTED": "1545",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -46751,7 +46751,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh --calibration-host ${CI:+--profile ci} --workspace --exclude hermit-detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests -E 'not (test(=chaos_replay_ipc_determinism_eventfd) | test(=chaos_replay_ipc_determinism_pipe_order) | test(=chaos_replay_ipc_determinism_socketpair) | test(=chaos_replay_sched_yield_progress) | test(=chaos_replay_thread_sync_determinism_barrier) | test(=chaos_replay_thread_sync_determinism_rwlock) | test(=chaos_replay_rust_futex_and_print) | test(=chaos_replay_rust_futex_wake_some) | test(=chaos_replay_rust_sched_yield))'",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh --calibration-host ${CI:+--profile ci} --workspace --exclude hermit-detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests -E 'not (test(=chaos_replay_ipc_determinism_eventfd) | test(=chaos_replay_ipc_determinism_pipe_order) | test(=chaos_replay_ipc_determinism_socketpair) | test(=chaos_replay_sched_yield_progress) | test(=chaos_replay_thread_sync_determinism_barrier) | test(=chaos_replay_thread_sync_determinism_rwlock) | test(=chaos_replay_rust_futex_and_print) | test(=chaos_replay_rust_futex_wake_some) | test(=chaos_replay_rust_sched_yield) | test(=verify_run_chaos_rust_futex_and_print) | test(=verify_run_chaos_rust_futex_wake_some) | test(=verify_run_chaos_rust_poll_spin) | test(=verify_run_strict_rust_clock_total_order) | test(=verify_run_strict_rust_exit_group))'",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -46768,7 +46768,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1346",
+        "NEXTEST_EXPECTED_EXECUTED": "1531",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,

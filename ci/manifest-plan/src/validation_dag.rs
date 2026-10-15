@@ -340,7 +340,11 @@ pub const HOSTED_PORTABLE_PMU_TIMER_RR_TESTS: &[&str] = &["rr_no_mask_timeslice"
 /// passing that flag to every hermit-verify/tests/replay_modes.rs case: these
 /// nine chaos-replay cases (six C guests, three Rust guests) then fail or time
 /// out, and every other case that runs locally still passes. The local `test.regular_crates` keeps running them in the
-/// pinned root.
+/// pinned root. Five strict and chaos `hermit-verify run` cases, measured the
+/// same way with `--max-timeslice=disabled` in place of their
+/// `--preemption-timeout`, time out: their guests spin waiting for another
+/// thread, which only a preemption lets run. The other 185 of the 190 that run
+/// locally pass.
 pub const HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS: &[&str] = &[
     "chaos_replay_ipc_determinism_eventfd",
     "chaos_replay_ipc_determinism_pipe_order",
@@ -351,6 +355,11 @@ pub const HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS: &[&str] = &[
     "chaos_replay_rust_futex_and_print",
     "chaos_replay_rust_futex_wake_some",
     "chaos_replay_rust_sched_yield",
+    "verify_run_chaos_rust_futex_and_print",
+    "verify_run_chaos_rust_futex_wake_some",
+    "verify_run_chaos_rust_poll_spin",
+    "verify_run_strict_rust_clock_total_order",
+    "verify_run_strict_rust_exit_group",
 ];
 
 /// Where the hosted regular-crates twin's filterset goes: after its selection.

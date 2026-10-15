@@ -22,7 +22,14 @@
 //! exec target `pending-exec-check` and the deliberate deadlock
 //! `blocking-sigsuspend-no-signal` of `signal_determinism` do not.
 //!
-//! The internal `tests/rust` guests get the same three modes, with that
+//! Every one of those C guests and scenarios, and all 25 `tests/rust` guests,
+//! also runs the internal `hermit_run_strict__` and `hermit_run_chaos__`
+//! targets: `hermit-verify run`, two `hermit run`s compared, with
+//! `--preemption-timeout=80000000` for strict and `--chaos
+//! --preemption-timeout=1000000` for chaos, and the internal HERMIT_MODE in
+//! the guest's environment.
+//!
+//! The internal `tests/rust` guests get the same three replay modes, with that
 //! matrix's exemptions: thread_random and poll_spin have no chaos replay;
 //! bind_connect_race, clock_total_order, exit_group, futex_and_print,
 //! futex_wake_some, poll_spin and thread_random have no trace replay; and the
@@ -47,6 +54,8 @@ enum Mode {
     ChaosReplay,
     TraceReplay,
     TraceReplayChaos,
+    Strict,
+    Chaos,
 }
 
 impl Mode {
@@ -60,6 +69,23 @@ impl Mode {
                 "--strip-times",
                 "--chaos",
                 "--isolate-workdir",
+            ],
+            // The internal `hermit_run_strict__` and `hermit_run_chaos__`
+            // targets: two `hermit run`s, compared. Their HERMIT_MODE reaches
+            // the guest, and some guests read it: mem_race asserts preemptions
+            // under strict, sched_yield skips itself under chaos.
+            Mode::Strict => &[
+                "run",
+                "--isolate-workdir",
+                "--hermit-arg=--env=HERMIT_MODE=strict",
+                "--hermit-arg=--preemption-timeout=80000000",
+            ],
+            Mode::Chaos => &[
+                "run",
+                "--isolate-workdir",
+                "--hermit-arg=--chaos",
+                "--hermit-arg=--env=HERMIT_MODE=chaos",
+                "--hermit-arg=--preemption-timeout=1000000",
             ],
         }
     }
@@ -1744,4 +1770,1051 @@ rust_replay_case!(
     trace_replay_chaos_rust_stack_ptr,
     "stack_ptr",
     Mode::TraceReplayChaos
+);
+
+// The internal targets' strict and chaos `hermit run` pairs, for every C
+// guest and scenario above and all 25 tests/rust guests.
+replay_case!(
+    verify_run_strict_arch_prctl_determinism,
+    "arch_prctl_determinism",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_arch_prctl_determinism,
+    "arch_prctl_determinism",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_clock_determinism,
+    "clock_determinism",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_clock_determinism,
+    "clock_determinism",
+    None,
+    Mode::Chaos
+);
+replay_case!(verify_run_strict_clone, "clone", None, Mode::Strict);
+replay_case!(verify_run_chaos_clone, "clone", None, Mode::Chaos);
+replay_case!(
+    verify_run_strict_epoll_determinism_control_fds,
+    "epoll_determinism",
+    Some("control-fds"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_epoll_determinism_control_fds,
+    "epoll_determinism",
+    Some("control-fds"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_epoll_determinism_dupfd,
+    "epoll_determinism",
+    Some("dupfd"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_epoll_determinism_dupfd,
+    "epoll_determinism",
+    Some("dupfd"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_epoll_determinism_edge,
+    "epoll_determinism",
+    Some("edge"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_epoll_determinism_edge,
+    "epoll_determinism",
+    Some("edge"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_epoll_determinism_mixed,
+    "epoll_determinism",
+    Some("mixed"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_epoll_determinism_mixed,
+    "epoll_determinism",
+    Some("mixed"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_epoll_determinism_multi,
+    "epoll_determinism",
+    Some("multi"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_epoll_determinism_multi,
+    "epoll_determinism",
+    Some("multi"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_epoll_determinism_nested,
+    "epoll_determinism",
+    Some("nested"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_epoll_determinism_nested,
+    "epoll_determinism",
+    Some("nested"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_epoll_determinism_oneshot,
+    "epoll_determinism",
+    Some("oneshot"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_epoll_determinism_oneshot,
+    "epoll_determinism",
+    Some("oneshot"),
+    Mode::Chaos
+);
+replay_case!(verify_run_strict_get_cpu, "getCpu", None, Mode::Strict);
+replay_case!(verify_run_chaos_get_cpu, "getCpu", None, Mode::Chaos);
+replay_case!(verify_run_strict_getpid, "getpid", None, Mode::Strict);
+replay_case!(verify_run_chaos_getpid, "getpid", None, Mode::Chaos);
+replay_case!(
+    verify_run_strict_getsockopt_null,
+    "getsockopt_null",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_getsockopt_null,
+    "getsockopt_null",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_hello_alarm,
+    "hello_alarm",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_hello_alarm,
+    "hello_alarm",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_hello_signals,
+    "hello_signals",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_hello_signals,
+    "hello_signals",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_io_uring_fallback,
+    "io_uring_fallback",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_io_uring_fallback,
+    "io_uring_fallback",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_ioctl_fioclex,
+    "ioctl_fioclex",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_ioctl_fioclex,
+    "ioctl_fioclex",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_ioctl_siocethtool,
+    "ioctl_siocethtool",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_ioctl_siocethtool,
+    "ioctl_siocethtool",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_ipc_determinism_epoll,
+    "ipc_determinism",
+    Some("epoll"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_ipc_determinism_epoll,
+    "ipc_determinism",
+    Some("epoll"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_ipc_determinism_eventfd,
+    "ipc_determinism",
+    Some("eventfd"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_ipc_determinism_eventfd,
+    "ipc_determinism",
+    Some("eventfd"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_ipc_determinism_pipe_capacity,
+    "ipc_determinism",
+    Some("pipe-capacity"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_ipc_determinism_pipe_capacity,
+    "ipc_determinism",
+    Some("pipe-capacity"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_ipc_determinism_pipe_order,
+    "ipc_determinism",
+    Some("pipe-order"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_ipc_determinism_pipe_order,
+    "ipc_determinism",
+    Some("pipe-order"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_ipc_determinism_socketpair,
+    "ipc_determinism",
+    Some("socketpair"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_ipc_determinism_socketpair,
+    "ipc_determinism",
+    Some("socketpair"),
+    Mode::Chaos
+);
+replay_case!(verify_run_strict_just_spin, "just_spin", None, Mode::Strict);
+replay_case!(
+    #[ignore = "over budget: 24.0 (killed at the cap) CPU-s against the 22 CPU-s per-test cap in the pinned root, 2026-10-15"]
+    verify_run_chaos_just_spin,
+    "just_spin",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_madvise_determinism,
+    "madvise_determinism",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_madvise_determinism,
+    "madvise_determinism",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_memory_press,
+    "memoryPress",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_memory_press,
+    "memoryPress",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_mmap_determinism_fixed,
+    "mmap_determinism",
+    Some("fixed"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_mmap_determinism_fixed,
+    "mmap_determinism",
+    Some("fixed"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_mmap_determinism_heap,
+    "mmap_determinism",
+    Some("heap"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_mmap_determinism_heap,
+    "mmap_determinism",
+    Some("heap"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_mmap_determinism_multiple,
+    "mmap_determinism",
+    Some("multiple"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_mmap_determinism_multiple,
+    "mmap_determinism",
+    Some("multiple"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_mmap_determinism_reuse,
+    "mmap_determinism",
+    Some("reuse"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_mmap_determinism_reuse,
+    "mmap_determinism",
+    Some("reuse"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_mmap_determinism_shared,
+    "mmap_determinism",
+    Some("shared"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_mmap_determinism_shared,
+    "mmap_determinism",
+    Some("shared"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_nanosleep_par,
+    "nanosleep-par",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    #[ignore = "over budget: 24.0 (killed at the cap) CPU-s against the 22 CPU-s per-test cap in the pinned root, 2026-10-15"]
+    verify_run_chaos_nanosleep_par,
+    "nanosleep-par",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_ppoll_readv,
+    "ppoll_readv",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_ppoll_readv,
+    "ppoll_readv",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_ppoll_simulation,
+    "ppoll_simulation",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_ppoll_simulation,
+    "ppoll_simulation",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_print_memaddrs,
+    "print_memaddrs",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_print_memaddrs,
+    "print_memaddrs",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_printf_with_threads,
+    "printf_with_threads",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_printf_with_threads,
+    "printf_with_threads",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_random_sources,
+    "random_sources",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_random_sources,
+    "random_sources",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_rcx_canonicalization,
+    "rcx_canonicalization",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_rcx_canonicalization,
+    "rcx_canonicalization",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_record_replay_fd_close,
+    "record_replay_fd_close",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_record_replay_fd_close,
+    "record_replay_fd_close",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_recvmsg_scm_rights_mmap,
+    "recvmsg_scm_rights_mmap",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_recvmsg_scm_rights_mmap,
+    "recvmsg_scm_rights_mmap",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_resource_determinism,
+    "resource_determinism",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_resource_determinism,
+    "resource_determinism",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_sched_yield_progress,
+    "sched_yield_progress",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_sched_yield_progress,
+    "sched_yield_progress",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_setitimer_determinism,
+    "setitimer_determinism",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_setitimer_determinism,
+    "setitimer_determinism",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_signal_determinism_altstack_preservation,
+    "signal_determinism",
+    Some("altstack-preservation"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_signal_determinism_altstack_preservation,
+    "signal_determinism",
+    Some("altstack-preservation"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_signal_determinism_blocking_read_interrupted,
+    "signal_determinism",
+    Some("blocking-read-interrupted"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_signal_determinism_blocking_read_interrupted,
+    "signal_determinism",
+    Some("blocking-read-interrupted"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_signal_determinism_blocking_read_restarted,
+    "signal_determinism",
+    Some("blocking-read-restarted"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_signal_determinism_blocking_read_restarted,
+    "signal_determinism",
+    Some("blocking-read-restarted"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_signal_determinism_blocking_sigsuspend,
+    "signal_determinism",
+    Some("blocking-sigsuspend"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_signal_determinism_blocking_sigsuspend,
+    "signal_determinism",
+    Some("blocking-sigsuspend"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_signal_determinism_epoll_wait_sa_restart,
+    "signal_determinism",
+    Some("epoll-wait-sa-restart"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_signal_determinism_epoll_wait_sa_restart,
+    "signal_determinism",
+    Some("epoll-wait-sa-restart"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_signal_determinism_handler_reentrance,
+    "signal_determinism",
+    Some("handler-reentrance"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_signal_determinism_handler_reentrance,
+    "signal_determinism",
+    Some("handler-reentrance"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_signal_determinism_itimer_delivery,
+    "signal_determinism",
+    Some("itimer-delivery"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_signal_determinism_itimer_delivery,
+    "signal_determinism",
+    Some("itimer-delivery"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_signal_determinism_itimer_exit,
+    "signal_determinism",
+    Some("itimer-exit"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_signal_determinism_itimer_exit,
+    "signal_determinism",
+    Some("itimer-exit"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_signal_determinism_masks_fork_clone,
+    "signal_determinism",
+    Some("masks-fork-clone"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_signal_determinism_masks_fork_clone,
+    "signal_determinism",
+    Some("masks-fork-clone"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_signal_determinism_pending_exec,
+    "signal_determinism",
+    Some("pending-exec"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_signal_determinism_pending_exec,
+    "signal_determinism",
+    Some("pending-exec"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_signal_determinism_pending_sigsuspend,
+    "signal_determinism",
+    Some("pending-sigsuspend"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_signal_determinism_pending_sigsuspend,
+    "signal_determinism",
+    Some("pending-sigsuspend"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_signal_determinism_poll_sa_restart,
+    "signal_determinism",
+    Some("poll-sa-restart"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_signal_determinism_poll_sa_restart,
+    "signal_determinism",
+    Some("poll-sa-restart"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_signal_determinism_sigsuspend_invalid_arguments,
+    "signal_determinism",
+    Some("sigsuspend-invalid-arguments"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_signal_determinism_sigsuspend_invalid_arguments,
+    "signal_determinism",
+    Some("sigsuspend-invalid-arguments"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_signal_determinism_sigtimedwait_sa_restart,
+    "signal_determinism",
+    Some("sigtimedwait-sa-restart"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_signal_determinism_sigtimedwait_sa_restart,
+    "signal_determinism",
+    Some("sigtimedwait-sa-restart"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_sigpipe_siginfo,
+    "sigpipe_siginfo",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_sigpipe_siginfo,
+    "sigpipe_siginfo",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_sigtimedwait_no_timeout,
+    "sigtimedwait-no-timeout",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_sigtimedwait_no_timeout,
+    "sigtimedwait-no-timeout",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_sigtimedwait_timeout_0s,
+    "sigtimedwait-timeout-0s",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_sigtimedwait_timeout_0s,
+    "sigtimedwait-timeout-0s",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_sigtimedwait_timeout_1s,
+    "sigtimedwait-timeout-1s",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_sigtimedwait_timeout_1s,
+    "sigtimedwait-timeout-1s",
+    None,
+    Mode::Chaos
+);
+replay_case!(verify_run_strict_sysinfo, "sysinfo", None, Mode::Strict);
+replay_case!(verify_run_chaos_sysinfo, "sysinfo", None, Mode::Chaos);
+replay_case!(
+    verify_run_strict_sysinfo_uptime,
+    "sysinfo_uptime",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    #[ignore = "over budget: 21.0 CPU-s against the 22 CPU-s per-test cap in the pinned root, 2026-10-15"]
+    verify_run_chaos_sysinfo_uptime,
+    "sysinfo_uptime",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_thread_exhaustion,
+    "threadExhaustion",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_thread_exhaustion,
+    "threadExhaustion",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_thread_sync_determinism_barrier,
+    "thread_sync_determinism",
+    Some("barrier"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_thread_sync_determinism_barrier,
+    "thread_sync_determinism",
+    Some("barrier"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_thread_sync_determinism_cancellation,
+    "thread_sync_determinism",
+    Some("cancellation"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_thread_sync_determinism_cancellation,
+    "thread_sync_determinism",
+    Some("cancellation"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_thread_sync_determinism_condvar,
+    "thread_sync_determinism",
+    Some("condvar"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_thread_sync_determinism_condvar,
+    "thread_sync_determinism",
+    Some("condvar"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_thread_sync_determinism_rwlock,
+    "thread_sync_determinism",
+    Some("rwlock"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_thread_sync_determinism_rwlock,
+    "thread_sync_determinism",
+    Some("rwlock"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_thread_sync_determinism_semaphore,
+    "thread_sync_determinism",
+    Some("semaphore"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_thread_sync_determinism_semaphore,
+    "thread_sync_determinism",
+    Some("semaphore"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_thread_sync_determinism_tls_fork,
+    "thread_sync_determinism",
+    Some("tls-fork"),
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_thread_sync_determinism_tls_fork,
+    "thread_sync_determinism",
+    Some("tls-fork"),
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_timer_create_determinism,
+    "timer_create_determinism",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_timer_create_determinism,
+    "timer_create_determinism",
+    None,
+    Mode::Chaos
+);
+replay_case!(verify_run_strict_uname, "uname", None, Mode::Strict);
+replay_case!(verify_run_chaos_uname, "uname", None, Mode::Chaos);
+replay_case!(
+    verify_run_strict_vfork_exec,
+    "vforkExec",
+    None,
+    Mode::Strict
+);
+replay_case!(verify_run_chaos_vfork_exec, "vforkExec", None, Mode::Chaos);
+replay_case!(
+    verify_run_strict_wait_on_child,
+    "wait_on_child",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_wait_on_child,
+    "wait_on_child",
+    None,
+    Mode::Chaos
+);
+replay_case!(
+    verify_run_strict_writev_determinism,
+    "writev_determinism",
+    None,
+    Mode::Strict
+);
+replay_case!(
+    verify_run_chaos_writev_determinism,
+    "writev_determinism",
+    None,
+    Mode::Chaos
+);
+rust_replay_case!(
+    verify_run_strict_rust_bind_connect_race,
+    "bind_connect_race",
+    Mode::Strict
+);
+rust_replay_case!(
+    verify_run_chaos_rust_bind_connect_race,
+    "bind_connect_race",
+    Mode::Chaos
+);
+rust_replay_case!(
+    verify_run_strict_rust_clock_gettime,
+    "clock_gettime",
+    Mode::Strict
+);
+rust_replay_case!(
+    verify_run_chaos_rust_clock_gettime,
+    "clock_gettime",
+    Mode::Chaos
+);
+rust_replay_case!(
+    verify_run_strict_rust_clock_total_order,
+    "clock_total_order",
+    Mode::Strict
+);
+rust_replay_case!(
+    verify_run_chaos_rust_clock_total_order,
+    "clock_total_order",
+    Mode::Chaos
+);
+rust_replay_case!(
+    verify_run_strict_rust_exit_group,
+    "exit_group",
+    Mode::Strict
+);
+rust_replay_case!(verify_run_chaos_rust_exit_group, "exit_group", Mode::Chaos);
+rust_replay_case!(
+    #[ignore = "over budget: 18.2 CPU-s against the 22 CPU-s per-test cap in the pinned root, 2026-10-15"]
+    verify_run_strict_rust_futex_and_print,
+    "futex_and_print",
+    Mode::Strict
+);
+rust_replay_case!(
+    verify_run_chaos_rust_futex_and_print,
+    "futex_and_print",
+    Mode::Chaos
+);
+rust_replay_case!(
+    verify_run_strict_rust_futex_timeout,
+    "futex_timeout",
+    Mode::Strict
+);
+rust_replay_case!(
+    verify_run_chaos_rust_futex_timeout,
+    "futex_timeout",
+    Mode::Chaos
+);
+rust_replay_case!(
+    verify_run_strict_rust_futex_wait_child,
+    "futex_wait_child",
+    Mode::Strict
+);
+rust_replay_case!(
+    verify_run_chaos_rust_futex_wait_child,
+    "futex_wait_child",
+    Mode::Chaos
+);
+rust_replay_case!(
+    verify_run_strict_rust_futex_wake_some,
+    "futex_wake_some",
+    Mode::Strict
+);
+rust_replay_case!(
+    verify_run_chaos_rust_futex_wake_some,
+    "futex_wake_some",
+    Mode::Chaos
+);
+rust_replay_case!(verify_run_strict_rust_heap_ptrs, "heap_ptrs", Mode::Strict);
+rust_replay_case!(verify_run_chaos_rust_heap_ptrs, "heap_ptrs", Mode::Chaos);
+rust_replay_case!(
+    verify_run_strict_rust_interrogate_tty,
+    "interrogate_tty",
+    Mode::Strict
+);
+rust_replay_case!(
+    verify_run_chaos_rust_interrogate_tty,
+    "interrogate_tty",
+    Mode::Chaos
+);
+rust_replay_case!(
+    #[ignore = "over budget: 24.0 (killed at the cap) CPU-s against the 22 CPU-s per-test cap in the pinned root, 2026-10-15"]
+    verify_run_strict_rust_mem_race,
+    "mem_race",
+    Mode::Strict
+);
+rust_replay_case!(
+    #[ignore = "over budget: 24.0 (killed at the cap) CPU-s against the 22 CPU-s per-test cap in the pinned root, 2026-10-15"]
+    verify_run_chaos_rust_mem_race,
+    "mem_race",
+    Mode::Chaos
+);
+rust_replay_case!(verify_run_strict_rust_nanosleep, "nanosleep", Mode::Strict);
+rust_replay_case!(verify_run_chaos_rust_nanosleep, "nanosleep", Mode::Chaos);
+rust_replay_case!(
+    verify_run_strict_rust_network_hello_world,
+    "network_hello_world",
+    Mode::Strict
+);
+rust_replay_case!(
+    verify_run_chaos_rust_network_hello_world,
+    "network_hello_world",
+    Mode::Chaos
+);
+rust_replay_case!(
+    verify_run_strict_rust_pipe_basics,
+    "pipe_basics",
+    Mode::Strict
+);
+rust_replay_case!(
+    verify_run_chaos_rust_pipe_basics,
+    "pipe_basics",
+    Mode::Chaos
+);
+rust_replay_case!(verify_run_strict_rust_poll, "poll", Mode::Strict);
+rust_replay_case!(verify_run_chaos_rust_poll, "poll", Mode::Chaos);
+rust_replay_case!(verify_run_strict_rust_poll_spin, "poll_spin", Mode::Strict);
+rust_replay_case!(verify_run_chaos_rust_poll_spin, "poll_spin", Mode::Chaos);
+rust_replay_case!(
+    verify_run_strict_rust_print_clock_nanosleep_monotonic_abs_race,
+    "print_clock_nanosleep_monotonic_abs_race",
+    Mode::Strict
+);
+rust_replay_case!(
+    #[ignore = "over budget: 24.0 (killed at the cap) CPU-s against the 22 CPU-s per-test cap in the pinned root, 2026-10-15"]
+    verify_run_chaos_rust_print_clock_nanosleep_monotonic_abs_race,
+    "print_clock_nanosleep_monotonic_abs_race",
+    Mode::Chaos
+);
+rust_replay_case!(
+    verify_run_strict_rust_print_clock_nanosleep_monotonic_race,
+    "print_clock_nanosleep_monotonic_race",
+    Mode::Strict
+);
+rust_replay_case!(
+    #[ignore = "over budget: 24.1 (killed at the cap) CPU-s against the 22 CPU-s per-test cap in the pinned root, 2026-10-15"]
+    verify_run_chaos_rust_print_clock_nanosleep_monotonic_race,
+    "print_clock_nanosleep_monotonic_race",
+    Mode::Chaos
+);
+rust_replay_case!(
+    verify_run_strict_rust_print_clock_nanosleep_realtime_abs_race,
+    "print_clock_nanosleep_realtime_abs_race",
+    Mode::Strict
+);
+rust_replay_case!(
+    #[ignore = "over budget: 24.0 (killed at the cap) CPU-s against the 22 CPU-s per-test cap in the pinned root, 2026-10-15"]
+    verify_run_chaos_rust_print_clock_nanosleep_realtime_abs_race,
+    "print_clock_nanosleep_realtime_abs_race",
+    Mode::Chaos
+);
+rust_replay_case!(
+    verify_run_strict_rust_print_nanosleep_race,
+    "print_nanosleep_race",
+    Mode::Strict
+);
+rust_replay_case!(
+    #[ignore = "over budget: 24.0 (killed at the cap) CPU-s against the 22 CPU-s per-test cap in the pinned root, 2026-10-15"]
+    verify_run_chaos_rust_print_nanosleep_race,
+    "print_nanosleep_race",
+    Mode::Chaos
+);
+rust_replay_case!(verify_run_strict_rust_rdtsc, "rdtsc", Mode::Strict);
+rust_replay_case!(verify_run_chaos_rust_rdtsc, "rdtsc", Mode::Chaos);
+rust_replay_case!(
+    verify_run_strict_rust_sched_yield,
+    "sched_yield",
+    Mode::Strict
+);
+rust_replay_case!(
+    verify_run_chaos_rust_sched_yield,
+    "sched_yield",
+    Mode::Chaos
+);
+rust_replay_case!(
+    verify_run_strict_rust_socketpair,
+    "socketpair",
+    Mode::Strict
+);
+rust_replay_case!(verify_run_chaos_rust_socketpair, "socketpair", Mode::Chaos);
+rust_replay_case!(verify_run_strict_rust_stack_ptr, "stack_ptr", Mode::Strict);
+rust_replay_case!(verify_run_chaos_rust_stack_ptr, "stack_ptr", Mode::Chaos);
+rust_replay_case!(
+    verify_run_strict_rust_thread_random,
+    "thread_random",
+    Mode::Strict
+);
+rust_replay_case!(
+    verify_run_chaos_rust_thread_random,
+    "thread_random",
+    Mode::Chaos
 );
