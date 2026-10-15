@@ -577,6 +577,12 @@ fn liteinst_in_guest_heap_growth_avoids_trampoline_mappings() {
 /// refused with EPERM; SIG_IGN then discards it and the socket succeeds. With
 /// handlers not admitted (the default), the installation is refused with
 /// EPERM as before and nothing changes. Both runs are verified deterministic.
+/// The table admits reads of a procfs file Detcore renders, whose descriptor
+/// is a sealed memfd: /proc/loadavg reads as on Linux, beside /proc/uptime,
+/// the phase's own admitted capture (the captured kernel loadavg was refused
+/// before https://github.com/rrnewton/hermit/issues/4213's package K
+/// rendered it), while a capture that may wait, /proc/diskstats, is still
+/// refused in the same process.
 #[test]
 fn liteinst_in_guest_sigalrm_handler_is_virtual_and_published() {
     let _guard = hermit_run_guard();
@@ -654,6 +660,33 @@ fn liteinst_in_guest_sigalrm_handler_is_virtual_and_published() {
     );
     let output = assert_liteinst_in_guest_output(output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), not_admitted);
+
+    let procfs_reader = sigalrm_fixture("liteinst_sigalrm_procfs_read");
+    let output = liteinst_command("info")
+        .arg("--verify")
+        .arg("--proc=standard")
+        .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
+        .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
+        .arg("--")
+        .arg(&procfs_reader)
+        .args(["/proc/loadavg", "/proc/uptime", "/proc/diskstats"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run Hermit LiteInst");
+    let output = assert_liteinst_in_guest_output(output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3, "{stdout}");
+    assert_eq!(lines[0], "/proc/loadavg: 0.00 0.00 0.00 1/1 1", "{stdout}");
+    assert!(
+        lines[1].starts_with("/proc/uptime: ") && !lines[1].contains("errno"),
+        "{stdout}"
+    );
+    assert_eq!(
+        lines[2],
+        format!("/proc/diskstats: read errno {}", libc::EOPNOTSUPP),
+        "{stdout}"
+    );
 }
 
 /// Compiles one of the SIGALRM guests in `tests/fixtures`.

@@ -837,11 +837,75 @@ fn cpu_and_node_directories_list_one_cpu_and_node() {
     );
 }
 
+/// /proc/loadavg is a fixed file Detcore renders
+/// (https://github.com/rrnewton/hermit/issues/4213): its bytes are the same
+/// in every run, and a recording of a read of it replays with the same output
+/// and log at the strict comparison. Under record/replay Detcore opens the
+/// kernel's file and takes the bytes from its fixed table, with no recorded
+/// kernel read.
 #[test]
 fn proc_loadavg_uses_virtual_values() {
     assert_deterministic("/proc/loadavg", |contents| {
         assert_eq!(contents, b"0.00 0.00 0.00 1/1 1\n");
     });
+
+    let _guard = hermit_run_lock();
+    let data_dir =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create recording directory");
+    let verdict = data_dir.path().join("verify.json");
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
+        .args([
+            "--log=info",
+            "--backend=ptrace",
+            "record",
+            "start",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--record-timeout=30",
+        ])
+        .arg(format!("--verify-json={}", verdict.display()))
+        .arg(format!(
+            "--data-dir={}",
+            data_dir.path().join("recording").display()
+        ))
+        .args(["--", "/bin/cat", "/proc/loadavg"])
+        .stdin(Stdio::null());
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "recording a read of /proc/loadavg did not replay: {rendered}\nstatus: {}\n\
+         stdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("0.00 0.00 0.00 1/1 1\n"),
+        "the recorded read of /proc/loadavg printed something else: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("record/replay wrote no verify JSON"))
+            .expect("record/replay verify JSON is not JSON");
+    assert_eq!(report["verdict"], serde_json::json!("matched"), "{report}");
+    assert_eq!(
+        report["bitwise_parity"],
+        serde_json::json!(true),
+        "{report}"
+    );
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "no INFO messages compared on the {side}: {report}"
+        );
+    }
 }
 
 #[test]

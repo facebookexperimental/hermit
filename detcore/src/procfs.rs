@@ -55,7 +55,6 @@ enum ProcfsKind {
     SystemStat,
     Cpuinfo,
     Diskstats,
-    Loadavg,
     ProcessIo,
     Uptime,
     BlockStat,
@@ -755,7 +754,6 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-861): Review deterministic kernel I/O accounting.
             "/proc/diskstats" => ProcfsKind::Diskstats,
-            "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
             "/proc/stat" => ProcfsKind::SystemStat,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1130,7 +1128,6 @@ impl ProcfsFile {
             ),
             ProcfsKind::Cpuinfo => virtual_cpuinfo.unwrap_or_else(|| sanitize_cpuinfo(&contents)),
             ProcfsKind::Diskstats => sanitize_diskstats(&contents),
-            ProcfsKind::Loadavg => sanitize_loadavg(&contents),
             ProcfsKind::ProcessIo => sanitize_process_io(&contents),
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
@@ -2200,14 +2197,6 @@ fn sanitize_btrfs_bytes_may_use(contents: &[u8]) -> Vec<u8> {
         b"0\n".to_vec()
     } else {
         b"0".to_vec()
-    }
-}
-
-fn sanitize_loadavg(contents: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        b"0.00 0.00 0.00 1/1 1\n".to_vec()
     }
 }
 
@@ -4065,7 +4054,7 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/loadavg"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Loadavg
+            ProcfsKind::Fixed(FixedProcfsFile::Loadavg)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/uptime"))
@@ -5914,11 +5903,7 @@ Rss:                   4 kB\n" as &[u8];
     }
 
     #[test]
-    fn loadavg_and_uptime_use_virtual_values() {
-        assert_eq!(
-            sanitize_loadavg(b"344.01 369.71 375.04 526/107858 512196\n"),
-            b"0.00 0.00 0.00 1/1 1\n"
-        );
+    fn uptime_uses_the_virtual_value() {
         assert_eq!(
             sanitize_uptime(b"156980.56 37990755.08\n", 120),
             b"120.00 0.00\n"

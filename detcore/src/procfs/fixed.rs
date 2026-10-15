@@ -144,6 +144,10 @@ pub(crate) enum FixedProcfsFile {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-231): Review parity with Hermit's configured memory persona.
     Meminfo,
+    /// `/proc/loadavg`: no load, one runnable task of one, and PID 1 the
+    /// last created. Detcore rendered these values from every backend's
+    /// capture already (https://github.com/rrnewton/hermit/issues/4213).
+    Loadavg,
     /// `fs/file-nr`.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-910): Review host file-table normalization.
@@ -187,7 +191,7 @@ pub(crate) enum FixedProcfsFile {
 
 impl FixedProcfsFile {
     /// Every fixed file.
-    pub(crate) const ALL: [Self; 35] = [
+    pub(crate) const ALL: [Self; 36] = [
         Self::Version,
         Self::Cmdline,
         Self::Osrelease,
@@ -215,6 +219,7 @@ impl FixedProcfsFile {
         Self::Cgroups,
         Self::TtyDrivers,
         Self::Meminfo,
+        Self::Loadavg,
         Self::FileNr,
         Self::FileMax,
         Self::InodeNr,
@@ -255,6 +260,7 @@ impl FixedProcfsFile {
             Self::Cgroups => c"/proc/cgroups",
             Self::TtyDrivers => c"/proc/tty/drivers",
             Self::Meminfo => c"/proc/meminfo",
+            Self::Loadavg => c"/proc/loadavg",
             Self::FileNr => c"/proc/sys/fs/file-nr",
             Self::FileMax => c"/proc/sys/fs/file-max",
             Self::InodeNr => c"/proc/sys/fs/inode-nr",
@@ -349,6 +355,7 @@ impl FixedProcfsFile {
             Self::Cgroups => Some(cgroups()),
             Self::TtyDrivers => Some(TTY_DRIVERS.to_owned()),
             Self::Meminfo => Some(meminfo(machine.memory)),
+            Self::Loadavg => Some("0.00 0.00 0.00 1/1 1\n".to_owned()),
             _ => None,
         };
         if let Some(table) = table {
@@ -669,6 +676,7 @@ mod tests {
                  SwapTotal:             0 kB\n\
                  SwapFree:              0 kB\n",
             ),
+            (Loadavg, "0.00 0.00 0.00 1/1 1\n"),
             (FileNr, "0\t0\t9223372036854775807\n"),
             (FileMax, "9223372036854775807\n"),
             (InodeNr, "0\t0\n"),

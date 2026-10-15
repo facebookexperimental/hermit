@@ -4255,7 +4255,7 @@ fn run_dbt_binds_in_a_user_namespace_of_its_own() {
 /// The files of `tests/c/virtual_kernel_files.c`, in its order: those that
 /// describe the kernel and its limits, then the kernel's tables
 /// (https://github.com/rrnewton/hermit/issues/4266).
-const VIRTUAL_KERNEL_FILES: [&str; 35] = [
+const VIRTUAL_KERNEL_FILES: [&str; 36] = [
     "/proc/version",
     "/proc/cmdline",
     "/proc/sys/kernel/osrelease",
@@ -4283,6 +4283,7 @@ const VIRTUAL_KERNEL_FILES: [&str; 35] = [
     "/proc/cgroups",
     "/proc/tty/drivers",
     "/proc/meminfo",
+    "/proc/loadavg",
     "/proc/sys/fs/file-nr",
     "/proc/sys/fs/file-max",
     "/proc/sys/fs/inode-nr",
