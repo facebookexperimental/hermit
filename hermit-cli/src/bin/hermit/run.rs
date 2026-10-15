@@ -429,14 +429,17 @@ fn unobserved_guest_execution(backend: Backend, passthru_opt: bool) -> Option<&'
         // Reverie's seccomp filter lets a syscall through untraced when it is
         // issued from the untraced stub of Reverie's private page
         // (`cp::TRAMPOLINE_BASE`, reverie-ptrace `seccomp_filter`), which
-        // Reverie needs to inject syscalls. The instruction after that stub is
-        // `ud2`, so a guest that uses it faults with SIGILL, and Detcore then
-        // records a change it could not establish, so that no host input
-        // change is named in that run (detcore `handle_signal_event`). A
-        // guest that rewrites or replaces the page to avoid the fault is
+        // Reverie needs to inject syscalls. Such a syscall is invisible to
+        // Detcore. The instruction after that stub is `ud2`, so a guest that
+        // uses it takes a SIGILL, and Detcore then records a change it could
+        // not establish, so that no host input change is named in that run
+        // (detcore `handle_signal_event`). The SIGILL does not stop a
+        // deliberate guest: a handler can keep the result, or a forked child
+        // can die of it and leave its effect behind, so determinism is lost
+        // with no race needed (https://github.com/rrnewton/reverie/issues/1064).
+        // A guest that rewrites or replaces the page to avoid the fault is
         // recorded the same way when it does so (`untraced_code_range`). See
-        // docs/DIVERGENCE_CLASSES.md for the one way around both that
-        // remains, by a guest that deliberately races a signal into the stub.
+        // docs/DIVERGENCE_CLASSES.md.
         Backend::Ptrace | Backend::E9patch | Backend::Kvm => None,
         Backend::Sabre => Some(
             "SaBRe's loader runs an exec'd program's .preinit_array before Detcore starts \

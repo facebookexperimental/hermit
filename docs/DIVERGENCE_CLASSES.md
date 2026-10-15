@@ -166,14 +166,23 @@ such a rebinding exactly as a host replacement, so the change is reported as
 ptrace has one window by design. Reverie's seccomp filter lets a syscall
 through untraced when it is issued from the untraced stub of Reverie's private
 page (`TRAMPOLINE_BASE`, 0x7100_0000), which Reverie needs to inject syscalls.
-Ordinary guest code never runs there, but a guest can jump into it on purpose.
-The instruction after the stub is `ud2`, so such a guest faults with SIGILL as
-soon as its syscall returns. Detcore records any SIGILL a guest takes during a
-verify run as a namespace change at `/`, which it could not establish, so no
-host input change is named in that run. A false alarm only withholds a name.
-A guest can avoid the fault only by changing the page first: making it
-writable with `mprotect` and replacing the `ud2`, mapping a page over it with
-`MAP_FIXED`, or writing it through `/proc/self/mem`. Detcore records each call
+Ordinary guest code never runs there, but a guest can jump into it on purpose,
+since the page's address is a public constant that `/proc/self/maps` also
+shows. Such a syscall, of any number, is invisible to Detcore: it is not
+determinized, recorded or refused. The instruction after the stub is `ud2`, so
+the guest takes a SIGILL as soon as its syscall returns, but that does not
+stop it. A SIGILL handler can read the result from `uc_mcontext` and carry on,
+and with no handler a forked child can make the call, die of the SIGILL, and
+leave its effect behind, in a file or shared memory. So a guest that does this
+deliberately defeats ptrace's determinism guarantee itself, with no race
+needed. Reverie today delivers that SIGILL like any other
+(https://github.com/rrnewton/reverie/issues/1064 tracks ending the run instead).
+Detcore records any SIGILL a guest takes during a verify run as a namespace
+change at `/`, which it could not establish, so no host input change is named
+in that run. A false alarm only withholds a name. A guest can also avoid the
+fault by changing the page first: making it writable with `mprotect` and
+replacing the `ud2`, mapping a page over it with `MAP_FIXED`, or writing it
+through `/proc/self/mem`. Detcore records each call
 that may change the page as a change at `/` too: `mmap` with `MAP_FIXED`
 (widened to the huge page size for `MAP_HUGETLB`), `mremap` with
 `MREMAP_FIXED`, or `shmat` with `SHM_REMAP` onto it; `mprotect`,
@@ -189,11 +198,10 @@ emulates and writes into guest memory from the tracer, which does not honor
 page protections, through an output pointer into the page; a fixed `mremap` of
 a huge-page mapping, whose extent the old mapping decides; `userfaultfd` and
 other forwarded ioctls; and a process-memory descriptor received from outside
-the container. One more way around both remains: a signal delivered at the syscall's
-return, by racing a signal into those two instructions, after which the guest
-never returns to the stub (its handler jumps elsewhere, or SIGKILL ends the
-process). That defeats ptrace's determinism guarantee itself, not only this
-attribution.
+the container. A signal delivered at the syscall's return, by racing a signal
+into those two instructions, also escapes the `ud2` (the guest's handler jumps
+elsewhere, or SIGKILL ends the process), but the handler and forked-child cases
+above already need no race.
 
 The one remaining case is a coincidence: a host file replaced during an attempt
 before the divergence, and an unrelated flaky product divergence in that same
