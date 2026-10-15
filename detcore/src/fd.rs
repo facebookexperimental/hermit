@@ -977,6 +977,16 @@ impl DetFd {
         })
     }
 
+    /// Whether this procfs file's snapshot seeks only from the start or the
+    /// position (`ProcfsFile::seeks_only_from_start_or_position`).
+    pub(crate) fn procfs_seeks_only_from_start_or_position(&self) -> bool {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .is_some_and(ProcfsFile::seeks_only_from_start_or_position)
+        })
+    }
+
     /// Whether a short copy of a read of this procfs file is `EFAULT`
     /// (`ProcfsFile::faults_on_a_short_copy`).
     pub(crate) fn procfs_faults_on_a_short_copy(&self) -> bool {

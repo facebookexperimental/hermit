@@ -72,6 +72,9 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-944): Review AVX-512 elapsed-time normalization.
     ArchStatus,
+    /// `/proc/<pid>/cgroup`: every line's path becomes `/`, as for a process
+    /// in the root cgroup (https://github.com/rrnewton/hermit/issues/4378).
+    ProcessCgroup,
     CpuidleCounter,
     Smaps,
     /// `/proc/*/maps`. Its per-mapping line carries a DEVICE and an INODE for
@@ -795,6 +798,7 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-944): Review AVX-512 elapsed-time normalization.
             other if is_process_file_path(other, "arch_status") => ProcfsKind::ArchStatus,
+            other if is_process_file_path(other, "cgroup") => ProcfsKind::ProcessCgroup,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-949): Review per-mapping memory accounting normalization.
             other if is_process_file_path(other, "smaps") => ProcfsKind::Smaps,
@@ -1038,6 +1042,26 @@ impl ProcfsFile {
         }
     }
 
+    /// Whether this is a process's cgroup file, which may be classified by
+    /// the procfs entry a descriptor reaches as well as by its spelling: its
+    /// rendering depends on no namespace, so it reads alike through any procfs
+    /// mount. Kinds bound to the guest's own mounts, such as mountinfo, are
+    /// not, as a file of another procfs mount fails their identity checks
+    /// (Claude re-check of https://github.com/rrnewton/hermit/pull/4386).
+    pub(crate) fn may_be_named_by_provenance(&self) -> bool {
+        self.kind == ProcfsKind::ProcessCgroup
+    }
+
+    /// Whether a seek of this snapshot moves only from the start or the
+    /// position, as the kernel's `seq_lseek` does, so that SEEK_END,
+    /// SEEK_DATA and SEEK_HOLE are EINVAL before and after the snapshot is
+    /// taken. Only `/proc/<pid>/cgroup` so far (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4386); the other process
+    /// files served from a snapshot still seek as a memory file once read.
+    pub(crate) fn seeks_only_from_start_or_position(&self) -> bool {
+        self.kind == ProcfsKind::ProcessCgroup
+    }
+
     /// Whether a read that cannot copy everything it formats fails with
     /// `EFAULT` and leaves the position where it was: a sysctl's
     /// `proc_sys_call_handler` copies its buffer in one `copy_to_iter` and
@@ -1129,6 +1153,7 @@ impl ProcfsFile {
             ProcfsKind::NumaMaps => sanitize_numa_maps(&contents),
             ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
             ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
+            ProcfsKind::ProcessCgroup => sanitize_process_cgroup(&contents),
             ProcfsKind::CpuidleCounter => sanitize_cpuidle_counter(&contents),
             ProcfsKind::Smaps => sanitize_smaps(&contents, mapping_identities),
             ProcfsKind::Maps => sanitize_maps(&contents, mapping_identities),
@@ -3119,6 +3144,45 @@ fn sanitize_smaps_rollup(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+/// A process's cgroup, as for a process in the root cgroup: every
+/// `hierarchy-ID:controllers:path` line keeps its ID and controllers and gets
+/// the path `/`. That agrees with the guest's other views, which are the
+/// initial cgroup namespace's (`/proc/self/ns/cgroup`) and the host's
+/// `/sys/fs/cgroup`. The host's path names whatever launched Hermit, such as a
+/// systemd unit named after its start time, so two separately launched runs
+/// read different bytes, and Go, which reads this file at every process start
+/// to size GOMAXPROCS from its cgroup's `cpu.max`, then took different
+/// branches, ran for different virtual times and wrote different timestamps
+/// into its build cache (https://github.com/rrnewton/hermit/issues/4378).
+/// With the path `/`, Go reads `/sys/fs/cgroup/cpu.max` instead: absent on a
+/// host's real root cgroup, but the launcher's quota at the root of a private
+/// cgroup namespace (a container), so launchers with different quotas can
+/// still differ (https://github.com/rrnewton/hermit/issues/4388).
+///
+/// Split on bytes: a cgroup directory name may hold any byte but `/` and NUL,
+/// and a name that is not UTF-8 must not pass through.
+fn sanitize_process_cgroup(contents: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|&byte| byte == b'\n') {
+        let has_newline = line.ends_with(b"\n");
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let mut fields = body.splitn(3, |&byte| byte == b':');
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some(hierarchy), Some(controllers), Some(_path)) => {
+                normalized.extend_from_slice(hierarchy);
+                normalized.push(b':');
+                normalized.extend_from_slice(controllers);
+                normalized.extend_from_slice(b":/");
+            }
+            _ => normalized.extend_from_slice(body),
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-944): Review the /proc/self/arch_status field policy.
 fn sanitize_arch_status(contents: &[u8]) -> Vec<u8> {
@@ -4112,6 +4176,17 @@ mod tests {
                 .kind,
             ProcfsKind::ArchStatus
         );
+        for path in [
+            "/proc/self/cgroup",
+            "/proc/42/cgroup",
+            "/proc/42/task/43/cgroup",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::ProcessCgroup,
+                "{path}"
+            );
+        }
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/swaps"))
                 .unwrap()
@@ -6878,6 +6953,33 @@ total_commit_ms 0\n"
                 .kind,
             ProcfsKind::ModuleRefcnt("kvm".to_owned()),
             "resolution turns the unclassifiable spelling into the real kind"
+        );
+    }
+    /// A process's cgroup reads as a cgroup namespace rooted at it shows it:
+    /// the host's path, which names whatever launched Hermit, becomes `/` on
+    /// every line, cgroup v1 or v2 (https://github.com/rrnewton/hermit/issues/4378).
+    #[test]
+    fn a_process_cgroup_reads_as_the_root_cgroup() {
+        assert_eq!(
+            sanitize_process_cgroup(
+                b"0::/user.slice/user-1.slice/app.slice/safehermit-20261015T004318Z-183710.service\n"
+            ),
+            b"0::/\n"
+        );
+        assert_eq!(
+            sanitize_process_cgroup(
+                b"12:pids:/user.slice\n11:cpu,cpuacct:/user.slice/x\n0::/a/b\n"
+            ),
+            b"12:pids:/\n11:cpu,cpuacct:/\n0::/\n"
+        );
+        assert_eq!(
+            sanitize_process_cgroup(b"not a cgroup line"),
+            b"not a cgroup line"
+        );
+        // A directory name that is not UTF-8 is replaced too.
+        assert_eq!(
+            sanitize_process_cgroup(b"0::/user.slice/\xff\xfe.scope\n"),
+            b"0::/\n"
         );
     }
 }

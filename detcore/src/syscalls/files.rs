@@ -3387,6 +3387,32 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .and_then(|resolved| ProcfsFile::from_path(&resolved));
                     }
                 }
+                // A process's cgroup file bind-mounted at another path, or
+                // reached through another procfs mount, classifies by neither
+                // its spelling nor its link, which names the bind's mount
+                // point, and would read as the host's bytes. Name the procfs
+                // entry the descriptor reaches, as a stat does, and classify
+                // that name, so the alias is the file it is (Codex review of
+                // https://github.com/rrnewton/hermit/pull/4386). Only that
+                // kind (`ProcfsFile::may_be_named_by_provenance`): a mountinfo
+                // file of another procfs mount failed its identity check and
+                // stopped the run (Claude re-check). Like the link above, this
+                // only adds a classification. Record and replay name no
+                // entries, and without sequentialized threads naming records a
+                // determinism loss for any file that may be procfs, so neither
+                // looks.
+                if procfs.is_none()
+                    && guest.config().sequentialize_threads
+                    && let Some(stat) = host_stat
+                    && let ProcfsEntry::At(within) =
+                        Self::procfs_entry(guest, &DetStat::from(stat), StatTarget::Descriptor(fd))
+                            .await
+                {
+                    procfs = ProcfsFile::from_path(
+                        &Path::new("/proc").join(within.strip_prefix("/").unwrap_or(&within)),
+                    )
+                    .filter(ProcfsFile::may_be_named_by_provenance);
+                }
                 if procfs
                     .as_ref()
                     .is_some_and(ProcfsFile::needs_bound_thread_identity)
@@ -5055,10 +5081,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(offset as i64);
         };
 
+        // A `seq_file` seeks only from the start or the position, before and
+        // after the snapshot (`ProcfsFile::seeks_only_from_start_or_position`).
+        let seq_file = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            detfd.procfs_seeks_only_from_start_or_position()
+        })?;
         let requested = i128::from(call.offset());
         let new_offset = match call.whence() {
             Whence::SEEK_SET => requested,
             Whence::SEEK_CUR => current as i128 + requested,
+            _ if seq_file => return Err(Errno::EINVAL.into()),
             Whence::SEEK_END => snapshot_len as i128 + requested,
             Whence::SEEK_DATA => {
                 if requested < 0 || requested >= snapshot_len as i128 {

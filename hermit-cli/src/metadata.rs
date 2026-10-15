@@ -539,7 +539,14 @@ impl RecordVersion {
 // /proc/thread-self/fd/N (https://github.com/rrnewton/hermit/issues/4266). An
 // older recording holds a kernel readlink of the guest's own spelling for each
 // of those.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x158);
+// 0x158 -> 0x159 (taken at land time, as the reservation file's land-time
+// numbering rule gives a ready change HIGHEST_SHIPPED + 1): /proc/<pid>/cgroup
+// is a procfs file whose every hierarchy reads as for a process in the root
+// cgroup (https://github.com/rrnewton/hermit/issues/4378), where it was an
+// unclassified open that recorded a readlink of its descriptor and the host's
+// bytes. Replay serves a classified procfs file itself, so an older recording
+// of a read of one would replay with different events.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x159);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -564,7 +571,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x158);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x158;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x159;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1595,6 +1602,14 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_decided_procfs_links() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x157)));
+    }
+
+    /// A recording older than 0x159 read /proc/<pid>/cgroup as an unclassified
+    /// file, recording a readlink of its descriptor and the host's bytes
+    /// (https://github.com/rrnewton/hermit/issues/4378).
+    #[test]
+    fn record_version_rejects_streams_from_before_the_process_cgroup_root() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x158)));
     }
 
     #[test]

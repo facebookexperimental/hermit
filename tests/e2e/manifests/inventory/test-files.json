@@ -1489,6 +1489,12 @@
       "why": "tests/c/proc_locks.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/process_cgroup.c",
+      "runner": "hermit-cli/tests/procfs_determinism.rs",
+      "why": "tests/c/process_cgroup.c is owned by hermit-cli/tests/procfs_determinism.rs: proc_self_cgroup_seeks_as_a_seq_file requires SEEK_END, SEEK_DATA and SEEK_HOLE on /proc/self/cgroup to give EINVAL before and after its first read, as Linux's seq_lseek does, and a_bind_mounted_cgroup_file_reads_as_the_root_cgroup bind-mounts a live process's cgroup file at an ordinary path inside a user and mount namespace and requires the guest to read it as procfs with every path '/' (https://github.com/rrnewton/hermit/issues/4378); a generic manifest cannot make the bind or check the seeks around a read."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/process_mrelease_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

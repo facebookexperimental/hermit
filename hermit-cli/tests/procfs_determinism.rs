@@ -311,6 +311,243 @@ fn proc_self_status_is_deterministic() {
     });
 }
 
+/// The host cgroup path (a launcher's unit name, a CI job's slice) changed the
+/// branch counts of Go's GOMAXPROCS probe and so every virtual timestamp after
+/// it (https://github.com/rrnewton/hermit/issues/4378). When the test itself
+/// already runs in the root cgroup the host path is `/` too, and only the
+/// Detcore unit test can tell the rule is missing.
+#[test]
+fn proc_self_cgroup_reads_as_the_root_cgroup() {
+    assert_deterministic("/proc/self/cgroup", |contents| {
+        let text = std::str::from_utf8(contents).expect("cgroup should be UTF-8");
+        assert!(!text.is_empty(), "cgroup has no hierarchy");
+        for line in text.lines() {
+            assert!(
+                line.ends_with(":/"),
+                "cgroup line keeps a host path: {line}"
+            );
+        }
+    });
+}
+
+/// `tests/c/process_cgroup.c`, built into a fresh directory under the test
+/// target's scratch space.
+fn process_cgroup_guest() -> (tempfile::TempDir, PathBuf) {
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create guest directory");
+    let guest = build.path().join("process-cgroup");
+    compile_c(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli must be inside the repository")
+            .join("tests/c/process_cgroup.c"),
+        &guest,
+    );
+    (build, guest)
+}
+
+/// Asserts that every cgroup line in `text` has the path `/`.
+fn assert_root_cgroup_lines(text: &str) {
+    assert!(!text.is_empty(), "cgroup has no hierarchy");
+    for line in text.lines() {
+        assert!(
+            line.ends_with(":/"),
+            "cgroup line keeps a host path: {line}"
+        );
+    }
+}
+
+/// The cgroup file seeks as Linux's `seq_lseek` does, before and after its
+/// first read: SEEK_END, SEEK_DATA and SEEK_HOLE are EINVAL. Once Detcore
+/// served it from a snapshot, they returned the snapshot's length, 0 and the
+/// length (Codex review of https://github.com/rrnewton/hermit/pull/4386).
+#[test]
+fn proc_self_cgroup_seeks_as_a_seq_file() {
+    let _guard = hermit_run_lock();
+    let (_build, guest) = process_cgroup_guest();
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
+        .args([
+            "--log=error",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+        ])
+        .arg(&guest)
+        .arg("seek");
+    hermit_test::configure_guest_execution(&mut command);
+    let output = command.output().expect("failed to run hermit");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "status {}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rest = stdout
+        .strip_prefix(
+            "cold: end EINVAL data EINVAL hole EINVAL\n\
+             read: end EINVAL data EINVAL hole EINVAL\n\
+             again: ",
+        )
+        .unwrap_or_else(|| panic!("unexpected seeks:\n{stdout}"));
+    assert_root_cgroup_lines(rest);
+}
+
+/// The real cgroup file bind-mounted at an ordinary path is the cgroup file:
+/// its spelling and its descriptor's link both name the bind's mount point,
+/// and it read as the launcher's path (Codex review of
+/// https://github.com/rrnewton/hermit/pull/4386). The bound process, the
+/// shell that made the bind, stays alive through the run. As for
+/// [`proc_self_cgroup_reads_as_the_root_cgroup`], a test that already runs in
+/// the root cgroup cannot tell.
+#[test]
+fn a_bind_mounted_cgroup_file_reads_as_the_root_cgroup() {
+    let _guard = hermit_run_lock();
+    let (build, guest) = process_cgroup_guest();
+    let alias = build.path().join("alias");
+    fs::write(&alias, b"").expect("create the bind target");
+    let mut command = Command::new("unshare");
+    command
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "sh",
+            "-c",
+            r#"mount --bind "/proc/$$/cgroup" "$1" || exit 3; alias=$1; shift; "$@" read "$alias""#,
+            "sh",
+        ])
+        .arg(&alias)
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--log=error",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+        ])
+        .arg(&guest);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = command.output().expect("failed to run hermit");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "status {}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rest = stdout
+        .strip_prefix("procfs 1\n")
+        .unwrap_or_else(|| panic!("the alias is not the procfs file:\n{stdout}"));
+    assert_root_cgroup_lines(rest);
+}
+
+/// Through a bind of the whole of `/proc` at another path, a process's
+/// cgroup file reads as the root cgroup too, and a mountinfo file, which
+/// Detcore leaves unclassified there, runs to completion: classifying it as
+/// the guest's own mountinfo failed its identity check, and Hermit killed the
+/// guest (exit 125; Claude re-check of
+/// https://github.com/rrnewton/hermit/pull/4386).
+#[test]
+fn a_bind_of_proc_reads_cgroup_as_root_and_leaves_mountinfo_alone() {
+    let _guard = hermit_run_lock();
+    let (build, guest) = process_cgroup_guest();
+    let copy = build.path().join("proc-copy");
+    fs::create_dir(&copy).expect("create the bind target");
+    let mut command = Command::new("unshare");
+    command
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "sh",
+            "-c",
+            r#"mount --rbind /proc "$1" || exit 3; copy=$1; shift
+               "$@" read "$copy/1/mountinfo" > /dev/null || exit 4
+               "$@" read "$copy/self/cgroup""#,
+            "sh",
+        ])
+        .arg(&copy)
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--log=error",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+        ])
+        .arg(&guest);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = command.output().expect("failed to run hermit");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "status {}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rest = stdout
+        .strip_prefix("procfs 1\n")
+        .unwrap_or_else(|| panic!("the copy's cgroup file is not procfs:\n{stdout}"));
+    assert_root_cgroup_lines(rest);
+}
+
+/// A process's status file bind-mounted at an ordinary path keeps Linux's
+/// `seq_lseek` answers before and after a read: Detcore leaves it to the
+/// kernel, as before. Classifying it by the entry it reaches served it from a
+/// snapshot that answered SEEK_END, SEEK_DATA and SEEK_HOLE once read (Codex
+/// re-check of https://github.com/rrnewton/hermit/pull/4386).
+#[test]
+fn a_bind_mounted_status_file_keeps_its_seeks() {
+    let _guard = hermit_run_lock();
+    let (build, guest) = process_cgroup_guest();
+    let alias = build.path().join("alias");
+    fs::write(&alias, b"").expect("create the bind target");
+    let mut command = Command::new("unshare");
+    command
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "sh",
+            "-c",
+            r#"mount --bind "/proc/$$/status" "$1" || exit 3; alias=$1; shift; "$@" seek "$alias""#,
+            "sh",
+        ])
+        .arg(&alias)
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--log=error",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+        ])
+        .arg(&guest);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = command.output().expect("failed to run hermit");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "status {}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.starts_with(
+            "cold: end EINVAL data EINVAL hole EINVAL\n\
+             read: end EINVAL data EINVAL hole EINVAL\n\
+             again: Name:"
+        ),
+        "{stdout}"
+    );
+}
+
 #[test]
 fn proc_self_cmdline_is_deterministic() {
     assert_deterministic("/proc/self/cmdline", |contents| {
