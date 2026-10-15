@@ -10227,6 +10227,13 @@
           "category": "c-programs",
           "test": "c-programs/statmount-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/statmount-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -10501,6 +10508,13 @@
           "test": "c-programs/syscall-quick-wins",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sysfs-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -10703,6 +10717,13 @@
           "category": "c-programs",
           "test": "c-programs/sysv-sem-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sysv-sem-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -10732,6 +10753,13 @@
           "test": "c-programs/sysv-sem-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sysv-shm-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -11354,6 +11382,13 @@
           "category": "c-programs",
           "test": "c-programs/ustat-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ustat-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -11551,6 +11586,13 @@
           "test": "c-programs/vforkexec",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vmsplice-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -35853,6 +35895,13 @@
           "category": "c-programs",
           "test": "c-programs/statmount-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/statmount-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -35993,6 +36042,13 @@
           "category": "c-programs",
           "test": "c-programs/sysfs-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sysfs-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -36084,6 +36140,13 @@
           "category": "c-programs",
           "test": "c-programs/sysv-sem-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sysv-sem-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -36092,6 +36155,13 @@
           "test": "c-programs/sysv-sem-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sysv-shm-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -36413,6 +36483,13 @@
           "category": "c-programs",
           "test": "c-programs/ustat-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ustat-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -36505,6 +36582,13 @@
           "test": "c-programs/vforkexec",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vmsplice-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -56793,6 +56877,13 @@
           "category": "c-programs",
           "test": "c-programs/statmount-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/statmount-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -57067,6 +57158,13 @@
           "test": "c-programs/syscall-quick-wins",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sysfs-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -57269,6 +57367,13 @@
           "category": "c-programs",
           "test": "c-programs/sysv-sem-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sysv-sem-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -57298,6 +57403,13 @@
           "test": "c-programs/sysv-sem-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sysv-shm-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -57920,6 +58032,13 @@
           "category": "c-programs",
           "test": "c-programs/ustat-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ustat-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -58117,6 +58236,13 @@
           "test": "c-programs/vforkexec",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vmsplice-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",

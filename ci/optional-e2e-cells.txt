@@ -21,15 +21,9 @@ c-programs/sched-yield-progress verify sabre
 c-programs/sigmask-preemption verify sabre
 c-programs/signal-waitstatus-identity verify dbt
 c-programs/sigtimedwait-timeout-0s verify sabre
-c-programs/statmount-enosys verify dbt
 c-programs/syscall-file-metadata verify kvm
-c-programs/sysfs-enosys verify dbt
-c-programs/sysv-sem-enosys verify dbt
-c-programs/sysv-shm-enosys verify dbt
 c-programs/thread-self-procfs-handoff verify sabre
 c-programs/threadexhaustion verify sabre
-c-programs/ustat-enosys verify dbt
-c-programs/vmsplice-enosys verify dbt
 c-programs/writev-determinism custom ptrace
 chaos-c/lock-granularity verify sabre
 data-handling/jq-json-transform naked -
