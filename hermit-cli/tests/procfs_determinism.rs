@@ -136,9 +136,7 @@ fn read_procfs_with(
     command.args(["--", "/bin/cat", path]);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "procfs read failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -555,9 +553,7 @@ fn cpu_count_queries_agree_on_one_virtual_cpu() {
     ]);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "CPU-count probe failed: {rendered}\nstatus: {}\nstderr:\n{}",
@@ -591,9 +587,7 @@ fn cpu_and_node_directories_list_one_cpu_and_node() {
     ]);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "CPU-listing probe failed: {rendered}\nstatus: {}\nstderr:\n{}",
@@ -778,9 +772,7 @@ fn proc_rtc_tracks_custom_epoch_and_virtual_time() {
     ]);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "RTC virtual-time probe failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -902,9 +894,7 @@ fn mountinfo_and_stat_proc_device(no_virtualize_metadata: bool, stat_first: bool
     command.args(["--", "/bin/sh", "-c", script]);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "mountinfo/stat probe failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -1420,9 +1410,7 @@ fn ordered_var_then_nscd_mount_keeps_the_run_nscd_hardening_mount() {
             .arg(&guest);
         hermit_test::configure_guest_execution(&mut command);
         let rendered = format!("{command:?}");
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+        let output = hermit_test::hermit_output(&rendered, &mut command);
         assert!(
             output.status.success(),
             "ordered mount run failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -1580,9 +1568,7 @@ fn fdinfo_and_mountinfo_ids() -> (u64, u64, u64, u64) {
     ]);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "fdinfo/mountinfo probe failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -1896,9 +1882,7 @@ fn redirected_regular_stdio_fdinfo() -> Vec<u8> {
             output.reopen().expect("reopen redirected stdout"),
         ));
     let rendered = format!("{command:?}");
-    let result = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let result = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         result.status.success(),
         "redirected stdio fdinfo failed: {rendered}\nstatus: {}\nstderr:\n{}",
@@ -1959,7 +1943,7 @@ fn fdinfo_mount_classes_with_stdio(guest: &PathBuf, regular_stdin_and_stderr: bo
             stderr_file.reopen().expect("reopen regular stderr"),
         ));
     }
-    let output = command.output().expect("run fdinfo mount-class guest");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert!(
         output.status.success(),
         "fdinfo mount-class guest failed: {}",
@@ -2051,9 +2035,7 @@ fn mount_namespace_fdinfo(no_namespace: bool) -> Vec<u8> {
     ]);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "mount namespace fdinfo failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -2099,9 +2081,7 @@ fn no_namespace_mountinfo_and_fdinfo_share_one_mount_identity_map() {
         ]);
         hermit_test::configure_guest_execution(&mut command);
         let rendered = format!("{command:?}");
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+        let output = hermit_test::hermit_output(&rendered, &mut command);
         assert!(
             output.status.success(),
             "no-namespace mountinfo/fdinfo read failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",

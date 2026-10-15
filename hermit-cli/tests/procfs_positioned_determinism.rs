@@ -62,9 +62,7 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
         ])
         .arg(&guest);
     hermit_test::configure_guest_execution(&mut run_command);
-    let run = run_command
-        .output()
-        .expect("failed to run procfs positioned probe");
+    let run = hermit_test::hermit_output(&format!("{run_command:?}"), &mut run_command);
     let stdout = String::from_utf8_lossy(&run.stdout);
     let stderr = String::from_utf8_lossy(&run.stderr);
     assert!(
@@ -100,9 +98,7 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
         ])
         .arg(&guest);
     hermit_test::configure_guest_execution(&mut verify_command);
-    let verify = verify_command
-        .output()
-        .expect("failed to verify procfs positioned probe");
+    let verify = hermit_test::hermit_output(&format!("{verify_command:?}"), &mut verify_command);
     let vstdout = String::from_utf8_lossy(&verify.stdout);
     let vstderr = String::from_utf8_lossy(&verify.stderr);
     assert!(

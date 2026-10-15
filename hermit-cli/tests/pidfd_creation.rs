@@ -70,9 +70,7 @@ fn pidfd_creation_is_tracked_across_descriptor_operations() {
             ])
             .arg(&guest);
         hermit_test::configure_guest_execution(&mut trace_command);
-        let trace = trace_command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to trace {source}: {error}"));
+        let trace = hermit_test::hermit_output(&format!("{trace_command:?}"), &mut trace_command);
         assert!(
             trace.status.success(),
             "{source} trace failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -108,9 +106,8 @@ fn pidfd_creation_is_tracked_across_descriptor_operations() {
             ])
             .arg(&guest);
         hermit_test::configure_guest_execution(&mut verify_command);
-        let verify = verify_command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to verify {source}: {error}"));
+        let verify =
+            hermit_test::hermit_output(&format!("{verify_command:?}"), &mut verify_command);
         assert!(
             verify.status.success(),
             "{source} verification failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",

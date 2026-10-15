@@ -24,9 +24,7 @@ struct ProgramCase {
 fn command_output(mut command: Command, label: &str) -> Output {
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -87,9 +85,8 @@ fn pty_nr_consumers_verify() {
         ])
         .arg(&probe);
     hermit_test::configure_guest_execution(&mut probe_command);
-    let probe_output = probe_command
-        .output()
-        .expect("failed to run pty count probe");
+    let probe_output =
+        hermit_test::hermit_output(&format!("{probe_command:?}"), &mut probe_command);
     assert!(
         probe_output.status.success()
             && String::from_utf8_lossy(&probe_output.stdout)

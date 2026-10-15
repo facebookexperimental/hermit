@@ -166,7 +166,7 @@ fn proc_fd_link_aliases_and_truncation_verify() {
             .args(["--strict", "--verify", "--"])
             .arg(&guest);
         hermit_test::configure_guest_execution(&mut command);
-        let output = command.output().expect("failed to start Hermit");
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -196,7 +196,7 @@ fn proc_fd_link_aliases_and_truncation_verify() {
             .args(["--strict", "--max-timeslice=disabled", "--"])
             .arg(&guest);
         hermit_test::configure_guest_execution(&mut command);
-        let output = command.output().expect("failed to start Hermit");
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(

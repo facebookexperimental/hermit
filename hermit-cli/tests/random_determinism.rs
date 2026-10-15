@@ -47,9 +47,7 @@ fn run_guest(guest: &Path, seed: u64) -> Vec<u8> {
         .arg(format!("--rng-seed={seed}"))
         .arg(guest);
     hermit_test::configure_guest_execution(&mut command);
-    let output = command
-        .output()
-        .expect("failed to run random guest under Hermit");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert!(
         output.status.success(),
         "random guest failed for seed {seed}:\nstdout:\n{}\nstderr:\n{}",
@@ -79,9 +77,7 @@ fn assert_guest_l2(guest: &Path, backend: Option<&str>) {
         ])
         .arg(guest);
     hermit_test::configure_guest_execution(&mut command);
-    let output = command
-        .output()
-        .expect("failed to run random guest under strict verification");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 

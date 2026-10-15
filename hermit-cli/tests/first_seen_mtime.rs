@@ -106,9 +106,7 @@ fn hermit_run(extra: &[&str], script: &str, args: &[&Path]) -> Output {
         .args(args);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{rendered} failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",

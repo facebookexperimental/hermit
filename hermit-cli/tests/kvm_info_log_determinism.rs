@@ -18,6 +18,9 @@
 //! prerequisites for that verdict: repeated input must match, and a changed
 //! syscall-buffer hash in the retained stream must make verification fail.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -228,18 +231,19 @@ fn run_kvm_log(binary: &Path, log_level: &str, extra_run_flags: &[&str]) -> Stri
     // line) stay on stderr, outside the compared record stream.
     let log_dir = tempfile::tempdir().expect("failed to create KVM log directory");
     let log_path = log_dir.path().join("kvm.log");
-    let output = Command::new("timeout")
-        .args(["--kill-after", "10s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log", log_level, "--backend", "kvm"])
-        .arg("--log-file")
-        .arg(&log_path)
-        .args(["run", "--strict", EPOCH])
-        .args(extra_run_flags)
-        .arg("--")
-        .arg(binary)
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run guest under KVM: {error}"));
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after", "10s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log", log_level, "--backend", "kvm"])
+            .arg("--log-file")
+            .arg(&log_path)
+            .args(["run", "--strict", EPOCH])
+            .args(extra_run_flags)
+            .arg("--")
+            .arg(binary),
+    );
     assert!(
         output.status.success(),
         "KVM strict run failed:\nstdout:\n{}\nstderr:\n{}",

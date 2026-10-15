@@ -15,6 +15,9 @@
 //! then checks that host wall-clock timings are excluded there but retained at
 //! DEBUG for profiling.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -56,19 +59,20 @@ fn run_kvm(binary: &Path, log_level: &str) -> String {
     // line) stay on stderr, outside the compared record stream.
     let log_dir = tempfile::tempdir().expect("failed to create KVM log directory");
     let log_path = log_dir.path().join("kvm.log");
-    let output = Command::new("timeout")
-        .args(["--kill-after", "10s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log", log_level, "--backend", "kvm"])
-        .arg("--log-file")
-        .arg(&log_path)
-        .args(["run", "--strict", EPOCH, "--"])
-        .arg(binary)
-        .env_remove("HERMIT_LOG")
-        .env_remove("HERMIT_LOG_FILE")
-        .env_remove("RUST_LOG")
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run guest under KVM: {error}"));
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after", "10s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log", log_level, "--backend", "kvm"])
+            .arg("--log-file")
+            .arg(&log_path)
+            .args(["run", "--strict", EPOCH, "--"])
+            .arg(binary)
+            .env_remove("HERMIT_LOG")
+            .env_remove("HERMIT_LOG_FILE")
+            .env_remove("RUST_LOG"),
+    );
     assert!(
         output.status.success(),
         "KVM strict run at {log_level} failed:\nstdout:\n{}\nstderr:\n{}",
@@ -85,15 +89,16 @@ fn canonical_info_from_standalone_log_diff(log: &str) -> String {
 
     // One-input log-diff prints the production canonical INFO stream. This is
     // an offline inspection step, not KVM's output/status-only built-in verify.
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .arg("log-diff")
-        .arg("--record-envelope=all-records-v1")
-        .arg(&log_path)
-        .env_remove("HERMIT_LOG")
-        .env_remove("HERMIT_LOG_FILE")
-        .env_remove("RUST_LOG")
-        .output()
-        .unwrap_or_else(|error| panic!("failed to inspect KVM INFO log: {error}"));
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .arg("log-diff")
+            .arg("--record-envelope=all-records-v1")
+            .arg(&log_path)
+            .env_remove("HERMIT_LOG")
+            .env_remove("HERMIT_LOG_FILE")
+            .env_remove("RUST_LOG"),
+    );
     assert!(
         output.status.success(),
         "standalone canonical INFO extraction failed:\nstdout:\n{}\nstderr:\n{}",

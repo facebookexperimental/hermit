@@ -17,6 +17,9 @@
 //! guest prints the checksum and the `mmap_stress success` marker so a stable
 //! stdout is the determinism witness.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -40,9 +43,7 @@ fn hermit_run_lock() -> MutexGuard<'static, ()> {
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",

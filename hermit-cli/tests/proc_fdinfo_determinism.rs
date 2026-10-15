@@ -53,9 +53,7 @@ fn proc_fdinfo_consumers_are_deterministic_under_strict_verify() {
             ])
             .arg(&guest);
         hermit_test::configure_guest_execution(&mut command);
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to verify {name}: {error}"));
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(

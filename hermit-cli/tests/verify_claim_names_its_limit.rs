@@ -21,6 +21,9 @@
 //! test guards the other half: that when content was NOT compared, the verdict
 //! says so instead of claiming determinism outright.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -46,7 +49,7 @@ fn verify(with_io_buffers: bool) -> (String, serde_json::Value) {
         .arg("--verify-json")
         .arg(json.path())
         .args(["--", "/bin/true"]);
-    let output = command.output().expect("failed to start hermit");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let text = std::fs::read_to_string(json.path()).expect("verify json");
     (
         String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -62,12 +65,13 @@ const BITWISE_PARITY_CLAIM: &str = "bitwise parity established";
 /// no `--verify-strict`) and return (stderr, parsed verify JSON).
 fn verify_plain() -> (String, serde_json::Value) {
     let json = tempfile::NamedTempFile::new().expect("temp file");
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["run", "--strict", "--verify", "--verify-json"])
-        .arg(json.path())
-        .args(["--", "/bin/true"])
-        .output()
-        .expect("failed to start hermit");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args(["run", "--strict", "--verify", "--verify-json"])
+            .arg(json.path())
+            .args(["--", "/bin/true"]),
+    );
     let text = std::fs::read_to_string(json.path()).expect("verify json");
     (
         String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -410,10 +414,16 @@ fn a_private_page_written_through_proc_self_mem_names_no_host_input_change() {
 /// shows it there, one executable page, so a move in Reverie fails here.
 #[test]
 fn reverie_private_page_is_the_range_hermit_guards() {
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["run", "--strict", "--", "/bin/cat", "/proc/self/maps"])
-        .output()
-        .expect("failed to start hermit");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new(env!("CARGO_BIN_EXE_hermit")).args([
+            "run",
+            "--strict",
+            "--",
+            "/bin/cat",
+            "/proc/self/maps",
+        ]),
+    );
     let maps = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{output:?}");
     let page: Vec<&str> = maps

@@ -47,9 +47,7 @@ fn run_in_guest_liteinst_twice(guest: &Path, args: &[&str], label: &str) -> Stri
             .arg(guest)
             .args(args);
         hermit_test::configure_guest_execution(&mut command);
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run liteinst/{label}: {error}"));
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -108,9 +106,7 @@ fn socket_timestamp_ioctls_use_logical_time() {
                 .arg(&guest)
                 .arg(mode);
             hermit_test::configure_guest_execution(&mut command);
-            let verify = command
-                .output()
-                .unwrap_or_else(|error| panic!("failed to run {backend}/{mode}: {error}"));
+            let verify = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
             let stdout = String::from_utf8_lossy(&verify.stdout);
             let stderr = String::from_utf8_lossy(&verify.stderr);
             assert!(
@@ -146,9 +142,7 @@ fn socket_timestamp_ioctls_use_logical_time() {
         .arg(&guest)
         .arg("v4-us");
     hermit_test::configure_guest_execution(&mut command);
-    let realtime = command
-        .output()
-        .expect("failed to run host-clock socket timestamp case");
+    let realtime = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert!(
         realtime.status.success(),
         "host-clock socket timestamp case failed: {}\nstdout:\n{}\nstderr:\n{}",

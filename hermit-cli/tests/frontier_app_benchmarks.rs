@@ -14,6 +14,9 @@
 //! `--backend=ptrace --strict --verify --log=info`. No determinism relaxations
 //! are used.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::ffi::OsString;
 use std::net::TcpListener;
 use std::path::Path;
@@ -88,9 +91,7 @@ impl Workload {
             .args(&self.args);
 
         let rendered = format!("{command:?}");
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+        let output = hermit_test::hermit_output(&rendered, &mut command);
         let verification_output = format!(
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
@@ -187,9 +188,7 @@ fn assert_occasional_application_script(script_name: &str, success_marker: &str)
         .env("HERMIT_APPLICATION_TIMEOUT", HERMIT_TIMEOUT);
 
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success() && stdout.contains(success_marker),

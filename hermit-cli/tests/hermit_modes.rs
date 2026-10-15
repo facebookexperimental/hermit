@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
@@ -67,9 +70,7 @@ impl RunMode {
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -1126,9 +1127,7 @@ fn no_hardware_stacktrace_signal() {
     configure_execution_root(&mut command);
     command.args(["--", "/bin/date"]);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start stacktrace signal: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         output.status.signal(),
@@ -1162,16 +1161,16 @@ fn verify_mode_matrix() {
 fn verify_rejects_explicit_log_levels_below_info() {
     let _guard = hermit_run_lock();
     for level in ["off", "error", "warn"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-            .args([
+        let output = hermit_test::hermit_output(
+            "hermit run",
+            Command::new(env!("CARGO_BIN_EXE_hermit")).args([
                 &format!("--log={level}"),
                 "run",
                 "--verify",
                 "--",
                 "/bin/true",
-            ])
-            .output()
-            .unwrap_or_else(|error| panic!("failed to start verify with {level} logs: {error}"));
+            ]),
+        );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !output.status.success(),
@@ -1449,9 +1448,7 @@ fn hello_race_chaos_verify() {
     configure_execution_root(&mut command);
     command.arg("--").arg(&workload.path);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     // Hermit propagates the guest status even when --verify-allow=both accepts it.

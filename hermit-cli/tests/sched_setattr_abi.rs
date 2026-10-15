@@ -22,6 +22,9 @@
 //! in `hermit-cli/tests/hermit_modes.rs`. A test that compiles but never runs
 //! is worse than no test, so the fixture moved here.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -61,9 +64,7 @@ fn build_fixture() -> PathBuf {
 /// Run `command`, require a clean exit, and return its stdout.
 fn transcript(mut command: Command, label: &str) -> String {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} exited nonzero: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",

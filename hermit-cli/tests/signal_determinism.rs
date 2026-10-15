@@ -41,9 +41,7 @@ static SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 fn command_output(mut command: Command, label: &str) -> Output {
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -424,9 +422,7 @@ fn verify_signal_report(options: &[&str], script: &str, run: &str, status: i32) 
         .args(options)
         .args(["--", "/bin/sh", "-c", script]);
     hermit_test::configure_guest_execution(&mut command);
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start hermit: {error}"));
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert_eq!(
         output.status.code(),
@@ -551,9 +547,7 @@ fn verify_writes_no_signal_report_when_the_signaled_runs_verify() {
         "echo before; kill -USR1 $$",
     ]);
     hermit_test::configure_guest_execution(&mut command);
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start hermit: {error}"));
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stderr = String::from_utf8_lossy(&output.stderr);
     // hermit ends as the verified guest did, by the same signal.
     assert_eq!(

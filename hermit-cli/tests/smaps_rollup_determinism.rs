@@ -45,9 +45,7 @@ fn assert_l2(case: &ProgramCase) {
         .arg(required_program(case))
         .args(case.args);
     hermit_test::configure_guest_execution(&mut command);
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to verify {}: {error}", case.name));
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -110,7 +108,7 @@ fn smaps_rollup_consumers_are_deterministic_under_strict_verify() {
         .arg(required_program(&cat))
         .args(cat.args);
     hermit_test::configure_guest_execution(&mut command);
-    let snapshot = command.output().expect("failed to read smaps_rollup");
+    let snapshot = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert!(snapshot.status.success());
     let text = String::from_utf8(snapshot.stdout).expect("smaps_rollup should be UTF-8");
     let mut accounting_rows = 0;

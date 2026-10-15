@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -153,15 +156,16 @@ impl MountinfoProbe {
 }
 
 fn run_mountinfo_probe(backend: &str, run_args: &[&str], guest: &Path) -> Vec<u8> {
-    let output = Command::new("timeout")
-        .args(["--kill-after", "10s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--backend", backend, "run"])
-        .args(run_args)
-        .args(["--tmp=/tmp", "--"])
-        .arg(guest)
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run the mountinfo probe on {backend}: {error}"));
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after", "10s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--backend", backend, "run"])
+            .args(run_args)
+            .args(["--tmp=/tmp", "--"])
+            .arg(guest),
+    );
     assert!(
         output.status.success(),
         "{backend} {run_args:?} mountinfo probe failed:\nstdout:\n{}\nstderr:\n{}",

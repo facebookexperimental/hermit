@@ -102,9 +102,7 @@ fn run_guest(extra: &[&str], guest_args: &[&str], marker: &str) {
 
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start guest: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
 
     // `timeout` exits 124 when it has to kill the child. That is precisely the
     // starvation this test guards: the poller monopolized the CPU and the

@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -54,22 +57,23 @@ fn interrupted_signal_mask_injections_are_retried() {
     let binary = compile_guest();
     let program = binary.to_str().expect("guest path should be UTF-8");
 
-    let verified = Command::new("timeout")
-        .args(["--kill-after", "10s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "run",
-            "--strict",
-            "--verify",
-            "--verify-strict",
-            "--epoch=2026-01-01T00:00:00Z",
-            "--max-timeslice=1000",
-            "--",
-            program,
-            ROUNDS,
-        ])
-        .output()
-        .expect("failed to verify sigmask preemption guest");
+    let verified = hermit_test::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after", "10s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--max-timeslice=1000",
+                "--",
+                program,
+                ROUNDS,
+            ]),
+    );
     assert!(
         verified.status.success(),
         "sigmask verification failed:\nstdout:\n{}\nstderr:\n{}",

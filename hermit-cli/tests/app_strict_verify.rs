@@ -859,9 +859,7 @@ fn build_dir(name: &str) -> PathBuf {
 /// Run a build command and panic with its full output on failure.
 fn run_build(mut command: Command, label: &str) {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label} ({rendered}): {error}"));
+    let output = hermit_test_binary::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed ({rendered})\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
