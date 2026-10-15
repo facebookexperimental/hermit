@@ -1674,6 +1674,16 @@ pub struct Scheduler {
     /// observable (`signal_observable`); sticky.
     signal_unobservable: BTreeSet<(DetPid, i32)>,
 
+    /// Each process's caught signals, with the handler's `sa_mask` and whether
+    /// it has `SA_NODEFER` (`DiscardedSignalControl::Handler`): a forked child
+    /// copies them, and exec resets them, as Linux does with the actions.
+    handler_masks: BTreeMap<(DetPid, i32), (u64, bool)>,
+
+    /// For the duration of a promotion sent at a delivery stop, the receiving
+    /// thread and the mask its handler frame leaves it with
+    /// (`thread_signal_mask`, 4262 design §4.5).
+    delivery_mask_override: Option<(DetTid, u64)>,
+
     /// The dequeue each thread's reported delivery stop identified, popped
     /// once the stop's hooks read the queues (`finish_timer_signal_dequeue`).
     pending_timer_dequeues: BTreeMap<DetTid, posix_timer_coalesce::PendingDequeue>,
@@ -3880,6 +3890,8 @@ impl Scheduler {
             posix_timer_overruns: Default::default(),
             signal_unobservable: Default::default(),
             pending_timer_dequeues: Default::default(),
+            handler_masks: Default::default(),
+            delivery_mask_override: None,
             saved_guest_sigmasks: Default::default(),
             pending_real_time_expirations: Default::default(),
             sending_child_exit: None,
@@ -4924,6 +4936,7 @@ impl Scheduler {
                 .retain(|(owner, _), _| owner != detpid);
             self.signal_unobservable
                 .retain(|(owner, _)| owner != detpid);
+            self.handler_masks.retain(|(owner, _), _| owner != detpid);
         }
     }
 
@@ -10004,12 +10017,26 @@ impl Scheduler {
         scope: HostTimedSignalScope,
         signals: u64,
     ) -> u64 {
-        match scope {
+        let processes = match scope {
             HostTimedSignalScope::Caller => {
                 let process = self.sigchld_process(caller);
                 *self.host_timed_signals.entry(process).or_default() |= signals;
+                vec![process]
             }
-            HostTimedSignalScope::Container => self.host_timed_signals_everywhere |= signals,
+            HostTimedSignalScope::Container => {
+                self.host_timed_signals_everywhere |= signals;
+                self.processes_with_timer_entries()
+            }
+        };
+        // A host-timed source of a signal ends its pairs' observability,
+        // decided in this turn, before the source can post (4262 design
+        // §3.4, §4.11).
+        for process in processes {
+            for signal in (1..32).filter(|signal| signals & kernel_signal_bit(*signal) != 0) {
+                if self.coalesces_alarms() {
+                    self.lose_timer_observability(process, signal);
+                }
+            }
         }
         self.host_timed_signals(caller)
     }
@@ -10246,6 +10273,11 @@ impl Scheduler {
     /// committed (`BlockedPool::out_of_scheduler_masks`); and otherwise the
     /// kernel's (`SigBlk`) for a thread stopped at a request.
     fn thread_signal_mask(&self, thread: DetTid) -> Option<u64> {
+        if let Some((receiver, mask)) = self.delivery_mask_override
+            && receiver == thread
+        {
+            return Some(mask);
+        }
         if let Some(watch) = self
             .parked_futex_waiter(thread)
             .and_then(|waiter| waiter.signal_watch)
@@ -12138,6 +12170,10 @@ impl Scheduler {
                 // one-turn exclusion and the yield epoch alike.
                 self.run_queue.consume_yield_exclusion();
                 self.run_queue.end_yield_epoch();
+                // The call runs outside the schedule, so no timer signal of
+                // its process stays observable: decided before it can run
+                // (4262 design N8-6, `lose_timer_observability`).
+                self.background_call_ends_timer_observability(self.sigchld_process(dettid));
                 self.unblock_guest(dettid, resp)?;
 
                 // Only once the ivars are cleared and the guest is ready to issue
@@ -14383,6 +14419,11 @@ impl Scheduler {
             // Alarm of 0 cancels any pending signal.
             self.blocked.timed_waiters.remove_alarm(detpid)
         } else {
+            // POSIX timers' SIGALRM entries are not followed once ITIMER_REAL
+            // is armed (4262 design §3.4), from this arm on.
+            if self.coalesces_alarms() {
+                self.lose_timer_observability(detpid, sig as libc::c_int);
+            }
             let target_time = now + duration;
             self.blocked
                 .timed_waiters

@@ -710,6 +710,11 @@ impl DiscardedAtSend {
         actions
     }
 
+    /// The processes with a parked timer.
+    pub(crate) fn parked_processes(&self) -> Vec<DetPid> {
+        self.parked.keys().map(|(process, _)| *process).collect()
+    }
+
     /// `timer_delete` of `process`'s timer `timer` removes its park.
     pub(crate) fn forget_park(&mut self, process: DetPid, timer: i32) {
         self.parked.remove(&(process, timer));
@@ -909,9 +914,20 @@ pub enum DiscardedSignalControl {
     /// unreported (`Tool::filter_unreported_signal`): as `Dequeue`, for a hook
     /// that cannot replace the siginfo.
     Unreported { signal: i32 },
-    /// The signals with entries in the calling thread's private queue and in
-    /// its process's shared queue (`signal_lists`), as `Bits`.
-    Listed,
+    /// The calling thread's process installed an action for `signal`: a
+    /// handler (`caught`) whose `sa_mask` is `mask`, with or without
+    /// `SA_NODEFER`. The mask a delivery leaves the receiving thread with
+    /// decides where a promotion goes (`Scheduler::handler_masks`).
+    Handler {
+        signal: i32,
+        caught: bool,
+        mask: u64,
+        nodefer: bool,
+    },
+    /// The signals whose list in the calling thread's private queue, and in
+    /// its process's shared queue, holds an entry behind its front
+    /// (`signal_lists`), as `Bits`: a dequeue of one sends the next.
+    Queued,
     /// `timer_gettime` or `timer_getoverrun` of the calling thread's
     /// process's timer `timer` at the caller's time `now`
     /// (`Scheduler::posix_timer_remaining`, `Scheduler::posix_timer_overrun`).
@@ -1443,10 +1459,23 @@ impl Scheduler {
             DiscardedSignalControl::Unreported { signal } => {
                 DiscardedSignalAnswer::Delivery(self.timer_signal_dequeue(dtid, signal, None))
             }
-            DiscardedSignalControl::Listed => {
+            DiscardedSignalControl::Handler {
+                signal,
+                caught,
+                mask,
+                nodefer,
+            } => {
+                if caught {
+                    self.handler_masks.insert((process, signal), (mask, nodefer));
+                } else {
+                    self.handler_masks.remove(&(process, signal));
+                }
+                DiscardedSignalAnswer::Recorded
+            }
+            DiscardedSignalControl::Queued => {
                 let listed = |queue: QueueId| {
                     (1..32)
-                        .filter(|&signal| self.discarded_at_send.lists.is_listed(queue, signal))
+                        .filter(|&signal| self.discarded_at_send.lists.entries(queue, signal).len() > 1)
                         .fold(0, |bits, signal| bits | kernel_signal_bit(signal))
                 };
                 DiscardedSignalAnswer::Bits {

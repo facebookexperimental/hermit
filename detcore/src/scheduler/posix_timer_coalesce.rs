@@ -107,6 +107,9 @@ pub struct TakeOutcome {
 pub(crate) struct PendingDequeue {
     queue: QueueId,
     signal: i32,
+    /// A delivery, after which the receiver runs the signal's handler, if
+    /// it has one, with that handler's mask (not a take).
+    delivery: bool,
     /// For a valid timer entry: the timer, the consuming thread's time, and
     /// the overrun its delivery reports.
     reconcile: Option<(i32, LogicalTime, i32)>,
@@ -158,6 +161,8 @@ impl Scheduler {
             .retain(|(owner, _), _| *owner != process);
         self.posix_timer_overruns
             .retain(|(owner, _), _| *owner != process);
+        // Exec resets every caught signal's action (`flush_signal_handlers`).
+        self.handler_masks.retain(|(owner, _), _| *owner != process);
     }
 
     /// Whether `process`'s timer `timer` is live (created and not deleted).
@@ -266,6 +271,66 @@ impl Scheduler {
             exit_on_scheduler_refusal(&format_args!(
                 "hermit: signal {signal} of process {process} stopped being observable while a POSIX timer's ignored expiry of it is parked: Linux re-queues it when the signal stops being ignored, which the fallback cannot follow, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)"
             ));
+        }
+    }
+
+    /// The processes with timer-signal entries or parked expiries.
+    pub(crate) fn processes_with_timer_entries(&self) -> Vec<DetPid> {
+        let mut processes: Vec<DetPid> = self
+            .discarded_at_send
+            .lists
+            .listed()
+            .into_iter()
+            .map(|(queue, _)| match queue {
+                QueueId::Process(process) => process,
+                QueueId::Thread(thread) => self.sigchld_process(thread),
+            })
+            .chain(self.discarded_at_send.parked_processes())
+            .collect();
+        processes.sort();
+        processes.dedup();
+        processes
+    }
+
+    /// `child` was created: its exit signal, posted to its wait parent when it
+    /// exits, ends that pair's observability (`signal_observable`).
+    pub(crate) fn child_ends_timer_observability(&mut self, child: DetPid) {
+        // A forked child copies its creator's actions.
+        if let Some(parent) = self.thread_tree.parent_process(&child) {
+            let inherited: Vec<_> = self
+                .handler_masks
+                .iter()
+                .filter(|((owner, _), _)| *owner == parent)
+                .map(|((_, signal), action)| (*signal, *action))
+                .collect();
+            for (signal, action) in inherited {
+                self.handler_masks.insert((child, signal), action);
+            }
+        }
+        if !self.coalesces_alarms() {
+            return;
+        }
+        let (Some(parent), Some(signal)) = (
+            self.thread_tree.parent_process(&child),
+            self.thread_tree.notification_signal(child),
+        ) else {
+            return;
+        };
+        if (1..32).contains(&signal) {
+            self.lose_timer_observability(parent, signal);
+        }
+    }
+
+    /// A thread of `process` is granted a call outside the schedule: every
+    /// signal of it stops being observable (`signal_observable` reads
+    /// `background_call_processes`), and the transition is decided now,
+    /// before the call can run.
+    pub(crate) fn background_call_ends_timer_observability(&mut self, process: DetPid) {
+        if !self.coalesces_alarms() {
+            return;
+        }
+        for signal in 1..32 {
+            self.lose_timer_observability(process, signal);
         }
     }
 
@@ -584,6 +649,7 @@ impl Scheduler {
             PendingDequeue {
                 queue,
                 signal,
+                delivery: true,
                 reconcile,
             },
         );
@@ -664,6 +730,7 @@ impl Scheduler {
             PendingDequeue {
                 queue,
                 signal,
+                delivery: false,
                 reconcile,
             },
             thread,
@@ -738,6 +805,7 @@ impl Scheduler {
             PendingDequeue {
                 queue,
                 signal,
+                delivery: false,
                 reconcile,
             },
             thread,
@@ -874,7 +942,24 @@ impl Scheduler {
             }
         }
         if let Some(Entry::Timer(next)) = popped.next {
+            // At a delivery the kernel sets up the handler frame before the
+            // receiver can take anything else: its mask then decides the
+            // promotion's target (§4.5, P3-3).
+            let process = self.sigchld_process(receiver);
+            self.delivery_mask_override = match self.handler_masks.get(&(process, pending.signal)) {
+                Some(&(mask, nodefer)) if pending.delivery => {
+                    let own = self.thread_signal_mask(receiver).unwrap_or(0);
+                    let deferred = if nodefer {
+                        0
+                    } else {
+                        kernel_signal_bit(pending.signal)
+                    };
+                    Some((receiver, own | mask | deferred))
+                }
+                _ => None,
+            };
             self.promote(pending.queue, pending.signal, next, receiver);
+            self.delivery_mask_override = None;
         }
     }
 

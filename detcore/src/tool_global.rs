@@ -3744,6 +3744,10 @@ impl GlobalState {
                 );
                 if is_group_leader {
                     sched.forget_previous_process_exit(child_dettid);
+                    // The child's exit signal is posted to its parent at a
+                    // host-timed moment: that pair stops being observable now,
+                    // before the child can run (4262 design §3.4).
+                    sched.child_ends_timer_observability(child_dettid);
                 }
                 let new_pid_namespace = is_group_leader
                     && flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_NEWPID));

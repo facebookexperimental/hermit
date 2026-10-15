@@ -544,8 +544,9 @@ pub(crate) const NO_SUCH_PID: libc::pid_t = libc::pid_t::MAX;
 /// sees it (4262 design N8-5): the first 48 bytes of the caller's
 /// `siginfo_t` for `rt_sigqueueinfo` and `rt_tgsigqueueinfo`, or Linux's
 /// `SI_USER` (`kill`) or `SI_TKILL` (`tgkill`, `tkill`) record with the
-/// caller's process id and real uid. `None` when it cannot be read, or for a
-/// call Detcore does not decode, which the scheduler records as `SI_USER`.
+/// caller's process id and real uid; for `pidfd_send_signal`, the caller's
+/// siginfo or `SI_USER`. `None` when it cannot be read, or for a call
+/// Detcore does not decode, which the scheduler records as `SI_USER`.
 /// The process id is the container's, which is the receiver's unless either
 /// is in a nested PID namespace.
 fn sent_siginfo<T, G: Guest<Detcore<T>>>(
@@ -567,6 +568,16 @@ where
         syscalls::Syscall::RtTgsigqueueinfo(call) => {
             return read_siginfo(guest, call.siginfo()?)
                 .map(|bytes| KernelSiginfo::from_user(&bytes));
+        }
+        // `pidfd_send_signal` queues the caller's siginfo when it passes one,
+        // and Linux's `SI_USER` record otherwise.
+        syscalls::Syscall::Other(sysno, args) if *sysno == Sysno::pidfd_send_signal => {
+            match AddrMut::<libc::siginfo_t>::from_raw(args.arg2 as usize) {
+                Some(info) => {
+                    return read_siginfo(guest, info).map(|bytes| KernelSiginfo::from_user(&bytes));
+                }
+                None => libc::SI_USER,
+            }
         }
         syscalls::Syscall::Kill(_) => libc::SI_USER,
         syscalls::Syscall::Tgkill(_) | syscalls::Syscall::Tkill(_) => libc::SI_TKILL,
@@ -1277,6 +1288,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             && crate::scheduler::timer_copies_recorded()
         {
             crate::tool_global::forget_thread_timer_copies(guest, call.signum()).await;
+        }
+        // A handler's mask decides where a POSIX timer's next entry goes when a
+        // delivery promotes it (<https://github.com/rrnewton/hermit/issues/4262>).
+        if crate::scheduler::discarded_at_send::records(guest.config())
+            && (result.is_ok() || matches!(result, Err(Errno::EFAULT)))
+            && (1..32).contains(&call.signum())
+            && let Some(action) = kernel_action
+        {
+            crate::tool_global::discarded_signal(
+                guest,
+                DiscardedSignalControl::Handler {
+                    signal: call.signum(),
+                    caught: action.handler != libc::SIG_IGN as u64
+                        && action.handler != libc::SIG_DFL as u64,
+                    mask: action.mask,
+                    nodefer: action.flags & libc::SA_NODEFER as u64 != 0,
+                },
+            )
+            .await;
         }
         // The flush takes every pending copy of the signal from every queue of
         // the process, so none of them is one Linux discarded any more; and an

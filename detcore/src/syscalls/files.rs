@@ -5124,10 +5124,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Whether a signalfd read of `fd` takes one record per kernel read
-    /// (4262 design §4.4): some signal it covers has entries in the calling
-    /// thread's or its process's lists, so a read must dequeue them one at a
-    /// time, sending each list's next entry before the next record, as
-    /// Linux's `signalfd_dequeue` loop takes them in its order.
+    /// (4262 design §4.4): some signal it covers has an entry behind the
+    /// front of its list in the calling thread's or its process's queue, so
+    /// a read must dequeue one record at a time, sending that list's next
+    /// entry before the next record, as Linux's `signalfd_dequeue` loop takes
+    /// them in its order. With at most one entry per list every entry is
+    /// physically queued, so one kernel read takes them in Linux's order, and
+    /// a stale timer entry among them is dropped in place.
     async fn signalfd_reads_per_record<G: Guest<Self>>(&self, guest: &mut G, fd: i32) -> bool {
         use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
         use crate::scheduler::discarded_at_send::DiscardedSignalControl;
@@ -5138,7 +5141,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return false;
         };
         matches!(
-            crate::tool_global::discarded_signal(guest, DiscardedSignalControl::Listed).await,
+            crate::tool_global::discarded_signal(guest, DiscardedSignalControl::Queued).await,
             DiscardedSignalAnswer::Bits { thread, process } if (thread | process) & mask != 0
         )
     }
@@ -6094,6 +6097,24 @@ impl<T: RecordOrReplay> Detcore<T> {
                 (word(0), word(8))
             })
             .collect();
+        // A vectored read of a signalfd covering a signal with an entry behind
+        // its list's front would need one record per kernel read, each into
+        // its own sub-extents (`read_signalfd_per_record`), which Detcore does
+        // not do for a vector; refused by name rather than return records out
+        // of Linux's order (<https://github.com/rrnewton/hermit/issues/4262>).
+        let total: usize = extents.iter().map(|(_, len)| *len).sum();
+        if total >= 2 * crate::syscalls::signal::SIGNALFD_RECORD
+            && self.signalfd_reads_per_record(guest, fd).await
+        {
+            tracing::error!(
+                "[detcore, dtid {}] {} of a signalfd while a signal it covers has a POSIX timer's entry queued behind another is not supported: Linux returns them one by one in its dequeue order, which Detcore produces only for read (https://github.com/rrnewton/hermit/issues/4262)",
+                guest.thread_state().dettid,
+                sysno,
+            );
+            return self
+                .refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+                .await;
+        }
         loop {
             let before =
                 crate::syscalls::signal::capture_signalfd_buffer(guest, &extents, usize::MAX);
