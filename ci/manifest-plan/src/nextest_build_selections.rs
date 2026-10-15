@@ -840,6 +840,8 @@ mod tests {
             // https://github.com/rrnewton/hermit/issues/4173 is fixed), plus
             // frontier_app_benchmarks' 3 and language_runtime_determinism's 4
             // whose programs the pinned root has.
+            // Plus signal_determinism's DBT and ptrace SIGKILL tests
+            // (https://github.com/rrnewton/hermit/issues/4362).
             // The local node runs in shards, which together execute the same.
             let executed = |tag: &str| -> u64 {
                 let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
@@ -853,7 +855,7 @@ mod tests {
             } else {
                 executed(tag)
             };
-            assert_eq!(population, 451);
+            assert_eq!(population, 453);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

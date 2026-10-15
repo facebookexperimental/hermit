@@ -2249,7 +2249,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And procfs_inode::tests::only_kvms_synthetic_procfs_device_is_proved_by_its_stat_fields
     // and only_a_backend_that_names_no_entries_but_shares_procfs_keeps_its_signature
     // (https://github.com/rrnewton/hermit/issues/4162): 1698.
-    ("test.detcore_unit", 1698),
+    // And scheduler::test::dbt_process_sigkill_retires_every_thread_of_the_target_group
+    // and tool_global::tests::the_dbt_sigkill_fence_waits_until_the_victim_process_is_gone
+    // (https://github.com/rrnewton/hermit/issues/4362): 1700, listed.
+    ("test.detcore_unit", 1700),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2521,9 +2524,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // language_runtime_determinism (4) whose programs the pinned root has,
     // in the second shard; the rest stay ignored: 60 + 169 + 222 = 451,
     // listed.
+    // And signal_determinism's DBT and ptrace SIGKILL tests in the third shard
+    // (https://github.com/rrnewton/hermit/issues/4362): 60 + 169 + 224 = 453.
     ("test.hermit_integration", 60),
     ("test.hermit_integration_2", 169),
-    ("test.hermit_integration_3", 222),
+    ("test.hermit_integration_3", 224),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3804,7 +3809,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +6 from a3133b84: 1693.
     // And the three chaos starvation-bound tests (https://github.com/rrnewton/hermit/issues/4374): 1696, listed.
     // And the two procfs-device tests (https://github.com/rrnewton/hermit/issues/4162): 1698.
-    ("test.detcore_unit_on_host", 1698),
+    // And the DBT SIGKILL group-retirement and fence tests: 1700.
+    ("test.detcore_unit_on_host", 1700),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3867,7 +3873,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And flock_exclusion's 23: 444.
     // And frontier_app_benchmarks' 3 and language_runtime_determinism's 4:
     // 451.
-    ("test.hermit_integration_on_host", 451),
+    // And the DBT and ptrace SIGKILL tests: 453.
+    ("test.hermit_integration_on_host", 453),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

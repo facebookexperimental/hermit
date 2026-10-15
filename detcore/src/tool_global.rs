@@ -2891,12 +2891,47 @@ impl GlobalState {
                 R::NamesHermitTask(hermit_task_named(caller, tgid, tid))
             }
             GlobalRequest::NotifySignalPending(dettid, SigWrapper(signal), target_process) => {
-                let mut scheduler = self.lock_rpc_scheduler(false).await;
-                scheduler.notify_signal_pending(dettid, SigWrapper(signal));
-                if signal == libc::SIGKILL {
-                    scheduler.record_committed_sigkill(dettid, target_process);
-                    if let Some(detpid) = target_process {
-                        scheduler.note_process_sigkill(dettid, detpid);
+                let fence = {
+                    let mut scheduler = self.lock_rpc_scheduler(false).await;
+                    scheduler.notify_signal_pending(dettid, SigWrapper(signal));
+                    let dbt = self.cfg.backend.requires_thread_directed_process_signals;
+                    // tgkill, tkill and rt_tgsigqueueinfo name a thread, but a
+                    // SIGKILL ends that thread's whole group
+                    // (https://github.com/rrnewton/hermit/issues/4362).
+                    let target_process = if signal == libc::SIGKILL && dbt {
+                        target_process.or_else(|| scheduler.registered_process(dettid))
+                    } else {
+                        target_process
+                    };
+                    let mut fence = None;
+                    if signal == libc::SIGKILL {
+                        scheduler.record_committed_sigkill(dettid, target_process);
+                        if let Some(detpid) = target_process {
+                            if dbt {
+                                fence = scheduler
+                                    .physical_process_of(dettid)
+                                    .and_then(open_process_pidfd)
+                                    .map(|pidfd| (detpid, pidfd, scheduler.sigkill_fence_valve));
+                            }
+                            scheduler.note_process_sigkill(dettid, detpid);
+                        }
+                    }
+                    fence
+                };
+                // The sender's kill does not return until the victim process
+                // is gone, as ptrace's SIGKILL fence makes it wait: a process
+                // pidfd reports exit after the kernel has closed the victim's
+                // files and sent its parent SIGCHLD. Only then can the sender,
+                // which still holds the serial grant, observe the death, at a
+                // point the schedule fixes (Claude review of
+                // https://github.com/rrnewton/hermit/pull/4400, F1).
+                if let Some((detpid, pidfd, valve)) = fence {
+                    let started = std::time::Instant::now();
+                    if !process_pidfd_reports_exit_within(pidfd, valve).await {
+                        self.sched
+                            .lock()
+                            .unwrap()
+                            .refuse_unsettled_process_sigkill(detpid, started.elapsed());
                     }
                 }
                 R::NotifySignalPending(())
@@ -5530,6 +5565,31 @@ fn wake_exec_robust_waiters(sched: &mut Scheduler, wakes: &[(DetTid, FutexID)], 
     }
 }
 
+/// A process pidfd for the host process `pid` (`pidfd_open` with no flags),
+/// which reports exit only once the whole thread group has exited.
+fn open_process_pidfd(pid: i32) -> Option<std::os::fd::OwnedFd> {
+    // SAFETY: pidfd_open takes no pointers.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        warn!(
+            "[detcore] cannot open a pidfd for host process {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+    // SAFETY: pidfd_open returned a new descriptor owned by this process.
+    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as libc::c_int) })
+}
+
+/// Whether the process behind `pidfd` exits within `valve`.
+async fn process_pidfd_reports_exit_within(pidfd: std::os::fd::OwnedFd, valve: Duration) -> bool {
+    let Ok(fd) = tokio::io::unix::AsyncFd::with_interest(pidfd, tokio::io::Interest::READABLE)
+    else {
+        return false;
+    };
+    tokio::time::timeout(valve, fd.readable()).await.is_ok()
+}
+
 /// Whether the reply to `request` can resume its thread from a scheduler grant
 /// (`Scheduler::unblock_guest`), or answers a timer it armed: the requests
 /// whose replies carry a deadline hint
@@ -7370,6 +7430,37 @@ mod tests {
         guest.wait().unwrap();
         stop.send(()).unwrap();
         thread.join().unwrap();
+    }
+
+    /// The DBT SIGKILL fence waits on a process pidfd: a live victim keeps it
+    /// waiting to the valve, and a dead one, even unreaped, releases it
+    /// (https://github.com/rrnewton/hermit/issues/4362).
+    #[test]
+    fn the_dbt_sigkill_fence_waits_until_the_victim_process_is_gone() {
+        use super::open_process_pidfd;
+        use super::process_pidfd_reports_exit_within;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut victim = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = victim.id() as i32;
+        let live = open_process_pidfd(pid).expect("a live child has a pidfd");
+        assert!(!runtime.block_on(process_pidfd_reports_exit_within(
+            live,
+            std::time::Duration::from_millis(50)
+        )));
+        let dying = open_process_pidfd(pid).expect("a live child has a pidfd");
+        victim.kill().unwrap();
+        assert!(runtime.block_on(process_pidfd_reports_exit_within(
+            dying,
+            std::time::Duration::from_secs(30)
+        )));
+        victim.wait().unwrap();
+        assert!(open_process_pidfd(pid).is_none());
     }
 
     /// DBT publishes READY_IMAGE between creating the scheduler future and

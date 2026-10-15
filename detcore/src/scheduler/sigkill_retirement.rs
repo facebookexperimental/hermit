@@ -582,6 +582,26 @@ impl Scheduler {
         }
     }
 
+    /// Refuse the run: on a backend that sends process signals to a named
+    /// thread (DBT), a SIGKILL's victim `process` was not gone within the
+    /// valve, so continuing would let host timing decide when the sender sees
+    /// its death (https://github.com/rrnewton/hermit/issues/4362).
+    pub(crate) fn refuse_unsettled_process_sigkill(
+        &mut self,
+        process: DetPid,
+        waited: std::time::Duration,
+    ) {
+        if self.sigkill_fence_refusal.is_none() {
+            let refusal = SigkillFenceRefusal {
+                unaccounted: Vec::new(),
+                unpublished: vec![process],
+                waited,
+            };
+            tracing::error!("[sigkill] {}", refusal);
+            self.sigkill_fence_refusal = Some(refusal);
+        }
+    }
+
     /// Whether `process` is a victim of the SIGKILL being committed right now.
     pub(crate) fn is_dying_sigkill_victim(&self, process: DetPid) -> bool {
         self.sigkill.dying.contains(&process)

@@ -2489,6 +2489,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         sig: libc::c_int,
     ) -> Result<Option<DetTid>, Error> {
         let (targets, zombie) = resolve_kill_targets_and_exit(guest, tgid).await;
+        // SIGKILL ends the whole thread group whichever thread receives it, so
+        // it needs no recipient choice. On a backend that sends process
+        // signals to a named thread (DBT), whose kill notice retires the
+        // target's whole group (`Scheduler::note_process_sigkill`), send it to
+        // the lowest live thread (https://github.com/rrnewton/hermit/issues/4362).
+        // Elsewhere a SIGKILL to another process is reserved and retired
+        // before this point.
+        if sig == libc::SIGKILL
+            && targets.len() > 1
+            && guest
+                .config()
+                .backend
+                .requires_thread_directed_process_signals
+        {
+            return Ok(targets.first().copied());
+        }
         match deterministic_kill_target(&targets, zombie, sig) {
             Err(Errno::ENOSYS) => {
                 tracing::error!(

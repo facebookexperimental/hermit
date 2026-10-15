@@ -7,15 +7,18 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -898,6 +901,164 @@ static int test_itimer_is_discarded_on_process_exit(void) {
   return 0;
 }
 
+static void* sigkill_child_sleeper(void* unused) {
+  (void)unused;
+  for (;;) {
+    pause();
+  }
+  return NULL;
+}
+
+/* The parent SIGKILLs its paused child, which has one thread or, with
+ * `threaded`, a second thread paused too, and reports how the child ended.
+ * SIGKILL ends the whole thread group
+ * (https://github.com/rrnewton/hermit/issues/4362). */
+static int test_sigkill_child_by(int threaded, int by_tgkill);
+
+static int test_sigkill_child(int threaded) {
+  return test_sigkill_child_by(threaded, 0);
+}
+
+/* With `by_tgkill`, the SIGKILL is sent with tgkill(2) to the child's main
+ * thread, which still ends the whole child. */
+static int test_sigkill_child_by(int threaded, int by_tgkill) {
+  _Atomic int* ready = mmap(
+      NULL, sizeof(*ready), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (ready == MAP_FAILED) {
+    perror("mmap");
+    return 1;
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    perror("fork");
+    return 1;
+  }
+  if (child == 0) {
+    if (threaded) {
+      pthread_t thread;
+      if (pthread_create(&thread, NULL, sigkill_child_sleeper, NULL) != 0) {
+        _exit(2);
+      }
+    }
+    atomic_store(ready, 1);
+    for (;;) {
+      pause();
+    }
+  }
+  while (!atomic_load(ready)) {
+    sched_yield();
+  }
+  if ((by_tgkill ? syscall(SYS_tgkill, child, child, SIGKILL) : kill(child, SIGKILL)) != 0) {
+    perror("kill");
+    return 1;
+  }
+  int status;
+  if (waitpid(child, &status, 0) != child) {
+    perror("waitpid");
+    return 1;
+  }
+  printf(
+      "sigkill%s child threaded=%d signaled=%d sig=%d\n",
+      by_tgkill ? " by tgkill" : "",
+      threaded,
+      WIFSIGNALED(status),
+      WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+  return 0;
+}
+
+static volatile sig_atomic_t sigkill_sigchld_seen;
+
+static void on_sigkill_sigchld(int signal) {
+  (void)signal;
+  sigkill_sigchld_seen = 1;
+}
+
+/* After SIGKILLing its paused child (one thread or, with `threaded`, two), the
+ * parent counts how many loop iterations pass before it observes the death:
+ * its SIGCHLD handler running (`by_pipe` 0), or EOF on a pipe whose only write
+ * end the child holds (`by_pipe` 1). Linux has sent SIGCHLD and closed the
+ * child's files by the time the kill returns to a sender that waits for the
+ * victim, as Hermit's SIGKILL fence makes it, so both counts are 0
+ * (https://github.com/rrnewton/hermit/issues/4362). */
+static int test_sigkill_observed(int threaded, int by_pipe) {
+  int fds[2];
+  if (by_pipe && pipe(fds) != 0) {
+    perror("pipe");
+    return 1;
+  }
+  if (!by_pipe) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = on_sigkill_sigchld;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGCHLD, &action, NULL) != 0) {
+      perror("sigaction");
+      return 1;
+    }
+  }
+  _Atomic int* ready = mmap(
+      NULL, sizeof(*ready), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (ready == MAP_FAILED) {
+    perror("mmap");
+    return 1;
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    perror("fork");
+    return 1;
+  }
+  if (child == 0) {
+    if (by_pipe) {
+      close(fds[0]);
+    }
+    if (threaded) {
+      pthread_t thread;
+      if (pthread_create(&thread, NULL, sigkill_child_sleeper, NULL) != 0) {
+        _exit(2);
+      }
+    }
+    atomic_store(ready, 1);
+    for (;;) {
+      pause();
+    }
+  }
+  if (by_pipe) {
+    close(fds[1]);
+    fcntl(fds[0], F_SETFL, O_NONBLOCK);
+  }
+  while (!atomic_load(ready)) {
+    sched_yield();
+  }
+  if (kill(child, SIGKILL) != 0) {
+    perror("kill");
+    return 1;
+  }
+  long iterations = 0;
+  if (by_pipe) {
+    char byte;
+    while (read(fds[0], &byte, 1) < 0 && errno == EAGAIN && iterations < 100000000) {
+      ++iterations;
+    }
+  } else {
+    while (!sigkill_sigchld_seen && iterations < 100000000) {
+      ++iterations;
+    }
+  }
+  int status;
+  if (waitpid(child, &status, 0) != child) {
+    perror("waitpid");
+    return 1;
+  }
+  printf(
+      "sigkill %s threaded=%d iterations=%ld signaled=%d sig=%d\n",
+      by_pipe ? "pipe-eof" : "sigchld",
+      threaded,
+      iterations,
+      WIFSIGNALED(status),
+      WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s SCENARIO\n", argv[0]);
@@ -950,6 +1111,30 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "pending-exec-check") == 0) {
     return check_pending_after_exec();
+  }
+  if (strcmp(argv[1], "sigkill-child") == 0) {
+    return test_sigkill_child(0);
+  }
+  if (strcmp(argv[1], "sigkill-threaded-child") == 0) {
+    return test_sigkill_child(1);
+  }
+  if (strcmp(argv[1], "sigkill-tgkill-child") == 0) {
+    return test_sigkill_child_by(0, 1);
+  }
+  if (strcmp(argv[1], "sigkill-tgkill-threaded-child") == 0) {
+    return test_sigkill_child_by(1, 1);
+  }
+  if (strcmp(argv[1], "sigkill-sigchld") == 0) {
+    return test_sigkill_observed(0, 0);
+  }
+  if (strcmp(argv[1], "sigkill-threaded-sigchld") == 0) {
+    return test_sigkill_observed(1, 0);
+  }
+  if (strcmp(argv[1], "sigkill-pipe-eof") == 0) {
+    return test_sigkill_observed(0, 1);
+  }
+  if (strcmp(argv[1], "sigkill-threaded-pipe-eof") == 0) {
+    return test_sigkill_observed(1, 1);
   }
   fprintf(stderr, "unknown scenario: %s\n", argv[1]);
   return 2;

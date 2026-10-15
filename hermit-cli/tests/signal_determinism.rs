@@ -296,6 +296,74 @@ fn dbt_sigsuspend_invalid_pointer_does_not_fault_in_the_tool() {
     );
 }
 
+/// On DBT, a guest's SIGKILL of another process ends every thread of that
+/// process, as Linux does: the parent's waitpid reports the child killed by
+/// SIGKILL, with one thread and with a second thread paused, whether the kill
+/// is sent with kill(2) or with tgkill(2) to the child's main thread. Before,
+/// a kill(2) to a two-threaded process was refused (Detcore does not choose a
+/// process signal's recipient thread), the kill notice retired only the
+/// thread it named, and a tgkill(2) SIGKILL retired nothing
+/// (https://github.com/rrnewton/hermit/issues/4362).
+///
+/// The sender's kill also returns only once the victim is gone, as ptrace's
+/// SIGKILL fence makes it: the parent's SIGCHLD handler has run and the pipe
+/// the child held is at EOF before the parent's next instruction, so each
+/// count is 0 in every run. Before the fence these counts varied from run to
+/// run (Claude review of https://github.com/rrnewton/hermit/pull/4400, F1).
+/// These are plain runs: `--verify` of a run whose child is SIGKILLed fails
+/// DBT's evidence check, which requires a FINAL frame that a killed process
+/// cannot write (https://github.com/rrnewton/hermit/issues/4396).
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_sigkill_ends_every_thread_of_the_target() {
+    for (scenario, expected) in SIGKILL_SCENARIOS {
+        run_signal_scenario_on_backend(Some("dbt"), scenario, expected, DETERMINISM_RUNS);
+    }
+}
+
+/// The ptrace control for `dbt_sigkill_ends_every_thread_of_the_target`.
+#[test]
+fn ptrace_sigkill_ends_every_thread_of_the_target() {
+    for (scenario, expected) in SIGKILL_SCENARIOS {
+        run_signal_scenario_on_backend(Some("ptrace"), scenario, expected, 1);
+    }
+}
+
+const SIGKILL_SCENARIOS: [(&str, &str); 8] = [
+    (
+        "sigkill-child",
+        "sigkill child threaded=0 signaled=1 sig=9\n",
+    ),
+    (
+        "sigkill-threaded-child",
+        "sigkill child threaded=1 signaled=1 sig=9\n",
+    ),
+    (
+        "sigkill-tgkill-child",
+        "sigkill by tgkill child threaded=0 signaled=1 sig=9\n",
+    ),
+    (
+        "sigkill-tgkill-threaded-child",
+        "sigkill by tgkill child threaded=1 signaled=1 sig=9\n",
+    ),
+    (
+        "sigkill-sigchld",
+        "sigkill sigchld threaded=0 iterations=0 signaled=1 sig=9\n",
+    ),
+    (
+        "sigkill-threaded-sigchld",
+        "sigkill sigchld threaded=1 iterations=0 signaled=1 sig=9\n",
+    ),
+    (
+        "sigkill-pipe-eof",
+        "sigkill pipe-eof threaded=0 iterations=0 signaled=1 sig=9\n",
+    ),
+    (
+        "sigkill-threaded-pipe-eof",
+        "sigkill pipe-eof threaded=1 iterations=0 signaled=1 sig=9\n",
+    ),
+];
+
 #[test]
 fn blocking_sigsuspend_releases_the_scheduler() {
     run_signal_scenario(

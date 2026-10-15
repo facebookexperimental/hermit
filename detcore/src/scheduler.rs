@@ -3631,6 +3631,13 @@ impl Scheduler {
         Ok(())
     }
 
+    /// The host process ID registered for `dettid`'s host thread, if any.
+    pub(crate) fn physical_process_of(&self, dettid: DetTid) -> Option<i32> {
+        self.physical_thread_pidfds
+            .get(&dettid)
+            .map(|(_, physical_pid, ..)| *physical_pid)
+    }
+
     fn remove_physical_thread(&mut self, dettid: &DetTid, mm: MmId) {
         if self
             .physical_thread_pidfds
@@ -3730,7 +3737,36 @@ impl Scheduler {
             return;
         };
         let mm = *mm;
+        // SIGKILL ends the whole thread group, whichever thread it names.
+        // Retire the group's other live threads too, in DetTid order, at this
+        // same committed point: none of them runs guest code again, and on
+        // this backend a killed thread's pending request is answered
+        // (`needs_killed_thread_rpc_cancellation`). Before, only the named
+        // thread was retired, and a multi-threaded victim's other threads
+        // stayed modeled as live until the deadlock detector fired
+        // (https://github.com/rrnewton/hermit/issues/4362).
+        let siblings: Vec<DetTid> = if self.thread_tree.contains(&detpid) {
+            let mut group: Vec<DetTid> = self
+                .thread_tree
+                .my_thread_group(&detpid)
+                .into_iter()
+                .filter(|tid| *tid != dettid && self.next_turns.contains_key(tid))
+                .collect();
+            group.sort();
+            group
+        } else {
+            Vec::new()
+        };
         self.logically_kill_thread(&dettid, &detpid, mm);
+        for tid in siblings {
+            let mm = self
+                .physical_thread_pidfds
+                .get(&tid)
+                .map(|(mm, ..)| *mm)
+                .or_else(|| self.thread_mm(tid))
+                .unwrap_or(MmId::initial(tid));
+            self.logically_kill_thread(&tid, &detpid, mm);
+        }
     }
 
     fn should_synthesize_child_exit_signal(&self, parent: DetTid) -> bool {
@@ -14517,6 +14553,49 @@ mod test {
         assert!(!scheduler.next_turns.contains_key(&child));
         assert!(!scheduler.physical_thread_pidfds.contains_key(&child));
         assert!(scheduler.logically_exited_processes.contains(&child));
+    }
+
+    /// SIGKILL ends a whole thread group, so the DBT kill notice retires every
+    /// live thread of the target's group, not only the thread it names, and a
+    /// sibling's filed request is answered so that it runs no more guest code
+    /// (https://github.com/rrnewton/hermit/issues/4362).
+    #[test]
+    fn dbt_process_sigkill_retires_every_thread_of_the_target_group() {
+        let config = Config::default().with_backend(|backend| {
+            *backend = reverie::BackendCapabilities::DBT;
+        });
+        let mut scheduler = Scheduler::new(&config);
+        let parent = DetTid::from_raw(37);
+        let child = DetTid::from_raw(38);
+        let sibling = DetTid::from_raw(39);
+        let child_mm = MmId::for_clone(MmId::initial(parent), child, false);
+        let physical_pid = std::process::id() as i32;
+        let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, child, true);
+        scheduler.thread_tree.add_child(child, sibling, false);
+        register_known_thread(&mut scheduler, parent);
+        register_known_thread(&mut scheduler, child);
+        register_known_thread(&mut scheduler, sibling);
+        scheduler.record_thread_mm(sibling, child_mm);
+        scheduler
+            .register_physical_thread(child, child_mm, physical_pid, physical_tid)
+            .expect("PIDFD_THREAD must bind the current test thread");
+        scheduler.next_turns[&sibling]
+            .req
+            .put(Ok(Resources::new(sibling)));
+        let sibling_response = scheduler.next_turns[&sibling].resp.clone();
+
+        scheduler.note_process_sigkill(child, child);
+
+        assert!(!scheduler.next_turns.contains_key(&child));
+        assert!(!scheduler.next_turns.contains_key(&sibling));
+        assert!(scheduler.next_turns.contains_key(&parent));
+        assert!(scheduler.logically_exited_processes.contains(&child));
+        assert!(matches!(
+            sibling_response.try_read(),
+            Some(SchedResponse::Signaled(None))
+        ));
     }
 
     fn install_runnable_exec_group(
