@@ -1210,9 +1210,29 @@ static int connect_loopback(uint16_t port, int send_buffer) {
 
 enum backpressure_kind { NONBLOCKING, BLOCKING, INTERLEAVED, OBSERVE, REPLACE, SHARED };
 
-/* The byte the shared mode's child writes at `index` of the second half. */
-static unsigned char rewritten_byte(size_t index) {
-  return (unsigned char)~backpressure_byte(index);
+/* Writes the stream's bytes [first, first + length) to `out`, each inverted
+ * when `invert` is set: inverted is what the shared mode's child writes over
+ * the second half. The bytes are backpressure_byte's.
+ *
+ * Optimized, but not vectorized: with GCC, which builds this fixture for the
+ * record and replay tests (the pinned root's 15.3), still one loop branch per
+ * byte, so Hermit's timer preempts the fill at the same retired-branch counts,
+ * in 8 instructions per branch rather than about 17 at -O0. (Clang ignores
+ * this attribute and keeps -O0's loop.) Hermit delivers each
+ * preemption exactly by single-stepping its last 1000 or so branches under
+ * ptrace, one stop per instruction, and a loaded host makes every stop slow:
+ * at -O0 a replay of the shared mode spent most of its time there, 0.74 s
+ * of wall time per preemption at load average 280, and overran its 45 s bound
+ * at higher load (https://github.com/rrnewton/hermit/issues/4401). */
+__attribute__((optimize("O2", "no-tree-vectorize"))) static void fill_stream(unsigned char *out,
+                                                                           size_t first,
+                                                                           size_t length,
+                                                                           int invert) {
+  unsigned char mask = invert ? 0xff : 0;
+  for (size_t index = 0; index < length; ++index) {
+    size_t at = first + index;
+    out[index] = (unsigned char)((at * 131 + (at >> 9)) ^ mask);
+  }
 }
 
 static void pwrite_all(int fd, const unsigned char *bytes, size_t length, off_t offset) {
@@ -1243,14 +1263,12 @@ static const unsigned char *map_shared_stream(int *rewrite, int *rewrite_done,
     fail("unlink shared stream");
   static unsigned char half[BACKPRESSURE_BYTES / 2];
   for (size_t offset = 0; offset < BACKPRESSURE_BYTES; offset += sizeof(half)) {
-    for (size_t index = 0; index < sizeof(half); ++index)
-      half[index] = backpressure_byte(offset + index);
+    fill_stream(half, offset, sizeof(half), 0);
     pwrite_all(fd, half, sizeof(half), (off_t)offset);
   }
   // The child only writes, so the rewrite fits the controller's timeout.
   static unsigned char rewritten[BACKPRESSURE_BYTES / 2];
-  for (size_t index = 0; index < sizeof(rewritten); ++index)
-    rewritten[index] = rewritten_byte(sizeof(rewritten) + index);
+  fill_stream(rewritten, sizeof(rewritten), sizeof(rewritten), 1);
   const unsigned char *bytes =
       mmap(NULL, BACKPRESSURE_BYTES, PROT_READ, MAP_SHARED, fd, 0);
   if (bytes == MAP_FAILED)
@@ -1338,8 +1356,7 @@ static int run_backpressure_client(const char *port_text, enum backpressure_kind
   if (kind == SHARED) {
     bytes = map_shared_stream(&rewrite, &rewrite_done, &rewriter);
   } else {
-    for (size_t index = 0; index < BACKPRESSURE_BYTES; ++index)
-      filled[index] = backpressure_byte(index);
+    fill_stream(filled, 0, BACKPRESSURE_BYTES, 0);
   }
   int data = connect_loopback(port, BACKPRESSURE_SOCKET_BUFFER);
   int control = connect_loopback(port, 0);
