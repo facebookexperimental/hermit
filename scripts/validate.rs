@@ -30175,9 +30175,13 @@ mod committed_selection_preservation_tests {
                         "test.cli" => {
                             format!("set -eu; mkdir {active}; sleep 0.1; rmdir {active}; exit 17")
                         }
-                        "privileged-build.privileged_tests" => format!(
-                            "set -eu; mkdir {active}; sleep 0.1; : > {artifact}; rmdir {active}"
-                        ),
+                        // The verifying build holds no integration token since
+                        // it stopped building (2026-10-14), so it may overlap
+                        // test.cli and takes no part in the exclusion; the two
+                        // consumers of the cli token still do.
+                        "privileged-build.privileged_tests" => {
+                            format!("set -eu; sleep 0.1; : > {artifact}")
+                        }
                         "privileged-test.cli_kvm" => format!(
                             "set -eu; mkdir {active}; test -f {artifact}; : > {}; rmdir {active}",
                             validate_plan::shell_quote(&passed.to_string_lossy())
