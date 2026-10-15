@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 2990,
-      "applicable": 1927,
-      "selectable": 1633,
-      "population": 2920,
-      "population_candidate_selected": 1633,
+      "cells": 2995,
+      "applicable": 1928,
+      "selectable": 1634,
+      "population": 2925,
+      "population_candidate_selected": 1634,
       "population_candidate_not_selected": 283,
-      "population_candidate_disabled": 1004
+      "population_candidate_disabled": 1008
     },
     "by_backend": {
       "dbt": {
-        "cells": 598,
+        "cells": 599,
         "applicable": 252,
         "selectable": 205,
-        "population": 584,
+        "population": 585,
         "population_candidate_selected": 205,
         "population_candidate_not_selected": 46,
-        "population_candidate_disabled": 333
+        "population_candidate_disabled": 334
       },
       "in-guest-trap": {
-        "cells": 598,
+        "cells": 599,
         "applicable": 319,
         "selectable": 318,
-        "population": 584,
+        "population": 585,
         "population_candidate_selected": 318,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 266
+        "population_candidate_disabled": 267
       },
       "kvm": {
-        "cells": 598,
-        "applicable": 558,
-        "selectable": 552,
-        "population": 584,
-        "population_candidate_selected": 552,
+        "cells": 599,
+        "applicable": 559,
+        "selectable": 553,
+        "population": 585,
+        "population_candidate_selected": 553,
         "population_candidate_not_selected": 3,
         "population_candidate_disabled": 29
       },
       "liteinst": {
-        "cells": 598,
+        "cells": 599,
         "applicable": 320,
         "selectable": 319,
-        "population": 584,
+        "population": 585,
         "population_candidate_selected": 319,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 265
+        "population_candidate_disabled": 266
       },
       "sabre": {
-        "cells": 598,
+        "cells": 599,
         "applicable": 478,
         "selectable": 239,
-        "population": 584,
+        "population": 585,
         "population_candidate_selected": 239,
         "population_candidate_not_selected": 234,
-        "population_candidate_disabled": 111
+        "population_candidate_disabled": 112
       }
     }
   },
@@ -1435,6 +1435,11 @@
     {"test_id":"c-programs/threadexhaustion","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/threadexhaustion","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
     {"test_id":"c-programs/threadexhaustion","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
+    {"test_id":"c-programs/threads-fd-churn","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately"},
+    {"test_id":"c-programs/threads-fd-churn","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"c-programs/threads-fd-churn","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/threads-fd-churn","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"c-programs/threads-fd-churn","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately"},
     {"test_id":"c-programs/timer-create-determinism","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/timer-create-determinism","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/timer-create-determinism","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

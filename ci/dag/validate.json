@@ -10554,6 +10554,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/threads-fd-churn",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/threads-fd-churn",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/timer-create-determinism",
           "mode": "verify",
           "backend": "dbt"
@@ -27079,6 +27093,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/threads-fd-churn",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/timer-create-determinism",
           "mode": "verify",
           "backend": "ptrace"
@@ -35006,6 +35027,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/threadexhaustion",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/threads-fd-churn",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -55852,6 +55880,20 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/threadexhaustion",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/threads-fd-churn",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/threads-fd-churn",
           "mode": "verify",
           "backend": "ptrace"
         },

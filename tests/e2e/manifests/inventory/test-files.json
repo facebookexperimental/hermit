@@ -2450,6 +2450,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/threads_fd_churn.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true)",
+      "why": "tests/c/threads_fd_churn.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true): threads that share one descriptor table keep their descriptors while another thread churns it (a cross-thread pipe EOF, an epoll registration modified and deleted after the table is republished, a dup3 seen across threads), for KVM's copy-only-changed-entries file table (https://github.com/rrnewton/hermit/issues/4287); verify cells on ptrace and KVM, other backends to ratchet against the ptrace reference"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/timer_create_determinism.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/timer_create_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
