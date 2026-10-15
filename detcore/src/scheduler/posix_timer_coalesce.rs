@@ -573,7 +573,8 @@ impl Scheduler {
     /// The single-target wake of a kept send of `signal` into `queue` that
     /// needs no physical send (4262 design §4.13, rev 7 F): a timer entry
     /// appended behind a stale head, or a stale entry refreshed in place.
-    /// The caller of an unignore (`preferred`) is running, so it is not woken.
+    /// The thread whose message caused it (an unignore's caller) is running,
+    /// so it is not woken (`signal_control_caller`).
     pub(super) fn wake_for_entry(&mut self, queue: QueueId, signal: Signal, preferred: DetTid) {
         let target = match queue {
             QueueId::Thread(thread) => Some(thread),
@@ -591,7 +592,7 @@ impl Scheduler {
         {
             self.note_signal_left_in_shared_queue(process, signal as libc::c_int);
         }
-        if self.holds_serial_grant(target) {
+        if self.signal_control_caller == Some(target) {
             return;
         }
         self.wake_signaled_guest_as(target, signal, false);
@@ -1018,9 +1019,10 @@ impl Scheduler {
     }
 
     /// `timer_gettime`'s remaining time of `process`'s timer `timer` at `now`
-    /// (4262 design §5), or `None` where the legacy answer stands (record and
-    /// replay). An Active timer past its deadline, whose pop waits for a turn
-    /// boundary, reads 1 ns (`common_timer_get` of an armed hrtimer); one
+    /// (4262 design §5), or `None` where the caller's own answer stands
+    /// (record and replay, or a timer the scheduler does not know). An Active
+    /// timer past its deadline, whose pop waits for a turn boundary, reads
+    /// 1 ns (`common_timer_get` of an armed hrtimer); one
     /// waiting for the dequeue of its entry reads the time to its next grid
     /// point, a full interval on an exact hit (`timer_forward`); a popped
     /// one-shot or a disarmed timer reads 0.
@@ -1030,7 +1032,9 @@ impl Scheduler {
         timer: i32,
         now: LogicalTime,
     ) -> Option<LogicalTime> {
-        if !self.coalesces_alarms() {
+        // A timer the scheduler never registered (a real-time one in a
+        // permissive run) keeps the caller's own answer.
+        if !self.coalesces_alarms() || !self.posix_timer_live(process, timer) {
             return None;
         }
         let id = SignalTimerId::Posix(process, timer);

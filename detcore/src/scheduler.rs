@@ -1681,6 +1681,11 @@ pub struct Scheduler {
     /// copies them, and exec resets them, as Linux does with the actions.
     handler_masks: BTreeMap<(DetPid, i32), (u64, bool)>,
 
+    /// The guest thread whose discarded-at-send message is being answered
+    /// (`discarded_signal_control`), which runs rather than waits: a send it
+    /// causes to itself wakes nothing (`send_guest_signal`).
+    signal_control_caller: Option<DetTid>,
+
     /// For the duration of a promotion sent at a delivery stop, the receiving
     /// thread and the mask its handler frame leaves it with
     /// (`thread_signal_mask`, 4262 design §4.5).
@@ -3910,6 +3915,7 @@ impl Scheduler {
             pending_timer_dequeues: Default::default(),
             handler_masks: Default::default(),
             delivery_mask_override: None,
+            signal_control_caller: None,
             saved_guest_sigmasks: Default::default(),
             pending_real_time_expirations: Default::default(),
             sending_child_exit: None,
@@ -9194,6 +9200,12 @@ impl Scheduler {
             );
         }
         self.guest_send_landed = Some(true);
+        // The thread whose own message caused this send (a promotion at its
+        // delivery stop or take, an exec re-send) is running, not parked: it
+        // meets the signal when it resumes.
+        if self.signal_control_caller == Some(dettid) {
+            return;
+        }
         self.wake_signaled_guest_as(dettid, signal, discarded);
     }
 

@@ -31792,6 +31792,18 @@ fn exec_discards_a_posix_timers_pending_signal_at_bitwise_parity() {
             "shared_sfd_no_timer",
             "shared_sfd_no_timer pending_after_exec=1 hits=1\n",
         ),
+        // Refused by name until https://github.com/rrnewton/hermit/issues/4262,
+        // which sends each timer copy with `SI_TIMER` so the kernel's own exec
+        // flush removes it: native, 5 runs each, 2026-10-15.
+        ("sfd_process", "sfd_process pending_after_exec=0 hits=0\n"),
+        ("sfd_thread", "sfd_thread pending_after_exec=1 hits=1\n"),
+        ("cont_flush", "cont_flush pending_after_exec=1 hits=1\n"),
+        ("stw_other", "stw_other pending_after_exec=0 hits=0\n"),
+        (
+            "cont_flush_process",
+            "cont_flush_process pending_after_exec=1 hits=1\n",
+        ),
+        ("shared_sfd", "shared_sfd pending_after_exec=1 hits=1\n"),
     ];
     for (mode, expected) in cases {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -31827,81 +31839,6 @@ fn exec_discards_a_posix_timers_pending_signal_at_bitwise_parity() {
             serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
                 .expect("the verdict must be JSON");
         assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
-    }
-}
-
-/// A timer's copy whose consumption could have gone unseen cannot be told,
-/// at exec, from another sender's copy of the same signal, so an exec with
-/// that signal pending is refused by name
-/// (https://github.com/rrnewton/hermit/issues/4184): a `SIGEV_SIGNAL` copy
-/// under an open signalfd (native discards it: `pending_after_exec=0
-/// hits=0`); a `SIGEV_THREAD_ID` copy a signalfd opened later read, then the
-/// thread's own tgkill copy, and a `SIGEV_THREAD_ID` SIGTSTP copy the
-/// process's SIGCONT flushed, then its own tgkill SIGTSTP (native keeps the
-/// tgkill copy: `pending_after_exec=1 hits=1`; the last two from the Claude
-/// review of https://github.com/rrnewton/hermit/pull/4203); and a
-/// `SIGEV_THREAD_ID` SIGUSR2 copy left pending by a sigtimedwait for SIGUSR1
-/// or SIGUSR2 that took the thread's own SIGUSR1 (native discards it); and a
-/// `SIGEV_SIGNAL` SIGTSTP copy the process's SIGCONT flushed, then its own
-/// kill(SIGTSTP) (native keeps the kill copy; Claude re-check of
-/// https://github.com/rrnewton/hermit/pull/4203); and a `SIGEV_SIGNAL` copy
-/// read through a signalfd a child re-pointed to its signal (a shared open
-/// description), then the process's own kill copy (native keeps it; Codex
-/// review). 5 native runs each.
-#[test]
-fn an_exec_with_an_unprovable_timer_copy_pending_is_refused_by_name() {
-    let guest = timer_exec_flush_guest().to_str().unwrap().to_owned();
-    for (mode, reason) in [
-        (
-            "sfd_process",
-            "a SIGEV_SIGNAL timer's copy of it may have been taken unobserved",
-        ),
-        (
-            "sfd_thread",
-            "a SIGEV_THREAD_ID timer's copy of it may have been taken unobserved",
-        ),
-        (
-            "cont_flush",
-            "a SIGEV_THREAD_ID timer's copy of it may have been taken unobserved",
-        ),
-        (
-            "stw_other",
-            "a SIGEV_THREAD_ID timer's copy of it may have been taken unobserved",
-        ),
-        (
-            "cont_flush_process",
-            "a SIGEV_SIGNAL timer's copy of it may have been taken unobserved",
-        ),
-        (
-            "shared_sfd",
-            "a SIGEV_SIGNAL timer's copy of it may have been taken unobserved",
-        ),
-    ] {
-        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-        let (status, log) = run_with_deadline(
-            hermit_command(&[
-                "run",
-                "--strict",
-                "--timeout",
-                "60",
-                "--",
-                guest.as_str(),
-                mode,
-            ]),
-            directory.path(),
-            Duration::from_secs(180),
-            false,
-        );
-        assert_eq!(
-            status.and_then(|status| status.code()),
-            Some(HERMIT_POLICY_REFUSAL_EXIT),
-            "{mode}: {log}"
-        );
-        assert!(
-            log.contains("exec'd with a POSIX timer's signal possibly pending")
-                && log.contains(reason),
-            "{mode}: {log}"
-        );
     }
 }
 
@@ -32556,48 +32493,74 @@ fn a_worker_exit_code_ends_a_process_whose_leader_called_pthread_exit() {
 /// A `SIGEV_THREAD_ID` expiration of a standard signal already pending on its
 /// thread from another source (a tgkill, or another timer) is one Linux
 /// queues beside the pending copy, so the thread takes the signal twice
-/// (native: `hits=2`, 5 runs each); a send from the scheduler would merge into
-/// the pending copy, so the run is refused by name instead
 /// (https://github.com/rrnewton/hermit/issues/4164,
-/// https://github.com/rrnewton/hermit/issues/4157). Before the refusal, both
-/// modes printed `hits=1`. The last three put the second copy there after the
-/// thread had taken the timer's first one (native `hits=3`): its own tgkill,
-/// another thread's tgkill, a pidfd thread-scope send. A record of the timer's
-/// copy that outlived the delivery made them an overrun (`hits=2`). The next
-/// four take the timer's copy away without a delivery (an ignore flush with
-/// SIG_IGN, also when rt_sigaction then fails writing the old action, or
-/// SIG_DFL on SIGURG, or a zero-timeout sigtimedwait) before the thread sends
-/// its own (native `hits=2`). `cont_flush` and `tstp_flush` time a job-control
-/// signal, which SIGCONT and the stop signals flush from any sender (native
-/// `hits=3` and `hits=2`). `signalfd_overrun` is refused
-/// because a signalfd's reads are not observed, where Linux counts an overrun
-/// (native `hits=1`).
+/// https://github.com/rrnewton/hermit/issues/4157). Until
+/// https://github.com/rrnewton/hermit/issues/4262 a send from the scheduler
+/// merged into the pending copy, and every mode below was refused by name;
+/// now the timer's entry waits behind the pending copy and is sent when that
+/// copy is dequeued. Each mode is strict-verified at bitwise parity and must
+/// print what Linux printed (5 native runs of each, identical, 2026-10-15):
+/// the timer beside the thread's own tgkill or another timer's copy
+/// (`hits=2`); the second copy put there after the thread took the timer's
+/// first one, by its own tgkill, another thread's, or a pidfd thread-scope
+/// send (`hits=3`); the timer's copy taken away without a delivery (an ignore
+/// flush with SIG_IGN, also when rt_sigaction then fails writing the old
+/// action, or SIG_DFL on SIGURG, or a zero-timeout sigtimedwait) before the
+/// thread sends its own (`hits=2`); and a signalfd that reads the timer's
+/// copy, where Linux counts an overrun (`hits=1`). `cont_flush` and
+/// `tstp_flush` time a job-control signal, which SIGCONT and the stop signals
+/// flush from any sender, so their timer entries are not followed and they
+/// stay refused by name (native `hits=3` and `hits=2`).
 #[test]
-fn a_sigev_thread_id_expiration_beside_a_pending_copy_is_refused_by_name() {
+fn a_sigev_thread_id_expiration_beside_a_pending_copy_is_delivered_as_on_linux() {
     let guest = timer_sigev_thread_id_guest().to_str().unwrap().to_owned();
-    for (mode, source) in [
-        ("coalesce_self", "(not sent by this timer)"),
-        ("two_timers_self", "(sent by another timer"),
-        ("raise_rearm", "(not sent by this timer)"),
-        ("tgkill_cross", "(not sent by this timer)"),
-        ("pidfd_leader", "(not sent by this timer)"),
-        ("ign_flush", "(not sent by this timer)"),
-        ("ign_flush_efault", "(not sent by this timer)"),
-        ("dfl_flush", "(not sent by this timer)"),
-        ("stw_zero", "(not sent by this timer)"),
-        (
-            "cont_flush",
-            "(a job-control signal, which any sender's SIGCONT or stop signal may have flushed unobserved)",
-        ),
-        (
-            "tstp_flush",
-            "(a job-control signal, which any sender's SIGCONT or stop signal may have flushed unobserved)",
-        ),
-        (
-            "signalfd_overrun",
-            "(a signalfd or an rt_sigtimedwait of the thread may have taken this timer's copy unobserved)",
-        ),
+    for (mode, expected) in [
+        ("coalesce_self", "coalesce_self hits=2\n"),
+        ("two_timers_self", "two_timers_self hits=2\n"),
+        ("raise_rearm", "raise_rearm first=1 hits=3\n"),
+        ("tgkill_cross", "tgkill_cross first=1 hits=3\n"),
+        ("pidfd_leader", "pidfd_leader first=1 hits=3\n"),
+        ("ign_flush", "ign_flush hits=2\n"),
+        ("ign_flush_efault", "ign_flush_efault rc=EFAULT hits=2\n"),
+        ("dfl_flush", "dfl_flush hits=2\n"),
+        ("stw_zero", "stw_zero hits=2\n"),
+        ("signalfd_overrun", "signalfd_overrun hits=1\n"),
     ] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "--log=info",
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                verdict.to_str().unwrap(),
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{mode}: stderr:\n{log}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+                .expect("the verdict must be JSON");
+        assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
+    }
+    for (mode, pending) in [("cont_flush", "SIGTSTP"), ("tstp_flush", "SIGCONT")] {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let (status, log) = run_with_deadline(
             hermit_command(&[
@@ -32620,16 +32583,10 @@ fn a_sigev_thread_id_expiration_beside_a_pending_copy_is_refused_by_name() {
         );
         assert!(
             log.contains("a SIGEV_THREAD_ID timer of process")
-                && log.contains(&format!(
-                    "while signal {} was already pending there",
-                    match mode {
-                        "dfl_flush" => "SIGURG",
-                        "cont_flush" => "SIGTSTP",
-                        "tstp_flush" => "SIGCONT",
-                        _ => "SIGUSR1",
-                    }
-                ))
-                && log.contains(source),
+                && log.contains(&format!("while signal {pending} was already pending there"))
+                && log.contains(
+                    "(a job-control signal, which any sender's SIGCONT or stop signal may have flushed unobserved)"
+                ),
             "{mode}: {log}"
         );
     }

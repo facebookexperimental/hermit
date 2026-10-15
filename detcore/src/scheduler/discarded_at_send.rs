@@ -1325,6 +1325,17 @@ impl Scheduler {
         dtid: DetTid,
         control: DiscardedSignalControl,
     ) -> DiscardedSignalAnswer {
+        self.signal_control_caller = Some(dtid);
+        let answer = self.answer_discarded_signal_control(dtid, control);
+        self.signal_control_caller = None;
+        answer
+    }
+
+    fn answer_discarded_signal_control(
+        &mut self,
+        dtid: DetTid,
+        control: DiscardedSignalControl,
+    ) -> DiscardedSignalAnswer {
         let process = self.thread_tree.process_of(dtid).unwrap_or(dtid);
         match control {
             DiscardedSignalControl::ClaimItimerReal => {
