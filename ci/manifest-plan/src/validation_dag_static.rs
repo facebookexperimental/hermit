@@ -1606,7 +1606,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And ptrace_completion::tests::a_forked_child_launches_on_a_tracer_thread_of_its_own
     // and a_forked_child_cannot_resume_its_parents_operation (Claude review of
     // the tracer thread): 1125, listed.
-    ("test.hermit_unit", 1125),
+    // And record_version_rejects_streams_from_before_sendfile_records_its_copy,
+    // recorder::fs::tests::mapping_permissions_follow_the_read_and_write_bits and
+    // recorder::fs::tests::only_kcmp_answers_decide_whether_descriptions_are_shared
+    // (https://github.com/rrnewton/hermit/issues/4416): 1128.
+    ("test.hermit_unit", 1128),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2846,7 +2850,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // shared_own_getters_preserve_record_replay_stream retains the prior
     // record/replay selection: 212 nonignored tests, freshly listed.
     // And +1 from 3717a6b7: 212.
-    ("test.record_replay", 212),
+    // And record_replay_copies_with_sendfile, a_run_copies_with_sendfile,
+    // record_sendfile_overlapping_its_input_keeps_the_bytes_it_wrote,
+    // record_sendfile_into_its_own_file_meets_the_file_size_limit and
+    // record_sendfile_without_kcmp
+    // (https://github.com/rrnewton/hermit/issues/4416): 217.
+    ("test.record_replay", 217),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -4336,7 +4345,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 1121, listed.
     // And the two tracer-thread tests: 1123.
     // And the two fork tests: 1125.
-    ("test.hermit_unit_on_host", 1125),
+    // And record_version_rejects_streams_from_before_sendfile_records_its_copy,
+    // recorder::fs::tests::mapping_permissions_follow_the_read_and_write_bits and
+    // recorder::fs::tests::only_kcmp_answers_decide_whether_descriptions_are_shared
+    // (https://github.com/rrnewton/hermit/issues/4416): 1128.
+    ("test.hermit_unit_on_host", 1128),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

@@ -1849,6 +1849,12 @@
       "why": "tests/c/record_replay_select.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this workload and checks that select and pselect6 replay the recorded result, fd sets, and remaining timeout for ready pipes, timeouts, partial copy-out, and invalid nfds."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_sendfile.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_sendfile.c is owned by hermit-cli/tests/record_replay.rs: record_replay_copies_with_sendfile records and replays sendfile copies from a pre-existing and a guest-made file, at the input position and at an offset argument, into a file and into stdout, and the read/write fallback for a pipe input under record start --verify --verify-strict, record_sendfile_overlapping_its_input_keeps_the_bytes_it_wrote checks the bytes recorded for copies that overwrite their own input, record_sendfile_into_its_own_file_meets_the_file_size_limit checks a self-feeding copy that reaches a file-size limit, record_sendfile_without_kcmp repeats read-only-offset cases with kcmp denied, and a_run_copies_with_sendfile requires hermit run --strict to copy with sendfile (https://github.com/rrnewton/hermit/issues/4416); a generic manifest cannot check the replay verdict."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/record_replay_setsockopt.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

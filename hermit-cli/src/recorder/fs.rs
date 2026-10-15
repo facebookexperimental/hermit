@@ -10,10 +10,12 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::Stack;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Ftruncate;
@@ -26,6 +28,7 @@ use reverie::syscalls::Pread64;
 use reverie::syscalls::Read;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Readlink;
+use reverie::syscalls::Sendfile;
 use reverie::syscalls::Statx;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::family::StatFamily;
@@ -39,6 +42,7 @@ use crate::event::FileExtent;
 use crate::event::FtruncateEvent;
 use crate::event::ReadEvent;
 use crate::event::ReplayFdKind;
+use crate::event::SendfileEvent;
 use crate::event::StatEvent;
 use crate::event::SyscallEvent;
 use crate::event::WriteEvent;
@@ -108,11 +112,39 @@ fn consumed_sigpipe_count(pid: libc::pid_t, fd: libc::c_int, bytes: &[u8]) -> u6
         .expect("SIGPIPE signalfd record count overflow")
 }
 
-fn write_advances_output_offset(syscall: WriteFamily) -> bool {
-    match syscall {
-        WriteFamily::Write(_) | WriteFamily::Writev(_) => true,
-        WriteFamily::Pwritev2(call) => vectored_offset(call.pos_l(), call.pos_h()) == -1,
-        WriteFamily::Pwrite64(_) | WriteFamily::Pwritev(_) => false,
+/// Where a write puts its bytes in a regular file.
+#[derive(Clone, Copy, Debug)]
+enum WritePlacement {
+    /// At the descriptor's position, which the write advances: write, writev,
+    /// and sendfile's output.
+    Position,
+    /// At an explicit offset, leaving the position: pwrite64 and pwritev.
+    Explicit(i64),
+    /// pwritev2: at an explicit offset unless it is -1, with its flags.
+    Pwritev2 { offset: i64, flags: libc::c_int },
+}
+
+impl WritePlacement {
+    fn of(syscall: WriteFamily) -> Self {
+        match syscall {
+            WriteFamily::Write(_) | WriteFamily::Writev(_) => Self::Position,
+            WriteFamily::Pwrite64(call) => Self::Explicit(call.offset()),
+            WriteFamily::Pwritev(call) => {
+                Self::Explicit(vectored_offset(call.pos_l(), call.pos_h()))
+            }
+            WriteFamily::Pwritev2(call) => Self::Pwritev2 {
+                offset: vectored_offset(call.pos_l(), call.pos_h()),
+                flags: call.flags(),
+            },
+        }
+    }
+}
+
+fn write_advances_output_offset(placement: WritePlacement) -> bool {
+    match placement {
+        WritePlacement::Position => true,
+        WritePlacement::Pwritev2 { offset, .. } => offset == -1,
+        WritePlacement::Explicit(_) => false,
     }
 }
 
@@ -139,7 +171,8 @@ fn shares_open_file_description(left: libc::c_int, right: libc::c_int) -> bool {
 
 fn output_file_offset(
     pid: libc::pid_t,
-    syscall: WriteFamily,
+    fd: libc::c_int,
+    placement: WritePlacement,
     metadata: &std::fs::Metadata,
     count: i64,
 ) -> Option<i64> {
@@ -147,7 +180,7 @@ fn output_file_offset(
         return None;
     }
 
-    let fdinfo = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{}", syscall.fd())).ok()?;
+    let fdinfo = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
     let position = fdinfo
         .lines()
         .find_map(|line| line.strip_prefix("pos:\t"))
@@ -157,25 +190,358 @@ fn output_file_offset(
         .find_map(|line| line.strip_prefix("flags:\t"))
         .and_then(|value| i32::from_str_radix(value, 8).ok())
         .unwrap_or_default();
-    let write_flags = match syscall {
-        WriteFamily::Pwritev2(call) => call.flags(),
+    let write_flags = match placement {
+        WritePlacement::Pwritev2 { flags, .. } => flags,
         _ => 0,
     };
     if uses_append_offset(status_flags, write_flags) {
         return i64::try_from(metadata.len()).ok()?.checked_sub(count);
     }
 
-    match syscall {
-        WriteFamily::Pwrite64(call) => Some(call.offset()),
-        WriteFamily::Pwritev(call) => Some(vectored_offset(call.pos_l(), call.pos_h())),
-        WriteFamily::Pwritev2(call) => {
-            let offset = vectored_offset(call.pos_l(), call.pos_h());
-            (offset != -1)
-                .then_some(offset)
-                .or_else(|| position.checked_sub(count))
-        }
-        WriteFamily::Write(_) | WriteFamily::Writev(_) => position.checked_sub(count),
+    match placement {
+        WritePlacement::Explicit(offset) => Some(offset),
+        WritePlacement::Pwritev2 { offset, .. } => (offset != -1)
+            .then_some(offset)
+            .or_else(|| position.checked_sub(count)),
+        WritePlacement::Position => position.checked_sub(count),
     }
+}
+
+/// Whether a user access can read and write `address`, by the mapping of a
+/// `/proc/<pid>/maps` listing that holds it: `(readable, writable)`, where on
+/// x86 a writable mapping is also readable. `None` if no mapping holds it.
+fn mapping_permissions(maps: &str, address: usize) -> Option<(bool, bool)> {
+    maps.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let (range, perms) = (fields.next()?, fields.next()?.as_bytes());
+        let (start, end) = range.split_once('-')?;
+        let (start, end) = (
+            usize::from_str_radix(start, 16).ok()?,
+            usize::from_str_radix(end, 16).ok()?,
+        );
+        let writable = perms.get(1) == Some(&b'w');
+        (start..end)
+            .contains(&address)
+            .then_some((perms.first() == Some(&b'r') || writable, writable))
+    })
+}
+
+/// The file-size limits (RLIMIT_FSIZE, soft) of the guest process `pid` and
+/// of the recorder, in that order, `None` meaning unlimited; `None` overall
+/// if either cannot be read.
+fn file_size_limits(pid: reverie::Pid) -> Option<(Option<u64>, Option<u64>)> {
+    let mut own = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `own` is a valid rlimit for getrlimit to fill.
+    if unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut own) } != 0 {
+        return None;
+    }
+    let recorder = (own.rlim_cur != libc::RLIM_INFINITY).then_some(own.rlim_cur);
+    let limits = std::fs::read_to_string(format!("/proc/{}/limits", pid.as_raw())).ok()?;
+    let guest = limits.lines().find_map(|line| {
+        match line
+            .strip_prefix("Max file size")?
+            .split_whitespace()
+            .next()?
+        {
+            "unlimited" => Some(None),
+            limit => limit.parse::<u64>().ok().map(Some),
+        }
+    })?;
+    Some((guest, recorder))
+}
+
+/// Whether a write ending at byte `end` stays within both the guest process
+/// `pid`'s file-size limit and the recorder's, so that neither process can
+/// reach EFBIG or SIGXFSZ and a write the recorder makes for the guest has the
+/// guest's outcome.
+fn within_file_size_limits(pid: reverie::Pid, end: u64) -> bool {
+    file_size_limits(pid).is_some_and(|(guest, recorder)| {
+        guest.is_none_or(|limit| end <= limit) && recorder.is_none_or(|limit| end <= limit)
+    })
+}
+
+/// What `kcmp(KCMP_FILE)` says of a call's input and output descriptors.
+#[derive(Debug, PartialEq, Eq)]
+enum Descriptions {
+    /// Two open file descriptions (kcmp orders them: 1 or 2).
+    Distinct,
+    /// One open file description (kcmp: 0).
+    Shared,
+    /// kcmp failed (-1: a kernel without it, or no access) and the two name
+    /// one file, so either may be true and neither may be assumed.
+    Unknown,
+}
+
+impl Descriptions {
+    /// From kcmp's answer `order` and, for when kcmp fails, whether the two
+    /// descriptors name the same file (`same_file`, by device and inode;
+    /// `None` if that could not be read): two files are two descriptions.
+    fn of(order: libc::c_long, same_file: Option<bool>) -> Self {
+        match (order, same_file) {
+            (0, _) => Self::Shared,
+            (1 | 2, _) | (_, Some(false)) => Self::Distinct,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Whether a copy of at most `count` bytes, written at the position of the
+/// file `output` describes, ends within both file-size limits
+/// (`within_file_size_limits`). `count` is the only bound: with input and
+/// output one file, Linux reads back what the copy has just written and goes
+/// on until `count` is used up, past the file's old end.
+fn recorder_copy_fits(
+    pid: reverie::Pid,
+    output: &std::os::fd::OwnedFd,
+    count: usize,
+) -> Option<bool> {
+    // SAFETY: `output` owns its descriptor; SEEK_CUR by 0 only reads the
+    // position, where the copy writes.
+    let at = u64::try_from(unsafe { libc::lseek(output.as_raw_fd(), 0, libc::SEEK_CUR) }).ok()?;
+    Some(within_file_size_limits(pid, at.checked_add(count as u64)?))
+}
+
+/// `sendfile(output, input, &position, count)` made by the recorder on its
+/// duplicates of the guest's two descriptors, so on the guest's own open file
+/// descriptions, shared or not: the kernel makes the guest's copy. SIGXFSZ is
+/// blocked on this thread for the call; whether the kernel raised one (at the
+/// recorder's file-size limit) is returned beside the result, and the signal
+/// is consumed.
+fn recorder_sendfile(
+    output: &std::os::fd::OwnedFd,
+    input: &std::os::fd::OwnedFd,
+    mut position: libc::loff_t,
+    count: usize,
+) -> (Result<i64, Errno>, bool) {
+    // SAFETY: sigset operations on locals; pthread_sigmask changes only this
+    // thread's mask, restored below; sendfile reads and updates `position`;
+    // sigtimedwait with a zero timeout only takes a pending SIGXFSZ.
+    unsafe {
+        let mut xfsz: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut xfsz);
+        libc::sigaddset(&mut xfsz, libc::SIGXFSZ);
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &xfsz, &mut previous);
+        let copied = libc::sendfile(output.as_raw_fd(), input.as_raw_fd(), &mut position, count);
+        let result = if copied < 0 {
+            Err(Errno::last())
+        } else {
+            Ok(copied as i64)
+        };
+        let now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let raised = libc::sigtimedwait(&xfsz, std::ptr::null_mut(), &now) == libc::SIGXFSZ;
+        libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        (result, raised)
+    }
+}
+
+/// Runs `syscall`, whose offset argument holds `position` but is read-only,
+/// so that it copies from `position` as Linux does without writing through
+/// that argument.
+///
+/// - Two open file descriptions (`Descriptions::Distinct`): the input's
+///   position is moved to `position` through the recorder's own descriptor,
+///   the call runs with no offset argument, and the position is put back, so
+///   the input's position is unchanged, as the offset form leaves it. The
+///   guest makes the call; no guest memory is needed.
+/// - A regular-file output otherwise (one description, or kcmp could not
+///   tell): the recorder makes the call itself on duplicates of both
+///   descriptors (`recorder_sendfile`), when the copy cannot reach either
+///   file-size limit (`recorder_copy_fits`). SIGPIPE cannot arise for a
+///   regular file.
+/// - Otherwise: the offset goes in a scratch slot below the guest's stack and
+///   the guest makes the call itself, meeting its own file-size limit.
+///
+/// With no room below the stack for that slot, a regular-file output is
+/// copied by the recorder when its file-size limit is the guest's
+/// (`copy_under_the_guests_limit`); anything else fails with EFAULT, as
+/// Linux's call does, but without the copy Linux would have made.
+async fn copy_at_offset<G: Guest<Recorder>>(
+    guest: &mut G,
+    pid: reverie::Pid,
+    task: reverie::Pid,
+    syscall: Sendfile,
+    position: libc::loff_t,
+) -> Result<Result<i64, Errno>, Errno> {
+    // SAFETY: kcmp only compares two of the task's descriptors.
+    let order = unsafe {
+        libc::syscall(
+            libc::SYS_kcmp,
+            task.as_raw(),
+            task.as_raw(),
+            0, // KCMP_FILE
+            libc::c_long::from(syscall.in_fd()),
+            libc::c_long::from(syscall.out_fd()),
+        )
+    };
+    let metadata =
+        |fd: libc::c_int| std::fs::metadata(format!("/proc/{}/fd/{fd}", task.as_raw())).ok();
+    let (input_file, output_file) = (metadata(syscall.in_fd()), metadata(syscall.out_fd()));
+    let same_file = input_file
+        .as_ref()
+        .zip(output_file.as_ref())
+        .map(|(input, output)| (input.dev(), input.ino()) == (output.dev(), output.ino()));
+    let descriptions = Descriptions::of(order, same_file);
+    let input = crate::fd::duplicate_guest_thread_fd(pid, task, syscall.in_fd()).ok();
+    if descriptions == Descriptions::Distinct
+        && let Some(input) = &input
+    {
+        // SAFETY: `input` owns its descriptor; these only move the shared
+        // position, which is put back below.
+        let saved = unsafe { libc::lseek(input.as_raw_fd(), 0, libc::SEEK_CUR) };
+        if saved >= 0 && unsafe { libc::lseek(input.as_raw_fd(), position, libc::SEEK_SET) } >= 0 {
+            let result = guest
+                .inject(Syscall::Sendfile(syscall.with_offset(None)))
+                .await;
+            // SAFETY: as above.
+            unsafe { libc::lseek(input.as_raw_fd(), saved, libc::SEEK_SET) };
+            return Ok(result);
+        }
+    }
+    // The recorder's own call needs both descriptors and a regular-file
+    // output: the call runs in the recorder's process, where SIGPIPE cannot
+    // arise for a regular file and the file-size limit is the recorder's.
+    let pair = input
+        .filter(|_| {
+            output_file
+                .as_ref()
+                .is_some_and(|output| output.file_type().is_file())
+        })
+        .zip(crate::fd::duplicate_guest_thread_fd(pid, task, syscall.out_fd()).ok());
+    if let Some((input, output)) = &pair
+        && recorder_copy_fits(pid, output, syscall.count()).unwrap_or(false)
+    {
+        return Ok(recorder_sendfile(output, input, position, syscall.count()).0);
+    }
+    let mut stack = guest.stack().await;
+    let scratch = stack.reserve::<libc::loff_t>();
+    let placed = stack.commit().and_then(|guard| {
+        guest
+            .memory()
+            .write_value(scratch, &position)
+            .map(|()| guard)
+    });
+    match (placed, pair) {
+        (Ok(_guard), _) => Ok(guest
+            .inject(Syscall::Sendfile(syscall.with_offset(Some(scratch))))
+            .await),
+        (Err(_), Some((input, output))) => {
+            copy_under_the_guests_limit(guest, pid, syscall, &input, &output, position).await
+        }
+        // Linux would copy and then return EFAULT; this copy cannot be made,
+        // so the call returns EFAULT without it (a disclosed difference).
+        (Err(_), None) => Err(Errno::EFAULT),
+    }
+}
+
+/// For a regular-file output whose copy could reach a file-size limit, on a
+/// stack with no room for a scratch offset: what Linux does, without guest
+/// memory, when the recorder's file-size limit is the guest's. The recorder
+/// makes the whole call on its duplicates (`recorder_sendfile`): the kernel
+/// validates it as it would the guest's, and copies up to the shared limit.
+/// If its next write met the limit, the kernel raised SIGXFSZ in the recorder
+/// instead of the guest; the recorder then has the guest write one byte at
+/// the limit (pwrite64, whose buffer is never read), so the kernel raises the
+/// guest's own SIGXFSZ, with the native signal information, and refuses the
+/// write (EFBIG). Different limits cannot be copied this way: EFAULT without
+/// the copy.
+async fn copy_under_the_guests_limit<G: Guest<Recorder>>(
+    guest: &mut G,
+    pid: reverie::Pid,
+    syscall: Sendfile,
+    input: &std::os::fd::OwnedFd,
+    output: &std::os::fd::OwnedFd,
+    position: libc::loff_t,
+) -> Result<Result<i64, Errno>, Errno> {
+    let (guest_limit, recorder_limit) = file_size_limits(pid).ok_or(Errno::EFAULT)?;
+    if guest_limit != recorder_limit {
+        return Err(Errno::EFAULT);
+    }
+    let (result, raised) = recorder_sendfile(output, input, position, syscall.count());
+    if raised && let Some(limit) = guest_limit.and_then(|limit| libc::off_t::try_from(limit).ok()) {
+        let buffer = syscall
+            .offset()
+            .and_then(|offset| reverie::syscalls::Addr::from_raw(offset.as_raw()));
+        // The write's own result (EFBIG) is not the guest's; its signal is.
+        let _ = guest
+            .inject(Syscall::Pwrite64(
+                reverie::syscalls::Pwrite64::new()
+                    .with_fd(syscall.out_fd())
+                    .with_buf(buffer)
+                    .with_len(1)
+                    .with_offset(limit),
+            ))
+            .await;
+    }
+    Ok(result)
+}
+
+/// Where in the input `handle_sendfile` reads back the bytes a copy wrote.
+enum SendfileStart {
+    /// At the offset the write side records for the output, which is the
+    /// same file as the input, so the copy may have overwritten its input.
+    Output,
+    /// At this offset, if the guest's offset argument was readable (when it
+    /// was not, the kernel fails the copy with EFAULT).
+    Input(Option<i64>),
+}
+
+/// The input descriptor `handle_sendfile` reads the copied bytes back from,
+/// and where, decided before the copy. Linux requires the input to be
+/// readable, while the output may be write-only (`cp`, Python's
+/// `shutil.copyfile`), so the bytes are always read through the input. When
+/// the output is the same file, the copy may have overwritten its own input
+/// (overlapping ranges), so they are read where they landed, at the output's
+/// write offset; any other output cannot have changed the input, so they are
+/// read where the copy began.
+///
+/// `None` when either descriptor is not open in task `task`'s table, so the
+/// kernel fails the copy with EBADF. An input without a position, which
+/// cannot be read back, is refused with EINVAL; Linux 7.1 refuses pipe, socket
+/// and procfs inputs itself, and Detcore refuses any input it does not type as
+/// a regular file or memfd (ENOSYS), so this is for a kernel that accepts one.
+/// Callers handle either error by falling back to read and write, which record
+/// their bytes. `offset` is the guest's offset argument, if it passed one,
+/// with the value it held if readable.
+fn sendfile_source(
+    pid: reverie::Pid,
+    task: reverie::Pid,
+    syscall: Sendfile,
+    offset: Option<Option<i64>>,
+) -> Result<Option<(std::fs::File, SendfileStart)>, Errno> {
+    let metadata = |fd: libc::c_int| std::fs::metadata(format!("/proc/{}/fd/{fd}", task.as_raw()));
+    let (Ok(input), Ok(output)) = (metadata(syscall.in_fd()), metadata(syscall.out_fd())) else {
+        return Ok(None);
+    };
+    let same_file = output.file_type().is_file()
+        && input.file_type().is_file()
+        && (input.dev(), input.ino()) == (output.dev(), output.ino());
+    let file = crate::fd::duplicate_guest_thread_fd(pid, task, syscall.in_fd())
+        .map(std::fs::File::from)
+        .map_err(|error| match error.raw_os_error() {
+            Some(libc::EBADF) => Errno::EBADF,
+            _ => Errno::EINVAL,
+        })?;
+    let start = match (same_file, offset) {
+        (true, _) => SendfileStart::Output,
+        (false, Some(offset)) => SendfileStart::Input(offset),
+        (false, None) => {
+            // SAFETY: `file` owns its descriptor; SEEK_CUR by 0 only reads
+            // the shared position.
+            let position = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR) };
+            if position < 0 {
+                return Err(Errno::EINVAL);
+            }
+            SendfileStart::Input(Some(position))
+        }
+    };
+    Ok(Some((file, start)))
 }
 
 const MAX_CLONE_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
@@ -548,26 +914,171 @@ impl Recorder {
         syscall: WriteFamily,
     ) -> Result<i64, Errno> {
         let result = guest.inject(Syscall::from(syscall)).await;
+        let pid = guest.pid();
+        let event = self.write_event(
+            &*guest,
+            pid,
+            pid,
+            syscall.fd(),
+            WritePlacement::of(syscall),
+            result,
+        );
+        self.record_event(guest, Ok(SyscallEvent::WriteV2(event)));
 
-        let metadata = std::fs::metadata(format!(
-            "/proc/{}/fd/{}",
-            guest.pid().as_raw(),
-            syscall.fd()
-        ))
-        .ok();
+        result
+    }
+
+    /// Runs `sendfile` and records what it copied, where its input stopped
+    /// and its output side, so replay applies the copy rather than running it
+    /// against its own descriptors, which for an input the guest did not create
+    /// are not that file (https://github.com/rrnewton/hermit/issues/4416).
+    ///
+    /// The copied bytes are read back through the input after the copy (see
+    /// `sendfile_source`). Whether that read is possible is decided before the
+    /// copy runs; a copy that cannot be recorded is refused rather than run.
+    pub(super) async fn handle_sendfile<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Sendfile,
+    ) -> Result<i64, Errno> {
+        let pid = guest.pid();
+        let task = guest.tid();
+        // The offset argument as Linux sees it: the recorder reads guest
+        // memory with debugger rights, which also reach a page the guest
+        // cannot read, so the mappings decide. `Some(None)` is an argument
+        // Linux cannot read: it fails the call with EFAULT before copying.
+        let permissions = syscall.offset().map(|address| {
+            let start = address.as_raw();
+            let end = start.saturating_add(std::mem::size_of::<libc::loff_t>() - 1);
+            std::fs::read_to_string(format!("/proc/{}/maps", pid.as_raw()))
+                .ok()
+                .and_then(|maps| {
+                    let (start, end) = (
+                        mapping_permissions(&maps, start)?,
+                        mapping_permissions(&maps, end)?,
+                    );
+                    Some((start.0 && end.0, start.1 && end.1))
+                })
+                .unwrap_or((false, false))
+        });
+        let offset = syscall.offset().map(|offset| {
+            permissions
+                .is_some_and(|(readable, _)| readable)
+                .then(|| guest.memory().read_value(offset).ok())
+                .flatten()
+        });
+        // Linux reads the offset argument, copies, then writes the final
+        // offset back through the guest's pointer and returns EFAULT if it
+        // cannot, whatever the copy returned. A readable but read-only
+        // argument therefore gets a real copy and EFAULT. Writing the final
+        // offset is the one step a recording cannot replay through that
+        // pointer, so the copy is run another way (`copy_at_offset`), its
+        // effects are recorded as usual, and the guest gets the EFAULT Linux
+        // gives.
+        let offset_fault =
+            matches!(offset, Some(Some(_))) && permissions.is_some_and(|(_, writable)| !writable);
+        let source = match sendfile_source(pid, task, syscall, offset) {
+            Ok(source) => source,
+            Err(error) => {
+                self.record_event(guest, Err(error));
+                return Err(error);
+            }
+        };
+        let result = match (offset_fault, offset.flatten()) {
+            (true, Some(position)) => {
+                match copy_at_offset(guest, pid, task, syscall, position).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.record_event(guest, Err(error));
+                        return Err(error);
+                    }
+                }
+            }
+            _ => guest.inject(Syscall::Sendfile(syscall)).await,
+        };
+        let write = self.write_event(
+            &*guest,
+            pid,
+            task,
+            syscall.out_fd(),
+            WritePlacement::Position,
+            result,
+        );
+        let bytes = match (result, source) {
+            (Ok(count), Some((file, start))) if count > 0 => {
+                let start = match start {
+                    SendfileStart::Output => write.replay_file_offset.or(write.output_offset),
+                    SendfileStart::Input(start) => start,
+                };
+                let mut bytes = vec![0; count as usize];
+                match start.and_then(|start| u64::try_from(start).ok()) {
+                    Some(start) => file
+                        .read_exact_at(&mut bytes, start)
+                        .map(|()| bytes)
+                        .map_err(|_| Errno::EIO),
+                    None => Err(Errno::EIO),
+                }
+            }
+            (Ok(count), None) if count > 0 => Err(Errno::EIO),
+            _ => Ok(Vec::new()),
+        };
+        // A copy that cannot be read back cannot be replayed; the guest sees
+        // the error replay will return. Only a file changed from outside the
+        // guest between the copy and the read gets here.
+        if let Err(error) = bytes {
+            self.record_event(guest, Err(error));
+            return Err(error);
+        }
+        let offset_after = match (result, syscall.offset()) {
+            (Ok(_), Some(offset)) if !offset_fault => guest.memory().read_value(offset).ok(),
+            _ => None,
+        };
+        self.record_event(
+            guest,
+            bytes.map(|bytes| {
+                SyscallEvent::Sendfile(SendfileEvent {
+                    bytes,
+                    offset_after,
+                    write,
+                    offset_fault,
+                })
+            }),
+        );
+
+        if offset_fault {
+            Err(Errno::EFAULT)
+        } else {
+            result
+        }
+    }
+
+    /// The output side of a write of `result` bytes to `fd` in the table of
+    /// task `task` of process `pid`, placed as `placement`: the captured
+    /// output it reaches, the regular-file offset replay writes at, and the
+    /// SIGPIPE the kernel generated.
+    fn write_event<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        pid: reverie::Pid,
+        task: reverie::Pid,
+        fd: libc::c_int,
+        placement: WritePlacement,
+        result: Result<i64, Errno>,
+    ) -> WriteEvent {
+        let metadata = std::fs::metadata(format!("/proc/{}/fd/{fd}", task.as_raw())).ok();
         let outputs = guest.thread_state().outputs;
         let (output_fd, shares_output_ofd) = metadata.as_ref().map_or((None, false), |metadata| {
             let (stdout_matches, stderr_matches) = outputs.matching(metadata);
             let candidate = (metadata.file_type().is_file() && (stdout_matches || stderr_matches))
-                .then(|| crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd()).ok())
+                .then(|| crate::fd::duplicate_guest_thread_fd(pid, task, fd).ok())
                 .flatten();
             let stdout_shares = stdout_matches
                 && candidate.as_ref().is_some_and(|candidate| {
-                    Self::output_ofd_matches(&*guest, libc::STDOUT_FILENO, candidate)
+                    Self::output_ofd_matches(guest, libc::STDOUT_FILENO, candidate)
                 });
             let stderr_shares = stderr_matches
                 && candidate.as_ref().is_some_and(|candidate| {
-                    Self::output_ofd_matches(&*guest, libc::STDERR_FILENO, candidate)
+                    Self::output_ofd_matches(guest, libc::STDERR_FILENO, candidate)
                 });
 
             if stdout_shares {
@@ -584,19 +1095,19 @@ impl Recorder {
         });
         let file_offset = match (result, metadata.as_ref()) {
             (Ok(count), Some(metadata)) => {
-                output_file_offset(guest.pid().as_raw(), syscall, metadata, count)
+                output_file_offset(task.as_raw(), fd, placement, metadata, count)
             }
             _ => None,
         };
         let output_offset = output_fd.and(file_offset);
         let advances_output_offset =
-            output_offset.is_some() && shares_output_ofd && write_advances_output_offset(syscall);
+            output_offset.is_some() && shares_output_ofd && write_advances_output_offset(placement);
         let generated_sigpipe = result == Err(Errno::EPIPE)
             && metadata.is_some_and(|metadata| {
                 metadata.file_type().is_fifo() || metadata.file_type().is_socket()
             });
         let replay_fd_kind = if result.is_ok() && output_fd.is_none() {
-            self.fd_replay_kind(guest.pid(), syscall.fd())
+            self.fd_replay_kind(task, fd)
         } else {
             ReplayFdKind::None
         };
@@ -604,22 +1115,17 @@ impl Recorder {
             .then_some(file_offset)
             .flatten();
         let replay_file_advances_offset =
-            replay_file_offset.is_some() && write_advances_output_offset(syscall);
-        self.record_event(
-            guest,
-            Ok(SyscallEvent::WriteV2(WriteEvent {
-                result,
-                output_fd,
-                output_offset,
-                generated_sigpipe,
-                advances_output_offset,
-                replay_fd_kind,
-                replay_file_offset,
-                replay_file_advances_offset,
-            })),
-        );
-
-        result
+            replay_file_offset.is_some() && write_advances_output_offset(placement);
+        WriteEvent {
+            result,
+            output_fd,
+            output_offset,
+            generated_sigpipe,
+            advances_output_offset,
+            replay_fd_kind,
+            replay_file_offset,
+            replay_file_advances_offset,
+        }
     }
 
     // TODO-HUMAN-REVIEW(#557): Audit captured-output ftruncate recording.
@@ -967,6 +1473,53 @@ impl Recorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether a user access can read and write sendfile's offset argument
+    /// decides how it is recorded
+    /// (https://github.com/rrnewton/hermit/pull/4422 reviews).
+    #[test]
+    fn mapping_permissions_follow_the_read_and_write_bits() {
+        let maps = "\
+            1000-2000 r--p 00000000 00:00 0\n\
+            2000-3000 rw-p 00000000 00:00 0\n\
+            3000-4000 -w-p 00000000 00:00 0\n\
+            4000-5000 ---p 00000000 00:00 0\n\
+            5000-6000 --xp 00000000 00:00 0\n";
+        for (address, permissions) in [
+            (0x0fff, None),
+            (0x1000, Some((true, false))),
+            (0x1fff, Some((true, false))),
+            (0x2000, Some((true, true))),
+            (0x2fff, Some((true, true))),
+            (0x3000, Some((true, true))),
+            (0x4000, Some((false, false))),
+            (0x5000, Some((false, false))),
+            (0x6000, None),
+        ] {
+            assert_eq!(
+                mapping_permissions(maps, address),
+                permissions,
+                "{address:#x}"
+            );
+        }
+    }
+
+    /// Only kcmp's 0 proves one open file description, and only 1 or 2, or
+    /// two different files, prove two; a failure (-1) on one file proves
+    /// neither, so neither route that assumes one is taken
+    /// (https://github.com/rrnewton/hermit/pull/4422 reviews).
+    #[test]
+    fn only_kcmp_answers_decide_whether_descriptions_are_shared() {
+        for same_file in [None, Some(true), Some(false)] {
+            assert_eq!(Descriptions::of(0, same_file), Descriptions::Shared);
+            assert_eq!(Descriptions::of(1, same_file), Descriptions::Distinct);
+            assert_eq!(Descriptions::of(2, same_file), Descriptions::Distinct);
+        }
+        assert_eq!(Descriptions::of(-1, Some(false)), Descriptions::Distinct);
+        assert_eq!(Descriptions::of(-1, Some(true)), Descriptions::Unknown);
+        assert_eq!(Descriptions::of(-1, None), Descriptions::Unknown);
+        assert_eq!(Descriptions::of(3, Some(true)), Descriptions::Unknown);
+    }
 
     #[test]
     fn vectored_offsets_combine_both_abi_halves() {

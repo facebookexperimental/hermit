@@ -32,6 +32,7 @@ use reverie::syscalls::Read;
 use reverie::syscalls::Readlink;
 use reverie::syscalls::RtSigtimedwait;
 use reverie::syscalls::RtTgsigqueueinfo;
+use reverie::syscalls::Sendfile;
 use reverie::syscalls::Statx;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
@@ -648,11 +649,19 @@ async fn inject_kernel_side_effect<G: Guest<Replayer>>(
 }
 
 impl Replayer {
-    fn advance_regular_file_position(&self, pid: reverie::Pid, fd: libc::c_int, length: usize) {
-        if !self.fd_is_in_replay_root(pid, fd) {
+    /// Moves the position of the replay-root file `fd` names in the table of
+    /// task `task` of process `pid` past `length` bytes a recorded read took.
+    fn advance_regular_file_position(
+        &self,
+        pid: reverie::Pid,
+        task: reverie::Pid,
+        fd: libc::c_int,
+        length: usize,
+    ) {
+        if !self.fd_is_in_replay_root(task, fd) {
             return;
         }
-        let duplicate = crate::fd::duplicate_guest_fd(pid, fd)
+        let duplicate = crate::fd::duplicate_guest_thread_fd(pid, task, fd)
             .unwrap_or_else(|error| panic!("failed to duplicate replay file for read: {error}"));
         let offset = libc::off_t::try_from(length).expect("recorded read length exceeds off_t");
         // SAFETY: duplicate is an owned descriptor and the recorded read succeeded.
@@ -673,9 +682,30 @@ impl Replayer {
         offset: Option<i64>,
         advances_offset: bool,
     ) -> Result<(), Error> {
-        if !self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
+        let pid = guest.pid();
+        if !self.fd_is_in_replay_root(pid, syscall.fd()) {
             return Ok(());
         }
+        let bytes = read_write_bytes(&guest.memory(), syscall, count)?;
+        self.replay_regular_file_bytes(pid, pid, syscall.fd(), &bytes, offset, advances_offset)
+    }
+
+    /// Writes `bytes` at `offset` to the replay-root regular file `fd` names
+    /// in the table of task `task` of process `pid`, and moves its position
+    /// past them when the recorded write advanced it.
+    fn replay_regular_file_bytes(
+        &self,
+        pid: reverie::Pid,
+        task: reverie::Pid,
+        fd: libc::c_int,
+        bytes: &[u8],
+        offset: Option<i64>,
+        advances_offset: bool,
+    ) -> Result<(), Error> {
+        if !self.fd_is_in_replay_root(task, fd) {
+            return Ok(());
+        }
+        let count = bytes.len();
         let offset = offset.ok_or_else(|| {
             Error::Tool(anyhow::anyhow!(
                 "recorded regular-file write is missing its offset"
@@ -686,11 +716,9 @@ impl Replayer {
                 "recorded regular-file write used negative offset {offset}"
             ))
         })?;
-        let bytes = read_write_bytes(&guest.memory(), syscall, count)?;
-        let duplicate =
-            crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd()).map_err(Error::Io)?;
+        let duplicate = crate::fd::duplicate_guest_thread_fd(pid, task, fd).map_err(Error::Io)?;
         let file = std::fs::File::from(duplicate);
-        file.write_all_at(&bytes, offset_u64).map_err(Error::Io)?;
+        file.write_all_at(bytes, offset_u64).map_err(Error::Io)?;
 
         if advances_offset {
             let next = offset
@@ -748,7 +776,7 @@ impl Replayer {
                 );
             }
             ReplayFdKind::RegularFile if advances_offset => {
-                self.advance_regular_file_position(guest.pid(), fd, event.bytes.len());
+                self.advance_regular_file_position(guest.pid(), guest.pid(), fd, event.bytes.len());
             }
             ReplayFdKind::None | ReplayFdKind::RegularFile => {}
         }
@@ -776,7 +804,12 @@ impl Replayer {
                 );
             }
             ReplayFdKind::RegularFile => {
-                self.advance_regular_file_position(guest.pid(), syscall.fd(), event.bytes.len());
+                self.advance_regular_file_position(
+                    guest.pid(),
+                    guest.pid(),
+                    syscall.fd(),
+                    event.bytes.len(),
+                );
             }
             ReplayFdKind::None => {}
         }
@@ -924,12 +957,32 @@ impl Replayer {
         // syscall errors. Failures after that boundary are failures of Replay's
         // host-side output machinery and must abort the tool instead.
         let bytes = read_write_bytes(&guest.memory(), syscall, count)?;
+        self.replay_output_bytes(
+            guest,
+            advances_output_offset,
+            output_fd,
+            &bytes,
+            output_offset,
+        )
+        .await
+    }
+
+    /// Emits `bytes` to the captured output `output_fd`, as a write of them
+    /// to it did while recording.
+    async fn replay_output_bytes<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        advances_output_offset: bool,
+        output_fd: i32,
+        bytes: &[u8],
+        output_offset: Option<i64>,
+    ) -> Result<(), Error> {
         // The root guest's endpoints, whichever process wrote
         // (`ReplayerThreadState::outputs`).
         let outputs = guest.thread_state().outputs.clone();
         let (output_lock, output) = outputs.output_endpoint(output_fd)?;
         let _guard = output_lock.lock().await;
-        emit_replay_output(output, &bytes, output_offset, advances_output_offset)
+        emit_replay_output(output, bytes, output_offset, advances_output_offset)
             .await
             .map_err(Error::Io)?;
         Ok(())
@@ -981,6 +1034,77 @@ impl Replayer {
             .await?;
         }
         event.result.map_err(Error::from)
+    }
+
+    /// Replays a `sendfile` from its recorded copy
+    /// (https://github.com/rrnewton/hermit/issues/4416): the input side moves
+    /// as the copy moved it, and the bytes reach the output as a write of them
+    /// would. Neither descriptor need name the recorded file, so the kernel is
+    /// not asked to copy again.
+    pub(super) async fn handle_sendfile<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Sendfile,
+    ) -> Result<i64, Error> {
+        let event = next_event!(guest, Sendfile)?;
+        let write = &event.write;
+        // A read-only offset argument: Linux made the copy, left the argument
+        // alone and returned EFAULT.
+        let result = if event.offset_fault {
+            Err(Errno::EFAULT)
+        } else {
+            write.result
+        };
+        if write.generated_sigpipe {
+            self.replay_sigpipe(guest).await?;
+        }
+        let Some(count) = successful_replay_write_count(write.result)? else {
+            return result.map_err(Error::from);
+        };
+        if event.bytes.len() != count {
+            return Err(Error::Tool(anyhow::anyhow!(
+                "recorded sendfile copied {count} bytes but holds {}",
+                event.bytes.len()
+            )));
+        }
+        let (pid, task) = (guest.pid(), guest.tid());
+        match (syscall.offset(), event.offset_after) {
+            (Some(_), _) if event.offset_fault => {}
+            (Some(offset), Some(after)) => guest.memory().write_value(offset, &after)?,
+            (None, _) => self.advance_regular_file_position(pid, task, syscall.in_fd(), count),
+            (Some(_), None) => {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "recorded sendfile with an offset argument is missing its final offset"
+                )));
+            }
+        }
+        match write.replay_fd_kind {
+            ReplayFdKind::RegularFile => self.replay_regular_file_bytes(
+                pid,
+                task,
+                syscall.out_fd(),
+                &event.bytes,
+                write.replay_file_offset,
+                write.replay_file_advances_offset,
+            )?,
+            ReplayFdKind::Eventfd => {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "replay cannot apply a recorded sendfile into an eventfd"
+                )));
+            }
+            ReplayFdKind::None => {}
+        }
+        if let Some(output_fd) = write.output_fd {
+            self.replay_output_bytes(
+                guest,
+                write.advances_output_offset,
+                output_fd,
+                &event.bytes,
+                write.output_offset,
+            )
+            .await?;
+        }
+        result.map_err(Error::from)
     }
 
     // TODO-HUMAN-REVIEW(#557): Audit captured-output ftruncate replay.

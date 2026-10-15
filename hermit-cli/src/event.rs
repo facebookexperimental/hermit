@@ -164,6 +164,28 @@ pub enum SyscallEvent {
     /// The outcome and peer-address copy-out of an `accept4` that the kernel
     /// completed.
     Accept(AcceptEvent),
+    /// What a `sendfile` copied and where its input stopped, with its output
+    /// side recorded as a write's is
+    /// (https://github.com/rrnewton/hermit/issues/4416).
+    Sendfile(SendfileEvent),
+}
+
+/// Recorded result and effects of `sendfile`. Replay applies them rather than
+/// running the copy again: its descriptors need not name the recorded files.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SendfileEvent {
+    /// The bytes copied.
+    pub bytes: Vec<u8>,
+    /// The value the kernel left in the guest's offset argument, when it
+    /// passed one; otherwise the copy moved the input's position.
+    pub offset_after: Option<i64>,
+    /// The copy's result and output side, as a write of `bytes` to the output
+    /// descriptor records them.
+    pub write: WriteEvent,
+    /// Whether the guest's offset argument was read-only, so Linux made the
+    /// copy and then failed writing the final offset back: the call returns
+    /// EFAULT whatever the copy returned, and the argument is unchanged.
+    pub offset_fault: bool,
 }
 
 /// Recorded output and signal side effects of a read syscall.

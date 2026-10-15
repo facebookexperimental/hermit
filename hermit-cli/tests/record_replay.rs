@@ -827,6 +827,20 @@ fn canonical_record_replay_command_retrying_skid(
     max_attempts: u32,
     env: &[(&str, &str)],
 ) -> String {
+    canonical_record_replay_command_configured(name, program, args, max_attempts, env, &|_| {}, &[])
+}
+
+/// `canonical_record_replay_command_retrying_skid`, with `configure` applied
+/// to the command and `hermit_global` given to Hermit before `record`.
+fn canonical_record_replay_command_configured(
+    name: &str,
+    program: &Path,
+    args: &[&OsStr],
+    max_attempts: u32,
+    env: &[(&str, &str)],
+    configure: &dyn Fn(&mut Command),
+    hermit_global: &[&str],
+) -> String {
     let label = format!("canonical record/replay for {name}");
     let (attempt, output, (rendered, verdict_path, _dirs)) =
         retry_typed_skid_refusal(name, max_attempts, || {
@@ -835,11 +849,13 @@ fn canonical_record_replay_command_retrying_skid(
             let verdict_dir = tempfile::tempdir().expect("failed to create verification directory");
             let verdict_path = verdict_dir.path().join("verify.json");
             let mut command = Command::new("timeout");
+            configure(&mut command);
             command
                 .env("HERMIT_MODE", "record")
                 .envs(env.iter().copied())
                 .args(["--kill-after=5s", "45s"])
                 .arg(env!("CARGO_BIN_EXE_hermit"))
+                .args(hermit_global)
                 .args([
                     "--log=info",
                     "--backend=ptrace",
@@ -2630,6 +2646,329 @@ fn record_replay_seeks_by_the_calling_threads_descriptor_table() {
         assert!(
             output.contains(line),
             "{mode}: the guest must print {line:?}:\n{output}"
+        );
+    }
+}
+
+/// `tests/c/record_replay_sendfile.c`, built into `build`.
+fn sendfile_guest(build: &Path) -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let guest = build.join("record_replay_sendfile");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/record_replay_sendfile.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile tests/c/record_replay_sendfile.c");
+    assert!(
+        output.status.success(),
+        "tests/c/record_replay_sendfile.c failed to compile:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    guest
+}
+
+/// sendfile records its copy and replays it without copying again
+/// (https://github.com/rrnewton/hermit/issues/4416): from a file that existed
+/// before the run and from one the guest made, at the input's position and at
+/// an offset argument, into a file the guest made and into stdout. Forwarded, sendfile was recorded by its
+/// count alone and ran again in replay against a descriptor that was not the
+/// input file, and the replay diverged (exit 125). A pipe input takes the
+/// guest's read and write fallback, which both record. An offset argument on a
+/// read-only page gets what Linux gives it: the copy (stdout gets "bcd", which
+/// replay emits from the recording) and then EFAULT, with the argument
+/// unchanged, as is the input's position (2); so does one made on a stack with
+/// no room below it (`tight-offset`) and one whose input and output are one
+/// O_RDWR descriptor (`ro-shared`: "ab" copied to position 4), also on that
+/// tight stack (`tight-shared`). One on a page the guest cannot read gets EFAULT before
+/// any copy (`none-offset`), although the recorder itself can read it. `copyfile` copies into
+/// a write-only destination in steps, as Python's shutil.copyfile does: the
+/// recorder reads the copied bytes back through the input, which Linux
+/// requires to be readable.
+#[test]
+fn record_replay_copies_with_sendfile() {
+    let _guard = hermit_record_lock();
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = sendfile_guest(build.path());
+    let file = build.path().join("file");
+    fs::write(&file, b"abcdef").expect("failed to write the input file");
+    let out = build.path().join("out");
+    let made = build.path().join("made");
+    let copy = build.path().join("copy");
+    let shared = build.path().join("shared");
+    let (file, out, made, copy, shared) = (
+        file.as_os_str(),
+        out.as_os_str(),
+        made.as_os_str(),
+        copy.as_os_str(),
+        shared.as_os_str(),
+    );
+    let cases: [(&str, &[&OsStr], &str); 11] = [
+        (
+            "position",
+            &[file, out],
+            "position via sendfile copied 2 in at 4 out at 2 size 2 next \"ef\" out \"cd\"\n",
+        ),
+        (
+            "made",
+            &[made, out],
+            "made via sendfile copied 2 in at 4 out at 2 size 2 next \"ef\" out \"cd\"\n",
+        ),
+        (
+            "offset",
+            &[file, out],
+            "offset via sendfile copied 3 offset 4 in at 0 out \"bcd\"\n",
+        ),
+        ("stdout", &[file], "stdout [abc] via sendfile copied 3\n"),
+        ("pipe", &[out], "pipe via read copied 3 out \"xyz\"\n"),
+        (
+            "ro-offset",
+            &[file],
+            "ro-offset [bcd] copied -1 EFAULT offset 1 pos 2\n",
+        ),
+        ("copyfile", &[file, copy], "copyfile copied 6 \"abcdef\"\n"),
+        (
+            "none-offset",
+            &[file],
+            "none-offset [] copied -1 EFAULT pos 2\n",
+        ),
+        (
+            "tight-offset",
+            &[file],
+            "tight-offset [bcd] copied -1 EFAULT offset 1 pos 2\n",
+        ),
+        (
+            "ro-shared",
+            &[shared],
+            "ro-shared copied -1 EFAULT pos 6 offset 0 file \"abcdab\"\n",
+        ),
+        (
+            "tight-shared",
+            &[shared],
+            "tight-shared copied -1 EFAULT pos 3 offset 8 file \"abc34567abcdefgh\"\n",
+        ),
+    ];
+    for (mode, args, line) in cases {
+        let mut argv = vec![OsStr::new(mode)];
+        argv.extend_from_slice(args);
+        let output = canonical_record_replay_command(&format!("sendfile {mode}"), &guest, &argv);
+        assert!(
+            output.contains(line),
+            "sendfile {mode}: the guest must print {line:?}:\n{output}"
+        );
+    }
+}
+
+/// A run forwards sendfile: between regular files its copy is deterministic
+/// (https://github.com/rrnewton/hermit/issues/4416).
+#[test]
+fn a_run_copies_with_sendfile() {
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = sendfile_guest(build.path());
+    let file = build.path().join("file");
+    fs::write(&file, b"abcdef").expect("failed to write the input file");
+    let out = build.path().join("out");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args(["run", "--strict", "--"])
+        .arg(&guest)
+        .arg("position")
+        .arg(&file)
+        .arg(&out);
+    let output = command_output(command, "sendfile run");
+    assert!(
+        output.status.success(),
+        "the run must exit 0:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "position via sendfile copied 2 in at 4 out at 2 size 2 next \"ef\" out \"cd\"\n"
+    );
+}
+
+/// A sendfile whose input and output are one description, with a read-only
+/// offset, copied past a file-size limit: Linux reads back what it has just
+/// written, stops at the limit, sends SIGXFSZ (the guest's handler counts it)
+/// and returns EFAULT. The recorder's own copy for a shared description runs
+/// under the recorder's limit, not the guest's, and would raise SIGXFSZ in the
+/// recorder, so it must not be used for a copy that could reach a limit; the
+/// guest then makes the copy itself with a scratch offset, or, with no room
+/// below its stack for one (`tight-xfsz`), the recorder makes the call under
+/// the same limit and has the guest meet the limit itself, so the signal is
+/// the kernel's own (si_code SI_USER); a call Linux refuses first raises none
+/// (`append-xfsz`), nor does one whose input ends first (`eof-tight`)
+/// (https://github.com/rrnewton/hermit/pull/4422 reviews). Hermit (and so the recorder and the guest) runs under the limit
+/// through `prlimit`; the files are sparse, 10 and 1 bytes short of it. Only the
+/// recording is checked: replay does not deliver a SIGXFSZ raised while
+/// recording, by the kernel or by the recorder, so the replayed handler count
+/// would differ (https://github.com/rrnewton/hermit/issues/4484).
+#[test]
+fn record_sendfile_into_its_own_file_meets_the_file_size_limit() {
+    const LIMIT: u64 = 32 << 20;
+    let _guard = hermit_record_lock();
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = sendfile_guest(build.path());
+    // `tight-xfsz` makes the call on a stack with no room below it, where no
+    // scratch offset fits: Linux still writes the 1 byte left to the limit.
+    for (mode, short, line) in [
+        // The kernel's own SIGXFSZ carries si_code SI_USER (0) and the
+        // writer's own pid: the guest made the copy itself.
+        (
+            "xfsz",
+            10,
+            "xfsz handler 1 si_code 0 si_pid self copied -1 EFAULT grew 10\n",
+        ),
+        // The guest's own SIGXFSZ, SI_USER from itself, though no scratch
+        // fits.
+        (
+            "tight-xfsz",
+            1,
+            "tight-xfsz handler 1 si_code 0 si_pid self copied -1 EFAULT grew 1\n",
+        ),
+        // At the limit with an O_APPEND output: Linux refuses before any
+        // write, so no SIGXFSZ (the handler's fields keep their zeros).
+        (
+            "append-xfsz",
+            0,
+            "append-xfsz handler 0 si_code 0 si_pid other copied -1 EFAULT grew 0\n",
+        ),
+        // The input ends before the limit: no SIGXFSZ (the guest makes its
+        // own 16-byte file).
+        (
+            "eof-tight",
+            1,
+            "eof-tight handler 0 copied -1 EFAULT pos 8 offset 8 file \"abcdefghabcdefgh\"\n",
+        ),
+    ] {
+        let file = build.path().join(mode);
+        fs::File::create(&file)
+            .and_then(|sparse| sparse.set_len(LIMIT - short))
+            .expect("failed to make the sparse input file");
+        let recording = tempfile::tempdir().expect("failed to create the recording directory");
+        let mut command = Command::new("prlimit");
+        command
+            .arg(format!("--fsize={LIMIT}:{LIMIT}"))
+            .args(["--", "timeout", "--kill-after=5s", "45s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--backend=ptrace", "record", "start", "--strict"])
+            .arg(format!("--data-dir={}", recording.path().display()))
+            .arg("--")
+            .arg(&guest)
+            .arg(mode)
+            .arg(&file);
+        let output = command_output(command, "sendfile file-size-limit recording");
+        assert!(
+            output.status.success(),
+            "sendfile {mode}: the recording must exit 0:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            line,
+            "sendfile {mode}"
+        );
+    }
+}
+
+/// Every byte of every file under `dir`, concatenated.
+fn recording_bytes(dir: &Path) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for entry in fs::read_dir(dir).expect("failed to list the recording") {
+        let path = entry.expect("failed to read the recording listing").path();
+        if path.is_dir() {
+            bytes.extend(recording_bytes(&path));
+        } else {
+            bytes.extend(fs::read(&path).expect("failed to read the recording"));
+        }
+    }
+    bytes
+}
+
+/// A sendfile whose output overlaps its input on one file records the bytes
+/// it wrote (https://github.com/rrnewton/hermit/pull/4422 review). The guest
+/// makes "12ZQWK" and copies 4 bytes within it. Backward (from 2 to 1) Linux
+/// writes "ZQWK"; reading the input back after the copy would record "QWKK",
+/// and reading the output at offset 0 "1ZQW". Forward (from 0 to 2) Linux
+/// writes "1212"; reading the input before the copy would record "12ZQ". Replay serves every later read of the file from
+/// the recording, so the event's bytes are checked in a second recording kept
+/// on disk (`--verify` removes its own); the guest prints no file contents and
+/// builds them at run time, so the bytes reach the recording only through the
+/// sendfile event.
+#[test]
+fn record_sendfile_overlapping_its_input_keeps_the_bytes_it_wrote() {
+    let _guard = hermit_record_lock();
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = sendfile_guest(build.path());
+    let file = build.path().join("file");
+    /// A guest mode, the line it prints, the bytes its copy wrote, and the
+    /// wrong readings that must not be recorded.
+    struct Overlap {
+        mode: &'static str,
+        line: &'static str,
+        wrote: &'static [u8],
+        wrong: &'static [&'static [u8]],
+    }
+    let cases = [
+        Overlap {
+            mode: "overlap-back",
+            line: "overlap-back via sendfile copied 4 in at 6 out at 5\n",
+            wrote: b"ZQWK",
+            wrong: &[b"QWKK", b"1ZQW"],
+        },
+        Overlap {
+            mode: "overlap-fwd",
+            line: "overlap-fwd via sendfile copied 4 in at 4 out at 6\n",
+            wrote: b"1212",
+            wrong: &[b"12ZQ"],
+        },
+    ];
+    for Overlap {
+        mode,
+        line,
+        wrote,
+        wrong,
+    } in cases
+    {
+        let args = [OsStr::new(mode), file.as_os_str()];
+        let output = canonical_record_replay_command(&format!("sendfile {mode}"), &guest, &args);
+        assert!(
+            output.contains(line),
+            "sendfile {mode}: the guest must print {line:?}:\n{output}"
+        );
+        let recording = tempfile::tempdir().expect("failed to create the recording directory");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .args(["--backend=ptrace", "record", "start", "--strict"])
+            .arg(format!("--data-dir={}", recording.path().display()))
+            .arg("--")
+            .arg(&guest)
+            .args(args);
+        let recorded = command_output(command, "sendfile overlap recording");
+        assert!(
+            recorded.status.success(),
+            "sendfile {mode}: the recording must exit 0:\n{}",
+            String::from_utf8_lossy(&recorded.stderr)
+        );
+        let bytes = recording_bytes(recording.path());
+        let holds = |needle: &[u8]| bytes.windows(needle.len()).any(|window| window == needle);
+        assert!(
+            holds(wrote) && !wrong.iter().any(|wrong| holds(wrong)),
+            "sendfile {mode}: the recording must hold {:?} and none of {:?}",
+            String::from_utf8_lossy(wrote),
+            wrong
+                .iter()
+                .map(|wrong| String::from_utf8_lossy(wrong))
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -4780,6 +5119,158 @@ fn deny_thread_pidfds(command: &mut Command) {
             }
             Ok(())
         });
+    }
+}
+
+/// Makes every `kcmp` in this process and its descendants fail with `EPERM`,
+/// as on a kernel without it or without access, and lets every other system
+/// call through.
+fn deny_kcmp(command: &mut Command) {
+    const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+    // SAFETY: the closure makes only prctl calls, which are async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            let filter = [
+                // Kill any other architecture.
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 4,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 1,
+                    jf: 0,
+                    k: AUDIT_ARCH_X86_64,
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: libc::SECCOMP_RET_KILL_PROCESS,
+                },
+                // kcmp fails with EPERM.
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 0,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 1,
+                    k: libc::SYS_kcmp as u32,
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: libc::SECCOMP_RET_ALLOW,
+                },
+            ];
+            let program = libc::sock_fprog {
+                len: filter.len() as u16,
+                filter: filter.as_ptr() as *mut libc::sock_filter,
+            };
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                || libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    &program as *const libc::sock_fprog,
+                ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// A sendfile with a read-only offset when kcmp fails (a kernel without it,
+/// or no access), simulated by denying the recorder's kcmp with seccomp: the
+/// recorder cannot tell one open file description from two by kcmp, and must
+/// not assume either (https://github.com/rrnewton/hermit/pull/4422 reviews).
+/// Two different files are two descriptions all the same, so `ro-distinct`
+/// and `tight-offset` (input file, stdout output) still take the position
+/// route. One file opened once as input and output (`ro-shared`), the same
+/// description through two descriptor numbers (`ro-dup`, which the
+/// two-files rule must not take for two descriptions), twice,
+/// read-only and write-only (`ro-two-opens`), or once on a stack with no room
+/// below it (`tight-shared`), cannot be told apart: the recorder makes the
+/// call itself on duplicates of both descriptors, which is right for one
+/// description or two. Each gets Linux's result.
+#[test]
+fn record_sendfile_without_kcmp() {
+    let _guard = hermit_record_lock();
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = sendfile_guest(build.path());
+    let file = build.path().join("file");
+    fs::write(&file, b"abcdef").expect("failed to write the input file");
+    let (input, output, shared) = (
+        build.path().join("input"),
+        build.path().join("output"),
+        build.path().join("shared"),
+    );
+    let two_opens = build.path().join("two-opens");
+    let tight_shared = build.path().join("tight-shared");
+    let dup = build.path().join("dup");
+    let cases: [(&str, Vec<&OsStr>, &str); 6] = [
+        (
+            "ro-distinct",
+            vec![input.as_os_str(), output.as_os_str()],
+            "ro-distinct copied -1 EFAULT pos 3 offset 1 out \"bcd3456789ABCDEF\"\n",
+        ),
+        (
+            "ro-shared",
+            vec![shared.as_os_str()],
+            "ro-shared copied -1 EFAULT pos 6 offset 0 file \"abcdab\"\n",
+        ),
+        (
+            "ro-dup",
+            vec![dup.as_os_str()],
+            "ro-dup copied -1 EFAULT pos 6 offset 0 file \"abcdab\"\n",
+        ),
+        (
+            "ro-two-opens",
+            vec![two_opens.as_os_str()],
+            "ro-two-opens copied -1 EFAULT pos 6 offset 0 file \"abcdab\"\n",
+        ),
+        (
+            "tight-offset",
+            vec![file.as_os_str()],
+            "tight-offset [bcd] copied -1 EFAULT offset 1 pos 2\n",
+        ),
+        (
+            "tight-shared",
+            vec![tight_shared.as_os_str()],
+            "tight-shared copied -1 EFAULT pos 3 offset 8 file \"abc34567abcdefgh\"\n",
+        ),
+    ];
+    for (mode, args, line) in cases {
+        let mut argv = vec![OsStr::new(mode)];
+        argv.extend(args);
+        let output = canonical_record_replay_command_configured(
+            &format!("sendfile {mode} without kcmp"),
+            &guest,
+            &argv,
+            1,
+            &[],
+            &deny_kcmp,
+            UNDER_HOST_FILTER,
+        );
+        assert!(
+            output.contains(line),
+            "sendfile {mode} without kcmp: the guest must print {line:?}:\n{output}"
+        );
     }
 }
 

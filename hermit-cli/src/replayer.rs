@@ -557,6 +557,7 @@ impl Tool for Replayer {
             Syscall::Pwritev2(syscall) => {
                 Ok(self.handle_write_family(guest, syscall.into()).await?)
             }
+            Syscall::Sendfile(syscall) => Ok(self.handle_sendfile(guest, syscall).await?),
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#3598)
             Syscall::Access(_) | Syscall::Faccessat(_) | Syscall::Other(Sysno::faccessat2, _) => {

@@ -623,7 +623,13 @@ impl RecordVersion {
 // writev_determinism's atomic full-pipe case.) Replay recomputes these
 // results, so an older recording of such a wake would replay to another
 // result.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x164);
+// 0x164 -> 0x165 (taken at land time, as the reservation file's land-time
+// numbering rule gives a ready change HIGHEST_SHIPPED + 1): sendfile records
+// the bytes it copied and where its input stopped, and replay applies them
+// instead of copying again (https://github.com/rrnewton/hermit/issues/4416).
+// An older recording holds sendfile's count alone, which a new replay cannot
+// read as its event.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x165);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -648,7 +654,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x164);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x164;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x165;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1702,7 +1708,7 @@ mod tests {
                 "{older:#x}"
             );
         }
-        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x164)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 
     /// A recording older than 0x162 may hold a PR_SET_PDEATHSIG the kernel
@@ -1767,6 +1773,14 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_armed_waiting_signal_calls() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x153)));
+    }
+
+    /// A recording older than 0x165 holds sendfile's count without its copy,
+    /// which a new replay needs (https://github.com/rrnewton/hermit/issues/4416).
+    #[test]
+    fn record_version_rejects_streams_from_before_sendfile_records_its_copy() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x164)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 
     /// A replayer older than 0x155 ignores a recording's CPU profile and would
