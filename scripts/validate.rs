@@ -6968,9 +6968,16 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
         .filter(|step| step.group == "test" && !step.cmd.contains("run-nextest-counted.sh"))
         .map(|step| step.tag())
         .collect::<BTreeSet<_>>();
+    // Audited 2026-10-15: the two isolation matrix nodes run
+    // tests/isolation/conformance.rs --expected, which prints one verdict
+    // line per cell and the ledger summary at every verbosity and publishes
+    // no structured test counts. Their result is the ledger's verdict, which
+    // the node's exit status carries; a count of cells would not say more.
     let expected_non_nextest = BTreeSet::from([
         "test.applications_e2e".to_string(),
         "test.envelope_levels".to_string(),
+        "test.isolation_matrix_dbt_in_guest".to_string(),
+        "test.isolation_matrix_ptrace_runtime".to_string(),
     ]);
     if non_nextest_test_nodes != expected_non_nextest {
         return Err(format!(

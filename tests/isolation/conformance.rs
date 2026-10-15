@@ -94,7 +94,10 @@ fn copy_bounded(
 /// `directory` up to `stream_bytes` each, kills its group at `deadline`, and
 /// kills the group again once it exits so that no descendant outlives the
 /// cell. Memory, task and CPU bounds are the caller's (the validation DAG
-/// boxes the whole node); a wrapper is not nested inside it.
+/// boxes the whole node); a wrapper is not nested inside it. Each cell
+/// chooses its runs' working directory itself, so the E2E harness's
+/// `HERMIT_E2E_EMPTY_WORKDIR=/test`, which validation exports and which makes
+/// a DBT run refuse any other `--workdir`, is not passed on.
 fn local_capture(
     command: &mut Command,
     directory: &Path,
@@ -116,6 +119,7 @@ fn local_capture(
         failure: None,
     };
     let mut child = match command
+        .env_remove("HERMIT_E2E_EMPTY_WORKDIR")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
