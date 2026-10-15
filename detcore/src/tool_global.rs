@@ -3776,6 +3776,7 @@ impl GlobalState {
                     blocked_signal_mask_unknown: false,
                     replay_served_from_log: false,
                     reads_signalfd: false,
+                    read_fd: None,
                     polls_guest_state_only: false,
                     waits_until_nothing_else_can_run: false,
                     previous_attempt_made_progress: false,

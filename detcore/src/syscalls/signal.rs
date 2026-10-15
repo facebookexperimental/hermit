@@ -3474,12 +3474,17 @@ where
         // sleep returned EINTR with no handler
         // (https://github.com/rrnewton/hermit/issues/4341).
         //
-        // Only in a run: record and replay keep parking it, since replay may
-        // serve the outside thread's signalfd read from the log without taking
-        // the copy (https://github.com/rrnewton/hermit/issues/4343).
+        // In record and replay too, but only while no other thread of the
+        // process is outside the schedule in a call that could take the copy
+        // (`Scheduler::outside_call_may_take_sigchld`, through
+        // `WindowUnusable`). Then nothing but this claim can take it, so its
+        // pending bit, and the claim, are the same in a recording and its
+        // replay (https://github.com/rrnewton/hermit/issues/4343). While such a
+        // call is out, whether it took the copy is host-timed, and replay
+        // serves a signalfd read from the log without taking anything, so the
+        // two could decide differently; the sleep parks again, as before.
         if committed == 0
             && held_woken & sigchld != 0
-            && !guest.config().recordreplay_modes
             && woken_sigchld_pending(&state, sigchld)
             && matches!(
                 crate::tool_global::child_exit_sigchld(

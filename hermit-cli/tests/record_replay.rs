@@ -744,7 +744,7 @@ fn record_replay_command_with_policy(
 }
 
 fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) -> String {
-    canonical_record_replay_command_retrying_skid(name, program, args, 1)
+    canonical_record_replay_command_retrying_skid(name, program, args, 1, &[])
 }
 
 /// `canonical_record_replay_command`, repeated only when an attempt ends in a
@@ -755,11 +755,13 @@ fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) 
 /// replay is a new measurement. Every retried attempt prints a `SKID-RETRY`
 /// line with its refusal to the test's stderr; any other outcome, and the
 /// last attempt, is checked as `canonical_record_replay_command` checks it.
+/// `env` is added to the environment of the recording and its replay.
 fn canonical_record_replay_command_retrying_skid(
     name: &str,
     program: &Path,
     args: &[&OsStr],
     max_attempts: u32,
+    env: &[(&str, &str)],
 ) -> String {
     let label = format!("canonical record/replay for {name}");
     let (attempt, output, (rendered, verdict_path, _dirs)) =
@@ -771,6 +773,7 @@ fn canonical_record_replay_command_retrying_skid(
             let mut command = Command::new("timeout");
             command
                 .env("HERMIT_MODE", "record")
+                .envs(env.iter().copied())
                 .args(["--kill-after=5s", "45s"])
                 .arg(env!("CARGO_BIN_EXE_hermit"))
                 .args([
@@ -2738,6 +2741,7 @@ fn record_vfork_child_waiting_for_another_thread() {
             &guest,
             &[OsStr::new(mode)],
             max_attempts,
+            &[],
         );
         assert!(output.contains(line), "missing {line:?} in:\n{output}");
     }
@@ -2898,6 +2902,7 @@ fn record_select_mode_retrying_skid(mode: &str, max_attempts: u32) {
         &workload("c_record_replay_select").path,
         &[OsStr::new(mode)],
         max_attempts,
+        &[],
     );
 }
 
@@ -3093,6 +3098,139 @@ fn record_sigtimedwait_ends_for_a_caught_sigchld_from_a_child_exit() {
             &workload("c_record_replay_sigtimedwait_child_exit").path,
             &[OsStr::new(mode)],
         );
+    }
+}
+
+/// A child-exit SIGCHLD that wakes a sleeping main thread ends its `pause` or
+/// `nanosleep` with EINTR and runs main's handler in record and replay, as on
+/// Linux and as `hermit run` does (https://github.com/rrnewton/hermit/issues/4343).
+/// The guest holds a signalfd for SIGCHLD it never reads, so the send window
+/// is unusable and the woken sleep claims the copy itself; a sibling that
+/// blocks SIGCHLD sits outside the schedule in a read of a second signalfd,
+/// for SIGUSR2 only, which cannot take it. Before, the recording returned 0
+/// from the `nanosleep` with the handler run afterwards, and the `pause`
+/// never returned. Each mode also runs with the sibling's background read
+/// started late and finished late (race probes, docs/RACE_PROBES.md), host
+/// orders under which the claim must decide the same in the recording and
+/// its replay. A sibling reading the SIGCHLD signalfd keeps the claim off.
+#[test]
+fn record_a_childs_sigchld_that_wakes_a_sleep() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = build.path().join("sigchld_bookkeeping");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/sigchld_bookkeeping.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the sigchld_bookkeeping guest");
+    assert!(
+        output.status.success(),
+        "guest compilation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (args, line) in [
+        (
+            &["sfdheld-nano"][..],
+            "sfdheld-nano: nanosleep EINTR, main handler 1\n",
+        ),
+        (
+            &["sfdheld-pause"],
+            "sfdheld-pause: pause EINTR, main handler 1\n",
+        ),
+        (
+            &["sfdheld-nano", "restart"],
+            "sfdheld-nano restart: nanosleep EINTR, main handler 1\n",
+        ),
+        (
+            &["sfdheld-pause", "yield"],
+            "sfdheld-pause yield: pause EINTR, main handler 1, yielder gave up 0\n",
+        ),
+        (
+            &["sfdheld-nano", "yield"],
+            "sfdheld-nano yield: nanosleep EINTR, main handler 1, yielder gave up 0\n",
+        ),
+    ] {
+        for probe in [None, Some("bg_pre_call=10-60"), Some("bg_post_call=10-60")] {
+            let _guard = hermit_record_lock();
+            let label = format!("{} (probe {probe:?})", args.join(" "));
+            let env: Vec<(&str, &str)> = probe
+                .map(|probe| {
+                    [
+                        ("HERMIT_RACE_PROBE", probe),
+                        ("HERMIT_RACE_PROBE_SEED", "1"),
+                    ]
+                })
+                .into_iter()
+                .flatten()
+                .collect();
+            let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+            let output = canonical_record_replay_command_retrying_skid(
+                &format!("sigchld {label}"),
+                &guest,
+                &args,
+                1,
+                &env,
+            );
+            assert!(
+                output.contains(line),
+                "{label}: the guest must print {line:?}:\n{output}"
+            );
+        }
+    }
+    // With a sibling blocked in a read of the SIGCHLD signalfd, outside the
+    // schedule, the claim stays off and the sibling takes the signal, also when
+    // its read starts late, and also when it reads a copy of the descriptor
+    // taken with pidfd_getfd. (A descriptor received over SCM_RIGHTS, which
+    // Detcore's table does not record as a signalfd, reads EBADF under record
+    // today, https://github.com/rrnewton/hermit/issues/4107; the gate also
+    // covers it, from the kernel's name for the descriptor.)
+    // Claiming there, the recording gave main the signal in every run ("main
+    // handler 1, sibling read 0"), and the replay decided differently once
+    // host timing moved. This mode's replay is
+    // https://github.com/rrnewton/hermit/issues/4349, so only its recording is
+    // checked.
+    for args in [&["sfdsib-pause"][..], &["sfdsib-pause", "getfd"]] {
+        let line = format!(
+            "{}: pause EINTR, main handler 0, usr1 1, sibling read 1 code CLD_EXITED\n",
+            args.join(" ")
+        );
+        for probe in [None, Some("bg_pre_call=10-60")] {
+            let _guard = hermit_record_lock();
+            let data_dir =
+                tempfile::tempdir().expect("failed to create Hermit recording directory");
+            let mut record = Command::new("timeout");
+            if let Some(probe) = probe {
+                record
+                    .env("HERMIT_RACE_PROBE", probe)
+                    .env("HERMIT_RACE_PROBE_SEED", "1");
+            }
+            record
+                .args(["--kill-after=5s", "45s"])
+                .arg(env!("CARGO_BIN_EXE_hermit"))
+                .args([
+                    "--log=off",
+                    "--backend=ptrace",
+                    "record",
+                    "start",
+                    "--record-timeout=30",
+                ])
+                .arg(format!("--data-dir={}", data_dir.path().display()))
+                .arg("--")
+                .arg(&guest)
+                .args(args);
+            let label = format!("{} (probe {probe:?})", args.join(" "));
+            let output = command_output(record, &format!("recording {label}"));
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                line,
+                "{label}: the sibling must take the SIGCHLD"
+            );
+        }
     }
 }
 

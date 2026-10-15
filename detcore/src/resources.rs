@@ -498,6 +498,16 @@ pub struct Resources {
     /// signalfd sets nothing. `false` for every other request.
     #[serde(default)]
     pub(crate) reads_signalfd: bool,
+    /// The descriptor a `BlockingExternalIO` request's `read`, `readv` or
+    /// `preadv2` reads, whatever it is; `None` for every other request. Under
+    /// record and replay the scheduler asks the kernel, as it grants the
+    /// request, whether that descriptor is a signalfd and which signals it
+    /// reads, so that a signalfd Detcore's table does not record as one (one
+    /// received over `SCM_RIGHTS`) counts too, and a descriptor changed by
+    /// another thread's turn while this request waited is read as it is when
+    /// the call runs (`Scheduler::background_kernel_signalfd_reads`).
+    #[serde(default)]
+    pub(crate) read_fd: Option<i32>,
     /// Set on a polling request whose attempts fail or succeed only through
     /// guest actions: a retry on a container-internal descriptor (a pipe, a
     /// socketpair end, or a FIFO polled as a pipe), or a FIFO open waiting for
@@ -638,6 +648,7 @@ impl Resources {
             blocked_signal_mask_unknown: false,
             replay_served_from_log: false,
             reads_signalfd: false,
+            read_fd: None,
             polls_guest_state_only: false,
             waits_until_nothing_else_can_run: false,
             previous_attempt_made_progress: false,

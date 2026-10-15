@@ -900,6 +900,16 @@ impl Scheduler {
     /// (`real_time_expiration_fate`).
     pub(crate) fn register_signalfd(&mut self, process: DetPid, mask: u64) {
         *self.signalfd_masks.entry(process).or_default() |= mask;
+        // The call may have changed the mask of a descriptor a background read
+        // already holds (`signalfd4` on an existing descriptor, whose
+        // description any process may share), so a read out now may read
+        // SIGCHLD whatever its descriptor read when it began
+        // (`outside_call_may_take_sigchld`).
+        if mask & super::kernel_signal_bit(libc::SIGCHLD) != 0 {
+            for (_, read_mask) in self.background_kernel_signalfd_reads.values_mut() {
+                *read_mask = None;
+            }
+        }
         // Its reads are not observed (`process_timer_copies`,
         // `thread_timer_copies`), and its description may be shared with any
         // process (`signalfd_may_read`), so every process's records of a

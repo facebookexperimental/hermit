@@ -249,6 +249,10 @@ pub enum ChildExitSigchldControl {
     /// scheduler's `SIGCHLD` when `PlacedPending` says no. There the window
     /// records no committed copy, so the copy's pending bit decides, as
     /// before the window existed (<https://github.com/rrnewton/hermit/issues/4229>).
+    /// Under record and replay, also no while another thread of the process
+    /// is outside the schedule in a call that could take the copy
+    /// (`Scheduler::outside_call_may_take_sigchld`), since the pending bit is
+    /// then host-timed (<https://github.com/rrnewton/hermit/issues/4343>).
     /// Appended after `PrivatePending`.
     WindowUnusable,
     /// The calling thread is at the delivery stop of a `SIGCHLD` it claimed,
@@ -866,7 +870,8 @@ impl Scheduler {
             }
             ChildExitSigchldControl::WindowUnusable => ChildExitSigchldAnswer::Placed(
                 self.models_signal_targets
-                    && !self.sigchld_window_usable(self.sigchld_process(dtid)),
+                    && !self.sigchld_window_usable(self.sigchld_process(dtid))
+                    && !(self.recordreplay_modes && self.outside_call_may_take_sigchld(dtid)),
             ),
             ChildExitSigchldControl::PrivateSent { target } => {
                 // Whether this made a new record, which a failed send undoes.

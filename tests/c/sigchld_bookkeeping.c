@@ -75,7 +75,9 @@
  *   sfdsib-pause, sfdsib-nano (with "late", the child exits 100 ms in; with
  *                  "rt", the signalfd also reads SIGRTMIN+2; with "poll", the
  *                  sibling polls a nonblocking signalfd with sched_yield
- *                  between reads, each read inside the schedule)
+ *                  between reads, each read inside the schedule; with "getfd",
+ *                  the sibling reads a copy of the signalfd taken with
+ *                  pidfd_getfd)
  *                  A sibling blocks SIGCHLD and blocks reading a signalfd for
  *                  SIGCHLD; the main thread (SIGCHLD caught) forks a child
  *                  that exits and pauses or sleeps 5 s. Exactly one of them
@@ -566,7 +568,19 @@ static void* signalfd_sibling(void* arg) {
   return NULL;
 }
 
-static int sfdsib(const char* mode, int late, int rt, int poll) {
+/* A copy of this process's descriptor `fd` taken with pidfd_getfd, as another
+ * process would take it: the new descriptor, or -1. The caller closes `fd`. */
+static int copy_with_pidfd_getfd(int fd) {
+  int pidfd = (int)syscall(SYS_pidfd_open, getpid(), 0);
+  if (pidfd < 0) {
+    return -1;
+  }
+  int copy = (int)syscall(SYS_pidfd_getfd, pidfd, fd, 0);
+  close(pidfd);
+  return copy;
+}
+
+static int sfdsib(const char* mode, int late, int rt, int poll, int getfd) {
   int pausing = !strcmp(mode, "sfdsib-pause");
   main_thread = pthread_self();
   catch_chld();
@@ -580,6 +594,14 @@ static int sfdsib(const char* mode, int late, int rt, int poll) {
   }
   sfd_polling = poll;
   sfd_reader = signalfd(-1, &mask, poll ? SFD_NONBLOCK : 0);
+  if (getfd) {
+    int copy = copy_with_pidfd_getfd(sfd_reader);
+    close(sfd_reader);
+    sfd_reader = copy;
+    if (sfd_reader < 0) {
+      return 3;
+    }
+  }
   pthread_t thread;
   pthread_create(&thread, NULL, signalfd_sibling, NULL);
   while (!atomic_load(&ready)) {
@@ -605,8 +627,9 @@ static int sfdsib(const char* mode, int late, int rt, int poll) {
   }
   pthread_join(thread, NULL);
   waitpid(child, NULL, 0);
-  printf("%s%s%s%s: %s %s, main handler %d, usr1 %d, sibling read %d code %s\n", mode,
-         late ? " late" : "", rt ? " rt" : "", poll ? " poll" : "", pausing ? "pause" : "nanosleep",
+  printf("%s%s%s%s%s: %s %s, main handler %d, usr1 %d, sibling read %d code %s\n", mode,
+         late ? " late" : "", rt ? " rt" : "", poll ? " poll" : "", getfd ? " getfd" : "",
+         pausing ? "pause" : "nanosleep",
          ret == 0 ? "0" : error == EINTR ? "EINTR" : strerror(error), in_main, usr1,
          atomic_load(&sibling_read),
          atomic_load(&sibling_read) ? code_name(atomic_load(&sibling_code)) : "none");
@@ -889,13 +912,14 @@ int main(int argc, char** argv) {
     return sfdheld(mode, restart, yielding, usr1, zeroreq, quietchld, again);
   }
   if (!strncmp(mode, "sfdsib-", 7)) {
-    int late = 0, rt = 0, poll = 0;
+    int late = 0, rt = 0, poll = 0, getfd = 0;
     for (int i = 2; i < argc; i++) {
       late |= !strcmp(argv[i], "late");
       rt |= !strcmp(argv[i], "rt");
       poll |= !strcmp(argv[i], "poll");
+      getfd |= !strcmp(argv[i], "getfd");
     }
-    return sfdsib(mode, late, rt, poll);
+    return sfdsib(mode, late, rt, poll, getfd);
   }
   return 2;
 }

@@ -288,6 +288,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Without it, resource_request is a no-op and internal fds may block directly.
             rsrcs.reads_signalfd = matches!(blocking_resource, ResourceID::BlockingExternalIO(_))
                 && call_reads_signalfd(guest, call);
+            if matches!(blocking_resource, ResourceID::BlockingExternalIO(_)) {
+                rsrcs.read_fd = read_family_fd(call);
+            }
             rsrcs.insert(blocking_resource, Permission::RW);
             rsrcs.fyi(call.name());
             rsrcs.blocked_signal_mask = blocked_signal_mask;
@@ -1024,6 +1027,16 @@ fn call_reads_signalfd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
         .thread_state()
         .with_detfd(fd, |detfd| detfd.ty() == crate::fd::FdType::Signalfd)
         .unwrap_or(false)
+}
+
+/// The descriptor a `read`, `readv` or `preadv2` reads (`Resources::read_fd`).
+fn read_family_fd(call: Syscall) -> Option<i32> {
+    match call {
+        Syscall::Read(c) => Some(c.fd()),
+        Syscall::Readv(c) => Some(c.fd()),
+        Syscall::Preadv2(c) => Some(c.fd()),
+        _ => None,
+    }
 }
 
 /// Does replay answer this call from the recording rather than by running it?

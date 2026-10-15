@@ -1571,6 +1571,15 @@ pub struct Scheduler {
     /// a signalfd (`Resources::reads_signalfd`). An entry counts only while
     /// that op is still the thread's `external_io_blockers` entry.
     background_signalfd_reads: BTreeMap<DetTid, ExternalOpId>,
+    /// Under record and replay, threads whose background read
+    /// (`Resources::read_fd`) is of a descriptor the kernel names a signalfd
+    /// as the scheduler grants it, tracked by Detcore or not
+    /// (`kernel_signalfd_read_mask`), with the signals it reads: `None` where
+    /// unknown, or where a later `signalfd4` for SIGCHLD may have changed them
+    /// (`register_signalfd`). An entry counts only while its op is still the
+    /// thread's `external_io_blockers` entry. Read only by
+    /// `outside_call_may_take_sigchld`.
+    background_kernel_signalfd_reads: BTreeMap<DetTid, (ExternalOpId, Option<u64>)>,
 
     /// The real-time signals (a kernel sigset) that the mask a signal handler's
     /// return restores leaves unblocked, by process: the thread's mask when a
@@ -3548,6 +3557,7 @@ impl Scheduler {
             sending_child_exit: None,
             signalfd_masks: Default::default(),
             background_signalfd_reads: Default::default(),
+            background_kernel_signalfd_reads: Default::default(),
             handler_restore_unblocked: Default::default(),
             background_call_processes: Default::default(),
             alarm_unobservable: Default::default(),
@@ -7032,6 +7042,80 @@ impl Scheduler {
                             })
                 });
         sigtimedwait || signalfd_read
+    }
+
+    /// Whether a thread of `dtid`'s process other than `dtid` sleeps outside the
+    /// schedule in a call that could take its process's SIGCHLD at a moment
+    /// host timing chooses: a call whose recorded mask
+    /// (`BlockedPool::out_of_scheduler_masks`) leaves SIGCHLD unblocked or is
+    /// unknown, so the kernel may deliver it there, or a background read of a
+    /// signalfd, tracked or not, that reads SIGCHLD or whose signals are
+    /// unknown (`background_kernel_signalfd_reads`). Membership is fixed at commit points: an
+    /// entry is made when the call is granted and removed when it rejoins.
+    ///
+    /// Under record and replay, a woken sleep claims its SIGCHLD only when this
+    /// is false (`ChildExitSigchldControl::WindowUnusable`). While such a call
+    /// is out, whether it took the copy before the claim reads the pending bit
+    /// is host-timed, in the recording and again in the replay, so the two
+    /// could decide differently, and the replay then took a different branch
+    /// or waited for ever for a signal the claim had taken
+    /// (https://github.com/rrnewton/hermit/issues/4343). Without the claim the
+    /// sleep stays parked, and the outside call takes the copy as it did
+    /// before the claim existed.
+    /// If `thread`'s descriptor `fd` is one the kernel names a signalfd
+    /// (`anon_inode:[signalfd]`), the signals (a kernel sigset) it reads, from
+    /// the `sigmask` line of its `fdinfo`, which only the guest's own
+    /// `signalfd4` calls set: `Some(None)` where they cannot be read, and also
+    /// where the descriptor cannot be read at all except because it is not
+    /// open. `None` for any other descriptor. Asked while `thread` is stopped
+    /// at its request and no other guest thread runs in the schedule.
+    fn kernel_signalfd_read_mask(&self, thread: DetTid, fd: i32) -> Option<Option<u64>> {
+        if crate::syscalls::host_signal_state_reads_refused() {
+            return Some(None);
+        }
+        let task = format!(
+            "/proc/{}/task/{}",
+            self.sigchld_process(thread).as_raw(),
+            thread.as_raw()
+        );
+        match std::fs::read_link(format!("{task}/fd/{fd}")) {
+            Ok(target) if target == std::path::Path::new("anon_inode:[signalfd]") => {}
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => return Some(None),
+        }
+        Some(
+            std::fs::read_to_string(format!("{task}/fdinfo/{fd}"))
+                .ok()
+                .and_then(|info| {
+                    info.lines()
+                        .find_map(|line| line.strip_prefix("sigmask:"))
+                        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+                }),
+        )
+    }
+
+    pub(crate) fn outside_call_may_take_sigchld(&self, dtid: DetTid) -> bool {
+        let bit = kernel_signal_bit(libc::SIGCHLD);
+        let process = self.sigchld_process(dtid);
+        self.thread_tree
+            .my_thread_group(&process)
+            .iter()
+            .any(|thread| {
+                *thread != dtid
+                    && (self
+                        .blocked
+                        .out_of_scheduler_masks
+                        .get(thread)
+                        .is_some_and(|mask| mask.is_none_or(|mask| mask & bit == 0))
+                        || self
+                            .background_kernel_signalfd_reads
+                            .get(thread)
+                            .is_some_and(|(op, mask)| {
+                                self.blocked.external_io_blockers.get(thread) == Some(op)
+                                    && mask.is_none_or(|mask| mask & bit != 0)
+                            }))
+            })
     }
 
     /// The thread of `process` that a timer's process-directed `sig` is sent
@@ -10935,6 +11019,21 @@ impl Scheduler {
                             self.background_signalfd_reads.insert(dettid, *op);
                         } else {
                             self.background_signalfd_reads.remove(&dettid);
+                        }
+                        // Asked now, as the call is granted: no other thread's
+                        // turn can change the descriptor before the call runs.
+                        let signalfd_mask = rs
+                            .read_fd
+                            .filter(|_| {
+                                self.recordreplay_modes
+                                    && self.blocked.external_io_blockers.get(&dettid) == Some(op)
+                            })
+                            .and_then(|fd| self.kernel_signalfd_read_mask(dettid, fd));
+                        if let Some(mask) = signalfd_mask {
+                            self.background_kernel_signalfd_reads
+                                .insert(dettid, (*op, mask));
+                        } else {
+                            self.background_kernel_signalfd_reads.remove(&dettid);
                         }
                     }
                     if rs.blocked_signal_mask_unknown
@@ -27987,6 +28086,94 @@ mod test {
         assert_eq!(ask(&mut scheduler), ChildExitSigchldAnswer::Placed(true));
         scheduler.models_signal_targets = false;
         assert_eq!(ask(&mut scheduler), ChildExitSigchldAnswer::Placed(false));
+    }
+
+    /// Under record and replay, `WindowUnusable` also says no while another
+    /// thread of the process is outside the schedule in a call that could take
+    /// its `SIGCHLD` (`outside_call_may_take_sigchld`): one sleeping with
+    /// `SIGCHLD` unblocked or under an unknown mask, or a background read of a
+    /// signalfd that reads `SIGCHLD` or whose signals are unknown, which they
+    /// become when a `signalfd4` for `SIGCHLD` follows the read's start. A
+    /// sibling that blocks `SIGCHLD` and reads a signalfd for other signals
+    /// cannot, and run mode is unchanged
+    /// (https://github.com/rrnewton/hermit/issues/4343).
+    #[test]
+    fn window_unusable_waits_for_an_outside_call_that_may_take_sigchld() {
+        use child_exit_sigchld::ChildExitSigchldAnswer;
+        use child_exit_sigchld::ChildExitSigchldControl;
+        let (mut scheduler, parent, creator, _) = owned_sigchld_family();
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let usr2 = kernel_signal_bit(libc::SIGUSR2);
+        let ask = |scheduler: &mut Scheduler| {
+            scheduler.child_exit_sigchld_control(creator, ChildExitSigchldControl::WindowUnusable)
+        };
+        scheduler.recordreplay_modes = true;
+        scheduler.signalfd_masks.insert(parent, chld | usr2);
+        scheduler.note_outside_blocker(parent, Some(chld | usr2), true);
+        assert_eq!(ask(&mut scheduler), ChildExitSigchldAnswer::Placed(true));
+
+        let op = ExternalOpId::new(parent, 7);
+        scheduler.blocked.external_io_blockers.insert(parent, op);
+        scheduler
+            .blocked
+            .out_of_scheduler_masks
+            .insert(parent, Some(chld | usr2));
+        scheduler
+            .background_kernel_signalfd_reads
+            .insert(parent, (op, Some(usr2)));
+        assert_eq!(
+            ask(&mut scheduler),
+            ChildExitSigchldAnswer::Placed(true),
+            "a sibling blocking SIGCHLD and reading a signalfd for SIGUSR2 only"
+        );
+        scheduler.register_signalfd(parent, usr2);
+        assert_eq!(
+            ask(&mut scheduler),
+            ChildExitSigchldAnswer::Placed(true),
+            "a signalfd4 for SIGUSR2 only, after the read began"
+        );
+        scheduler.register_signalfd(parent, chld);
+        assert_eq!(
+            ask(&mut scheduler),
+            ChildExitSigchldAnswer::Placed(false),
+            "a signalfd4 for SIGCHLD after the read began may have re-armed its descriptor"
+        );
+        for read in [Some(chld | usr2), None] {
+            scheduler
+                .background_kernel_signalfd_reads
+                .insert(parent, (op, read));
+            assert_eq!(
+                ask(&mut scheduler),
+                ChildExitSigchldAnswer::Placed(false),
+                "a sibling reading a signalfd for {read:?}"
+            );
+        }
+        scheduler
+            .background_kernel_signalfd_reads
+            .insert(parent, (ExternalOpId::new(parent, 6), Some(chld)));
+        assert_eq!(
+            ask(&mut scheduler),
+            ChildExitSigchldAnswer::Placed(true),
+            "a signalfd read that has ended, the sibling now in another call"
+        );
+        scheduler.background_kernel_signalfd_reads.remove(&parent);
+        for mask in [Some(usr2), None] {
+            scheduler
+                .blocked
+                .out_of_scheduler_masks
+                .insert(parent, mask);
+            assert_eq!(
+                ask(&mut scheduler),
+                ChildExitSigchldAnswer::Placed(false),
+                "a sibling outside the schedule under mask {mask:?}"
+            );
+        }
+        scheduler.recordreplay_modes = false;
+        assert_eq!(
+            ask(&mut scheduler),
+            ChildExitSigchldAnswer::Placed(true),
+            "run mode claims as before"
+        );
     }
 
     /// A thread a guest sent a thread-directed `SIGCHLD` takes that copy from
