@@ -17393,7 +17393,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "81");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "82");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -17430,10 +17430,12 @@ mod nextest_timeout_tests {
         // run_kvm_notifies_a_child_exit_once_at_bitwise_parity
         // (https://github.com/rrnewton/hermit/issues/4360): 79. And
         // run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does
-        // (https://github.com/rrnewton/hermit/issues/4293): 80.
+        // (https://github.com/rrnewton/hermit/issues/4293): 80. And
+        // run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting
+        // (https://github.com/rrnewton/hermit/issues/4374): 81.
         assert_eq!(
             names.len(),
-            80,
+            81,
             "update the exact CI inventory with new KVM tests"
         );
         let required_cases = [
@@ -17450,6 +17452,7 @@ mod nextest_timeout_tests {
             "run_kvm_a_sibling_may_exit_while_its_signal_is_taken",
             "run_kvm_notifies_a_child_exit_once_at_bitwise_parity",
             "run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does",
+            "run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -18503,7 +18506,9 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does
         // (https://github.com/rrnewton/hermit/issues/4293): 80 declarations,
         // 81 selected.
-        ("privileged-only-test.cli_kvm", 81usize),
+        // run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting
+        // (https://github.com/rrnewton/hermit/issues/4374): 81 declarations, 82 selected.
+        ("privileged-only-test.cli_kvm", 82usize),
     ] {
         let step = privileged
             .steps

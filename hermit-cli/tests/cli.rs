@@ -196,6 +196,7 @@ static SIGSUSPEND_SHARED_MASK_REWRITE_GUEST: OnceLock<PathBuf> = OnceLock::new()
 static SIGSUSPEND_SHARED_STACK_MASK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_ONCE_PER_CHILD_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_THEN_SIBLING_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CHAOS_SPINNER_AND_NEW_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1976,6 +1977,32 @@ fn signal_then_sibling_exit_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "signal-then-sibling-exit guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn chaos_spinner_and_new_thread_guest() -> &'static Path {
+    CHAOS_SPINNER_AND_NEW_THREAD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("chaos-spinner-and-new-thread");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the chaos-spinner-and-new-thread guest directory");
+        let guest = build_root.join("chaos_spinner_and_new_thread");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/chaos_spinner_and_new_thread.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the chaos-spinner-and-new-thread guest");
+        assert!(
+            output.status.success(),
+            "chaos-spinner-and-new-thread guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -10010,10 +10037,12 @@ fn run_kvm_notifies_a_child_exit_once_at_bitwise_parity() {
 /// was refused as a protocol failure ("KVM parked signal protocol failed ...
 /// Identity"), on main 2bf536af for `spin` in 4 of 4 runs. The exit now waits
 /// for the permit's release (https://github.com/rrnewton/hermit/issues/4367).
-/// `sigsuspend` also runs under three chaos seeds; `spin` busy-waits with no
-/// blocking call, which chaos can starve on KVM
-/// (https://github.com/rrnewton/hermit/issues/4374), so it runs at the default
-/// schedule. Every run must reach bitwise parity.
+/// `sigsuspend` also runs under three chaos seeds. `spin` runs at the default
+/// schedule: it busy-waits with no blocking call, and under chaos it holds a
+/// new thread off for up to two full slices (200 ms of virtual time each), too
+/// slow for this test; `chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting`
+/// covers that case (https://github.com/rrnewton/hermit/issues/4374). Every
+/// run must reach bitwise parity.
 #[test]
 fn run_kvm_a_sibling_may_exit_while_its_signal_is_taken() {
     if !Path::new("/dev/kvm").exists() {
@@ -10076,6 +10105,177 @@ fn run_kvm_a_sibling_may_exit_while_its_signal_is_taken() {
             );
         }
     }
+}
+
+/// Runs tests/c/chaos_spinner_and_new_thread.c under `--chaos --sched-seed=7`
+/// with 1 ms slices on `backend` (empty for ptrace), and returns how many
+/// virtual milliseconds the spinner kept the new thread waiting, after
+/// checking the run reached bitwise parity with INFO messages compared.
+fn chaos_spinner_wait_ms(backend: &[&str]) -> u64 {
+    let _guard = hermit_run_guard();
+    let guest = chaos_spinner_and_new_thread_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("verify.json");
+    let report_arg = report.to_str().expect("report path should be UTF-8");
+    let mut args: Vec<&str> = backend.to_vec();
+    args.extend([
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--chaos",
+        "--sched-seed=7",
+        "--max-timeslice=1000000",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report_arg,
+        "--",
+        guest,
+    ]);
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("strict verification wrote no verdict"))
+            .expect("strict verification verdict is valid JSON");
+    assert_eq!(verdict["bitwise_parity"], true, "{backend:?}: {verdict}");
+    for side in ["left", "right"] {
+        assert!(
+            verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+            "{backend:?}: no INFO messages compared: {verdict}"
+        );
+    }
+    let stdout = stdout(&output);
+    stdout
+        .strip_prefix("worker ran after ")
+        .and_then(|rest| rest.strip_suffix(" ms\n"))
+        .and_then(|ms| ms.parse().ok())
+        .unwrap_or_else(|| panic!("{backend:?}: unexpected output {stdout:?}"))
+}
+
+/// Under `--chaos`, a thread draws its priority at creation and redraws it
+/// only at the end of its own slice, so a new thread that never runs never
+/// redraws. With seed 7 the worker draws 9820 of 10000 and the main thread
+/// busy-waits on getpid: before, the worker waited until the spinner drew a
+/// worse priority still, 90 ms of virtual time here with 1 ms slices (and,
+/// with the default 200 ms slices, minutes of wall time on 4 of 30 seeds on
+/// ptrace; https://github.com/rrnewton/hermit/issues/4374). A thread passed
+/// over at two slice ends now moves ahead of the spinner and keeps the lead
+/// for its own turns. So it waits two 1 ms slices plus its own turns (each
+/// committed turn advances the clock 0.5 ms): 4 ms here.
+#[test]
+fn chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting() {
+    let waited = chaos_spinner_wait_ms(&[]);
+    assert!(waited <= 4, "the new thread waited {waited} ms");
+}
+
+/// The bounded priority is the one recorded, so a preemption replay of the
+/// schedule reproduces it: the record holds the spinner at one below the
+/// worker's priority, and the replay prints the same wait and re-records the
+/// same priorities and preemption RCB counts. The replay runs under another
+/// seed, 8, whose own schedule differs (it prints another wait), so only the
+/// record can have produced it. (Each replayed change point is recorded one
+/// RCB, 250 ns, earlier, as on main; times are not compared.)
+#[test]
+fn a_bounded_chaos_schedule_replays_as_recorded() {
+    let _guard = hermit_run_guard();
+    let guest = chaos_spinner_and_new_thread_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let recorded = directory.path().join("recorded.json");
+    let replayed = directory.path().join("replayed.json");
+    let common = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--chaos",
+        "--max-timeslice=1000000",
+    ];
+    let mut record_args: Vec<&str> = common.to_vec();
+    record_args.extend([
+        "--sched-seed=7",
+        "--record-preemptions-to",
+        recorded.to_str().unwrap(),
+        "--",
+        guest,
+    ]);
+    let record = hermit(&record_args);
+    assert_success(&record, &record_args);
+    let mut fresh_args: Vec<&str> = common.to_vec();
+    fresh_args.extend(["--sched-seed=8", "--", guest]);
+    let fresh = hermit(&fresh_args);
+    assert_success(&fresh, &fresh_args);
+    assert_ne!(
+        stdout(&fresh),
+        stdout(&record),
+        "seed 8 must schedule differently for the replay below to show anything"
+    );
+    let mut replay_args: Vec<&str> = common.to_vec();
+    replay_args.extend([
+        "--sched-seed=8",
+        "--replay-preemptions-from",
+        recorded.to_str().unwrap(),
+        "--record-preemptions-to",
+        replayed.to_str().unwrap(),
+        "--",
+        guest,
+    ]);
+    let replay = hermit(&replay_args);
+    assert_success(&replay, &replay_args);
+    assert_eq!(stdout(&replay), stdout(&record));
+
+    // Each thread's priorities, in order, and its preemption RCB counts.
+    let schedule = |path: &Path| -> Vec<(String, Vec<u64>, serde_json::Value)> {
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("no preemption record")).unwrap();
+        let threads = json["per_thread"].as_object().expect("per_thread");
+        threads
+            .iter()
+            .map(|(tid, thread)| {
+                let mut priorities: Vec<u64> = thread["prio_changes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|change| change[1].as_u64().unwrap())
+                    .collect();
+                priorities.push(thread["final_prio"].as_u64().unwrap());
+                (tid.clone(), priorities, thread["preemption_rcbs"].clone())
+            })
+            .collect()
+    };
+    let recorded = schedule(&recorded);
+    assert_eq!(schedule(&replayed), recorded);
+    // The worker, the one thread that never changed priority; the spinner
+    // held the one below it.
+    let unchanged: Vec<u64> = recorded
+        .iter()
+        .filter(|(_, priorities, _)| priorities.len() == 1)
+        .map(|(_, priorities, _)| priorities[0])
+        .collect();
+    assert_eq!(unchanged.len(), 1, "{recorded:?}");
+    let worker = unchanged[0];
+    assert!(
+        recorded
+            .iter()
+            .any(|(_, priorities, _)| priorities.contains(&(worker + 1))),
+        "no thread took the priority below the worker's {worker}: {recorded:?}"
+    );
+}
+
+/// The same bound on KVM, where the spinner's getpid takes no scheduler turn
+/// either: 90 ms before, 4 ms now.
+#[test]
+fn run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM chaos spinner case: /dev/kvm is unavailable");
+        return;
+    }
+    let waited = chaos_spinner_wait_ms(&["--backend=kvm"]);
+    assert!(waited <= 4, "the new thread waited {waited} ms");
 }
 
 /// tests/c/clone_exit_signal_effective.c: a child's effective exit signal

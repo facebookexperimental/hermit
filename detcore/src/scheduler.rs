@@ -1770,6 +1770,17 @@ pub struct Scheduler {
     /// A cached copy of the same (immutable) field in Config. Under chaos a
     /// `sched_yield` opens or joins a yield epoch ([`Self::requeue_after`]).
     chaos: bool,
+    /// Whether chaos change points are bounded
+    /// ([`Self::bound_chaos_starvation`]): under `--chaos` with timer
+    /// preemption and the default heuristic, and not replaying preemptions.
+    /// There every change point is a random draw at a timer slice end. A
+    /// preemption replay's change points carry the recorded priorities, which
+    /// already hold any bound applied when they were recorded.
+    chaos_bounds_starvation: bool,
+    /// Under chaos, how many timer-slice change points have passed each runnable
+    /// thread over since its last committed turn
+    /// ([`Self::bound_chaos_starvation`]).
+    chaos_passed_over: BTreeMap<DetTid, u32>,
 
     /// Happens-before enforcement state, present only when the run carries a
     /// `HappensBeforeProgram`. Holds AFTER anchors until their BEFORE anchors
@@ -3337,6 +3348,13 @@ pub struct ConsumeResult {
 /// a response that further includes a path means print to a file at that location.
 pub type MaybePrintStack = Option<Option<PathBuf>>;
 
+/// How many chaos timer-slice change points may pass a runnable thread over,
+/// since its last committed turn, before the changing thread moves behind it
+/// ([`Scheduler::bound_chaos_starvation`]). Each pass ends a slice, capped by
+/// `--max-timeslice`, so a passed-over thread waits at most this many slices
+/// of a thread that never blocks.
+const CHAOS_PASSOVER_BOUND: u32 = 2;
+
 enum ThreadStatus {
     // Not present in scheduler structures.
     Gone,
@@ -3550,6 +3568,11 @@ impl Scheduler {
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
             chaos: cfg.chaos,
+            chaos_bounds_starvation: cfg.chaos
+                && cfg.max_timeslice.is_some()
+                && cfg.sched_heuristic == crate::config::SchedHeuristic::None
+                && cfg.replay_preemptions_from.is_none(),
+            chaos_passed_over: Default::default(),
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
             post_fork_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed() ^ 0x706f_7374_666f_726b),
             happens_before: cfg.happens_before.clone().map(HbRuntime::new),
@@ -5649,6 +5672,7 @@ impl Scheduler {
         });
         self.pending_run_queue_admissions.remove(dtid);
         self.parked.exits_awaiting_permit.remove(dtid);
+        self.chaos_passed_over.remove(dtid);
         self.forget_poll_deadline(*dtid);
         let _ = self.remove_futex_waiter(dtid);
         // A killed thread must not keep the scheduler loop alive as a parked
@@ -10926,6 +10950,8 @@ impl Scheduler {
                     }
                 }
                 crate::detlog::write_forwarded_for(dettid.as_raw(), false);
+                // A committed turn, as a step-5 grant is (`bound_chaos_starvation`).
+                self.chaos_passed_over.remove(&dettid);
                 if enabled!(Level::INFO) {
                     let record_suffix = scheduler_commit_record_suffix(
                         self.turn,
@@ -11415,6 +11441,77 @@ impl Scheduler {
         );
     }
 
+    /// Bound how long chaos priority change points can keep passing a runnable
+    /// thread over (https://github.com/rrnewton/hermit/issues/4374).
+    ///
+    /// Under chaos a thread draws its priority at creation and redraws it only
+    /// at the end of its own slice, so a thread that never runs never redraws.
+    /// Behind a thread that never blocks (a busy-wait on non-blocking calls), a
+    /// new thread with a poor draw waited until the spinner happened to draw
+    /// worse still: at a priority of 9820 out of 10000, about 55 slices of
+    /// 200 ms of virtual time on average, and on ptrace about 1 seed in 8 of a
+    /// busy-wait guest hung for minutes.
+    ///
+    /// It applies only where every change point is a random draw at the end of
+    /// a timer slice (`chaos_bounds_starvation`): under chaos with timer
+    /// preemption, a `sched_yield` takes the yield epoch or a weak yield, never
+    /// a change point (`sched_yield_route`). It never rewrites a priority that
+    /// was chosen rather than drawn: none under a preemption or schedule
+    /// replay, and none under `--sched-heuristic=connectbind`, whose connect and
+    /// bind set the first and last priorities. Under the random heuristics a
+    /// priority does not decide the turn: each turn draws among the queued
+    /// threads, so a thread that never runs is not held back by a draw it made
+    /// once.
+    ///
+    /// Each runnable (non-polling) thread that `dettid`'s new priority still
+    /// beats counts one more pass. A thread passed over at
+    /// [`CHAOS_PASSOVER_BOUND`] such change points since its last committed
+    /// turn moves ahead: `dettid` takes the priority one below it (numerically
+    /// one greater, capped at `LAST_PRIORITY`), so the passed-over thread keeps
+    /// the lead for all its turns until it blocks, or until `dettid`'s next
+    /// change point draws again. A thread's count restarts at its committed
+    /// turn and goes when its blocking entries are removed (it retires, or a
+    /// forced wake requeues it).
+    ///
+    /// Deterministic: it reads only the priority map and run-queue membership
+    /// at this change point, in thread-ID order, and counts change only at
+    /// change points and committed turns; run-queue membership is the same
+    /// input turn selection reads. The priority it returns is the one recorded
+    /// for `dettid`, so a preemption replay restores it as a fixed priority.
+    fn bound_chaos_starvation(&mut self, dettid: DetTid, drawn: Priority) -> Priority {
+        if !self.chaos_bounds_starvation || self.replayer.is_some() {
+            return drawn;
+        }
+        let queued: Vec<(DetTid, Priority)> = self
+            .priorities
+            .iter()
+            .filter(|(tid, _)| **tid != dettid && self.run_queue.contains_non_polling_tid(**tid))
+            .map(|(tid, prio)| (*tid, *prio))
+            .collect();
+        let starving = queued
+            .iter()
+            .filter(|(tid, prio)| {
+                *prio > drawn
+                    && self.chaos_passed_over.get(tid).copied().unwrap_or(0) + 1
+                        >= CHAOS_PASSOVER_BOUND
+            })
+            .map(|(_, prio)| *prio)
+            .max();
+        let priority = starving.map_or(drawn, |prio| (prio + 1).min(runqueue::LAST_PRIORITY));
+        for (tid, prio) in queued {
+            if prio > priority {
+                *self.chaos_passed_over.entry(tid).or_insert(0) += 1;
+            }
+        }
+        if priority != drawn {
+            info!(
+                "[scheduler] chaos change point of dettid {}: priority {} drawn, {} taken, behind a thread passed over at {} change points",
+                dettid, drawn, priority, CHAOS_PASSOVER_BOUND
+            );
+        }
+        priority
+    }
+
     /// Helper for priority changepoint logic
     ///
     /// Precondition: guest is stopped so that there is no chance the ivars are being used
@@ -11435,6 +11532,7 @@ impl Scheduler {
         chaos_epochs: &[crate::resources::ChaosEpochTransition],
     ) -> Result<(), SkipTurn> {
         assert!(runqueue::is_ordinary_priority(new_priority));
+        let new_priority = self.bound_chaos_starvation(dettid, new_priority);
         // Alter the threads priority and requeue.
         let old_priority = self.priorities.insert(dettid, new_priority);
 
@@ -11847,6 +11945,7 @@ impl Scheduler {
                 // this turn serves go to the log here, at a point the schedule fixes
                 // (the order rule at `detlog::set_forwarded_source`).
                 crate::detlog::write_forwarded_for(next_dtid.as_raw(), true);
+                self.chaos_passed_over.remove(&next_dtid);
                 let normalization_marker = if self.is_host_timed_internal_pipe_io_turn(rsrcs) {
                     " [sabre-internal-pipe-io]"
                 } else if self.is_loopback_poll_yield_turn(rsrcs) {
@@ -19206,6 +19305,202 @@ mod test {
                 .is_err()
         );
         assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
+    }
+
+    /// Two threads, spinner and waiter, at the given priorities, both queued,
+    /// on a chaos scheduler.
+    fn chaos_spinner_and_waiter(
+        cfg: Config,
+        spinner_priority: Priority,
+        waiter_priority: Priority,
+    ) -> (Scheduler, DetTid, DetTid) {
+        let mut scheduler = Scheduler::new(&cfg);
+        let spinner = DetTid::from_raw(100);
+        let waiter = DetTid::from_raw(101);
+        for tid in [spinner, waiter] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        scheduler.priorities.insert(spinner, spinner_priority);
+        scheduler.priorities.insert(waiter, waiter_priority);
+        scheduler.runqueue_push_back(spinner);
+        scheduler.runqueue_push_back(waiter);
+        (scheduler, spinner, waiter)
+    }
+
+    /// The spinner's change point, through the scheduler's own path, with
+    /// `drawn` as its new random priority.
+    fn spinner_changepoint(scheduler: &mut Scheduler, spinner: DetTid, drawn: Priority, at: u64) {
+        assert_eq!(
+            scheduler.run_queue.tentative_pop_tid(spinner),
+            Some(spinner)
+        );
+        assert!(
+            scheduler
+                .perform_priority_changepoint(spinner, drawn, LogicalTime::from_nanos(at), at, &[])
+                .is_err()
+        );
+    }
+
+    /// One committed turn of `tid`, through steps 4 to 6: it must be the next
+    /// thread, and it is requeued at the back of its band.
+    fn commit_a_turn(scheduler: &mut Scheduler, tid: DetTid) {
+        let request = Resources::new(tid);
+        let next = scheduler.next_turns.get(&tid).unwrap();
+        next.req.put(Ok(request.clone()));
+        let response = next.resp.clone();
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(tid));
+        assert!(
+            scheduler
+                .step4_resource_block(tid, &request, &response)
+                .is_ok()
+        );
+        assert!(
+            scheduler
+                .step5_guest_unblock(tid, &request, &response)
+                .is_ok()
+        );
+        let requeue = scheduler.requeue_after(&request);
+        scheduler.step6_reenquue(tid, requeue);
+    }
+
+    /// Under chaos, a thread that never blocks redraws its priority at each
+    /// slice end, but a thread that never runs never redraws. A new thread
+    /// with a poor draw (9820 here) waited behind a busy-wait until the spinner
+    /// drew worse still (https://github.com/rrnewton/hermit/issues/4374). Now a
+    /// thread passed over at `CHAOS_PASSOVER_BOUND` slice ends moves ahead:
+    /// the spinner takes the priority one below it, so it keeps the lead for
+    /// every turn it takes, not only the first.
+    #[test]
+    fn a_chaos_change_point_yields_to_a_thread_it_keeps_passing_over() {
+        let (mut scheduler, spinner, waiter) = chaos_spinner_and_waiter(
+            Config {
+                chaos: true,
+                ..Config::default()
+            },
+            500,
+            9820,
+        );
+        assert_eq!(CHAOS_PASSOVER_BOUND, 2);
+        let next = |scheduler: &mut Scheduler| {
+            let next = scheduler.run_queue.tentative_pop_next();
+            scheduler.run_queue.undo_tentative_pop();
+            next
+        };
+        assert_eq!(next(&mut scheduler), Some(spinner));
+        // The first pass: the spinner keeps its draw and runs again.
+        spinner_changepoint(&mut scheduler, spinner, 136, 1);
+        assert_eq!(scheduler.priorities[&spinner], 136);
+        assert_eq!(scheduler.chaos_passed_over.get(&waiter), Some(&1));
+        assert_eq!(next(&mut scheduler), Some(spinner));
+        // The second: it takes the priority one below the waiter's, not 7043.
+        spinner_changepoint(&mut scheduler, spinner, 7043, 2);
+        assert_eq!(scheduler.priorities[&spinner], 9821);
+        // The waiter runs, and keeps running ahead of the spinner turn after
+        // turn; its count restarted at its first committed turn.
+        for _ in 0..3 {
+            commit_a_turn(&mut scheduler, waiter);
+            assert!(!scheduler.chaos_passed_over.contains_key(&waiter));
+        }
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(waiter));
+        scheduler.run_queue.undo_tentative_pop();
+        // A thread whose blocking entries are removed leaves no count behind.
+        scheduler.chaos_passed_over.insert(waiter, 1);
+        scheduler.remove_blocking_entries(&waiter);
+        assert!(!scheduler.chaos_passed_over.contains_key(&waiter));
+    }
+
+    /// A waiter at the last priority has no band below it: the spinner shares
+    /// it and is requeued behind it.
+    #[test]
+    fn a_chaos_change_point_behind_a_last_priority_thread_shares_its_band() {
+        let (mut scheduler, spinner, waiter) = chaos_spinner_and_waiter(
+            Config {
+                chaos: true,
+                ..Config::default()
+            },
+            500,
+            runqueue::LAST_PRIORITY,
+        );
+        spinner_changepoint(&mut scheduler, spinner, 136, 1);
+        spinner_changepoint(&mut scheduler, spinner, 7043, 2);
+        assert_eq!(scheduler.priorities[&spinner], runqueue::LAST_PRIORITY);
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(waiter));
+    }
+
+    /// The bound counts only a thread the new priority still beats, and only
+    /// where every change point is a random draw at a timer slice end: under
+    /// chaos with timer preemption and the default heuristic. Without timer
+    /// preemption (a chaos `sched_yield` is then a change point), under
+    /// `connectbind` (which sets chosen priorities), a preemption replay, a raw
+    /// schedule replay or a random heuristic, and for a polling waiter, every
+    /// change point keeps its draw.
+    #[test]
+    fn a_chaos_change_point_bounds_only_timer_slices_on_the_default_queue() {
+        let chaos = || Config {
+            chaos: true,
+            ..Config::default()
+        };
+        assert!(chaos().max_timeslice.is_some());
+        // A waiter the spinner's draws never beat is never counted.
+        let (mut scheduler, spinner, waiter) = chaos_spinner_and_waiter(chaos(), 500, 9820);
+        for (at, drawn) in [(1, 9900), (2, 9950), (3, 9990)] {
+            spinner_changepoint(&mut scheduler, spinner, drawn, at);
+            assert_eq!(scheduler.priorities[&spinner], drawn);
+            assert!(!scheduler.chaos_passed_over.contains_key(&waiter));
+            scheduler.priorities.insert(spinner, 500);
+            assert!(scheduler.run_queue.remove_tid(spinner));
+            scheduler.runqueue_push_back(spinner);
+        }
+
+        let unbounded = |name: &str, cfg: Config, setup: &dyn Fn(&mut Scheduler)| {
+            let (mut scheduler, spinner, _waiter) = chaos_spinner_and_waiter(cfg, 500, 9820);
+            setup(&mut scheduler);
+            for (at, drawn) in [(1, 136), (2, 7043), (3, 4756)] {
+                spinner_changepoint(&mut scheduler, spinner, drawn, at);
+                assert_eq!(scheduler.priorities[&spinner], drawn, "{name}");
+            }
+            assert!(scheduler.chaos_passed_over.is_empty(), "{name}");
+        };
+        unbounded(
+            "no timer preemption",
+            Config {
+                max_timeslice: None,
+                ..chaos()
+            },
+            &|_| {},
+        );
+        unbounded(
+            "connectbind",
+            Config {
+                sched_heuristic: crate::config::SchedHeuristic::ConnectBind,
+                ..chaos()
+            },
+            &|_| {},
+        );
+        unbounded(
+            "random heuristic",
+            Config {
+                sched_heuristic: crate::config::SchedHeuristic::Random,
+                ..chaos()
+            },
+            &|_| {},
+        );
+        unbounded(
+            "preemption replay",
+            Config {
+                replay_preemptions_from: Some(PathBuf::from("/nonexistent/preemptions.json")),
+                ..chaos()
+            },
+            &|_| {},
+        );
+        unbounded("schedule replay", chaos(), &|scheduler| {
+            scheduler.replayer = Some(replayer::Replayer::new(Vec::new()));
+        });
+        unbounded("polling waiter", chaos(), &|scheduler| {
+            let waiter = DetTid::from_raw(101);
+            assert!(scheduler.run_queue.remove_tid(waiter));
+            scheduler.run_queue.push_poller(waiter, 9820, u32::MAX);
+        });
     }
 
     /// A background grant (here `BlockingExternalIO`) is a turn of a thread

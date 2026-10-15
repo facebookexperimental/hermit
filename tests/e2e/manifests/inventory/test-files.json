@@ -121,6 +121,12 @@
       "why": "tests/c/chaos_last_band_admission.c is owned by hermit-cli/tests/cli.rs: The integration test a_sigsuspend_wake_beside_a_last_band_worker_lands_at_a_fixed_turn_under_chaos runs this guest under run --strict --chaos --chaos-target-races three times at each of two seeds and requires the progress line each seed fixes, 399 at seed 2 and 0 at seed 4, because main's sigsuspend is armed for the SIGCHLD waiting in the shared queue (https://github.com/rrnewton/hermit/issues/4234); a generic manifest cannot assert a seed-specific progress line across repeated chaos runs."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/chaos_spinner_and_new_thread.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/chaos_spinner_and_new_thread.c is owned by hermit-cli/tests/cli.rs: chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting (ptrace) and run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting (KVM) run it under --chaos --sched-seed=7 with 1 ms slices, where a new low-priority thread waits behind a main thread busy-waiting on getpid; the chaos starvation bound must let it run within two slices (https://github.com/rrnewton/hermit/issues/4374). Each run requires run --strict --verify --verify-strict at bitwise parity and parses the guest's own virtual wait, so it remains a guest fixture rather than a manifest cell."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/child_subreaper_refusal.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
