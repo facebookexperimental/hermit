@@ -4834,6 +4834,43 @@ impl<T: RecordOrReplay> Detcore<T> {
         res
     }
 
+    /// Whether `fd`, whose open recorded the host stat `cached`, is a
+    /// directory that is not on procfs (see [`Self::handle_lseek`]). procfs
+    /// keeps the host's seek behavior, as it keeps the host's sizes. A
+    /// descriptor's type and device never change, so the stat its open took
+    /// answers without another `fstat` (Claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/4369). Its block size can (a
+    /// FUSE server reports it), so it only rules procfs out: the kernel's
+    /// procfs always has 1024-byte blocks, and a directory that may be procfs
+    /// is proved so by naming its entry, as a stat does, and KVM's by its
+    /// device ([`procfs_inode::is_backend_procfs_device`]). Under DBT, where
+    /// Detcore names no entries, one with procfs's stat fields keeps the
+    /// host's seek unproved ([`procfs_inode::unprovable_procfs_signature`]).
+    /// With metadata virtualized every descriptor the guest opened has a stat;
+    /// those without are Detcore's own pipes and sockets.
+    async fn is_seekable_directory<G: Guest<Self>>(
+        guest: &mut G,
+        fd: RawFd,
+        cached: Option<DetStat>,
+    ) -> bool {
+        let Some(stat) = cached.filter(|stat| stat.mode & libc::S_IFMT == libc::S_IFDIR) else {
+            return false;
+        };
+        if procfs_inode::is_backend_procfs_device(&guest.config().backend, stat.dev, stat.blksize)
+            || procfs_inode::unprovable_procfs_signature(
+                &guest.config().backend,
+                guest.thread_state().physical_tid,
+                stat.dev,
+                stat.blksize,
+            )
+        {
+            return false;
+        }
+        !Self::procfs_entry(guest, &stat, StatTarget::Descriptor(fd))
+            .await
+            .is_procfs()
+    }
+
     /// SYS_lseek system call.
     pub async fn handle_lseek<G: Guest<Self>>(
         &self,
@@ -4901,6 +4938,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(result);
         }
         let Some((current, snapshot_len)) = procfs_position else {
+            // A directory without a stream yet: SEEK_END would return the
+            // host directory's size, which st_size no longer reports and
+            // which changes as anything outside the run adds or removes an
+            // entry (https://github.com/rrnewton/hermit/issues/4372). Answer
+            // as a stream does (above, tmpfs's `dcache_dir_lseek`), from the
+            // descriptor's first use. An `O_PATH` descriptor goes on to the
+            // kernel, which refuses its seek with EBADF whatever the whence.
+            if guest.config().virtualize_metadata
+                && status_flags & libc::O_PATH == 0
+                && matches!(
+                    call.whence(),
+                    Whence::SEEK_END | Whence::SEEK_DATA | Whence::SEEK_HOLE
+                )
+            {
+                let cached = guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| detfd.stat())?;
+                if Self::is_seekable_directory(guest, call.fd(), cached).await {
+                    return Err(Errno::EINVAL.into());
+                }
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#1044): Regular-file lseek must
             // flow through record_or_replay, exactly as handle_read does for
@@ -6693,7 +6751,53 @@ impl<T: RecordOrReplay> Detcore<T> {
         // number for procfs/sysfs/tmpfs mounts, which drifts between runs (and
         // between the two runs of `--verify`). Reveal only a deterministic
         // device id.
+        let host_device = stat.dev;
         stat.dev = determinize_device(guest, stat.dev).await;
+
+        // A directory's size is whatever its file system makes of its
+        // entries: btrfs sums the names' lengths, tmpfs counts entries, ext4
+        // rounds up to its blocks. So it changes whenever any process adds or
+        // removes an entry, and differs between file systems. Builds stat
+        // every ancestor of their working directory (kbuild, configure,
+        // cargo, CMake's look at $HOME), so the host's value broke
+        // `--verify --verify-strict` of ordinary builds on a shared machine
+        // and reproducibility across hosts
+        // (https://github.com/rrnewton/hermit/issues/4162). Report one
+        // 4096-byte block, as ext4 does for a small directory, whatever the
+        // directory holds; btrfs reports an empty directory as 0, so even
+        // an empty one is set. A procfs directory keeps the host's value
+        // (0, or a descriptor count for /proc/<pid>/fd), which Detcore
+        // already virtualizes there. Only a proved procfs directory keeps
+        // it: one whose entry Detcore names (`ProcfsEntry`, on the backends
+        // whose guest threads are host tasks) or KVM's synthetic procfs
+        // (`procfs_inode::is_backend_procfs_device`). Its stat fields alone
+        // prove nothing: an anonymous device with 1024-byte blocks is also
+        // devpts, autofs or a FUSE mount reporting those blocks (Codex
+        // re-check of https://github.com/rrnewton/hermit/pull/4369). Under
+        // DBT, where Detcore names no procfs entries, such a directory keeps
+        // the host's value unproved
+        // (`procfs_inode::unprovable_procfs_signature`). sysfs and cgroup
+        // directories, which Linux also reports as 0, report 4096.
+        if stat.mode & libc::S_IFMT == libc::S_IFDIR
+            && stat.mask.contains(StatxMask::STATX_SIZE)
+            && !procfs.is_procfs()
+            && !procfs_inode::is_backend_procfs_device(
+                &guest.config().backend,
+                host_device,
+                stat.blksize,
+            )
+            && !procfs_inode::unprovable_procfs_signature(
+                &guest.config().backend,
+                guest.thread_state().physical_tid,
+                host_device,
+                stat.blksize,
+            )
+        {
+            stat.size = 4096;
+            if stat.mask.contains(StatxMask::STATX_BLOCKS) {
+                stat.blocks = 8;
+            }
+        }
 
         let epoch_tp = Timespec {
             tv_sec: cfg.epoch.timestamp(),

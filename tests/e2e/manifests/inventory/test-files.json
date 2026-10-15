@@ -308,6 +308,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/directory_size.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/directory_size.c is owned by hermit-cli/tests/cli.rs: The integration tests a_directory_reports_one_block_whatever_it_holds, entries_added_outside_a_run_leave_verify_strict_parity, a_fresh_directory_descriptor_refuses_seek_end, a_directory_descriptors_first_seeks, run_kvm_a_directory_descriptors_first_seeks, a_directory_named_proc_exempts_nothing, a_procfs_directory_keeps_its_size, dbt_a_procfs_directory_keeps_its_size and run_kvm_a_procfs_directory_keeps_its_size run this guest under run --strict: on a tmpfs inside a user and mount namespace a directory reports st_size 4096 and st_blocks 8 before and after entries are added, and --verify --verify-strict stays at bitwise parity while another process adds and removes entries for more than 100 rounds; SEEK_END is EINVAL on a fresh or inherited directory descriptor and EBADF on an O_PATH one, on ptrace and KVM; after a chroot into a tree whose proc is an ordinary directory, another directory still reports one block and refuses SEEK_END; an open /proc keeps size 0 and SEEK_END 0 on ptrace, DBT and KVM (https://github.com/rrnewton/hermit/issues/4162); a generic manifest cannot mount the tmpfs, run the outside writer, pass a directory as standard input, chroot, or check the verify verdict."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/dlopen_cpuid_vendor.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/dlopen_cpuid_vendor.c is owned by hermit-cli/tests/cli.rs: The in-guest LiteInst program tests (hermit-cli/tests/common/liteinst_in_guest_programs.rs) compile this guest, which executes CPUID in its main executable and then dlopens tests/c/dlopen_cpuid_vendor_lib.c whose constructor executes CPUID in code mapped after start-up, and require both vendor strings under ptrace and in-guest LiteInst; it remains a guest fixture because a generic manifest cannot build and pass the companion shared library."
@@ -545,6 +551,12 @@
       "path": "tests/c/ftruncate_sparse.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/ftruncate_sparse.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/fuse_directory.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/fuse_directory.c is owned by hermit-cli/tests/cli.rs: a_fuse_directory_with_procfs_block_size_is_not_procfs runs it inside a user and mount namespace to mount a FUSE directory with 1024-byte blocks and a size that changes, then runs tests/c/directory_size.c's fuse mode under run --strict inside it, which must report one block and refuse SEEK_END as for any directory outside procfs (https://github.com/rrnewton/hermit/issues/4162); it is a FUSE server rather than a guest, and a generic manifest cannot mount it."
     },
     {
       "disposition": "guest-fixture",

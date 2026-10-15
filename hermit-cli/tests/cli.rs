@@ -157,6 +157,8 @@ static FUTEX_REWAIT_CHANGED_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_SIGNAL_MASKED_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_LAST_BAND_ADMISSION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static YIELD_LOOP_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DIRECTORY_SIZE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUSE_DIRECTORY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LAST_BAND_BACKGROUND_CALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SCHEDULER_SIGNAL_WAITING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_WAITING_BESIDE_BACKGROUND_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -31745,6 +31747,454 @@ fn a_yield_loop_waiting_for_a_finished_call_verifies_under_chaos() {
     .expect("the verify verdict is not JSON");
     assert_eq!(report["verdict"], "matched", "{report}");
     assert_eq!(report["bitwise_parity"], true, "{report}");
+}
+
+/// `hermit run --strict` of the directory-size guest with `args`, inside a
+/// user and mount namespace with a tmpfs mounted on `mount_point`, after
+/// `prelude` (shell, with the mount point as `$1`) has started. A prelude that
+/// starts an outside writer sets `$churn` to its PID and has it write its
+/// round count to `$1/.rounds`; the writer must still be running when the run
+/// ends, and stderr then reports the rounds it completed during the run. tmpfs counts a
+/// directory's entries in its size, so the host value moves on every file
+/// system the test runs on; ext4 alone would stay at 4096 and hide a missing
+/// rule (Claude review of https://github.com/rrnewton/hermit/pull/4369).
+fn run_directory_size_guest_on_tmpfs(
+    directory: &Path,
+    mount_point: &Path,
+    prelude: &str,
+    hermit_args: &[&str],
+) -> (Option<std::process::ExitStatus>, String, String) {
+    let script = format!(
+        r#"
+        mount -t tmpfs none "$1" || exit 3
+        mnt=$1
+        {prelude}
+        shift
+        before=$(cat "$mnt/.rounds" 2>/dev/null || echo 0)
+        "$@"
+        status=$?
+        if [ -n "${{churn:-}}" ]; then
+            after=$(cat "$mnt/.rounds" 2>/dev/null || echo 0)
+            kill -0 "$churn" || {{ echo "the outside writer stopped during the run" >&2; status=3; }}
+            echo "outside writer rounds during the run: $((after - before))" >&2
+            kill "$churn"
+        fi
+        exit "$status"
+        "#
+    );
+    let mut command = Command::new("unshare");
+    command
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "sh",
+            "-c",
+            &script,
+            "sh",
+        ])
+        .arg(mount_point)
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(hermit_args);
+    let (status, log) = run_with_deadline(command, directory, Duration::from_secs(120), false);
+    let stdout = fs::read_to_string(directory.join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    (status, stdout, log)
+}
+
+/// A directory reports one 4096-byte block (st_size 4096, st_blocks 8),
+/// whatever it holds and whatever file system it is on; the host's value
+/// changes whenever an entry is added or removed, and differs between file
+/// systems (tmpfs counts entries, btrfs sums their names' lengths and reports
+/// an empty directory as 0). A procfs directory keeps the host's 0
+/// (https://github.com/rrnewton/hermit/issues/4162).
+#[test]
+fn a_directory_reports_one_block_whatever_it_holds() {
+    let guest = futex_c_guest(&DIRECTORY_SIZE_GUEST, "directory_size")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mount_point = directory.path().join("tmpfs");
+    fs::create_dir(&mount_point).unwrap();
+    let mount_arg = mount_point.to_str().unwrap().to_owned();
+    let (status, stdout, log) = run_directory_size_guest_on_tmpfs(
+        directory.path(),
+        &mount_point,
+        "",
+        &[
+            "run",
+            "--strict",
+            "--",
+            guest.as_str(),
+            "grow",
+            mount_arg.as_str(),
+        ],
+    );
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "the run must exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(stdout, "dir 4096 then 4096, blocks 8; /proc 0\n");
+}
+
+/// Entries another process adds to and removes from a directory while the
+/// guest stats it leave `--verify --verify-strict` at bitwise parity: the
+/// guest's view of the directory's size no longer follows the host's. Builds
+/// stat every ancestor of their working directory, and the host's value
+/// failed verification of ordinary builds on a shared machine
+/// (https://github.com/rrnewton/hermit/issues/4162).
+#[test]
+fn entries_added_outside_a_run_leave_verify_strict_parity() {
+    let guest = futex_c_guest(&DIRECTORY_SIZE_GUEST, "directory_size")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mount_point = directory.path().join("tmpfs");
+    fs::create_dir(&mount_point).unwrap();
+    let mount_arg = mount_point.to_str().unwrap().to_owned();
+    let verdict = directory.path().join("verify.json");
+    let verdict_arg = verdict.to_str().unwrap().to_owned();
+    let churn = r#"
+        ( i=0; while :; do
+            : > "$1/outside-entry-$((i % 32))"
+            [ $((i % 3)) -eq 0 ] && rm -f "$1/outside-entry-$((i % 32))"
+            i=$((i + 1))
+            [ $((i % 16)) -eq 0 ] && echo "$i" > "$1/.rounds"
+          done ) &
+        churn=$!
+        sleep 0.1
+        kill -0 "$churn" || { echo "the outside writer did not start" >&2; exit 3; }
+    "#;
+    let (status, stdout, log) = run_directory_size_guest_on_tmpfs(
+        directory.path(),
+        &mount_point,
+        churn,
+        &[
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict_arg.as_str(),
+            "--",
+            guest.as_str(),
+            "watch",
+            mount_arg.as_str(),
+            "2000",
+        ],
+    );
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "the run must verify and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&verdict).expect("failed to read the verify verdict"),
+    )
+    .expect("the verify verdict is not JSON");
+    assert_eq!(report["verdict"], "matched", "{report}");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+    assert!(
+        stdout.ends_with("watched 2000 times; size 4096\n"),
+        "{stdout:?}"
+    );
+    // The writer changed the directory throughout the run, so the matched
+    // verdict is not a quiet directory's (Codex re-check of
+    // https://github.com/rrnewton/hermit/pull/4369).
+    let rounds: u64 = log
+        .lines()
+        .find_map(|line| line.strip_prefix("outside writer rounds during the run: "))
+        .and_then(|rounds| rounds.parse().ok())
+        .unwrap_or_else(|| panic!("no outside writer round count:\n{log}"));
+    assert!(
+        rounds > 100,
+        "the outside writer completed only {rounds} rounds during the run"
+    );
+}
+
+/// A fresh descriptor of a directory refuses SEEK_END (EINVAL), as tmpfs and
+/// Hermit's sorted directory stream do, instead of returning the host
+/// directory's size, which changes as anything outside the run adds or
+/// removes an entry (Codex review of https://github.com/rrnewton/hermit/pull/4369;
+/// https://github.com/rrnewton/hermit/issues/4372). Natively on btrfs this
+/// returns the size and on ext4 a hash cookie.
+#[test]
+fn a_fresh_directory_descriptor_refuses_seek_end() {
+    let guest = futex_c_guest(&DIRECTORY_SIZE_GUEST, "directory_size")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let sought = directory.path().join("sought");
+    fs::create_dir(&sought).unwrap();
+    let sought_arg = sought.to_str().unwrap().to_owned();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--",
+            guest.as_str(),
+            "seek",
+            sought_arg.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(60),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "the run must exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(stdout, "seek end: EINVAL\n");
+}
+
+/// SEEK_END on a directory descriptor's first use: EINVAL on a fresh
+/// descriptor, EBADF on an O_PATH one as Linux answers it, and with `stdin`,
+/// EINVAL on a descriptor the run inherited. An earlier revision panicked the
+/// run (exit 125) on ptrace and KVM when such a seek came before any directory
+/// stat, and answered EINVAL for O_PATH (Claude re-check of
+/// https://github.com/rrnewton/hermit/pull/4369). Nothing is set up on a first
+/// use any more, so the ordinary dynamically linked guest exercises the same
+/// path; a static one would need a static libc the pinned validation root
+/// lacks.
+fn assert_first_directory_seeks(backend: &str, stdin: bool) {
+    let guest = futex_c_guest(&DIRECTORY_SIZE_GUEST, "directory_size")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let sought = directory.path().join("sought");
+    fs::create_dir(&sought).unwrap();
+    let sought_arg = sought.to_str().unwrap().to_owned();
+    let backend_arg = format!("--backend={backend}");
+    let mut cases = vec![
+        ("seek", "seek end: EINVAL\n"),
+        ("seek-path", "seek end: EBADF\n"),
+    ];
+    if stdin {
+        cases.push(("seek-stdin", "seek end: EINVAL\n"));
+    }
+    for (mode, expected) in cases {
+        let mut command = hermit_command(&[
+            backend_arg.as_str(),
+            "run",
+            "--strict",
+            "--",
+            guest.as_str(),
+            mode,
+            sought_arg.as_str(),
+        ]);
+        if mode == "seek-stdin" {
+            command.stdin(fs::File::open(&sought).unwrap());
+        }
+        let (status, log) =
+            run_with_deadline(command, directory.path(), Duration::from_secs(60), false);
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{backend} {mode}: the run must exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{backend} {mode}");
+    }
+}
+
+/// [`assert_first_directory_seeks`] on ptrace.
+#[test]
+fn a_directory_descriptors_first_seeks() {
+    assert_first_directory_seeks("ptrace", true);
+}
+
+/// [`assert_first_directory_seeks`] on KVM.
+#[test]
+fn run_kvm_a_directory_descriptors_first_seeks() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM first directory seeks: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    assert_first_directory_seeks("kvm", true);
+}
+
+/// A directory merely named `/proc` is not procfs: after a chroot into a tree
+/// whose `proc` is an ordinary directory, another directory on the same file
+/// system still reports one block and refuses SEEK_END. When Detcore took the
+/// device of whatever `/proc` named as procfs's, it printed "chroot dir 0 then
+/// 3180, blocks 0; seek end: 3180" on btrfs (Codex re-check of
+/// https://github.com/rrnewton/hermit/pull/4369). Also without a `/proc`.
+#[test]
+fn a_directory_named_proc_exempts_nothing() {
+    let guest = futex_c_guest(&DIRECTORY_SIZE_GUEST, "directory_size")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for fake_proc in [true, false] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let root = directory.path().join("root");
+        fs::create_dir_all(root.join("watched")).unwrap();
+        if fake_proc {
+            fs::create_dir(root.join("proc")).unwrap();
+        }
+        let root_arg = root.to_str().unwrap().to_owned();
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "run",
+                "--strict",
+                "--",
+                guest.as_str(),
+                "chroot",
+                root_arg.as_str(),
+            ]),
+            directory.path(),
+            Duration::from_secs(60),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "fake /proc {fake_proc}: the run must exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(
+            stdout, "chroot dir 4096 then 4096, blocks 8; seek end: EINVAL\n",
+            "fake /proc {fake_proc}"
+        );
+    }
+}
+
+/// A FUSE directory whose server reports 1024-byte blocks on an anonymous
+/// device, as procfs's stat fields look, is not procfs: it reports one block
+/// and refuses SEEK_END while its server's size changes. `changing` also moves
+/// its block size from 1024 to 4096 under one open descriptor, which must not
+/// change the seek's answer. When Detcore took those stat fields as procfs,
+/// the guest read the server's 1111 and 2222 (Codex re-check of
+/// https://github.com/rrnewton/hermit/pull/4369); natively it reads them too.
+#[test]
+fn a_fuse_directory_with_procfs_block_size_is_not_procfs() {
+    let guest = futex_c_guest(&DIRECTORY_SIZE_GUEST, "directory_size")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let server = futex_c_guest(&FUSE_DIRECTORY_GUEST, "fuse_directory")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for mode in ["fixed", "changing"] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let mount_point = directory.path().join("fuse");
+        fs::create_dir(&mount_point).unwrap();
+        let mount_arg = mount_point.to_str().unwrap().to_owned();
+        let control = directory.path().join("control");
+        let control_arg = control.to_str().unwrap().to_owned();
+        let mut command = Command::new("unshare");
+        command
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                server.as_str(),
+                mode,
+                mount_arg.as_str(),
+                control_arg.as_str(),
+            ])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "run",
+                "--strict",
+                "--",
+                guest.as_str(),
+                "fuse",
+                mount_arg.as_str(),
+                control_arg.as_str(),
+            ]);
+        let (status, log) =
+            run_with_deadline(command, directory.path(), Duration::from_secs(60), false);
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}: the run must exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(
+            stdout,
+            "before fuse 1 size 4096 blocks 8; seek end: EINVAL\n\
+             after fuse 1 size 4096 blocks 8; seek end: EINVAL\n",
+            "{mode}"
+        );
+    }
+}
+
+/// An open procfs directory keeps the host's size, 0, through fstat, and the
+/// host's SEEK_END, 0: on ptrace Detcore proves it procfs by naming its entry,
+/// and on KVM by the backend's synthetic procfs device. An earlier rule keyed
+/// on procfs naming alone reported 4096 under KVM (Claude review of
+/// https://github.com/rrnewton/hermit/pull/4369), and one that refused SEEK_END
+/// on every directory but KVM's passed every other test (Claude re-check at
+/// ff79270863c6903a93a50feb78c9e941e4f02e65).
+fn assert_procfs_directory_keeps_its_size(backend: &str) {
+    let guest = futex_c_guest(&DIRECTORY_SIZE_GUEST, "directory_size")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let backend_arg = format!("--backend={backend}");
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            backend_arg.as_str(),
+            "run",
+            "--strict",
+            "--tmp=/tmp",
+            "--",
+            guest.as_str(),
+            "proc",
+        ]),
+        directory.path(),
+        Duration::from_secs(60),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "{backend}: the run must exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(stdout, "proc 0 0; seek end: 0\n", "{backend}");
+}
+
+/// [`assert_procfs_directory_keeps_its_size`] on ptrace.
+#[test]
+fn a_procfs_directory_keeps_its_size() {
+    assert_procfs_directory_keeps_its_size("ptrace");
+}
+
+/// [`assert_procfs_directory_keeps_its_size`] on DBT, where Detcore names no
+/// procfs entries and keeps the host's values for a directory with procfs's
+/// stat fields (`procfs_inode::unprovable_procfs_signature`; Codex and Claude
+/// re-checks of https://github.com/rrnewton/hermit/pull/4369).
+#[test]
+#[cfg(feature = "dbt")]
+fn dbt_a_procfs_directory_keeps_its_size() {
+    let _guard = hermit_run_guard();
+    assert_procfs_directory_keeps_its_size("dbt");
+}
+
+/// [`assert_procfs_directory_keeps_its_size`] on KVM.
+#[test]
+fn run_kvm_a_procfs_directory_keeps_its_size() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM procfs directory size: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    assert_procfs_directory_keeps_its_size("kvm");
 }
 
 /// A yield loop beside a call that only the yielder or an alarm can end

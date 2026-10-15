@@ -133,6 +133,52 @@ pub(crate) fn may_be_procfs(device: u64, block_size: i64) -> bool {
     libc::major(device) == 0 && block_size == PROC_BLOCK_SIZE
 }
 
+/// The device of the procfs files the KVM backend synthesizes (`/proc` and
+/// its allowlisted files): reverie-kvm's `synthetic_dev(SYNTHETIC_PROC_DEV_MINOR)`
+/// in `reverie-kvm/src/executor.rs`, which reports them with 4096-byte blocks.
+/// `run_kvm_a_procfs_directory_keeps_its_size` fails if the two drift apart.
+pub(crate) const KVM_SYNTHETIC_PROC_DEVICE: u64 = libc::makedev(0, 0xff01);
+
+/// Whether a stat result is the procfs of a backend whose `/proc` is its
+/// own: where the tool cannot name guest descriptors through host procfs
+/// ([`tool_can_name_guest_descriptors`], KVM), the backend serves `/proc`
+/// itself, on [`KVM_SYNTHETIC_PROC_DEVICE`] with 4096-byte blocks, and that
+/// device is the proof. Elsewhere the kernel's procfs is proved by naming the
+/// entry (`ProcfsEntry`), not by its stat fields: an anonymous device with
+/// 1024-byte blocks is also devpts, autofs or a FUSE mount that reports those
+/// blocks (Codex re-check of https://github.com/rrnewton/hermit/pull/4369).
+pub(crate) fn is_backend_procfs_device(
+    backend: &BackendCapabilities,
+    device: u64,
+    block_size: i64,
+) -> bool {
+    !tool_can_name_guest_descriptors(backend)
+        && device == KVM_SYNTHETIC_PROC_DEVICE
+        && block_size == 4096
+}
+
+/// Whether a stat result must be taken as procfs although Detcore cannot
+/// prove it: where guest thread IDs do not name host tasks
+/// ([`guest_tids_name_host_tasks`]), Detcore names no procfs entries, but
+/// where the tool still shares the kernel's procfs with the guest
+/// ([`tool_can_name_guest_descriptors`]: DBT), a file with procfs's stat
+/// fields ([`may_be_procfs`]) may be procfs. Taking it as an ordinary file
+/// turned `/proc`'s size 0 and SEEK_END 0 into 4096 and EINVAL there (Codex
+/// re-check of https://github.com/rrnewton/hermit/pull/4369), so it keeps
+/// what it had before; so does a FUSE directory reporting 1024-byte blocks,
+/// until Detcore names procfs entries there
+/// (https://github.com/rrnewton/hermit/issues/4395).
+pub(crate) fn unprovable_procfs_signature(
+    backend: &BackendCapabilities,
+    physical_tid: Option<i32>,
+    device: u64,
+    block_size: i64,
+) -> bool {
+    tool_can_name_guest_descriptors(backend)
+        && !guest_tids_name_host_tasks(backend, physical_tid)
+        && may_be_procfs(device, block_size)
+}
+
 /// Whether the thread IDs of a guest that `backend` runs name host tasks,
 /// whose `/proc/<tid>` the tracer can read, for a guest thread whose host
 /// thread ID is `physical_tid` when the backend supplies one beside its own.
@@ -1148,6 +1194,77 @@ mod tests {
         ] {
             assert_eq!(tasks(path), Vec::<i32>::new(), "{path}");
         }
+    }
+
+    #[test]
+    fn only_kvms_synthetic_procfs_device_is_proved_by_its_stat_fields() {
+        let synthetic = libc::makedev(0, 0xff01);
+        assert!(is_backend_procfs_device(
+            &BackendCapabilities::KVM,
+            synthetic,
+            4096
+        ));
+        assert!(!is_backend_procfs_device(
+            &BackendCapabilities::KVM,
+            synthetic,
+            1024
+        ));
+        assert!(!is_backend_procfs_device(
+            &BackendCapabilities::KVM,
+            PROC_DEVICE,
+            1024
+        ));
+        assert!(!is_backend_procfs_device(
+            &BackendCapabilities::PTRACE,
+            synthetic,
+            4096
+        ));
+        assert!(!is_backend_procfs_device(
+            &BackendCapabilities::PTRACE,
+            PROC_DEVICE,
+            1024
+        ));
+        assert!(!is_backend_procfs_device(
+            &BackendCapabilities::DBT,
+            PROC_DEVICE,
+            1024
+        ));
+    }
+
+    #[test]
+    fn only_a_backend_that_names_no_entries_but_shares_procfs_keeps_its_signature() {
+        // DBT: guest thread IDs are its scheduler's virtual IDs.
+        assert!(unprovable_procfs_signature(
+            &BackendCapabilities::DBT,
+            Some(4242),
+            PROC_DEVICE,
+            1024
+        ));
+        assert!(!unprovable_procfs_signature(
+            &BackendCapabilities::DBT,
+            Some(4242),
+            PROC_DEVICE,
+            4096
+        ));
+        assert!(!unprovable_procfs_signature(
+            &BackendCapabilities::DBT,
+            Some(4242),
+            libc::makedev(8, 1),
+            1024
+        ));
+        // ptrace names entries; KVM's procfs is its own.
+        assert!(!unprovable_procfs_signature(
+            &BackendCapabilities::PTRACE,
+            None,
+            PROC_DEVICE,
+            1024
+        ));
+        assert!(!unprovable_procfs_signature(
+            &BackendCapabilities::KVM,
+            None,
+            PROC_DEVICE,
+            1024
+        ));
     }
 
     #[test]
