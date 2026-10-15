@@ -671,3 +671,47 @@ fn a_deleted_timers_park_goes() {
             .is_empty()
     );
 }
+
+/// R5-2 (rev 7 F): an unignore whose parked expiry's discarded copy is still
+/// pending lets that copy stand for the re-queued entry, with no physical
+/// send, so the single target is woken; the caller, running, is not.
+#[test]
+fn a_copy_standing_for_an_unignored_entry_wakes_the_target() {
+    let mut f = family();
+    for thread in [f.leader, f.sibling] {
+        let state = f.sched.test_kernel_signal_states.get_mut(&thread).unwrap();
+        state.caught = 0;
+        state.ignored = kernel_signal_bit(USR1);
+    }
+    f.arm(0, SignalTarget::Process(f.leader), 10, 10);
+    f.pop(10);
+    let sh = shared(&f);
+    assert!(
+        f.sched.discarded_at_send.is_discarded(sh, USR1),
+        "parked, its copy discarded"
+    );
+    f.sent();
+    // Now the leader blocks USR1 (it would have been discarded otherwise),
+    // and the sibling polls.
+    f.sibling_polls();
+    assert!(!f.woken(f.sibling));
+    f.sched
+        .discarded_signal_control(f.leader, DiscardedSignalControl::Unignored { signal: USR1 });
+    assert!(
+        f.sent().is_empty(),
+        "the discarded copy stands; nothing is sent"
+    );
+    assert_eq!(
+        f.sched
+            .discarded_at_send
+            .lists
+            .front(sh, USR1)
+            .map(|front| front.1),
+        Some(FrontClass::Proxy)
+    );
+    assert!(!f.sched.discarded_at_send.is_discarded(sh, USR1));
+    assert!(
+        f.woken(f.sibling),
+        "the copy-stands unignore wakes the sibling"
+    );
+}

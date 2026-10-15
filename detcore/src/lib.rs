@@ -1021,13 +1021,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             // it inside the dequeue, with no turn
             // (<https://github.com/rrnewton/hermit/issues/4262>).
             let mut timer_entry = false;
+            let stop_time = guest.thread_state().thread_logical_time.as_nanos();
             if scheduler::discarded_at_send::records(&self.cfg) && (1..32).contains(&signal.raw()) {
                 use scheduler::discarded_at_send::DiscardedSignalAnswer;
                 use scheduler::discarded_at_send::DiscardedSignalControl;
                 use scheduler::posix_timer_coalesce::DeliveryAnswer;
                 let control = DiscardedSignalControl::Dequeue {
                     signal: signal.raw(),
-                    at: guest.thread_state().thread_logical_time.as_nanos(),
+                    at: stop_time,
                 };
                 let answer = tool_global::discarded_signal(guest, control).await;
                 timer_entry = answer == DiscardedSignalAnswer::Delivery(DeliveryAnswer::TimerEntry);
