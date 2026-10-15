@@ -38,6 +38,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The virtual-time epoch the fixtures' Hermit runs share unless the caller
+/// set `HERMIT_EPOCH`.
+const LIT_EPOCH: &str = "2026-01-01T00:00:00Z";
+
 /// The verdict on one fixture.
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -267,18 +271,26 @@ fn run_fixture(path: &Path, substitutions: &[(&str, &Path)]) -> Outcome {
 
     let label = format!("lit fixture {}", path.display());
     let (output, recorded) = hermit_test::hermit_output_with(&label, || {
-        let scratch = tempfile::tempdir().expect("failed to create the fixture's directory");
+        let scratch = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create the fixture's directory");
         let recorded = scratch.path().join("filecheck");
         fs::create_dir(&recorded).unwrap();
         let work = scratch.path().join("work");
         fs::create_dir(&work).unwrap();
-        let output = Command::new("bash")
+        let mut command = Command::new("bash");
+        command
             .arg("-c")
             .arg(&script)
             .current_dir(&work)
-            .env("LIT_FILECHECK_DIR", &recorded)
-            .output()
-            .expect("failed to run bash");
+            .env("LIT_FILECHECK_DIR", &recorded);
+        // A Hermit run with no epoch draws one from the host and saves its
+        // inputs as a recording under ~/.cache/hermit. One fixed epoch makes
+        // the fixtures' runs repeatable and saves nothing; a fixture that
+        // passes --epoch keeps its own.
+        if std::env::var_os("HERMIT_EPOCH").is_none() {
+            command.env("HERMIT_EPOCH", LIT_EPOCH);
+        }
+        let output = command.output().expect("failed to run bash");
         let inputs: Vec<Option<String>> = (0..calls.len())
             .map(|index| fs::read_to_string(recorded.join(index.to_string())).ok())
             .collect();
@@ -390,6 +402,122 @@ fn every_lit_fixture_is_within_the_supported_subset() {
     }
     // `grep -o '\bFileCheck\b'` over the same files' RUN: lines also counts 36.
     assert_eq!(checked, 36);
+}
+
+/// The `%me` of FIXTURE, built into DIRECTORY: its directory's `main.c`,
+/// compiled with the internal `cpp_lit_unittest` rule's flags. A fixture
+/// beside no `main` has none, so a RUN line naming `%me` is refused.
+fn build_me(fixture: &Path, directory: &Path) -> Option<PathBuf> {
+    let source = fixture.parent()?.join("main.c");
+    if fixture.parent()? == lit_root().as_path() || !source.is_file() {
+        return None;
+    }
+    let me = directory.join("me");
+    let output = Command::new("cc")
+        .args(["-O2", "-g", "-pthread"])
+        .args(["-D_POSIX_C_SOURCE=20180920", "-D_GNU_SOURCE=1", "-UNDEBUG"])
+        .arg("-o")
+        .arg(&me)
+        .arg(&source)
+        .output()
+        .unwrap_or_else(|error| panic!("cannot run cc for {}: {error}", source.display()));
+    assert!(
+        output.status.success(),
+        "cc failed for {}:\n{}",
+        source.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Some(me)
+}
+
+/// Run the fixture at RELATIVE (under detcore/tests/lit) as lit would.
+///
+/// Its scripts run in a fresh directory of their own, as lit's do, and keep
+/// the fixtures' own Hermit arguments: they name paths relative to that
+/// directory (tmpfs.test binds `foo`), and FileCheck compares each run with
+/// fixed text, not with a second run, so validation's `/test` workdir is not
+/// imposed on them.
+fn run_case(relative: &str) {
+    let fixture = lit_root().join(relative);
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the fixture's build directory");
+    let me = build_me(&fixture, directory.path());
+    let mut substitutions = vec![("hermit", hermit_test::hermit_binary())];
+    if let Some(me) = &me {
+        substitutions.push(("me", me.as_path()));
+    }
+    match run_fixture(&fixture, &substitutions) {
+        Outcome::Pass => {}
+        outcome => panic!("lit fixture {relative}: {outcome:?}"),
+    }
+}
+
+/// A fixture whose `%me` is a Rust or Go program. Those run in a later step,
+/// once validation prepares their binaries.
+fn waits_for_its_guest(fixture: &Path) -> bool {
+    let directory = fixture.parent().unwrap();
+    directory.join("main.rs").is_file() || directory.join("main.go").is_file()
+}
+
+macro_rules! lit_cases {
+    ($($(#[ignore = $reason:literal])? $name:ident => $path:literal,)+) => {
+        /// Every fixture this file runs, as paths under detcore/tests/lit.
+        const LIT_CASES: &[&str] = &[$($path),+];
+        $(
+            #[test]
+            $(#[ignore = $reason])?
+            fn $name() {
+                run_case($path);
+            }
+        )+
+    };
+}
+
+lit_cases! {
+    #[ignore = "the pinned root has no /etc/issue, which cat.test reads through Hermit and requires to be non-empty"]
+    lit_cat => "cat.test",
+    lit_exit_code => "exit_code.test",
+    lit_hostname => "hostname.test",
+    lit_tmpfs => "tmpfs.test",
+    lit_tmpfs_preserved => "tmpfs_preserved.test",
+    lit_uname => "uname.test",
+    lit_scheduler_strategies_chaos_verify =>
+        "scheduler_strategies/hermit-run-shedulers-chaos-verify.sh",
+    lit_scheduler_strategies_strict_verify =>
+        "scheduler_strategies/hermit-run-shedulers-strict-verify.sh",
+    lit_hello_world_c_main => "hello_world_c/main.c",
+    lit_hello_world_c_hermit_run => "hello_world_c/hermit-run.lit",
+    lit_hello_world_c_hermit_run_strict => "hello_world_c/hermit-run-strict.lit",
+    lit_networking_main => "networking/main.c",
+    lit_networking_hermit_run => "networking/hermit-run.lit",
+    lit_rt_sigaction_main => "rt_sigaction/main.c",
+    lit_rt_sigaction_hermit_run => "rt_sigaction/hermit-run.lit",
+    lit_rt_sigprocmask_main => "rt_sigprocmask/main.c",
+    lit_rt_sigprocmask_hermit_run => "rt_sigprocmask/hermit-run.lit",
+    lit_timerfd_virtual_time_main => "timerfd_virtual_time/main.c",
+    lit_timerfd_virtual_time_hermit_run_strict => "timerfd_virtual_time/hermit-run-strict.lit",
+}
+
+/// Every fixture is a case here, or waits for its Rust or Go guest; none is
+/// silently left out.
+#[test]
+fn every_lit_fixture_is_a_case_or_waits_for_its_guest() {
+    let root = lit_root();
+    let expected: Vec<String> = fixtures(&root)
+        .into_iter()
+        .filter(|fixture| !waits_for_its_guest(fixture))
+        .map(|fixture| {
+            fixture
+                .strip_prefix(&root)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    let mut cases: Vec<String> = LIT_CASES.iter().map(|case| case.to_string()).collect();
+    cases.sort();
+    assert_eq!(cases, expected);
 }
 
 #[cfg(test)]

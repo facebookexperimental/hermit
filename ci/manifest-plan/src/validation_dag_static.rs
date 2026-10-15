@@ -2577,8 +2577,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 60 + 169 + 232 = 461.
     // And lit's 18 runner and FileCheck-matcher tests in the second shard:
     // 60 + 187 + 232 = 479.
+    // And lit's 19 detcore/tests/lit fixtures that need no Rust or Go guest,
+    // less cat.test (ignored: the pinned root has no /etc/issue), plus its
+    // completeness test, in the second shard: 60 + 206 + 232 = 498.
     ("test.hermit_integration", 60),
-    ("test.hermit_integration_2", 187),
+    ("test.hermit_integration_2", 206),
     ("test.hermit_integration_3", 232),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
@@ -3970,7 +3973,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two DBT fatal-signal tests: 460.
     // And the DBT unfenceable-SIGKILL refusal test: 461.
     // And lit's 18 runner and FileCheck-matcher tests: 479.
-    ("test.hermit_integration_on_host", 479),
+    // And lit's 19 fixtures without a Rust or Go guest, less the ignored
+    // cat.test, plus its completeness test: 498.
+    ("test.hermit_integration_on_host", 498),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

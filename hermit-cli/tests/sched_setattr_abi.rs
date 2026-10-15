@@ -17,10 +17,10 @@
 //!
 //! This is an ordinary `cargo test` target on purpose. An earlier version of
 //! this regression test lived in `detcore/tests/lit/`, which nothing in this
-//! repository executes: there is no lit runner, no `lit.cfg`, and the handful
-//! of `detcore/tests/lit/` fixtures that do run are the ones enumerated by path
-//! in `hermit-cli/tests/hermit_modes.rs`. A test that compiles but never runs
-//! is worse than no test, so the fixture moved here.
+//! repository executed when it moved: there was no lit runner and no
+//! `lit.cfg`. A test that compiles but never runs is worse than no test, so
+//! the fixture moved here. (`hermit-cli/tests/lit.rs` now runs those
+//! fixtures.)
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;

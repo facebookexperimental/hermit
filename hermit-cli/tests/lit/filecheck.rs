@@ -241,8 +241,15 @@ pub fn check(directives: &[Directive], input: &str) -> Result<(), String> {
             ))
         };
         if directive.kind == Kind::Empty {
+            // FileCheck matches CHECK-EMPTY as `\n$` from the previous match,
+            // and `$` also matches at the end of the input, so the empty line
+            // after the input's final newline counts as the next line.
             let next = previous.unwrap() + 1;
-            if lines.get(next).is_none_or(|line| !line.is_empty()) {
+            let empty = match lines.get(next) {
+                Some(line) => line.is_empty(),
+                None => next == lines.len() && input.ends_with('\n'),
+            };
+            if !empty {
                 return fail(format!("input line {} is not empty", next + 1));
             }
             position = (next, 0);
@@ -359,9 +366,13 @@ mod tests {
     fn check_empty_needs_an_empty_next_line() {
         run("CHECK: a\nCHECK-EMPTY:\nCHECK-NEXT: b", "a\n\nb\n").unwrap();
         run("CHECK: a\nCHECK-EMPTY:", "a\nb\n").unwrap_err();
-        // A final newline ends the last line; it does not start an empty one.
-        run("CHECK: a\nCHECK-EMPTY:", "a\n").unwrap_err();
+        // As in FileCheck, whose CHECK-EMPTY is `\n$`: the end of the input
+        // after a final newline is an empty next line, and no newline is none.
+        run("CHECK: a\nCHECK-EMPTY:", "a\n").unwrap();
+        run("CHECK: a\nCHECK-EMPTY:", "a").unwrap_err();
         run("CHECK: a\nCHECK-EMPTY:", "a\n\n").unwrap();
+        // Nothing follows that empty line.
+        run("CHECK: a\nCHECK-EMPTY:\nCHECK: b", "a\n").unwrap_err();
     }
 
     #[test]
