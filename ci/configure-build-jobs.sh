@@ -1641,8 +1641,9 @@ fi
 # KVM LAZY-WAKE SDK-BUDGET CARRY (2026-10-14): advance from 370eb86a to dfb68913256514f1550f67fb52271e5aba1e3655 (KVM stops subscribing and registering wakes on every guest syscall; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # KVM ENTRY-CHECK + SHARED-MOUNT SDK-BUDGET CARRY (2026-10-14): advance from dfb68913 to 9e0ce5768aae1e6c71697ef3dd7ce3d61a91a260 (4b633f7f: cheaper KVM per-syscall entry checks, adds one GlobalTool method skip_empty_signal_boundaries defaulting to false that Detcore does not opt into; 9e0ce576: LiteInst shared-mount setup fix for nested tmpfs targets and pinned bind restrictions in reverie-process; reverie-dbt sources and inventory unchanged), so the budgets above carry.
 # KVM READ-QUERY-DEDUP SDK-BUDGET CARRY (2026-10-14): advance from 9e0ce576 to a1fb30867b020e9a8da1fc18296d306e0dbe91a6 (KVM read queries each descriptor's access mode and type once; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a1fb30867b020e9a8da1fc18296d306e0dbe91a6 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a1fb30867b020e9a8da1fc18296d306e0dbe91a6 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# KVM PUBLISH-CHANGED-FILES SDK-BUDGET CARRY (2026-10-14): advance from a1fb3086 to 69228e48decbb554ddc832086d4fdf3b28bb4fde (KVM republishes only changed descriptors to its shared file table; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 69228e48decbb554ddc832086d4fdf3b28bb4fde ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 69228e48decbb554ddc832086d4fdf3b28bb4fde (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
