@@ -2461,6 +2461,115 @@ fn record_fcntl_queries_replay_the_struct_they_write() {
     );
 }
 
+/// A recording of SEEK_END on a directory descriptor replays: the recorded
+/// answer is the host directory's size (btrfs) or hash cookie (ext4), which
+/// the replay's materialized directory need not give, and the replayer
+/// asserted that it did and stopped the replay (exit 125;
+/// https://github.com/rrnewton/hermit/issues/4373). Replay serves getdents
+/// from the recording, so the recorded seek result is the whole answer.
+#[test]
+fn record_replay_serves_a_directory_seek_from_the_recording() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = build.path().join("directory_size");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/directory_size.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile tests/c/directory_size.c");
+    assert!(
+        output.status.success(),
+        "tests/c/directory_size.c failed to compile:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sought = build.path().join("sought");
+    fs::create_dir(&sought).expect("failed to create the sought directory");
+    for entry in 0..40 {
+        fs::write(
+            sought.join(format!("entry-with-a-longer-name-{entry:02}")),
+            b"",
+        )
+        .expect("failed to fill the sought directory");
+    }
+    let output = canonical_record_replay_command(
+        "directory seek",
+        &guest,
+        &[OsStr::new("seek"), sought.as_os_str()],
+    );
+    assert!(
+        output.contains("seek end: "),
+        "the guest must print its seek's answer:\n{output}"
+    );
+}
+
+/// A seek in a thread whose descriptor table is its own (CLONE_THREAD without
+/// CLONE_FILES), where descriptor 60 names a directory in one table and a
+/// regular file in the other, replays by the calling thread's file. Classified
+/// by the leader's table, the worker's regular-file seek was skipped, its
+/// sendfile read from the wrong offset and replay desynchronized (exit 125);
+/// and a worker's directory seek hit the physical-offset assertion (Codex
+/// review of https://github.com/rrnewton/hermit/pull/4406).
+#[test]
+fn record_replay_seeks_by_the_calling_threads_descriptor_table() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = build.path().join("thread_table_seek");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/thread_table_seek.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile tests/c/thread_table_seek.c");
+    assert!(
+        output.status.success(),
+        "tests/c/thread_table_seek.c failed to compile:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Entries make the directory's host offset (its size, on btrfs) one the
+    // replay's materialized copy need not give; the guest creates the file.
+    let directory = build.path().join("directory");
+    fs::create_dir(&directory).expect("failed to create the directory");
+    for entry in 0..40 {
+        fs::write(
+            directory.join(format!("entry-with-a-longer-name-{entry:02}")),
+            b"",
+        )
+        .expect("failed to fill the directory");
+    }
+    let file = build.path().join("file");
+    for (mode, line) in [
+        ("file-in-worker", "file-in-worker seek 2 copied 2 \"cd\"\n"),
+        ("dir-in-worker", "dir-in-worker seek end ok\n"),
+    ] {
+        let out = build.path().join(format!("{mode}.out"));
+        let output = canonical_record_replay_command(
+            mode,
+            &guest,
+            &[
+                OsStr::new(mode),
+                directory.as_os_str(),
+                file.as_os_str(),
+                out.as_os_str(),
+            ],
+        );
+        assert!(
+            output.contains(line),
+            "{mode}: the guest must print {line:?}:\n{output}"
+        );
+    }
+}
+
 /// epoll_ctl answers EPERM for a regular file, which cannot be polled. Replay
 /// stands in for a regular file the guest opened with an eventfd placeholder,
 /// which epoll accepts, so a replay that asked the kernel again answered 0, and

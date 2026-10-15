@@ -310,7 +310,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/directory_size.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/directory_size.c is owned by hermit-cli/tests/cli.rs: The integration tests a_directory_reports_one_block_whatever_it_holds, entries_added_outside_a_run_leave_verify_strict_parity, a_fresh_directory_descriptor_refuses_seek_end, a_directory_descriptors_first_seeks, run_kvm_a_directory_descriptors_first_seeks, a_directory_named_proc_exempts_nothing, a_procfs_directory_keeps_its_size, dbt_a_procfs_directory_keeps_its_size and run_kvm_a_procfs_directory_keeps_its_size run this guest under run --strict: on a tmpfs inside a user and mount namespace a directory reports st_size 4096 and st_blocks 8 before and after entries are added, and --verify --verify-strict stays at bitwise parity while another process adds and removes entries for more than 100 rounds; SEEK_END is EINVAL on a fresh or inherited directory descriptor and EBADF on an O_PATH one, on ptrace and KVM; after a chroot into a tree whose proc is an ordinary directory, another directory still reports one block and refuses SEEK_END; an open /proc keeps size 0 and SEEK_END 0 on ptrace, DBT and KVM (https://github.com/rrnewton/hermit/issues/4162); a generic manifest cannot mount the tmpfs, run the outside writer, pass a directory as standard input, chroot, or check the verify verdict."
+      "why": "tests/c/directory_size.c is owned by hermit-cli/tests/cli.rs: The integration tests a_directory_reports_one_block_whatever_it_holds, entries_added_outside_a_run_leave_verify_strict_parity, a_fresh_directory_descriptor_refuses_seek_end, a_directory_descriptors_first_seeks, run_kvm_a_directory_descriptors_first_seeks, a_directory_named_proc_exempts_nothing, a_procfs_directory_keeps_its_size, dbt_a_procfs_directory_keeps_its_size and run_kvm_a_procfs_directory_keeps_its_size run this guest under run --strict: on a tmpfs inside a user and mount namespace a directory reports st_size 4096 and st_blocks 8 before and after entries are added, and --verify --verify-strict stays at bitwise parity while another process adds and removes entries for more than 100 rounds; SEEK_END is EINVAL on a fresh or inherited directory descriptor and EBADF on an O_PATH one, on ptrace and KVM; after a chroot into a tree whose proc is an ordinary directory, another directory still reports one block and refuses SEEK_END; an open /proc keeps size 0 and SEEK_END 0 on ptrace, DBT and KVM (https://github.com/rrnewton/hermit/issues/4162); hermit-cli/tests/record_replay.rs's record_replay_serves_a_directory_seek_from_the_recording records and replays its seek mode (https://github.com/rrnewton/hermit/issues/4373); a generic manifest cannot mount the tmpfs, run the outside writer, pass a directory as standard input, chroot, or check the verify verdict."
     },
     {
       "disposition": "guest-fixture",
@@ -2495,6 +2495,12 @@
       "path": "tests/c/thread_sync_determinism.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/thread_sync_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/thread_table_seek.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/thread_table_seek.c is owned by hermit-cli/tests/record_replay.rs: record_replay_seeks_by_the_calling_threads_descriptor_table records and replays a CLONE_THREAD worker made without CLONE_FILES whose descriptor 60 names a regular file while the leader's names a directory, and the inverse, under record start --verify --verify-strict, and requires the guest's seek and sendfile results (https://github.com/rrnewton/hermit/issues/4373); a generic manifest cannot make the worker or check the replay verdict."
     },
     {
       "disposition": "manifest-test",

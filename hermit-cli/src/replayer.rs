@@ -2269,16 +2269,33 @@ impl Replayer {
         let Syscall::Lseek(call) = syscall else {
             unreachable!("descriptor-position handler received {syscall:?}");
         };
-        if !self.fd_is_in_replay_root(guest.pid(), call.fd()) {
+        // The calling thread's descriptor: a thread made without CLONE_FILES
+        // has a table of its own, where the leader's (`guest.pid()`) can hold
+        // another file at the same number (Codex review of
+        // https://github.com/rrnewton/hermit/pull/4406).
+        let thread = guest.tid();
+        if !self.fd_is_in_replay_root(thread, call.fd()) {
             return self.handle_simple(guest, syscall).await;
+        }
+        // A directory's position is its file system's: SEEK_END is its size
+        // on btrfs and a hash cookie on ext4, and the positions telldir gives
+        // differ between file systems, so the materialized directory need not
+        // answer as the recorded one did, and asserting that it does stopped
+        // the replay (https://github.com/rrnewton/hermit/issues/4373). Replay
+        // serves getdents from the recording (`handle_getdents64`), which no
+        // physical position feeds, so the recorded result is the whole answer.
+        let link = format!("/proc/{}/fd/{}", thread.as_raw(), call.fd());
+        if std::fs::metadata(&link).is_ok_and(|metadata| metadata.is_dir()) {
+            return next_event!(guest, Return);
         }
         if matches!(call.whence(), Whence::SEEK_DATA | Whence::SEEK_HOLE) {
             let recorded = next_event!(guest, Return);
             if let Ok(expected) = recorded {
-                let duplicate = crate::fd::duplicate_guest_fd(guest.pid(), call.fd())
-                    .unwrap_or_else(|error| {
-                        panic!("failed to duplicate replay file for extent seek: {error}")
-                    });
+                let duplicate =
+                    crate::fd::duplicate_guest_thread_fd(guest.pid(), thread, call.fd())
+                        .unwrap_or_else(|error| {
+                            panic!("failed to duplicate replay file for extent seek: {error}")
+                        });
                 // SAFETY: duplicate owns the same open-file description and the
                 // recorded extent seek returned this nonnegative offset.
                 let actual =
