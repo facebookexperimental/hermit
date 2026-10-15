@@ -10896,6 +10896,7 @@ sys.exit(1 if failed else 0)
             before,
             "{test} does not enable {backend}"
         );
+        let emptied = enabled.is_empty();
         // A per-backend hermit_args_reason is keyed like hermit_args.
         for per_backend in [
             "ci",
@@ -10926,6 +10927,16 @@ sys.exit(1 if failed else 0)
             backend.into(),
             "un-flipped by the sync-cells round-trip test".into(),
         );
+        // A required mode with no enabled backend is refused, so taking its
+        // last backend also makes it optional, with a reason, as a real
+        // un-flip of a single-backend mode (a ptrace replay cell) would.
+        if emptied && mode.get("ci").and_then(Value::as_bool) == Some(true) {
+            mode.insert("ci".into(), false.into());
+            mode.insert(
+                "ci_disabled_reason".into(),
+                "un-flipped by the sync-cells round-trip test".into(),
+            );
+        }
         serde_yaml::to_string(&manifest).unwrap()
     }
 
