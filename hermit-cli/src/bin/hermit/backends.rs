@@ -1517,6 +1517,9 @@ struct DbtExecution {
     /// Statistics sinks, made below the original /tmp before the run, that
     /// the client must still reach at the same path inside the private /tmp.
     statistics: std::cell::RefCell<Vec<PathBuf>>,
+    /// DynamoRIO's configuration directory inside the container; see
+    /// `contained_command`.
+    config_dir: PathBuf,
 }
 
 #[cfg(feature = "dbt")]
@@ -1539,6 +1542,7 @@ impl DbtExecution {
         Self {
             options: options.with_dbt_mounts(&[], mounts),
             statistics: Default::default(),
+            config_dir: dynamorio_config_dir(),
         }
     }
 
@@ -1554,22 +1558,31 @@ impl DbtExecution {
         Ok(capture)
     }
 
-    /// `guest`, copied, with DynamoRIO's configuration directory moved into
-    /// the container's private /tmp.
+    /// `guest`, copied, with DynamoRIO's configuration directory moved to a
+    /// directory of this invocation's own under the container's /tmp.
     ///
     /// drrun hands its client options to the launched process in a one-time
     /// file, `<dir>/.dynamorio/<program>.<pid>.1config64`, where `<dir>` is
     /// `DYNAMORIO_CONFIGDIR` or else `HOME`. In the container the PID is the
-    /// namespace's own, so concurrent runs that share `HOME` agree on the
+    /// namespace's own, so concurrent runs that share `<dir>` agree on the
     /// file name: one guest then reads and deletes the other's file, runs with
-    /// that run's evidence channel, and neither run receives its evidence.
+    /// that run's evidence channel, and neither run receives its evidence
+    /// ("DBT evidence received no image START"). The container's /tmp alone
+    /// is not private enough: `--tmp=DIR` binds a shared directory there, as
+    /// the robust_futex_owner_death tests do with `--tmp=/tmp`, and those
+    /// collided when nextest ran them eight at a time. So `<dir>` is a
+    /// directory named for this invocation, made inside the container before
+    /// each physical run and removed after it.
+    ///
     /// DynamoRIO removes every `DYNAMORIO_` variable from the guest's
-    /// environment, and the value is the same on every run, so the guest's
-    /// initial stack does not change between runs.
+    /// environment. The value is the same on every physical run of one
+    /// invocation (both runs of a verification), and its length is the same
+    /// on every invocation, so the guest's initial stack does not change
+    /// between runs.
     fn contained_command(&self, guest: &StdCommand) -> StdCommand {
         let mut command = copy_dbt_command(guest);
         if self.options.uses_container() {
-            command.env(DYNAMORIO_CONFIG_DIR_ENV, "/tmp");
+            command.env(DYNAMORIO_CONFIG_DIR_ENV, &self.config_dir);
         }
         command
     }
@@ -1603,6 +1616,10 @@ impl DbtExecution {
             .collect::<Vec<_>>();
         let options = self.options.with_dbt_mounts(&preserved, Vec::new());
         let config = config.clone();
+        let config_dir = self
+            .options
+            .uses_container()
+            .then(|| self.config_dir.clone());
         options
             .launch_in_container(
                 (),
@@ -1613,6 +1630,10 @@ impl DbtExecution {
                     // guest exits.
                     super::container::exit_init_after_publication();
                     let config = super::run::complete_container_config(config.clone(), identity)?;
+                    let _config_dir = config_dir
+                        .as_deref()
+                        .map(DynamoRioConfigDir::create)
+                        .transpose()?;
                     let runtime = Self::new_runtime()?;
                     // The operation consumes GlobalState cleanup; runtime Drop
                     // joins its workers before the result is published.
@@ -1699,6 +1720,52 @@ impl OwnedDbtRunEvidence {
 }
 
 /// A copy of `guest`, which `std::process::Command` cannot clone.
+/// A DynamoRIO configuration directory under the container's /tmp, named
+/// for one Hermit invocation: `/tmp/.hermit-dynamorio-` and 16 hex digits
+/// from a randomly keyed hash, so concurrent invocations sharing /tmp never
+/// share it and every name has the same length.
+#[cfg(feature = "dbt")]
+fn dynamorio_config_dir() -> PathBuf {
+    use std::hash::BuildHasher;
+    let key = std::collections::hash_map::RandomState::new().hash_one((
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos()),
+    ));
+    PathBuf::from(format!("/tmp/.hermit-dynamorio-{key:016x}"))
+}
+
+/// The configuration directory of one physical DBT run, made inside the
+/// container before drrun starts and removed, with the `.dynamorio` files
+/// drrun leaves in it, when the run ends.
+#[cfg(feature = "dbt")]
+struct DynamoRioConfigDir(PathBuf);
+
+#[cfg(feature = "dbt")]
+impl DynamoRioConfigDir {
+    fn create(path: &Path) -> Result<Self, Error> {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path)
+            .map_err(|error| {
+                Error::msg(format!(
+                    "failed to create the DynamoRIO configuration directory {}: {error}",
+                    path.display()
+                ))
+            })?;
+        Ok(Self(path.to_path_buf()))
+    }
+}
+
+#[cfg(feature = "dbt")]
+impl Drop for DynamoRioConfigDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(feature = "dbt")]
 fn copy_dbt_command(guest: &StdCommand) -> StdCommand {
     let mut command = StdCommand::new(guest.get_program());
@@ -2081,6 +2148,42 @@ pub fn run_sabre_strace(_program: &Path, _args: &[String]) -> Result<ExitStatus,
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn each_invocation_names_its_own_dynamorio_config_dir_of_one_length() {
+        let first = super::dynamorio_config_dir();
+        let second = super::dynamorio_config_dir();
+        for dir in [&first, &second] {
+            let name = dir.to_str().unwrap();
+            let suffix = name.strip_prefix("/tmp/.hermit-dynamorio-").unwrap();
+            assert_eq!(suffix.len(), 16, "{name}");
+            assert!(
+                suffix.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "{name}"
+            );
+        }
+        assert_ne!(first, second);
+    }
+
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn a_dynamorio_config_dir_is_private_and_removed_with_its_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("config");
+        let dir = super::DynamoRioConfigDir::create(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // A second run cannot take over a directory that already exists.
+        assert!(super::DynamoRioConfigDir::create(&path).is_err());
+        std::fs::create_dir(path.join(".dynamorio")).unwrap();
+        std::fs::write(path.join(".dynamorio/true.2.1config64"), b"-client").unwrap();
+        drop(dir);
+        assert!(!path.exists());
+    }
+
     #[cfg(not(feature = "sabre"))]
     #[test]
     fn disabled_sabre_strace_refuses_before_resolving_artifacts() {
