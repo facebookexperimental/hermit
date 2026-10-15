@@ -42044,6 +42044,142 @@
       ],
       "test": "c-programs/kcmp-eperm",
       "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/keyctl-enosys",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/lsm-get-self-attr-enosys",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/lsm-list-modules-enosys",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/lsm-set-self-attr-enosys",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/map-shadow-stack-enosys",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/memfd-secret-enosys",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/perf-event-hardware-enosys",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/perf-event-open-enosys",
+      "timeout_seconds": 57
     }
   ],
   "schema": 1

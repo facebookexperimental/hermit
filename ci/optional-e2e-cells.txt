@@ -10,16 +10,8 @@ c-programs/get-robust-list-thread verify sabre
 c-programs/hardware-trap-identity verify dbt
 c-programs/just-spin verify kvm
 c-programs/just-spin verify sabre
-c-programs/keyctl-enosys verify dbt
-c-programs/lsm-get-self-attr-enosys verify dbt
-c-programs/lsm-list-modules-enosys verify dbt
-c-programs/lsm-set-self-attr-enosys verify dbt
-c-programs/map-shadow-stack-enosys verify dbt
-c-programs/memfd-secret-enosys verify dbt
 c-programs/nanosleep-par verify sabre
 c-programs/nanosleep-threads-nocrash verify sabre
-c-programs/perf-event-hardware-enosys verify dbt
-c-programs/perf-event-open-enosys verify dbt
 c-programs/perf-event-software-enosys verify dbt
 c-programs/perf-event-watchpoint-enosys verify dbt
 c-programs/ppoll-simulation verify sabre

@@ -4109,6 +4109,13 @@
           "category": "c-programs",
           "test": "c-programs/keyctl-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/keyctl-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -4326,6 +4333,13 @@
           "category": "c-programs",
           "test": "c-programs/lsm-get-self-attr-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/lsm-get-self-attr-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -4361,6 +4375,13 @@
           "category": "c-programs",
           "test": "c-programs/lsm-list-modules-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/lsm-list-modules-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -4390,6 +4411,13 @@
           "test": "c-programs/lsm-list-modules-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/lsm-set-self-attr-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -4480,6 +4508,13 @@
           "category": "c-programs",
           "test": "c-programs/map-shadow-stack-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/map-shadow-stack-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -4635,6 +4670,13 @@
           "test": "c-programs/memfd-create",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/memfd-secret-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -6160,6 +6202,13 @@
           "category": "c-programs",
           "test": "c-programs/perf-event-hardware-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/perf-event-hardware-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -6189,6 +6238,13 @@
           "test": "c-programs/perf-event-hardware-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/perf-event-open-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -32605,6 +32661,13 @@
           "category": "c-programs",
           "test": "c-programs/keyctl-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/keyctl-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -32710,6 +32773,13 @@
           "category": "c-programs",
           "test": "c-programs/lsm-get-self-attr-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/lsm-get-self-attr-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -32724,6 +32794,13 @@
           "category": "c-programs",
           "test": "c-programs/lsm-list-modules-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/lsm-list-modules-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -32732,6 +32809,13 @@
           "test": "c-programs/lsm-list-modules-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/lsm-set-self-attr-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -32780,6 +32864,13 @@
           "category": "c-programs",
           "test": "c-programs/map-shadow-stack-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/map-shadow-stack-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -32851,6 +32942,13 @@
           "test": "c-programs/memfd-create",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/memfd-secret-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -33620,6 +33718,13 @@
           "category": "c-programs",
           "test": "c-programs/perf-event-hardware-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/perf-event-hardware-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -33628,6 +33733,13 @@
           "test": "c-programs/perf-event-hardware-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/perf-event-open-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -50451,6 +50563,13 @@
           "category": "c-programs",
           "test": "c-programs/keyctl-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/keyctl-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -50668,6 +50787,13 @@
           "category": "c-programs",
           "test": "c-programs/lsm-get-self-attr-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/lsm-get-self-attr-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -50703,6 +50829,13 @@
           "category": "c-programs",
           "test": "c-programs/lsm-list-modules-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/lsm-list-modules-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -50732,6 +50865,13 @@
           "test": "c-programs/lsm-list-modules-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/lsm-set-self-attr-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -50822,6 +50962,13 @@
           "category": "c-programs",
           "test": "c-programs/map-shadow-stack-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/map-shadow-stack-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -50977,6 +51124,13 @@
           "test": "c-programs/memfd-create",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/memfd-secret-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -52502,6 +52656,13 @@
           "category": "c-programs",
           "test": "c-programs/perf-event-hardware-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/perf-event-hardware-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -52531,6 +52692,13 @@
           "test": "c-programs/perf-event-hardware-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/perf-event-open-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
