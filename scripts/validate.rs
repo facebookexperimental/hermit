@@ -19957,6 +19957,74 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
 
 /// Run one lane exactly once and retain every reported or missing outcome.
 ///
+/// The scheduler's dispatch order: the longest estimated path to the end of
+/// the graph first.
+///
+/// Without an order, dagrun starts ready nodes longest-`est_duration_s` first,
+/// which cannot see a short node in front of a long one. On e9473c43
+/// (2026-10-14) privileged-build.privileged_tests (6 s; estimated 60 s) waited
+/// until DAG +449 s for a slot, although its dependencies were done by ~+400 s,
+/// behind longer nodes that ended sooner. The PMU node behind it then ended the
+/// DAG at +669 s. A node's level is its own estimate plus the largest level
+/// among the nodes that depend on it, so a short node gating a long chain
+/// starts early. Ties keep the graph's order. Only the order of ready nodes
+/// changes; resources, dependencies and limits do not.
+fn bottom_level_order(cfg: &DagConfig) -> Vec<String> {
+    let tags: Vec<String> = cfg.steps.iter().map(|step| step.tag()).collect();
+    let index: BTreeMap<&str, usize> = tags
+        .iter()
+        .enumerate()
+        .map(|(position, tag)| (tag.as_str(), position))
+        .collect();
+    let mut dependents = vec![Vec::new(); tags.len()];
+    for (position, step) in cfg.steps.iter().enumerate() {
+        for dependency in &step.deps {
+            if let Some(&parent) = index.get(dependency.as_str()) {
+                dependents[parent].push(position);
+            }
+        }
+    }
+    // Iterative post-order, so a deep graph cannot overflow the stack; a node
+    // met again while open (a cycle, which dagrun refuses anyway) counts 0.
+    let mut level: Vec<Option<f64>> = vec![None; tags.len()];
+    let mut open = vec![false; tags.len()];
+    for root in 0..tags.len() {
+        let mut stack = vec![(root, false)];
+        while let Some((node, expanded)) = stack.pop() {
+            if level[node].is_some() {
+                continue;
+            }
+            if expanded {
+                let below = dependents[node]
+                    .iter()
+                    .map(|&child| level[child].unwrap_or(0.0))
+                    .fold(0.0, f64::max);
+                level[node] = Some(cfg.steps[node].hint.est_duration_s.max(0.0) + below);
+                open[node] = false;
+            } else if !open[node] {
+                open[node] = true;
+                stack.push((node, true));
+                for &child in &dependents[node] {
+                    if level[child].is_none() && !open[child] {
+                        stack.push((child, false));
+                    }
+                }
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..tags.len()).collect();
+    order.sort_by(|&a, &b| {
+        level[b]
+            .unwrap_or(0.0)
+            .partial_cmp(&level[a].unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    order
+        .into_iter()
+        .map(|position| tags[position].clone())
+        .collect()
+}
+
 /// Test frameworks own retries at the individual-test or manifest-cell layer.
 /// Retrying an outer DAG node repeats passing peers and cannot repair the first
 /// graph's dependency skips: RUN 1572 retried `gate.manifest` successfully while
@@ -20007,7 +20075,7 @@ fn run_lane_once(
         keep_going,
         verbosity,
         cgroups,
-        None,
+        Some(bottom_level_order(cfg)),
         Some(cpu_budget),
         remaining,
     );
@@ -29625,6 +29693,85 @@ sys.exit(2)
             format!("record-missing {}", committed.len())
         );
         assert!(portable_rows(&expected_withheld).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dispatch_order_tests {
+    use super::*;
+
+    fn committed() -> DagConfig {
+        let root = Path::new(file!())
+            .parent()
+            .and_then(Path::parent)
+            .expect("validate.rs has a repository parent");
+        validate_plan::validation_config(root).unwrap()
+    }
+
+    fn step(template: &Step, tag: &str, est: f64, deps: &[&str]) -> Step {
+        let (group, job) = tag.split_once('.').unwrap();
+        let mut step = template.clone();
+        step.group = group.into();
+        step.job = job.into();
+        step.deps = deps.iter().map(|dep| dep.to_string()).collect();
+        step.hint.est_duration_s = est;
+        step
+    }
+
+    #[test]
+    fn a_short_node_gating_a_long_chain_is_dispatched_before_longer_leaves() {
+        let committed = committed();
+        let template = &committed.steps[0];
+        let step = |tag: &str, est: f64, deps: &[&str]| step(template, tag, est, deps);
+        let cfg = DagConfig {
+            steps: vec![
+                step("build.root", 10.0, &[]),
+                step("test.long_leaf", 150.0, &["build.root"]),
+                step("lint.longer_leaf", 180.0, &["build.root"]),
+                step("privileged-build.gate", 6.0, &["build.root"]),
+                step("test.gated", 200.0, &["privileged-build.gate"]),
+                step("test.unestimated", 0.0, &[]),
+            ],
+            ..committed.clone()
+        };
+        assert_eq!(
+            bottom_level_order(&cfg),
+            [
+                "build.root",
+                // 6 + 200: ahead of both leaves, though shorter than either.
+                "privileged-build.gate",
+                "test.gated",
+                "lint.longer_leaf",
+                "test.long_leaf",
+                "test.unestimated",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_committed_full_plan_starts_the_privileged_chain_with_the_test_wave() {
+        let committed = committed();
+        let full = dagrun::select_steps_by_labels(&committed, &["full".into()]).unwrap();
+        let order = bottom_level_order(&full);
+        // Every node exactly once.
+        let mut sorted = order.clone();
+        sorted.sort();
+        let mut tags: Vec<String> = full.steps.iter().map(|step| step.tag()).collect();
+        tags.sort();
+        assert_eq!(sorted, tags);
+        let position = |tag: &str| order.iter().position(|candidate| candidate == tag).unwrap();
+        for later in [
+            "test.cli",
+            "test.hermit_integration",
+            "test.hermit_integration_2",
+            "test.hermit_integration_3",
+            "test.record_replay",
+        ] {
+            assert!(
+                position("privileged-build.privileged_tests") < position(later),
+                "the PMU chain's gate must be dispatched before {later}: {order:?}"
+            );
+        }
     }
 }
 
