@@ -5712,7 +5712,7 @@ mod before_park_tests {
     /// copy, so `/proc` shows it in `ShdPnd` only, and the ledger records the
     /// private send and the flush. The waiter's check, as
     /// `handle_futex_blocking` runs it with the drain's `SIGCHLD` left out of
-    /// the committed set (`drain_woken_futex_waiters`), ends nothing, and the
+    /// the committed set (`drain_woken_waiters`), ends nothing, and the
     /// wait parks again: a futex wait holds shared copies. Had the drain's
     /// `SIGCHLD` been committed, as before the design check of
     /// https://github.com/rrnewton/hermit/issues/4132, the shared copy, which

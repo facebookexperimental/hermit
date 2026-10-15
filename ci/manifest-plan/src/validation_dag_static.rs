@@ -1593,7 +1593,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Listed at bef97db4 with this node's own selection: 1115.
     // And -2 from 9851b797: 1113.
     // And the five --pipe-wake-latency tests (run, bisect, analyze, metadata) (https://github.com/rrnewton/hermit/issues/4380): 1120, listed.
-    ("test.hermit_unit", 1120),
+    // And +1 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 1121, listed.
+    ("test.hermit_unit", 1121),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2349,7 +2350,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the fourteen --pipe-wake-latency tests (scheduler::pipe_wake, tool_local channel and exec carry, preemptions) (https://github.com/rrnewton/hermit/issues/4380): 1809, listed.
     // And +1 from d9be5f8a: 1810.
     // And +10 from d3151c64: 1820.
-    ("test.detcore_unit", 1820),
+    // And +7 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 1827, listed.
+    ("test.detcore_unit", 1827),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3349,7 +3351,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4445): 450, listed.
     // And the nine PMU-free --pipe-wake-latency tests (their tenth, a PMU subject, runs in privileged-test.pmu_cli_cases) (https://github.com/rrnewton/hermit/issues/4380): 459, listed.
     // And +1 from ae5ca666: 460.
-    ("test.cli", 460),
+    // And +3 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 463, listed.
+    ("test.cli", 463),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3749,7 +3752,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4445): 386, listed.
     // And the nine PMU-free --pipe-wake-latency tests (https://github.com/rrnewton/hermit/issues/4380): 395, listed.
     // And +1 from ae5ca666: 396.
-    ("test.cli_on_host", 396),
+    // And +3 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 399, listed.
+    ("test.cli_on_host", 399),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4021,7 +4025,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the fourteen --pipe-wake-latency tests (https://github.com/rrnewton/hermit/issues/4380): 1809, listed.
     // And +1 from d9be5f8a: 1810.
     // And +10 from d3151c64: 1820.
-    ("test.detcore_unit_on_host", 1820),
+    // And +7 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 1827, listed.
+    ("test.detcore_unit_on_host", 1827),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4278,7 +4283,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Listed at bef97db4 with this node's own selection: 1115.
     // And -2 from 9851b797: 1113.
     // And the five --pipe-wake-latency tests (https://github.com/rrnewton/hermit/issues/4380): 1120, listed.
-    ("test.hermit_unit_on_host", 1120),
+    // And +1 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 1121, listed.
+    ("test.hermit_unit_on_host", 1121),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

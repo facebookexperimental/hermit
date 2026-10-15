@@ -613,7 +613,17 @@ impl RecordVersion {
 // refused it with ENOSYS, so an older recording containing one would replay
 // out of step; and every read of it shows Detcore's layout, not the host's
 // lines, so an older recording's guest saw other bytes.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x163);
+// 0x163 -> 0x164 (taken at land time, HIGHEST_SHIPPED + 1): R2b-1 relanded
+// (https://github.com/rrnewton/hermit/issues/4273): a pipe read, a pipe write
+// or a pipe writev woken by a kept signal ends as Linux's does, and a pipe
+// writev makes its first attempt in the slice of its own entry, so the kernel
+// imports the iovec array the call began with. (The 0x15f writev requested a
+// turn first and then read the array again, so another thread's rewrite in
+// that turn changed the bytes an atomic writev to a full pipe wrote:
+// writev_determinism's atomic full-pipe case.) Replay recomputes these
+// results, so an older recording of such a wake would replay to another
+// result.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x164);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -638,7 +648,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x163);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x163;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x164;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1675,6 +1685,22 @@ mod tests {
     fn record_version_rejects_streams_from_before_reused_set_tid_is_refused() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15d)));
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x164 was made when a pipe call woken by a kept
+    /// signal could miss the wake or end on a copy Linux discarded (0x15e and
+    /// 0x160 to 0x163), or when a pipe writev could write an iovec array
+    /// another thread rewrote after the call began (0x15f)
+    /// (https://github.com/rrnewton/hermit/issues/4273).
+    #[test]
+    fn record_version_rejects_streams_from_before_kept_wakes_stand() {
+        for older in 0x15e..=0x163 {
+            assert!(
+                !RECORD_VERSION.compatible_with(&RecordVersion(older)),
+                "{older:#x}"
+            );
+        }
+        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x164)));
     }
 
     /// A recording older than 0x162 may hold a PR_SET_PDEATHSIG the kernel
