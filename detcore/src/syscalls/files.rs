@@ -1974,7 +1974,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         resources.polls_guest_state_only = true;
         resources.waits_until_nothing_else_can_run = true;
         if in_effect {
-            resources.polls_channel = Some((channel, waits_for));
+            resources.polls_channel = Some(Box::new((channel, waits_for)));
         }
         // As a polled pipe read: a signal another task sends ends the wait.
         resources.set_signal_interrupt_errno(Errno::ERESTARTSYS);

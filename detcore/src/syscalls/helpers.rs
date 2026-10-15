@@ -394,7 +394,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A read waits for data, a write for room (`--pipe-wake-latency`).
             rsrc.polls_channel = crate::pipe_wake::poll_of(&wrapped).and_then(|(fd, wants)| {
                 self.pipe_channel_end(guest, fd)
-                    .map(|end| (end.channel, wants))
+                    .map(|end| Box::new((end.channel, wants)))
             });
             // In record/replay mode, route an internal-fd (pipe or socketpair) read/write through the
             // record/replay subtool so its data is captured on record and reproduced on
@@ -476,7 +476,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut resources = pipe_writev_resources(guest.thread_state().dettid, call);
         resources.polls_channel = self
             .pipe_channel_end(guest, call.fd())
-            .map(|end| (end.channel, crate::pipe_wake::Wants::Space));
+            .map(|end| Box::new((end.channel, crate::pipe_wake::Wants::Space)));
         let subtool = self.cfg.recordreplay_modes.then_some(self);
         let mut current = Syscall::Writev(call);
         let mut written_total = 0usize;
@@ -670,7 +670,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         resources.polls_guest_state_only = true;
         resources.polls_channel = self
             .pipe_channel_end(guest, call.fd())
-            .map(|end| (end.channel, crate::pipe_wake::Wants::Space));
+            .map(|end| Box::new((end.channel, crate::pipe_wake::Wants::Space)));
         // Without a host task whose kernel state the scheduler can filter by
         // (KVM), the scheduler keeps every signal and the write checks after
         // the wake, as `execute_blocking_pipe_writev` does, whether one would

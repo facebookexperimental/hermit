@@ -2479,7 +2479,7 @@ impl GlobalState {
                         caller: dtid,
                         process,
                         mm,
-                        fd_blocking,
+                        fd_blocking: *fd_blocking,
                     },
                 );
                 R::PrepareExec(())
@@ -2612,7 +2612,7 @@ impl GlobalState {
                             input.take().map(|input| input.lease.identity().clone());
                     }
                 }
-                R::MarkPastFirstExecve(overrides)
+                R::MarkPastFirstExecve(Box::new(overrides))
             }
             // Requested by the parent thread:
             GlobalRequest::CreateChildThread(
@@ -4860,7 +4860,12 @@ pub enum GlobalRequest {
     // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
     /// Save the caller, address-space identity, and logically blocking descriptors before exec.
     /// A successful backend may reload the Tool or preserve and transfer its thread state.
-    PrepareExec(DetPid, MmId, ExecFdState),
+    /// Boxed, as is `GlobalResponse::MarkPastFirstExecve`'s: inline, the
+    /// largest payload sizes every RPC future, and each of the hundreds of
+    /// handler futures `handle_syscall_event` awaits holds some, which in a
+    /// debug build overflowed the 2 MiB test thread that runs ptrace record
+    /// through the library (`record_replay`'s `public_record_*` tests).
+    PrepareExec(DetPid, MmId, Box<ExecFdState>),
 
     /// Clear the saved transition after an exec attempt returns with an error.
     CancelExec(DetPid),
@@ -5303,7 +5308,7 @@ pub enum GlobalResponse {
     ReconnectExec(bool),
     ResumeExec(ResumeStatus, Option<LogicalTime>),
     RetireExec(bool),
-    MarkPastFirstExecve(ExecFdState),
+    MarkPastFirstExecve(Box<ExecFdState>),
     CreateChildThread(Option<MmId>),
     /// Includes optional preemption points for the new thread.
     StartNewThread(Option<ThreadHistory>),
@@ -5542,8 +5547,11 @@ pub async fn prepare_exec<G, T>(
     } else {
         fd_state
     };
-    let (_, response) =
-        send_and_update_time(guest, GlobalRequest::PrepareExec(detpid, mm, fd_state)).await;
+    let (_, response) = send_and_update_time(
+        guest,
+        GlobalRequest::PrepareExec(detpid, mm, Box::new(fd_state)),
+    )
+    .await;
     assert_eq!(response, GlobalResponse::PrepareExec(()));
 }
 
@@ -5575,7 +5583,7 @@ where
     )
     .await;
     let overrides = match response {
-        GlobalResponse::MarkPastFirstExecve(overrides) => overrides,
+        GlobalResponse::MarkPastFirstExecve(overrides) => *overrides,
         _ => unreachable!(),
     };
     if controlled {
@@ -11425,10 +11433,10 @@ mod tests {
                     GlobalRequest::PrepareExec(
                         detpid,
                         MmId::initial(detpid),
-                        ExecFdState {
+                        Box::new(ExecFdState {
                             robust_wakes: vec![(leader, futex)],
                             ..Default::default()
-                        },
+                        }),
                     ),
                 ),
             )
@@ -11496,10 +11504,10 @@ mod tests {
                     GlobalRequest::PrepareExec(
                         detpid,
                         MmId::initial(detpid),
-                        ExecFdState {
+                        Box::new(ExecFdState {
                             robust_wakes: vec![(leader, futex)],
                             ..Default::default()
-                        },
+                        }),
                     ),
                 ),
             )
@@ -11787,7 +11795,7 @@ mod tests {
             .await;
         assert_eq!(
             mark_response.1,
-            GlobalResponse::MarkPastFirstExecve(fd_blocking)
+            GlobalResponse::MarkPastFirstExecve(Box::new(fd_blocking))
         );
         assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
     }

@@ -106,7 +106,8 @@ impl Scheduler {
                 .get(&tid)
                 .and_then(|turn| turn.req.try_read())
                 .and_then(|request| request.as_ref().ok().cloned());
-            let Some(request) = request.filter(|rs| rs.polls_channel == Some((channel, wants)))
+            let Some(request) =
+                request.filter(|rs| rs.polls_channel.as_deref() == Some(&(channel, wants)))
             else {
                 continue;
             };
@@ -215,7 +216,7 @@ mod tests {
         let mut request = Resources::new(tid);
         request.insert(ResourceID::InternalIOPolling, Permission::W);
         request.poll_attempt = 3;
-        request.polls_channel = channel;
+        request.polls_channel = channel.map(Box::new);
         scheduler.next_turns[&tid].req.put(Ok(request));
     }
 

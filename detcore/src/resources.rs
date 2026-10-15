@@ -540,9 +540,13 @@ pub struct Resources {
     /// The pipe or FIFO this polling request waits on, and what it waits
     /// for, under `--pipe-wake-latency` (`crate::pipe_wake`): an action of
     /// another thread that can satisfy it hands this thread the turn. `None`
-    /// for every other request, and always with the option unset.
+    /// for every other request, and always with the option unset. Boxed:
+    /// inline, its 32 bytes in every request a handler future holds grew
+    /// `handle_syscall_event`'s debug-build stack past the 2 MiB test thread
+    /// that runs ptrace record through the library (`record_replay`'s
+    /// `public_record_*` tests).
     #[serde(default)]
-    pub(crate) polls_channel: Option<(crate::pipe_wake::ChannelId, crate::pipe_wake::Wants)>,
+    pub(crate) polls_channel: Option<Box<(crate::pipe_wake::ChannelId, crate::pipe_wake::Wants)>>,
     /// The absolute virtual deadline of the timed wait that a polling request
     /// (`poll_attempt > 0`) retries: `ppoll`, `poll`, `epoll_wait`,
     /// `epoll_pwait`, `rt_sigtimedwait`, `select`, `pselect6` or a polling
