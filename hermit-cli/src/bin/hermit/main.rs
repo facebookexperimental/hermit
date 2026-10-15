@@ -32,6 +32,24 @@ mod inventory;
 mod list;
 mod logdiff;
 mod manifest;
+#[cfg(feature = "native-exec")]
+mod native_exec_artifacts;
+#[cfg(feature = "native-exec")]
+mod native_exec_cli;
+#[cfg(feature = "native-exec")]
+mod native_exec_coordinator;
+#[cfg(feature = "native-exec")]
+mod native_exec_inputs;
+#[cfg(feature = "native-exec")]
+mod native_exec_maps;
+#[cfg(feature = "native-exec")]
+mod native_exec_observer;
+#[cfg(feature = "native-exec")]
+mod native_exec_provider;
+#[cfg(feature = "native-exec")]
+mod native_exec_run;
+#[cfg(feature = "native-exec")]
+mod native_exec_setup;
 mod oci;
 mod owned_container;
 mod podman_store;
@@ -965,6 +983,32 @@ fn display_error(error: Error) {
         let _ = writeln!(out, "     {} {}", ">".dimmed().bold(), cause);
     }
 }
+
+// Compile the actual native consumer in this existing test target; the preload
+// remains test=false and its constructor/allocator are never bypassed.
+#[cfg(all(test, feature = "native-exec"))]
+use detcore_model::liteinst_native_exec_runtime as runtime_packet;
+#[cfg(all(test, feature = "native-exec"))]
+fn qualify_config(_: &detcore::Config) -> std::io::Result<()> {
+    panic!("completion fixture must not qualify an image")
+}
+#[cfg(all(test, feature = "native-exec"))]
+mod exec_initial {
+    pub(crate) unsafe fn restore_dispatch_sequence(_: u64) -> std::io::Result<()> {
+        panic!("completion fixture must not restore an image")
+    }
+}
+#[cfg(all(test, feature = "native-exec"))]
+#[path = "../../../../detcore-liteinst/src/exec_native/consumer.rs"]
+mod native_exec_consumer;
+
+// Exercise the actual guest provider without enabling the preload's unit
+// harness. These socket/descriptor controls do not manufacture native admission.
+#[cfg(all(test, feature = "native-exec"))]
+#[path = "../../../../detcore-liteinst/src/exec_native/provider.rs"]
+mod native_exec_guest_provider;
+#[cfg(all(test, feature = "native-exec"))]
+mod native_exec_provider_connect_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1647,7 +1647,12 @@ impl DbtExecution {
                 (),
                 "the DBT coordinator",
                 options.run_timeout(),
-                move |_, identity| {
+                move |_, identity, native| {
+                    if native.is_some() {
+                        return Err(Error::msg(
+                            "native exec container state cannot be used by the DBT coordinator",
+                        ));
+                    }
                     // The detached stdin reader may stay blocked after the
                     // guest exits.
                     super::container::exit_init_after_publication();

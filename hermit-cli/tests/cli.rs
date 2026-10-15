@@ -6899,6 +6899,59 @@ fn run_liteinst_rejects_an_inert_dso_before_dispatch() {
     assert!(!stderr.contains("Success: deterministic"), "{stderr}");
 }
 
+/// Native inputs select the embedded artifact owner. An invalid ordinary
+/// preload must neither preempt that owner's real refusal nor become accepted
+/// by an ordinary trap run. Neither control starts a guest.
+#[test]
+#[cfg(feature = "native-exec")]
+fn native_exec_checks_its_declared_inputs_without_an_ordinary_preload() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let declaration = directory.path().join("unsupported-native-inputs.json");
+    fs::write(
+        &declaration,
+        br#"{"version":0,"executables":[],"loader_files":[],"data_files":[],"aliases":[]}"#,
+    )
+    .unwrap();
+    for native in [true, false] {
+        let mut args = vec![
+            "--backend=in-guest-trap",
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--max-timeslice=disabled",
+        ];
+        if native {
+            args.extend(["--native-exec-inputs", declaration.to_str().unwrap()]);
+        }
+        args.extend(["--", "/bin/true"]);
+        let output = hermit_command(&args)
+            .env("HERMIT_LITEINST_TOOL_RUNTIME", "/bin/true")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(125), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let error = stderr(&output);
+        if native {
+            assert!(
+                error.contains("unsupported declared input version"),
+                "{error}"
+            );
+            assert!(!error.contains("class=backend-unavailable"), "{error}");
+        } else {
+            assert!(error.contains("class=backend-unavailable"), "{error}");
+            assert!(error.contains("missing required export"), "{error}");
+            assert!(
+                !error.contains("unsupported declared input version"),
+                "{error}"
+            );
+        }
+        assert!(!error.contains("Success: deterministic"), "{error}");
+    }
+}
+
 /// An installed Hermit finds the in-guest runtime as the packaged resource
 /// `rsrcs/libdetcore_liteinst.so`, which `hermit-install` stages beside the DBT
 /// and SaBRe Detcore runtimes, and a packaged resource is consulted before the

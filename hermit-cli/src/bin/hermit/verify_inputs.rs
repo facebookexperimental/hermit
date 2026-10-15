@@ -52,6 +52,8 @@ use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -78,8 +80,10 @@ const NATIVE_RESERVED_FDS: std::ops::RangeInclusive<RawFd> = 198..=204;
 /// records it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SharedObjectMeta {
-    /// Original guest-visible path. An alias is its own entry.
-    pub(crate) path: PathBuf,
+    /// Original guest-visible path. An alias is its own entry. None is
+    /// permitted only for an explicitly pathless role checked by its consuming
+    /// owner; native config and declaration metadata have no guest path.
+    pub(crate) path: Option<PathBuf>,
     /// The owner's role label, such as "executable", "library" or "group".
     pub(crate) role: String,
     pub(crate) size: u64,
@@ -114,7 +118,7 @@ struct Manifest {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestObject {
-    path: PathBuf,
+    path: ManifestPath,
     role: String,
     size: u64,
     /// Lower-case hex.
@@ -123,7 +127,44 @@ struct ManifestObject {
     fd: RawFd,
 }
 
-const MANIFEST_SCHEMA: u32 = 1;
+// Schema 1 keeps its original string paths. Schema 2 uses raw Unix bytes for
+// every path in the same manifest; mixed encodings and unknown schemas refuse.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum ManifestPath {
+    Utf8(String),
+    UnixBytes(Option<Vec<u8>>),
+}
+impl ManifestPath {
+    fn into_path(self, schema: u32) -> Result<Option<PathBuf>> {
+        match (schema, self) {
+            (1, Self::Utf8(path)) => Ok(Some(PathBuf::from(path))),
+            (2, Self::UnixBytes(bytes)) => {
+                Ok(bytes.map(|bytes| std::ffi::OsString::from_vec(bytes).into()))
+            }
+            _ => bail!("shared-input path encoding differs from manifest schema {schema}"),
+        }
+    }
+    fn matches_schema(&self, schema: u32) -> bool {
+        matches!((schema, self), (1, Self::Utf8(_)) | (2, Self::UnixBytes(_)))
+    }
+}
+fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
+    let manifest: Manifest =
+        serde_json::from_slice(bytes).context("shared-input manifest is not versioned JSON")?;
+    ensure!(
+        [1, 2].contains(&manifest.schema),
+        "unknown shared-input manifest schema"
+    );
+    ensure!(
+        manifest
+            .objects
+            .iter()
+            .all(|object| object.path.matches_schema(manifest.schema)),
+        "shared-input path encoding differs from manifest schema"
+    );
+    Ok(manifest)
+}
 
 /// Plain sealed files, the set the holder seals from `--input ROLE:PATH`.
 pub(crate) struct SealedFiles {
@@ -144,7 +185,7 @@ impl SealedFiles {
                 let (fd, size, sha256) = seal_into_memfd(c"hermit-shared-input", &mut file)
                     .with_context(|| format!("cannot seal shared input {}", path.display()))?;
                 let meta = SharedObjectMeta {
-                    path: path.clone(),
+                    path: Some(path.clone()),
                     role: role.clone(),
                     size,
                     sha256,
@@ -178,6 +219,13 @@ impl SharedInputs for SealedFiles {
             producer == Self::PRODUCER,
             "shared inputs were produced by {producer:?}, not {:?}",
             Self::PRODUCER
+        );
+        ensure!(
+            objects.iter().all(|(meta, _)| meta
+                .path
+                .as_ref()
+                .is_some_and(|path| !path.as_os_str().is_empty())),
+            "plain sealed files require original paths"
         );
         Ok(Self { objects })
     }
@@ -270,6 +318,11 @@ pub struct VerifyInputsOpts {
     #[clap(long = "input", value_name = "ROLE:PATH")]
     inputs: Vec<String>,
 
+    /// Capture the declared native cohort once for the existing pair program.
+    #[cfg(feature = "native-exec")]
+    #[clap(long, conflicts_with = "inputs", value_name = "DECLARATION")]
+    native_exec_declaration: Option<PathBuf>,
+
     /// The pair program and its arguments.
     #[clap(last = true, required = true)]
     program: Vec<String>,
@@ -299,8 +352,14 @@ impl VerifyInputsOpts {
             })
             .collect::<Result<Vec<_>>>()?;
         let stdin = freeze_stdin(super::startup_stdin()?)?;
-        let sealed = SealedFiles::seal(&inputs)?;
-        let (producer, objects) = sealed.export()?;
+        #[cfg(feature = "native-exec")]
+        let (producer, objects) = if let Some(declaration) = &self.native_exec_declaration {
+            super::native_exec_cli::Capture::prepare_shared(declaration)?.export()?
+        } else {
+            SealedFiles::seal(&inputs)?.export()?
+        };
+        #[cfg(not(feature = "native-exec"))]
+        let (producer, objects) = SealedFiles::seal(&inputs)?.export()?;
         let manifest = place(producer, objects, self.manifest_fd)?;
         let (manifest_fd, _, _) = seal_into_memfd(
             c"hermit-shared-inputs-manifest",
@@ -325,6 +384,14 @@ fn place(
     objects: Vec<(SharedObjectMeta, OwnedFd)>,
     manifest_fd: RawFd,
 ) -> Result<Manifest> {
+    let schema = if objects
+        .iter()
+        .all(|(meta, _)| meta.path.as_ref().and_then(|path| path.to_str()).is_some())
+    {
+        1
+    } else {
+        2
+    };
     let mut placed = Vec::with_capacity(objects.len());
     for (meta, fd) in objects {
         let mut raw = fd.as_raw_fd();
@@ -342,7 +409,21 @@ fn place(
         }
         set_cloexec(raw, false)?;
         placed.push(ManifestObject {
-            path: meta.path,
+            path: if schema == 1 {
+                ManifestPath::Utf8(
+                    meta.path
+                        .as_ref()
+                        .and_then(|path| path.to_str())
+                        .context("schema-1 path is not UTF-8")?
+                        .to_owned(),
+                )
+            } else {
+                ManifestPath::UnixBytes(
+                    meta.path
+                        .as_ref()
+                        .map(|path| path.as_os_str().as_bytes().to_vec()),
+                )
+            },
             role: meta.role,
             size: meta.size,
             sha256: sha256_hex(&meta.sha256),
@@ -353,7 +434,7 @@ fn place(
         std::mem::forget(owned);
     }
     Ok(Manifest {
-        schema: MANIFEST_SCHEMA,
+        schema,
         producer,
         objects: placed,
     })
@@ -419,18 +500,16 @@ pub(crate) fn adopt(manifest_fd: RawFd) -> Result<AdoptedInputs> {
     let manifest_owner = unsafe { OwnedFd::from_raw_fd(manifest_fd) };
     let mut bytes = Vec::new();
     File::open(format!("/proc/self/fd/{manifest_fd}"))?.read_to_end(&mut bytes)?;
-    let manifest: Manifest =
-        serde_json::from_slice(&bytes).context("shared-input manifest is not schema-1 JSON")?;
-    ensure!(
-        manifest.schema == MANIFEST_SCHEMA,
-        "shared-input manifest schema {} is not {MANIFEST_SCHEMA}",
-        manifest.schema
-    );
+    let manifest = decode_manifest(&bytes)?;
     let mut seen = std::collections::BTreeSet::new();
     let mut objects = Vec::with_capacity(manifest.objects.len());
     for object in manifest.objects {
         let fd = object.fd;
-        let path = object.path.display().to_string();
+        let object_path = object.path.into_path(manifest.schema)?;
+        let path = object_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<pathless owner role>".into());
         ensure!(
             fd > 2 && fd != manifest_fd && !NATIVE_RESERVED_FDS.contains(&fd) && seen.insert(fd),
             "shared input {path} names descriptor {fd}, which no object may use"
@@ -453,7 +532,7 @@ pub(crate) fn adopt(manifest_fd: RawFd) -> Result<AdoptedInputs> {
         // manifest names it once, so this is its only owner in the run.
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
         let meta = SharedObjectMeta {
-            path: object.path,
+            path: object_path,
             role: object.role,
             size,
             sha256: digest,
@@ -478,18 +557,25 @@ static ENTRY_ADOPTION: std::sync::Mutex<Option<(RawFd, Result<AdoptedInputs>)>> 
 /// before its first `--`, which ends Hermit's own options. Only the two exact
 /// spellings clap accepts count; anything else is left to clap to refuse.
 fn shared_inputs_fd_in(argv: &[std::ffi::OsString]) -> Option<String> {
-    const FLAG: &str = "--native-exec-shared-inputs";
-    let mut words = argv.iter().skip(1).map(|word| word.to_str());
+    const FLAG: &[u8] = b"--native-exec-shared-inputs";
+    // Other operands (including the declaration path) are opaque Unix bytes.
+    // Only this flag's numeric value must be UTF-8 for clap's integer parser.
+    let mut words = argv.iter().skip(1).map(|word| word.as_bytes());
     while let Some(word) = words.next() {
-        match word? {
-            "--" => return None,
-            word if word == FLAG => return words.next().flatten().map(str::to_string),
+        match word {
+            b"--" => return None,
+            word if word == FLAG => {
+                return words
+                    .next()
+                    .and_then(|value| std::str::from_utf8(value).ok())
+                    .map(str::to_owned);
+            }
             word => {
                 if let Some(value) = word
                     .strip_prefix(FLAG)
-                    .and_then(|rest| rest.strip_prefix('='))
+                    .and_then(|rest| rest.strip_prefix(b"="))
                 {
-                    return Some(value.to_string());
+                    return std::str::from_utf8(value).ok().map(str::to_owned);
                 }
             }
         }
@@ -596,8 +682,196 @@ mod tests {
     }
 
     #[test]
+    fn the_entry_scan_preserves_non_utf8_operands_and_exact_flag_boundaries() {
+        use std::ffi::OsString;
+
+        let path = OsString::from_vec(b"/inputs/native-\xff.json".to_vec());
+        for flag in [
+            vec![OsString::from("--native-exec-shared-inputs=197")],
+            vec![
+                OsString::from("--native-exec-shared-inputs"),
+                OsString::from("197"),
+            ],
+        ] {
+            let mut argv = vec![
+                OsString::from("hermit"),
+                OsString::from("run"),
+                OsString::from("--native-exec-inputs"),
+                path.clone(),
+            ];
+            argv.extend(flag.clone());
+            argv.extend([OsString::from("--"), OsString::from("/bin/true")]);
+            assert_eq!(shared_inputs_fd_in(&argv), Some("197".into()));
+
+            // A guest's identically named argument must never retain a cohort.
+            let mut guest_argv = vec![
+                OsString::from("hermit"),
+                OsString::from("run"),
+                OsString::from("--"),
+                path.clone(),
+            ];
+            guest_argv.extend(flag);
+            assert_eq!(shared_inputs_fd_in(&guest_argv), None);
+        }
+        for malformed in [
+            vec![OsString::from_vec(
+                b"--native-exec-shared-inputs\xff=197".to_vec(),
+            )],
+            vec![OsString::from_vec(
+                b"--native-exec-shared-inputs=197\xff".to_vec(),
+            )],
+            vec![
+                OsString::from("--native-exec-shared-inputs"),
+                OsString::from_vec(b"197\xff".to_vec()),
+            ],
+        ] {
+            let mut argv = vec![OsString::from("hermit"), OsString::from("run")];
+            argv.extend(malformed);
+            assert_eq!(shared_inputs_fd_in(&argv), None);
+        }
+    }
+
+    #[test]
     fn plain_sealed_files_adopt_only_their_own_producer() {
         assert!(SealedFiles::adopt(SealedFiles::PRODUCER, Vec::new()).is_ok());
         assert!(SealedFiles::adopt("someone-else", Vec::new()).is_err());
+    }
+
+    #[test]
+    fn manifest_path_versions_preserve_legacy_and_refuse_mixed_encodings() {
+        let object = serde_json::json!({"path":"/input","role":"data","size":0,
+            "sha256":"00".repeat(32),"seals":REQUIRED_SEALS,"fd":205});
+        let legacy = serde_json::json!({"schema":1,"producer":"legacy","objects":[object]});
+        let parsed = decode_manifest(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(
+            parsed
+                .objects
+                .into_iter()
+                .next()
+                .unwrap()
+                .path
+                .into_path(1)
+                .unwrap(),
+            Some(PathBuf::from("/input"))
+        );
+        for (schema, path) in [
+            (1, serde_json::json!([47, 255])),
+            (2, serde_json::json!("/input")),
+            (3, serde_json::json!([47, 255])),
+        ] {
+            let mut invalid = legacy.clone();
+            invalid["schema"] = schema.into();
+            invalid["objects"][0]["path"] = path;
+            assert!(decode_manifest(&serde_json::to_vec(&invalid).unwrap()).is_err());
+        }
+        let raw_path = b"/input-\xff".to_vec();
+        let mut raw = legacy.clone();
+        raw["schema"] = 2.into();
+        raw["objects"][0]["path"] = serde_json::json!(raw_path);
+        let parsed = decode_manifest(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert_eq!(
+            parsed
+                .objects
+                .into_iter()
+                .next()
+                .unwrap()
+                .path
+                .into_path(2)
+                .unwrap(),
+            Some(PathBuf::from(std::ffi::OsString::from_vec(raw_path)))
+        );
+        raw["objects"][0]["path"] = serde_json::Value::Null;
+        let parsed = decode_manifest(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert_eq!(
+            parsed
+                .objects
+                .into_iter()
+                .next()
+                .unwrap()
+                .path
+                .into_path(2)
+                .unwrap(),
+            None
+        );
+        let mut invalid = legacy;
+        invalid["schema"] = 2.into();
+        invalid["objects"][0]["path"] = serde_json::json!([47, 256]);
+        assert!(decode_manifest(&serde_json::to_vec(&invalid).unwrap()).is_err());
+    }
+
+    #[test]
+    fn plain_owner_refuses_pathless_and_empty_path_roles() {
+        for path in [None, Some(PathBuf::new())] {
+            let (fd, size, sha256) = seal_into_memfd(c"path-test", &mut b"x".as_slice()).unwrap();
+            let seals = seals_of(fd.as_raw_fd()).unwrap();
+            assert!(
+                SealedFiles::adopt(
+                    SealedFiles::PRODUCER,
+                    vec![(
+                        SharedObjectMeta {
+                            path,
+                            role: "data".into(),
+                            size,
+                            sha256,
+                            seals
+                        },
+                        fd
+                    )]
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn actual_non_utf8_manifest_retains_one_cohort_for_two_consumers() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(b"source-\xff".to_vec()));
+        std::fs::write(&path, b"original").unwrap();
+        let held = SealedFiles::seal(&[("data".into(), path.clone())]).unwrap();
+        let original = File::from(held.objects[0].1.try_clone().unwrap())
+            .metadata()
+            .unwrap();
+        let (producer, objects) = held.export().unwrap();
+        let manifest = place(producer, objects, 197).unwrap();
+        let bytes =
+            serde_json::to_vec(&manifest).expect("original Unix path bytes must be representable");
+        let (manifest_fd, _, _) =
+            seal_into_memfd(c"test-shared-manifest", &mut bytes.as_slice()).unwrap();
+        std::fs::write(&path, b"mutated host").unwrap();
+        for _ in 0..2 {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let adopted = adopt(manifest_fd.as_raw_fd())
+                    .unwrap()
+                    .into_inputs::<SealedFiles>()
+                    .unwrap();
+                let actual = File::from(adopted.objects[0].1.try_clone().unwrap())
+                    .metadata()
+                    .unwrap();
+                assert_eq!(
+                    (actual.dev(), actual.ino()),
+                    (original.dev(), original.ino())
+                );
+                assert_eq!(
+                    sha256_of_fd(adopted.objects[0].1.as_raw_fd()).unwrap(),
+                    (8, *detcore::Digest::new(b"original"))
+                );
+                unsafe { libc::_exit(0) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert_eq!(status, 0);
+        }
+        for object in manifest.objects {
+            unsafe {
+                libc::close(object.fd);
+            }
+        }
     }
 }

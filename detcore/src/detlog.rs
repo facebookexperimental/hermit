@@ -711,6 +711,18 @@ struct ForwardedSource {
     socket: OwnedFd,
     sink: ForwardedRecordSink,
     order: ForwardedOrder,
+    // Ordinary drains retain their historical behavior; native cuts must not
+    // reinterpret a prior EOF/receive failure or loss notice as an empty source.
+    transport_failure: Option<ForwardedSourceError>,
+    loss_seen: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForwardedSourceError {
+    Closed,
+    Io(i32),
+    Poll(i16),
+    MessageChanged,
 }
 
 static FORWARDED_SOURCE: Mutex<Option<ForwardedSource>> = Mutex::new(None);
@@ -789,6 +801,7 @@ pub fn write_loss_notice(reason: &str) {
 /// determinism loss when the record is a loss notice.
 fn emit(source: &mut ForwardedSource, record: &[u8]) {
     if record.starts_with(FORWARDING_LOSS_NOTICE.as_bytes()) {
+        source.loss_seen = true;
         record_determinism_loss(&String::from_utf8_lossy(record));
     }
     (source.sink)(record);
@@ -855,6 +868,8 @@ pub fn set_forwarded_source(socket: OwnedFd, sink: ForwardedRecordSink) {
         socket,
         sink,
         order: ForwardedOrder::new(),
+        transport_failure: None,
+        loss_seen: false,
     });
 }
 
@@ -898,10 +913,12 @@ fn stop_forwarded_receiver() {
 
 /// The receiver task of [`start_forwarded_receiver`]: waits until `watched`
 /// (its own duplicate of the registered socket) is readable and takes the
-/// socket's messages into their threads' queues, until the source of
-/// `generation` is replaced or cleared, which also sends `stopped`. Readiness
-/// is only a hint; the source lock and the generation decide whether the
-/// registered socket is still the one it serves.
+/// socket's messages into their threads' queues, until a terminal transport
+/// failure is retained or the source of `generation` is replaced or cleared,
+/// which also sends `stopped`. Readiness is only a hint; the source lock and the
+/// generation decide whether the registered socket is still the one it serves.
+/// Retiring this task leaves the source, queued records and failure intact for
+/// the final checks; task completion does not accept a drain.
 async fn receive_forwarded(
     watched: OwnedFd,
     generation: u64,
@@ -936,7 +953,12 @@ async fn receive_forwarded(
                 return;
             }
             match source.as_mut() {
-                Some(source) => collect_forwarded(source),
+                Some(source) => {
+                    collect_forwarded(source);
+                    if source.transport_failure.is_some() {
+                        return;
+                    }
+                }
                 None => return,
             }
         }
@@ -958,6 +980,211 @@ pub fn clear_forwarded_source() {
         write_records(source, records);
     }
     source.take();
+}
+
+/// Actual physical exit-watch completion carried by a private affine backend
+/// receipt, not a caller's assertion that an exit happened.
+///
+/// # Safety
+/// Implement only on a private type constructed after the real watched birth's
+/// PhysicalExitWatch drain completed, its one physical report was delivered,
+/// and all watch failures were excluded. Retain that same pidfs pidfd and IDs.
+/// Numerical PID equality, child wait alone, source EOF, or a bool cannot create
+/// this receipt. The host implementation additionally checks the actual fd below.
+pub unsafe trait NativePhysicalExitCompletion {
+    /// The same retained watched pidfd, owned by this affine receipt.
+    fn retained_pidfd(&self) -> std::os::fd::BorrowedFd<'_>;
+    /// Actual deterministic/physical root PID of the single-thread domain.
+    fn process_id(&self) -> i32;
+    /// Independently retained pidfs inode of that watched birth.
+    fn birth_identity(&self) -> u64;
+}
+
+/// Identity retained by the actual backend watch for this run's root process.
+///
+/// # Safety
+/// Implement only for a private owner constructed from a successful real watch
+/// registration. The pidfd and IDs must name that exact registration and remain
+/// immutable; `watch_is_healthy` must consult that retained watch's actual state.
+/// A numeric PID, a parsed packet, or a socketpair creator is not this authority.
+pub unsafe trait NativePhysicalWatchIdentity {
+    /// The actual registered birth, retained by this owner.
+    fn retained_pidfd(&self) -> std::os::fd::BorrowedFd<'_>;
+    /// Actual guest-visible root process ID from that registration.
+    fn process_id(&self) -> i32;
+    /// Actual pidfs inode of that birth.
+    fn birth_identity(&self) -> u64;
+    /// The retained watcher is still running without failure.
+    fn watch_is_healthy(&self) -> bool;
+}
+
+/// Coordinator-local source identity retained at native source registration.
+/// It does not authenticate an image or authorize any exec/lifecycle transition.
+#[derive(Debug)]
+pub struct NativeForwardedSourceReceipt {
+    generation: u64,
+    identity: (u64, u64),
+    owner: (i32, u64),
+}
+
+/// Bind the actual source to its living watched root before releasing guest
+/// startup. EOF later requires completion of this exact retained birth.
+pub fn retain_native_forwarded_source(
+    watch: &dyn NativePhysicalWatchIdentity,
+) -> Result<NativeForwardedSourceReceipt, CoordinatorForwardingCutError> {
+    use std::os::fd::AsRawFd;
+    let owner = (watch.process_id(), watch.birth_identity());
+    let fd = watch.retained_pidfd().as_raw_fd();
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if owner.0 <= 0
+        || owner.1 == 0
+        || !watch.watch_is_healthy()
+        || unsafe { libc::fstat(fd, &mut stat) } != 0
+        || unsafe { libc::fstatfs(fd, &mut fs) } != 0
+        || fs.f_type as i64 != 0x5049_4446
+        || stat.st_ino != owner.1
+        || unsafe { libc::poll(&mut poll, 1, 0) } != 0
+    {
+        return Err(CoordinatorForwardingCutError::InvalidOwner);
+    }
+    let mut source = FORWARDED_SOURCE.lock().unwrap();
+    let source = source
+        .as_mut()
+        .ok_or(CoordinatorForwardingCutError::MissingSource)?;
+    Ok(NativeForwardedSourceReceipt {
+        generation: FORWARDED_GENERATION.load(Ordering::SeqCst),
+        identity: source_identity_for_cut(source)?,
+        owner,
+    })
+}
+
+fn verify_native_physical_completion(
+    receipt: &dyn NativePhysicalExitCompletion,
+) -> Result<(), CoordinatorForwardingCutError> {
+    use std::os::fd::AsRawFd;
+    let fd = receipt.retained_pidfd().as_raw_fd();
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if receipt.process_id() <= 0
+        || receipt.birth_identity() == 0
+        || unsafe { libc::fstat(fd, &mut stat) } != 0
+        || unsafe { libc::fstatfs(fd, &mut fs) } != 0
+        || fs.f_type as i64 != 0x5049_4446
+        || stat.st_ino != receipt.birth_identity()
+    {
+        return Err(CoordinatorForwardingCutError::InvalidOwner);
+    }
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut poll, 1, 0) };
+    if result < 0 {
+        return Err(CoordinatorForwardingCutError::SourceIo(
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        ));
+    }
+    if result != 1
+        || poll.revents & libc::POLLIN == 0
+        || poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0
+    {
+        return Err(CoordinatorForwardingCutError::InvalidOwner);
+    }
+    Ok(())
+}
+
+fn inspect_native_final_source(
+    source: &mut ForwardedSource,
+    identity: (u64, u64),
+    owner: (i32, u64),
+    completion: &dyn NativePhysicalExitCompletion,
+) -> Result<(), CoordinatorForwardingCutError> {
+    if (completion.process_id(), completion.birth_identity()) != owner {
+        return Err(CoordinatorForwardingCutError::InvalidOwner);
+    }
+    verify_native_physical_completion(completion)?;
+    if socket_identity(source.socket.as_raw_fd()) != Some(identity) {
+        return Err(CoordinatorForwardingCutError::SourceChanged);
+    }
+    collect_forwarded(source);
+    // EOF is interpreted only after actual physical-watch completion. Other
+    // retained transport failures are never erased or turned into healthy EOF.
+    match source.transport_failure {
+        Some(ForwardedSourceError::Closed) => {}
+        Some(error) => return Err(error.into()),
+        None => return Err(CoordinatorForwardingCutError::ClosedSource),
+    }
+    let mut poll = libc::pollfd {
+        fd: source.socket.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut poll, 1, 0) };
+    if result < 0 {
+        return Err(CoordinatorForwardingCutError::SourceIo(
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        ));
+    }
+    if result != 1
+        || poll.revents & libc::POLLHUP == 0
+        || poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0
+    {
+        return Err(CoordinatorForwardingCutError::ClosedSource);
+    }
+    if source.loss_seen || source.order.legacy || source.order.ambiguous {
+        return Err(CoordinatorForwardingCutError::DeterminismLoss);
+    }
+    for (tid, interval) in &source.order.received {
+        if let Some((expected, sent)) = interval.out_of_sequence {
+            return Err(CoordinatorForwardingCutError::OutOfSequence { expected, sent });
+        }
+        if interval.count != 0 {
+            // No caller-supplied or guessed final produced count is accepted.
+            // The genuine final counted exit request must have consumed it.
+            return Err(CoordinatorForwardingCutError::OtherOwnerPending(*tid));
+        }
+    }
+    if let Some(tid) = source.order.pending.keys().next() {
+        return Err(CoordinatorForwardingCutError::OtherOwnerPending(*tid));
+    }
+    Ok(())
+}
+
+/// Complete native DETLOG teardown after an actual physical-watch receipt.
+/// The unchanged counted/order rules must have credited every final record;
+/// unchecked tail records, legacy/order/loss notices, receive/poll errors and
+/// a replaced source all remain errors. On failure the source is retained.
+/// The successful operation consumes this registered source once.
+pub fn finish_native_forwarded_source_after_exit(
+    expected: &NativeForwardedSourceReceipt,
+    completion: &dyn NativePhysicalExitCompletion,
+) -> Result<(), CoordinatorForwardingCutError> {
+    let mut registered = FORWARDED_SOURCE.lock().unwrap();
+    if FORWARDED_GENERATION.load(Ordering::SeqCst) != expected.generation {
+        return Err(CoordinatorForwardingCutError::SourceChanged);
+    }
+    let source = registered
+        .as_mut()
+        .ok_or(CoordinatorForwardingCutError::MissingSource)?;
+    if DETERMINISM_LOSS.lock().unwrap().is_some() {
+        return Err(CoordinatorForwardingCutError::DeterminismLoss);
+    }
+    inspect_native_final_source(source, expected.identity, expected.owner, completion)?;
+    FORWARDED_GENERATION.fetch_add(1, Ordering::SeqCst);
+    stop_forwarded_receiver();
+    registered.take();
+    Ok(())
 }
 
 /// Takes every message waiting on the registered forwarding socket into the queue of
@@ -1012,39 +1239,388 @@ pub fn drain_forwarded_at_request(tid: i32) {
 pub fn check_forwarded_count(tid: i32, produced: u64) {
     if let Some(source) = FORWARDED_SOURCE.lock().unwrap().as_mut() {
         collect_forwarded(source);
-        let ReceivedInterval {
-            count: received,
-            out_of_sequence,
-        } = source.order.received_since_check(tid);
-        if produced == UNCOUNTED || out_of_sequence.is_some() || received != produced {
-            let reason = if produced == UNCOUNTED {
-                format!(
-                    "forwarded records uncounted: a guest thread's records could not be counted (reported by thread {tid})"
-                )
-            } else if let Some((expected, sent)) = out_of_sequence {
-                if sent > expected {
-                    format!(
-                        "forwarded records lost: thread {tid} sent record {sent} of its interval where {expected} was next"
-                    )
-                } else {
-                    format!(
-                        "forwarded records not the Tool's: thread {tid} sent record {sent} of its interval where {expected} was next"
-                    )
-                }
-            } else if received < produced {
-                format!(
-                    "forwarded records lost: thread {tid} produced {produced} since its last counted request and {received} arrived"
-                )
-            } else {
-                format!(
-                    "forwarded records not the Tool's: thread {tid} produced {produced} since its last counted request and {received} arrived"
-                )
-            };
-            record_determinism_loss(&reason);
-            let line = format!("{FORWARDING_LOSS_NOTICE} 0 0 {reason}\n");
-            (source.sink)(line.as_bytes());
+        let interval = source.order.received_since_check(tid);
+        if let Some(failure) = forwarded_count_failure(produced, interval) {
+            report_forwarded_count_failure(source, tid, failure);
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForwardedCountFailure {
+    Uncounted,
+    Sequence { expected: u64, sent: u64 },
+    Count { produced: u64, received: u64 },
+}
+
+fn forwarded_count_failure(
+    produced: u64,
+    interval: ReceivedInterval,
+) -> Option<ForwardedCountFailure> {
+    if produced == UNCOUNTED {
+        Some(ForwardedCountFailure::Uncounted)
+    } else if let Some((expected, sent)) = interval.out_of_sequence {
+        Some(ForwardedCountFailure::Sequence { expected, sent })
+    } else if interval.count != produced {
+        Some(ForwardedCountFailure::Count {
+            produced,
+            received: interval.count,
+        })
+    } else {
+        None
+    }
+}
+
+fn report_forwarded_count_failure(
+    source: &mut ForwardedSource,
+    tid: i32,
+    failure: ForwardedCountFailure,
+) {
+    let reason = match failure {
+        ForwardedCountFailure::Uncounted => format!(
+            "forwarded records uncounted: a guest thread's records could not be counted (reported by thread {tid})"
+        ),
+        ForwardedCountFailure::Sequence { expected, sent } if sent > expected => format!(
+            "forwarded records lost: thread {tid} sent record {sent} of its interval where {expected} was next"
+        ),
+        ForwardedCountFailure::Sequence { expected, sent } => format!(
+            "forwarded records not the Tool's: thread {tid} sent record {sent} of its interval where {expected} was next"
+        ),
+        ForwardedCountFailure::Count { produced, received } if received < produced => format!(
+            "forwarded records lost: thread {tid} produced {produced} since its last counted request and {received} arrived"
+        ),
+        ForwardedCountFailure::Count { produced, received } => format!(
+            "forwarded records not the Tool's: thread {tid} produced {produced} since its last counted request and {received} arrived"
+        ),
+    };
+    record_determinism_loss(&reason);
+    source.loss_seen = true;
+    let line = format!("{FORWARDING_LOSS_NOTICE} 0 0 {reason}\n");
+    (source.sink)(line.as_bytes());
+}
+
+/// A coordinator-local observation of a checked forwarding boundary.
+///
+/// Private fields bind the owner, registered source generation and actual socket
+/// device/inode under the source lock. This is not an authenticated guest ACK,
+/// watched-birth identity, scheduler grant, or authorization to replace an image.
+/// Supply it to a later check to refuse replacement of this receiving source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoordinatorForwardingReceipt {
+    owner_tid: i32,
+    generation: u64,
+    socket_identity: (u64, u64),
+}
+
+/// Why the coordinator cannot establish a strict counted forwarding boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoordinatorForwardingCutError {
+    /// The caller supplied no positive physical thread ID.
+    InvalidOwner,
+    /// No genuine receiving socket and sink have been registered.
+    MissingSource,
+    /// The owner, source generation or actual socket differs from the prior receipt.
+    SourceChanged,
+    /// The descriptor is not a connected AF_UNIX SOCK_SEQPACKET source.
+    InvalidSource,
+    /// EOF, peer shutdown or a zero-length message prevents a healthy empty drain.
+    ClosedSource,
+    /// A socket operation failed with this actual errno.
+    SourceIo(i32),
+    /// Poll observed actual socket error flags (without consuming SO_ERROR).
+    SourcePoll(i16),
+    /// The peeked message changed before it was received.
+    MessageChanged,
+    /// A persistent process or source loss, legacy record or ambiguous order exists.
+    DeterminismLoss,
+    /// The producer could not assign its records to a counted interval.
+    Uncounted,
+    /// An interval's first incorrect record index.
+    OutOfSequence {
+        /// The next index required by the existing protocol.
+        expected: u64,
+        /// The index actually received.
+        sent: u64,
+    },
+    /// The actual received count differs from the supplied produced count, even zero.
+    CountMismatch {
+        /// The actual producer interval claimed by the caller's counted request.
+        produced: u64,
+        /// The records genuinely collected from the registered socket.
+        received: u64,
+    },
+    /// Another thread retains records or an unchecked received interval.
+    OtherOwnerPending(i32),
+    /// This owner's request is not a fixed point of the existing order rule.
+    NotOwnerBoundary,
+    /// More records arrived while the checked interval was being written.
+    PendingOwnerRecords,
+}
+
+impl From<ForwardedSourceError> for CoordinatorForwardingCutError {
+    fn from(error: ForwardedSourceError) -> Self {
+        match error {
+            ForwardedSourceError::Closed => Self::ClosedSource,
+            ForwardedSourceError::Io(errno) => Self::SourceIo(errno),
+            ForwardedSourceError::Poll(flags) => Self::SourcePoll(flags),
+            ForwardedSourceError::MessageChanged => Self::MessageChanged,
+        }
+    }
+}
+
+impl From<ForwardedCountFailure> for CoordinatorForwardingCutError {
+    fn from(error: ForwardedCountFailure) -> Self {
+        match error {
+            ForwardedCountFailure::Uncounted => Self::Uncounted,
+            ForwardedCountFailure::Sequence { expected, sent } => {
+                Self::OutOfSequence { expected, sent }
+            }
+            ForwardedCountFailure::Count { produced, received } => {
+                Self::CountMismatch { produced, received }
+            }
+        }
+    }
+}
+
+/// Collect, write and check one owner's actual counted interval, then require
+/// the registered forwarding source to have no unchecked or queued records.
+///
+/// Unlike [`check_forwarded_count`], this successor-only inspection refuses a
+/// missing or unhealthy message source and any persistent determinism loss; it
+/// checks zero too. It uses the unchanged request/COMMIT order rule and never
+/// substitutes captured line counts for actual socket records. A refusal retains
+/// all unchecked intervals and queues (records collected during the check remain
+/// queued); a success consumes only the interval that was actually validated.
+///
+/// The caller must bind `owner_tid` and `produced` through its authenticated
+/// counted request, exclude concurrent producers, and repeat this check with the
+/// returned receipt at the final cut. The sink must report write failures through
+/// [`record_determinism_loss`], as the existing sink interface returns no result.
+/// This coordinator-local receipt is not a guest acknowledgment, watched-birth
+/// authority, scheduler permission, or proof that a later exec edge is neutral.
+pub fn check_native_exec_forwarding_cut(
+    owner_tid: i32,
+    produced: u64,
+    previous: Option<&CoordinatorForwardingReceipt>,
+) -> Result<CoordinatorForwardingReceipt, CoordinatorForwardingCutError> {
+    let mut source = FORWARDED_SOURCE.lock().unwrap();
+    let generation = FORWARDED_GENERATION.load(Ordering::SeqCst);
+    inspect_coordinator_forwarding_cut(
+        source.as_mut(),
+        generation,
+        owner_tid,
+        produced,
+        previous,
+        || DETERMINISM_LOSS.lock().unwrap().is_some(),
+    )
+}
+
+fn source_identity_for_cut(
+    source: &mut ForwardedSource,
+) -> Result<(u64, u64), CoordinatorForwardingCutError> {
+    if let Some(error) = source.transport_failure {
+        return Err(error.into());
+    }
+    let fd = source.socket.as_raw_fd();
+    let identity = socket_identity(fd).ok_or(CoordinatorForwardingCutError::InvalidSource)?;
+    let mut kind = 0i32;
+    let mut length;
+    loop {
+        length = std::mem::size_of_val(&kind) as libc::socklen_t;
+        // SAFETY: the output and length pointers refer to initialized stack storage.
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                (&mut kind as *mut i32).cast(),
+                &mut length,
+            )
+        };
+        if result >= 0 {
+            break;
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+        if errno == libc::EINTR {
+            continue;
+        }
+        let error = ForwardedSourceError::Io(errno);
+        source.transport_failure = Some(error);
+        return Err(error.into());
+    }
+    if length as usize != std::mem::size_of_val(&kind) || kind != libc::SOCK_SEQPACKET {
+        return Err(CoordinatorForwardingCutError::InvalidSource);
+    }
+    // SAFETY: sockaddr_storage is plain C storage, initialized before the query.
+    let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    loop {
+        length = std::mem::size_of_val(&peer) as libc::socklen_t;
+        // SAFETY: peer has the capacity reported in length and fd remains owned.
+        let result = unsafe {
+            libc::getpeername(
+                fd,
+                (&mut peer as *mut libc::sockaddr_storage).cast(),
+                &mut length,
+            )
+        };
+        if result >= 0 {
+            break;
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+        if errno == libc::EINTR {
+            continue;
+        }
+        let error = ForwardedSourceError::Io(errno);
+        source.transport_failure = Some(error);
+        return Err(error.into());
+    }
+    if (length as usize) < std::mem::size_of_val(&peer.ss_family)
+        || i32::from(peer.ss_family) != libc::AF_UNIX
+    {
+        return Err(CoordinatorForwardingCutError::InvalidSource);
+    }
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLRDHUP,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one initialized pollfd is writable for this nonblocking query.
+        let result = unsafe { libc::poll(&mut poll, 1, 0) };
+        if result < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+            if errno == libc::EINTR {
+                continue;
+            }
+            let error = ForwardedSourceError::Io(errno);
+            source.transport_failure = Some(error);
+            return Err(error.into());
+        }
+        let error = if poll.revents & (libc::POLLHUP | libc::POLLRDHUP) != 0 {
+            Some(ForwardedSourceError::Closed)
+        } else if poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            Some(ForwardedSourceError::Poll(poll.revents))
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            source.transport_failure = Some(error);
+            return Err(error.into());
+        }
+        return Ok(identity);
+    }
+}
+
+fn check_cut_state(
+    source: &ForwardedSource,
+    owner_tid: i32,
+    has_loss: &impl Fn() -> bool,
+) -> Result<(), CoordinatorForwardingCutError> {
+    if has_loss() || source.loss_seen || source.order.legacy || source.order.ambiguous {
+        return Err(CoordinatorForwardingCutError::DeterminismLoss);
+    }
+    if let Some((&tid, _)) = source
+        .order
+        .pending
+        .iter()
+        .find(|(tid, records)| **tid != owner_tid && !records.is_empty())
+    {
+        return Err(CoordinatorForwardingCutError::OtherOwnerPending(tid));
+    }
+    if let Some((&tid, _)) = source
+        .order
+        .received
+        .iter()
+        .find(|(tid, _)| **tid != owner_tid)
+    {
+        return Err(CoordinatorForwardingCutError::OtherOwnerPending(tid));
+    }
+    match source.order.runner {
+        Runner::NoTurnYet => Ok(()),
+        Runner::Root(tid) | Runner::Exclusive(tid) if tid == owner_tid => Ok(()),
+        _ => Err(CoordinatorForwardingCutError::NotOwnerBoundary),
+    }
+}
+
+fn inspect_coordinator_forwarding_cut(
+    source: Option<&mut ForwardedSource>,
+    generation: u64,
+    owner_tid: i32,
+    produced: u64,
+    previous: Option<&CoordinatorForwardingReceipt>,
+    has_loss: impl Fn() -> bool,
+) -> Result<CoordinatorForwardingReceipt, CoordinatorForwardingCutError> {
+    if owner_tid <= 0 {
+        return Err(CoordinatorForwardingCutError::InvalidOwner);
+    }
+    let source = source.ok_or(CoordinatorForwardingCutError::MissingSource)?;
+    let receipt = CoordinatorForwardingReceipt {
+        owner_tid,
+        generation,
+        socket_identity: source_identity_for_cut(source)?,
+    };
+    if previous.is_some_and(|previous| *previous != receipt) {
+        return Err(CoordinatorForwardingCutError::SourceChanged);
+    }
+    collect_forwarded(source);
+    source_identity_for_cut(source)?;
+    check_cut_state(source, owner_tid, &has_loss)?;
+    let interval = source
+        .order
+        .received
+        .get(&owner_tid)
+        .copied()
+        .unwrap_or_default();
+    if let Some(failure) = forwarded_count_failure(produced, interval) {
+        report_forwarded_count_failure(source, owner_tid, failure);
+        return Err(failure.into());
+    }
+    let records = source.order.at_request(owner_tid);
+    for record in &records {
+        emit(source, record);
+    }
+    // Sinks can expose a loss or peer closure while writing; do not consume an
+    // interval on that refusal. Excluded concurrent producers are checked too.
+    collect_forwarded(source);
+    let final_check = (|| {
+        if source_identity_for_cut(source)? != receipt.socket_identity {
+            return Err(CoordinatorForwardingCutError::SourceChanged);
+        }
+        check_cut_state(source, owner_tid, &has_loss)?;
+        let current = source
+            .order
+            .received
+            .get(&owner_tid)
+            .copied()
+            .unwrap_or_default();
+        if let Some(failure) = forwarded_count_failure(produced, current) {
+            report_forwarded_count_failure(source, owner_tid, failure);
+            return Err(failure.into());
+        }
+        if source
+            .order
+            .pending
+            .get(&owner_tid)
+            .is_some_and(|records| !records.is_empty())
+        {
+            return Err(CoordinatorForwardingCutError::PendingOwnerRecords);
+        }
+        Ok(())
+    })();
+    if let Err(error) = final_check {
+        // Preserve the original records ahead of any just-collected records.
+        // Some may already have reached the sink; this refused run gets no ACK.
+        if !records.is_empty() {
+            let mut retained = records;
+            if let Some(mut later) = source.order.pending.remove(&owner_tid) {
+                retained.append(&mut later);
+            }
+            source.order.pending.insert(owner_tid, retained);
+        }
+        return Err(error);
+    }
+    source.order.received_since_check(owner_tid);
+    Ok(receipt)
 }
 
 fn write_records(source: &mut ForwardedSource, records: Vec<Vec<u8>>) {
@@ -1068,28 +1644,65 @@ fn collect_forwarded(source: &mut ForwardedSource) {
                 libc::MSG_PEEK | libc::MSG_TRUNC | libc::MSG_DONTWAIT,
             )
         };
-        if size < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            continue;
+        if size < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+            if errno == libc::EINTR {
+                continue;
+            }
+            if errno != libc::EAGAIN && errno != libc::EWOULDBLOCK {
+                source
+                    .transport_failure
+                    .get_or_insert(ForwardedSourceError::Io(errno));
+            }
+            return;
         }
-        if size <= 0 {
-            // Nothing waiting (EAGAIN), the senders are gone (0), or an error: the
-            // next drain tries again, and the end of the run drains the rest.
+        if size == 0 {
+            source
+                .transport_failure
+                .get_or_insert(ForwardedSourceError::Closed);
             return;
         }
         buffer.resize(size as usize, 0);
         // SAFETY: `buffer` has room for `size` bytes.
-        let received = unsafe {
-            libc::recv(
-                fd,
-                buffer.as_mut_ptr().cast::<libc::c_void>(),
-                buffer.len(),
-                libc::MSG_DONTWAIT,
-            )
+        let received = loop {
+            let received = unsafe {
+                libc::recv(
+                    fd,
+                    buffer.as_mut_ptr().cast::<libc::c_void>(),
+                    buffer.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                )
+            };
+            if received < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break received;
         };
-        if received <= 0 {
+        if received < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+            let error = if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                ForwardedSourceError::MessageChanged
+            } else {
+                ForwardedSourceError::Io(errno)
+            };
+            source.transport_failure.get_or_insert(error);
             return;
         }
-        let message = &buffer[..received as usize];
+        if received == 0 {
+            source
+                .transport_failure
+                .get_or_insert(ForwardedSourceError::Closed);
+            return;
+        }
+        if received != size {
+            source
+                .transport_failure
+                .get_or_insert(ForwardedSourceError::MessageChanged);
+        }
+        // MSG_TRUNC reports the real message length if a competing consumer
+        // changed the peeked packet. Preserve ordinary emitted bytes, but never
+        // let a truncated packet establish a healthy native cut.
+        let message = &buffer[..(received as usize).min(buffer.len())];
         match split_forwarded_message(message) {
             Some((tid, index, record)) => {
                 source.order.arrived(tid, index);
@@ -1160,6 +1773,66 @@ static FORWARDING_UNCOUNTED: std::sync::atomic::AtomicBool =
 /// forked child inherits its parent's flag together with its parent's table.
 static FORWARDING_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Why the process-local forwarding state cannot cross an image replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForwardingCutError {
+    /// At least one record could not be assigned a counted interval.
+    Uncounted,
+    /// Loss notices are still waiting to be forwarded.
+    UnreportedLosses(u64),
+    /// A thread still has records in its current interval.
+    PendingRecords {
+        /// Physical process owning the counter slot.
+        pid: i32,
+        /// Physical thread owning the counter slot.
+        tid: i32,
+        /// Records that the existing completeness protocol must check.
+        count: u64,
+    },
+}
+
+/// Inspect an empty forwarding boundary without consuming or resetting it.
+///
+/// The caller must first complete an authenticated counted request through the
+/// existing completeness protocol. This inspection establishes only the local
+/// empty interval; it is not evidence of coordinator receipt or authorization
+/// to replace an image. A native handover must exclude concurrent producers
+/// and repeat this check immediately before its physical exec. No syscall,
+/// allocation, counter-slot claim, logging, or loss acknowledgment occurs here.
+/// Old slots are inspected too: a stale owner cannot make a retained record
+/// disappear at the boundary.
+pub fn check_empty_forwarding_cut() -> Result<(), ForwardingCutError> {
+    inspect_empty_forwarding_cut(
+        &FORWARDED_COUNTS,
+        FORWARDING_UNCOUNTED.load(Ordering::Acquire),
+        UNREPORTED_LOSSES.load(Ordering::Acquire),
+    )
+}
+
+fn inspect_empty_forwarding_cut(
+    slots: &[ForwardedCount],
+    uncounted: bool,
+    losses: u64,
+) -> Result<(), ForwardingCutError> {
+    if uncounted {
+        return Err(ForwardingCutError::Uncounted);
+    }
+    if losses != 0 {
+        return Err(ForwardingCutError::UnreportedLosses(losses));
+    }
+    for slot in slots {
+        let count = slot.count.load(Ordering::Acquire);
+        if count != 0 {
+            return Err(ForwardingCutError::PendingRecords {
+                pid: slot.pid.load(Ordering::Acquire),
+                tid: slot.tid.load(Ordering::Acquire),
+                count,
+            });
+        }
+    }
+    Ok(())
+}
 
 /// The count a request reports when some thread's records could not be
 /// counted.
@@ -1385,6 +2058,63 @@ mod tests {
     use super::RECORD_SEPARATOR;
     use super::record_suffix;
 
+    #[test]
+    fn native_exec_forwarding_cut_refuses_retained_records_and_loss_state_without_resetting() {
+        use std::sync::atomic::AtomicI32;
+        use std::sync::atomic::AtomicU64;
+
+        use super::ForwardedCount;
+        use super::ForwardingCutError;
+        use super::inspect_empty_forwarding_cut;
+
+        let slots = [ForwardedCount {
+            pid: AtomicI32::new(41),
+            tid: AtomicI32::new(43),
+            count: AtomicU64::new(0),
+        }];
+        assert_eq!(inspect_empty_forwarding_cut(&slots, false, 0), Ok(()));
+        slots[0].count.store(3, Ordering::Release);
+        for _ in 0..2 {
+            assert_eq!(
+                inspect_empty_forwarding_cut(&slots, false, 0),
+                Err(ForwardingCutError::PendingRecords {
+                    pid: 41,
+                    tid: 43,
+                    count: 3,
+                })
+            );
+            assert_eq!(slots[0].count.load(Ordering::Acquire), 3);
+        }
+        // Removing an owner does not waive an unconsumed record.
+        slots[0].tid.store(0, Ordering::Release);
+        assert!(matches!(
+            inspect_empty_forwarding_cut(&slots, false, 0),
+            Err(ForwardingCutError::PendingRecords {
+                tid: 0,
+                count: 3,
+                ..
+            })
+        ));
+        assert_eq!(
+            inspect_empty_forwarding_cut(&slots, true, 0),
+            Err(ForwardingCutError::Uncounted)
+        );
+        assert_eq!(
+            inspect_empty_forwarding_cut(&slots, false, 2),
+            Err(ForwardingCutError::UnreportedLosses(2))
+        );
+        assert_eq!(slots[0].count.load(Ordering::Acquire), 3);
+        slots[0].count.store(0, Ordering::Release);
+        assert_eq!(inspect_empty_forwarding_cut(&slots, false, 0), Ok(()));
+        // A producer after the first empty observation invalidates the later
+        // check; the earlier observation is not a reusable authorization.
+        slots[0].count.store(1, Ordering::Release);
+        assert!(matches!(
+            inspect_empty_forwarding_cut(&slots, false, 0),
+            Err(ForwardingCutError::PendingRecords { count: 1, .. })
+        ));
+    }
+
     /// A thread that sends more records than the socket buffer holds before its
     /// next request (a single writev's records, say) is not blocked: the
     /// receiver task takes them off the socket as they arrive, queued for their
@@ -1397,6 +2127,567 @@ mod tests {
         GLOBAL_SOURCE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    // Real, connected message sockets and an actual record sink. Local positive
+    // fixtures isolate the process's permanently sticky loss latch, which other
+    // loss tests intentionally set; the public helper's latch is tested separately.
+    // Every user still holds global_source_test: emit/report can set that latch.
+    struct NativeCutSource {
+        source: super::ForwardedSource,
+        sender: std::os::fd::OwnedFd,
+        written: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl NativeCutSource {
+        fn new() -> Self {
+            use std::os::fd::FromRawFd;
+            let mut fds = [-1; 2];
+            // SAFETY: fds has space for both descriptors; ownership is taken once.
+            assert_eq!(
+                unsafe {
+                    libc::socketpair(
+                        libc::AF_UNIX,
+                        libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                        0,
+                        fds.as_mut_ptr(),
+                    )
+                },
+                0
+            );
+            let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = written.clone();
+            Self {
+                source: super::ForwardedSource {
+                    socket: unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) },
+                    sink: Box::new(move |record| sink.lock().unwrap().push(record.to_vec())),
+                    order: super::ForwardedOrder::new(),
+                    transport_failure: None,
+                    loss_seen: false,
+                },
+                sender: unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) },
+                written,
+            }
+        }
+
+        fn send(&self, tid: i32, index: u64, record: &[u8]) {
+            use std::os::fd::AsRawFd;
+            let message = super::tagged_forwarded_message(tid, index, record);
+            // SAFETY: message is live for the complete message-oriented send.
+            assert_eq!(
+                unsafe {
+                    libc::send(
+                        self.sender.as_raw_fd(),
+                        message.as_ptr().cast(),
+                        message.len(),
+                        libc::MSG_NOSIGNAL,
+                    )
+                },
+                message.len() as isize
+            );
+        }
+
+        fn check(
+            &mut self,
+            produced: u64,
+        ) -> Result<super::CoordinatorForwardingReceipt, super::CoordinatorForwardingCutError>
+        {
+            super::inspect_coordinator_forwarding_cut(
+                Some(&mut self.source),
+                19,
+                41,
+                produced,
+                None,
+                || false,
+            )
+        }
+    }
+
+    #[test]
+    fn native_coordinator_cut_checks_zero_and_nonzero_real_socket_intervals() {
+        let _guard = global_source_test();
+        let mut fixture = NativeCutSource::new();
+        let first = fixture.check(0).unwrap();
+        assert!(fixture.written.lock().unwrap().is_empty());
+        assert!(fixture.source.order.received.is_empty());
+        assert_eq!(
+            fixture.source.transport_failure, None,
+            "empty EAGAIN is healthy"
+        );
+        fixture.send(41, 1, b"a\n");
+        fixture.send(41, 2, b"b\n");
+        let second = super::inspect_coordinator_forwarding_cut(
+            Some(&mut fixture.source),
+            19,
+            41,
+            2,
+            Some(&first),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            *fixture.written.lock().unwrap(),
+            vec![b"a\n".to_vec(), b"b\n".to_vec()]
+        );
+        assert!(fixture.source.order.pending.is_empty());
+        assert!(fixture.source.order.received.is_empty());
+        // Success consumes exactly this interval; the actual next one starts at1.
+        fixture.send(41, 1, b"c\n");
+        assert_eq!(fixture.check(1), Ok(first));
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(
+                Some(&mut fixture.source),
+                19,
+                41,
+                0,
+                Some(&first),
+                || false
+            ),
+            Ok(first)
+        );
+        assert_eq!(
+            *fixture.written.lock().unwrap(),
+            vec![b"a\n".to_vec(), b"b\n".to_vec(), b"c\n".to_vec()]
+        );
+        assert!(fixture.source.order.at_commit(41, true).is_empty());
+        assert_eq!(
+            fixture.check(0),
+            Ok(first),
+            "the actual owner's exclusive point is eligible too"
+        );
+    }
+
+    #[test]
+    fn native_coordinator_cut_refuses_unchecked_counts_without_consuming_them() {
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        for (indexes, produced, expected) in [
+            (
+                vec![],
+                1,
+                Error::CountMismatch {
+                    produced: 1,
+                    received: 0,
+                },
+            ),
+            (
+                vec![1],
+                0,
+                Error::CountMismatch {
+                    produced: 0,
+                    received: 1,
+                },
+            ),
+            (
+                vec![1],
+                2,
+                Error::CountMismatch {
+                    produced: 2,
+                    received: 1,
+                },
+            ),
+            (
+                vec![1, 2],
+                1,
+                Error::CountMismatch {
+                    produced: 1,
+                    received: 2,
+                },
+            ),
+            (
+                vec![2],
+                1,
+                Error::OutOfSequence {
+                    expected: 1,
+                    sent: 2,
+                },
+            ),
+            (
+                vec![1, 1],
+                2,
+                Error::OutOfSequence {
+                    expected: 2,
+                    sent: 1,
+                },
+            ),
+            (vec![1], super::UNCOUNTED, Error::Uncounted),
+        ] {
+            let mut fixture = NativeCutSource::new();
+            for &index in &indexes {
+                fixture.send(41, index, b"kept\n");
+            }
+            assert_eq!(fixture.check(produced), Err(expected));
+            assert_eq!(
+                fixture
+                    .source
+                    .order
+                    .received
+                    .get(&41)
+                    .copied()
+                    .unwrap_or_default()
+                    .count,
+                indexes.len() as u64
+            );
+            assert_eq!(
+                fixture.source.order.pending.get(&41).map_or(0, Vec::len),
+                indexes.len()
+            );
+            assert!(
+                fixture
+                    .written
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|record| record.starts_with(super::FORWARDING_LOSS_NOTICE.as_bytes()))
+            );
+            assert_eq!(
+                fixture.check(produced),
+                Err(Error::DeterminismLoss),
+                "a later check cannot clear the loss"
+            );
+            assert_eq!(
+                fixture
+                    .source
+                    .order
+                    .received
+                    .get(&41)
+                    .copied()
+                    .unwrap_or_default()
+                    .count,
+                indexes.len() as u64
+            );
+        }
+    }
+
+    #[test]
+    fn native_coordinator_cut_retains_other_owner_records_and_requires_order_point() {
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        let mut fixture = NativeCutSource::new();
+        fixture.send(41, 1, b"owner\n");
+        fixture.send(43, 1, b"other\n");
+        for _ in 0..2 {
+            assert_eq!(fixture.check(1), Err(Error::OtherOwnerPending(43)));
+            assert_eq!(fixture.source.order.pending[&41], vec![b"owner\n".to_vec()]);
+            assert_eq!(fixture.source.order.pending[&43], vec![b"other\n".to_vec()]);
+            assert_eq!(fixture.source.order.received[&41].count, 1);
+            assert_eq!(fixture.source.order.received[&43].count, 1);
+            assert!(fixture.written.lock().unwrap().is_empty());
+        }
+        // The other queue may already have been written at its ordinary COMMIT;
+        // its actual unchecked received interval still prevents this cut.
+        let other = fixture.source.order.at_commit(43, true);
+        super::write_records(&mut fixture.source, other);
+        assert_eq!(fixture.check(1), Err(Error::OtherOwnerPending(43)));
+        assert_eq!(fixture.source.order.received[&43].count, 1);
+
+        for runner in [
+            super::Runner::None,
+            super::Runner::Exclusive(43),
+            super::Runner::Root(43),
+        ] {
+            let mut fixture = NativeCutSource::new();
+            fixture.send(41, 1, b"kept\n");
+            fixture.source.order.runner = runner;
+            assert_eq!(fixture.check(1), Err(Error::NotOwnerBoundary));
+            assert_eq!(fixture.source.order.pending[&41], vec![b"kept\n".to_vec()]);
+            assert_eq!(fixture.source.order.received[&41].count, 1);
+            assert!(fixture.written.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn native_coordinator_cut_requires_a_healthy_actual_message_source() {
+        use std::os::fd::FromRawFd;
+
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(None, 19, 41, 0, None, || false),
+            Err(Error::MissingSource)
+        );
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(None, 19, 0, 0, None, || false),
+            Err(Error::InvalidOwner)
+        );
+
+        let mut fixture = NativeCutSource::new();
+        fixture.source.socket = std::fs::File::open("/dev/null").unwrap().into();
+        assert_eq!(fixture.check(0), Err(Error::InvalidSource));
+        super::collect_forwarded(&mut fixture.source);
+        assert_eq!(
+            fixture.source.transport_failure,
+            Some(super::ForwardedSourceError::Io(libc::ENOTSOCK))
+        );
+        assert_eq!(fixture.check(0), Err(Error::SourceIo(libc::ENOTSOCK)));
+
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut fixture = NativeCutSource::new();
+        fixture.source.socket = stream.into();
+        assert_eq!(
+            fixture.check(0),
+            Err(Error::InvalidSource),
+            "a stream cannot stand in for the counted message transport"
+        );
+
+        let mut fixture = NativeCutSource::new();
+        // SAFETY: successful socket creation supplies one uniquely owned fd.
+        let fd =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+        assert!(fd >= 0);
+        fixture.source.socket = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        assert_eq!(fixture.check(0), Err(Error::SourceIo(libc::ENOTCONN)));
+
+        let fixture = NativeCutSource::new();
+        fixture.send(41, 1, b"retained on closure\n");
+        let NativeCutSource {
+            mut source, sender, ..
+        } = fixture;
+        drop(sender);
+        // An ordinary drain remembers its EOF; the strict check cannot bless it
+        // later as a successful empty source, even with a matching real count.
+        super::collect_forwarded(&mut source);
+        assert_eq!(
+            source.transport_failure,
+            Some(super::ForwardedSourceError::Closed)
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                super::inspect_coordinator_forwarding_cut(
+                    Some(&mut source),
+                    19,
+                    41,
+                    1,
+                    None,
+                    || false
+                ),
+                Err(Error::ClosedSource)
+            );
+            assert_eq!(source.order.received[&41].count, 1);
+            assert_eq!(
+                source.order.pending[&41],
+                vec![b"retained on closure\n".to_vec()]
+            );
+        }
+    }
+
+    #[test]
+    fn native_coordinator_cut_receipt_rechecks_generation_socket_and_owner() {
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        let mut fixture = NativeCutSource::new();
+        let receipt = fixture.check(0).unwrap();
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(
+                Some(&mut fixture.source),
+                20,
+                41,
+                0,
+                Some(&receipt),
+                || false
+            ),
+            Err(Error::SourceChanged)
+        );
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(
+                Some(&mut fixture.source),
+                19,
+                43,
+                0,
+                Some(&receipt),
+                || false
+            ),
+            Err(Error::SourceChanged)
+        );
+        let mut replacement = NativeCutSource::new();
+        replacement.send(41, 1, b"new source\n");
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(
+                Some(&mut replacement.source),
+                19,
+                41,
+                1,
+                Some(&receipt),
+                || false
+            ),
+            Err(Error::SourceChanged)
+        );
+        super::collect_forwarded(&mut replacement.source);
+        assert_eq!(replacement.source.order.received[&41].count, 1);
+        assert_eq!(
+            replacement.source.order.pending[&41],
+            vec![b"new source\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn native_coordinator_cut_refuses_real_loss_notices_and_persistent_process_loss() {
+        use std::os::fd::AsRawFd;
+
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        for message in [
+            b"HERMIT_DETLOG_RECORD_LOST 0 1 actual forwarding loss\n".as_slice(),
+            b"untagged actual record\n".as_slice(),
+        ] {
+            let mut fixture = NativeCutSource::new();
+            // SAFETY: the complete message bytes stay live until send returns.
+            assert_eq!(
+                unsafe {
+                    libc::send(
+                        fixture.sender.as_raw_fd(),
+                        message.as_ptr().cast(),
+                        message.len(),
+                        libc::MSG_NOSIGNAL,
+                    )
+                },
+                message.len() as isize
+            );
+            assert_eq!(fixture.check(0), Err(Error::DeterminismLoss));
+            assert!(fixture.source.loss_seen);
+            assert!(
+                fixture
+                    .written
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|record| record.starts_with(super::FORWARDING_LOSS_NOTICE.as_bytes()))
+            );
+            assert_eq!(fixture.check(0), Err(Error::DeterminismLoss));
+        }
+        // No test resets the process latch. Even a fresh real registered source
+        // cannot waive a previous loss through the public production helper.
+        super::clear_forwarded_source();
+        super::record_determinism_loss("native cut test persistent loss");
+        let NativeCutSource { source, sender, .. } = NativeCutSource::new();
+        super::set_forwarded_source(source.socket, source.sink);
+        assert_eq!(
+            super::check_native_exec_forwarding_cut(41, 0, None),
+            Err(Error::DeterminismLoss)
+        );
+        super::clear_forwarded_source();
+        assert_eq!(
+            super::check_native_exec_forwarding_cut(41, 0, None),
+            Err(Error::MissingSource)
+        );
+        drop(sender);
+    }
+
+    #[test]
+    fn native_coordinator_cut_restores_unchecked_queue_after_sink_closure() {
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        let fixture = NativeCutSource::new();
+        fixture.send(41, 1, b"written before closure\n");
+        let NativeCutSource {
+            mut source,
+            sender,
+            written,
+        } = fixture;
+        let mut peer = Some(sender);
+        let sink = written.clone();
+        source.sink = Box::new(move |record| {
+            sink.lock().unwrap().push(record.to_vec());
+            drop(peer.take());
+        });
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(Some(&mut source), 19, 41, 1, None, || false),
+            Err(Error::ClosedSource)
+        );
+        assert_eq!(
+            *written.lock().unwrap(),
+            vec![b"written before closure\n".to_vec()]
+        );
+        assert_eq!(source.order.received[&41].count, 1);
+        assert_eq!(
+            source.order.pending[&41],
+            vec![b"written before closure\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn native_coordinator_cut_rechecks_loss_reported_by_the_record_sink() {
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        let fixture = NativeCutSource::new();
+        fixture.send(41, 1, b"sink failure\n");
+        let NativeCutSource {
+            mut source,
+            sender,
+            written,
+        } = fixture;
+        let local_loss = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let loss_from_sink = local_loss.clone();
+        let sink = written.clone();
+        source.sink = Box::new(move |record| {
+            sink.lock().unwrap().push(record.to_vec());
+            // The sink interface has no Result; this is its real required loss
+            // report, plus a local fixture view to isolate older process losses.
+            super::record_determinism_loss("native cut test sink failure");
+            loss_from_sink.store(true, Ordering::Release);
+        });
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(Some(&mut source), 19, 41, 1, None, || {
+                local_loss.load(Ordering::Acquire)
+            }),
+            Err(Error::DeterminismLoss)
+        );
+        assert!(super::determinism_loss().is_some());
+        assert_eq!(*written.lock().unwrap(), vec![b"sink failure\n".to_vec()]);
+        assert_eq!(source.order.received[&41].count, 1);
+        assert_eq!(source.order.pending[&41], vec![b"sink failure\n".to_vec()]);
+        drop(sender);
+    }
+
+    #[test]
+    fn native_coordinator_cut_retains_actual_packet_that_arrives_during_sink_write() {
+        use std::os::fd::AsRawFd;
+
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        let fixture = NativeCutSource::new();
+        fixture.send(41, 1, b"first\n");
+        let NativeCutSource {
+            mut source,
+            sender,
+            written,
+        } = fixture;
+        let sink = written.clone();
+        let mut sent = false;
+        source.sink = Box::new(move |record| {
+            sink.lock().unwrap().push(record.to_vec());
+            if !sent {
+                sent = true;
+                let message = super::tagged_forwarded_message(41, 2, b"late\n");
+                // SAFETY: this actual second message is complete during the send.
+                assert_eq!(
+                    unsafe {
+                        libc::send(
+                            sender.as_raw_fd(),
+                            message.as_ptr().cast(),
+                            message.len(),
+                            libc::MSG_NOSIGNAL,
+                        )
+                    },
+                    message.len() as isize
+                );
+            }
+        });
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(Some(&mut source), 19, 41, 1, None, || false),
+            Err(Error::CountMismatch {
+                produced: 1,
+                received: 2
+            })
+        );
+        assert_eq!(source.order.received[&41].count, 2);
+        assert_eq!(
+            source.order.pending[&41],
+            vec![b"first\n".to_vec(), b"late\n".to_vec()]
+        );
+        assert_eq!(written.lock().unwrap()[0], b"first\n".to_vec());
+        assert!(source.loss_seen);
     }
 
     /// Each thread counts the records it produced for forwarding since its
@@ -2186,5 +3477,530 @@ mod tests {
                 "{malformed:?} must be refused"
             );
         }
+    }
+    struct ModelPhysicalCompletion {
+        fd: std::os::fd::OwnedFd,
+        pid: i32,
+        identity: u64,
+    }
+    // SAFETY: test-only watch authority model. The pidfds and socket EOF below
+    // are real, but this fixture DOES NOT claim a real PhysicalExitWatch drain.
+    unsafe impl super::NativePhysicalExitCompletion for ModelPhysicalCompletion {
+        fn retained_pidfd(&self) -> std::os::fd::BorrowedFd<'_> {
+            use std::os::fd::AsFd;
+            self.fd.as_fd()
+        }
+        fn process_id(&self) -> i32 {
+            self.pid
+        }
+        fn birth_identity(&self) -> u64 {
+            self.identity
+        }
+    }
+    fn model_completion(dead: bool) -> ModelPhysicalCompletion {
+        use std::os::fd::FromRawFd;
+        let mut child = dead.then(|| std::process::Command::new("true").spawn().unwrap());
+        let pid = child
+            .as_ref()
+            .map_or(std::process::id(), std::process::Child::id);
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        assert!(raw >= 0);
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        use std::os::fd::AsRawFd;
+        assert_eq!(unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) }, 0);
+        if let Some(child) = child.as_mut() {
+            assert!(child.wait().unwrap().success());
+        }
+        ModelPhysicalCompletion {
+            fd,
+            pid: pid as i32,
+            identity: stat.st_ino,
+        }
+    }
+    #[test]
+    fn model_native_final_drain_requires_actual_death_and_credited_real_source() {
+        use std::os::fd::AsRawFd;
+
+        use super::CoordinatorForwardingCutError as Error;
+        let mut fixture = NativeCutSource::new();
+        fixture.send(41, 1, b"credited\n");
+        fixture.check(1).unwrap();
+        let identity = super::socket_identity(fixture.source.socket.as_raw_fd()).unwrap();
+        drop(fixture.sender);
+        let live = model_completion(false);
+        assert_eq!(
+            super::inspect_native_final_source(
+                &mut fixture.source,
+                identity,
+                (live.pid, live.identity),
+                &live
+            ),
+            Err(Error::InvalidOwner)
+        );
+        let dead = model_completion(true);
+        assert!(
+            super::inspect_native_final_source(
+                &mut fixture.source,
+                identity,
+                (dead.pid, dead.identity),
+                &dead
+            )
+            .is_ok()
+        );
+        assert_eq!(*fixture.written.lock().unwrap(), [b"credited\n".to_vec()]);
+    }
+    #[test]
+    fn model_native_final_drain_retains_transport_loss_tail_and_identity_failures() {
+        use std::os::fd::AsRawFd;
+
+        use super::CoordinatorForwardingCutError as Error;
+        use super::ForwardedSourceError;
+        let dead = model_completion(true);
+        let mut fixture = NativeCutSource::new();
+        fixture.check(0).unwrap();
+        let identity = super::socket_identity(fixture.source.socket.as_raw_fd()).unwrap();
+        drop(fixture.sender);
+        fixture.source.transport_failure = Some(ForwardedSourceError::Io(libc::EIO));
+        assert_eq!(
+            super::inspect_native_final_source(
+                &mut fixture.source,
+                identity,
+                (dead.pid, dead.identity),
+                &dead
+            ),
+            Err(Error::SourceIo(libc::EIO))
+        );
+        assert_eq!(
+            fixture.source.transport_failure,
+            Some(ForwardedSourceError::Io(libc::EIO))
+        );
+        assert_eq!(
+            super::inspect_native_final_source(
+                &mut fixture.source,
+                (identity.0, identity.1 ^ 1),
+                (dead.pid, dead.identity),
+                &dead
+            ),
+            Err(Error::SourceChanged)
+        );
+        let mut tail = NativeCutSource::new();
+        tail.check(0).unwrap();
+        tail.send(41, 1, b"uncredited\n");
+        let identity = super::socket_identity(tail.source.socket.as_raw_fd()).unwrap();
+        drop(tail.sender);
+        assert_eq!(
+            super::inspect_native_final_source(
+                &mut tail.source,
+                identity,
+                (dead.pid, dead.identity),
+                &dead
+            ),
+            Err(Error::OtherOwnerPending(41))
+        );
+        assert_eq!(tail.source.order.received[&41].count, 1);
+        assert!(tail.written.lock().unwrap().is_empty());
+        tail.source.loss_seen = true;
+        assert_eq!(
+            super::inspect_native_final_source(
+                &mut tail.source,
+                identity,
+                (dead.pid, dead.identity),
+                &dead
+            ),
+            Err(Error::DeterminismLoss)
+        );
+    }
+
+    #[test]
+    fn model_native_final_drain_refuses_another_births_completion_without_consuming_source() {
+        use std::os::fd::AsRawFd;
+
+        use super::CoordinatorForwardingCutError as Error;
+        let owner = model_completion(false);
+        let unrelated = model_completion(true);
+        assert_ne!(owner.identity, unrelated.identity);
+        let mut fixture = NativeCutSource::new();
+        fixture.check(0).unwrap();
+        let identity = super::socket_identity(fixture.source.socket.as_raw_fd()).unwrap();
+        drop(fixture.sender);
+        assert_eq!(
+            super::inspect_native_final_source(
+                &mut fixture.source,
+                identity,
+                (owner.pid, owner.identity),
+                &unrelated
+            ),
+            Err(Error::InvalidOwner)
+        );
+        // A mismatched completion cannot reinterpret or consume this EOF.
+        assert_eq!(fixture.source.transport_failure, None);
+        assert!(fixture.written.lock().unwrap().is_empty());
+    }
+
+    // Test-owned task handles expose natural completion without adding a
+    // production status API. The independent watchdog stops a spinning old
+    // receiver even if a Tokio timer cannot obtain a poll. Drop also stops and
+    // joins on assertion unwinding; neither path counts as natural completion.
+    type ForwardedReceiverStop =
+        std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>;
+
+    struct ForwardedReceiverTask {
+        runtime: tokio::runtime::Runtime,
+        task: Option<tokio::task::JoinHandle<()>>,
+        stop: ForwardedReceiverStop,
+        done: Option<std::sync::mpsc::Sender<()>>,
+        watchdog: Option<std::thread::JoinHandle<()>>,
+        watchdog_fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ForwardedReceiverTask {
+        fn spawn(watched: std::os::fd::OwnedFd, generation: u64) -> Self {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let stop = std::sync::Arc::new(std::sync::Mutex::new(Some(stop)));
+            let watchdog_stop = stop.clone();
+            let watchdog_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fired = watchdog_fired.clone();
+            let (done, completed) = std::sync::mpsc::channel();
+            let watchdog = std::thread::spawn(move || {
+                if completed
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_err()
+                {
+                    fired.store(true, Ordering::SeqCst);
+                    if let Some(stop) = watchdog_stop.lock().unwrap().take() {
+                        let _ = stop.send(());
+                    }
+                }
+            });
+            let task = runtime.spawn(super::receive_forwarded(watched, generation, stopped));
+            Self {
+                runtime,
+                task: Some(task),
+                stop,
+                done: Some(done),
+                watchdog: Some(watchdog),
+                watchdog_fired,
+            }
+        }
+
+        fn request_stop(&self) {
+            if let Some(stop) = self.stop.lock().unwrap().take() {
+                let _ = stop.send(());
+            }
+        }
+
+        fn join(&mut self) -> (Result<(), tokio::task::JoinError>, bool) {
+            let result = self.runtime.block_on(self.task.take().unwrap());
+            let _ = self.done.take().unwrap().send(());
+            let watchdog_ok = self.watchdog.take().unwrap().join().is_ok();
+            (
+                result,
+                self.watchdog_fired.load(Ordering::SeqCst) || !watchdog_ok,
+            )
+        }
+
+        fn is_finished(&self) -> bool {
+            self.task.as_ref().unwrap().is_finished()
+        }
+    }
+
+    impl Drop for ForwardedReceiverTask {
+        fn drop(&mut self) {
+            if self.task.is_some() {
+                self.request_stop();
+                let _ = self.join();
+            }
+        }
+    }
+
+    struct ForwardedReceiverSourceCleanup;
+    impl Drop for ForwardedReceiverSourceCleanup {
+        fn drop(&mut self) {
+            super::clear_forwarded_source();
+        }
+    }
+
+    struct ReceiverSource {
+        sender: std::os::fd::OwnedFd,
+        written: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        generation: u64,
+        identity: (u64, u64),
+    }
+
+    fn install_receiver_source() -> ReceiverSource {
+        use std::os::fd::AsRawFd;
+        let NativeCutSource {
+            source,
+            sender,
+            written,
+        } = NativeCutSource::new();
+        let identity = super::socket_identity(source.socket.as_raw_fd()).unwrap();
+        super::set_forwarded_source(source.socket, source.sink);
+        let generation = super::FORWARDED_GENERATION.load(Ordering::SeqCst);
+        ReceiverSource {
+            sender,
+            written,
+            generation,
+            identity,
+        }
+    }
+
+    fn send_receiver_record(sender: &std::os::fd::OwnedFd, record: &[u8]) {
+        use std::os::fd::AsRawFd;
+        let message = super::tagged_forwarded_message(41, 1, record);
+        // SAFETY: the live message buffer is valid for the complete packet.
+        let sent = unsafe {
+            libc::send(
+                sender.as_raw_fd(),
+                message.as_ptr().cast(),
+                message.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        assert_eq!(sent, message.len() as isize);
+    }
+
+    fn receiver_watched_socket() -> std::os::fd::OwnedFd {
+        super::FORWARDED_SOURCE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .socket
+            .try_clone()
+            .unwrap()
+    }
+
+    fn wait_for_receiver_record() -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let received = super::FORWARDED_SOURCE
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .order
+                .received
+                .get(&41)
+                .is_some_and(|interval| interval.count == 1);
+            if received {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        false
+    }
+
+    #[test]
+    fn forwarded_receiver_retires_after_real_eof_without_rearming() {
+        use std::os::fd::AsRawFd;
+        let _guard = global_source_test();
+        let _cleanup = ForwardedReceiverSourceCleanup;
+        let ReceiverSource {
+            sender,
+            written,
+            generation,
+            identity,
+        } = install_receiver_source();
+        super::RECEIVER_GENERATION.store(generation, Ordering::SeqCst);
+        // A marker for the existing global stop owner: terminal return must
+        // leave it intact, and starting the same generation must not replace it.
+        let (marker, mut marker_receiver) = tokio::sync::oneshot::channel();
+        *super::RECEIVER_STOP.lock().unwrap() = Some(marker);
+        let mut receiver = ForwardedReceiverTask::spawn(receiver_watched_socket(), generation);
+        send_receiver_record(&sender, b"credited before EOF\n");
+        assert!(wait_for_receiver_record(), "actual async task must collect");
+        assert!(!receiver.is_finished(), "live EAGAIN must keep waiting");
+        let credited = {
+            let mut source = super::FORWARDED_SOURCE.lock().unwrap();
+            super::inspect_coordinator_forwarding_cut(
+                source.as_mut(),
+                generation,
+                41,
+                1,
+                None,
+                || false,
+            )
+        };
+        assert!(credited.is_ok());
+        assert_eq!(
+            *written.lock().unwrap(),
+            [b"credited before EOF\n".to_vec()]
+        );
+        drop(sender);
+        let (joined, watchdog_fired) = receiver.join();
+        assert!(joined.is_ok(), "actual receiver task must join");
+        assert!(!watchdog_fired, "EOF must retire without stop or abort");
+        let retained = {
+            let source = super::FORWARDED_SOURCE.lock().unwrap();
+            let source = source.as_ref().unwrap();
+            (
+                source.transport_failure,
+                super::socket_identity(source.socket.as_raw_fd()).unwrap(),
+                source.order.pending.values().all(Vec::is_empty),
+                source.order.received.is_empty(),
+            )
+        };
+        assert_eq!(
+            retained,
+            (
+                Some(super::ForwardedSourceError::Closed),
+                identity,
+                true,
+                true
+            )
+        );
+        assert_eq!(
+            super::FORWARDED_GENERATION.load(Ordering::SeqCst),
+            generation
+        );
+        assert_eq!(
+            super::RECEIVER_GENERATION.load(Ordering::SeqCst),
+            generation
+        );
+        assert!(matches!(
+            marker_receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        receiver
+            .runtime
+            .block_on(async { super::start_forwarded_receiver() });
+        assert!(matches!(
+            marker_receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn forwarded_receiver_replacement_preserves_new_generation() {
+        let _guard = global_source_test();
+        let _cleanup = ForwardedReceiverSourceCleanup;
+        let ReceiverSource {
+            sender: old_sender,
+            written: old_written,
+            generation: old_generation,
+            ..
+        } = install_receiver_source();
+        let old_watched = receiver_watched_socket();
+        send_receiver_record(&old_sender, b"old queued packet\n");
+        let ReceiverSource {
+            sender,
+            written,
+            generation,
+            ..
+        } = install_receiver_source();
+        assert_ne!(old_generation, generation);
+        super::RECEIVER_GENERATION.store(generation, Ordering::SeqCst);
+        let (marker, mut marker_receiver) = tokio::sync::oneshot::channel();
+        *super::RECEIVER_STOP.lock().unwrap() = Some(marker);
+        send_receiver_record(&sender, b"fresh queued packet\n");
+        let mut stale = ForwardedReceiverTask::spawn(old_watched, old_generation);
+        let (joined, watchdog_fired) = stale.join();
+        assert!(joined.is_ok());
+        assert!(!watchdog_fired, "stale generation must return naturally");
+        let untouched = {
+            let source = super::FORWARDED_SOURCE.lock().unwrap();
+            let source = source.as_ref().unwrap();
+            source.order.received.is_empty() && source.order.pending.is_empty()
+        };
+        assert!(
+            untouched,
+            "stale task cannot consume the fresh source packet"
+        );
+        assert!(old_written.lock().unwrap().is_empty());
+        assert!(written.lock().unwrap().is_empty());
+        assert_eq!(
+            super::RECEIVER_GENERATION.load(Ordering::SeqCst),
+            generation
+        );
+        assert!(matches!(
+            marker_receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let mut fresh = ForwardedReceiverTask::spawn(receiver_watched_socket(), generation);
+        assert!(wait_for_receiver_record());
+        let queued = {
+            let source = super::FORWARDED_SOURCE.lock().unwrap();
+            let source = source.as_ref().unwrap();
+            (source.transport_failure, source.order.pending[&41].clone())
+        };
+        assert_eq!(queued, (None, vec![b"fresh queued packet\n".to_vec()]));
+        assert!(!fresh.is_finished(), "healthy open peer must keep waiting");
+        fresh.request_stop();
+        let (joined, watchdog_fired) = fresh.join();
+        assert!(joined.is_ok());
+        assert!(!watchdog_fired, "explicit healthy-source stop must join");
+        assert!(written.lock().unwrap().is_empty());
+        assert_eq!(
+            super::RECEIVER_GENERATION.load(Ordering::SeqCst),
+            generation
+        );
+        drop(sender);
+        drop(old_sender);
+    }
+
+    #[test]
+    fn forwarded_receiver_retirement_preserves_uncredited_tail_refusal() {
+        use std::os::fd::AsRawFd;
+
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        let _cleanup = ForwardedReceiverSourceCleanup;
+        let ReceiverSource {
+            sender,
+            written,
+            generation,
+            identity,
+        } = install_receiver_source();
+        super::RECEIVER_GENERATION.store(generation, Ordering::SeqCst);
+        let mut receiver = ForwardedReceiverTask::spawn(receiver_watched_socket(), generation);
+        send_receiver_record(&sender, b"uncredited tail\n");
+        drop(sender);
+        let (joined, watchdog_fired) = receiver.join();
+        assert!(joined.is_ok());
+        assert!(!watchdog_fired, "EOF must retire without stop or abort");
+        // Existing fixture models watch authority; pidfd death and transport
+        // are real. Task completion itself grants no final-drain acceptance.
+        let dead = model_completion(true);
+        let refusal = {
+            let mut source = super::FORWARDED_SOURCE.lock().unwrap();
+            super::inspect_native_final_source(
+                source.as_mut().unwrap(),
+                identity,
+                (dead.pid, dead.identity),
+                &dead,
+            )
+        };
+        assert_eq!(refusal, Err(Error::OtherOwnerPending(41)));
+        let retained = {
+            let source = super::FORWARDED_SOURCE.lock().unwrap();
+            let source = source.as_ref().unwrap();
+            (
+                source.transport_failure,
+                super::socket_identity(source.socket.as_raw_fd()).unwrap(),
+                source.order.received[&41].count,
+                source.order.pending[&41].clone(),
+            )
+        };
+        assert_eq!(
+            retained,
+            (
+                Some(super::ForwardedSourceError::Closed),
+                identity,
+                1,
+                vec![b"uncredited tail\n".to_vec()]
+            )
+        );
+        assert!(written.lock().unwrap().is_empty());
+        assert_eq!(
+            super::FORWARDED_GENERATION.load(Ordering::SeqCst),
+            generation
+        );
     }
 }

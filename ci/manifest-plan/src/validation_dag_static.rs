@@ -279,9 +279,13 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Two actual-leaf matrices, five shared qualifier controls and the real
     // Gitless source-copy factory regression; confirm with the prepared listing.
-    ("test.liteinst_allocator", 8),
+    // The measured native-exec 0xe8 TLS whole-recipe control adds one identity.
+    // And +1 from a3a9c83a: 9.
+    ("test.liteinst_allocator", 9),
     // Eleven unchanged M2 cases plus one constructor row and two refusal controls.
-    ("test.liteinst_stacks", 14),
+    // The same measured native-exec TLS recipe control adds one identity.
+    // And +1 from a3a9c83a: 15.
+    ("test.liteinst_stacks", 15),
     // run_dbt_binds_in_a_user_namespace_of_its_own retains both prior
     // identities: 2 + 1 = 3.
     ("test.isolated_dbt_workdir", 3),
@@ -1066,7 +1070,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the parser of the skid retry for hermit-verify's runs: 1569.
     // And replay_modes' trace_replay_split_just_spin, the internal
     // just_spin_trace_replay_split target: 1570.
-    ("test.regular_crates", 1570),
+    // And +13 from a3a9c83a: 1583.
+    ("test.regular_crates", 1583),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1578,7 +1583,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from 6dc8ee70 (two dbt-gated backends.rs unit tests): 1097, listed.
     // And record_version_rejects_streams_from_before_stat_is_rendered (https://github.com/rrnewton/hermit/issues/4213): 1098.
     // And backend_guest_code_between_injections_is_explicit (https://github.com/rrnewton/hermit/issues/4213): 1099.
-    ("test.hermit_unit", 1099),
+    // And +18 from a3a9c83a: 1117.
+    ("test.hermit_unit", 1117),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2324,7 +2330,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler::test::a_process_sigkill_does_not_take_a_reused_thread_id_from_another_group
     // (Claude re-check of https://github.com/rrnewton/hermit/pull/4439, N2): 1721, listed.
     // And a_placeholder_carries_the_uptime_of_the_first_read (https://github.com/rrnewton/hermit/issues/4213): 1722.
-    ("test.detcore_unit", 1722),
+    // And +69 from a3a9c83a: 1791.
+    ("test.detcore_unit", 1791),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3971,7 +3978,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4440): 1718, listed.
     // And the two 4411 tests and the 4439 reused-thread-id test: 1721.
     // And a_placeholder_carries_the_uptime_of_the_first_read (https://github.com/rrnewton/hermit/issues/4213): 1722.
-    ("test.detcore_unit_on_host", 1722),
+    // And +69 from a3a9c83a: 1791.
+    ("test.detcore_unit_on_host", 1791),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4223,7 +4231,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from 6dc8ee70 (two dbt-gated backends.rs unit tests): 1097, listed.
     // And record_version_rejects_streams_from_before_stat_is_rendered (https://github.com/rrnewton/hermit/issues/4213): 1098.
     // And backend_guest_code_between_injections_is_explicit (https://github.com/rrnewton/hermit/issues/4213): 1099.
-    ("test.hermit_unit_on_host", 1099),
+    // And +18 from a3a9c83a: 1117.
+    ("test.hermit_unit_on_host", 1117),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -4370,7 +4379,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the timer disabled: 1554.
     // And the same replay_modes parser test: 1555.
     // And the same trace_replay_split_just_spin: 1556.
-    ("test.regular_crates_on_host", 1556),
+    // And +13 from a3a9c83a: 1569.
+    ("test.regular_crates_on_host", 1569),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),

@@ -1584,7 +1584,11 @@ fi
 # KVM UPTIME-COPY-DELETION SDK-BUDGET CARRY (2026-10-15): advance from 68e5db20 to 361661a980278a363529b63246f173900d431fa6 (7858a5c3, the reverie-ptrace change ending the run on a guest syscall through the untraced private-page stub, changes only reverie-ptrace; 361661a9 deletes reverie-kvm's copies of /proc/uptime, which Detcore renders, and changes only reverie-kvm; inventory unchanged), so the budgets above carry.
 # KVM FILE-MMAP-STREAMING SDK-BUDGET CARRY (2026-10-15): advance from 361661a9 to f07e52b10ebb2ad4393a4fa2999bac5440c703ad (reverie-kvm streams a regular file's mmap into guest memory through one 64 KiB buffer, and unmaps the whole range when the mmap fails after its reservation; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # DBT STATS-GUEST-PATH SDK-BUDGET CARRY (2026-10-15): advance from f07e52b10ebb2ad4393a4fa2999bac5440c703ad to 7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7 (a KVM shared-file test and the additive DBT launcher configure_at utility with capture tests; neither changes native sources, build.rs, vendor SDK inputs or the native build recipe), so the budgets above carry unchanged.
-expected_pin=7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7
+# SHARED NATIVE EXEC SDK-BUDGET CARRY: advance 7b42bb03 to f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91.
+# This adds the accepted native exec pair after the DBT stats-path fix. The
+# third-party SDK tree, root Cargo.toml and reverie-dbt/build.rs are unchanged;
+# inventory remains 955. The existing SDK budget is carried, not remeasured.
+expected_pin=f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

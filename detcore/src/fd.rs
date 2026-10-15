@@ -665,6 +665,25 @@ impl DetFd {
         }
     }
 
+    /// Inspect only local ownership and the skipped directory lease. This
+    /// never takes a canonical shared-OFD lease or contacts its channel.
+    /// The caller separately owns quiescence across this temporary probe.
+    pub(crate) fn validate_native_exec_runtime_state(
+        &self,
+    ) -> Result<(OpenFileId, usize), crate::native_exec::NativeExecCutError> {
+        use crate::native_exec::NativeExecCutError;
+
+        let state = crate::native_exec::try_native_exec_lock(&self.open_file, "open_file")?;
+        let (id, directory_lock) = match &*state {
+            OpenFileState::Local(description) => (description.id, &description.directory_lock),
+            OpenFileState::Shared(shared) => (shared.id, &shared.directory_lock),
+        };
+        let _lease = directory_lock
+            .try_lock()
+            .ok_or(NativeExecCutError::LiveCapability("directory lease"))?;
+        Ok((id, Arc::as_ptr(&self.open_file) as usize))
+    }
+
     /// create a new detfd from rawfd
     pub fn new(fd: RawFd, flags: OFlag, ty: FdType, id: OpenFileId) -> Self {
         let bits = flags.bits();
@@ -1640,6 +1659,95 @@ pub(crate) fn install_test_shared_open_file_channel() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_exec_directory_lease_probe_preserves_idle_stream_and_aliases() {
+        use crate::native_exec::NativeExecCutError;
+
+        let id = OpenFileId::new(DetTid::from_raw(42), 7);
+        let fd = DetFd::new(30, OFlag::O_DIRECTORY, FdType::Regular, id);
+        let alias = fd.clone().with_fd(31);
+        fd.install_directory_snapshot(
+            vec![
+                DirEntry {
+                    name: b"b".to_vec(),
+                    ino: 19,
+                    off: 41,
+                    ty: libc::DT_REG,
+                },
+                DirEntry {
+                    name: b"a".to_vec(),
+                    ino: 17,
+                    off: 43,
+                    ty: libc::DT_REG,
+                },
+            ],
+            SnapshotMark {
+                retirements: 3,
+                threads_counted: 7,
+            },
+            DirectoryInodes::new(11, None),
+        );
+        alias
+            .with_directory_stream(|stream| stream.advance(1))
+            .unwrap();
+        let before = serde_json::to_value(&fd).unwrap();
+        assert_eq!(
+            fd.validate_native_exec_runtime_state().unwrap(),
+            alias.validate_native_exec_runtime_state().unwrap()
+        );
+        assert_eq!(serde_json::to_value(&fd).unwrap(), before);
+        let lock = alias.directory_lock();
+        let lease = lock.try_lock().unwrap();
+        assert_eq!(
+            fd.validate_native_exec_runtime_state(),
+            Err(NativeExecCutError::LiveCapability("directory lease"))
+        );
+        assert!(
+            lock.try_lock().is_none(),
+            "validation must not release the owned lease"
+        );
+        drop(lease);
+        assert_eq!(serde_json::to_value(&fd).unwrap(), before);
+        assert_eq!(
+            fd.with_directory_stream(|stream| stream.position())
+                .unwrap(),
+            1
+        );
+        let guard = fd.open_file.lock().unwrap();
+        assert_eq!(
+            alias.validate_native_exec_runtime_state(),
+            Err(NativeExecCutError::LockUnavailable("open_file"))
+        );
+        drop(guard);
+        fd.validate_native_exec_runtime_state().unwrap();
+    }
+
+    #[test]
+    fn native_exec_shared_descriptor_probe_never_takes_canonical_model() {
+        let id = OpenFileId::new(DetTid::from_raw(42), 9);
+        let fd = DetFd::new(30, OFlag::empty(), FdType::Rng, id);
+        fd.advance_random_device_offset(37);
+        let model = fd.share_for_test();
+        let alias = fd.clone().with_fd(31);
+        // Do not install a channel. with_description on this handle would
+        // need one; a local runtime probe must not touch canonical state.
+        assert_eq!(
+            fd.validate_native_exec_runtime_state().unwrap(),
+            alias.validate_native_exec_runtime_state().unwrap()
+        );
+        assert_eq!(model.0.random_device_offset, 37);
+        let lock = alias.directory_lock();
+        let lease = lock.try_lock().unwrap();
+        assert_eq!(
+            fd.validate_native_exec_runtime_state(),
+            Err(crate::native_exec::NativeExecCutError::LiveCapability(
+                "directory lease"
+            ))
+        );
+        drop(lease);
+        assert_eq!(model.0.random_device_offset, 37);
+    }
 
     #[test]
     fn random_access_modes_survive_status_updates_through_aliases() {

@@ -15,7 +15,7 @@ hermit_build_env = {
     "CARGO_PKG_VERSION": "0.4.1",
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7",
+    "HERMIT_REVERIE_PIN": "f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91",
 }
 
 # The shadow release entrypoint supplies these values from Git/Cargo metadata
@@ -88,6 +88,8 @@ rust_library(
             "dependencies_override": {
                 "dependencies": {
                     "hermit-test-workdir": {"optional": True},
+                    "reverie-inguest": {"default-features": False, "optional": True},
+                    "sha2": {"optional": True},
                     "reverie-rpc-transport": {"optional": True},
                     "reverie-sabre-stats": {"optional": True},
                 },
@@ -97,7 +99,8 @@ rust_library(
                 "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
                 "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],
                 "e9patch": [],
-                "liteinst": ["dep:reverie-liteinst"],
+                "liteinst": ["dep:reverie-liteinst", "dep:reverie-rpc-transport"],
+                "native-exec": ["liteinst", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"],
                 "third-party-backends": ["dbt", "sabre", "e9patch", "liteinst"],
                 "kvm-native-test-support": ["reverie-kvm/native-test-support"],
                 "kvm-execution-tests": [],
@@ -134,6 +137,7 @@ rust_library(
         "fbsource//third-party/rust:rand_pcg",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:sha2",
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:tracing",
@@ -144,6 +148,7 @@ rust_library(
         "//hermetic_infra/hermit/detcore-model:detcore-model",
         "//hermetic_infra/hermit/hermit-resources:hermit-resources",
         "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-inguest",
         "//hermetic_infra/reverie:reverie-kvm",
         "//hermetic_infra/reverie:reverie-liteinst",
         "//hermetic_infra/reverie:reverie-ptrace",
@@ -177,6 +182,8 @@ rust_binary(
             "dependencies_override": {
                 "dependencies": {
                     "hermit-test-workdir": {"optional": True},
+                    "reverie-inguest": {"default-features": False, "optional": True},
+                    "sha2": {"optional": True},
                     "reverie-rpc-transport": {"optional": True},
                     "reverie-sabre-stats": {"optional": True},
                 },
@@ -186,7 +193,8 @@ rust_binary(
                 "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
                 "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],
                 "e9patch": [],
-                "liteinst": ["dep:reverie-liteinst"],
+                "liteinst": ["dep:reverie-liteinst", "dep:reverie-rpc-transport"],
+                "native-exec": ["liteinst", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"],
                 "third-party-backends": ["dbt", "sabre", "e9patch", "liteinst"],
                 "kvm-native-test-support": ["reverie-kvm/native-test-support"],
                 "kvm-execution-tests": [],
@@ -219,6 +227,7 @@ rust_binary(
         "fbsource//third-party/rust:regex",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:sha2",
         "fbsource//third-party/rust:serde_yaml",
         "fbsource//third-party/rust:shell-words",
         "fbsource//third-party/rust:tempfile",
@@ -234,6 +243,7 @@ rust_binary(
         "//hermetic_infra/hermit/detcore:detcore",
         "//hermetic_infra/hermit/detcore-model:detcore-model",
         "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-inguest",
         "//hermetic_infra/reverie:reverie-ptrace",
     ],
 )

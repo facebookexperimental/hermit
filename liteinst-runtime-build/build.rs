@@ -47,6 +47,15 @@ fn copy_into_protected_stage(source: &Path, destination: &Path) -> io::Result<()
 }
 
 fn main() {
+    #[cfg(feature = "native-exec")]
+    if env::var_os("CARGO_FEATURE_NATIVE_EXEC").is_some() {
+        assert!(
+            env::var_os("CARGO_FEATURE_ALLOCATOR_FIXTURE").is_none(),
+            "native runtime cannot use the diagnostic preload producer mode"
+        );
+        artifact::native::build();
+        return;
+    }
     println!("cargo:rerun-if-env-changed=HERMIT_LITEINST_STAGE");
     println!("cargo:rerun-if-env-changed=HERMIT_LITEINST_REVERIE_PIN");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ALLOCATOR_FIXTURE");

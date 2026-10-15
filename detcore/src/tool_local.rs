@@ -771,6 +771,53 @@ impl FileMetadata {
         }
     }
 
+    /// Read the live table incarnation for an independently owned exec cut.
+    pub fn native_exec_files_id(&self) -> FilesId {
+        self.files_id
+    }
+
+    /// Validate before and after preparation: `for_exec` intentionally drops
+    /// waits and CLOEXEC-only descriptions, so checking only its result would
+    /// lose evidence about their skipped runtime capabilities.
+    pub(crate) fn validate_native_exec_cut(
+        &self,
+        expected: FilesId,
+        prepared: bool,
+    ) -> Result<(), crate::native_exec::NativeExecCutError> {
+        use crate::native_exec::NativeExecCutError;
+
+        if self.files_id != expected {
+            return Err(NativeExecCutError::Identity("files_id"));
+        }
+        if !self.accept_waits.is_empty() {
+            return Err(NativeExecCutError::LiveCapability("accept_waits"));
+        }
+        if prepared && self.next_accept_wait != 0 {
+            return Err(NativeExecCutError::PreparedState("next_accept_wait"));
+        }
+        // The native final cut repeats this check after freezing counters.
+        // Compare prior descriptors directly so validation neither allocates a
+        // scratch map nor changes the carried Tool heap. The state transport
+        // separately bounds this first, quiescent single-thread domain.
+        for (index, (&slot, fd)) in self.file_handles.iter().enumerate() {
+            if slot < 0 || slot != fd.fd {
+                return Err(NativeExecCutError::Descriptor("slot number"));
+            }
+            if prepared && fd.is_cloexec() {
+                return Err(NativeExecCutError::PreparedState("CLOEXEC slot"));
+            }
+            let (id, owner) = fd.validate_native_exec_runtime_state()?;
+            for (_, previous) in self.file_handles.iter().take(index) {
+                let (previous_id, previous_owner) =
+                    previous.validate_native_exec_runtime_state()?;
+                if (id == previous_id) != (owner == previous_owner) {
+                    return Err(NativeExecCutError::Descriptor("OFD alias identity"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn exec_blocking_overrides(&self) -> ExecFdBlockingOverrides {
         self.file_handles
             .iter()
@@ -2712,6 +2759,15 @@ pub(crate) struct ProcessCpuTime {
 }
 
 impl ProcessCpuTime {
+    fn validate_native_exec_cut(&self) -> Result<(), crate::native_exec::NativeExecCutError> {
+        if !self.child_cpu_publications.is_empty() {
+            return Err(crate::native_exec::NativeExecCutError::LiveCapability(
+                "child_cpu_publications",
+            ));
+        }
+        Ok(())
+    }
+
     fn add_thread_delta(&mut self, user: LogicalTime, system: LogicalTime) {
         self.snapshot.user = self.snapshot.user + user;
         self.snapshot.system = self.snapshot.system + system;
@@ -3305,6 +3361,169 @@ impl<T> ThreadState<T> {
     pub(crate) fn peek_guest_clock(&self, raw: LogicalTime) -> LogicalTime {
         let clock = self.guest_clock.lock().expect("guest clock mutex poisoned");
         clock.now.max(raw)
+    }
+
+    /// Inspect the live per-thread cut. Physical task count, childlessness,
+    /// coordinator leases and signal dispositions need their own admission;
+    /// neither serde nor these lock probes establish those facts.
+    pub(crate) fn validate_native_exec_cut(
+        &self,
+        binding: &crate::native_exec::NativeExecCutBinding,
+        config: &Config,
+    ) -> Result<(), crate::native_exec::NativeExecCutError> {
+        use crate::native_exec::NativeExecCutError;
+        use crate::native_exec::try_native_exec_lock;
+
+        if self.dettid != binding.dettid
+            || self.detpid != Some(binding.detpid)
+            || self.physical_tid != Some(binding.physical_tid)
+        {
+            return Err(NativeExecCutError::Identity("ThreadState IDs"));
+        }
+        if !self.thread_start_entered || !self.past_global_first_execve {
+            return Err(NativeExecCutError::PreparedState("initial lifecycle"));
+        }
+        if self.tool_shares_guest_descriptor_table
+            != config.backend.tool_shares_guest_descriptor_table
+        {
+            return Err(NativeExecCutError::Identity("descriptor-table capability"));
+        }
+        if self.nested_pid_namespace {
+            return Err(NativeExecCutError::LiveCapability("nested PID namespace"));
+        }
+        if self.signal_task_identity.is_some() {
+            return Err(NativeExecCutError::LiveCapability("signal task identity"));
+        }
+        if self.parent_process_cpu_time.is_some() || self.parent_cpu_publication.is_some() {
+            return Err(NativeExecCutError::LiveCapability("parent CPU ownership"));
+        }
+        if self.restart_block.is_some() || self.signal_register_projection.is_some() {
+            return Err(NativeExecCutError::LiveCapability("restart/projection"));
+        }
+        if self.claimed_sigchld {
+            return Err(NativeExecCutError::LiveCapability("claimed SIGCHLD"));
+        }
+        if self.clone_flags.is_some() || self.pending_vfork.is_some() {
+            return Err(NativeExecCutError::LiveCapability("clone/vfork"));
+        }
+        if self.own_signal_turn_hold.is_some()
+            || self.sigalrm_handled
+            || self.handler_restore_rt_reported != 0
+        {
+            return Err(NativeExecCutError::LiveCapability("guest signal handler"));
+        }
+        if self.initialized_random_auxv.is_some() {
+            return Err(NativeExecCutError::LiveCapability("initial random handoff"));
+        }
+        if self.uncharged_bootstrap_syscalls != 0
+            || self.in_uncharged_bootstrap_syscall
+            || self.yield_after_futex_wake
+        {
+            return Err(NativeExecCutError::LiveCapability(
+                "bootstrap/yield transient",
+            ));
+        }
+        if self.preemption_points.is_some()
+            || !self.interrupt_at.is_empty()
+            || self.replay_rcb_end.is_some()
+            || self.last_rcb_timer.is_some()
+            || self.last_rcb_timer_is_max
+            || self.max_timeslice_end.is_some()
+            || self.chaos_slowdown_active
+            || !self.pending_chaos_epochs.is_empty()
+        {
+            return Err(NativeExecCutError::LiveCapability("RCB/replay/chaos state"));
+        }
+        let user = self.thread_logical_time.user_cpu_time();
+        let system = self.thread_logical_time.system_cpu_time();
+        if self.thread_cpu_start_user_time > self.last_accounted_user_time
+            || self.last_accounted_user_time > user
+            || self.thread_cpu_start_system_time > self.last_accounted_system_time
+            || self.last_accounted_system_time > system
+        {
+            return Err(NativeExecCutError::PreparedState(
+                "CPU accounting checkpoints",
+            ));
+        }
+        try_native_exec_lock(&self.process_cpu_time, "process_cpu_time")?
+            .validate_native_exec_cut()?;
+        // Do not call observe/accounting routines: pending deltas and the
+        // process-tree guest floor are continuing state, not a new epoch.
+        drop(try_native_exec_lock(&self.guest_clock, "guest_clock")?);
+        drop(try_native_exec_lock(
+            &self.resource_limits,
+            "resource_limits",
+        )?);
+        drop(try_native_exec_lock(&self.posix_timers, "posix_timers")?);
+        Ok(())
+    }
+
+    pub(crate) fn validate_old_native_exec_robust_state(
+        &self,
+    ) -> Result<(), crate::native_exec::NativeExecCutError> {
+        use crate::native_exec::NativeExecCutError;
+        let process = crate::native_exec::try_native_exec_lock(
+            &self.robust_list_process,
+            "robust_list_process",
+        )?;
+        if process.heads.len() != usize::from(self.robust_list_head.is_some())
+            || process.heads.get(&self.dettid).copied() != self.robust_list_head
+            || !process.pending.is_empty()
+            || !process.matched_physical_exits.is_empty()
+            || !process.exec_pending.is_empty()
+            || !process.tool_walked.is_empty()
+            || process.exit_group_filed
+            || !process.exit_group_filers.is_empty()
+            || process.exit_group_walker.is_some()
+            || process.exit_group_walked
+        {
+            return Err(NativeExecCutError::LiveCapability(
+                "old robust process state",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_prepared_native_exec_cut(
+        &self,
+        binding: &crate::native_exec::NativeExecCutBinding,
+    ) -> Result<(), crate::native_exec::NativeExecCutError> {
+        use crate::native_exec::NativeExecCutError;
+        use crate::native_exec::try_native_exec_lock;
+
+        if self.mm_id != binding.prepared_mm() {
+            return Err(NativeExecCutError::Identity("prepared mm"));
+        }
+        try_native_exec_lock(&self.file_metadata, "prepared file_metadata")?
+            .validate_native_exec_cut(binding.prepared_files(), true)?;
+        if !try_native_exec_lock(&self.memory_metadata, "memory_metadata")?
+            .is_fresh_for_native_exec()
+        {
+            return Err(NativeExecCutError::PreparedState("memory_metadata"));
+        }
+        let process = try_native_exec_lock(&self.robust_list_process, "robust_list_process")?;
+        if self.robust_list_head.is_some()
+            || !process.heads.is_empty()
+            || !process.pending.is_empty()
+            || !process.matched_physical_exits.is_empty()
+            || !process.tool_walked.is_empty()
+            || process.exit_group_filed
+            || !process.exit_group_filers.is_empty()
+            || process.exit_group_walker.is_some()
+            || process.exit_group_walked
+        {
+            return Err(NativeExecCutError::PreparedState("robust process state"));
+        }
+        // These wakes belong to the old image. Preserve their order and keys
+        // for the actual successful post-exec hook; do not rebase or consume.
+        for (owner, wake) in &process.exec_pending {
+            if *owner != binding.dettid
+                || matches!(wake.futex, FutexID::Private { mm, .. } if mm != binding.old_mm)
+            {
+                return Err(NativeExecCutError::PreparedState("staged robust wake"));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn observe_guest_clock(&self, raw: LogicalTime) -> LogicalTime {
@@ -6168,6 +6387,349 @@ pub(crate) fn thread_rng_from_parent_pedigree(
     rng
 }
 
+#[cfg(test)]
+mod native_exec_cut_tests {
+    use super::*;
+    use crate::native_exec::NativeExecCutError;
+    use crate::native_exec::capture_prepared_native_exec;
+    use crate::native_exec::tests::fixture;
+    use crate::native_exec::tests::prepare;
+    use crate::native_exec::tests::state_bytes;
+    use crate::native_exec::validate_old_native_exec_cut;
+
+    #[test]
+    fn native_exec_child_publications_refuse_every_runtime_token_state() {
+        for completion in [None, Some(true), Some(false)] {
+            let (tool, thread, binding) = fixture();
+            let before = state_bytes(&thread);
+            let child = DetPid::from_raw(43);
+            let token = thread.prepare_child_cpu_publication(child);
+            if let Some(published) = completion {
+                token.finish(published);
+            }
+            // The map is genuinely invisible to serde in all three states.
+            assert_eq!(state_bytes(&thread), before);
+            assert!(matches!(
+                validate_old_native_exec_cut(&tool, &thread, &binding),
+                Err(NativeExecCutError::LiveCapability("child_cpu_publications"))
+            ));
+            assert!(Arc::ptr_eq(
+                thread
+                    .process_cpu_time
+                    .lock()
+                    .unwrap()
+                    .child_cpu_publications
+                    .get(&child)
+                    .unwrap(),
+                &token
+            ));
+        }
+    }
+
+    #[test]
+    fn native_exec_historical_cpu_accounting_survives_without_live_publications() {
+        let (tool, mut thread, binding) = fixture();
+        {
+            let mut cpu = thread.process_cpu_time.lock().unwrap();
+            cpu.add_thread_delta(LogicalTime::from_nanos(17), LogicalTime::from_nanos(31));
+            cpu.record_exited_child(
+                DetPid::from_raw(43),
+                ProcessCpuSnapshot {
+                    user: LogicalTime::from_nanos(19),
+                    system: LogicalTime::from_nanos(23),
+                    children_user: LogicalTime::from_nanos(29),
+                    children_system: LogicalTime::from_nanos(37),
+                },
+            );
+            cpu.reap_child(DetPid::from_raw(43));
+            cpu.record_exited_child(
+                DetPid::from_raw(44),
+                ProcessCpuSnapshot {
+                    user: LogicalTime::from_nanos(41),
+                    system: LogicalTime::from_nanos(47),
+                    ..ProcessCpuSnapshot::default()
+                },
+            );
+        }
+        let before = serde_json::to_value(&*thread.process_cpu_time.lock().unwrap()).unwrap();
+        let receipt = validate_old_native_exec_cut(&tool, &thread, &binding).unwrap();
+        prepare(&mut thread, &binding);
+        let bytes = bincode::serde::encode_to_vec(
+            capture_prepared_native_exec(&tool, &thread, &binding, &receipt).unwrap(),
+            bincode::config::legacy(),
+        )
+        .unwrap();
+        let (payload, used): (crate::native_exec::DetcoreExecSnapshotV2, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+        assert_eq!(used, bytes.len());
+        let (_, restored) = payload.into_validated_parts(&binding, &tool.cfg).unwrap();
+        assert_eq!(
+            serde_json::to_value(&*restored.process_cpu_time.lock().unwrap()).unwrap(),
+            before
+        );
+        let cpu = restored.process_cpu_time.lock().unwrap();
+        assert_eq!(cpu.snapshot.children_user, LogicalTime::from_nanos(48));
+        assert_eq!(cpu.snapshot.children_system, LogicalTime::from_nanos(60));
+        assert_eq!(cpu.exited_children.len(), 1);
+        assert!(cpu.child_cpu_publications.is_empty());
+    }
+
+    #[test]
+    fn native_exec_old_accept_waits_and_invalid_table_slots_refuse() {
+        let (tool, thread, binding) = fixture();
+        let operation = {
+            let mut table = thread.file_metadata.lock().unwrap();
+            table
+                .add_fd(binding.dettid, 33, OFlag::O_CLOEXEC, FdType::Socket, None)
+                .unwrap();
+            table.add_accept_wait(33)
+        };
+        assert!(matches!(
+            validate_old_native_exec_cut(&tool, &thread, &binding),
+            Err(NativeExecCutError::LiveCapability("accept_waits"))
+        ));
+        let mut table = thread.file_metadata.lock().unwrap();
+        assert!(table.for_exec(binding.dettid).accept_waits.is_empty());
+        assert_eq!(table.accept_waits, [(operation, 33)]);
+        table.remove_accept_wait(operation);
+        // An old operation counter is historical, but the existing prepared
+        // table has a fresh counter. Neither validation path resets it.
+        assert_eq!(table.next_accept_wait, operation + 1);
+        table
+            .validate_native_exec_cut(binding.old_files, false)
+            .unwrap();
+        let mut prepared = table.for_exec(binding.dettid);
+        prepared
+            .validate_native_exec_cut(binding.prepared_files(), true)
+            .unwrap();
+        prepared.next_accept_wait = 1;
+        assert_eq!(
+            prepared.validate_native_exec_cut(binding.prepared_files(), true),
+            Err(NativeExecCutError::PreparedState("next_accept_wait"))
+        );
+        let only = table.file_handles.remove(&33).unwrap();
+        table.file_handles.insert(34, only);
+        assert_eq!(
+            table.validate_native_exec_cut(binding.old_files, false),
+            Err(NativeExecCutError::Descriptor("slot number"))
+        );
+        table.file_handles.clear();
+        table.file_handles.insert(
+            -1,
+            DetFd::new(
+                -1,
+                OFlag::empty(),
+                FdType::Rng,
+                OpenFileId::new(binding.dettid, 1),
+            ),
+        );
+        assert_eq!(
+            table.validate_native_exec_cut(binding.old_files, false),
+            Err(NativeExecCutError::Descriptor("slot number"))
+        );
+    }
+
+    #[test]
+    fn native_exec_each_skipped_or_live_thread_transient_refuses() {
+        for field in 0..26 {
+            let (tool, mut thread, binding) = fixture();
+            match field {
+                0 => {
+                    thread.parent_process_cpu_time =
+                        Some(Arc::new(Mutex::new(ProcessCpuTime::default())))
+                }
+                1 => thread.parent_cpu_publication = Some(ChildCpuPublication::pending()),
+                2 => {
+                    thread.restart_block = Some(crate::syscalls::helpers::RestartBlock {
+                        rip: 0x1234,
+                        deadline: None,
+                        call: crate::syscalls::helpers::RestartCall::Poll(
+                            reverie::syscalls::Poll::new(),
+                        ),
+                    })
+                }
+                3 => thread.signal_register_projection = Some(unsafe { std::mem::zeroed() }),
+                4 => thread.clone_flags = Some(CloneFlags::empty()),
+                5 => {
+                    thread.pending_vfork = Some(PendingVfork {
+                        parent_dettid: binding.dettid,
+                        parent_detpid: binding.detpid,
+                        child_tid_addr: 0,
+                        flags: CloneFlags::CLONE_VFORK,
+                        exit_signal: libc::SIGCHLD,
+                        child_priority_entropy: None,
+                    })
+                }
+                6 => thread.own_signal_turn_hold = Some(libc::SIGALRM),
+                7 => thread.sigalrm_handled = true,
+                8 => thread.handler_restore_rt_reported = 1,
+                9 => {
+                    thread.initialized_random_auxv = Some((
+                        crate::random::InitialImage {
+                            pid: binding.physical_tid,
+                            start_time_ticks: 1,
+                            at_random: 0x234000,
+                        },
+                        [7; 16],
+                        Vec::new(),
+                    ))
+                }
+                10 => thread.uncharged_bootstrap_syscalls = 1,
+                11 => thread.in_uncharged_bootstrap_syscall = true,
+                12 => thread.yield_after_futex_wake = true,
+                13 => {
+                    thread.interrupt_at.insert(1);
+                }
+                14 => thread.replay_rcb_end = Some(1),
+                15 => thread.last_rcb_timer = Some(1),
+                16 => thread.last_rcb_timer_is_max = true,
+                17 => thread.max_timeslice_end = Some(LogicalTime::from_nanos(1)),
+                18 => thread.chaos_slowdown_active = true,
+                19 => thread.nested_pid_namespace = true,
+                20 => thread.thread_start_entered = false,
+                21 => thread.past_global_first_execve = false,
+                22 => {
+                    thread.last_accounted_system_time =
+                        thread.thread_logical_time.system_cpu_time() + Duration::from_nanos(1)
+                }
+                23 => {
+                    thread.preemption_points =
+                        Some(crate::preemptions::ThreadHistory::new().into_iter())
+                }
+                24 => thread.pending_chaos_epochs.push(ChaosEpochTransition {
+                    logical_time: LogicalTime::from_nanos(1),
+                    epoch: 1,
+                    factor: RcbTimeMultiplier::from_f64(1.5),
+                }),
+                25 => {
+                    thread.signal_task_identity = Some(reverie::SignalTaskIdentity {
+                        process: reverie::SignalProcessId {
+                            tgid: reverie::Pid::from_raw(binding.physical_tid),
+                            generation: 0,
+                        },
+                        tid: reverie::Pid::from_raw(binding.physical_tid),
+                        task_generation: 0,
+                    })
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_old_native_exec_cut(&tool, &thread, &binding).is_err(),
+                "field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_exec_robust_and_prepared_memory_must_match_the_actual_cut() {
+        for field in 0..4 {
+            let (tool, mut thread, binding) = fixture();
+            thread.record_robust_list_head(Some(0x1000));
+            {
+                let mut robust = thread.robust_list_process.lock().unwrap();
+                match field {
+                    0 => {
+                        robust.heads.insert(DetTid::from_raw(43), 0x2000);
+                    }
+                    1 => {
+                        robust.pending.insert(
+                            binding.dettid,
+                            PendingRobustListWakes {
+                                reason: RobustListExit::ExitGroup,
+                                wakes: Vec::new(),
+                            },
+                        );
+                    }
+                    2 => {
+                        robust
+                            .matched_physical_exits
+                            .insert(binding.dettid, thread.thread_logical_time.clone());
+                    }
+                    3 => robust.exec_pending.push((
+                        binding.dettid,
+                        RobustListWake {
+                            futex: FutexID::private(binding.old_mm, 0x3000),
+                        },
+                    )),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                validate_old_native_exec_cut(&tool, &thread, &binding).is_err(),
+                "old field {field}"
+            );
+        }
+        for field in 0..8 {
+            let (tool, mut thread, binding) = fixture();
+            let receipt = validate_old_native_exec_cut(&tool, &thread, &binding).unwrap();
+            prepare(&mut thread, &binding);
+            match field {
+                0 => thread.memory_metadata.lock().unwrap().observe_brk(0x4000),
+                1 => thread.memory_metadata.lock().unwrap().map_anonymous(
+                    binding.prepared_mm(),
+                    0x5000,
+                    0x1000,
+                ),
+                2 => thread.record_robust_list_head(Some(0x1000)),
+                3 => thread.stage_robust_list_wakes_for_exec(vec![(
+                    binding.dettid,
+                    vec![RobustListWake {
+                        futex: FutexID::private(binding.prepared_mm(), 0x3000),
+                    }],
+                )]),
+                4 => thread.stage_robust_list_wakes_for_exec(vec![(
+                    DetTid::from_raw(43),
+                    vec![RobustListWake {
+                        futex: FutexID::private(binding.old_mm, 0x3000),
+                    }],
+                )]),
+                5 => thread.file_metadata.lock().unwrap().files_id = binding.old_files,
+                6 => {
+                    thread.file_metadata.lock().unwrap().file_handles.insert(
+                        3,
+                        DetFd::new(
+                            3,
+                            OFlag::O_CLOEXEC,
+                            FdType::Rng,
+                            OpenFileId::new(binding.dettid, 1),
+                        ),
+                    );
+                }
+                7 => thread.mm_id = binding.old_mm,
+                _ => unreachable!(),
+            }
+            assert!(
+                capture_prepared_native_exec(&tool, &thread, &binding, &receipt).is_err(),
+                "prepared field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_exec_model_lock_contention_is_a_refusal_without_mutation() {
+        let (tool, thread, binding) = fixture();
+        let before = state_bytes(&thread);
+        macro_rules! locked {
+            ($field:ident) => {{
+                let guard = thread.$field.lock().unwrap();
+                assert!(matches!(
+                    validate_old_native_exec_cut(&tool, &thread, &binding),
+                    Err(NativeExecCutError::LockUnavailable(_))
+                ));
+                drop(guard);
+                assert_eq!(state_bytes(&thread), before);
+            }};
+        }
+        locked!(file_metadata);
+        locked!(process_cpu_time);
+        locked!(guest_clock);
+        locked!(resource_limits);
+        locked!(posix_timers);
+        locked!(robust_list_process);
+        validate_old_native_exec_cut(&tool, &thread, &binding).unwrap();
+    }
+}
+
 fn thread_rng_from_parent_entropy(msg: &str, parent: &Pcg64Mcg, entropy: u128) -> Pcg64Mcg {
     thread_rng_from_parent_entropy_labeled(msg, parent, entropy, "entropy")
 }
@@ -6274,4 +6836,260 @@ fn placeholder_behind(fd: RawFd) -> Option<(&'static std::path::Path, Vec<u8>)> 
     };
     let length = usize::try_from(length).ok()?.min(target.len());
     crate::procfs::placeholder_link(&target[..length])
+}
+
+#[cfg(test)]
+mod native_main_state_tests {
+    use super::*;
+    use crate::native_exec::capture_prepared_native_exec;
+    use crate::native_exec::tests::fixture;
+    use crate::native_exec::tests::prepare;
+    use crate::native_exec::tests::state_bytes;
+    use crate::native_exec::validate_old_native_exec_cut;
+    fn snapshot(
+        tool: &crate::Detcore<crate::native_exec::NoopTool>,
+        thread: &ThreadState<()>,
+        binding: &crate::native_exec::NativeExecCutBinding,
+        receipt: &crate::native_exec::NativeExecPreparationReceipt,
+    ) -> crate::native_exec::DetcoreExecSnapshotV2 {
+        let bytes = bincode::serde::encode_to_vec(
+            capture_prepared_native_exec(tool, thread, binding, receipt).unwrap(),
+            bincode::config::legacy(),
+        )
+        .unwrap();
+        crate::native_exec::tests::decoded(&bytes)
+    }
+
+    #[test]
+    fn native_main_claimed_sigchld_refuses_live_and_decoded_without_reset() {
+        let (tool, mut thread, binding) = fixture();
+        thread.claimed_sigchld = true;
+        let before = state_bytes(&thread);
+        assert!(matches!(
+            validate_old_native_exec_cut(&tool, &thread, &binding),
+            Err(crate::native_exec::NativeExecCutError::LiveCapability(
+                "claimed SIGCHLD"
+            ))
+        ));
+        assert_eq!(state_bytes(&thread), before);
+        thread.claimed_sigchld = false;
+        let receipt = validate_old_native_exec_cut(&tool, &thread, &binding).unwrap();
+        prepare(&mut thread, &binding);
+        let mut payload = snapshot(&tool, &thread, &binding, &receipt);
+        crate::native_exec::tests::thread_for_test(&mut payload).claimed_sigchld = true;
+        assert!(matches!(
+            payload.validate(&binding, &tool.cfg),
+            Err(crate::native_exec::NativeExecCutError::LiveCapability(
+                "claimed SIGCHLD"
+            ))
+        ));
+        assert!(crate::native_exec::tests::thread_for_test(&mut payload).claimed_sigchld);
+    }
+
+    fn mark_barrier(process: &mut RobustListProcessState, field: usize, owner: DetTid) {
+        match field {
+            0 => {
+                process.tool_walked.insert(owner);
+            }
+            1 => process.exit_group_filed = true,
+            2 => {
+                process.exit_group_filers.insert(owner);
+            }
+            3 => process.exit_group_walker = Some(owner),
+            4 => process.exit_group_walked = true,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn native_main_robust_barrier_state_refuses_old_prepared_and_decoded() {
+        for field in 0..5 {
+            let (tool, thread, binding) = fixture();
+            mark_barrier(
+                &mut thread.robust_list_process.lock().unwrap(),
+                field,
+                binding.dettid,
+            );
+            let before = state_bytes(&thread);
+            assert!(
+                validate_old_native_exec_cut(&tool, &thread, &binding).is_err(),
+                "old {field}"
+            );
+            assert_eq!(state_bytes(&thread), before);
+
+            let (tool, mut thread, binding) = fixture();
+            let receipt = validate_old_native_exec_cut(&tool, &thread, &binding).unwrap();
+            prepare(&mut thread, &binding);
+            let mut payload = snapshot(&tool, &thread, &binding, &receipt);
+            mark_barrier(
+                &mut thread.robust_list_process.lock().unwrap(),
+                field,
+                binding.dettid,
+            );
+            let before = state_bytes(&thread);
+            assert!(
+                capture_prepared_native_exec(&tool, &thread, &binding, &receipt).is_err(),
+                "prepared {field}"
+            );
+            assert_eq!(state_bytes(&thread), before);
+            let decoded = crate::native_exec::tests::thread_for_test(&mut payload);
+            mark_barrier(
+                &mut decoded.robust_list_process.lock().unwrap(),
+                field,
+                binding.dettid,
+            );
+            let before = state_bytes(decoded);
+            assert!(
+                payload.validate(&binding, &tool.cfg).is_err(),
+                "decoded {field}"
+            );
+            assert_eq!(
+                state_bytes(crate::native_exec::tests::thread_for_test(&mut payload)),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn native_main_nanosleep_restart_refuses_even_when_serde_skips_it() {
+        for deadline in [None, Some(crate::types::LogicalTime::from_nanos(4567))] {
+            let (tool, mut thread, binding) = fixture();
+            let before = state_bytes(&thread);
+            thread.restart_block = Some(crate::syscalls::helpers::RestartBlock {
+                rip: 0x1234,
+                deadline,
+                call: crate::syscalls::helpers::RestartCall::Nanosleep(
+                    reverie::syscalls::Nanosleep::new().into(),
+                ),
+            });
+            assert_eq!(state_bytes(&thread), before);
+            assert!(matches!(
+                validate_old_native_exec_cut(&tool, &thread, &binding),
+                Err(crate::native_exec::NativeExecCutError::LiveCapability(
+                    "restart/projection"
+                ))
+            ));
+            assert!(thread.restart_block.is_some());
+        }
+    }
+
+    #[test]
+    fn native_main_rng_promotion_history_survives_snapshot_and_some_empty() {
+        use std::os::fd::AsRawFd;
+        crate::fd::install_test_shared_open_file_channel();
+        {
+            let (tool, mut thread, binding) = fixture();
+            let local = std::fs::File::open("/dev/urandom").unwrap();
+            thread
+                .add_fd(local.as_raw_fd(), OFlag::O_RDONLY, FdType::Rng, None)
+                .unwrap();
+            assert!(thread.shared_open_files_for_exec().unwrap().is_none());
+            let receipt = validate_old_native_exec_cut(&tool, &thread, &binding).unwrap();
+            prepare(&mut thread, &binding);
+            let (_, restored) = snapshot(&tool, &thread, &binding, &receipt)
+                .into_validated_parts(&binding, &tool.cfg)
+                .unwrap();
+            assert!(restored.shared_open_files_for_exec().unwrap().is_none());
+        }
+        let (tool, mut thread, binding) = fixture();
+        let creator = DetTid::from_raw(930001);
+        thread.set_open_file_creator(creator);
+        let file = std::fs::File::open("/dev/urandom").unwrap();
+        let alias = nix::unistd::dup(&file).unwrap();
+        let cloexec = nix::unistd::dup(&file).unwrap();
+        let distinct = std::fs::File::open("/dev/urandom").unwrap();
+        let (fd, alias_fd, cloexec_fd, distinct_fd) = (
+            file.as_raw_fd(),
+            alias.as_raw_fd(),
+            cloexec.as_raw_fd(),
+            distinct.as_raw_fd(),
+        );
+        thread
+            .add_fd(fd, OFlag::O_RDONLY, FdType::Rng, None)
+            .unwrap();
+        thread.dup_fd(fd, alias_fd, OFlag::empty()).unwrap();
+        thread.dup_fd(fd, cloexec_fd, OFlag::O_CLOEXEC).unwrap();
+        thread
+            .add_fd(distinct_fd, OFlag::O_RDONLY, FdType::Rng, None)
+            .unwrap();
+        assert!(
+            thread.shared_open_files_for_exec().unwrap().is_none(),
+            "local RNG is not promotion"
+        );
+        let high = thread
+            .metadata()
+            .allocate_open_file_id(creator, FdType::Rng);
+        let high_socket = thread
+            .metadata()
+            .allocate_open_file_id(creator, FdType::Socket);
+        thread.promote_random_open_files().unwrap();
+        let expected = thread.shared_open_files_for_exec().unwrap().unwrap();
+        assert_eq!(expected.creator, creator);
+        assert_eq!(expected.handles[&fd].id, expected.handles[&alias_fd].id);
+        assert_ne!(expected.handles[&fd].id, expected.handles[&distinct_fd].id);
+        assert!(!expected.handles.contains_key(&cloexec_fd));
+        let old_table = Arc::clone(&thread.file_metadata);
+        let receipt = validate_old_native_exec_cut(&tool, &thread, &binding).unwrap();
+        prepare(&mut thread, &binding);
+        assert!(
+            old_table
+                .lock()
+                .unwrap()
+                .file_handles
+                .contains_key(&cloexec_fd)
+        );
+        let (_, restored) = snapshot(&tool, &thread, &binding, &receipt)
+            .into_validated_parts(&binding, &tool.cfg)
+            .unwrap();
+        assert_eq!(
+            restored.shared_open_files_for_exec().unwrap(),
+            Some(expected)
+        );
+        assert_eq!(restored.open_file_creator, Some(creator));
+        assert_eq!(
+            restored.metadata().next_open_file_sequence,
+            thread.metadata().next_open_file_sequence
+        );
+        assert_eq!(
+            restored.metadata().next_socket_open_file_sequence,
+            thread.metadata().next_socket_open_file_sequence
+        );
+        restored.metadata().file_handles[&alias_fd]
+            .with_random_device_stream::<Errno>(|offset| {
+                assert_eq!(offset, 0);
+                Ok(11)
+            })
+            .unwrap();
+        thread.metadata().file_handles[&fd]
+            .with_random_device_stream::<Errno>(|offset| {
+                assert_eq!(offset, 11);
+                Ok(0)
+            })
+            .unwrap();
+        // Both tables retain the same canonical shared ID, not a copied cursor.
+        for slot in [fd, alias_fd, distinct_fd] {
+            thread.remove_fd(slot);
+        }
+        let empty = thread.shared_open_files_for_exec().unwrap().unwrap();
+        assert!(empty.handles.is_empty());
+        assert_eq!(empty.creator, creator);
+        assert_ne!(OpenFileId::new(creator, empty.next_sequence), high);
+        assert_ne!(
+            OpenFileId::new_socket(creator, empty.next_socket_sequence),
+            high_socket
+        );
+        // Drop the test-owned metadata guard before the validator probes it.
+        let old_files = thread.metadata().files_id;
+        let binding2 = crate::native_exec::NativeExecCutBinding {
+            old_mm: thread.mm_id,
+            old_files,
+            ..binding
+        };
+        let receipt2 = validate_old_native_exec_cut(&tool, &thread, &binding2).unwrap();
+        prepare(&mut thread, &binding2);
+        let (_, again) = snapshot(&tool, &thread, &binding2, &receipt2)
+            .into_validated_parts(&binding2, &tool.cfg)
+            .unwrap();
+        assert_eq!(again.shared_open_files_for_exec().unwrap(), Some(empty));
+    }
 }

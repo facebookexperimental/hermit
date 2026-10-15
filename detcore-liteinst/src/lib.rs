@@ -28,15 +28,17 @@ use std::path::Path;
 // allocator neutral.
 reverie_liteinst::declare_fixed_tool_allocator!();
 
-// Errors are printed without the C library's errno messages: strerror_r can
-// allocate through the guest's malloc (see describe_io_error).
-use reverie_inguest::guest::support::describe_io_error;
-#[cfg(feature = "exec-private-init")]
-mod exec_initial;
 use std::ffi::OsString;
 
 #[cfg(feature = "exec-private-init")]
+mod exec_initial;
+#[cfg(feature = "exec-native-injection")]
+mod exec_native;
+#[cfg(feature = "exec-private-init")]
 pub use exec_initial::detcore_liteinst_exec_initialize;
+// Errors are printed without the C library's errno messages: strerror_r can
+// allocate through the guest's malloc (see describe_io_error).
+use reverie_inguest::guest::support::describe_io_error;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-3635): Review the
@@ -306,15 +308,24 @@ unsafe fn initialize_detcore(inputs: InitializationInputs) {
     // the window `install_tool` requires.
     #[cfg(feature = "exec-private-init")]
     let initial_control = match initial_image {
-        Some(initial) => Some(
-            unsafe {
-                reverie_liteinst::install_tool_initial_image::<detcore::Detcore>(
-                    Path::new(&socket),
-                    initial.prepared,
-                )
-            }
-            .unwrap_or_else(|error| fail(&describe_io_error(&error))),
-        ),
+        Some(exec_initial::InitialImageInputs::Initial { prepared }) => {
+            Some(exec_initial::InstalledImage::Initial(
+                unsafe {
+                    reverie_liteinst::install_tool_initial_image::<detcore::Detcore>(
+                        Path::new(&socket),
+                        prepared,
+                    )
+                }
+                .unwrap_or_else(|error| fail(&describe_io_error(&error))),
+            ))
+        }
+        #[cfg(feature = "exec-native-injection")]
+        Some(exec_initial::InitialImageInputs::Native(prepared)) => {
+            Some(exec_initial::InstalledImage::Native(
+                unsafe { exec_native::entry::install(prepared, Path::new(&socket)) }
+                    .unwrap_or_else(|error| fail(&describe_io_error(&error))),
+            ))
+        }
         None => {
             if let Err(error) =
                 unsafe { reverie_liteinst::install_tool::<detcore::Detcore>(socket) }
@@ -375,14 +386,10 @@ unsafe fn initialize_detcore(inputs: InitializationInputs) {
         detcore::ChunkedOpenFileChannel::new(CoordinatorOpenFiles),
     ));
     #[cfg(feature = "exec-private-init")]
-    if let Some(control) = initial_control {
-        exec_initial::install_dispatch_observer();
-        if let Err(error) = reverie_liteinst::initialize_initial_image_lifecycle(&control) {
-            fail(&describe_io_error(&error));
-        }
-        if let Err(error) = control.finish() {
-            fail(&describe_io_error(&error));
-        }
+    if let Some(control) = initial_control
+        && let Err(error) = unsafe { control.finish() }
+    {
+        fail(&describe_io_error(&error));
     }
 }
 

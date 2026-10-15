@@ -208,3 +208,83 @@ pub fn reverie_pin_in(crate_dir: &Path) -> String {
     };
     parse_reverie_pin(&text).unwrap_or_else(|| "unknown".into())
 }
+
+/// Build actual native artifacts through the existing isolated build-only root.
+/// No runtime cdylib or automatic guest constructor is a host dependency.
+pub fn emit_native_exec_bundle(pin: &str) {
+    assert!(
+        pin.len() == 40
+            && pin
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "native build requires the actual full embedded Reverie pin"
+    );
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .expect("missing current CLI manifest directory");
+    let root = std::fs::canonicalize(manifest_dir.parent().expect("CLI has no source root"))
+        .expect("canonicalize native producer source root");
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("missing native OUT_DIR"));
+    let target = out.join("native-producer-target");
+    let profile = match std::env::var("PROFILE").as_deref() {
+        Ok("debug") => "dev",
+        Ok("release") => "release",
+        _ => panic!("unsupported actual native Cargo profile"),
+    };
+    let manifest = root.join("liteinst-runtime-build/Cargo.toml");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .args(["build", "--locked", "--offline", "--manifest-path"])
+        .arg(&manifest)
+        .args([
+            "--features",
+            "native-exec",
+            "--profile",
+            profile,
+            "--target-dir",
+        ])
+        .arg(&target)
+        .env("HERMIT_NATIVE_EXEC_STAGE", &out)
+        .env("HERMIT_LITEINST_REVERIE_PIN", pin)
+        .env_remove("HERMIT_LITEINST_STAGE")
+        .status()
+        .expect("invoke real native standalone producer");
+    assert!(status.success(), "real native producer failed: {status}");
+    let generated = out.join("native_exec_bundle.rs");
+    assert!(
+        generated.is_file()
+            && !std::fs::symlink_metadata(&generated)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+        "native producer did not generate the compiled bundle"
+    );
+    let hints = out.join("native_exec_rerun_paths.txt");
+    assert!(
+        std::fs::metadata(&hints)
+            .expect("native producer dependency hints absent")
+            .len()
+            <= 65536,
+        "native dependency hints exceed bound"
+    );
+    for path in std::fs::read_to_string(hints)
+        .expect("read native dependency hints")
+        .lines()
+    {
+        assert!(
+            Path::new(path).is_absolute() && !path.contains('\r') && Path::new(path).exists(),
+            "native producer dependency hint differs"
+        );
+        println!("cargo:rerun-if-changed={path}");
+    }
+    for relative in [
+        "liteinst-runtime-build/build.rs",
+        "liteinst-runtime-build/artifact.rs",
+        "liteinst-runtime-build/Cargo.toml",
+        "detcore-liteinst/src/lib.rs",
+        "detcore-liteinst/src/exec_initial.rs",
+        "detcore-model/src/liteinst_native_exec_sources.rs",
+    ] {
+        println!("cargo:rerun-if-changed={}", root.join(relative).display());
+    }
+}

@@ -113,6 +113,17 @@ pub struct FilesId {
 }
 
 impl FilesId {
+    /// Task that created this model descriptor-table incarnation.
+    /// This is data for equality checks, not kernel table attestation.
+    pub const fn creator(self) -> DetTid {
+        self.creator
+    }
+
+    /// Exact model exec generation of this descriptor table.
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
     /// Create the first descriptor table owned by a task.
     pub const fn initial(creator: DetTid) -> Self {
         Self {

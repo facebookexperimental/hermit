@@ -15,10 +15,17 @@ crate-type = ["rlib"]
 [features]
 # Adds only the nested leaf's diagnostic exports, never allocator selection.
 allocator-fixture = []
+# Build-only actual native runtime; never links a guest constructor into host.
+native-exec = ["dep:detcore-model", "dep:reverie-inguest", "dep:goblin", "dep:sha2"]
 
 [build-dependencies]
-reverie-liteinst-artifact = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7", default-features = false }
+reverie-liteinst-artifact = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91", default-features = false }
 serde_json = "1.0.151"
+
+detcore-model = { version = "0.4.1", path = "../detcore-model", features = ["native-exec"], optional = true }
+reverie-inguest = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91", default-features = false, features = ["exec-native-injection"], optional = true }
+goblin = { version = "0.10.7", optional = true }
+sha2 = { version = "0.10.9", optional = true }
 
 [dev-dependencies]
 serde_json = "1.0.151"

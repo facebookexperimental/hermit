@@ -169,6 +169,12 @@ pub mod futex;
 pub mod happens_before;
 pub mod host_input;
 pub mod liteinst_initial_image;
+/// Bounded sealed native target catalog data, without admission authority.
+#[cfg(feature = "native-exec")]
+pub mod liteinst_native_exec_catalog;
+pub mod liteinst_native_exec_input;
+/// Exact versioned neutral cut envelope outside opaque Tool state.
+pub mod liteinst_native_exec_state;
 pub mod logdiff_policy;
 pub mod network_engine;
 pub mod network_trace;
@@ -178,3 +184,9 @@ pub mod procfs;
 pub mod schedule;
 pub mod summary;
 pub mod time;
+
+/// Exact native runtime/dispatch-sequence envelope, separate from admission.
+pub mod liteinst_native_exec_runtime;
+
+#[cfg(feature = "native-exec")]
+pub mod liteinst_native_exec_sources;

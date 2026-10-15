@@ -35,7 +35,7 @@ pub mod happens_before;
 pub mod host_input_change;
 mod id;
 #[cfg(feature = "liteinst")]
-mod in_guest_exits;
+pub mod in_guest_exits;
 pub mod instruction_map;
 mod interp;
 pub mod liteinst_bootstrap;
@@ -382,7 +382,7 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
-#[cfg(any(feature = "sabre", feature = "liteinst"))]
+#[cfg(any(feature = "sabre", all(test, feature = "liteinst")))]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(feature = "sabre")]
 use std::os::unix::fs::OpenOptionsExt;
@@ -690,7 +690,7 @@ fn output_backend_stdin_file() -> Result<Option<fs::File>, Error> {
 /// `--verify` run reads identical input. Otherwise (no snapshot reserved, or a
 /// terminal/absent stdin) the guest gets `/dev/null`, matching the previous
 /// behavior for callers that do not reserve a snapshot.
-fn output_backend_stdin() -> Result<Stdio, Error> {
+pub fn output_backend_stdin() -> Result<Stdio, Error> {
     match output_backend_stdin_file()? {
         Some(file) => Ok(Stdio::from(file)),
         None => Ok(Stdio::null()),
@@ -1286,6 +1286,33 @@ fn refuse_in_guest_trap_patching(backend: Backend, evidence: Option<String>) -> 
         }
         None => Ok(()),
     }
+}
+
+/// Use the existing actual subscriber-derived forwarding policy for the
+/// shared native path. Call inside the same verification tracing scope.
+#[cfg(feature = "native-exec")]
+#[doc(hidden)]
+pub fn in_guest_detlog_forward_policy_for_native() -> detcore::detlog::ForwardPolicy {
+    in_guest_detlog_forward_policy()
+}
+
+/// Report the shared native trap runtime through the existing statistics
+/// comparator and require a real guest report with site patching disabled.
+/// This never converts a patching-off execution into LiteInst evidence.
+#[cfg(feature = "liteinst")]
+#[doc(hidden)]
+pub fn native_trap_dispatch_stats(
+    source: &reverie_liteinst::LiteinstBackendStatsSource,
+) -> Result<Option<reverie::DispatchStats>, Error> {
+    let backend = Backend::InGuestTrap;
+    let record = backend_stats::report(backend, reverie::BackendStatsRequest::ENABLED, source);
+    let evidence = in_guest_trap_patching_evidence(
+        backend,
+        record.as_ref(),
+        source.snapshot().process_reports(),
+    );
+    refuse_in_guest_trap_patching(backend, evidence)?;
+    Ok(record)
 }
 
 /// The oldest kernel in-guest LiteInst runs on, as (major, minor). Linux 6.5
@@ -5475,6 +5502,8 @@ mod tests {
     #[test]
     #[cfg(feature = "liteinst")]
     fn in_guest_trap_refuses_a_guest_environment_that_turns_site_patching_on() {
+        use std::ffi::OsStr;
+
         let name = reverie_liteinst::SITE_PATCHING_ENV;
         let mut unset = Command::new("/bin/true");
         unset.env_remove(name);

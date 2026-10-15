@@ -34,6 +34,8 @@ dbt = ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"]
 sabre = ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"]
 e9patch = []
 liteinst = ["dep:reverie-liteinst", "dep:reverie-rpc-transport"]
+# Explicit native in-guest-trap launch domain; ordinary exec remains unchanged.
+native-exec = ["liteinst", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"]
 third-party-backends = ["dbt", "sabre", "e9patch", "liteinst"]
 # Hardware qualification selected only by the existing KVM validation nodes.
 kvm-execution-tests = []
@@ -64,17 +66,19 @@ rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
 # Reverie is pinned to a specific commit for reproducibility. Keep this rev in
 # sync across all crates and bump it via docs/updating-reverie.md.
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7" }
-reverie-dbt = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7", default-features = false, optional = true }
-reverie-kvm = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7" }
-reverie-ptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7" }
-reverie-liteinst = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7", default-features = false, optional = true }
-reverie-rpc-transport = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7", optional = true }
-reverie-sabre-stats = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7", optional = true }
-safeptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7" }
+reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91" }
+reverie-dbt = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91", default-features = false, optional = true }
+reverie-kvm = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91" }
+reverie-ptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91" }
+reverie-liteinst = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91", default-features = false, optional = true }
+reverie-inguest = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91", default-features = false, optional = true }
+reverie-rpc-transport = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91", optional = true }
+reverie-sabre-stats = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91", optional = true }
+safeptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 serde_yaml = "0.9.34"
+sha2 = { version = "0.10.9", optional = true }
 shell-words = "1.1.1"
 tempfile = "3.27.0"
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }

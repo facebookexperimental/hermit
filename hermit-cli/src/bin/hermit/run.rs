@@ -116,6 +116,41 @@ use super::verify_run;
 
 const TMP_DIR: &str = "/tmp";
 
+#[cfg(feature = "native-exec")]
+type NativeContainerRun = super::native_exec_cli::PhysicalContainer;
+#[cfg(not(feature = "native-exec"))]
+type NativeContainerRun = ();
+
+/// Descriptor-free forwarding selection retained by the common container owner.
+/// Open the one physical stream only inside that container's child.
+pub(super) enum ForwardedDetlogPlan {
+    None,
+    Socket { opened: bool },
+}
+
+impl ForwardedDetlogPlan {
+    fn requires_socket(&self) -> bool {
+        matches!(self, Self::Socket { .. })
+    }
+
+    #[cfg(all(test, feature = "dbt"))]
+    pub(super) fn is_none(&self) -> bool {
+        !self.requires_socket()
+    }
+
+    fn open_in_container(&mut self) -> Result<Option<(OwnedFd, OwnedFd)>, Error> {
+        match self {
+            Self::None => Ok(None),
+            Self::Socket { opened } => {
+                if std::mem::replace(opened, true) {
+                    return Err(Error::msg("forwarded DETLOG plan already consumed"));
+                }
+                RunOpts::open_forwarded_detlog_channel()
+            }
+        }
+    }
+}
+
 /// Why this host cannot arm Reverie's ptrace PMU timer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TimerUnavailable {
@@ -987,6 +1022,16 @@ fn started_by_a_dap_supervisor(owner: &OsStr) -> bool {
 #[derive(Debug, Parser, Clone)]
 #[clap(group(clap::ArgGroup::new("verification").args(["verify", "verify_run"])))]
 pub struct RunOpts {
+    /// Freeze explicitly declared dynamic files for the native trap exec domain.
+    /// Static files, scripts, threads, fork and timers remain outside this domain.
+    #[cfg(feature = "native-exec")]
+    #[clap(long, value_name = "DECLARATION", requires = "verification")]
+    native_exec_inputs: Option<PathBuf>,
+
+    #[cfg(feature = "native-exec")]
+    #[clap(skip)]
+    native_exec_capture: Option<std::sync::Arc<super::native_exec_cli::Capture>>,
+
     /// The process instrumentation backend. It is selected only by the global
     /// option (`hermit --backend <BACKEND> run ...`); `run` does not accept
     /// `--backend` itself. [`RunOpts::main`] copies the global value here.
@@ -4336,6 +4381,31 @@ fn strict_run_refuses_an_inexact_branch_counter_before_it_looks_at_the_program()
 }
 
 #[test]
+#[cfg(feature = "native-exec")]
+fn native_inputs_refuse_wrong_backend_before_program_or_declaration_access() {
+    for backend in ["dbt", "e9patch", "ptrace", "liteinst"] {
+        let backend_flag = format!("--backend={backend}");
+        let global = GlobalOpts::parse_from(["hermit", &backend_flag]);
+        let mut options = RunOpts::parse_from([
+            "run",
+            "--verify",
+            "--native-exec-inputs=/nonexistent-native-declaration",
+            "/nonexistent-native-guest",
+        ]);
+        // Exercise the actual common entry, in builds with or without DBT.
+        // Reaching program/declaration validation or a backend probe instead
+        // produces a different error and must fail this control.
+        let error = options.main(&global).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "native exec currently requires in-guest-trap",
+            "{backend}: {error:#}"
+        );
+        assert!(options.native_exec_capture.is_none());
+    }
+}
+
+#[test]
 fn non_strict_runs_still_allow_host_networking() {
     // The refusal is about `--strict` claiming something it did not enforce,
     // not about forbidding host networking outright.
@@ -5243,6 +5313,14 @@ impl RunOpts {
         backend == Backend::Sabre || backend.is_in_guest_liteinst()
     }
 
+    /// Select forwarding with the same backend predicate before common setup.
+    fn forwarded_detlog_plan(&self) -> Result<ForwardedDetlogPlan, Error> {
+        if !self.uses_in_guest_liteinst() && !self.uses_sabre() {
+            return Ok(ForwardedDetlogPlan::None);
+        }
+        Ok(ForwardedDetlogPlan::Socket { opened: false })
+    }
+
     /// A Unix `SOCK_SEQPACKET` pair for one verification run's forwarded
     /// DETLOG records, when the run hosts Detcore inside the guest (in-guest
     /// LiteInst or SaBRe): the guest's runtime sends each record as one message
@@ -5252,12 +5330,8 @@ impl RunOpts {
     /// receiving end; inside the run's container, the coordinator writes what
     /// arrives on the receiving end into the run's log in order
     /// (`detcore::detlog::set_forwarded_source`).
-    fn forwarded_detlog_channel(
-        &self,
-    ) -> Result<Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>, Error> {
-        if !self.uses_in_guest_liteinst() && !self.uses_sabre() {
-            return Ok(None);
-        }
+    fn open_forwarded_detlog_channel()
+    -> Result<Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>, Error> {
         let mut pair = [-1; 2];
         // SAFETY: socketpair writes two descriptors into `pair` on success.
         let created = unsafe {
@@ -5321,6 +5395,19 @@ impl RunOpts {
     /// it never does.
     fn uses_in_guest_liteinst(&self) -> bool {
         !self.namespace_only && self.selected_backend().is_in_guest_liteinst()
+    }
+
+    /// Native launches qualify their embedded artifact catalog in
+    /// `Capture::prepare` before either physical verification run starts.
+    fn uses_native_exec(&self) -> bool {
+        #[cfg(feature = "native-exec")]
+        {
+            self.native_exec_inputs.is_some()
+        }
+        #[cfg(not(feature = "native-exec"))]
+        {
+            false
+        }
     }
 
     /// Whether this run hosts Detcore inside the guest through SaBRe.
@@ -5751,6 +5838,15 @@ impl RunOpts {
         // The backend is a global option (`hermit --backend X run ...`), the only
         // place it can be given.
         self.backend = global.backend;
+        // Static native-option policy belongs before stdin reservation,
+        // availability probes, or backend-specific preprocessing/dispatch.
+        #[cfg(feature = "native-exec")]
+        if self.native_exec_inputs.is_some() {
+            anyhow::ensure!(
+                self.selected_backend() == Backend::InGuestTrap,
+                "native exec currently requires in-guest-trap"
+            );
+        }
         self.refuse_unapplied_config()?;
         if let Some(path) = &self.backend_engagement_json {
             clear_machine_record(path, "backend engagement")?;
@@ -5769,8 +5865,27 @@ impl RunOpts {
         self.refuse_unenforceable_happens_before()?;
         // Before stdin or any backend: a pair whose shared inputs are missing,
         // unsealed or not the manifest's objects is refused before it starts.
+        #[cfg(feature = "native-exec")]
+        anyhow::ensure!(
+            self.native_exec_inputs.is_none()
+                || self.verify_run.is_none()
+                || self.native_exec_shared_inputs.is_some(),
+            "native --verify-run requires the holder's shared-input manifest"
+        );
         if let Some(fd) = self.native_exec_shared_inputs {
-            self.shared_inputs = Some(std::sync::Arc::new(super::verify_inputs::take_adopted(fd)?));
+            let adopted = super::verify_inputs::take_adopted(fd)?;
+            #[cfg(feature = "native-exec")]
+            if self.native_exec_inputs.is_some() {
+                self.native_exec_capture = Some(std::sync::Arc::new(
+                    adopted.into_inputs::<super::native_exec_cli::Capture>()?,
+                ));
+            } else {
+                self.shared_inputs = Some(std::sync::Arc::new(adopted));
+            }
+            #[cfg(not(feature = "native-exec"))]
+            {
+                self.shared_inputs = Some(std::sync::Arc::new(adopted));
+            }
         }
         // Also before stdin is read: a host or run the x86-64-v3 profile
         // cannot qualify is refused at once.
@@ -5878,12 +5993,16 @@ impl RunOpts {
         // different verdict per build
         // (https://github.com/rrnewton/hermit/issues/3418).
         self.ensure_timeout_supported()?;
-        if !self.namespace_only && backend != Backend::Kvm {
+        if !self.namespace_only && backend != Backend::Kvm && !self.uses_native_exec() {
             // E9patch's own availability check covers both its ptrace runtime and
             // the `e9patch` cargo feature (it reports "not included in this build"
             // when the feature is disabled), so it no longer needs a special case.
             backend.ensure_available()?;
         }
+        // Native exec uses the embedded, producer-qualified catalog rather
+        // than the ordinary preload. Its complete Capture::prepare below
+        // remains mandatory after program/config validation and before either
+        // physical run; an adjacent preload cannot establish its availability.
         self.install_pmu_config()?;
         // After the PMU configuration, which Reverie's validation reads, and
         // before every check below that can still refuse the run: the pending
@@ -5976,12 +6095,45 @@ impl RunOpts {
             );
         }
         if backend == Backend::InGuestTrap && self.uses_in_guest_liteinst() {
-            crate::tracing::diagnostic_eprintln!(
-                "hermit: [in-guest-trap] selected: the guest preload is to host the Detcore Tool, \
-                 with syscall site patching off (REVERIE_LITEINST_SITE_PATCHING=0)"
-            );
+            if self.uses_native_exec() {
+                crate::tracing::diagnostic_eprintln!(
+                    "hermit: [in-guest-trap] selected: the embedded native runtime is to host \
+                     the Detcore Tool, with syscall site patching off"
+                );
+            } else {
+                crate::tracing::diagnostic_eprintln!(
+                    "hermit: [in-guest-trap] selected: the guest preload is to host the Detcore Tool, \
+                     with syscall site patching off (REVERIE_LITEINST_SITE_PATCHING=0)"
+                );
+            }
         }
 
+        #[cfg(feature = "native-exec")]
+        if let Some(declaration) = &self.native_exec_inputs {
+            anyhow::ensure!(
+                !self.no_namespace && !self.namespace_only && self.image.is_none(),
+                "native exec requires the common declared-input namespace"
+            );
+            anyhow::ensure!(
+                self.timer_downgrade.is_none(),
+                "native exec requires an explicit no-timer configuration"
+            );
+            detcore::native_exec::validate_native_exec_host_configuration(
+                &self.effective_det_config(),
+            )?;
+            let command = self.guest_command()?;
+            let capture = if let Some(adopted) = self.native_exec_capture.take() {
+                adopted
+            } else {
+                anyhow::ensure!(
+                    self.native_exec_shared_inputs.is_none() && self.verify_run.is_none(),
+                    "native shared enrollment cannot fall back to fresh capture"
+                );
+                super::native_exec_cli::Capture::prepare(declaration, &command)?
+            };
+            capture.require_initial(&command)?;
+            self.native_exec_capture = Some(capture);
+        }
         self.warn_no_namespace();
 
         if self.namespace_only {
@@ -7360,7 +7512,18 @@ impl RunOpts {
             network_trace,
             resources,
             self.run_timeout(),
-            move |_, identity| options.run_in_container(&global, capture_output, identity),
+            move |_, identity, native| {
+                #[cfg(feature = "native-exec")]
+                if let Some(native) = native {
+                    let _ = native;
+                    return Err(Error::msg(
+                        "native exec currently requires the verification run path",
+                    ));
+                }
+                #[cfg(not(feature = "native-exec"))]
+                let _ = native;
+                options.run_in_container(&global, capture_output, identity)
+            },
         )
         .map(|(value, _guards)| value)
     }
@@ -7383,7 +7546,9 @@ impl RunOpts {
     /// Run `work` as the init of this run's container: the PID, UTS, mount and
     /// network namespaces, private /tmp and identity mounts that every backend
     /// shares, or a plain child under `--no-namespace`. `work` receives the
-    /// parent-held `guards` and the container's identity mounts.
+    /// parent-held `guards`, the container's identity mounts, and any explicitly
+    /// enrolled native run. An adapter that cannot consume a native run must
+    /// refuse it.
     pub(super) fn launch_in_container<G, F, T>(
         &self,
         guards: G,
@@ -7393,7 +7558,8 @@ impl RunOpts {
     ) -> Result<(T, G), Error>
     where
         G: 'static,
-        F: FnMut(&mut G, Option<&IdentityGuard>) -> Result<T, Error> + 'static,
+        F: FnMut(&mut G, Option<&IdentityGuard>, Option<NativeContainerRun>) -> Result<T, Error>
+            + 'static,
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
         let (mut container, tmpfs, identity, resources) = if self.no_namespace {
@@ -7414,18 +7580,33 @@ impl RunOpts {
             );
             (container, Some(tmpfs), Some(identity), resources)
         };
+        #[cfg(feature = "native-exec")]
+        let native_plan = self
+            .native_exec_capture
+            .as_ref()
+            .map(|capture| capture.plan(&mut container))
+            .transpose()?;
+        #[cfg(not(feature = "native-exec"))]
+        let native_plan: Option<()> = None;
         super::owned_container::run(
             &mut container,
-            (tmpfs, identity, guards),
+            (tmpfs, identity, guards, native_plan),
             resources,
             !self.no_namespace,
             "with_container",
             timeout,
-            move |(_, identity, guards): &mut (Option<Tmpfs>, Option<IdentityGuard>, G)| {
-                work(guards, identity.as_ref())
+            move |(_, identity, guards, native_plan)| {
+                #[cfg(feature = "native-exec")]
+                let native = native_plan
+                    .take()
+                    .map(|plan| unsafe { plan.materialize() })
+                    .transpose()?;
+                #[cfg(not(feature = "native-exec"))]
+                let native = native_plan.take();
+                work(guards, identity.as_ref(), native)
             },
         )
-        .map(|(value, (_, _, guards))| (value, guards))
+        .map(|(value, (_, _, guards, _))| (value, guards))
     }
 
     fn run_with_namespace_only(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
@@ -7590,8 +7771,8 @@ impl RunOpts {
             .create_new(true)
             .open(&log_path)
             .with_context(|| format!("creating the verification log {}", log_path.display()))?;
-        let forwarded = self.forwarded_detlog_channel()?;
-        let socket = forwarded.is_some();
+        let forwarded = self.forwarded_detlog_plan()?;
+        let socket = forwarded.requires_socket();
         // Both reached through the controller's descriptors, as `verify`
         // reaches its own (see private_summary_descriptor_path).
         let summary_file = private_verify_summary()?;
@@ -7724,7 +7905,7 @@ impl RunOpts {
             &Self,
             fs::File,
             &Path,
-            Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
+            ForwardedDetlogPlan,
             VerificationRun,
         ) -> Result<VerificationRunOutput, Error>,
     ) -> Result<ExitStatus, Error> {
@@ -7734,9 +7915,12 @@ impl RunOpts {
 
         let (log1_file, log1_path) = log1.into_parts();
         let (log2_file, log2_path) = log2.into_parts();
-        let forwarded1_for_run = self.forwarded_detlog_channel()?;
-        let forwarded2_for_run = self.forwarded_detlog_channel()?;
-        let (forwarded1, forwarded2) = (forwarded1_for_run.is_some(), forwarded2_for_run.is_some());
+        let forwarded1_for_run = self.forwarded_detlog_plan()?;
+        let forwarded2_for_run = self.forwarded_detlog_plan()?;
+        let (forwarded1, forwarded2) = (
+            forwarded1_for_run.requires_socket(),
+            forwarded2_for_run.requires_socket(),
+        );
 
         // Verification historically sent both executions to one --summary-json
         // path, so run 2 overwrote run 1. Keep the public path's run-2 meaning,
@@ -8358,7 +8542,7 @@ impl RunOpts {
         &self,
         log_file: fs::File,
         _log_path: &Path,
-        forwarded_detlogs: Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
+        forwarded_detlogs: ForwardedDetlogPlan,
         global: &GlobalOpts,
         _run: VerificationRun,
         #[cfg(feature = "dbt")] dbt: Option<&mut super::backends::DbtVerification>,
@@ -8384,7 +8568,7 @@ impl RunOpts {
             } else {
                 ""
             },
-            if forwarded_detlogs.is_some() {
+            if forwarded_detlogs.requires_socket() {
                 ", forwarded DETLOG"
             } else {
                 ""
@@ -8394,8 +8578,8 @@ impl RunOpts {
             (Some(log_file), network_trace, forwarded_detlogs),
             &resources,
             None,
-            move |(log, _, forwarded), identity| {
-                options.run_verify_in_container(log, forwarded, &global, identity)
+            move |(log, _, forwarded), identity, native| {
+                options.run_verify_in_container(log, forwarded, &global, identity, native)
             },
         )
         .map(
@@ -9107,10 +9291,12 @@ impl RunOpts {
     fn run_verify_in_container(
         &self,
         log_file: &mut Option<fs::File>,
-        forwarded_detlogs: &mut Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
+        forwarded_detlogs: &mut ForwardedDetlogPlan,
         global: &GlobalOpts,
         identity_sources: Option<&IdentityGuard>,
+        native: Option<NativeContainerRun>,
     ) -> Result<(Output, u64, RunLatches), Error> {
+        let mut forwarded_detlogs = forwarded_detlogs.open_in_container()?;
         hermit::proc_mount::warn_if_readonly_proc();
 
         // HACK: Use interior mutability to workaround not being able to pass
@@ -9146,6 +9332,43 @@ impl RunOpts {
         // The command has no `pre_exec` callback.
         let config = complete_container_config(self.effective_det_config(), identity_sources)?;
 
+        #[cfg(feature = "native-exec")]
+        if let Some(native) = native {
+            let (sender, receiver) = forwarded_detlogs.take().ok_or_else(|| {
+                Error::msg("native exec requires the actual verification DETLOG source")
+            })?;
+            detcore::detlog::set_forwarded_source(receiver, log.record_sink());
+            let policy = hermit::in_guest_detlog_forward_policy_for_native();
+            let mut config = hermit::prepare_backend_config(config, Backend::InGuestTrap);
+            config.in_guest_site_patching_off = true;
+            config.in_guest_detlog_forward_policy = Some(policy.encode());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let result = runtime.block_on(super::native_exec_run::run(
+                super::native_exec_run::PhysicalRun {
+                    command,
+                    config,
+                    root: native.root,
+                    runtime_files: native.runtime_files,
+                    artifacts: native.artifacts,
+                    endpoints: native.endpoints,
+                    detlog_sender: sender,
+                    print_summary: self.summary,
+                    summary_json: self.summary_json.clone(),
+                },
+            ));
+            detcore::detlog::clear_forwarded_source();
+            let output = result?;
+            let _ = log.clone().flush();
+            let latches = RunLatches {
+                determinism_loss: detcore::detlog::determinism_loss(),
+                log_sink_failure: log.failure(),
+            };
+            return Ok((output, 0, latches));
+        }
+        #[cfg(not(feature = "native-exec"))]
+        let _ = native;
         let forwarding = forwarded_detlogs.take().map(|(sender, receiver)| {
             hermit::forward_in_guest_detlogs_to(sender);
             detcore::detlog::set_forwarded_source(receiver, log.record_sink());
@@ -9534,6 +9757,240 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    fn forwarding_plan_options(forwarded: bool) -> RunOpts {
+        let backend = if forwarded { "in-guest-trap" } else { "ptrace" };
+        run_opts_for(&["hermit", "--backend", backend, "run", "--", "/bin/true"])
+    }
+
+    fn assert_channel_record(sender: &OwnedFd, receiver: &OwnedFd, record: &[u8]) {
+        let sent = unsafe {
+            libc::send(
+                sender.as_raw_fd(),
+                record.as_ptr().cast(),
+                record.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        assert_eq!(sent, record.len() as isize, "send exact channel record");
+        let mut bytes = [0u8; 128];
+        let received = unsafe {
+            libc::recv(
+                receiver.as_raw_fd(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        assert_eq!(received, record.len() as isize, "receive complete record");
+        assert_eq!(&bytes[..record.len()], record);
+    }
+
+    fn assert_channel_empty_with_writer(receiver: &OwnedFd) {
+        let mut poll = libc::pollfd {
+            fd: receiver.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 0) }, 0);
+        assert_eq!(poll.revents, 0, "a live writer must prevent HUP");
+        let mut byte = 0u8;
+        let received = unsafe {
+            libc::recv(
+                receiver.as_raw_fd(),
+                (&raw mut byte).cast(),
+                1,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        assert_eq!(received, -1, "an empty live source is not EOF");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+    }
+
+    fn assert_channel_eof_after_last_writer(receiver: &OwnedFd) {
+        let mut poll = libc::pollfd {
+            fd: receiver.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut poll, 1, 250) },
+            1,
+            "last writer retirement must become observable while ancestor waits"
+        );
+        assert_ne!(
+            poll.revents & libc::POLLHUP,
+            0,
+            "last writer must yield HUP"
+        );
+        assert_eq!(poll.revents & (libc::POLLERR | libc::POLLNVAL), 0);
+        let mut byte = 0u8;
+        assert_eq!(
+            unsafe {
+                libc::recv(
+                    receiver.as_raw_fd(),
+                    (&raw mut byte).cast(),
+                    1,
+                    libc::MSG_DONTWAIT,
+                )
+            },
+            0,
+            "last writer must yield actual recv EOF"
+        );
+    }
+
+    #[test]
+    fn forwarded_detlog_plan_record_reaches_eof_while_parent_waits() {
+        let options = forwarding_plan_options(true);
+        let plan = options.forwarded_detlog_plan().unwrap();
+        assert!(plan.requires_socket());
+        let ((), _guards) = options
+            .launch_in_container(plan, "forwarded DETLOG test plan", None, |plan, _, _| {
+                let (sender, receiver) = plan.open_in_container()?.expect("forwarded pair");
+                assert_channel_record(
+                    &sender,
+                    &receiver,
+                    &detcore::detlog::tagged_forwarded_message(
+                        unsafe { libc::syscall(libc::SYS_gettid) as i32 },
+                        1,
+                        b"DETLOG retained record\n",
+                    ),
+                );
+                drop(sender);
+                assert_channel_eof_after_last_writer(&receiver);
+                assert!(
+                    plan.open_in_container().is_err(),
+                    "one physical stream only"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn forwarded_detlog_plan_duplicate_writer_blocks_eof() {
+        use std::os::fd::FromRawFd;
+
+        let options = forwarding_plan_options(true);
+        let plan = options.forwarded_detlog_plan().unwrap();
+        let ((), _guards) = options
+            .launch_in_container(plan, "duplicated forwarding writer", None, |plan, _, _| {
+                let (sender, receiver) = plan.open_in_container()?.expect("forwarded pair");
+                let raw = unsafe { libc::fcntl(sender.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+                assert!(raw >= 0);
+                let duplicate = unsafe { OwnedFd::from_raw_fd(raw) };
+                assert_channel_record(
+                    &sender,
+                    &receiver,
+                    &detcore::detlog::tagged_forwarded_message(
+                        unsafe { libc::syscall(libc::SYS_gettid) as i32 },
+                        1,
+                        b"DETLOG before last writer\n",
+                    ),
+                );
+                drop(sender);
+                assert_channel_empty_with_writer(&receiver);
+                drop(duplicate);
+                assert_channel_eof_after_last_writer(&receiver);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn forwarded_detlog_plan_nonforwarded_opens_no_channel() {
+        let options = forwarding_plan_options(false);
+        let plan = options.forwarded_detlog_plan().unwrap();
+        assert!(!plan.requires_socket());
+        let ((), _guards) = options
+            .launch_in_container(plan, "nonforwarding test plan", None, |plan, _, _| {
+                assert!(!plan.requires_socket());
+                assert!(plan.open_in_container()?.is_none());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn forwarded_detlog_plan_two_runs_keep_streams_independent() {
+        let options = forwarding_plan_options(true);
+        let plans = (
+            options.forwarded_detlog_plan().unwrap(),
+            options.forwarded_detlog_plan().unwrap(),
+        );
+        let ((), _guards) = options
+            .launch_in_container(
+                plans,
+                "independent forwarding plans",
+                None,
+                |(first, second), _, _| {
+                    let (sender1, receiver1) = first.open_in_container()?.expect("first pair");
+                    let (sender2, receiver2) = second.open_in_container()?.expect("second pair");
+                    let first_identity =
+                        detcore::detlog::socket_identity(receiver1.as_raw_fd()).unwrap();
+                    let second_identity =
+                        detcore::detlog::socket_identity(receiver2.as_raw_fd()).unwrap();
+                    assert_ne!(first_identity, second_identity);
+                    assert_channel_record(
+                        &sender1,
+                        &receiver1,
+                        &detcore::detlog::tagged_forwarded_message(
+                            unsafe { libc::syscall(libc::SYS_gettid) as i32 },
+                            1,
+                            b"DETLOG physical run one\n",
+                        ),
+                    );
+                    assert_channel_empty_with_writer(&receiver2);
+                    assert_channel_record(
+                        &sender2,
+                        &receiver2,
+                        &detcore::detlog::tagged_forwarded_message(
+                            unsafe { libc::syscall(libc::SYS_gettid) as i32 },
+                            1,
+                            b"DETLOG physical run two\n",
+                        ),
+                    );
+                    assert_channel_empty_with_writer(&receiver1);
+                    drop(sender1);
+                    assert_channel_eof_after_last_writer(&receiver1);
+                    assert_channel_empty_with_writer(&receiver2);
+                    drop(sender2);
+                    assert_channel_eof_after_last_writer(&receiver2);
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "native-exec")]
+    fn native_observer_plan_reaches_eof_while_parent_waits() {
+        let options = forwarding_plan_options(true);
+        let staging = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let endpoints =
+            super::super::native_exec_run::NativeEndpoints::bind(staging.path()).unwrap();
+        let ((), _guards) = options
+            .launch_in_container(
+                (staging, endpoints),
+                "native observer test plan",
+                None,
+                |(_, endpoints), _, _| {
+                    let (receiver, sender) = endpoints.open_observer_in_container()?;
+                    assert_channel_record(&sender, &receiver, b"observer retained record");
+                    drop(sender);
+                    assert_channel_eof_after_last_writer(&receiver);
+                    assert!(
+                        endpoints.open_observer_in_container().is_err(),
+                        "one observer stream only"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
 
     #[test]
     fn host_base_env_keeps_hermits_own_variables_from_the_guest() {

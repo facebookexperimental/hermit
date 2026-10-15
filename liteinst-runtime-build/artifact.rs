@@ -286,6 +286,123 @@ mod tests {
     fn rejects_non_json_output() {
         let error = select("not cargo json").unwrap_err();
         assert!(error.contains("invalid Cargo JSON on line 1"));
+        let native = serde_json::json!({
+            "reason": "compiler-artifact", "package_id": "actual-local-detcore-package",
+            "manifest_path": "/isolated/hermit/detcore-liteinst/Cargo.toml",
+            "target": {"name": "detcore_liteinst", "kind": ["cdylib"], "crate_types": ["cdylib"]},
+            "features": ["exec-native-injection", "exec-private-init"],
+            "profile": {"opt_level": "3", "debuginfo": 0, "debug_assertions": true,
+                "overflow_checks": true, "test": false},
+            "filenames": ["/isolated/native-target/libdetcore_liteinst.so"]
+        });
+        let finished = serde_json::json!({"reason":"build-finished", "success":true});
+        let select_native = |messages: &str| {
+            native_cdylib_from_cargo_messages(
+                messages,
+                "actual-local-detcore-package",
+                Path::new("/isolated/hermit/detcore-liteinst/Cargo.toml"),
+            )
+        };
+        assert_eq!(
+            select_native(&format!("{native}\n{finished}\n")).unwrap(),
+            PathBuf::from("/isolated/native-target/libdetcore_liteinst.so")
+        );
+        // This is the canonical Detcore validate tuple, independently spelled
+        // in the artifact fixture. Outer dev/release cannot select another ELF.
+        for (field, wrong, wrong_type) in [
+            ("opt_level", serde_json::json!("0"), serde_json::json!(3)),
+            ("debuginfo", serde_json::json!(2), serde_json::json!("0")),
+            (
+                "debug_assertions",
+                serde_json::json!(false),
+                serde_json::json!("true"),
+            ),
+            (
+                "overflow_checks",
+                serde_json::json!(false),
+                serde_json::json!("true"),
+            ),
+            ("test", serde_json::json!(true), serde_json::json!("false")),
+        ] {
+            for value in [Some(wrong), Some(wrong_type), None] {
+                let mut bad = native.clone();
+                if let Some(value) = value {
+                    bad["profile"][field] = value;
+                } else {
+                    bad["profile"].as_object_mut().unwrap().remove(field);
+                }
+                let error = select_native(&format!("{bad}\n{finished}\n")).unwrap_err();
+                assert!(
+                    error.contains("validate profile"),
+                    "native Cargo profile {field}: {error}"
+                );
+            }
+        }
+        for profile in [serde_json::Value::Null, serde_json::json!({})] {
+            let mut bad = native.clone();
+            bad["profile"] = profile;
+            assert!(
+                select_native(&format!("{bad}\n{finished}\n"))
+                    .unwrap_err()
+                    .contains("validate profile")
+            );
+        }
+        let mut bad = native.clone();
+        bad.as_object_mut().unwrap().remove("profile");
+        assert!(
+            select_native(&format!("{bad}\n{finished}\n"))
+                .unwrap_err()
+                .contains("validate profile")
+        );
+        let mut bad = native.clone();
+        bad["profile"]["unexpected"] = serde_json::json!(true);
+        assert!(
+            select_native(&format!("{bad}\n{finished}\n"))
+                .unwrap_err()
+                .contains("validate profile")
+        );
+        assert!(select_native(&native.to_string()).is_err());
+        assert!(select_native(&format!("{native}\n{native}\n{finished}\n")).is_err());
+        assert!(select_native(&format!("{native}\n{finished}\n{finished}\n")).is_err());
+        assert!(
+            select_native(&format!(
+                "{native}\n{}",
+                serde_json::json!({"reason":"build-finished","success":false})
+            ))
+            .is_err()
+        );
+        for (field, value) in [
+            ("package_id", serde_json::json!("old-package")),
+            (
+                "manifest_path",
+                serde_json::json!("/old/detcore-liteinst/Cargo.toml"),
+            ),
+            ("features", serde_json::json!([])),
+            ("features", serde_json::json!(["exec-private-init"])),
+            (
+                "features",
+                serde_json::json!([
+                    "exec-native-injection",
+                    "exec-private-init",
+                    "allocator-fixture"
+                ]),
+            ),
+            (
+                "filenames",
+                serde_json::json!(["/old/libreverie_liteinst.so"]),
+            ),
+            (
+                "filenames",
+                serde_json::json!(["/a/libdetcore_liteinst.so", "/b/libdetcore_liteinst.so"]),
+            ),
+        ] {
+            let mut bad = native.clone();
+            bad[field] = value;
+            assert!(
+                select_native(&format!("{bad}\n{finished}\n")).is_err(),
+                "native Cargo {field}"
+            );
+        }
     }
 
     #[test]
@@ -414,5 +531,487 @@ mod tests {
                 "accepted wrong {field}"
             );
         }
+    }
+}
+
+/// Actual native artifact selection is separate from the ordinary preload.
+#[cfg(any(feature = "native-exec", test))]
+pub(crate) fn native_cdylib_from_cargo_messages(
+    messages: &str,
+    package_id: &str,
+    manifest: &Path,
+) -> Result<PathBuf, String> {
+    let mut selected = None;
+    let mut finished = false;
+    for line in messages.lines().filter(|line| !line.is_empty()) {
+        let value: Value =
+            serde_json::from_str(line).map_err(|e| format!("native Cargo JSON: {e}"))?;
+        if finished {
+            return Err("native Cargo stream has trailing messages after build-finished".into());
+        }
+        if value["reason"] == "build-finished" {
+            if value["success"] != true {
+                return Err("native Cargo build did not finish successfully".into());
+            }
+            finished = true;
+        } else if value["reason"] == "compiler-artifact"
+            && value["target"]["name"] == "detcore_liteinst"
+        {
+            if selected.is_some()
+                || value["package_id"] != package_id
+                || value["manifest_path"].as_str().map(Path::new) != Some(manifest)
+                || value["target"]["kind"] != serde_json::json!(["cdylib"])
+                || value["target"]["crate_types"] != serde_json::json!(["cdylib"])
+                || value["features"]
+                    != serde_json::json!(["exec-native-injection", "exec-private-init"])
+            {
+                return Err("native Detcore artifact has ambiguous package/target/features".into());
+            }
+            // Native Detcore uses the same checked validate code generation
+            // as the maintained allocator producer, independent of the host
+            // CLI/producer profile. Authenticate the actual Cargo artifact.
+            if value["profile"]
+                != serde_json::json!({"opt_level": "3", "debuginfo": 0,
+                    "debug_assertions": true, "overflow_checks": true, "test": false})
+            {
+                return Err(
+                    "native Detcore artifact differs from the exact validate profile".into(),
+                );
+            }
+            let filenames = value["filenames"]
+                .as_array()
+                .ok_or("native artifact filenames absent")?;
+            if filenames.len() != 1 {
+                return Err("native Detcore must emit one current cdylib".into());
+            }
+            let path = PathBuf::from(filenames[0].as_str().ok_or("native filename is not text")?);
+            if path.file_name().and_then(|s| s.to_str()) != Some("libdetcore_liteinst.so") {
+                return Err("native Detcore filename differs".into());
+            }
+            selected = Some(path);
+        }
+    }
+    if !finished {
+        return Err("native Cargo stream lacks actual successful build-finished".into());
+    }
+    selected.ok_or_else(|| "current native Detcore artifact absent".into())
+}
+
+#[cfg(all(feature = "native-exec", not(test)))]
+pub(crate) mod native {
+    use std::env;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::time::Duration;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
+    use goblin::elf::Elf;
+    use goblin::elf::program_header;
+    use reverie_liteinst_artifact as qualifier;
+    use sha2::Digest;
+    use sha2::Sha256;
+
+    use super::*;
+
+    const GATE: u64 = 0x5000_0000_0000;
+    const STREAM_CAP: usize = 16 * 1024 * 1024;
+    fn text(path: &Path) -> String {
+        path.to_str()
+            .expect("native compiler path is not UTF8")
+            .to_owned()
+    }
+    fn hex_array(hex: &str) -> [u8; 32] {
+        assert!(hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+        std::array::from_fn(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+    }
+    fn retain(
+        runner: &mut qualifier::Runner,
+        program: &str,
+        args: Vec<String>,
+        cwd: &Path,
+    ) -> Vec<u8> {
+        runner
+            .run(program, &args, cwd)
+            .unwrap_or_else(|e| panic!("native producer command failed: {e}"))
+    }
+    fn gate_digest(path: &Path) -> [u8; 32] {
+        let bytes = fs::read(path).expect("read current native bootstrap");
+        let elf = Elf::parse(&bytes).expect("parse current native bootstrap");
+        let segments: Vec<_> = elf
+            .program_headers
+            .iter()
+            .filter(|p| {
+                p.p_type == program_header::PT_LOAD
+                    && GATE >= p.p_vaddr
+                    && GATE.checked_add(4096).is_some_and(|end| {
+                        p.p_vaddr
+                            .checked_add(p.p_filesz)
+                            .is_some_and(|hi| end <= hi)
+                    })
+            })
+            .collect();
+        assert_eq!(segments.len(), 1, "gate page not uniquely file backed");
+        let segment = segments[0];
+        assert_eq!(segment.p_flags, program_header::PF_R | program_header::PF_X);
+        let offset = usize::try_from(
+            segment
+                .p_offset
+                .checked_add(GATE - segment.p_vaddr)
+                .unwrap(),
+        )
+        .unwrap();
+        Sha256::digest(
+            bytes
+                .get(offset..offset + 4096)
+                .expect("truncated native gate page"),
+        )
+        .into()
+    }
+    fn compiled_file(name: &str, identity: &qualifier::FileIdentity) -> String {
+        format!(
+            "{name}: CompiledFile {{ bytes: include_bytes!({:?}), digest: {:?} }},",
+            text(&identity.path),
+            hex_array(&identity.sha256)
+        )
+    }
+    pub(crate) fn build() {
+        println!("cargo:rerun-if-env-changed=HERMIT_NATIVE_EXEC_STAGE");
+        println!("cargo:rerun-if-env-changed=HERMIT_LITEINST_REVERIE_PIN");
+        println!("cargo:rerun-if-env-changed=PROFILE");
+        for file in ["artifact.rs", "build.rs", "Cargo.toml", "Cargo.lock"] {
+            println!("cargo:rerun-if-changed={file}");
+        }
+        let stage_root = PathBuf::from(
+            env::var_os("HERMIT_NATIVE_EXEC_STAGE")
+                .expect("native stage must be the real host OUT_DIR"),
+        );
+        assert!(stage_root.is_absolute() && stage_root.is_dir());
+        let manifest_dir =
+            fs::canonicalize(PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())).unwrap();
+        let compiled_manifest = fs::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
+        assert_eq!(
+            manifest_dir, compiled_manifest,
+            "native producer compile/run source roots differ"
+        );
+        let root = manifest_dir.parent().unwrap();
+        let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let evidence = out.join(format!(
+            "native-qualification-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir(&evidence).unwrap();
+        let mut runner =
+            qualifier::Runner::new(evidence.join("logs"), Duration::from_secs(1200), STREAM_CAP)
+                .unwrap();
+        let pin =
+            env::var("HERMIT_LITEINST_REVERIE_PIN").expect("actual native full RV pin absent");
+        assert!(
+            pin.len() == 40
+                && pin
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        let source_manifest = root.join("detcore-liteinst/Cargo.toml");
+        // The Detcore content profile binds the actual root workspace and its
+        // lock, then independently selects this exact runtime leaf. The
+        // standalone producer has its own manifest/lock and qualifier source.
+        let qualification_manifest = root.join("Cargo.toml");
+        let sources = qualifier::VerifiedCompiledSources::resolve_content(
+            &qualifier::CompiledSourceExpectation {
+                layout: qualifier::CompiledSourceLayout::HermitGit,
+                image_kind: qualifier::FixedImageKind::Detcore,
+                workspace_root: root,
+                manifest: &qualification_manifest,
+                reverie_pin: &pin,
+            },
+            &mut runner,
+        )
+        .unwrap_or_else(|e| panic!("native compiled-source qualification refused: {e}"));
+        let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let metadata_bytes = retain(
+            &mut runner,
+            &cargo,
+            vec![
+                "metadata".into(),
+                "--locked".into(),
+                "--offline".into(),
+                "--manifest-path".into(),
+                text(&source_manifest),
+                "--format-version=1".into(),
+            ],
+            root,
+        );
+        let metadata: Value = serde_json::from_slice(&metadata_bytes).unwrap();
+        let packages = metadata["packages"].as_array().unwrap();
+        let selected: Vec<_> = packages
+            .iter()
+            .filter(|p| p["name"] == "detcore-liteinst")
+            .collect();
+        assert_eq!(selected.len(), 1);
+        let package = selected[0];
+        let package_manifest = PathBuf::from(package["manifest_path"].as_str().unwrap());
+        assert_eq!(
+            fs::canonicalize(&package_manifest).unwrap(),
+            fs::canonicalize(&source_manifest).unwrap()
+        );
+        assert_eq!(package["id"].as_str().unwrap(), sources.package().id);
+        let rv_packages: Vec<_> = packages
+            .iter()
+            .filter(|p| p["name"] == "reverie-inguest")
+            .collect();
+        assert_eq!(rv_packages.len(), 1);
+        let rv_package = rv_packages[0];
+        let expected_source =
+            format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
+        assert_eq!(rv_package["source"], expected_source);
+        let rv_manifest = fs::canonicalize(rv_package["manifest_path"].as_str().unwrap()).unwrap();
+        let rv = rv_manifest.parent().unwrap().parent().unwrap();
+        assert_eq!(rv_manifest, rv.join("reverie-inguest/Cargo.toml"));
+        let qualifier_manifest = rv.join("reverie-liteinst-artifact/Cargo.toml");
+        let proof_source =
+            qualifier::FileIdentity::read(&rv.join("scripts/m1_artifact.rs")).unwrap();
+        assert_eq!(
+            proof_source.sha256,
+            qualifier::qualifier_source_sha256(),
+            "native proof source differs from actual shared compiler input"
+        );
+        let helper: Vec<_> = packages
+            .iter()
+            .filter(|p| p["name"] == "reverie-liteinst-artifact")
+            .collect();
+        // The runtime graph need not include the host-only qualifier package.
+        // Its independent build dependency still has to be this exact source;
+        // compile-time source SHA and actual resolved RV path establish that join.
+        if !helper.is_empty() {
+            assert_eq!(helper.len(), 1);
+            assert_eq!(helper[0]["source"], expected_source);
+            assert_eq!(
+                fs::canonicalize(helper[0]["manifest_path"].as_str().unwrap()).unwrap(),
+                qualifier_manifest
+            );
+        }
+        let native_sources = rv.join("reverie-inguest/native_exec");
+        let source_names = [
+            "private-bootstrap.c",
+            "private-control.h",
+            "private-entry.S",
+            "private-fs.S",
+            "private-kernel-state.c",
+            "private-maps.c",
+            "private-bootstrap.ld",
+            "private-runner.c",
+        ];
+        let source_files: Vec<_> = source_names
+            .iter()
+            .map(|name| {
+                let path = native_sources.join(name);
+                println!("cargo:rerun-if-changed={}", path.display());
+                qualifier::FileIdentity::read(&path).unwrap()
+            })
+            .collect();
+        let nested = out.join("native-runtime-target");
+        let build_stdout = retain(
+            &mut runner,
+            &cargo,
+            vec![
+                "build".into(),
+                "--locked".into(),
+                "--offline".into(),
+                "--manifest-path".into(),
+                text(&qualification_manifest),
+                "-p".into(),
+                "detcore-liteinst".into(),
+                "--lib".into(),
+                "--no-default-features".into(),
+                "--features".into(),
+                "exec-native-injection".into(),
+                "--profile".into(),
+                "validate".into(),
+                "--target-dir".into(),
+                text(&nested),
+                "--message-format=json-render-diagnostics".into(),
+            ],
+            root,
+        );
+        let runtime_path = native_cdylib_from_cargo_messages(
+            std::str::from_utf8(&build_stdout).unwrap(),
+            package["id"].as_str().unwrap(),
+            &package_manifest,
+        )
+        .unwrap();
+        assert!(
+            fs::canonicalize(&runtime_path)
+                .unwrap()
+                .starts_with(fs::canonicalize(&nested).unwrap())
+        );
+        sources.verify_unchanged(&mut runner).unwrap();
+        let qualification = qualifier::qualify_detcore_native_entry_with_sources(
+            &runtime_path,
+            &mut runner,
+            &sources,
+        )
+        .unwrap_or_else(|e| panic!("actual native runtime entry refused: {e}"));
+        let destination = stage_root.join(format!("native-bundle-{}-{stamp}", std::process::id()));
+        fs::create_dir(&destination).unwrap();
+        let cc = env::var("CC").unwrap_or_else(|_| "cc".into());
+        let ld = env::var("LD").unwrap_or_else(|_| "ld".into());
+        let common = [
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-fno-stack-protector",
+            "-fno-builtin",
+            "-ffreestanding",
+            "-fno-asynchronous-unwind-tables",
+            "-fcf-protection=branch",
+        ];
+        let mut objects = Vec::new();
+        for name in [
+            "private-entry.S",
+            "private-bootstrap.c",
+            "private-fs.S",
+            "private-kernel-state.c",
+            "private-maps.c",
+        ] {
+            let object = destination.join(format!("{name}.boot.o"));
+            let mut args = common.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            args.extend([
+                "-mcmodel=large".into(),
+                "-fno-pic".into(),
+                "-fno-pie".into(),
+                "-DEXEC_PRIVATE_BOOTSTRAP_IMAGE".into(),
+                "-c".into(),
+                text(&native_sources.join(name)),
+                "-o".into(),
+                text(&object),
+            ]);
+            retain(&mut runner, &cc, args, &native_sources);
+            objects.push(object);
+        }
+        let bootstrap = destination.join("private-bootstrap");
+        let mut args = vec![
+            "-T".into(),
+            text(&native_sources.join("private-bootstrap.ld")),
+            "--defsym=GATE_PAGE=0x500000000000".into(),
+            "-z".into(),
+            "noexecstack".into(),
+            "-o".into(),
+            text(&bootstrap),
+        ];
+        args.extend(objects.iter().map(|p| text(p)));
+        retain(&mut runner, &ld, args, &native_sources);
+        let runtime = destination.join("libdetcore_liteinst.so");
+        super::super::copy_into_protected_stage(&runtime_path, &runtime).unwrap();
+        let runner_file = destination.join("private-runner");
+        let mut args = common.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        args.extend(["-fPIE".into(), "-pie".into(), "-Wl,-z,now,-z,relro".into()]);
+        args.extend(
+            [
+                "private-runner.c",
+                "private-fs.S",
+                "private-kernel-state.c",
+                "private-maps.c",
+            ]
+            .iter()
+            .map(|p| text(&native_sources.join(p))),
+        );
+        args.extend([
+            format!("-L{}", destination.display()),
+            "-Wl,--no-as-needed".into(),
+            "-ldetcore_liteinst".into(),
+            "-Wl,--as-needed".into(),
+            "-o".into(),
+            text(&runner_file),
+        ]);
+        retain(&mut runner, &cc, args, &native_sources);
+        for source in &source_files {
+            source.verify().unwrap();
+        }
+        proof_source.verify().unwrap();
+        sources.verify_unchanged(&mut runner).unwrap();
+        let runtime_identity = qualifier::FileIdentity::read(&runtime).unwrap();
+        assert_eq!(runtime_identity.sha256, qualification.artifact.sha256);
+        qualification.artifact.verify().unwrap();
+        let bootstrap_identity = qualifier::FileIdentity::read(&bootstrap).unwrap();
+        let runner_identity = qualifier::FileIdentity::read(&runner_file).unwrap();
+        let source_digest = detcore_model::liteinst_native_exec_sources::digest(
+            reverie_inguest::native_exec_sources::digest(),
+        );
+        assert_ne!(source_digest, [0; 32]);
+        let gate_digest = gate_digest(&bootstrap);
+        // Join the actual compiled bootstrap page to the complete template
+        // authenticated in the actual runtime. A matching entry address alone
+        // does not bind the other bytes that runtime adoption will compare.
+        qualification
+            .generic_bootstrap
+            .fixed_native_gate
+            .as_ref()
+            .expect("native runtime lacks qualified fixed gate evidence")
+            .verify_bootstrap_page_digest(&gate_digest)
+            .unwrap_or_else(|e| panic!("native bootstrap/runtime gate pages differ: {e}"));
+        let source = format!(
+            "const NATIVE_BUNDLE: CompiledBundle = CompiledBundle {{ source_digest: {:?}, {} {} {} gate_digest: {:?} }};\n",
+            source_digest,
+            compiled_file("bootstrap", &bootstrap_identity),
+            compiled_file("runner", &runner_identity),
+            compiled_file("runtime", &runtime_identity),
+            gate_digest
+        );
+        let temporary = destination.join("native_exec_bundle.rs");
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .unwrap();
+        output.write_all(source.as_bytes()).unwrap();
+        output.sync_all().unwrap();
+        fs::rename(&temporary, stage_root.join("native_exec_bundle.rs")).unwrap();
+        // Cargo rerun triggers are dependency hints, not source authority.
+        // The host build script must watch the actual resolved native checkout
+        // as well as its local source dirs after this nested producer returns.
+        let dependencies = [
+            root.join("detcore-model/src"),
+            root.join("detcore/src"),
+            root.join("detcore-liteinst/src"),
+            root.join("Cargo.toml"),
+            root.join("Cargo.lock"),
+            rv.join("scripts/m1_artifact.rs"),
+            rv.join("reverie-inguest/src"),
+            rv.join("reverie-inguest/native_exec"),
+            rv.join("reverie-liteinst/src"),
+            rv.join("reverie-rpc-transport/src"),
+            rv.join("reverie-process/src"),
+        ];
+        let mut hints = String::new();
+        for path in &dependencies {
+            let path = text(path);
+            assert!(
+                !path.contains(['\n', '\r']),
+                "native Cargo dependency hint has line breaks"
+            );
+            println!("cargo:rerun-if-changed={path}");
+            hints.push_str(&path);
+            hints.push('\n');
+        }
+        let hints_temporary = destination.join("native_exec_rerun_paths.txt");
+        qualifier::write_new(&hints_temporary, hints.as_bytes()).unwrap();
+        fs::rename(
+            &hints_temporary,
+            stage_root.join("native_exec_rerun_paths.txt"),
+        )
+        .unwrap();
+        qualifier::write_new(&evidence.join("native-qualification.json"), &serde_json::to_vec_pretty(&serde_json::json!({
+            "source_digest": source_digest, "compiled_sources": sources.record(), "proof_source": proof_source,
+            "native_sources": source_files, "qualification": qualification,
+            "bootstrap": bootstrap_identity, "runner": runner_identity, "runtime": runtime_identity,
+            "gate_digest": gate_digest, "commands": runner.commands, "executed_tests": 0,
+        })).unwrap()).unwrap();
     }
 }

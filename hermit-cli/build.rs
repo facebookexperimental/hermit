@@ -49,4 +49,8 @@ fn main() {
     println!("cargo:rustc-env=HERMIT_REVERIE_PIN={reverie_pin}");
     println!("cargo:rerun-if-changed=../detcore/Cargo.toml");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NATIVE_EXEC");
+    if std::env::var_os("CARGO_FEATURE_NATIVE_EXEC").is_some() {
+        build_support::emit_native_exec_bundle(&reverie_pin);
+    }
 }

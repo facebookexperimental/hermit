@@ -13,7 +13,12 @@ categories = ["development-tools::debugging", "development-tools::testing"]
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
 
+[features]
+# Compiled input identity for the explicit native runtime, not launch authority.
+native-exec = ["dep:sha2"]
+
 [dependencies]
+sha2 = { version = "0.10.9", optional = true }
 anyhow = "1.0.103"
 bincode = { version = "2", features = ["serde"] }
 bitvec = { version = "1.1.1", features = ["atomic", "serde"] }
@@ -22,8 +27,8 @@ chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-fea
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7" }
-reverie-syscalls = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7" }
+reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91" }
+reverie-syscalls = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shell-words = "1.1.1"

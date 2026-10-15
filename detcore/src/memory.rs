@@ -69,6 +69,14 @@ impl MemoryMetadata {
         Self::default()
     }
 
+    /// Inspect the actual replacement model without erasing old observations.
+    pub(crate) fn is_fresh_for_native_exec(&self) -> bool {
+        self.next_anonymous_sequence == 0
+            && self.shared_mappings.is_empty()
+            && self.brk_start.is_none()
+            && self.brk_current.is_none()
+    }
+
     /// Record a program break reported by a `brk(2)` return.
     ///
     /// Both `brk(NULL)` (a query) and `brk(addr)` (a request) return the break
@@ -243,6 +251,29 @@ impl MemoryMetadata {
 #[cfg(test)]
 mod brk_tests {
     use super::*;
+
+    #[test]
+    fn native_exec_fresh_memory_requires_sequence_mappings_and_brk_to_be_empty() {
+        let owner = crate::types::DetTid::from_raw(42);
+        let mut memory = MemoryMetadata::new();
+        assert!(memory.is_fresh_for_native_exec());
+        memory.map_anonymous(MmId::initial(owner), 0x5000, 0x1000);
+        assert!(!memory.is_fresh_for_native_exec());
+        memory.unmap(0x5000, 0x1000);
+        assert!(memory.shared_mappings.is_empty());
+        assert!(
+            !memory.is_fresh_for_native_exec(),
+            "the old allocator sequence remains"
+        );
+        let mut brk = MemoryMetadata::new();
+        brk.observe_brk(0x405000);
+        assert_eq!(brk.brk_heap_range(), None);
+        assert!(
+            !brk.is_fresh_for_native_exec(),
+            "even an unexpanded old heap has observations"
+        );
+        assert!(MemoryMetadata::new().is_fresh_for_native_exec());
+    }
 
     #[test]
     fn brk_range_tracks_the_observed_program_break() {

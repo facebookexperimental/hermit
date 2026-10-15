@@ -10,6 +10,7 @@
 //! the Detcore tool.
 
 mod exec_identity;
+pub mod native_exec;
 mod parked;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -26,6 +27,7 @@ use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering::SeqCst;
@@ -1105,6 +1107,8 @@ pub struct GlobalState {
     /// Pre-exec identity and descriptor state awaiting a successful image transition.
     // TODO-HUMAN-REVIEW(PR-1173): Review SaBRe exec incarnation fencing.
     pending_exec_states: Arc<Mutex<BTreeMap<DetPid, PendingExecState>>>,
+    // Installed only by the trusted watched native launcher, never by an RPC.
+    native_exec_registry: OnceLock<Mutex<native_exec::NativeExecRegistry>>,
     /// Successful identity transfers whose RPC acknowledgment may still be in flight.
     /// Nesting either exec map with global_time requires holding sched first;
     /// the scheduler mutex serializes their inner lock orders. Process
@@ -1351,6 +1355,7 @@ impl GlobalState {
             pending_exec_states: process_exit_cleanup.pending_exec_states,
             completed_exec_transfers: process_exit_cleanup.completed_exec_transfers,
             post_exec_fd_blocking: process_exit_cleanup.post_exec_fd_blocking,
+            native_exec_registry: OnceLock::new(),
             inodes: Arc::new(Mutex::new(InodePool::new())),
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping state.
@@ -1938,6 +1943,11 @@ impl GlobalTool for GlobalState {
     }
 
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
+        // Intercept even malformed counted envelopes before taking a deadline
+        // hint. Native controls belong to the already owned exec cut.
+        if native_exec::is_native_exec_control(&gr.2) {
+            return self.dispatch_native_exec_control(from, gr);
+        }
         // The deadline hint of https://github.com/rrnewton/hermit/issues/4121
         // rides on whichever reply resumes the thread after its grant: an
         // ordinary or parked resource grant, a futex wake, a parent's
@@ -1975,6 +1985,11 @@ impl GlobalState {
         from: Tid,
         gr: <Self as GlobalTool>::Request,
     ) -> <Self as GlobalTool>::Response {
+        // This entry is also used directly. The strict native cut must precede
+        // ordinary forwarding drain/checks and all sender-clock accounting.
+        if native_exec::is_native_exec_control(&gr.2) {
+            return self.dispatch_native_exec_control(from, gr);
+        }
         // Records an in-guest Tool forwarded before sending this request are queued,
         // and the sender's are written now if it runs alone (the order rule at
         // `detlog::set_forwarded_source`).
@@ -2313,6 +2328,13 @@ impl GlobalState {
         // threads' own clock happens through shared memory.)
         #[allow(clippy::unit_arg)]
         let resp = match request {
+            GlobalRequest::PrepareNativeExec(_)
+            | GlobalRequest::SealNativeExecStats { .. }
+            | GlobalRequest::IssueNativeExec { .. }
+            | GlobalRequest::CancelNativeExec { .. }
+            | GlobalRequest::CompleteNativeExec { .. } => {
+                unreachable!("native controls handled before ordinary admission")
+            }
             GlobalRequest::ReconnectExec { .. } | GlobalRequest::RetireExec { .. } => {
                 unreachable!("exec transfer handled before ordinary admission")
             }
@@ -2549,6 +2571,18 @@ impl GlobalState {
                         reconnect_priority: None,
                     });
                     self.pending_exec_states.lock().unwrap().remove(&dtid);
+                    // Native-only lifecycle receipt: the actual same-leader
+                    // Mark edge has now installed this ticket's new mm. This
+                    // hook grants no turn and performs no clock accounting.
+                    if let Some(registry) = self.native_exec_registry.get()
+                        && registry
+                            .lock()
+                            .unwrap()
+                            .mark_past_first_exec(dtid, request_mm)
+                            .is_err()
+                    {
+                        return (None, R::ThreadExited);
+                    }
                 }
                 self.past_first_execve.store(true, SeqCst);
                 let first_image = !self.initial_descriptor_image_complete.swap(true, SeqCst);
@@ -4756,26 +4790,40 @@ pub enum GlobalRequest {
     /// `request`, sent with the number of records this guest thread produced
     /// for forwarding since its previous counted request, so the coordinator
     /// can check they all arrived (`detlog::check_forwarded_count`). Sent only
-    /// by a thread that has produced some ([`counted_request`]).
+    /// by a thread that has produced some (`counted_request`).
     WithForwardedCount(u64, Box<GlobalRequest>),
     /// Lock the resources
     /// Also contains the `DetPid` of the process containing the thread requesting resources.
     RequestResources(Resources, DetPid),
+    /// Request resources with the actual backend parked-callback capability.
     ParkedRequest(Resources, DetPid, ControlCapability),
+    /// Resume a previously parked request at its actual current callback site.
     ResumeParkedRequest {
+        /// Scheduler-issued one-use continuation ticket.
         ticket: ResumeTicket,
+        /// Actual callback site supplied by the backend on resumption.
         current_site: reverie::CallbackSignalSite,
     },
+    /// Finish the observation belonging to one scheduler-owned parked wait.
     FinishParkedObservation {
+        /// Actual pending wait identity.
         wait: ContinuationId,
+        /// Backend observation lease belonging to that wait.
         lease: reverie::ParkedObservationLease,
+        /// Actual callback site at the observation boundary.
         site: reverie::CallbackSignalSite,
+        /// Result of the observation, including an explicit failure.
         finish: ObservationFinish,
     },
+    /// Report a terminal violation of the parked continuation protocol.
     ParkedProtocolFailure(ProtocolFailure),
+    /// Report an actual signal removed from this process's pending set.
     SignalDequeued {
+        /// Deterministic process whose signal was dequeued.
         detpid: DetPid,
+        /// Backend identity of the actual signal task.
         identity: reverie::SignalTaskIdentity,
+        /// Exact signal dequeue observation.
         dequeue: reverie::SignalDequeue,
     },
     /// Release the locks
@@ -4798,7 +4846,9 @@ pub enum GlobalRequest {
 
     /// Authenticate the preserved exec caller taking over its process leader's TID.
     ReconnectExec {
+        /// Preserved caller before the kernel leader-identity transition.
         former: DetTid,
+        /// Continuing process leader identity.
         process: DetPid,
     },
     /// Acquire the replacement's first turn without newborn state initialization.
@@ -4807,7 +4857,9 @@ pub enum GlobalRequest {
     /// rebinding. The Tool copies `signaled` from the backend's exit status;
     /// ordinary exit requires a separately recorded backend failure.
     RetireExec {
+        /// Final transferred thread state and accounting.
         thread: ThreadDeregistration,
+        /// Whether the backend observed signal termination.
         signaled: bool,
     },
 
@@ -4997,10 +5049,10 @@ pub enum GlobalRequest {
     /// one: a process-group kill (`Some(group)`), or a pidfd whose process
     /// Detcore did not record (`None`).
     NotifyUnresolvedSigkill(Option<DetPid>),
-    /// Liveness of one tid, leader or not; see [`thread_is_live`].
+    /// Liveness of one tid, leader or not; see `thread_is_live`.
     ThreadIsLive(DetTid),
     /// The pending real-time timer expirations of a process; see
-    /// [`pending_real_time_expirations`].
+    /// `pending_real_time_expirations`.
     PendingRealTimeExpirations(DetPid),
     /// Discard pending real-time timer expirations of a process (a kernel
     /// sigset) whose disposition became `SIG_IGN`.
@@ -5016,13 +5068,13 @@ pub enum GlobalRequest {
     /// The container is shutting down.  Exit the scheduler "thread".
     UnrecoverableShutdown,
 
-    // Request a port for an open file description.
+    /// Request a port for an open file description.
     RequestPort(OpenFileId),
 
-    // Add a port to the used-port list for an open file description.
+    /// Add a port to the used-port list for an open file description.
     AddUsedPort(u16, OpenFileId),
 
-    // Release the port when the last alias of its open file description closes.
+    /// Release the port when the last alias of its open file description closes.
     ReleasePort(OpenFileId),
 
     /// Deliver robust-futex wakes collected before exit after the backend has
@@ -5038,8 +5090,11 @@ pub enum GlobalRequest {
     /// the end, so that adding it left every earlier variant's encoded tag
     /// unchanged.
     RecordHostInput {
+        /// Guest pathname observed by the original syscall.
         path: String,
+        /// Number of the syscall that observed the input.
         syscall: u64,
+        /// Captured actual host file identity.
         identity: HostFileIdentity,
     },
 
@@ -5049,14 +5104,15 @@ pub enum GlobalRequest {
     /// [`Self::RecordHostInput`]. Appended at the end, so that adding it left
     /// every earlier variant's encoded tag unchanged.
     RecordHostMutation {
+        /// Guest pathname whose namespace binding changed.
         path: String,
     },
     /// This thread armed, in its turn, a host-timed source of these signals;
-    /// see [`record_host_timed_signals`]. Appended after `RecordHostMutation`,
+    /// see `record_host_timed_signals`. Appended after `RecordHostMutation`,
     /// so that adding it left every earlier variant's encoded tag unchanged.
     RecordHostTimedSignals(DetTid, HostTimedSignalScope, u64),
     /// The signals no gated wait of this thread ends for; see
-    /// [`host_timed_signals`]. Appended after `RecordHostTimedSignals`, for the
+    /// `host_timed_signals`. Appended after `RecordHostTimedSignals`, for the
     /// same reason.
     HostTimedSignals(DetTid),
     /// A control message about a shared open file description, answered
@@ -5065,7 +5121,7 @@ pub enum GlobalRequest {
     /// same reason.
     SharedOpenFile(OpenFileControl),
     /// A SIGALRM ledger control message, answered before any clock or
-    /// scheduler accounting (see [`sigalrm_refuses`]). Appended after
+    /// scheduler accounting (see `sigalrm_refuses`). Appended after
     /// `SharedOpenFile`, for the same reason.
     Sigalrm(SigalrmControl),
     /// A child-exit `SIGCHLD` control message
@@ -5152,6 +5208,35 @@ pub enum GlobalRequest {
     /// signal that Detcore sends itself (`parent_death_signal`). Appended
     /// after `ProcfsListing`, for the same reason.
     ParentDeathSignal(Option<i32>),
+
+    /// Neutral controls appended without changing any existing wire tag.
+    PrepareNativeExec(native_exec::PrepareNativeExec),
+    /// Seal the exact versioned runtime bytes before one-use descriptor provision.
+    SealNativeExecStats {
+        /// Retained prepared transaction ticket.
+        ticket: native_exec::ExecTicket,
+        /// SHA-256 of the exact runtime envelope bytes.
+        runtime_digest: [u8; 32],
+        /// Bounded actual runtime envelope, not host-decoded Tool state.
+        runtime: Vec<u8>,
+    },
+    /// Last old-image control after the sealed empty forwarding cut.
+    IssueNativeExec {
+        /// Successfully provisioned retained transaction ticket.
+        ticket: native_exec::ExecTicket,
+        /// Independently computed composite Tool/runtime digest.
+        state_digest: [u8; 32],
+    },
+    /// Invalidate a pre-redemption ticket; ordinary CancelExec still follows.
+    CancelNativeExec {
+        /// Prepared or Issued ticket whose physical exec did not succeed.
+        ticket: native_exec::ExecTicket,
+    },
+    /// Acknowledge the real new-mm lifecycle after MarkPastFirstExecve.
+    CompleteNativeExec {
+        /// Consumed successor ticket after real lifecycle and frontend checks.
+        ticket: native_exec::ExecTicket,
+    },
 }
 
 /// Responses from the global object
@@ -5164,7 +5249,7 @@ pub enum GlobalResponse {
     /// A reply, with the virtual time that remained before the earliest
     /// pending deadline when the thread was granted the turn it resumes, or
     /// armed a timer (`Scheduler::deadline_remaining_from`). Unwrapped by
-    /// [`send_and_update_time`], which caps the thread's slice there.
+    /// `send_and_update_time`, which caps the thread's slice there.
     WithDeadline(Duration, Box<GlobalResponse>),
     RequestResources(ResumeStatus),
     ParkedRequest(ResourceReply),
@@ -5306,6 +5391,13 @@ pub enum GlobalResponse {
     ProcfsListing(crate::procfs::listing::ListingFacts),
     /// Appended after `ProcfsListing`, for the same reason.
     ParentDeathSignal(i32),
+
+    /// Exact native responses, appended without changing existing wire tags.
+    PrepareNativeExec(Result<native_exec::ExecTicket, native_exec::ExecControlError>),
+    SealNativeExecStats(Result<[u8; 32], native_exec::ExecControlError>),
+    IssueNativeExec(Result<(), native_exec::ExecControlError>),
+    CancelNativeExec(Result<(), native_exec::ExecControlError>),
+    CompleteNativeExec(Result<(), native_exec::ExecControlError>),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
