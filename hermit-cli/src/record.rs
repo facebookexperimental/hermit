@@ -98,6 +98,7 @@ impl Record {
         config.mount_id_assignment_order = metadata.mount_id_assignment_order.clone();
         config.proc_level = metadata.proc_level.unwrap_or_default();
 
+        crate::cpu_profile_admission::refuse_unadmitted_launch(&config, true)?;
         let tracer = reverie_ptrace::TracerBuilder::<RecordTool>::new(command)
             .config(config)
             .spawn()

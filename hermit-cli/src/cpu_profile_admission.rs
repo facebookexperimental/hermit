@@ -377,23 +377,55 @@ fn admit_with(
     qualify: impl FnOnce() -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal>,
 ) -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal> {
     check_request(request)?;
-    let admitted = match ADMITTED.get() {
-        Some(admitted) => admitted.clone(),
-        None => {
-            let qualified = qualify()?;
-            ADMITTED.get_or_init(|| qualified).clone()
-        }
-    };
-    // Detcore refuses a v3 guest whose host facts this process did not admit.
-    detcore::admit_cpu_profile_host(&admitted.1);
+    if let Some(admitted) = ADMITTED.get() {
+        return Ok(admitted.clone());
+    }
+    let qualified = qualify()?;
     // The qualification covers the XSTATE_BV a guest's own instructions
     // produce. A tracer write of its floating-point registers (PTRACE_SETFPREGS
     // or PTRACE_SETREGSET NT_X86_XSTATE) sets that header from the tracer's
     // buffer instead, which nothing checked, so it fails with EPERM. The flag
     // is process-wide and set before the container child is forked, so the
-    // tracer inherits it.
+    // tracer inherits it. It is set before the admission becomes visible in
+    // [`ADMITTED`], so an admitted launch always runs with it.
     safeptrace::forbid_fpu_register_writes();
-    Ok(admitted)
+    Ok(ADMITTED.get_or_init(|| qualified).clone())
+}
+
+/// Refuses a launch of an x86-64-v3 configuration that this process's
+/// admission did not produce. Hermit's launch functions call this before any
+/// backend starts, so a library caller cannot run a v3 guest on host facts of
+/// its own, on another backend, or without the floating-point register write
+/// ban: the facts must be exactly the ones [`admit`] bound after the host
+/// qualified, and [`admit`] is the only way to bind them.
+pub fn refuse_unadmitted_launch(
+    config: &detcore::Config,
+    ptrace: bool,
+) -> Result<(), CpuProfileRefusal> {
+    if config.cpu_profile.is_default() {
+        return Ok(());
+    }
+    let refuse = |why: &str| Err(CpuProfileRefusal(why.to_owned()));
+    if !ptrace {
+        return refuse("only the ptrace backend is qualified");
+    }
+    if !config.virtualize_cpuid || config.gdbserver {
+        return refuse("the launch does not virtualize CPUID, or serves a gdbserver");
+    }
+    match (&config.cpu_profile_host, ADMITTED.get()) {
+        (None, _) => return refuse("the configuration carries no qualified host facts"),
+        (Some(_), None) => return refuse("this process did not qualify the host"),
+        (Some(facts), Some((_, admitted))) if facts != admitted => {
+            return refuse(
+                "the configuration's host facts are not the ones this process qualified",
+            );
+        }
+        _ => {}
+    }
+    if !safeptrace::fpu_register_writes_forbidden() {
+        return refuse("ptrace floating-point register writes are not forbidden");
+    }
+    Ok(())
 }
 
 /// The host half of [`admit`], run once per process: the kernel, the
@@ -498,16 +530,44 @@ mod tests {
         assert!(check_request(&r).unwrap_err().contains("--namespace-only"));
     }
 
-    /// An admitted v3 run refuses ptrace floating-point register writes, and
-    /// a refused request neither probes the host nor forbids them. No other
-    /// test admits, so the process-wide flag starts clear.
+    /// The launch certificate, in one process (no other test admits): a v3
+    /// configuration with facts but no admission is refused; a refused
+    /// request neither probes nor forbids floating-point writes; an admission
+    /// forbids them before it is visible, and then exactly the admitted facts
+    /// launch, on ptrace only.
     #[test]
-    fn admission_forbids_floating_point_register_writes() {
+    fn only_the_admitted_facts_launch_and_the_write_ban_comes_first() {
+        let host = HostXstate {
+            vendor: [1, 2, 3],
+            signature: 0x00b1_0f11,
+            xcr0: 0x2e7,
+            xsave_leaves: vec![[0, 0x2e7, 0x988, 0x988, 0]],
+            xcomp_supp: 0x2e7,
+            xcomp_perm: 0x2e7,
+            xcomp_guest_perm: 0x2e7,
+            xfeature_max: 20,
+            probe_cases: 33,
+            probe_forced_exit: false,
+        };
+        let mut config = detcore::Config {
+            cpu_profile: detcore_model::cpu_profile::CpuProfile::X86_64V3,
+            cpu_profile_host: Some(host.clone()),
+            ..Default::default()
+        };
+        let unadmitted = refuse_unadmitted_launch(&config, true).unwrap_err();
+        assert!(unadmitted.0.contains("did not qualify"), "{unadmitted}");
+        assert_eq!(
+            refuse_unadmitted_launch(&detcore::Config::default(), false),
+            Ok(())
+        );
+
         let refused = admit_with(&request("kvm"), || {
             panic!("a refused request probed the host")
         });
         assert!(refused.is_err());
         assert!(!safeptrace::fpu_register_writes_forbidden());
+        assert!(ADMITTED.get().is_none());
+
         let report = xstate_probe::ProbeReport {
             cpu: 3,
             xcr0: 0x2e7,
@@ -524,21 +584,25 @@ mod tests {
             retried_exits: 0,
             counter_reopens: 0,
         };
-        let host = HostXstate {
-            vendor: [1, 2, 3],
-            signature: 0x00b1_0f11,
-            xcr0: 0x2e7,
-            xsave_leaves: vec![[0, 0x2e7, 0x988, 0x988, 0]],
-            xcomp_supp: 0x2e7,
-            xcomp_perm: 0x2e7,
-            xcomp_guest_perm: 0x2e7,
-            xfeature_max: 20,
-            probe_cases: 33,
-            probe_forced_exit: false,
-        };
-        let admitted = admit_with(&request("ptrace"), || Ok((report.clone(), host.clone())));
-        assert_eq!(admitted, Ok((report, host)));
+        let admitted = admit_with(&request("ptrace"), || {
+            // The ban is not yet in force while the host qualifies.
+            assert!(!safeptrace::fpu_register_writes_forbidden());
+            Ok((report.clone(), host.clone()))
+        });
+        assert_eq!(admitted, Ok((report, host.clone())));
         assert!(safeptrace::fpu_register_writes_forbidden());
+        assert_eq!(refuse_unadmitted_launch(&config, true), Ok(()));
+        assert!(refuse_unadmitted_launch(&config, false).is_err());
+        let mut other = host;
+        other.probe_cases = 0;
+        config.cpu_profile_host = Some(other);
+        let forged = refuse_unadmitted_launch(&config, true).unwrap_err();
+        assert!(
+            forged.0.contains("not the ones this process qualified"),
+            "{forged}"
+        );
+        config.cpu_profile_host = None;
+        assert!(refuse_unadmitted_launch(&config, true).is_err());
     }
 
     #[test]

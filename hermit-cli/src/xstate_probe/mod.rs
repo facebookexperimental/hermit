@@ -1368,10 +1368,56 @@ mod tests {
         assert!(pkru_usable(0x207, false).is_err());
     }
 
+    /// Clean spins sum their counts, and the outside share is weighted by each
+    /// spin's interrupts, not averaged per spin.
+    #[test]
+    fn calibration_spins_are_summed_with_interrupt_weighted_outside_time() {
+        let mut sum = CalibrationSum::default();
+        assert_eq!(sum.outside(), 0.0);
+        let kernel = |local_timer, total| irq_counter::CpuInterrupts { local_timer, total };
+        sum.add(60, kernel(64, 70), 0.1);
+        sum.add(130, kernel(132, 140), 0.0);
+        assert_eq!(sum.counter, 190);
+        assert_eq!(sum.kernel.local_timer, 196);
+        assert_eq!(sum.kernel.total, 210);
+        // 7 of 210 interrupts fell outside: 1/30, where a per-spin mean would
+        // give 1/20.
+        assert!(
+            (sum.outside() - 7.0 / 210.0).abs() < 1e-12,
+            "{}",
+            sum.outside()
+        );
+    }
+
+    /// RDPKRU. Safety: CR4.PKE must be set (CPUID.7.0:ECX.OSPKE).
+    unsafe fn rdpkru() -> u32 {
+        let pkru: u32;
+        // SAFETY: the caller checked OSPKE; RDPKRU reads PKRU into EAX and
+        // zeroes EDX.
+        unsafe {
+            std::arch::asm!("rdpkru", in("ecx") 0, out("eax") pkru, out("edx") _,
+                options(nomem, nostack, preserves_flags));
+        }
+        pkru
+    }
+
+    /// WRPKRU. Safety: CR4.PKE must be set, and `pkru` must leave key 0
+    /// accessible.
+    unsafe fn wrpkru(pkru: u32) {
+        // SAFETY: the caller checked OSPKE and the value.
+        unsafe {
+            std::arch::asm!("wrpkru", in("eax") pkru, in("ecx") 0, in("edx") 0,
+                options(nostack, preserves_flags));
+        }
+    }
+
     /// The arm's PKRU guards in the assembly, both ways: with the flag clear it
     /// runs neither RDPKRU nor WRPKRU (and reports PKRU 0), which is how a host
     /// without protection keys runs the subset cases; with it set (where this
     /// host has OSPKE) it sets the probe's PKRU and restores the caller's.
+    /// Where this host has OSPKE the caller's PKRU is a distinctive value, so an
+    /// unguarded WRPKRU with the flag clear, or a missing restore with it set,
+    /// leaves the caller's PKRU changed.
     #[test]
     fn an_arm_runs_with_and_without_pkru_instructions() {
         if std::arch::x86_64::__cpuid(1).ecx & (1 << 27) == 0 {
@@ -1412,9 +1458,24 @@ mod tests {
                 saved_pkru: 0,
                 saved_mxcsr: 0,
             };
+            // Keys 0 and 1 stay fully accessible, so this thread's memory, all
+            // of it under key 0, stays usable whatever the arm does.
+            const CALLER_PKRU: u32 = 0x5555_5550;
+            let original = ospke.then(|| {
+                // SAFETY: OSPKE is set, so RDPKRU and WRPKRU are enabled.
+                let original = unsafe { rdpkru() };
+                unsafe { wrpkru(CALLER_PKRU) };
+                original
+            });
             // SAFETY: the context and its buffers outlive the call; Reference
             // mode uses no descriptor.
             let status = unsafe { asm::hermit_xinuse_arm(&mut ctx) };
+            if let Some(original) = original {
+                // SAFETY: as above.
+                let after = unsafe { rdpkru() };
+                unsafe { wrpkru(original) };
+                assert_eq!(after, CALLER_PKRU, "pkru {pkru}: the caller's PKRU changed");
+            }
             assert_eq!(
                 ArmStatus::from_raw(status),
                 Some(ArmStatus::Ok),

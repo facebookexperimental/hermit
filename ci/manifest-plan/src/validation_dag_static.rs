@@ -1525,7 +1525,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the_probe_takes_the_lowest_idle_cpu_and_otherwise_the_idlest: 1070.
     // And the review fixes' unit tests (calibration floor, counter flags, peer
     // start and reply, PKRU guards, AMX refusal; https://github.com/rrnewton/hermit/issues/4243): 1077, listed.
-    ("test.hermit_unit", 1077),
+    // The floating-point write admission test became the launch-certificate
+    // test, and the calibration-sum test was added: 1078, listed.
+    ("test.hermit_unit", 1078),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2221,7 +2223,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 927aa185: 1645.
     // And the three x86-64-v3 table tests in cpuid.rs
     // (https://github.com/rrnewton/hermit/issues/4243): 1648, listed.
-    // And a_v3_configuration_runs_only_with_the_admitted_host_facts: 1649.
+    // And a_v3_configuration_runs_only_with_the_admitted_host_facts, renamed
+    // a_v3_configuration_without_host_facts_is_refused: 1649.
     ("test.detcore_unit", 1649),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
@@ -3934,7 +3937,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the floating-point write admission test: 1069.
     // And the probe-CPU choice test: 1070.
     // And the seven review-fix unit tests: 1077.
-    ("test.hermit_unit_on_host", 1077),
+    // And the calibration-sum test: 1078.
+    ("test.hermit_unit_on_host", 1078),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

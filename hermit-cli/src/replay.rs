@@ -176,6 +176,7 @@ impl Replay {
 
         command.chroot(chroot.path());
 
+        crate::cpu_profile_admission::refuse_unadmitted_launch(&config, true)?;
         let mut builder = reverie_ptrace::TracerBuilder::<ReplayTool>::new(command).config(config);
         if let Some(port) = gdbserver {
             builder = builder.gdbserver(port);

@@ -29922,60 +29922,37 @@ fn cpu_profile_v3_refuses_backends_and_flags_it_cannot_qualify() {
 }
 
 /// A library caller cannot run a v3 guest by supplying host facts of its own:
-/// this process never ran the qualification, so Detcore refuses the guest by
-/// name with the policy-refusal status before its first instruction, whatever
-/// the facts say. (`hermit run` qualifies first; the library does not.) The
-/// refusal ends the whole process, as the library's tracer runs in it, so the
-/// library call runs in a child of this test.
+/// this process never ran the qualification, so the library's launch refuses
+/// by name before any backend starts, whatever the facts say. (`hermit run`
+/// qualifies first; the library does not.)
 #[test]
 fn cpu_profile_v3_library_run_with_unqualified_facts_is_refused() {
-    const CHILD: &str = "HERMIT_TEST_V3_LIBRARY_CHILD";
+    let facts = detcore_model::cpu_profile::HostXstate {
+        vendor: [0x756e_6547, 0x4965_6e69, 0x6c65_746e],
+        signature: 0x0009_06ea,
+        xcr0: 0x2e7,
+        xsave_leaves: vec![[0, 0x2e7, 0x988, 0x988, 0]],
+        xcomp_supp: 0x2e7,
+        xcomp_perm: 0x2e7,
+        xcomp_guest_perm: 0x2e7,
+        xfeature_max: 20,
+        probe_cases: 0,
+        probe_forced_exit: false,
+    };
+    let config = hermit::DetConfig {
+        cpu_profile: detcore_model::cpu_profile::CpuProfile::X86_64V3,
+        cpu_profile_host: Some(facts),
+        max_timeslice: None,
+        ..Default::default()
+    };
     let guest = cpuid_profile_v3_guest();
-    if std::env::var_os(CHILD).is_some() {
-        let facts = detcore_model::cpu_profile::HostXstate {
-            vendor: [0x756e_6547, 0x4965_6e69, 0x6c65_746e],
-            signature: 0x0009_06ea,
-            xcr0: 0x2e7,
-            xsave_leaves: vec![[0, 0x2e7, 0x988, 0x988, 0]],
-            xcomp_supp: 0x2e7,
-            xcomp_perm: 0x2e7,
-            xcomp_guest_perm: 0x2e7,
-            xfeature_max: 20,
-            probe_cases: 0,
-            probe_forced_exit: false,
-        };
-        let config = hermit::DetConfig {
-            cpu_profile: detcore_model::cpu_profile::CpuProfile::X86_64V3,
-            cpu_profile_host: Some(facts),
-            max_timeslice: None,
-            ..Default::default()
-        };
-        let output =
-            hermit::run_with_output(reverie::process::Command::new(guest), config, false, &None);
-        panic!("the library run returned instead of refusing: {output:?}");
-    }
-    let child = Command::new(std::env::current_exe().expect("find the test binary"))
-        .args([
-            "--exact",
-            "cpu_profile_v3_library_run_with_unqualified_facts_is_refused",
-            "--nocapture",
-        ])
-        .env(CHILD, "1")
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run the library child");
-    let stdout = String::from_utf8_lossy(&child.stdout);
-    let stderr = String::from_utf8_lossy(&child.stderr);
+    let refusal =
+        hermit::run_with_output(reverie::process::Command::new(guest), config, false, &None)
+            .expect_err("the library ran a v3 guest on facts it never qualified");
     assert_eq!(
-        child.status.code(),
-        Some(HERMIT_POLICY_REFUSAL_EXIT),
-        "stdout:\n{stdout}\nstderr:\n{stderr}"
+        format!("{refusal:#}"),
+        "--cpu-profile x86-64-v3 refused: this process did not qualify the host"
     );
-    assert!(
-        stderr.contains("--cpu-profile x86-64-v3 refused:"),
-        "stderr:\n{stderr}"
-    );
-    assert!(!stdout.contains("xcomp"), "the guest ran:\n{stdout}");
 }
 
 /// Under `--cpu-profile x86-64-v3` the guest sees the v3 CPU: every v3 feature
