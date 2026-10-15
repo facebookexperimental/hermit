@@ -9009,6 +9009,13 @@
           "category": "c-programs",
           "test": "c-programs/sigpipe-siginfo",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigpipe-siginfo",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -34560,6 +34567,13 @@
           "category": "c-programs",
           "test": "c-programs/sigpipe-siginfo",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigpipe-siginfo",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -54597,6 +54611,13 @@
           "test": "c-programs/signalfd-create",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigpipe-siginfo",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
