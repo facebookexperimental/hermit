@@ -2943,6 +2943,11 @@ async fn run_kvm(
             &cwd,
         )
         .map_err(|error| anyhow!("failed to load KVM guest executable {program:?}: {error}"))?;
+    // The loader has copied the image's segments into guest memory, so the
+    // file's bytes are no longer needed. Holding them until the run ends kept
+    // a second copy of the program in host memory for the whole run: 75 MB
+    // for node (https://github.com/rrnewton/reverie/issues/1063).
+    drop(image);
     backend
         .set_random_seed(random_seed)
         .map_err(|error| anyhow!("failed to configure KVM guest random seed: {error}"))?;
