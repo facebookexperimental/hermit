@@ -318,6 +318,33 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "run_liteinst_finds_the_runtime_staged_as_an_installed_resource",
 ];
 
+/// rr suite cases the GitHub-hosted portable profile excludes by exact name.
+///
+/// This rr program makes progress only when Hermit preempts a spinning
+/// thread, which needs the PMU timer. GitHub-hosted runners have no PMU, so
+/// hermit continues with `--max-timeslice=disabled`. Measured 2026-10-15 on
+/// the validation host: with the timer disabled it times out at the suite's
+/// 120 s cap, and every other running rr case passes as with the timer
+/// (rr_spinlock_priorities also times out, and is `#[ignore]`d for the
+/// per-test CPU budget). The local `test.rr_suite_contract` keeps running it
+/// in the pinned root. Only its hosted twin excludes it, with one exact-name
+/// filterset, as `test.cli_on_host` does for
+/// [`HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS`].
+pub const HOSTED_PORTABLE_PMU_TIMER_RR_TESTS: &[&str] = &["rr_no_mask_timeslice"];
+
+/// The exact-name filterset that keeps `names` out of a hosted twin.
+fn hosted_exclusion_filterset(names: &[&str]) -> String {
+    let exclusions = names
+        .iter()
+        .map(|name| format!("test(={name})"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!(" -E 'not ({exclusions})'")
+}
+
+/// Where the hosted rr twin's filterset goes: right after its one binary.
+const RR_SUITE_SELECTION: &str = "--test rr_suite -j 1";
+
 fn hosted_portable_excludes(cell: &DagManifest) -> bool {
     cell.backend
         .as_deref()
@@ -1402,6 +1429,21 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     for step in &mut cfg.steps {
         if split.contains(&step.tag()) {
             let mut hosted = step.clone();
+            if hosted.tag() == "test.rr_suite_contract" {
+                if hosted.cmd.matches(RR_SUITE_SELECTION).count() != 1 {
+                    return Err(format!(
+                        "test.rr_suite_contract must select `{RR_SUITE_SELECTION}` once"
+                    ));
+                }
+                hosted.cmd = hosted.cmd.replacen(
+                    RR_SUITE_SELECTION,
+                    &format!(
+                        "--test rr_suite{} -j 1",
+                        hosted_exclusion_filterset(HOSTED_PORTABLE_PMU_TIMER_RR_TESTS)
+                    ),
+                    1,
+                );
+            }
             hosted.job.push_str(HOSTED_VARIANT_SUFFIX);
             hosted.labels = vec![HOSTED_PORTABLE_LABEL.into()];
             hosted.fail_fast_family = Some(hosted.tag());
@@ -6485,13 +6527,34 @@ sys.exit(37)
                         );
                     }
                 }
-                let exclusions = HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS
-                    .iter()
-                    .map(|name| format!("test(={name})"))
-                    .collect::<Vec<_>>()
-                    .join(" | ");
                 assert_eq!(local_payload.matches(" -- ").count(), 1);
-                local_payload.replacen(" -- ", &format!(" -E 'not ({exclusions})' -- "), 1)
+                local_payload.replacen(
+                    " -- ",
+                    &format!(
+                        "{} -- ",
+                        hosted_exclusion_filterset(HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS)
+                    ),
+                    1,
+                )
+            } else if local_tag == "test.rr_suite_contract" {
+                // The hosted twin excludes exactly the PMU-timer rr cases,
+                // which the local selection must keep running.
+                assert!(!local_payload.contains(" -E "));
+                for name in HOSTED_PORTABLE_PMU_TIMER_RR_TESTS {
+                    assert!(
+                        !local_payload.contains(name),
+                        "test.rr_suite_contract must keep running {name}"
+                    );
+                }
+                assert_eq!(local_payload.matches(RR_SUITE_SELECTION).count(), 1);
+                local_payload.replacen(
+                    RR_SUITE_SELECTION,
+                    &format!(
+                        "--test rr_suite{} -j 1",
+                        hosted_exclusion_filterset(HOSTED_PORTABLE_PMU_TIMER_RR_TESTS)
+                    ),
+                    1,
+                )
             } else {
                 local_payload
             };
@@ -6524,10 +6587,10 @@ sys.exit(37)
             // excludes at most one test, so the hosted twin executes exactly
             // that many fewer only if every listed name exists and nothing
             // else is excluded.
-            let hosted_only_skips = if local_tag == "test.cli" {
-                HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS.len()
-            } else {
-                0
+            let hosted_only_skips = match local_tag.as_str() {
+                "test.cli" => HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS.len(),
+                "test.rr_suite_contract" => HOSTED_PORTABLE_PMU_TIMER_RR_TESTS.len(),
+                _ => 0,
             };
             let count =
                 |step: &Step| -> usize { step.env["NEXTEST_EXPECTED_EXECUTED"].parse().unwrap() };

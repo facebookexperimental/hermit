@@ -29,38 +29,55 @@ This mirrors the fbsource `RR_TEST_TARGETS` set defined in
 
 ## Running
 
-The programs are ptrace-heavy and depend on PMU branch counters plus working
-user/mount namespaces, so they are `#[ignore]`d by default (like the other Hermit
-integration suites) and run explicitly:
+Validation runs every case that is not `#[ignore]`d, in the pinned root:
+`test.rr_suite_contract` runs 191 rr programs plus the scratch-directory
+contract test, serially (233 s of wall time measured 2026-10-15). Its GitHub
+hosted twin leaves out `rr_no_mask_timeslice` by exact name. That program
+needs the PMU preemption timer, and hosted runners have no PMU. The programs
+are ptrace-heavy and need PMU branch counters plus working user and mount
+namespaces, so run them on such a host:
 
 ```sh
-cargo test -p hermit --test rr_suite -- --ignored          # all
-cargo test -p hermit --test rr_suite -- --ignored rr_hello # one
+cargo test -p hermit --test rr_suite              # every enabled case
+cargo test -p hermit --test rr_suite rr_hello     # one
+cargo test -p hermit --test rr_suite -- --ignored # only the known failures
 ```
-
-`scripts/validate.rs` runs the full suite as its "rr syscall suite" check.
 
 ## Coverage
 
 Starting from the fbsource `RR_TEST_TARGETS` minus the tests fbsource already
-disables under Hermit (its `wrap_test_suite(exclude=[...])` list), **218** rr
-programs build against this checkout, and the harness enables the **217** that
-pass when each program receives a fresh scratch directory.
-`rr_rusage`, `rr_sigchld_interrupt_signal`,
-`rr_sigprocmask_in_syscallbuf_sighandler` and `rr_spinlock_priorities` were
-enabled on 2026-10-13, after they passed 3 of 3 runs each (`rr_rusage` 2 of 2)
-at main `d851dee4`. Each run is
-wrapped in `timeout(1)` (`120s`) with a `10s` TERM-to-KILL grace period so any
-future hang fails that test cleanly rather than blocking the serialized suite.
-Special cases carried over from fbsource:
+disables under Hermit (its `wrap_test_suite(exclude=[...])` list), **217** rr
+programs build against this checkout and have an `rr_test!` case. **191** run in
+validation. Measured 2026-10-15 at main ec49cdd7, 25 of the 217 had stopped
+passing while every case was `#[ignore]`d and no validation node ran them.
+Each now carries an `#[ignore = "..."]` naming its reason
+(https://github.com/rrnewton/hermit/issues/4257):
+
+- 19 are refusals by design that an E2E cell or Detcore policy already covers:
+  - `keyctl`;
+  - 8 `seccomp_*` cases that need `prctl(PR_SET_NO_NEW_PRIVS)`, and
+    `seccomp_desched`;
+  - `shm` and `shm_unmap`;
+  - `splice` and `vm_readv_writev`;
+  - `prctl_speculation_ctrl`, `rlimit`, `quotactl`, `setgroups` and `setuid`.
+- 6 are gaps:
+  - `fatal_init_signal` and `unexpected_exit_pid_ns`;
+  - `numa`;
+  - `sched_yield_to_lower_priority`;
+  - `intr_ppoll` and `multiple_pending_signals` (both refused with exit 122).
+- `spinlock_priorities` passes, in 43 s on a developer host, but spins past
+  validation's 22 CPU-second per-test budget.
+
+Each run is wrapped in `timeout(1)` (`120s`) with a `10s` TERM-to-KILL grace
+period, so any future hang fails that test cleanly rather than blocking the
+serialized suite. Special cases carried over from fbsource:
 
 - `rr_args` runs with `-no --force-syscall-buffer=foo -c 1000 hello` (exit 0).
 - `rr_pause` expects exit code 1 and must print its final `EXIT-SUCCESS` marker.
 
-## Known failures (not yet enabled) — bugs to file
+## Programs with no case
 
-These upstream rr programs build but do **not** pass under `hermit run` today.
-They are excluded from the harness and tracked here:
+These upstream rr programs build but have no `rr_test!` case:
 
 | rr test | symptom | likely Hermit gap |
 | --- | --- | --- |

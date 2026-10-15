@@ -3203,7 +3203,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
     ("test.ignored_syscall_regressions", 4),
-    ("test.rr_suite_contract", 1),
+    // Every rr program that is not #[ignore]d (191, measured 2026-10-15; the
+    // 26 ignored ones name a refusal by design, a gap, or the per-test CPU
+    // budget, https://github.com/rrnewton/hermit/issues/4257) plus the
+    // scratch contract: 192, listed.
+    ("test.rr_suite_contract", 192),
     ("privileged-test.pmu_buck_chaos_cases", 6),
     // PMU-subject cases moved out of test.hermit_unit and test.cli so the
     // hosted lane, which has no PMU, does not select them (see
@@ -4124,7 +4128,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the CpuProfile name test: 1099.
     // And the cpu_profile legacy-form test: 1100.
     ("test.regular_crates_on_host", 1100),
-    ("test.rr_suite_contract_on_host", 1),
+    // The local 192 less the PMU-timer case the hosted twin excludes by name
+    // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
+    ("test.rr_suite_contract_on_host", 191),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
     // And the same target-scoped DETLOG forwarding test (13), and the same
@@ -7289,14 +7295,14 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
     StaticStepSpec {
         group: r########"test"########,
         job: r########"rr_suite_contract"########,
-        desc: r########"rr suite source contract (scratch dirs fresh and cleaned)"########,
-        description: r########"MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which capped the OTHER compile-bearing nodes but MISSED this one): pinned_jobs=8 via the scheduler-controlled CARGO_BUILD_JOBS channel (was unset -> the test binary's build phase defaulted to nproc, and under the full portable profile that cc1plus fan-out blew the old 2.0GiB cap -> OOM; the job-pin is the actual fix). rss_baseline=measured_peak@j8=3.5GiB; method=cgroup-RECORDED (dagrun step_profiles peak_bytes == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@b384187e. CAVEAT: peak_bytes is cap-influenced because compile page-cache is reclaimable (a negative-control run at a 512MiB cap PASSED via reclaim, oom_kills=0) -> the true non-reclaimable working set at j8 is well under this figure; the cap is conservative headroom, the pin is the fix. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.0GiB (was 2.0GiB, which was too tight once the node was left unpinned). classification light->cpu-bound (compile-bearing). CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 is delivered through the CARGO_BUILD_JOBS jobs_env channel. See doc.rustdoc for the shared derivation; jobs_flag is empty because appending '-j 8' here would land after '--' and reach libtest, which rejects it."########,
+        desc: r########"rr syscall test programs under hermit run, plus the scratch-directory contract"########,
+        description: r########"RR SUITE 2026-10-15 (https://github.com/rrnewton/hermit/issues/4257): runs every case of hermit-cli/tests/rr_suite.rs that is not #[ignore]d, not only the scratch-directory contract: 191 of the 217 cases for the upstream rr src/test programs that the fbsource RR_TEST_TARGETS set wraps, compiled from the pinned third-party/rr submodule and run as `hermit run --base-env=minimal --max-timeslice=80000000`, each asserting its expected exit status, plus rr_scratch_directories_are_fresh_and_cleaned. Before this, all 217 were #[ignore]d and no node ran them, and 25 had stopped passing unnoticed. Each of those 25 is now #[ignore]d with its reason: 19 are refusals by design that an E2E cell or policy already covers, 6 are gaps tracked on that issue. A 26th, rr_spinlock_priorities, passes but spins past the 22 CPU-second per-test budget (exit 124 at 24 s here), so it is #[ignore]d for that. MEASURED 2026-10-15 in the pinned root on the validation host: the node took 233 s of wall time, 225 s of it in the 193 tests then selected (including the 24 s case since ignored), serially (-j 1); the wall limit is about four times that, 960 s. The hosted twin excludes rr_no_mask_timeslice by exact name, because it needs the PMU preemption timer (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS). MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which capped the OTHER compile-bearing nodes but MISSED this one): pinned_jobs=8 via the scheduler-controlled CARGO_BUILD_JOBS channel (was unset -> the test binary's build phase defaulted to nproc, and under the full portable profile that cc1plus fan-out blew the old 2.0GiB cap -> OOM; the job-pin is the actual fix). rss_baseline=measured_peak@j8=3.5GiB; method=cgroup-RECORDED (dagrun step_profiles peak_bytes == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@b384187e. CAVEAT: peak_bytes is cap-influenced because compile page-cache is reclaimable (a negative-control run at a 512MiB cap PASSED via reclaim, oom_kills=0) -> the true non-reclaimable working set at j8 is well under this figure; the cap is conservative headroom, the pin is the fix. headroom=+1.5GiB additive -> hard_mem_max_bytes=5.0GiB (was 2.0GiB, which was too tight once the node was left unpinned). classification light->cpu-bound (compile-bearing). CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 is delivered through the CARGO_BUILD_JOBS jobs_env channel. See doc.rustdoc for the shared derivation; jobs_flag is empty because appending '-j 8' here would land after '--' and reach libtest, which rejects it."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test rr_suite -j 1 rr_scratch_directories_are_fresh_and_cleaned -- --exact"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test rr_suite -j 1"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"rr_suite"########]),
@@ -7307,7 +7313,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         env: &[],
         hint: HintSpec {
             resources: &[],
-            est_duration_s: 30.0,
+            est_duration_s: 240.0,
             rss_baseline_bytes: Some(3758096384),
             hard_mem_max_bytes: Some(5368709120),
             classification: StepClass::CpuBound,
@@ -7317,7 +7323,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 720,
+        timeout: 960,
         cpu_timeout: 7200,
         jobs_flag: Some(r########""########),
         jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
