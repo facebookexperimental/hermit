@@ -25497,7 +25497,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "84",
+        "NEXTEST_EXPECTED_EXECUTED": "85",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-execution-tests\",\"--lib\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -30101,7 +30101,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "84",
+        "NEXTEST_EXPECTED_EXECUTED": "85",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-execution-tests\",\"--lib\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -39511,7 +39511,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "84",
+        "NEXTEST_EXPECTED_EXECUTED": "85",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-execution-tests\",\"--lib\",\"--test\",\"cli\"]"
       },
       "networkonly": false,

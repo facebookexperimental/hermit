@@ -3411,7 +3411,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And run_kvm_a_procfs_directory_keeps_its_size and
     // run_kvm_a_directory_descriptors_first_seeks
     // (https://github.com/rrnewton/hermit/issues/4162; 84, of which 83 are run_kvm_ tests): 84.
-    ("privileged-test.cli_kvm", 84),
+    // And run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity, the
+    // raw-exit half split out of run_kvm_notifies_a_child_exit_once_at_bitwise_parity
+    // to fit the per-test time limit (https://github.com/rrnewton/hermit/issues/4360;
+    // 85, of which 84 are run_kvm_ tests): 85, listed.
+    ("privileged-test.cli_kvm", 85),
     // The same three https://github.com/rrnewton/hermit/issues/3260 tests as
     // test.cli; all 99 prior identities retained. The same
     // https://github.com/rrnewton/hermit/pull/3547 version test as test.cli
@@ -3645,7 +3649,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from the discarded-at-send record (https://github.com/rrnewton/hermit/issues/4293): 81.
     // And run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting: 82, listed.
     // And the two directory-size KVM tests (https://github.com/rrnewton/hermit/issues/4162): 84.
-    ("privileged-only-test.cli_kvm", 84),
+    // And run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity, split out of
+    // run_kvm_notifies_a_child_exit_once_at_bitwise_parity: 85, listed.
+    ("privileged-only-test.cli_kvm", 85),
     ("privileged-only-test.pmu_buck_chaos_cases_on_host", 6),
     // And the KVM unreadable futex word test: 56.
     // And run_kvm_a_parked_sleep_carries_the_deadline_cap: 57.
@@ -3657,7 +3663,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from the discarded-at-send record (https://github.com/rrnewton/hermit/issues/4293): 81.
     // And run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting: 82, listed.
     // And the two directory-size KVM tests (https://github.com/rrnewton/hermit/issues/4162): 84.
-    ("privileged-only-test.cli_kvm_on_host", 84),
+    // And run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity, split out of
+    // run_kvm_notifies_a_child_exit_once_at_bitwise_parity: 85, listed.
+    ("privileged-only-test.cli_kvm_on_host", 85),
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),

@@ -10205,11 +10205,32 @@ fn a_child_exit_is_notified_once_with_linuxs_siginfo() {
 /// cannot win every turn ahead of the child it waits on. Each mode must reach
 /// bitwise parity, with INFO messages compared, five times at the default
 /// schedule and once under each of four chaos seeds. Seed 7 is the one under
-/// which a weak yield starved the child until the run was killed.
+/// which a weak yield starved the child until the run was killed. This test
+/// covers `exit-group`; `run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity`
+/// covers `raw-exit` with the same nine schedules and assertions. The two
+/// modes are separate tests because together their 18 strict verify runs
+/// took 50.8 to 57 seconds, at the 57-second per-test limit.
 #[test]
 fn run_kvm_notifies_a_child_exit_once_at_bitwise_parity() {
+    kvm_child_exit_is_notified_once_at_bitwise_parity("exit-group");
+}
+
+/// `raw-exit` half of `run_kvm_notifies_a_child_exit_once_at_bitwise_parity`,
+/// whose comment describes both: the child's only thread calls the raw `exit`
+/// syscall, and the run must reach bitwise parity, with INFO messages
+/// compared, under the same nine schedules.
+#[test]
+fn run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity() {
+    kvm_child_exit_is_notified_once_at_bitwise_parity("raw-exit");
+}
+
+/// Runs tests/c/sigchld_once_per_child_exit.c in `mode` on KVM five times at
+/// the default schedule and once under each of chaos seeds 1, 2, 3 and 7, and
+/// requires one SIGCHLD with Linux's siginfo and bitwise parity with INFO
+/// messages compared in every run.
+fn kvm_child_exit_is_notified_once_at_bitwise_parity(mode: &str) {
     if !Path::new("/dev/kvm").exists() {
-        eprintln!("skipping the KVM child-exit notification: /dev/kvm is unavailable");
+        eprintln!("skipping the KVM child-exit notification ({mode}): /dev/kvm is unavailable");
         return;
     }
     let _guard = hermit_run_guard();
@@ -10227,49 +10248,47 @@ fn run_kvm_notifies_a_child_exit_once_at_bitwise_parity() {
         &["--chaos", "--sched-seed=3"],
         &["--chaos", "--sched-seed=7"],
     ];
-    for mode in ["exit-group", "raw-exit"] {
-        for (run, schedule) in schedules.iter().enumerate() {
-            let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-            let report = directory.path().join("verify.json");
-            let report_arg = report.to_str().expect("report path should be UTF-8");
-            let mut args = vec![
-                "--backend=kvm",
-                "run",
-                "--strict",
-                "--base-env=minimal",
-                "--epoch=2026-01-01T00:00:00Z",
-            ];
-            args.extend_from_slice(schedule);
-            args.extend([
-                "--verify",
-                "--verify-strict",
-                "--verify-json",
-                report_arg,
-                "--",
-                guest,
-                mode,
-            ]);
-            let output = hermit(&args);
-            assert_success(&output, &args);
-            assert_eq!(
-                stdout(&output),
-                "sigchld=1 code=1 pid=child status=7\n",
-                "{mode} run {run} {schedule:?}"
+    for (run, schedule) in schedules.iter().enumerate() {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report_arg = report.to_str().expect("report path should be UTF-8");
+        let mut args = vec![
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+        ];
+        args.extend_from_slice(schedule);
+        args.extend([
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
+            "--",
+            guest,
+            mode,
+        ]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            "sigchld=1 code=1 pid=child status=7\n",
+            "{mode} run {run} {schedule:?}"
+        );
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(
+            verdict["bitwise_parity"], true,
+            "{mode} run {run} {schedule:?}: {verdict}"
+        );
+        for side in ["left", "right"] {
+            assert!(
+                verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+                "{mode} run {run} {schedule:?}: no INFO messages compared: {verdict}"
             );
-            let verdict: serde_json::Value = serde_json::from_slice(
-                &fs::read(&report).expect("strict verification wrote no verdict"),
-            )
-            .expect("strict verification verdict is valid JSON");
-            assert_eq!(
-                verdict["bitwise_parity"], true,
-                "{mode} run {run} {schedule:?}: {verdict}"
-            );
-            for side in ["left", "right"] {
-                assert!(
-                    verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
-                    "{mode} run {run} {schedule:?}: no INFO messages compared: {verdict}"
-                );
-            }
         }
     }
 }
