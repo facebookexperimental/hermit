@@ -12592,18 +12592,21 @@ esac
         );
         // https://github.com/rrnewton/hermit/pull/3231 qualifies three new
         // cells without revising the frozen calibration or any timeout override.
+        // DBT verification now joins after whole-fixture qualification, with
+        // the same default bounds and no calibration change.
         for population in [&required, &enabled] {
             let rng = population
                 .iter()
                 .filter(|cell| cell.id.test == "c-programs/random-readv-stream")
                 .collect::<Vec<_>>();
-            assert_eq!(rng.len(), 3);
+            assert_eq!(rng.len(), 4);
             assert_eq!(
                 rng.iter()
                     .map(|cell| (cell.id.mode.as_str(), cell.id.backend.as_deref()))
                     .collect::<BTreeSet<_>>(),
                 BTreeSet::from([
                     ("verify", Some("ptrace")),
+                    ("verify", Some("dbt")),
                     ("verify", Some("kvm")),
                     ("replay", Some("ptrace")),
                 ])

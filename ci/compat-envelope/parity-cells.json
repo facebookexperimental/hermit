@@ -9,22 +9,22 @@
   "counts": {
     "all": {
       "cells": 2995,
-      "applicable": 1928,
-      "selectable": 1634,
+      "applicable": 1929,
+      "selectable": 1635,
       "population": 2925,
-      "population_candidate_selected": 1634,
+      "population_candidate_selected": 1635,
       "population_candidate_not_selected": 283,
-      "population_candidate_disabled": 1008
+      "population_candidate_disabled": 1007
     },
     "by_backend": {
       "dbt": {
         "cells": 599,
-        "applicable": 252,
-        "selectable": 205,
+        "applicable": 253,
+        "selectable": 206,
         "population": 585,
-        "population_candidate_selected": 205,
+        "population_candidate_selected": 206,
         "population_candidate_not_selected": 46,
-        "population_candidate_disabled": 334
+        "population_candidate_disabled": 333
       },
       "in-guest-trap": {
         "cells": 599,
@@ -990,7 +990,7 @@
     {"test_id":"c-programs/racewrite-nostdlib","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/racewrite-nostdlib","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
     {"test_id":"c-programs/racewrite-nostdlib","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"},
-    {"test_id":"c-programs/random-readv-stream","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Random-device cursor, access-mode, and fault semantics have not been qualified on DBT"},
+    {"test_id":"c-programs/random-readv-stream","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/random-readv-stream","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
     {"test_id":"c-programs/random-readv-stream","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/random-readv-stream","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Random-device cursor, access-mode, and fault semantics have not been qualified on LiteInst"},

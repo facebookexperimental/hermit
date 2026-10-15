@@ -7574,6 +7574,13 @@
           "category": "c-programs",
           "test": "c-programs/random-readv-stream",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/random-readv-stream",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -33839,6 +33846,13 @@
           "category": "c-programs",
           "test": "c-programs/random-readv-stream",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/random-readv-stream",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -53148,6 +53162,13 @@
           "test": "c-programs/random-readv-stream",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/random-readv-stream",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
