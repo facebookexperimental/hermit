@@ -1573,7 +1573,8 @@ fi
 # The rebase onto 69228e48 changes only KVM files, preserving these SDK inputs.
 # Keep the existing budgets and 16-job clamp. This single SDK observation
 # is not a full-profile calibration or whole-guest qualification.
-expected_pin=c18f07cb614ca404b34e131a8a912f4a7b62813c
+# NON-LEADER-EXEC ROBUST-OWNER SDK-BUDGET CARRY (2026-10-15): advance from c18f07cb to 4bfe8b8f44bd9992f6ae3f8f4df0fdfb4b334bfd (https://github.com/rrnewton/reverie/pull/1053: reverie-dbt native/client.c robust-owner rewrites and its tests only; vendor/dynamorio, the SDK build inputs, is unchanged, so the observation above carries).
+expected_pin=4bfe8b8f44bd9992f6ae3f8f4df0fdfb4b334bfd
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

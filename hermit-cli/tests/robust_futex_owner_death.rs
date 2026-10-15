@@ -651,15 +651,17 @@ fn ptrace_wakes_nobody_when_an_exec_leaves_the_owner_word_alone() {
 /// the wakes to the coordinator, which delivers them when the new image
 /// reconnects (https://github.com/rrnewton/hermit/issues/4268). Before, each of
 /// these modes left the waiter parked until the run timed out.
-/// `thread-tgid-exec` is left out: DBT's client does not rewrite a word that
-/// names the virtual thread group ID, so Linux never marks it
-/// (https://github.com/rrnewton/reverie/issues/1052).
+/// `thread-tgid-exec` needs DBT's client to rewrite a non-leader caller's word
+/// naming the virtual thread group ID to the host one before the native exec,
+/// so that Linux's walk under that ID marks it
+/// (https://github.com/rrnewton/reverie/issues/1052, fixed by
+/// https://github.com/rrnewton/reverie/pull/1053).
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_wakes_the_waiter_when_an_exec_ends_the_owner() {
     let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-dbt-exec");
     let guest = build_lifecycle_guest(&build_root);
-    for mode in ["de-thread", "owner-exec", "leader-exec"] {
+    for mode in ["de-thread", "owner-exec", "leader-exec", "thread-tgid-exec"] {
         for verify in [true, false] {
             let run = run_dbt_lifecycle_mode(&build_root, &guest, mode, verify);
             assert!(

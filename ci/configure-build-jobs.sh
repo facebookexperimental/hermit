@@ -1650,8 +1650,9 @@ fi
 # The rebase onto 69228e48 changes only KVM files, preserving these SDK inputs.
 # Keep the existing budgets and 16-job clamp. This single SDK observation
 # is not a full-profile calibration or whole-guest qualification.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c18f07cb614ca404b34e131a8a912f4a7b62813c ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c18f07cb614ca404b34e131a8a912f4a7b62813c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# NON-LEADER-EXEC ROBUST-OWNER SDK-BUDGET CARRY (2026-10-15): advance from c18f07cb to 4bfe8b8f44bd9992f6ae3f8f4df0fdfb4b334bfd (https://github.com/rrnewton/reverie/pull/1053: reverie-dbt native/client.c robust-owner rewrites and its tests only; vendor/dynamorio, the SDK build inputs, is unchanged, so the observation above carries).
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4bfe8b8f44bd9992f6ae3f8f4df0fdfb4b334bfd ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4bfe8b8f44bd9992f6ae3f8f4df0fdfb4b334bfd (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
