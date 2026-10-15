@@ -479,6 +479,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "privileged-test.pmu_detcore_time_cases",
     "privileged-cpuid.cpu_profile_v3",
     "test.pmu_integration_cases",
+    "test.pmu_integration_cases_2",
     "privileged-test.cli_kvm",
     "privileged-only-cpuid.faulting",
     "privileged-only-pmu.preemption",
@@ -588,9 +589,10 @@ const PROFILES: [Profile; 11] = [
         // The six inherited-terminal regressions add one full-only node.
         // privileged-cpuid.cpu_profile_v3 adds another
         // (https://github.com/rrnewton/hermit/issues/4243).
+        // test.pmu_integration_cases_2 adds one full-only node: 97/98 before.
         label: "full",
-        direct_steps: 97,
-        selected_steps: 98,
+        direct_steps: 98,
+        selected_steps: 99,
     },
     Profile {
         label: "portable",
@@ -1405,7 +1407,7 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             hosted.fail_fast_family = Some(hosted.tag());
             // A twin declares its own registered population, which differs
             // from the local node's when the local node is split afterwards
-            // (materialize_hermit_integration_shards).
+            // (materialize_shards).
             if let Some((_, count)) = NEXTEST_EXPECTED_COUNTS
                 .iter()
                 .find(|(candidate, _)| *candidate == hosted.tag())
@@ -1528,7 +1530,11 @@ pub const HERMIT_INTEGRATION_TAG: &str = "test.hermit_integration";
 ///
 /// The ranges and estimates are the per-binary sums of the PASS times of the
 /// 2bf536af and 656b74d4 runs, averaged: 66, 123 and 125 s.
-pub const HERMIT_INTEGRATION_SHARDS: &[(&str, Option<&str>, f64)] = &[
+/// One shard: its job name, its first binary (None for the first shard) and
+/// its estimated seconds.
+pub type Shard = (&'static str, Option<&'static str>, f64);
+
+pub const HERMIT_INTEGRATION_SHARDS: &[Shard] = &[
     ("hermit_integration", None, 66.0),
     (
         "hermit_integration_2",
@@ -1538,20 +1544,55 @@ pub const HERMIT_INTEGRATION_SHARDS: &[(&str, Option<&str>, f64)] = &[
     ("hermit_integration_3", Some("procfs_determinism"), 125.0),
 ];
 
-/// Every local Hermit integration shard's tag, in shard order.
-pub fn hermit_integration_shard_tags() -> Vec<String> {
-    HERMIT_INTEGRATION_SHARDS
+/// The authored PMU integration node, which runs in shards.
+pub const PMU_INTEGRATION_TAG: &str = "test.pmu_integration_cases";
+
+/// The shards of [`PMU_INTEGRATION_TAG`], as (job, first binary, estimated seconds).
+///
+/// It runs the PMU-only cases of three binaries, one test at a time, and
+/// ended the DAG on e9473c43: +460 s to +669 s (209 s), after
+/// test.hermit_integration ran in shards. Its e9473c43 PASS lines give
+/// deadline_slice_cap 114.9 s (36 tests), external_signal_interrupt 78.1 s
+/// (27) and chaos_sched_yield_progress 4.6 s (1). The first shard takes the
+/// names up to deadline_slice_cap (chaos and deadline, ~120 s), the second
+/// the rest (external_signal_interrupt, ~78 s). It is selected by the same
+/// rule as [`HERMIT_INTEGRATION_SHARDS`].
+pub const PMU_INTEGRATION_SHARDS: &[Shard] = &[
+    ("pmu_integration_cases", None, 120.0),
+    (
+        "pmu_integration_cases_2",
+        Some("dentry_state_determinism"),
+        78.0,
+    ),
+];
+
+/// The nodes that run in shards, with their shards.
+const SHARDED_NODES: &[(&str, &[Shard])] = &[
+    (HERMIT_INTEGRATION_TAG, HERMIT_INTEGRATION_SHARDS),
+    (PMU_INTEGRATION_TAG, PMU_INTEGRATION_SHARDS),
+];
+
+fn shard_tags(shards: &[Shard]) -> Vec<String> {
+    shards
         .iter()
         .map(|(job, _, _)| format!("test.{job}"))
         .collect()
 }
 
+/// Every local Hermit integration shard's tag, in shard order.
+pub fn hermit_integration_shard_tags() -> Vec<String> {
+    shard_tags(HERMIT_INTEGRATION_SHARDS)
+}
+
+/// Every PMU integration shard's tag, in shard order.
+pub fn pmu_integration_shard_tags() -> Vec<String> {
+    shard_tags(PMU_INTEGRATION_SHARDS)
+}
+
 /// The binaries of the shard at INDEX, from the node's sorted binary list.
-fn hermit_integration_shard_binaries(binaries: &[String], index: usize) -> Vec<&String> {
-    let start = HERMIT_INTEGRATION_SHARDS[index].1;
-    let end = HERMIT_INTEGRATION_SHARDS
-        .get(index + 1)
-        .and_then(|(_, first, _)| *first);
+fn shard_binaries<'a>(shards: &[Shard], binaries: &'a [String], index: usize) -> Vec<&'a String> {
+    let start = shards[index].1;
+    let end = shards.get(index + 1).and_then(|(_, first, _)| *first);
     binaries
         .iter()
         .filter(|binary| start.is_none_or(|start| binary.as_str() >= start))
@@ -1559,94 +1600,104 @@ fn hermit_integration_shard_binaries(binaries: &[String], index: usize) -> Vec<&
         .collect()
 }
 
-/// Split the local [`HERMIT_INTEGRATION_TAG`] into [`HERMIT_INTEGRATION_SHARDS`].
-fn materialize_hermit_integration_shards(cfg: &mut DagConfig) -> Result<(), String> {
+/// Split every node in [`SHARDED_NODES`] into its shards.
+fn materialize_shards(cfg: &mut DagConfig) -> Result<(), String> {
+    for (tag, shards) in SHARDED_NODES {
+        materialize_node_shards(cfg, tag, shards)?;
+    }
+    Ok(())
+}
+
+/// Split the node TAG into SHARDS.
+///
+/// Each shard runs the authored command, with its prepared selection and
+/// `--test` list, and narrows the authored filter to the shard's binaries:
+/// `-E '(binary(=a) | ...) & (<authored filter>)'`. A binary therefore runs in
+/// exactly one shard, and a binary's tests stay serialized there.
+fn materialize_node_shards(cfg: &mut DagConfig, tag: &str, shards: &[Shard]) -> Result<(), String> {
     let index = cfg
         .steps
         .iter()
-        .position(|step| step.tag() == HERMIT_INTEGRATION_TAG)
-        .ok_or("the Hermit integration node is absent")?;
+        .position(|step| step.tag() == tag)
+        .ok_or_else(|| format!("{tag} is absent"))?;
     let authored = cfg.steps[index].clone();
     if authored
         .labels
         .iter()
         .any(|label| label == HOSTED_PORTABLE_LABEL)
     {
-        return Err(format!(
-            "{HERMIT_INTEGRATION_TAG} is split before its hosted twin is made"
-        ));
+        return Err(format!("{tag} is split before its hosted twin is made"));
     }
     let binaries = authored
         .integration_test_binaries
         .clone()
-        .ok_or("the Hermit integration node declares no integration test binaries")?;
+        .ok_or_else(|| format!("{tag} declares no integration test binaries"))?;
     if !binaries.windows(2).all(|pair| pair[0] < pair[1]) {
         return Err(format!(
-            "{HERMIT_INTEGRATION_TAG} must list its integration test binaries sorted and once each"
+            "{tag} must list its integration test binaries sorted and once each"
         ));
     }
-    // The shard filter is ANDed onto the authored one, which must be a single
-    // `not (...)` term ending the command so the conjunction keeps its meaning.
-    const FILTER: &str = " -E 'not (";
-    if authored.cmd.matches(" -E ").count() != 1
-        || authored.cmd.matches(FILTER).count() != 1
-        || !authored.cmd.ends_with(")'")
-    {
-        return Err(format!(
-            "{HERMIT_INTEGRATION_TAG} must end with one authored filter -E 'not (...)'"
-        ));
+    // The shard filter is ANDed onto the authored one, which must be the one
+    // filter and end the command.
+    const FILTER: &str = " -E '";
+    let Some((head, filter)) = authored.cmd.split_once(FILTER) else {
+        return Err(format!("{tag} must end with one authored filter -E '...'"));
+    };
+    let Some(filter) = filter.strip_suffix('\'') else {
+        return Err(format!("{tag} must end with one authored filter -E '...'"));
+    };
+    if authored.cmd.matches(" -E ").count() != 1 || filter.contains('\'') || filter.is_empty() {
+        return Err(format!("{tag} must end with one authored filter -E '...'"));
     }
-    let mut shards = Vec::new();
+    let mut split = Vec::new();
     let mut covered = 0;
-    for (shard_index, (job, _, estimate)) in HERMIT_INTEGRATION_SHARDS.iter().enumerate() {
-        let members = hermit_integration_shard_binaries(&binaries, shard_index);
+    for (shard_index, (job, _, estimate)) in shards.iter().enumerate() {
+        let members = shard_binaries(shards, &binaries, shard_index);
         let (Some(first), Some(last)) = (members.first(), members.last()) else {
-            return Err(format!("Hermit integration shard {job} has no binaries"));
+            return Err(format!("{tag} shard {job} has no binaries"));
         };
         covered += members.len();
         let mut shard = authored.clone();
         shard.job = (*job).into();
-        let tag = shard.tag();
+        let shard_tag = shard.tag();
         let selected = members
             .iter()
             .map(|binary| format!("binary(={binary})"))
             .collect::<Vec<_>>()
             .join(" | ");
-        shard.cmd = authored
-            .cmd
-            .replacen(FILTER, &format!(" -E '({selected}) & not ("), 1);
+        shard.cmd = format!("{head}{FILTER}({selected}) & ({filter})'");
         let expected = NEXTEST_EXPECTED_COUNTS
             .iter()
-            .find_map(|(candidate, count)| (*candidate == tag).then_some(*count))
-            .ok_or_else(|| format!("{tag} has no NEXTEST_EXPECTED_COUNTS entry"))?;
+            .find_map(|(candidate, count)| (*candidate == shard_tag).then_some(*count))
+            .ok_or_else(|| format!("{shard_tag} has no NEXTEST_EXPECTED_COUNTS entry"))?;
         shard
             .env
             .insert("NEXTEST_EXPECTED_EXECUTED".into(), expected.to_string());
         for result in shard.result_manifests.iter_mut().flatten() {
             if let ResultManifest::StructuredTestResults(result) = result {
-                result.owner = tag.clone();
+                result.owner = shard_tag.clone();
             }
         }
-        shard.fail_fast_family = Some(tag.clone());
+        shard.fail_fast_family = Some(shard_tag.clone());
         shard.hint.est_duration_s = *estimate;
         let position = shard_index + 1;
-        let count = HERMIT_INTEGRATION_SHARDS.len();
+        let count = shards.len();
         shard.desc.push_str(&format!(
             " -- shard {position} of {count}, {first} to {last}"
         ));
         shard.description.push_str(&format!(
-            " SHARD {position} of {count} (validation_dag::HERMIT_INTEGRATION_SHARDS): the {} binaries from {first} to {last}, selected by binary(=NAME) on top of the authored filter. Each shard runs the same prepared selection, and each binary runs in one shard, serialized there. The {expected} tests and {estimate} s estimate are this shard's.",
+            " SHARD {position} of {count} (validation_dag::SHARDED_NODES): the {} binaries from {first} to {last}, selected by binary(=NAME) on top of the authored filter. Each shard runs the same prepared selection, and each binary runs in one shard, serialized there. The {expected} tests and {estimate} s estimate are this shard's.",
             members.len()
         ));
-        shards.push(shard);
+        split.push(shard);
     }
     if covered != binaries.len() {
         return Err(format!(
-            "Hermit integration shards cover {covered} of {} binaries",
+            "{tag} shards cover {covered} of {} binaries",
             binaries.len()
         ));
     }
-    cfg.steps.splice(index..=index, shards);
+    cfg.steps.splice(index..=index, split);
     Ok(())
 }
 
@@ -2744,9 +2795,10 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // test.hermit_integration, add two; privileged-cpuid.cpu_profile_v3, the
     // must-qualify x86-64-v3 CLI cases, adds one more
     // (https://github.com/rrnewton/hermit/issues/4243).
-    if expected.len() != 141 {
+    // test.pmu_integration_cases_2, the second PMU integration shard, adds one.
+    if expected.len() != 142 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 141",
+            "structured result producer registry has {} entries, expected 142",
             expected.len()
         ));
     }
@@ -2767,9 +2819,10 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // The two further shards of the local test.hermit_integration add two;
     // privileged-cpuid.cpu_profile_v3 adds one more
     // (https://github.com/rrnewton/hermit/issues/4243).
-    if expected_counts.len() != 49 {
+    // The second PMU integration shard adds one.
+    if expected_counts.len() != 50 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 49",
+            "Nextest expected-count registry has {} entries, expected 50",
             expected_counts.len()
         ));
     }
@@ -2914,7 +2967,8 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // The shards test.hermit_integration_2 and _3 add the 74th and 75th;
     // privileged-cpuid.cpu_profile_v3 adds the 76th
     // (https://github.com/rrnewton/hermit/issues/4243).
-    if actual_group_counts != [76, 56, 7, 2] {
+    // The second PMU integration shard adds the 77th Nextest writer.
+    if actual_group_counts != [77, 56, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -4085,9 +4139,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // and 437 with privileged-cpuid.cpu_profile_v3, which runs the x86-64-v3
     // CLI cases on a host that must qualify
     // (https://github.com/rrnewton/hermit/issues/4243).
-    if cfg.steps.len() != 437 {
+    // 438 since test.pmu_integration_cases runs as two shards (437 + 1).
+    if cfg.steps.len() != 438 {
         return Err(format!(
-            "superset has {} steps, expected 437",
+            "superset has {} steps, expected 438",
             cfg.steps.len()
         ));
     }
@@ -4779,7 +4834,7 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     let mut refreshed = refresh_generated_partitions(static_source, generated)?;
     materialize_hosted_portable_selection(&mut refreshed);
     materialize_hosted_test_variants(&mut refreshed)?;
-    materialize_hermit_integration_shards(&mut refreshed)?;
+    materialize_shards(&mut refreshed)?;
     materialize_hosted_script_unit_tests(&mut refreshed)?;
     materialize_buck_e2e(&mut refreshed)?;
     materialize_pinned_root(&mut refreshed)?;
@@ -6364,14 +6419,15 @@ sys.exit(37)
                         .unwrap();
                     let shard_payload = payload(shard);
                     let (head, rest) = shard_payload.split_once(" -E '(").unwrap();
-                    let (binaries, tail) = rest.split_once(") & not (").unwrap();
+                    let (binaries, tail) = rest.split_once(") & (").unwrap();
+                    let authored = tail.strip_suffix(")'").unwrap();
                     selected.extend(binaries.split(" | ").map(|term| {
                         term.strip_prefix("binary(=")
                             .and_then(|term| term.strip_suffix(')'))
                             .unwrap()
                             .to_owned()
                     }));
-                    unsharded.insert(format!("{head} -E 'not ({tail}"));
+                    unsharded.insert(format!("{head} -E '{authored}'"));
                     assert_eq!(
                         shard.timeout, local.timeout,
                         "{shard_tag} changed its timeout"
@@ -6545,8 +6601,9 @@ sys.exit(37)
         // The inherited-terminal target stays required beside the Buck cells.
         // 94 since the local test.hermit_integration runs as three shards,
         // and 95 with privileged-cpuid.cpu_profile_v3 (98 full nodes;
-        // https://github.com/rrnewton/hermit/issues/4243).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 95);
+        // https://github.com/rrnewton/hermit/issues/4243), and 96 since
+        // test.pmu_integration_cases runs as two shards (99 full nodes).
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 96);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps

@@ -171,6 +171,7 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "test.hermit_unit",
     "test.ignored_syscall_regressions",
     "test.pmu_integration_cases",
+    "test.pmu_integration_cases_2",
     "test.regular_crates",
     "test.rr_suite_contract",
     "test.sabre_examples",
@@ -3260,7 +3261,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And ptrace_a_sleep_takes_the_sigchld_of_a_child_that_exits_beside_a_running_sibling
     // (https://github.com/rrnewton/hermit/issues/4333): 64, listed.
     // And +1 from 4afd3a3e: 64.
-    ("test.pmu_integration_cases", 64),
+    // The node then ran in two shards by binary name
+    // (validation_dag::PMU_INTEGRATION_SHARDS), counted from e9473c43's PASS
+    // lines: chaos_sched_yield_progress 1 + deadline_slice_cap 36 = 37, and
+    // external_signal_interrupt 27; 37 + 27 = 64.
+    ("test.pmu_integration_cases", 37),
+    ("test.pmu_integration_cases_2", 27),
     // Exec timer and nonleader-exec refusal regressions extend 33 KVM cases
     // plus the unchanged setup control.
     // Two KVM gettimeofday EFAULT regressions retain all 36 prior identities.
