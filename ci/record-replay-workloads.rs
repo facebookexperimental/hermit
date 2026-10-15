@@ -667,7 +667,15 @@ pub fn standalone(
 ) -> Result<Vec<Workload>, BuildError> {
     require_standalone()?;
     fs::create_dir_all(build_root).map_err(|e| e.to_string())?;
-    let logs = build_root.join(format!("{CARGO_LOGS_PREFIX}{}", std::process::id()));
+    // Not the process id alone: tests that re-run themselves in a new PID
+    // namespace are all pid 2 there, so two of them running at once named the
+    // same directory and one's cleanup deleted the other's Cargo logs mid-build
+    // ("No such file or directory"). The wall-clock nanoseconds keep the name
+    // unique across namespaces.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let logs = build_root.join(format!("{CARGO_LOGS_PREFIX}{}-{nanos}", std::process::id()));
     fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
     let logs = Staging(logs);
     let mut metadata = Command::new(cargo);

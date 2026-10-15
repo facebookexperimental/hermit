@@ -352,7 +352,7 @@ fn exact_filter(identity: &nextest_cpu::AttemptIdentity) -> String {
 /// test-group) pairs. Each group only lowers how many of its tests run at once.
 const REGULAR_GROUP_OVERRIDES: [(&str, &str); 2] = [
     (
-        "package(=hermit) & kind(=test) & !binary(=cli) & !binary(=rr_suite)",
+        "package(=hermit) & kind(=test) & !binary(=cli) & !binary(=rr_suite) & !binary(=record_replay)",
         "hermit-serialized",
     ),
     (
@@ -1118,7 +1118,7 @@ mod tests {
             &changed_default.parse::<DocumentMut>().unwrap()
         ));
         let widened_group =
-            include_str!("../.config/nextest.toml").replace(" & !binary(=rr_suite)\"", "\"");
+            include_str!("../.config/nextest.toml").replace(" & !binary(=record_replay)\"", "\"");
         assert_ne!(widened_group, include_str!("../.config/nextest.toml"));
         assert!(!regular_config_compatible(
             &widened_group.parse::<DocumentMut>().unwrap()

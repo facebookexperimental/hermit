@@ -51,12 +51,16 @@ path = "junit.xml"
 # test.rr_suite_contract runs it with -j 8 (measured 2026-10-15: 171-179 s at
 # -j 1, 31-40 s at -j 8, every one of 192 tests passing in every run); its
 # hosted twin keeps -j 1.
+#
+# The `record_replay` binary is outside it as well: each test records into its
+# own tempdir and runs prepared, read-only workloads, and test.record_replay
+# runs eight at a time (measured 2026-10-15: 390 s at -j 1, 40-48 s at -j 8).
 # ci/nextest-timeout-config.rs accepts exactly this filter.
 [test-groups.hermit-serialized]
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = "package(=hermit) & kind(=test) & !binary(=cli) & !binary(=rr_suite)"
+filter = "package(=hermit) & kind(=test) & !binary(=cli) & !binary(=rr_suite) & !binary(=record_replay)"
 test-group = "hermit-serialized"
 
 # Stopgap for https://github.com/rrnewton/hermit/issues/3827. `hermit record

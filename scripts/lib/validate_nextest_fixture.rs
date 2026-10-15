@@ -591,12 +591,12 @@ fn actual_nextest_results_and_publication_failures() {
         "#[test]\nfn passes() { assert_eq!(2 + 2, 4); }\n",
         "#[test]\nfn fails() { assert_eq!(2 + 2, 5, \"intentional structured-result fixture assertion\"); }\n",
     )).unwrap();
-    // The canonical .config/nextest.toml names the `cli` and `rr_suite` test
-    // binaries, and nextest refuses a config whose binary() matcher names no
+    // The canonical .config/nextest.toml names the `cli`, `rr_suite` and
+    // `record_replay` test binaries, and nextest refuses a config whose binary() matcher names no
     // binary in the workspace. Empty targets keep the copied config loadable;
     // they have no tests, so nothing they add is selected or counted.
     fs::create_dir_all(fixture.join("tests")).unwrap();
-    for binary in ["cli", "rr_suite"] {
+    for binary in ["cli", "rr_suite", "record_replay"] {
         fs::write(fixture.join(format!("tests/{binary}.rs")), b"").unwrap();
     }
     let target = tree.target_dir();
