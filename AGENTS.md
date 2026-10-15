@@ -132,7 +132,7 @@ and the reason is documented.
 
 ## Workspace Map
 
-The root Cargo workspace has thirteen members:
+The root Cargo workspace has sixteen members:
 
 | Path | Role |
 | --- | --- |
@@ -141,9 +141,12 @@ The root Cargo workspace has thirteen members:
 | `detcore-model` | Shared deterministic state and model types, including PIDs, file descriptors, futexes, schedules, and logical time. |
 | `detcore-dbt` | Feature-gated DynamoRIO backend glue; private while the public DBT package boundary and name remain undecided. |
 | `detcore-sabre` | Feature-gated SaBRe backend glue; private while third-party backend packaging remains provisional. |
+| `detcore-liteinst` | In-guest Detcore runtime that Hermit preloads into the guest for `--backend=liteinst`. |
 | `detcore/tests/testutils` | Helpers used by Detcore integration tests. |
+| `detcore/tests/lit-guests` | Private package that builds the Rust programs `detcore/tests/lit`'s fixtures run as `%me`, for `hermit-cli/tests/lit.rs`. |
 | `hermit-verify` | Verification executable for stress, trace, schedule, and replay checks. |
 | `common/test-allocator` | Test allocator and supporting test binary. |
+| `common/test-workdir` | Per-run filesystem isolation for Hermit tests inside the pinned root. |
 | `ci/manifest-plan` | Private generator and validator for the E2E manifest, test inventory, and test-selection artifacts. |
 | `hermit-install` | Private build helper that stages feature-gated third-party backend resources for tests and development. |
 | `hermit-resources` | Resource accounting and limit types shared by Hermit and Detcore. |
