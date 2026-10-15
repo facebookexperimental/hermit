@@ -3675,6 +3675,13 @@
           "category": "c-programs",
           "test": "c-programs/io-uring-fallback",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/io-uring-fallback",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -32199,6 +32206,13 @@
           "category": "c-programs",
           "test": "c-programs/io-uring-fallback",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/io-uring-fallback",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -49731,6 +49745,13 @@
           "test": "c-programs/io-uring-fallback",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/io-uring-fallback",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",

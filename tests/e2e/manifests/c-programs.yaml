@@ -2611,14 +2611,10 @@ test:
           ptrace: true
           sabre: true
           kvm: true
-          dbt: false
+          dbt: true
           liteinst: true
           in-guest-trap: true
-        ci_disabled_reason:
-          dbt:
-            result: parity-failure
-            evidence: "run s13-dbt-c at Hermit 12371d6cbf8a56c69175baea5baeb7507ca7e9cf (binary_sha256 037ad220fb4928cea94d79b0f77020001cb6140bf1feb3e929e28bfd9fce2560), reproduced in the isolated /test workdir; https://github.com/rrnewton/reverie/issues/764"
-            reason: "Under --verify the reverie-dbt evidence guard refuses io_uring_setup with EPERM instead of ENOSYS, so the guest exits 1 and the verification records no comparison; plain --strict DBT runs get ENOSYS and pass, which the custom dbt cell keeps selected."
+        ci_disabled_reason: {}
         backends_enabled:
           - ptrace
           - sabre

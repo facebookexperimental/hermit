@@ -12677,9 +12677,11 @@ esac
                 dbt_verify(&enabled, test),
                 "{test} verify/dbt is not enabled"
             );
+            // The whole io-uring fallback verify/DBT cell is now required after
+            // 20 independent strict canonical pairs passed at ed4a5dd90da2.
             assert!(
-                !dbt_verify(&required, test),
-                "{test} verify/dbt is required"
+                dbt_verify(&required, test),
+                "{test} verify/dbt is not required"
             );
         }
 

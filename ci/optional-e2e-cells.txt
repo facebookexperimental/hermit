@@ -20,7 +20,6 @@ c-programs/futex-wake-enosys verify dbt
 c-programs/get-robust-list-self verify dbt
 c-programs/get-robust-list-thread verify sabre
 c-programs/hardware-trap-identity verify dbt
-c-programs/io-uring-fallback verify dbt
 c-programs/ioctl-fioclex verify dbt
 c-programs/just-spin verify kvm
 c-programs/just-spin verify sabre
