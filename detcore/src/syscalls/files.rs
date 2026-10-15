@@ -5106,6 +5106,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if kept > 0 {
                         break Ok(kept as i64);
                     }
+                    if !may_read_again {
+                        break Ok(0);
+                    }
                 }
                 (Err(Error::Errno(Errno::EFAULT)), _) => {
                     if self

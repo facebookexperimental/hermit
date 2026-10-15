@@ -257,11 +257,8 @@ impl SignalLists {
     }
 
     /// Whether the timer has an entry in any list.
-    pub(crate) fn timer_entry(
-        &self,
-        process: DetPid,
-        timer: i32,
-    ) -> Option<(QueueId, i32, TimerEntry)> {
+    #[cfg(test)]
+    pub(crate) fn timer_entry(&self, process: DetPid, timer: i32) -> Option<(QueueId, i32, TimerEntry)> {
         self.lists.iter().find_map(|(&(queue, signal), list)| {
             list.entries.iter().find_map(|entry| match entry {
                 Entry::Timer(t) if t.process == process && t.timer == timer => {

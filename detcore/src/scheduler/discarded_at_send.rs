@@ -1218,6 +1218,30 @@ impl Scheduler {
         self.discard_job_control_flush(token.queue, token.signal);
     }
 
+    /// Record a send `token` that succeeded, by its `fate`: an actual
+    /// ITIMER_REAL expiry keeps its origin (`discard_note_itimer_real`), and
+    /// any other send is recorded with its POSIX timer producer and its
+    /// `record` (`discard_note_send`). The ITIMER_REAL pair is never listed:
+    /// an ITIMER_REAL arm ended its observability.
+    pub(crate) fn discard_note_fate(
+        &mut self,
+        token: DiscardToken,
+        fate: SendFate,
+        record: Option<KernelSiginfo>,
+    ) {
+        match fate {
+            SendFate::Classify(Some(SignalProducer::ItimerReal)) => {
+                self.discard_note_itimer_real(token)
+            }
+            SendFate::Classify(Some(SignalProducer::Posix(timer))) => {
+                self.discard_note_send(token, Some(timer), record)
+            }
+            SendFate::Classify(None) | SendFate::Kept => {
+                self.discard_note_send(token, None, record)
+            }
+        }
+    }
+
     /// Record the successful physical publication of an actual ITIMER_REAL
     /// expiry in the existing pending-copy owner.
     pub(crate) fn discard_note_itimer_real(&mut self, token: DiscardToken) {

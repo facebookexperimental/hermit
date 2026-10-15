@@ -15,6 +15,8 @@ pub(crate) mod exec_teardown_tests;
 pub(crate) mod itimer_coalesce;
 pub(crate) mod parked;
 #[cfg(test)]
+mod posix_timer_coalesce_tests;
+#[cfg(test)]
 mod parked_tests;
 pub(crate) mod pid_namespaces;
 mod pipe_wake;
@@ -1776,6 +1778,13 @@ pub struct Scheduler {
     /// Unit tests: treat every guest send as landed without a host syscall.
     #[cfg(test)]
     test_guest_sends_land: bool,
+
+    /// When set, `send_guest_signal` records each send here (target, signal,
+    /// siginfo, `thread_of`) and notes it to the discarded-at-send record as
+    /// if it landed, instead of signalling a host task.
+    #[cfg(test)]
+    pub(crate) test_sent_signals:
+        Option<Vec<(DetTid, i32, Option<signal_lists::KernelSiginfo>, Option<DetPid>)>>,
 
     /// The set each thread polling `rt_sigtimedwait` waits for: a signal in
     /// it is taken at the thread's next poll whatever its mask, so the
@@ -3906,6 +3915,8 @@ impl Scheduler {
             alarm_exec_deferred: Default::default(),
             #[cfg(test)]
             test_guest_sends_land: false,
+            #[cfg(test)]
+            test_sent_signals: None,
             sigtimedwait_sets: Default::default(),
             undelivered_scheduler_signals: Default::default(),
             thread_timer_copies: Default::default(),
@@ -9014,12 +9025,34 @@ impl Scheduler {
                 self.discard_kept_token(queue, signal as libc::c_int)
             }
         });
-        let producer = match fate {
-            discarded_at_send::SendFate::Classify(Some(
-                discarded_at_send::SignalProducer::Posix(timer),
-            )) => Some(timer),
-            _ => None,
+        // An ordinary send's record joins its list (A1): the siginfo it
+        // carries, or Linux's `SI_KERNEL` for the scheduler's own signal
+        // (`SEND_SIG_PRIV`). A timer entry's own record does not.
+        let record = match fate {
+            discarded_at_send::SendFate::Classify(_) => Some(
+                info.as_ref()
+                    .map(signal_lists::KernelSiginfo::from_user)
+                    .unwrap_or_else(|| {
+                        signal_lists::ordinary_siginfo(signal as libc::c_int, 0x80, 0, 0)
+                    }),
+            ),
+            discarded_at_send::SendFate::Kept => None,
         };
+        // Unit tests capture the send, as if it landed.
+        #[cfg(test)]
+        if let Some(sent) = self.test_sent_signals.as_mut() {
+            sent.push((
+                dettid,
+                signal as libc::c_int,
+                info.as_ref().map(signal_lists::KernelSiginfo::from_user),
+                thread_of,
+            ));
+            if let Some(token) = token {
+                self.discard_note_fate(token, fate, record);
+            }
+            self.guest_send_landed = Some(true);
+            return;
+        }
         // Whether a SIGCHLD is already pending in the shared queue, read before
         // the send: no guest thread holds the turn at a committed send, so
         // only a host-timed copy could change it (`fire_process_timer`).
@@ -9103,36 +9136,7 @@ impl Scheduler {
         if result.is_ok()
             && let Some(token) = token
         {
-            match fate {
-                // The actual ITIMER_REAL expiry keeps its origin for the
-                // reported delivery's siginfo. Its pair is not listed: an
-                // ITIMER_REAL arm ended the pair's observability.
-                discarded_at_send::SendFate::Classify(Some(
-                    discarded_at_send::SignalProducer::ItimerReal,
-                )) => self.discard_note_itimer_real(token),
-                _ => {
-                    // An ordinary send's record joins its list (A1): the
-                    // siginfo it carries, or Linux's `SI_KERNEL` for the
-                    // scheduler's own signal (`SEND_SIG_PRIV`). A timer
-                    // entry's own record does not.
-                    let record = match fate {
-                        discarded_at_send::SendFate::Classify(_) => Some(
-                            info.as_ref()
-                                .map(signal_lists::KernelSiginfo::from_user)
-                                .unwrap_or_else(|| {
-                                    signal_lists::ordinary_siginfo(
-                                        signal as libc::c_int,
-                                        0x80,
-                                        0,
-                                        0,
-                                    )
-                                }),
-                        ),
-                        discarded_at_send::SendFate::Kept => None,
-                    };
-                    self.discard_note_send(token, producer, record);
-                }
-            }
+            self.discard_note_fate(token, fate, record);
         }
         match result {
             Ok(()) if thread_of.is_none() => {

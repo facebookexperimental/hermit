@@ -40,7 +40,6 @@ use super::discarded_at_send::Consumption;
 use super::discarded_at_send::QueueId;
 use super::discarded_at_send::SendFate;
 use super::discarded_at_send::SignalProducer;
-use super::exit_on_scheduler_refusal;
 use super::kernel_signal_bit;
 use super::signal_lists::Entry;
 use super::signal_lists::FrontClass;
@@ -113,6 +112,15 @@ pub(crate) struct PendingDequeue {
     /// For a valid timer entry: the timer, the consuming thread's time, and
     /// the overrun its delivery reports.
     reconcile: Option<(i32, LogicalTime, i32)>,
+}
+
+/// End the run with a named refusal (`exit_on_scheduler_refusal`); a unit
+/// test sees it as a panic with the same text.
+fn refuse(refusal: std::fmt::Arguments<'_>) -> ! {
+    #[cfg(test)]
+    panic!("{refusal}");
+    #[cfg(not(test))]
+    super::exit_on_scheduler_refusal(&refusal)
 }
 
 /// The overrun Linux reports for a periodic timer last expired at `last`
@@ -256,7 +264,7 @@ impl Scheduler {
                     Entry::Timer(timer) => self.timer_entry_valid(&timer),
                 };
             if !single_own {
-                exit_on_scheduler_refusal(&format_args!(
+                refuse(format_args!(
                     "hermit: signal {signal} of process {process} stopped being observable (a call outside the schedule, a host-timed source, or a child's exit signal) while its pending entries in {queue:?} were {entries:?} with a {class:?} front: Linux would deliver them one by one, which the fallback cannot, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)"
                 ));
             }
@@ -268,7 +276,7 @@ impl Scheduler {
             .iter()
             .any(|producer| self.posix_timer_expiry_current(producer))
         {
-            exit_on_scheduler_refusal(&format_args!(
+            refuse(format_args!(
                 "hermit: signal {signal} of process {process} stopped being observable while a POSIX timer's ignored expiry of it is parked: Linux re-queues it when the signal stops being ignored, which the fallback cannot follow, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)"
             ));
         }
@@ -453,6 +461,7 @@ impl Scheduler {
             }
             TimerAppend::AlreadyPending => unreachable!("refreshed above"),
         }
+        debug_assert!(self.discarded_at_send.lists.invariants_hold());
     }
 
     /// The fallback (4262 design §4.12): send the expiry at the pop, with
@@ -623,7 +632,7 @@ impl Scheduler {
         let at = at.unwrap_or(self.committed_time);
         let stale = matches!(front, Entry::Timer(entry) if !self.timer_entry_valid(&entry));
         if !reported && class == FrontClass::Proxy && !stale {
-            exit_on_scheduler_refusal(&format_args!(
+            refuse(format_args!(
                 "hermit: thread {thread} took signal {signal} from {queue:?} where the backend passes it on unreported, so its siginfo cannot be replaced, and the pending record is another sender's standing for {front:?}: the guest would see that sender's siginfo, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)"
             ));
         }
@@ -783,7 +792,7 @@ impl Scheduler {
                 );
             }
             [one] => *one,
-            _ => exit_on_scheduler_refusal(&format_args!(
+            _ => refuse(format_args!(
                 "hermit: thread {thread}'s rt_sigtimedwait failed copying out a signal it dequeued, and the entries of {taken:?} all left their queues, so which one Linux took cannot be told; the run is refused (https://github.com/rrnewton/hermit/issues/4262)"
             )),
         };
@@ -903,7 +912,7 @@ impl Scheduler {
         let other_expected = self.discarded_at_send.lists.is_listed(other, signal)
             || self.discarded_at_send.is_discarded(other, signal);
         if identified_holds || other_holds != other_expected {
-            exit_on_scheduler_refusal(&format_args!(
+            refuse(format_args!(
                 "hermit: thread {thread} took signal {signal} from {queue:?}, and afterwards that queue {} the signal and {other:?} {} it, where the model of its pending entries expects {}: a producer the schedule does not see, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)",
                 if identified_holds { "still held" } else { "no longer held" },
                 if other_holds { "held" } else { "did not hold" },
@@ -941,6 +950,7 @@ impl Scheduler {
                 );
             }
         }
+        debug_assert!(self.discarded_at_send.lists.invariants_hold());
         if let Some(Entry::Timer(next)) = popped.next {
             // At a delivery the kernel sets up the handler frame before the
             // receiver can take anything else: its mask then decides the
