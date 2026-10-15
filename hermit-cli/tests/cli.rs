@@ -1485,10 +1485,10 @@ fn the_lazy_binding_check_refuses_a_bind_now_guest() {
 /// `hermit host-capabilities --cpu-profile x86-64-v3`: `Ok(())`, or the
 /// refusal reason it printed.
 fn cpu_profile_v3_qualification() -> Result<(), String> {
-    let output = hermit_command(&["host-capabilities", "--cpu-profile", "x86-64-v3"])
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit host-capabilities");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&["host-capabilities", "--cpu-profile", "x86-64-v3"]).stdin(Stdio::null()),
+    );
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     match output.status.code() {
         Some(0) => {
@@ -3044,7 +3044,7 @@ fn run_refuses_an_inherited_seccomp_filter() {
     let args = ["run", "--", "/bin/echo", "the guest ran"];
     let mut command = hermit_command(&args);
     deny_syscall(&mut command, libc::SYS_acct);
-    let output = command.stdin(Stdio::null()).output().unwrap();
+    let output = hermit_test::hermit_output(&format!("{command:?}"), command.stdin(Stdio::null()));
     let stderr = stderr(&output);
     assert_eq!(
         output.status.code(),
@@ -3088,7 +3088,7 @@ fn run_under_an_inherited_seccomp_filter_with_the_unsafe_override_is_recorded() 
     ];
     let mut command = hermit_command(&args);
     deny_syscall(&mut command, libc::SYS_acct);
-    let output = command.stdin(Stdio::null()).output().unwrap();
+    let output = hermit_test::hermit_output(&format!("{command:?}"), command.stdin(Stdio::null()));
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "the guest ran\n");
     let stderr = stderr(&output);
@@ -3424,9 +3424,7 @@ fn assert_readonly_proc_run(namespace_only: bool) {
         "--no-virtualize-cpuid",
     ]);
     args.extend_from_slice(&["--", "/bin/cat", "/proc/mounts", "/proc/self/status"]);
-    let output = readonly_proc_command(&args)
-        .output()
-        .expect("start Hermit with writable mounts denied");
+    let output = hermit_test::hermit_output("hermit run", &mut readonly_proc_command(&args));
     assert_success(&output, &args);
     let stdout = stdout(&output);
     let (mounts, status) = stdout
@@ -3498,9 +3496,7 @@ fn namespace_only_readonly_proc_warning_tolerates_closed_stderr() {
             Ok(())
         });
     }
-    let output = command
-        .output()
-        .expect("start namespace-only guest with a broken stderr pipe");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert_success(&output, &args);
     assert!(
         output.stdout.is_empty(),
@@ -3521,9 +3517,7 @@ fn namespace_only_readonly_proc_warning_tolerates_denied_statfs() {
     let mut command = hermit_command_under_host_filter(&args);
     // Deny only the diagnostic probe; container mounts must still complete.
     deny_syscall(&mut command, libc::SYS_statfs);
-    let output = command
-        .output()
-        .expect("start namespace-only guest with statfs denied");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert_success(&output, &args);
     assert!(
         output.stdout.is_empty(),
@@ -3560,7 +3554,7 @@ fn run_verify_uses_readonly_proc_after_permission_denial() {
         "--",
         "/bin/true",
     ];
-    let output = readonly_proc_command(&args).output().unwrap();
+    let output = hermit_test::hermit_output("hermit run", &mut readonly_proc_command(&args));
     assert_success(&output, &args);
     assert!(stderr(&output).contains("Success: deterministic. Determinism verified."));
     assert_eq!(
@@ -3619,9 +3613,7 @@ fn record_replay_uses_readonly_proc_after_permission_denial() {
     let _guard = hermit_run_guard();
     // Local networking would require another flags-zero mount for sysfs.
     let args = ["record", "--network=host", "--verify", "--", "/bin/true"];
-    let output = readonly_proc_command(&args)
-        .output()
-        .expect("start record/replay with writable mounts denied");
+    let output = hermit_test::hermit_output("hermit run", &mut readonly_proc_command(&args));
     assert_success(&output, &args);
     assert!(
         stderr(&output).contains("Success: replay matched recording."),
@@ -3658,7 +3650,8 @@ fn readonly_proc_metadata_detects_replay_mismatch_and_accepts_older_recordings()
         "--",
         "/bin/true",
     ];
-    let recording = readonly_proc_command(&record_args).output().unwrap();
+    let recording =
+        hermit_test::hermit_output("hermit run", &mut readonly_proc_command(&record_args));
     assert_success(&recording, &record_args);
     let id = fs::read_to_string(data.path().join("last")).unwrap();
 
@@ -3677,7 +3670,8 @@ fn readonly_proc_metadata_detects_replay_mismatch_and_accepts_older_recordings()
     );
     let hint_words = shell_words::split(&hint).unwrap();
     let hint_args: Vec<&str> = hint_words[1..].iter().map(String::as_str).collect();
-    let hinted_replay = readonly_proc_command(&hint_args).output().unwrap();
+    let hinted_replay =
+        hermit_test::hermit_output("hermit run", &mut readonly_proc_command(&hint_args));
     assert_success(&hinted_replay, &hint_args);
 
     let metadata_path = data.path().join(id.trim()).join("metadata.json");
@@ -3716,7 +3710,7 @@ fn readonly_proc_metadata_detects_replay_mismatch_and_accepts_older_recordings()
     metadata["proc_readonly"] = false.into();
     fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];
-    let replay = readonly_proc_command(&replay_args).output().unwrap();
+    let replay = hermit_test::hermit_output("hermit run", &mut readonly_proc_command(&replay_args));
     assert_success(&replay, &replay_args);
     assert!(
         stderr(&replay)
@@ -3727,7 +3721,7 @@ fn readonly_proc_metadata_detects_replay_mismatch_and_accepts_older_recordings()
 
     metadata.as_object_mut().unwrap().remove("proc_readonly");
     fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
-    let legacy = readonly_proc_command(&replay_args).output().unwrap();
+    let legacy = hermit_test::hermit_output("hermit run", &mut readonly_proc_command(&replay_args));
     assert_success(&legacy, &replay_args);
     assert!(stderr(&legacy).contains(hermit::proc_mount::READONLY_WARNING.trim()));
     assert!(!stderr(&legacy).contains("mount mode differs"));
@@ -3802,10 +3796,10 @@ fn run_rejects_subcommand_level_backend() {
             "--backend=kvm oci run busybox /bin/true",
         ),
     ] {
-        let output = Command::new(hermit_binary)
-            .args(args)
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+        let output = hermit_test::hermit_output(
+            &format!("{hermit_binary:?}"),
+            Command::new(hermit_binary).args(args),
+        );
         assert_eq!(
             output.status.code(),
             Some(2),
@@ -3869,10 +3863,10 @@ fn analyze_rejects_backend_in_its_run_arguments() {
             "hermit --backend=<BACKEND> analyze ...",
         ),
     ] {
-        let output = Command::new(hermit_binary)
-            .args(args)
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+        let output = hermit_test::hermit_output(
+            &format!("{hermit_binary:?}"),
+            Command::new(hermit_binary).args(args),
+        );
         let message = stderr(&output);
         assert_eq!(
             output.status.code(),
@@ -4035,7 +4029,7 @@ fn dbt_network_modes_preserve_the_outer_listener_and_isolate_local_runs() {
             serde_json::to_vec_pretty(&argv).unwrap(),
         )
         .unwrap();
-        let output = command.output().expect("run native outer network helper");
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         fs::write(directory.join(format!("{label}.stdout")), &output.stdout).unwrap();
         fs::write(directory.join(format!("{label}.stderr")), &output.stderr).unwrap();
         fs::write(
@@ -4147,10 +4141,10 @@ fn run_dbt_uses_the_requested_guest_environment() {
         "--",
         "/usr/bin/env",
     ];
-    let output = hermit_command(&args)
-        .env("DBT_HOST_ONLY", "must-not-leak")
-        .output()
-        .expect("failed to run DBT environment regression");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&args).env("DBT_HOST_ONLY", "must-not-leak"),
+    );
 
     assert_success(&output, &args);
     let stdout = stdout(&output);
@@ -4235,7 +4229,7 @@ fn run_dbt_binds_in_a_user_namespace_of_its_own() {
             Ok(())
         });
     }
-    let output = command.output().unwrap();
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert!(output.status.success(), "{}", stderr(&output));
     let text = stdout(&output);
     let mut lines = text.lines();
@@ -5192,10 +5186,8 @@ fn dbt_keeps_dynamorio_configuration_out_of_home() {
         "-c",
         "env | grep -c '^DYNAMORIO_' || true",
     ];
-    let output = hermit_command(&args)
-        .env("HOME", home.path())
-        .output()
-        .unwrap();
+    let output =
+        hermit_test::hermit_output("hermit run", hermit_command(&args).env("HOME", home.path()));
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "0\n");
     assert!(
@@ -5252,7 +5244,7 @@ fn run_dbt_verifies_fresh_physical_workdirs() {
             "--",
             guest.to_str().unwrap(),
         ]);
-        let output = command.output().unwrap();
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         assert!(
             output.status.success(),
             "verify {attempt}: {}",
@@ -5359,7 +5351,7 @@ fn dbt_verify_retains_captures_under_the_names_the_harness_scans_for() {
         &mut command,
         &["--", "/bin/echo", "dbt-verify-log-naming"],
     );
-    let output = command.output().expect("failed to run DBT verification");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
 
     // DELIBERATELY NOT REQUIRING a particular verdict. The subject here is the
     // NAME the captures are retained under. An earlier version of this test
@@ -5492,11 +5484,8 @@ fn dbt_verify_without_json_rejects_io_buffer_content_divergence() {
         ])
         .arg(&log_dir);
     append_hermit_args_using_outer_mount(&mut command, &["--"]);
-    let output = command
-        .arg(&guest)
-        .arg(&state)
-        .output()
-        .expect("failed to run DBT io-buffer verification");
+    let output =
+        hermit_test::hermit_output(&format!("{command:?}"), command.arg(&guest).arg(&state));
     let _ = fs::remove_file(&state);
     let stderr = strip_ansi_sgr(&stderr(&output));
 
@@ -5692,10 +5681,8 @@ fn run_verify_from_a_working_directory_under_host_tmp() {
             fs::write(directory.join(".gitignore"), "/ignored/\n").expect("fixture ignore rule");
         }
         let args = ["run", "--verify", "--", "/bin/true"];
-        let output = hermit_command(&args)
-            .current_dir(directory)
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+        let output =
+            hermit_test::hermit_output("hermit run", hermit_command(&args).current_dir(directory));
         let stderr = stderr(&output);
         assert!(
             !stderr.contains("panicked") && !stderr.contains("class=container-child-panic"),
@@ -5850,10 +5837,10 @@ fn run_ptrace_backend_engagement_from_a_working_directory_under_host_tmp() {
         "--",
         "/bin/true",
     ];
-    let output = hermit_command(&args)
-        .current_dir(directory.path())
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&args).current_dir(directory.path()),
+    );
     let stderr = stderr(&output);
     assert!(
         !stderr.contains("panicked") && !stderr.contains("class=container-child-panic"),
@@ -6084,10 +6071,10 @@ fn run_dbt_strict_returns_with_blocked_stdin_source() {
         .args(["--kill-after", "2s", "10s"])
         .arg(env!("CARGO_BIN_EXE_hermit"));
     append_hermit_args(&mut command, &args);
-    let output = command
-        .stdin(source.stdout.take().expect("sleep stdout was not piped"))
-        .output()
-        .expect("failed to run strict DBT blocked-input regression");
+    let output = hermit_test::hermit_output(
+        &format!("{command:?}"),
+        command.stdin(source.stdout.take().expect("sleep stdout was not piped")),
+    );
     let _ = source.kill();
     let _ = source.wait();
     assert_ne!(output.status.code(), Some(124), "strict DBT hung on stdin");
@@ -6127,10 +6114,7 @@ fn run_dbt_verify_returns_with_blocked_stdin_source_after_both_runs() {
     );
     command.arg(&report_path);
     append_hermit_args(&mut command, &["--", "/bin/true"]);
-    let output = command
-        .stdin(reader)
-        .output()
-        .expect("run DBT verification with held-open input");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), command.stdin(reader));
     // The writer is intentionally still open when both executions return.
     drop(writer);
     assert_ne!(
@@ -6332,9 +6316,7 @@ fn liteinst_backend_stats_report_the_guests_own_dispatch_paths() {
             .env_remove("HERMIT_LOG")
             .env_remove("HERMIT_LOG_FILE")
             .stdin(Stdio::null());
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run LiteInst Hermit with {args:?}: {error}"));
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         assert_success(&output, &args);
         assert_eq!(stdout(&output), "dispatch-stats-guest 1\n");
         stderr(&output)
@@ -6453,10 +6435,10 @@ fn run_liteinst_rejects_a_non_runtime_override_before_dispatch() {
         "--",
         "/bin/true",
     ];
-    let output = hermit_command(&args)
-        .env("HERMIT_LITEINST_TOOL_RUNTIME", &runtime)
-        .output()
-        .expect("failed to run Hermit with a false LiteInst runtime");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&args).env("HERMIT_LITEINST_TOOL_RUNTIME", &runtime),
+    );
     assert!(!output.status.success(), "{output:?}");
     let stderr = stderr(&output);
     assert!(stderr.contains("missing required export"), "{stderr}");
@@ -6477,10 +6459,10 @@ fn run_liteinst_rejects_an_inert_dso_before_dispatch() {
         "--",
         "/bin/true",
     ];
-    let output = hermit_command(&args)
-        .env("HERMIT_LITEINST_TOOL_RUNTIME", liteinst_inert_runtime())
-        .output()
-        .expect("failed to run Hermit with an inert LiteInst runtime");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&args).env("HERMIT_LITEINST_TOOL_RUNTIME", liteinst_inert_runtime()),
+    );
     assert!(!output.status.success(), "{output:?}");
     let stderr = stderr(&output);
     assert!(
@@ -6606,12 +6588,13 @@ fn run_liteinst_finds_the_runtime_staged_as_an_installed_resource() {
         inert_install.path().join("rsrcs/libdetcore_liteinst.so"),
     )
     .expect("failed to stage the inert runtime");
-    let output = hermit_command(&args)
-        .env("HERMIT_INSTALL_DIR", inert_install.path())
-        .env_remove("HERMIT_LITEINST_TOOL_RUNTIME")
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run Hermit with an inert packaged runtime");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&args)
+            .env("HERMIT_INSTALL_DIR", inert_install.path())
+            .env_remove("HERMIT_LITEINST_TOOL_RUNTIME")
+            .stdin(Stdio::null()),
+    );
     assert!(!output.status.success(), "{output:?}");
     let stderr = stderr(&output);
     assert!(
@@ -7967,9 +7950,7 @@ fn run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stderr_flags() 
         .args(["--kill-after", "2s", "60s"])
         .arg(env!("CARGO_BIN_EXE_hermit"));
     append_hermit_args(&mut command, &args);
-    let output = command
-        .output()
-        .expect("failed to run the stderr-flag determinism regression");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
 
     assert_ne!(
         output.status.code(),
@@ -8056,9 +8037,7 @@ fn run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stdout_flags() 
         .args(["--kill-after", "2s", "60s"])
         .arg(env!("CARGO_BIN_EXE_hermit"));
     append_hermit_args(&mut command, &args);
-    let output = command
-        .output()
-        .expect("failed to run the stdout-flag determinism regression");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
 
     assert_ne!(
         output.status.code(),
@@ -8096,9 +8075,7 @@ fn run_kvm_awk_mincore_probe_terminates() {
         .args(["--kill-after", "2s", "20s"])
         .arg(env!("CARGO_BIN_EXE_hermit"));
     append_hermit_args(&mut command, &args);
-    let output = command
-        .output()
-        .expect("failed to run the KVM awk mincore regression");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
 
     assert_ne!(
         output.status.code(),
@@ -8298,9 +8275,7 @@ fn run_kvm_propagates_explicit_environment() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.env("KVM_HOST_ONLY", "must-not-leak");
     append_hermit_args(&mut command, &args);
-    let output = command
-        .output()
-        .expect("failed to run the KVM guest-environment regression");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
 
     assert_success(&output, &args);
     let stdout = stdout(&output);
@@ -8749,13 +8724,14 @@ fn run_kvm_preserves_closed_standard_input() {
             &epoch_arg,
             "--",
         ];
-        let output = hermit_command(&args)
-            .arg(guest)
-            .arg(mode)
-            .current_dir(native_dir.path())
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run stdio-inode identity fixture");
+        let output = hermit_test::hermit_output(
+            "hermit run",
+            hermit_command(&args)
+                .arg(guest)
+                .arg(mode)
+                .current_dir(native_dir.path())
+                .stdin(Stdio::null()),
+        );
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{backend} {mode}");
         assert_eq!(stderr(&output), expected_stderr, "{backend} {mode}");
@@ -8796,10 +8772,8 @@ fn run_kvm_verify_does_not_write_to_standard_input() {
         ];
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
         append_hermit_args(&mut command, &args);
-        let output = command
-            .stdin(Stdio::from(stdin))
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+        let output =
+            hermit_test::hermit_output(&format!("{command:?}"), command.stdin(Stdio::from(stdin)));
 
         assert_success(&output, &args);
         assert_eq!(
@@ -9181,13 +9155,14 @@ fn namespace_only_applies_minimal_and_explicit_environment() {
          \"${NAMESPACE_ONLY_EXPLICIT-UNSET}\" \"${NAMESPACE_ONLY_HOST_ONLY-UNSET}\" \
          \"${ASAN_OPTIONS-UNSET}\" \"${LSAN_OPTIONS-UNSET}\"",
     ];
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .env("NAMESPACE_ONLY_HOST_ONLY", "must-not-leak")
-        .env("ASAN_OPTIONS", "namespace-only-host-asan")
-        .env("LSAN_OPTIONS", "namespace-only-host-lsan")
-        .args(args)
-        .output()
-        .expect("failed to run namespace-only minimal-environment regression");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .env("NAMESPACE_ONLY_HOST_ONLY", "must-not-leak")
+            .env("ASAN_OPTIONS", "namespace-only-host-asan")
+            .env("LSAN_OPTIONS", "namespace-only-host-lsan")
+            .args(args),
+    );
 
     assert_success(&output, &args);
     assert_eq!(
@@ -9214,14 +9189,15 @@ fn namespace_only_preserves_default_host_environment() {
          \"$NAMESPACE_ONLY_HOST_ONLY\" \"$NAMESPACE_ONLY_EXPLICIT\" \
          \"$ASAN_OPTIONS\" \"$LSAN_OPTIONS\"",
     ];
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .env("NAMESPACE_ONLY_HOST_ONLY", "preserved")
-        .env("ASAN_OPTIONS", "namespace-only-host-asan")
-        .env("LSAN_OPTIONS", "namespace-only-host-lsan")
-        .env("NAMESPACE_ONLY_UNRELATED_SECRET", unrelated_secret)
-        .args(args)
-        .output()
-        .expect("failed to run namespace-only host-environment regression");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .env("NAMESPACE_ONLY_HOST_ONLY", "preserved")
+            .env("ASAN_OPTIONS", "namespace-only-host-asan")
+            .env("LSAN_OPTIONS", "namespace-only-host-lsan")
+            .env("NAMESPACE_ONLY_UNRELATED_SECRET", unrelated_secret)
+            .args(args),
+    );
 
     assert_success(&output, &args);
     let guest_stdout = stdout(&output);
@@ -9311,11 +9287,12 @@ fn namespace_only_reports_invalid_process_settings() {
         "--",
         "/bin/true",
     ];
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .env("NAMESPACE_ONLY_UNRELATED_SECRET", unrelated_secret)
-        .args(workdir_args)
-        .output()
-        .expect("failed to run namespace-only bad-workdir regression");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .env("NAMESPACE_ONLY_UNRELATED_SECRET", unrelated_secret)
+            .args(workdir_args),
+    );
     assert_hermit_refusal_contains(
         &output,
         Refusal::Hermit,
@@ -9480,11 +9457,12 @@ fn sabre_rpc_socket_ignores_host_tmpdir_hidden_by_container_tmp() {
         "--",
         "/bin/true",
     ];
-    let output = hermit_command(&args)
-        .env("TMPDIR", host_tmpdir.path())
-        .env("HERMIT_SABRE_BINARY", &loader)
-        .output()
-        .expect("failed to run SaBRe nested-TMPDIR regression");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&args)
+            .env("TMPDIR", host_tmpdir.path())
+            .env("HERMIT_SABRE_BINARY", &loader),
+    );
     assert_success(&output, &args);
 
     let report: serde_json::Value = serde_json::from_slice(
@@ -9842,7 +9820,7 @@ fn a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest() {
             .env_remove("HERMIT_MANIFEST")
             .env_remove("HERMIT_EPOCH")
             .stdin(std::process::Stdio::null());
-        command.output().expect("hermit should run")
+        hermit_test::hermit_output("hermit run", &mut command)
     };
     let manifests = |data: &Path| -> Vec<PathBuf> {
         match fs::read_dir(data) {
@@ -9917,25 +9895,26 @@ fn a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest() {
     assert_eq!(stdout(&bare), stdout(&original));
     assert_eq!(fs::read(&left_log).unwrap(), original_log);
     // `hermit record list` lists syscall recordings, not manifests.
-    let list = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["record", "list", "--json"])
-        .env("HERMIT_DATA_DIR", &data)
-        .output()
-        .unwrap();
+    let list = hermit_test::hermit_output(
+        "hermit run",
+        Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args(["record", "list", "--json"])
+            .env("HERMIT_DATA_DIR", &data),
+    );
     assert!(list.status.success(), "{}", stderr(&list));
     assert_eq!(stdout(&list).trim(), "[]");
     let comparison = path("comparison.json");
-    let diff = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args([
+    let diff = hermit_test::hermit_output(
+        "hermit run",
+        Command::new(env!("CARGO_BIN_EXE_hermit")).args([
             "log-diff",
             "--canonical-info",
             "--json",
             &comparison,
             &left_log,
             &right_log,
-        ])
-        .output()
-        .expect("hermit log-diff should run");
+        ]),
+    );
     assert!(diff.status.success(), "{}", stderr(&diff));
     let verdict: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&comparison).unwrap()).unwrap();
@@ -9977,10 +9956,15 @@ fn a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest() {
         "{}",
         stderr(&replayed)
     );
-    let diff = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["log-diff", "--canonical-info", &left_log, &replay_log])
-        .output()
-        .expect("hermit log-diff should run");
+    let diff = hermit_test::hermit_output(
+        "hermit run",
+        Command::new(env!("CARGO_BIN_EXE_hermit")).args([
+            "log-diff",
+            "--canonical-info",
+            &left_log,
+            &replay_log,
+        ]),
+    );
     assert!(diff.status.success(), "{}{}", stdout(&diff), stderr(&diff));
     // An ID prefix and `run --from last-run` name the same recording.
     for args in [
@@ -10092,7 +10076,7 @@ fn a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest() {
         .env("XDG_CONFIG_HOME", &config_home)
         .env("HERMIT_MANIFEST", "always")
         .stdin(std::process::Stdio::null());
-    let output = always.output().unwrap();
+    let output = hermit_test::hermit_output(&format!("{always:?}"), &mut always);
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
     let history = manifests(&explicit);
     assert_eq!(history.len(), 1);
@@ -10544,11 +10528,12 @@ fn a_childs_exit_signal_follows_its_exec_and_clone_parent() {
 #[test]
 fn record_list_json_reports_an_empty_inventory() {
     let data_dir = tempfile::tempdir().expect("failed to create recording data directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["record", "list", "--json", "--data-dir"])
-        .arg(data_dir.path())
-        .output()
-        .expect("failed to run hermit record list");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args(["record", "list", "--json", "--data-dir"])
+            .arg(data_dir.path()),
+    );
     assert!(
         output.status.success(),
         "hermit record list failed with {}\nstdout:\n{}\nstderr:\n{}",
@@ -10569,22 +10554,24 @@ fn record_list_rejects_a_non_directory_inventory() {
     fs::write(&data_file, b"not a recording inventory")
         .expect("failed to create non-directory data path");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["record", "list", "--json", "--data-dir"])
-        .arg(&data_file)
-        .output()
-        .expect("failed to run hermit record list");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args(["record", "list", "--json", "--data-dir"])
+            .arg(&data_file),
+    );
     assert_hermit_refusal_contains(
         &output,
         Refusal::Hermit,
         &["Failed to read recording inventory", "not-a-directory"],
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["record", "clean", "--data-dir"])
-        .arg(&data_file)
-        .output()
-        .expect("failed to run hermit record clean");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args(["record", "clean", "--data-dir"])
+            .arg(&data_file),
+    );
     assert_hermit_refusal_contains(
         &output,
         Refusal::Hermit,
@@ -10629,20 +10616,20 @@ fn run_rejects_invalid_programs_with_actionable_errors() {
     let non_executable = temp.path().join("non-executable");
     fs::write(&non_executable, "#!/bin/sh\nexit 0\n").expect("failed to write program fixture");
 
-    let output = hermit_command(&["run", "--tmp=/tmp", "--"])
-        .arg(&non_executable)
-        .output()
-        .expect("failed to run hermit");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&["run", "--tmp=/tmp", "--"]).arg(&non_executable),
+    );
     assert_hermit_refusal_contains(
         &output,
         Refusal::GuestNotExecutable,
         &["is not executable", "chmod +x"],
     );
 
-    let output = hermit_command(&["run", "--tmp=/tmp", "--"])
-        .arg(temp.path())
-        .output()
-        .expect("failed to run hermit");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&["run", "--tmp=/tmp", "--"]).arg(temp.path()),
+    );
     assert_hermit_refusal_contains(
         &output,
         Refusal::GuestNotExecutable,
@@ -10657,10 +10644,10 @@ fn run_rejects_invalid_programs_with_actionable_errors() {
     permissions.set_mode(0o755);
     fs::set_permissions(&bad_shebang, permissions).expect("failed to make script executable");
 
-    let output = hermit_command(&["run", "--tmp=/tmp", "--"])
-        .arg(&bad_shebang)
-        .output()
-        .expect("failed to run hermit");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&["run", "--tmp=/tmp", "--"]).arg(&bad_shebang),
+    );
     assert_hermit_refusal_contains(
         &output,
         Refusal::Hermit,
@@ -10736,7 +10723,7 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
             "/bin/true",
         ]);
         deny_syscall(&mut command, syscall);
-        let output = command.output().expect("failed to run restricted hermit");
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         assert_hermit_refusal_contains(&output, Refusal::Hermit, &expected);
     }
 }
@@ -11190,10 +11177,8 @@ fn max_log_bytes_exits_promptly_when_perf_is_unavailable_and_stderr_is_a_full_pi
         let mut command =
             hermit_command_under_host_filter(&["run", "--timeout", "120", "--", "/bin/true"]);
         deny_syscall(&mut command, libc::SYS_perf_event_open);
-        let output = command
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run hermit without perf_event_open");
+        let output =
+            hermit_test::hermit_output(&format!("{command:?}"), command.stdin(Stdio::null()));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("--max-timeslice requires user-space perf counters"),
@@ -15545,7 +15530,8 @@ fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
         ),
     ];
     for (args, named) in cases {
-        let output = hermit_command(args).stdin(Stdio::null()).output().unwrap();
+        let output =
+            hermit_test::hermit_output("hermit run", hermit_command(args).stdin(Stdio::null()));
         let text = stderr(&output);
         assert_eq!(
             output.status.code(),
@@ -15597,10 +15583,10 @@ fn max_log_bytes_is_refused_under_no_namespace_on_the_ptrace_runtime() {
             let mut capped = vec!["--max-log-bytes=64K"];
             capped.extend(&without_flag);
 
-            let output = hermit_command(&capped)
-                .stdin(Stdio::null())
-                .output()
-                .unwrap();
+            let output = hermit_test::hermit_output(
+                "hermit run",
+                hermit_command(&capped).stdin(Stdio::null()),
+            );
             let (out, err) = (stdout(&output), stderr(&output));
             assert_eq!(
                 output.status.code(),
@@ -15620,10 +15606,10 @@ fn max_log_bytes_is_refused_under_no_namespace_on_the_ptrace_runtime() {
                 "{capped:?}: the guest ran: {out} {err}"
             );
 
-            let output = hermit_command(&without_flag)
-                .stdin(Stdio::null())
-                .output()
-                .unwrap();
+            let output = hermit_test::hermit_output(
+                "hermit run",
+                hermit_command(&without_flag).stdin(Stdio::null()),
+            );
             let (out, err) = (stdout(&output), stderr(&output));
             assert_ne!(
                 output.status.code(),
@@ -15821,10 +15807,8 @@ fn log_true_run(log: &Path, level: &str, epoch: &str) {
         "--",
         "/bin/true",
     ];
-    let output = hermit_command(&args)
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit");
+    let output =
+        hermit_test::hermit_output("hermit run", hermit_command(&args).stdin(Stdio::null()));
     assert_success(&output, &args);
 }
 
@@ -15876,9 +15860,10 @@ fn run_config_saved_by_one_run_reproduces_it() {
         .chain([save_config.as_str()])
         .chain(guest)
         .collect();
-    let first = without_implicit_hermit_inputs(&mut hermit_command(&first_args))
-        .output()
-        .unwrap();
+    let first = hermit_test::hermit_output(
+        "hermit run",
+        without_implicit_hermit_inputs(&mut hermit_command(&first_args)),
+    );
     assert_success(&first, &first_args);
 
     let saved: serde_yaml::Value =
@@ -15892,9 +15877,10 @@ fn run_config_saved_by_one_run_reproduces_it() {
 
     let second_log_arg = format!("--log-file={second_log}");
     let second_args = [second_log_arg.as_str(), "run", "--config", config.as_str()];
-    let second = without_implicit_hermit_inputs(&mut hermit_command(&second_args))
-        .output()
-        .unwrap();
+    let second = hermit_test::hermit_output(
+        "hermit run",
+        without_implicit_hermit_inputs(&mut hermit_command(&second_args)),
+    );
     assert_success(&second, &second_args);
     assert_eq!(stdout(&first).lines().count(), 2, "{}", stdout(&first));
     assert_eq!(stdout(&second), stdout(&first));
@@ -15902,9 +15888,10 @@ fn run_config_saved_by_one_run_reproduces_it() {
     assert_eq!(diff.status.code(), Some(0), "{}", stderr(&diff));
 
     let third_args: Vec<&str> = ["run"].into_iter().chain(options).chain(guest).collect();
-    let third = without_implicit_hermit_inputs(&mut hermit_command(&third_args))
-        .output()
-        .unwrap();
+    let third = hermit_test::hermit_output(
+        "hermit run",
+        without_implicit_hermit_inputs(&mut hermit_command(&third_args)),
+    );
     assert_success(&third, &third_args);
     assert_ne!(stdout(&third), stdout(&first));
 }
@@ -16010,12 +15997,13 @@ fn log_diff_does_not_count_the_epoch_notice_as_evidence() {
             "--",
             "/bin/true",
         ];
-        let output = hermit_command(&args)
-            .env_remove("HERMIT_LOG")
-            .env_remove("RUST_LOG")
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run hermit");
+        let output = hermit_test::hermit_output(
+            "hermit run",
+            hermit_command(&args)
+                .env_remove("HERMIT_LOG")
+                .env_remove("RUST_LOG")
+                .stdin(Stdio::null()),
+        );
         assert_success(&output, &args);
         let contents = std::fs::read_to_string(log).unwrap();
         // The premise: the notice is the log's only record.
@@ -16605,10 +16593,10 @@ const DAP_GUEST_LOOP_LINE: u64 = 10;
 /// `expected` in its stdout, and returns the recording id.
 fn dap_record(program: &Path, data_dir: &Path, expected: &str) -> String {
     let program_arg = program.to_str().expect("guest path should be UTF-8");
-    let recorded = hermit_command(&["record", "start", "--", program_arg])
-        .env("HERMIT_DATA_DIR", data_dir)
-        .output()
-        .expect("failed to run hermit record start");
+    let recorded = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&["record", "start", "--", program_arg]).env("HERMIT_DATA_DIR", data_dir),
+    );
     assert!(
         recorded.status.success() && String::from_utf8_lossy(&recorded.stdout).contains(expected),
         "hermit record start: {}\nstdout:\n{}\nstderr:\n{}",
@@ -20468,10 +20456,10 @@ fn ptrace_verification_reports_carry_the_exact_branch_counter_verdict() {
     let _guard = hermit_run_guard();
     let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create the branch-counter report test directory");
-    let capabilities = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["host-capabilities", "--json"])
-        .output()
-        .expect("failed to run hermit host-capabilities");
+    let capabilities = hermit_test::hermit_output(
+        "hermit run",
+        Command::new(env!("CARGO_BIN_EXE_hermit")).args(["host-capabilities", "--json"]),
+    );
     assert!(capabilities.status.success(), "{capabilities:?}");
     let expected = serde_json::from_slice::<serde_json::Value>(&capabilities.stdout)
         .expect("host-capabilities --json is JSON")["exact_branch_counter"]
@@ -20500,9 +20488,7 @@ fn ptrace_verification_reports_carry_the_exact_branch_counter_verdict() {
             "--",
             program,
         ]);
-        let output = hermit_command(&args)
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run {label}: {error}"));
+        let output = hermit_test::hermit_output("hermit run", &mut hermit_command(&args));
         let report: serde_json::Value = serde_json::from_slice(
             &fs::read(&verdict_path)
                 .unwrap_or_else(|error| panic!("{label} wrote no report: {error}")),
@@ -20639,23 +20625,25 @@ fn ptrace_keep_logs_retains_only_the_golden_log_after_a_match() {
 fn container_child_exit_is_distinguishable_from_an_ordinary_cli_error() {
     // (a) The container child dies of a fault `catch_unwind` cannot intercept,
     // so reverie reports a real typed status rather than a reported error.
-    let child_exit = hermit_command(&["run", "--strict", "--", "/bin/true"])
-        .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", "segv")
-        .output()
-        .expect("failed to run the fault-injected container child");
+    let child_exit = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&["run", "--strict", "--", "/bin/true"])
+            .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", "segv"),
+    );
     let child_exit_stderr = String::from_utf8_lossy(&child_exit.stderr).into_owned();
 
     // (c) An ordinary CLI failure: hermit cannot open the requested log file.
-    let cli_error = hermit_command(&[
-        "--log-file",
-        "/nonexistent-directory-for-hermit-cli-test/log",
-        "run",
-        "--strict",
-        "--",
-        "/bin/true",
-    ])
-    .output()
-    .expect("failed to run the unwritable-log-path case");
+    let cli_error = hermit_test::hermit_output(
+        "hermit run",
+        &mut hermit_command(&[
+            "--log-file",
+            "/nonexistent-directory-for-hermit-cli-test/log",
+            "run",
+            "--strict",
+            "--",
+            "/bin/true",
+        ]),
+    );
     let cli_error_stderr = String::from_utf8_lossy(&cli_error.stderr).into_owned();
 
     assert!(
@@ -20687,10 +20675,11 @@ fn container_child_exit_is_distinguishable_from_an_ordinary_cli_error() {
     // crosses a process boundary through `SerializableError`, which carries
     // only strings, so without the `kind` discriminant it arrives
     // indistinguishable from an ordinary reported error.
-    let child_panic = hermit_command(&["run", "--strict", "--", "/bin/true"])
-        .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", "panic")
-        .output()
-        .expect("failed to run the panic-injected container child");
+    let child_panic = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&["run", "--strict", "--", "/bin/true"])
+            .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", "panic"),
+    );
     let child_panic_stderr = String::from_utf8_lossy(&child_panic.stderr).into_owned();
     assert!(
         child_panic_stderr.contains("HERMIT_INTERNAL_FAILURE class=container-child-panic"),
@@ -20707,9 +20696,10 @@ stderr:
 
     // (b) The guest's own exit is NOT an internal failure and must carry no
     // marker at all — "hermit's exit IS the guest's exit" stays intact.
-    let guest_exit = hermit_command(&["run", "--strict", "--", "/bin/false"])
-        .output()
-        .expect("failed to run the guest-exit case");
+    let guest_exit = hermit_test::hermit_output(
+        "hermit run",
+        &mut hermit_command(&["run", "--strict", "--", "/bin/false"]),
+    );
     assert_eq!(
         guest_exit.status.code(),
         Some(1),
@@ -20776,10 +20766,10 @@ int main(void) {
         String::from_utf8_lossy(&built.stderr)
     );
 
-    let output = hermit_command(&["run", "--strict", "--proc=standard", "--"])
-        .arg(&guest)
-        .output()
-        .expect("failed to run the pipe-capacity guest under hermit");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&["run", "--strict", "--proc=standard", "--"]).arg(&guest),
+    );
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 
     assert!(
@@ -20930,14 +20920,15 @@ int main(void) {
 /// unwritable `--log-file` both returned 125 with the same class.
 #[test]
 fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
-    let missing = hermit_command(&[
-        "run",
-        "--strict",
-        "--",
-        "/no/such/program-for-hermit-cli-test",
-    ])
-    .output()
-    .expect("failed to run the missing-program case");
+    let missing = hermit_test::hermit_output(
+        "hermit run",
+        &mut hermit_command(&[
+            "run",
+            "--strict",
+            "--",
+            "/no/such/program-for-hermit-cli-test",
+        ]),
+    );
     let missing_stderr = String::from_utf8_lossy(&missing.stderr).into_owned();
     assert_eq!(
         missing.status.code(),
@@ -20956,10 +20947,10 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
     fs::write(&unexecutable, b"\x7fELF not really\n").expect("failed to write the file");
     fs::set_permissions(&unexecutable, fs::Permissions::from_mode(0o644))
         .expect("failed to drop the execute bit");
-    let denied = hermit_command(&["run", "--strict", "--"])
-        .arg(&unexecutable)
-        .output()
-        .expect("failed to run the not-executable case");
+    let denied = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&["run", "--strict", "--"]).arg(&unexecutable),
+    );
     let denied_stderr = String::from_utf8_lossy(&denied.stderr).into_owned();
     assert_eq!(
         denied.status.code(),
@@ -20980,10 +20971,11 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
     // originally written still reported `1 passed` -- the arm named for the
     // mutation did not see it. Through the fault-injected route the same mutation
     // fails here.
-    let internal = hermit_command(&["run", "--strict", "--", "/bin/true"])
-        .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", "segv")
-        .output()
-        .expect("failed to run the hermit-internal case");
+    let internal = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&["run", "--strict", "--", "/bin/true"])
+            .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", "segv"),
+    );
     let internal_stderr = String::from_utf8_lossy(&internal.stderr).into_owned();
     assert_eq!(
         internal.status.code(),
@@ -21004,16 +20996,17 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
     // unwritable `--log-file` never reaches `failure_exit_code`, so this pins the
     // constant in `main` rather than the mapping. Kept, and no longer described as
     // the arm that guards the mapping.
-    let pre_dispatch = hermit_command(&[
-        "--log-file",
-        "/nonexistent-directory-for-hermit-cli-test/log",
-        "run",
-        "--strict",
-        "--",
-        "/bin/true",
-    ])
-    .output()
-    .expect("failed to run the unwritable-log-file case");
+    let pre_dispatch = hermit_test::hermit_output(
+        "hermit run",
+        &mut hermit_command(&[
+            "--log-file",
+            "/nonexistent-directory-for-hermit-cli-test/log",
+            "run",
+            "--strict",
+            "--",
+            "/bin/true",
+        ]),
+    );
     let pre_dispatch_stderr = String::from_utf8_lossy(&pre_dispatch.stderr).into_owned();
     assert_eq!(
         pre_dispatch.status.code(),
@@ -21032,9 +21025,10 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
     );
 
     // And the guest's own exit is untouched by any of this.
-    let guest = hermit_command(&["run", "--strict", "--", "/bin/false"])
-        .output()
-        .expect("failed to run the guest-exit case");
+    let guest = hermit_test::hermit_output(
+        "hermit run",
+        &mut hermit_command(&["run", "--strict", "--", "/bin/false"]),
+    );
     assert_eq!(
         guest.status.code(),
         Some(1),
@@ -21407,11 +21401,12 @@ fn record_classifies_a_container_child_failure_the_same_way_run_does() {
         let mut args = vec!["record"];
         args.extend_from_slice(extra);
         args.extend_from_slice(&["--", "/bin/true"]);
-        let output = hermit_command(&args)
-            .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", fault)
-            .env("HERMIT_DATA_DIR", data_dir.path())
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run {args:?}: {error}"));
+        let output = hermit_test::hermit_output(
+            "hermit run",
+            hermit_command(&args)
+                .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", fault)
+                .env("HERMIT_DATA_DIR", data_dir.path()),
+        );
         String::from_utf8_lossy(&output.stderr).into_owned()
     };
 
@@ -21486,16 +21481,17 @@ fn every_record_container_site_classifies_a_child_fault_by_name() {
     // `{recording}` a `--verify-run` directory holding a completed recording
     // for the replay to replay.
     let recording = data_dir.path().join("verify-run-recording");
-    let recorded = hermit_command(&[
-        "record",
-        "--verify-run",
-        recording.to_str().unwrap(),
-        "--",
-        "/bin/true",
-    ])
-    .env("HERMIT_DATA_DIR", data_dir.path())
-    .output()
-    .expect("failed to record for the replay sites");
+    let recorded = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&[
+            "record",
+            "--verify-run",
+            recording.to_str().unwrap(),
+            "--",
+            "/bin/true",
+        ])
+        .env("HERMIT_DATA_DIR", data_dir.path()),
+    );
     assert!(
         recording.join("verify-run.json").exists(),
         "{}",
@@ -21518,12 +21514,13 @@ fn every_record_container_site_classifies_a_child_fault_by_name() {
         let mut args = vec!["record"];
         args.extend_from_slice(&extra);
         args.extend_from_slice(&["--", "/bin/true"]);
-        let output = hermit_command(&args)
-            .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", fault)
-            .env("HERMIT_TEST_CONTAINER_CHILD_FAULT_SITE", site)
-            .env("HERMIT_DATA_DIR", data_dir.path())
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run {args:?} for site {site}: {error}"));
+        let output = hermit_test::hermit_output(
+            "hermit run",
+            hermit_command(&args)
+                .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", fault)
+                .env("HERMIT_TEST_CONTAINER_CHILD_FAULT_SITE", site)
+                .env("HERMIT_DATA_DIR", data_dir.path()),
+        );
         String::from_utf8_lossy(&output.stderr).into_owned()
     };
 
@@ -21554,12 +21551,13 @@ fn every_record_container_site_classifies_a_child_fault_by_name() {
 fn a_fault_aimed_at_no_existing_site_fires_nowhere() {
     let data_dir =
         tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("failed to create a data dir");
-    let output = hermit_command(&["record", "--", "/bin/true"])
-        .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", "segv")
-        .env("HERMIT_TEST_CONTAINER_CHILD_FAULT_SITE", "no.such.site")
-        .env("HERMIT_DATA_DIR", data_dir.path())
-        .output()
-        .expect("failed to run the unaimed fault injection");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&["record", "--", "/bin/true"])
+            .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", "segv")
+            .env("HERMIT_TEST_CONTAINER_CHILD_FAULT_SITE", "no.such.site")
+            .env("HERMIT_DATA_DIR", data_dir.path()),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.contains("HERMIT_INTERNAL_FAILURE"),
@@ -22224,9 +22222,10 @@ fn a_guest_exiting_a_reserved_status_is_not_reported_as_hermit() {
         detcore_model::HERMIT_SIGINT_DEATH_EXIT,
     ] {
         let shell_command = format!("exit {code}");
-        let run = hermit_command(&["run", "--", "/bin/sh", "-c", &shell_command])
-            .output()
-            .unwrap_or_else(|e| panic!("failed to run the guest exiting {code}: {e}"));
+        let run = hermit_test::hermit_output(
+            "hermit run",
+            &mut hermit_command(&["run", "--", "/bin/sh", "-c", &shell_command]),
+        );
         let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
 
         assert_eq!(
@@ -22826,7 +22825,7 @@ fn diagnostics_survive_a_nonblocking_stderr_under_back_pressure() {
     ];
 
     // The truth to compare against, captured with an ordinary pipe.
-    let control = hermit_command(&args).output().expect("control run");
+    let control = hermit_test::hermit_output("hermit run", &mut hermit_command(&args));
     let expected = control.stderr;
     // EXIT-CLASS: hermit
     assert_eq!(
@@ -23224,7 +23223,7 @@ fn run_with_post_publication_stall(stall_ms: u64, budget_ms: Option<&str>) -> (O
         command.env("HERMIT_FINALIZE_BUDGET_MS", budget);
     }
     let started = std::time::Instant::now();
-    let output = command.output().expect("failed to run hermit");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     (output, started.elapsed())
 }
 
@@ -23316,19 +23315,20 @@ fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
     let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     for backend in ["sabre", "dbt", "kvm"] {
-        let output = hermit_command(&[
-            "--backend",
-            backend,
-            "run",
-            "--timeout",
-            "3",
-            "--",
-            "/bin/echo",
-            "unreachable",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit");
+        let output = hermit_test::hermit_output(
+            "hermit run",
+            hermit_command(&[
+                "--backend",
+                backend,
+                "run",
+                "--timeout",
+                "3",
+                "--",
+                "/bin/echo",
+                "unreachable",
+            ])
+            .stdin(Stdio::null()),
+        );
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
         // EXIT-CLASS: hermit
@@ -23365,17 +23365,18 @@ fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
 fn liteinst_in_guest_refuses_a_maximum_timeslice_before_dispatch() {
     let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let output = hermit_command(&[
-        "--backend",
-        "liteinst",
-        "run",
-        "--",
-        "/bin/echo",
-        "unreachable",
-    ])
-    .stdin(Stdio::null())
-    .output()
-    .expect("failed to run hermit");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&[
+            "--backend",
+            "liteinst",
+            "run",
+            "--",
+            "/bin/echo",
+            "unreachable",
+        ])
+        .stdin(Stdio::null()),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
     // EXIT-CLASS: hermit
@@ -23505,20 +23506,21 @@ fn liteinst_replay_with_a_conflicting_epoch_is_refused_in_every_build() {
     .expect("failed to write the preemption record");
     let replay = format!("--replay-preemptions-from={}", record.display());
 
-    let output = hermit_command(&[
-        "--backend",
-        "liteinst",
-        "run",
-        "--max-timeslice=disabled",
-        "--epoch=2001-01-01T00:00:00Z",
-        &replay,
-        "--",
-        "/bin/echo",
-        "unreachable",
-    ])
-    .stdin(Stdio::null())
-    .output()
-    .expect("failed to run hermit");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&[
+            "--backend",
+            "liteinst",
+            "run",
+            "--max-timeslice=disabled",
+            "--epoch=2001-01-01T00:00:00Z",
+            &replay,
+            "--",
+            "/bin/echo",
+            "unreachable",
+        ])
+        .stdin(Stdio::null()),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
     // EXIT-CLASS: hermit
@@ -23559,20 +23561,21 @@ fn liteinst_replay_with_a_conflicting_epoch_is_refused_in_every_build() {
 fn liteinst_verify_with_a_quiet_log_level_is_refused_in_every_build() {
     let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let output = hermit_command(&[
-        "--log=warn",
-        "--backend",
-        "liteinst",
-        "run",
-        "--max-timeslice=disabled",
-        "--verify",
-        "--",
-        "/bin/echo",
-        "unreachable",
-    ])
-    .stdin(Stdio::null())
-    .output()
-    .expect("failed to run hermit");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&[
+            "--log=warn",
+            "--backend",
+            "liteinst",
+            "run",
+            "--max-timeslice=disabled",
+            "--verify",
+            "--",
+            "/bin/echo",
+            "unreachable",
+        ])
+        .stdin(Stdio::null()),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
     // EXIT-CLASS: hermit
@@ -23658,7 +23661,7 @@ fn liteinst_verify_with_forwarded_records_under(
     if let Some(filter) = rust_log {
         command.env("RUST_LOG", filter);
     }
-    let output = command.output().expect("failed to run hermit");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert_success(&output, &args);
     let stderr = stderr(&output);
     assert!(stderr.contains("Determinism verified"), "stderr:\n{stderr}");
@@ -23822,13 +23825,14 @@ fn verify_log_of_true(backend: &str, logs: &Path) -> PathBuf {
         "--",
         "/bin/true",
     ];
-    let output = hermit_command(&args)
-        .env_remove("RUST_LOG")
-        .env_remove("HERMIT_LOG")
-        .env_remove("HERMIT_LOG_FILE")
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&args)
+            .env_remove("RUST_LOG")
+            .env_remove("HERMIT_LOG")
+            .env_remove("HERMIT_LOG_FILE")
+            .stdin(Stdio::null()),
+    );
     assert_success(&output, &args);
     let golden: Vec<_> = fs::read_dir(logs)
         .unwrap()
@@ -24019,13 +24023,14 @@ __attribute__((constructor)) static void replace_tool_output(void) {
         "--",
         guest,
     ];
-    let output = hermit_command(&args)
-        .env_remove("RUST_LOG")
-        .env_remove("HERMIT_LOG")
-        .env_remove("HERMIT_LOG_FILE")
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&args)
+            .env_remove("RUST_LOG")
+            .env_remove("HERMIT_LOG")
+            .env_remove("HERMIT_LOG_FILE")
+            .stdin(Stdio::null()),
+    );
     let stderr = stderr(&output);
     assert!(!output.status.success(), "the run was accepted:\n{stderr}");
     assert!(
@@ -24074,14 +24079,15 @@ fn liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result() {
         "-c",
         "i=0; while [ $i -lt 200 ]; do echo x > /dev/null; i=$((i+1)); done; echo capped",
     ];
-    let output = hermit_command(&args)
-        .env_remove("RUST_LOG")
-        .env_remove("HERMIT_LOG")
-        .env_remove("HERMIT_LOG_FILE")
-        .env("HERMIT_LOG_MAX_BYTES", "50000")
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&args)
+            .env_remove("RUST_LOG")
+            .env_remove("HERMIT_LOG")
+            .env_remove("HERMIT_LOG_FILE")
+            .env("HERMIT_LOG_MAX_BYTES", "50000")
+            .stdin(Stdio::null()),
+    );
     let stderr = stderr(&output);
     assert!(!output.status.success(), "stderr:\n{stderr}");
     assert!(
@@ -24192,17 +24198,18 @@ fn liteinst_in_guest_refuses_a_statically_linked_guest() {
     assert_eq!(native.stdout, b"RAN\n", "native run");
 
     let guest_arg = guest.to_str().expect("UTF-8 temporary path");
-    let output = hermit_command(&[
-        "--backend",
-        "liteinst",
-        "run",
-        "--max-timeslice=disabled",
-        "--",
-        guest_arg,
-    ])
-    .stdin(Stdio::null())
-    .output()
-    .expect("failed to run hermit");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&[
+            "--backend",
+            "liteinst",
+            "run",
+            "--max-timeslice=disabled",
+            "--",
+            guest_arg,
+        ])
+        .stdin(Stdio::null()),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
     // EXIT-CLASS: hermit
@@ -24328,10 +24335,10 @@ fn liteinst_in_guest_runs_detcore_without_a_ptrace_tracer() {
             .unwrap_or_else(|| panic!("no TracerPid line in:\n{status}"))
     };
 
-    let output = command_for("liteinst", &["/bin/echo", "hello", "in-guest"])
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        command_for("liteinst", &["/bin/echo", "hello", "in-guest"]).stdin(Stdio::null()),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         output.status.success(),
@@ -25286,11 +25293,12 @@ fn run_timeout_refusal_does_not_depend_on_backend_availability() {
             args.extend(["--timeout", "3"]);
         }
         args.extend(["--", "/bin/echo", "unreachable"]);
-        let output = hermit_command(&args)
-            .env("HERMIT_SABRE_BINARY", missing_loader)
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run hermit");
+        let output = hermit_test::hermit_output(
+            "hermit run",
+            hermit_command(&args)
+                .env("HERMIT_SABRE_BINARY", missing_loader)
+                .stdin(Stdio::null()),
+        );
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         (output, stderr)
     };
@@ -32881,7 +32889,7 @@ fn verify_tmpdir_does_not_reach_the_guest_environment() {
             Some(path) => command.env("HERMIT_VERIFY_TMPDIR", path),
             None => command.env_remove("HERMIT_VERIFY_TMPDIR"),
         };
-        let output = command.output().expect("run hermit");
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         assert!(
             output.status.success(),
             "{}",
@@ -32964,11 +32972,12 @@ fn an_unusable_verify_tmpdir_is_a_clean_error_naming_the_variable() {
         &["run", "--verify", "--", "/bin/true"][..],
         &["record", "start", "--verify", &data_dir, "--", "/bin/true"][..],
     ] {
-        let output = hermit_command(args)
-            .env("HERMIT_VERIFY_TMPDIR", &missing)
-            .stdin(Stdio::null())
-            .output()
-            .expect("run hermit");
+        let output = hermit_test::hermit_output(
+            "hermit run",
+            hermit_command(args)
+                .env("HERMIT_VERIFY_TMPDIR", &missing)
+                .stdin(Stdio::null()),
+        );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{args:?} succeeded: {stderr}");
         assert_ne!(
@@ -33321,10 +33330,8 @@ fn a_blocking_fifo_open_waits_for_its_peer_without_holding_the_turn() {
             }
             args.extend(["--verify", "--verify-strict", "--"]);
             args.extend(program);
-            let output = hermit_command(&args)
-                .current_dir(dir)
-                .output()
-                .expect("failed to run hermit");
+            let output =
+                hermit_test::hermit_output("hermit run", hermit_command(&args).current_dir(dir));
             assert_success(&output, &args);
             assert_eq!(stdout(&output), expected, "{args:?}");
             assert!(
@@ -33834,10 +33841,8 @@ fn a_blocking_fifo_open_beside_a_pipeline_waits_for_its_writer() {
             "-c",
             "mkfifo f; (head -c 1000000 /dev/zero | cat > /dev/null; echo done > f) & cat f; wait; rm f",
         ]);
-        let output = hermit_command(&args)
-            .current_dir(&scratch)
-            .output()
-            .expect("failed to run hermit");
+        let output =
+            hermit_test::hermit_output("hermit run", hermit_command(&args).current_dir(&scratch));
         assert_success(&output, &args);
         assert_eq!(stdout(&output), "done\n", "{args:?}");
         assert!(
