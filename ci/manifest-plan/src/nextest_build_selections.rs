@@ -167,6 +167,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "leveldb",
             "--test",
+            "lit",
+            "--test",
             "madvise",
             "--test",
             "meminfo_determinism",
@@ -848,6 +850,7 @@ mod tests {
             // (https://github.com/rrnewton/hermit/issues/4278), and
             // signal_determinism's DBT unfenceable-SIGKILL refusal test
             // (https://github.com/rrnewton/hermit/issues/4411).
+            // Plus lit's 18 runner and FileCheck-matcher tests.
             // The local node runs in shards, which together execute the same.
             let executed = |tag: &str| -> u64 {
                 let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
@@ -861,7 +864,7 @@ mod tests {
             } else {
                 executed(tag)
             };
-            assert_eq!(population, 461);
+            assert_eq!(population, 479);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
