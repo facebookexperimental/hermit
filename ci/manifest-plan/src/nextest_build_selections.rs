@@ -143,6 +143,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "inode_nr_determinism",
             "--test",
+            "integration_matrix",
+            "--test",
             "io_uring_ring_determinism",
             "--test",
             "ipc_determinism",
@@ -152,6 +154,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "kernel_keyring",
             "--test",
             "key_users_determinism",
+            "--test",
+            "kvm_harder",
             "--test",
             "kvm_lifecycle_timing_log_level",
             "--test",
@@ -241,6 +245,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "self_schedstat_determinism",
             "--test",
+            "sigmask_preemption",
+            "--test",
             "signal_determinism",
             "--test",
             "smaps_determinism",
@@ -260,6 +266,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "softnet_stat_determinism",
             "--test",
             "sqlite_veryquick",
+            "--test",
+            "stress_suite",
             "--test",
             "swaps_determinism",
             "--test",
@@ -817,7 +825,10 @@ mod tests {
             // two mount-propagation tests
             // (https://github.com/rrnewton/hermit/issues/4167), plus the four DBT
             // and ptrace exec owner-death tests
-            // (https://github.com/rrnewton/hermit/issues/4268).
+            // (https://github.com/rrnewton/hermit/issues/4268), plus
+            // integration_matrix's one, kvm_harder's four, sigmask_preemption's
+            // one and stress_suite's two non-ignored tests
+            // (https://github.com/rrnewton/hermit/issues/2791).
             // The local node runs in shards, which together execute the same.
             let executed = |tag: &str| -> u64 {
                 let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
@@ -831,7 +842,7 @@ mod tests {
             } else {
                 executed(tag)
             };
-            assert_eq!(population, 413);
+            assert_eq!(population, 421);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

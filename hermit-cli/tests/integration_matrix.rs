@@ -20,6 +20,11 @@ use std::time::Instant;
 const GUEST_FIXTURE: &str = "/tmp/integration-matrix";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 const EXPECTED_FAIL_TIMEOUT_SECONDS: u64 = 5;
+// Each case's two runs are separate Hermit processes compared byte for byte,
+// so they share one epoch: a host-drawn one differs per run, and Hermit then
+// reports the recording it saved on stderr
+// (https://github.com/rrnewton/hermit/issues/4321).
+const EPOCH: &str = "--epoch=2026-01-01T00:00:00Z";
 
 #[derive(Clone, Copy, Debug)]
 enum Expectation {
@@ -341,6 +346,7 @@ fn run_case(case: &Case, fixture: &Fixture) -> TimedRun {
             "--base-env=minimal",
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
+            EPOCH,
         ])
         .arg(format!("--bind={}:{GUEST_FIXTURE}", fixture.root.display()))
         .arg("--")

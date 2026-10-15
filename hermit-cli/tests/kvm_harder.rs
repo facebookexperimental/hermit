@@ -118,8 +118,61 @@ fn kvm_matches_ptrace_for_prefilled_pipe_across_fork() {
     );
 }
 
+/// What `tests/c/mountinfo_device_identity.c` printed: the fields of the first
+/// mountinfo row, and the device of `/` from stat and from statx.
+#[derive(Debug, PartialEq)]
+struct MountinfoProbe {
+    row: Vec<String>,
+    stat: String,
+    statx: String,
+}
+
+impl MountinfoProbe {
+    fn parse(stdout: &[u8]) -> Self {
+        let text = std::str::from_utf8(stdout).expect("mountinfo probe output should be UTF-8");
+        let field = |prefix: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(prefix))
+                .unwrap_or_else(|| panic!("probe omitted {prefix:?}:\n{text}"))
+                .to_owned()
+        };
+        Self {
+            row: field("MOUNTINFO ")
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
+            stat: field("STAT "),
+            statx: field("STATX "),
+        }
+    }
+
+    /// The row's device, the third field.
+    fn device(&self) -> &str {
+        &self.row[2]
+    }
+}
+
+fn run_mountinfo_probe(backend: &str, run_args: &[&str], guest: &Path) -> Vec<u8> {
+    let output = Command::new("timeout")
+        .args(["--kill-after", "10s", "90s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--backend", backend, "run"])
+        .args(run_args)
+        .args(["--tmp=/tmp", "--"])
+        .arg(guest)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run the mountinfo probe on {backend}: {error}"));
+    assert!(
+        output.status.success(),
+        "{backend} {run_args:?} mountinfo probe failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    output.stdout
+}
+
 #[test]
-fn kvm_mountinfo_uses_its_synthetic_namespace_identity() {
+fn kvm_mountinfo_matches_ptrace_and_keeps_the_linux_device_relation() {
     if !Path::new("/dev/kvm").exists() {
         return;
     }
@@ -131,46 +184,49 @@ fn kvm_mountinfo_uses_its_synthetic_namespace_identity() {
         "tests/c/mountinfo_device_identity.c",
         &[],
     );
-    let run = || {
-        let mut command = Command::new("timeout");
-        command
-            .args(["--kill-after", "10s", "90s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
-            .args(["--backend", "kvm", "run", "--strict", "--tmp=/tmp", "--"])
-            .arg(&guest);
-        let output = command.output().expect("run KVM mountinfo guest");
-        assert!(
-            output.status.success(),
-            "KVM mountinfo failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+    // Linux's own answer in the same container, with host device numbers.
+    // Whether the root row's device equals stat's is a property of the host
+    // filesystem: on btrfs, stat reports the subvolume's anonymous device and
+    // mountinfo the superblock's, so they differ natively.
+    let native = MountinfoProbe::parse(&run_mountinfo_probe(
+        "ptrace",
+        &["--no-virtualize-metadata"],
+        &guest,
+    ));
+    let strict = |backend: &str| {
+        let first = run_mountinfo_probe(backend, &["--strict"], &guest);
+        let second = run_mountinfo_probe(backend, &["--strict"], &guest);
+        assert_eq!(
+            first, second,
+            "{backend} mountinfo changed between strict runs"
         );
-        output.stdout
+        MountinfoProbe::parse(&first)
     };
-    let first = run();
-    let second = run();
-    assert_eq!(first, second, "KVM mountinfo changed between strict runs");
-    let text = std::str::from_utf8(&first).expect("KVM probe output should be UTF-8");
-    let mountinfo = text
-        .lines()
-        .find_map(|line| line.strip_prefix("MOUNTINFO "))
-        .expect("probe omitted mountinfo row");
-    let fields = mountinfo.split_whitespace().collect::<Vec<_>>();
-    assert_eq!(&fields[..2], ["1", "2"]);
-    assert_eq!(
-        &fields[3..],
-        ["/", "/", "rw", "-", "rootfs", "rootfs", "rw"]
-    );
-    let stat_device = text
-        .lines()
-        .find_map(|line| line.strip_prefix("STAT "))
-        .expect("probe omitted stat device");
-    let statx_device = text
-        .lines()
-        .find_map(|line| line.strip_prefix("STATX "))
-        .expect("probe omitted statx device");
-    assert_eq!(fields[2], stat_device, "mountinfo disagreed with stat");
-    assert_eq!(fields[2], statx_device, "mountinfo disagreed with statx");
+    let ptrace = strict("ptrace");
+    let kvm = strict("kvm");
+    for (backend, view) in [("ptrace", &ptrace), ("kvm", &kvm)] {
+        // Detcore numbers mount IDs by first observation, so the first row
+        // the guest reads is mount 1; everything after the IDs is Linux's.
+        assert_eq!(view.row[0], "1", "{backend}: {view:?}");
+        assert_eq!(view.row[3..], native.row[3..], "{backend}: {view:?}");
+        assert_eq!(view.stat, view.statx, "{backend}: {view:?}");
+        assert_eq!(
+            view.device() == view.stat,
+            native.device() == native.stat,
+            "{backend} changed whether mountinfo and stat name one device: \
+             {view:?} against native {native:?}"
+        );
+    }
+    // KVM gives the same view as ptrace, except the row's device number. The
+    // probe's stdio fstats the open mountinfo file before reading it. KVM's
+    // own /proc gives that file a device of its own, and the fstat takes one
+    // more run-global device number on KVM than on ptrace, so the row's
+    // device is numbered one later (reading before the fstat numbers it alike).
+    // https://github.com/rrnewton/hermit/issues/4282 removes KVM's own /proc;
+    // compare the whole view then.
+    assert_eq!(kvm.row[..2], ptrace.row[..2]);
+    assert_eq!(kvm.row[3..], ptrace.row[3..]);
+    assert_eq!((&kvm.stat, &kvm.statx), (&ptrace.stat, &ptrace.statx));
     // This is output/status evidence only; KVM does not expose comparable INFO
     // logs for a full L2 claim, and the first-observation policy is not a
     // cross-machine promise.
