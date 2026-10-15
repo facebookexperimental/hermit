@@ -127,6 +127,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "first_seen_mtime",
             "--test",
+            "flock_exclusion",
+            "--test",
             "fp_reduction_determinism",
             "--test",
             "full_summary_futex_order",
@@ -828,7 +830,9 @@ mod tests {
             // (https://github.com/rrnewton/hermit/issues/4268), plus
             // integration_matrix's one, kvm_harder's four, sigmask_preemption's
             // one and stress_suite's two non-ignored tests
-            // (https://github.com/rrnewton/hermit/issues/2791).
+            // (https://github.com/rrnewton/hermit/issues/2791), plus
+            // flock_exclusion's 23 (its 24th is ignored until
+            // https://github.com/rrnewton/hermit/issues/4173 is fixed).
             // The local node runs in shards, which together execute the same.
             let executed = |tag: &str| -> u64 {
                 let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
@@ -842,7 +846,7 @@ mod tests {
             } else {
                 executed(tag)
             };
-            assert_eq!(population, 421);
+            assert_eq!(population, 444);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
