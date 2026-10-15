@@ -3059,6 +3059,13 @@ impl GlobalState {
             GlobalRequest::ThreadIsLive(dtid) => {
                 R::ThreadIsLive(self.lock_rpc_scheduler(false).await.thread_is_live(dtid))
             }
+            GlobalRequest::ParentDeathSignal(arm) => {
+                let mut sched = self.lock_rpc_scheduler(false).await;
+                if let Some(signal) = arm {
+                    sched.set_parent_death_signal(dtid, signal);
+                }
+                R::ParentDeathSignal(sched.parent_death_signal(dtid))
+            }
             GlobalRequest::ThreadIdRefused(id) => {
                 let (registered, zombie) = {
                     let sched = self.lock_rpc_scheduler(false).await;
@@ -5115,6 +5122,10 @@ pub enum GlobalRequest {
     /// the given process lists (`Scheduler::procfs_listing`). Appended after
     /// `ThreadIdRefused`, for the same reason.
     ProcfsListing(Option<DetPid>),
+    /// Arm (`Some`, 0 disarms) or read (`None`) the sender's parent-death
+    /// signal that Detcore sends itself (`parent_death_signal`). Appended
+    /// after `ProcfsListing`, for the same reason.
+    ParentDeathSignal(Option<i32>),
 }
 
 /// Responses from the global object
@@ -5267,6 +5278,8 @@ pub enum GlobalResponse {
     ThreadIdRefused(bool),
     /// Appended after `ThreadIdRefused`, for the same reason.
     ProcfsListing(crate::procfs::listing::ListingFacts),
+    /// Appended after `ProcfsListing`, for the same reason.
+    ParentDeathSignal(i32),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -6809,6 +6822,23 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ThreadIdRefused(dettid)).await;
     match response.1 {
         GlobalResponse::ThreadIdRefused(refused) => refused,
+        _ => unreachable!(),
+    }
+}
+
+/// Arm (`Some(signal)`, 0 disarms) or read (`None`) the calling task's
+/// parent-death signal that Detcore sends itself when its parent thread
+/// leaves (`Scheduler::deliver_parent_death_signals`,
+/// https://github.com/rrnewton/hermit/issues/4440). Returns the value held
+/// after the call.
+pub(crate) async fn parent_death_signal<G, T>(guest: &mut G, arm: Option<i32>) -> i32
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::ParentDeathSignal(arm)).await;
+    match response.1 {
+        GlobalResponse::ParentDeathSignal(signal) => signal,
         _ => unreachable!(),
     }
 }

@@ -641,8 +641,13 @@ impl ChildExitSigchldLedger {
         let deliver = self.settle_sends(parent, &sends);
         // A guest's copy queued first keeps its siginfo, as Linux keeps the
         // first-queued copy's (the Claude re-check of
-        // <https://github.com/rrnewton/hermit/pull/4131>).
-        let deliver = if sends.first() == Some(&WindowSend::Guest) {
+        // <https://github.com/rrnewton/hermit/pull/4131>), and so does a
+        // scheduler copy that names no child, such as a parent-death SIGCHLD
+        // (<https://github.com/rrnewton/hermit/issues/4440>).
+        let deliver = if matches!(
+            sends.first(),
+            Some(WindowSend::Guest | WindowSend::Scheduler)
+        ) {
             None
         } else {
             deliver

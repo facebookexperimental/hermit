@@ -202,6 +202,7 @@ static SIGSUSPEND_SHARED_MASK_REWRITE_GUEST: OnceLock<PathBuf> = OnceLock::new()
 static SIGSUSPEND_SHARED_STACK_MASK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_ONCE_PER_CHILD_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE3_SET_TID_REUSE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PARENT_DEATH_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_PIDFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHILD_WAIT_DEADLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_THEN_SIBLING_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -2115,6 +2116,32 @@ fn child_wait_deadlock_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "child-wait-deadlock guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn parent_death_signal_guest() -> &'static Path {
+    PARENT_DEATH_SIGNAL_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("parent-death-signal");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the parent-death-signal guest directory");
+        let guest = build_root.join("parent_death_signal");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/parent_death_signal.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the parent-death-signal guest");
+        assert!(
+            output.status.success(),
+            "parent-death-signal guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -27057,8 +27084,11 @@ fn a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux() {
 ///   in a `PROT_NONE` page, which Linux answers EFAULT (the tracer's
 ///   `/proc/<tid>/mem` would force-read it; the page's protection decides);
 /// - an armed host-timed source (an `F_SETOWN_EX` thread owner, an `F_SETOWN`
-///   pid owner, a sibling's armed and disarmed parent-death signal, a sent
-///   SIGTSTP) whose signals the sender blocks;
+///   pid owner, a sent SIGTSTP) whose signals the sender blocks;
+/// - a sibling's armed and disarmed parent-death signal, blocked or not: Detcore
+///   sends a parent-death signal itself when the parent thread leaves, so it is
+///   no host-timed source (https://github.com/rrnewton/hermit/issues/4440;
+///   before, the unblocked case was refused);
 /// - SIGTERM after a thread took the SIGHUP of an expired POSIX timer (the
 ///   scheduler's copy); after a child's SIGHUP was already pending when the
 ///   timer expired (Hermit emulates the timer with `kill()`, so its copy merges
@@ -27101,6 +27131,7 @@ fn a_signal_to_the_senders_own_process_goes_to_the_sender_at_bitwise_parity() {
         (vec!["owner_tid", "blocked"], delivered("owner_tid", 10)),
         (vec!["owner_pid", "blocked"], delivered("owner_pid", 10)),
         (vec!["pdeathsig", "blocked"], delivered("pdeathsig", 10)),
+        (vec!["pdeathsig"], delivered("pdeathsig", 10)),
         (vec!["stop", "blocked"], delivered("stop", 10)),
         (vec!["timer_taken"], delivered("timer_taken", 15)),
         (vec!["merged"], delivered("merged", 15)),
@@ -27388,8 +27419,8 @@ fn a_scheduler_signal_left_in_the_shared_queue_refuses_a_send_after_another_copy
 ///   caught, are outside the seven admitted signals;
 /// - SIGTERM with its default, fatal, disposition;
 /// - armed host-timed sources the sender does not block: an `F_SETOWN_EX`
-///   thread owner with `F_SETSIG(SIGUSR2)`, an `F_SETOWN` pid owner, a sibling's
-///   armed and disarmed parent-death signal, a sent SIGTSTP (the orphaned
+///   thread owner with `F_SETSIG(SIGUSR2)`, an `F_SETOWN` pid owner, a sent
+///   SIGTSTP (the orphaned
 ///   process group's SIGHUP and SIGCONT), and a raw clone child with SIGUSR2 as
 ///   its exit signal, which stays recorded after the child is reaped;
 /// - a signalfd in the process;
@@ -27460,7 +27491,6 @@ fn each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name() {
         (vec!["default"], "the signal has its default disposition"),
         (vec!["owner_tid"], armed),
         (vec!["owner_pid"], armed),
-        (vec!["pdeathsig"], armed),
         (vec!["stop"], armed),
         (vec!["exit_signal"], armed),
         (vec!["exit_signal", "reaped"], armed),
@@ -29293,6 +29323,75 @@ fn a_wait_for_a_child_that_cannot_exit_is_a_deadlock() {
         let (code, stdout, log) = run(mode);
         assert_eq!(code, Some(0), "{mode}: {stdout}\n{log}");
         assert_eq!(stdout, expected, "{mode}: {log}");
+    }
+}
+
+/// A parent-death signal (`prctl(PR_SET_PDEATHSIG)`) reaches the child when
+/// its parent thread leaves, as on Linux: the thread that forked it (while
+/// its process lives on), or a middle process whose orphan a subreaper
+/// adopts, also when the thread is torn down by its process's exit_group. Its
+/// default action ends a paused child, and a caught one wakes the pause and
+/// runs its handler; `PR_GET_PDEATHSIG` reads it back, a forked child starts
+/// with none, and an invalid value leaves the armed one. A thread that execs
+/// survives as its process's leader, so its children are sent nothing. Before, the kernel sent it at a host-timed
+/// moment that Hermit held off the child's wait, so the run hung until the
+/// timeout (https://github.com/rrnewton/hermit/issues/4440). Each mode at L2
+/// (ptrace).
+#[test]
+fn a_parent_death_signal_reaches_the_child_when_its_parent_thread_leaves() {
+    let guest = parent_death_signal_guest().to_str().unwrap().to_owned();
+    for (mode, expected) in [
+        ("term", "term: child signal 15\n"),
+        ("caught", "caught: child exit 7\n"),
+        ("get", "get: 10, child 0\n"),
+        ("subreaper", "subreaper: child signal 15\n"),
+        ("group", "group: child signal 15\n"),
+        ("exec", "exec: child exit 0\n"),
+        (
+            "invalid",
+            "invalid: get 15 einval 1\ninvalid: child signal 15\n",
+        ),
+    ] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let verdict_arg = format!("--verify-json={}", verdict.display());
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                verdict_arg.as_str(),
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}: {stdout}\n{log}"
+        );
+        assert_eq!(stdout, expected, "{mode}: {log}");
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(&verdict)
+                .unwrap_or_else(|error| panic!("{mode}: no verdict: {error}\n{log}")),
+        )
+        .unwrap_or_else(|error| panic!("{mode}: unreadable verdict: {error}"));
+        let compared = &report["compared_log_messages"];
+        assert!(
+            report["bitwise_parity"] == true
+                && compared["left"].as_u64().is_some_and(|count| count > 0)
+                && compared["left"] == compared["right"],
+            "{mode}: no bitwise parity over equal, nonzero INFO counts: {report}\n{log}"
+        );
     }
 }
 

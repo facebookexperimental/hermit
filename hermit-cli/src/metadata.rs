@@ -597,7 +597,13 @@ impl RecordVersion {
 // pidfd_send_signal through it is forwarded and recorded where Detcore
 // answered EBADF without recording anything. An older recording holding such
 // a send would replay out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x161);
+// 0x161 -> 0x162 (taken at land time, HIGHEST_SHIPPED + 1; reserved as
+// 0x163): Detcore sends a parent-death signal (PR_SET_PDEATHSIG with a
+// standard signal other than SIGKILL, SIGSTOP and SIGALRM) itself when the
+// parent thread leaves, and arms the kernel with 0
+// (https://github.com/rrnewton/hermit/issues/4440). An older recording of
+// such a prctl or of the kernel's signal would replay out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x162);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -622,7 +628,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x161);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x161;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x162;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1628,6 +1634,15 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_reused_set_tid_is_refused() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15d)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x162 may hold a PR_SET_PDEATHSIG the kernel
+    /// armed and a parent-death signal it sent; Detcore now sends it
+    /// (https://github.com/rrnewton/hermit/issues/4440).
+    #[test]
+    fn record_version_rejects_streams_from_before_parent_death_signals_are_sent_by_detcore() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x161)));
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 

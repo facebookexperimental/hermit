@@ -1267,6 +1267,12 @@
       "why": "tests/c/own_process_signal.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests a_signal_to_the_senders_own_process_goes_to_the_sender_at_bitwise_parity and each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name compile this guest, which sends kill or rt_sigqueueinfo to its own two-threaded process in one mode per admitted case and per named refusal, and require Linux's output at bitwise parity for each admitted mode and the named refusal for each other (https://github.com/rrnewton/hermit/issues/4034); it remains a guest fixture because a generic manifest cannot assert these exact outputs, refusal reasons or verdicts."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/parent_death_signal.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/parent_death_signal.c is owned by hermit-cli/tests/cli.rs: a parent-death signal armed with prctl(PR_SET_PDEATHSIG) must reach the child when its parent thread leaves (a creating thread whose process lives on, or a middle process whose orphan a subreaper adopts), ending a paused child by default or waking it into a handler, and PR_GET_PDEATHSIG must read it back with a forked child starting at none (https://github.com/rrnewton/hermit/issues/4440). It remains a fixture because the integration test checks each mode's stdout at L2."
+    },
+    {
       "disposition": "suite-helper",
       "path": "tests/c/parity_probe.h",
       "runner": "tests/c/fixture_mutation.py",

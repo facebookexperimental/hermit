@@ -86,6 +86,24 @@ fn seccomp_result(op: u32, flags: u32, has_args: bool) -> Result<i64, Errno> {
     Err(Errno::EOPNOTSUPP)
 }
 
+/// Whether Detcore sends parent-death signals itself
+/// (https://github.com/rrnewton/hermit/issues/4440): only where a thread's
+/// exit reaches the scheduler in order (sequentialized threads) and the
+/// guest's tasks are host tasks it can signal (ptrace).
+fn emulates_parent_death_signal(config: &crate::config::Config) -> bool {
+    config.sequentialize_threads && config.backend_supports_blocked_wait_signal_interruption
+}
+
+/// Whether parent-death signal `signal` is one Detcore sends itself: a
+/// standard signal (1 to 31) other than SIGKILL and SIGSTOP, which the
+/// kernel keeps acting on as before (a SIGKILL'd child is never counted as
+/// stuck, `Scheduler::child_is_stuck`), and SIGALRM, whose scheduler sends go
+/// to the process's alarm ledger.
+fn detcore_sends_parent_death_signal(signal: libc::c_ulong) -> bool {
+    (1..=31).contains(&signal)
+        && ![libc::SIGKILL, libc::SIGSTOP, libc::SIGALRM].contains(&(signal as libc::c_int))
+}
+
 fn is_supported_prctl_option(option: libc::c_int) -> bool {
     matches!(
         option,
@@ -482,10 +500,55 @@ impl<T: RecordOrReplay> Detcore<T> {
             // does not remove it (`Scheduler::record_host_timed_signals`). Linux
             // accepts 0 (disarm) and 1 to 64; anything else fails with EINVAL in
             // the kernel and arms nothing.
+            // A parent-death signal Detcore sends itself is held by Detcore,
+            // not the kernel (armed with 0); any other comes from the kernel.
+            libc::PR_GET_PDEATHSIG if emulates_parent_death_signal(guest.config()) => {
+                let held = crate::tool_global::parent_death_signal(guest, None).await;
+                if held == 0 {
+                    return self.passthrough(guest, call.into()).await;
+                }
+                let target =
+                    AddrMut::<libc::c_int>::from_raw(call.arg2() as usize).ok_or(Errno::EFAULT)?;
+                guest
+                    .memory()
+                    .write_value(target, &held)
+                    .map_err(|_| Errno::EFAULT)?;
+                Ok(0)
+            }
             libc::PR_SET_PDEATHSIG => {
                 let signal = call.arg2();
                 if signal == libc::SIGALRM as libc::c_ulong {
                     refuse_sigalrm(guest, SigalrmControl::ArmProducer).await?;
+                }
+                // A signal Detcore sends itself when the parent thread leaves
+                // (`Scheduler::deliver_parent_death_signals`,
+                // https://github.com/rrnewton/hermit/issues/4440): the kernel
+                // is armed with 0, so it never posts a copy of its own at a
+                // host-timed moment, and Detcore keeps the value. Any other
+                // value takes the kernel's path below, and disarms Detcore's
+                // only once the kernel has accepted it (an invalid one, which
+                // the kernel refuses with EINVAL, changes nothing).
+                let emulated = emulates_parent_death_signal(guest.config());
+                if emulated && (signal == 0 || detcore_sends_parent_death_signal(signal)) {
+                    // The call is Detcore's, not recorded: replay decides it
+                    // the same way. The kernel may hold a value an earlier
+                    // kernel-path call armed, which this one replaces, so it
+                    // is disarmed (retried if interrupted). Detcore's record
+                    // changes first: a parent that dies at a host-timed moment
+                    // between the two then sends the new signal and the old
+                    // (a death just before the call, on Linux, sends the old,
+                    // which a fatal old one makes the outcome), never neither.
+                    // A disarm that fails restores Detcore's previous value.
+                    let previous = crate::tool_global::parent_death_signal(guest, None).await;
+                    crate::tool_global::parent_death_signal(guest, Some(signal as i32)).await;
+                    if let Err(errno) = guest
+                        .inject_with_retry(syscalls::Syscall::from(call.with_arg2(0)))
+                        .await
+                    {
+                        crate::tool_global::parent_death_signal(guest, Some(previous)).await;
+                        return Err(errno.into());
+                    }
+                    return Ok(0);
                 }
                 if (1..=64).contains(&signal)
                     && guest
@@ -499,7 +562,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     )
                     .await;
                 }
-                self.passthrough(guest, call.into()).await
+                let result = self.passthrough(guest, call.into()).await?;
+                if emulated {
+                    crate::tool_global::parent_death_signal(guest, Some(0)).await;
+                }
+                Ok(result)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-4000)

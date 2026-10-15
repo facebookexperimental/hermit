@@ -683,13 +683,12 @@ static int creator_main(const char *role_name) {
  * parent, tells the main process it is ready, and polls no descriptors for
  * PDEATH_POLL_MS. The main process waits PDEATH_KILL_DELAY_MS, kills P with
  * SIGKILL and reaps it. Linux sends C the signal when P exits, and C has never
- * had a child. On Linux the poll returns EINTR at the instant P dies; under
- * Hermit that instant is the host's, because P exits before the scheduler
- * deregisters it. So the poll must keep its deadline: it returns 0 after its
- * full timeout and the handler runs once afterwards. C reports its fields on a
- * pipe; a trial matches when ret=0, the poll took
- * [PDEATH_POLL_MS, PDEATH_POLL_MS + PDEATH_OVERSHOOT_MS) ms and the handler ran
- * once. Prints one TRIAL line per trial, then
+ * had a child. On Linux the poll returns EINTR at the instant P dies.
+ * Detcore sends the parent-death signal itself, at the turn the committed
+ * SIGKILL retires P (https://github.com/rrnewton/hermit/issues/4440), so the
+ * poll ends with EINTR as on Linux, at a turn the schedule fixes; a trial
+ * matches when ret=-1, errno=EINTR, the poll took less than PDEATH_POLL_MS
+ * and the handler ran once. Prints one TRIAL line per trial, then
  * `RESULT call=poll role=<mode> trials=<n> matched=<m>`. */
 #define PDEATH_TRIALS 3
 #define PDEATH_POLL_MS 300
@@ -704,20 +703,30 @@ static void on_pdeath(int sig) {
 }
 
 /* Polls no descriptors for PDEATH_POLL_MS, waits boundedly for the handler,
- * writes the trial's fields to `out_fd` and exits. */
-static void report_poll_to_deadline(int out_fd) {
+ * writes the trial's fields to `out_fd` and exits. A trial matches when the
+ * poll keeps its deadline and the handler runs once afterwards; with
+ * `interrupted_on_time`, set for a parent-death signal, which Detcore sends
+ * itself when P's exit is committed
+ * (https://github.com/rrnewton/hermit/issues/4440), it matches as on Linux
+ * instead: the poll ends early with EINTR, the handler having run once by
+ * then (so an unrelated EINTR followed by a late signal does not match). */
+static void report_poll_to_deadline(int interrupted_on_time, int out_fd) {
   struct timespec start, end;
   clock_gettime(CLOCK_MONOTONIC, &start);
   errno = 0;
   int ret = poll(NULL, 0, PDEATH_POLL_MS);
   int err = errno;
+  int handled_at_return = pdeath_handled;
   clock_gettime(CLOCK_MONOTONIC, &end);
   /* Without an interruption, P's death signal is delivered after the poll. */
   for (int naps = 0; pdeath_handled == 0 && naps < PDEATH_HANDLER_NAPS; naps++) sleep_ms(1);
   long elapsed = ms_between(&start, &end);
   int handled_count = pdeath_handled;
-  int ok = ret == 0 && elapsed >= PDEATH_POLL_MS &&
-           elapsed < PDEATH_POLL_MS + PDEATH_OVERSHOOT_MS && handled_count == 1;
+  int ok = interrupted_on_time
+               ? ret == -1 && err == EINTR && elapsed < PDEATH_POLL_MS && handled_at_return == 1 &&
+                     handled_count == 1
+               : ret == 0 && elapsed >= PDEATH_POLL_MS &&
+                     elapsed < PDEATH_POLL_MS + PDEATH_OVERSHOOT_MS && handled_count == 1;
   char line[160];
   int n = snprintf(line, sizeof line, "ret=%d errno=%s elapsed=%ld handled=%d ok=%d\n", ret,
                    ret < 0 ? errno_name(err) : "none", elapsed, handled_count, ok);
@@ -732,7 +741,7 @@ static void pdeath_child(pid_t parent, int sig, int ready_fd, int out_fd) {
   if (getppid() != parent) _exit(81);
   if (write(ready_fd, "R", 1) != 1) _exit(82);
   close(ready_fd);
-  report_poll_to_deadline(out_fd);
+  report_poll_to_deadline(1, out_fd);
 }
 
 /* Reads one trial's report from `out_fd` to end of file, closes it, prints the
@@ -823,7 +832,7 @@ static int exit_signal_main(const char *call) {
         sleep_ms(EXIT_SIGNAL_DELAY_MS);
         _exit(0);
       }
-      report_poll_to_deadline(out[1]);
+      report_poll_to_deadline(0, out[1]);
     }
     close(out[1]);
     int trial = collect_trial(i, out[0]);
@@ -887,7 +896,7 @@ static int stop_hup_main(const char *call) {
       reap(stopped);
       if (write(ready[1], "R", 1) != 1) _exit(82);
       close(ready[1]);
-      report_poll_to_deadline(out[1]);
+      report_poll_to_deadline(0, out[1]);
     }
     close(ready[1]);
     close(out[1]);
@@ -934,7 +943,7 @@ static void hangup_child(int slave, int ready_fd, int out_fd) {
   close(slave);
   if (write(ready_fd, "R", 1) != 1) _exit(82);
   close(ready_fd);
-  report_poll_to_deadline(out_fd);
+  report_poll_to_deadline(0, out_fd);
 }
 
 static int hangup_main(const char *call, int by_ioctl, const char *role) {
