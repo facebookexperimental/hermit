@@ -818,7 +818,20 @@ mod tests {
             // (https://github.com/rrnewton/hermit/issues/4167), plus the four DBT
             // and ptrace exec owner-death tests
             // (https://github.com/rrnewton/hermit/issues/4268).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "413");
+            // The local node runs in shards, which together execute the same.
+            let executed = |tag: &str| -> u64 {
+                let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
+                step.env["NEXTEST_EXPECTED_EXECUTED"].parse().unwrap()
+            };
+            let population: u64 = if tag == crate::validation_dag::HERMIT_INTEGRATION_TAG {
+                crate::validation_dag::hermit_integration_shard_tags()
+                    .iter()
+                    .map(|shard| executed(shard))
+                    .sum()
+            } else {
+                executed(tag)
+            };
+            assert_eq!(population, 413);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

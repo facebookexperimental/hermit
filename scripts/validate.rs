@@ -594,7 +594,9 @@ mod artifact_plan_tests {
     fn actual_host_and_pinned_consumers_require_their_artifact_and_resource_producers() {
         let cfg = validate_plan::validation_config(&test_source_root()).unwrap();
         release_artifact_plan_bracket(&cfg).unwrap();
-        for tag in ["test.hermit_integration", "test.hermit_integration_on_host"] {
+        let mut tags = hermit_manifest_plan::validation_dag::hermit_integration_shard_tags();
+        tags.push("test.hermit_integration_on_host".into());
+        for tag in tags {
             let step = cfg.steps.iter().find(|step| step.tag() == tag).unwrap();
             integration_artifact_bracket(step).unwrap();
         }
@@ -5072,13 +5074,19 @@ cleared-caps refusal names {} starved step(s)",
             );
         }
         release_artifact_plan_bracket(&full.cfg)?;
-        let integration = full
-            .cfg
-            .steps
-            .iter()
-            .find(|s| s.tag() == "test.hermit_integration")
-            .ok_or("full-plan bracket: Hermit integration node disappeared")?;
-        integration_artifact_bracket(integration)?;
+        // The local Hermit integration node runs as shards; each must consume
+        // the published artifact.
+        for shard in hermit_manifest_plan::validation_dag::hermit_integration_shard_tags() {
+            let integration = full
+                .cfg
+                .steps
+                .iter()
+                .find(|s| s.tag() == shard)
+                .ok_or_else(|| {
+                    format!("full-plan bracket: Hermit integration shard {shard} disappeared")
+                })?;
+            integration_artifact_bracket(integration)?;
+        }
         let manifest_consumers: Vec<_> = full
             .cfg
             .steps

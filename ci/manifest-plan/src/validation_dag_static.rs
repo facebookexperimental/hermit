@@ -163,6 +163,8 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "test.detcore_time",
     "test.detcore_unit",
     "test.hermit_integration",
+    "test.hermit_integration_2",
+    "test.hermit_integration_3",
     "test.hermit_modes",
     "test.hermit_modes_on_host",
     "test.hermit_unit",
@@ -2448,7 +2450,18 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two DBT exec owner-death tests and the DBT and ptrace
     // one-waiter-per-word exec tests
     // (https://github.com/rrnewton/hermit/issues/4268): 413.
-    ("test.hermit_integration", 413),
+    // The local node then ran in three shards by binary name
+    // (validation_dag::HERMIT_INTEGRATION_SHARDS); its hosted twin
+    // test.hermit_integration_on_host still runs all 413. Counted from the
+    // PASS lines of the 2bf536af run, plus the two mount_introspection tests
+    // and the four robust_futex_owner_death tests since:
+    // aio_nr_determinism to container_init_deadline (19 binaries) 60,
+    // copy_file_range_refusal to process_isolation_refusals (49) 134,
+    // procfs_determinism to zero_copy_pipe_fallback (54) 219;
+    // 60 + 134 + 219 = 413.
+    ("test.hermit_integration", 60),
+    ("test.hermit_integration_2", 134),
+    ("test.hermit_integration_3", 219),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
