@@ -87,11 +87,32 @@ pub fn skid_overshoot_refusal(code: Option<i32>, stderr: &str) -> Option<&str> {
 /// that runner.
 pub const SKID_RETRY_RECORD_ENV: &str = "HERMIT_SKID_RETRY_RECORD";
 
-/// Append `line`, prefixed with the running test's name, to the
-/// [`SKID_RETRY_RECORD_ENV`] file. A record that cannot be written fails the
-/// test, so the count never under-reports silently.
+/// The file the per-test CPU wrapper (ci/manifest-plan/src/bin/
+/// nextest-cpu-wrapper.rs) gives this test process. Each retry line written
+/// here earns the next attempt one more base CPU budget, so a retried run does
+/// not have to fit in what the refused attempt left. Unset outside that
+/// wrapper.
+pub const SKID_RETRY_CREDIT_ENV: &str = "HERMIT_SKID_RETRY_CREDIT";
+
+/// Append `line` to the [`SKID_RETRY_CREDIT_ENV`] file, and, prefixed with the
+/// running test's name, to the [`SKID_RETRY_RECORD_ENV`] file. A line that
+/// cannot be written fails the test, so the count never under-reports
+/// silently.
 pub fn record_skid_retry(line: &str) {
     use std::io::Write;
+    if let Some(path) = std::env::var_os(SKID_RETRY_CREDIT_ENV).filter(|path| !path.is_empty()) {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap_or_else(|error| {
+                panic!("cannot open {SKID_RETRY_CREDIT_ENV}={path:?}: {error}")
+            });
+        // One write, so the wrapper never counts a partial line.
+        file.write_all(format!("{line}\n").as_bytes())
+            .unwrap_or_else(|error| {
+                panic!("cannot write {SKID_RETRY_CREDIT_ENV}={path:?}: {error}")
+            });
+    }
     let Some(path) = std::env::var_os(SKID_RETRY_RECORD_ENV).filter(|path| !path.is_empty()) else {
         return;
     };

@@ -13387,14 +13387,20 @@ fn skid_retry_loop_returns_any_other_failure_at_once() {
 /// is returned, not retried, for the caller to fail.
 #[test]
 fn skid_retry_loop_retries_only_typed_refusals_up_to_its_bound() {
-    // Each retry is recorded for ci/run-nextest-counted.sh's count. Send this
-    // test's synthetic refusals to a file of its own, so they never reach that
-    // count, and check them there.
+    // Each retry is recorded for ci/run-nextest-counted.sh's count, and
+    // credited to the per-test CPU wrapper's budget. Send this test's
+    // synthetic refusals to files of its own, so they reach neither, and check
+    // them there.
     let record_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let record = record_dir.path().join("skid-retries.log");
+    let credit = record_dir.path().join("skid-credit");
+    fs::write(&credit, "").unwrap();
     // SAFETY: Nextest runs each test in a process of its own, and this test
-    // starts no thread before it sets the variable.
-    unsafe { std::env::set_var(skid_overshoot::SKID_RETRY_RECORD_ENV, &record) };
+    // starts no thread before it sets the variables.
+    unsafe {
+        std::env::set_var(skid_overshoot::SKID_RETRY_RECORD_ENV, &record);
+        std::env::set_var(skid_overshoot::SKID_RETRY_CREDIT_ENV, &credit);
+    }
     let mut calls = 0;
     let (attempt, output, ()) = retry_typed_skid_refusal("loop test", 5, || {
         calls += 1;
@@ -13431,6 +13437,16 @@ fn skid_retry_loop_retries_only_typed_refusals_up_to_its_bound() {
         lines.iter().all(|line| line
             .starts_with("skid_retry_loop_retries_only_typed_refusals_up_to_its_bound\tSKID-RETRY loop test: attempt ")),
         "{records}"
+    );
+    // The credit file holds the same six lines, without the test's name.
+    let credits = fs::read_to_string(&credit).expect("the retries were not credited");
+    let credit_lines = credits.lines().collect::<Vec<_>>();
+    assert_eq!(credit_lines.len(), 6, "{credits}");
+    assert!(
+        credit_lines.iter().zip(&lines).all(|(credited, recorded)| {
+            recorded.split_once('\t').map(|(_, line)| line) == Some(credited)
+        }),
+        "{credits}"
     );
 }
 

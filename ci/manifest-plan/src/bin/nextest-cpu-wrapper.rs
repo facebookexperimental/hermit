@@ -83,6 +83,17 @@ const CONTROL_SENTINEL_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_SENTINEL";
 // those directories, so two runs of one verification can see different sizes
 // (https://github.com/rrnewton/hermit/issues/3846).
 const DYNAMIC_LIBRARY_PATH_ENV: &str = "LD_LIBRARY_PATH";
+// A Hermit-running test retries a typed PMU skid-overshoot refusal
+// (https://github.com/rrnewton/hermit/issues/1845) inside its one test
+// process. Before each retry it appends the retry's `SKID-RETRY` line to the
+// file this names (hermit-cli/tests/common/skid_overshoot.rs), and each line
+// adds one more base CPU budget, so every attempt has its own budget rather
+// than the retry running on what the refused attempt left over. Nextest's
+// per-test wall limit still bounds the whole test.
+const SKID_RETRY_CREDIT_ENV: &str = "HERMIT_SKID_RETRY_CREDIT";
+/// The helper makes at most five attempts, so at most four retries earn a
+/// budget.
+const MAX_SKID_RETRY_CREDITS: u64 = 4;
 const INFRASTRUCTURE_EXIT: u8 = 70;
 const CPU_TIMEOUT_EXIT: u8 = 124;
 const NON_SIGNAL_CAUSE_RESERVED: i32 = -1;
@@ -1428,6 +1439,83 @@ fn wait_for_direct_child(
     }
 }
 
+/// The budgeted attempt's skid-retry credit file ([`SKID_RETRY_CREDIT_ENV`]),
+/// owned by this wrapper and removed when the attempt ends.
+struct SkidRetryCredit {
+    path: PathBuf,
+    /// Bytes of complete lines already counted.
+    counted_len: u64,
+    credits: u64,
+}
+
+impl SkidRetryCredit {
+    fn create(pid: u32) -> Result<Self, String> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("clock before the epoch: {error}"))?
+            .as_nanos();
+        let path = env::temp_dir().join(format!("hermit-nextest-skid-credit-{pid}-{nanos}"));
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| {
+                format!(
+                    "cannot create skid-retry credit file {}: {error}",
+                    path.display()
+                )
+            })?;
+        Ok(Self {
+            path,
+            counted_len: 0,
+            credits: 0,
+        })
+    }
+
+    /// The credits earned so far. Only a complete retry line counts, and a
+    /// line that is not one fails the attempt closed.
+    fn refresh(&mut self) -> Result<u64, String> {
+        let len = fs::metadata(&self.path)
+            .map_err(|error| format!("cannot stat {}: {error}", self.path.display()))?
+            .len();
+        if len == self.counted_len {
+            return Ok(self.credits);
+        }
+        let text = fs::read_to_string(&self.path)
+            .map_err(|error| format!("cannot read {}: {error}", self.path.display()))?;
+        let complete = text.rfind('\n').map_or(0, |end| end + 1);
+        let lines = text[..complete].lines().collect::<Vec<_>>();
+        if let Some(line) = lines.iter().find(|line| !skid_retry_line(line)) {
+            return Err(format!(
+                "skid-retry credit file {} holds a line that is not a typed skid-overshoot retry: {line:?}",
+                self.path.display()
+            ));
+        }
+        self.counted_len = complete as u64;
+        self.credits = (lines.len() as u64).min(MAX_SKID_RETRY_CREDITS);
+        Ok(self.credits)
+    }
+
+    fn budget(&mut self, base_usec: u64) -> Result<u64, String> {
+        Ok(base_usec.saturating_mul(1 + self.refresh()?))
+    }
+}
+
+impl Drop for SkidRetryCredit {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// A line `retry_typed_skid_refusal` writes before it retries a typed
+/// skid-overshoot refusal.
+fn skid_retry_line(line: &str) -> bool {
+    line.starts_with("SKID-RETRY ")
+        && line.contains(
+            " exited 122 with `HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=",
+        )
+}
+
 fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     let mut invocation = parse_wrapper_invocation(args)?;
     let entry_control = ReapEntryControl::from_env()?;
@@ -1504,6 +1592,14 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     command.env_remove(CONTROL_WAIT4_RESUME_FILE_ENV);
     command.env_remove(CONTROL_WAIT4_STORED_FILE_ENV);
     command.env_remove(DYNAMIC_LIBRARY_PATH_ENV);
+    command.env_remove(SKID_RETRY_CREDIT_ENV);
+    let mut skid_credit = invocation
+        .cpu_budget_usec
+        .map(|_| SkidRetryCredit::create(pid))
+        .transpose()?;
+    if let Some(credit) = &skid_credit {
+        command.env(SKID_RETRY_CREDIT_ENV, &credit.path);
+    }
     if let Some(control) = &entry_control {
         command.env(
             CONTROL_ENTRY_DEADLINE_NS_ENV,
@@ -1686,7 +1782,20 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
                 );
             }
             max_cpu_usec = observed;
-            if observed >= cpu_budget_usec {
+            let credited_budget_usec = match skid_credit
+                .as_mut()
+                .expect("budgeted path created a skid-retry credit")
+                .budget(cpu_budget_usec)
+            {
+                Ok(budget) => budget,
+                Err(error) => {
+                    break reserved_or_external(
+                        FirstCause::AccountingUnavailable { error },
+                        already_reserved,
+                    );
+                }
+            };
+            if observed >= credited_budget_usec {
                 let cause = reserved_or_external(
                     FirstCause::CpuTimeout {
                         observed_cpu_usec: observed,
@@ -1792,7 +1901,7 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
         };
     }
 
-    let cpu_budget_usec = invocation
+    let base_budget_usec = invocation
         .cpu_budget_usec
         .expect("budgeted path requires an enabled CPU budget");
     let cleanup_signal = match cause {
@@ -1884,6 +1993,12 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
         ));
     }
     max_cpu_usec = final_cpu_usec.expect("successful finalization retained final CPU");
+    // The budget with every retry the test credited, read after it ended.
+    let cpu_budget_usec = skid_credit
+        .as_mut()
+        .expect("budgeted path created a skid-retry credit")
+        .budget(base_budget_usec)
+        .map_err(|error| format!("primary outcome {cause:?}; {error}"))?;
 
     let cause = match cause {
         FirstCause::Exit(status) if status.success() && max_cpu_usec >= cpu_budget_usec => {
@@ -1912,6 +2027,9 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     )
     .with_wait4(wait4);
     write_attempt_atomic(&record_dir, &record)?;
+    // Remove the credit file now: propagating a signal ends this process
+    // without running destructors.
+    drop(skid_credit);
 
     match completion {
         AttemptCompletion::Exit { .. } => direct_status
@@ -1950,6 +2068,24 @@ fn burn_cpu(milliseconds: u64) {
             break;
         }
     }
+}
+
+/// A retry line as `retry_typed_skid_refusal` writes it.
+const CONTROL_SKID_RETRY_LINE: &str = "SKID-RETRY control: attempt 1 of at most 5 exited 122 with \
+     `HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=1`; running again";
+
+fn write_skid_credit(lines: &[&str]) -> Result<(), String> {
+    use std::io::Write;
+    let path = required_env(SKID_RETRY_CREDIT_ENV)?;
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("cannot open the skid-retry credit file {path}: {error}"))?;
+    for line in lines {
+        file.write_all(format!("{line}\n").as_bytes())
+            .map_err(|error| format!("cannot credit a skid retry to {path}: {error}"))?;
+    }
+    Ok(())
 }
 
 fn control_child(mode: &str, args: &[OsString]) -> Result<ExitCode, String> {
@@ -2023,6 +2159,23 @@ fn control_child(mode: &str, args: &[OsString]) -> Result<ExitCode, String> {
         }
         "burn-long" => {
             burn_cpu(500);
+            Ok(ExitCode::SUCCESS)
+        }
+        // Credit retries as hermit-cli/tests/common/skid_overshoot.rs does,
+        // then spend past the base budget but within the credited one.
+        "credited-burn" => {
+            write_skid_credit(&[CONTROL_SKID_RETRY_LINE])?;
+            burn_cpu(150);
+            Ok(ExitCode::SUCCESS)
+        }
+        "over-credited-burn" => {
+            write_skid_credit(&[CONTROL_SKID_RETRY_LINE; 6])?;
+            burn_cpu(700);
+            Ok(ExitCode::SUCCESS)
+        }
+        "malformed-credit" => {
+            write_skid_credit(&["SKID-RETRY not a typed refusal"])?;
+            burn_cpu(100);
             Ok(ExitCode::SUCCESS)
         }
         "failure-after-burn" => {
@@ -2273,6 +2426,12 @@ fn control_command_with_limits(
         .env(CONTROL_SENTINEL_ENV, "preserved")
         .env(DYNAMIC_LIBRARY_PATH_ENV, scratch.join("deps"))
         .env(CONTROL_PROC_ROOT_ENV, "/proc")
+        // Where the wrapper creates the attempt's skid-retry credit file.
+        .env("TMPDIR", {
+            let credits = scratch.join("credit-tmp");
+            fs::create_dir_all(&credits).expect("cannot create the self-test credit directory");
+            credits
+        })
         .env(CPU_WRAPPER_ENV, executable)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2970,6 +3129,39 @@ fn self_test() -> Result<(), String> {
         return Err(format!("forced CPU-timeout control returned {forced:?}"));
     }
 
+    // A credited skid retry gives the attempt one more base budget: 150ms of
+    // CPU completes under a 100ms base with one credit. Six credits earn only
+    // the four the retry helper can use, so 700ms times out at 500ms. A line
+    // that is not a typed retry fails the attempt closed.
+    for (mode, expected) in [
+        ("credited-burn", Some(0)),
+        ("over-credited-burn", Some(i32::from(CPU_TIMEOUT_EXIT))),
+        ("malformed-credit", Some(i32::from(INFRASTRUCTURE_EXIT))),
+    ] {
+        let credited = control_command_with_limits(
+            &executable,
+            &test_binary,
+            &scratch.0,
+            mode,
+            1,
+            100_000,
+            100,
+        )
+        .output()
+        .map_err(|error| format!("cannot run {mode} control: {error}"))?;
+        if credited.status.code() != expected {
+            return Err(format!("{mode} control returned {credited:?}"));
+        }
+        if mode == "malformed-credit"
+            && !String::from_utf8_lossy(&credited.stderr)
+                .contains("holds a line that is not a typed skid-overshoot retry")
+        {
+            return Err(format!(
+                "{mode} control did not name its refusal: {credited:?}"
+            ));
+        }
+    }
+
     for mode in ["auto-reap-ignored", "auto-reap-nocldwait"] {
         let auto_reaped = control_command_with_limits(
             &executable,
@@ -3365,7 +3557,7 @@ fn self_test() -> Result<(), String> {
         .iter()
         .map(|r| r.identity.test.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    if records.len() != 18
+    if records.len() != 20
         || identities
             != [
                 "success",
@@ -3384,12 +3576,14 @@ fn self_test() -> Result<(), String> {
                 "failure-after-burn",
                 "peer-sleep",
                 "wait4-race",
+                "credited-burn",
+                "over-credited-burn",
             ]
             .into_iter()
             .collect()
     {
         return Err(format!(
-            "self-test expected the original thirteen and five added exact atomic attempt identities, found {identities:?} ({} records)",
+            "self-test expected the original thirteen and seven added exact atomic attempt identities, found {identities:?} ({} records)",
             records.len()
         ));
     }
@@ -3459,6 +3653,28 @@ fn self_test() -> Result<(), String> {
     ) {
         return Err(format!(
             "forced control did not retain its CPU-timeout boundary: {forced_record:?}"
+        ));
+    }
+    let credited_record = find_record(&records, "credited-burn")?;
+    if !matches!(
+        credited_record.completion,
+        AttemptCompletion::Exit { code: 0 }
+    ) || credited_record.cpu_usage_usec < 100_000
+    {
+        return Err(format!(
+            "credited control did not complete past its base budget: {credited_record:?}"
+        ));
+    }
+    let over_credited_record = find_record(&records, "over-credited-burn")?;
+    if !matches!(
+        over_credited_record.completion,
+        AttemptCompletion::CpuTimeout {
+            cpu_budget_usec: 500_000,
+            observed_cpu_usec,
+        } if observed_cpu_usec >= 500_000
+    ) {
+        return Err(format!(
+            "over-credited control was not capped at four credits: {over_credited_record:?}"
         ));
     }
     let exited_parent_record = find_record(&records, "exit-after-escaped-burner")?;
@@ -3551,12 +3767,27 @@ fn self_test() -> Result<(), String> {
             "wait4 receipt was lost when a signal won terminal classification: {wait4_race_record:?}"
         ));
     }
+    // Every controlled attempt, however it ended, removed its credit file.
+    let leftover_credits = fs::read_dir(scratch.0.join("credit-tmp"))
+        .map_err(|error| format!("cannot read the credit directory: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .filter(|name| {
+            name.to_string_lossy()
+                .starts_with("hermit-nextest-skid-credit-")
+        })
+        .collect::<Vec<_>>();
+    if !leftover_credits.is_empty() {
+        return Err(format!(
+            "controlled attempts left skid-retry credit files behind: {leftover_credits:?}"
+        ));
+    }
     let duplicate = write_attempt_atomic(&scratch.0.join("attempts"), &records[0]);
     if duplicate.is_ok() {
         return Err("duplicate atomic attempt publication unexpectedly replaced a record".into());
     }
     println!(
-        "nextest-cpu-wrapper: self-test PASS (owned cgroup v2 accounting, SIG_IGN and SA_NOCLDWAIT auto-reap, peer exclusion, pre-exec enrollment, process tree, success, failure, signal, wall timeout, CPU timeout, 500ms post-parent CPU boundary, stopped low-CPU wall delay, missing and final accounting fail-closed, final-counter regression, recovered hard-cleanup refusal, CPU, exit and wait4 first-cause races, cgroup.kill cleanup, no survivors, typed identity, truthful CPU source, substituted path, atomic identity)"
+        "nextest-cpu-wrapper: self-test PASS (owned cgroup v2 accounting, SIG_IGN and SA_NOCLDWAIT auto-reap, peer exclusion, pre-exec enrollment, process tree, success, failure, signal, wall timeout, CPU timeout, skid-retry budget credit, 500ms post-parent CPU boundary, stopped low-CPU wall delay, missing and final accounting fail-closed, final-counter regression, recovered hard-cleanup refusal, CPU, exit and wait4 first-cause races, cgroup.kill cleanup, no survivors, typed identity, truthful CPU source, substituted path, atomic identity)"
     );
     Ok(())
 }
