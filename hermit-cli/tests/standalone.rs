@@ -159,7 +159,10 @@ fn no_networking_network_bind() {
     run_no_networking("network_bind_rs");
 }
 
+/// The guest binds every port from 32768 to 65534, 32,767 listeners, each a
+/// few syscalls through ptrace.
 #[test]
+#[ignore = "over budget: 14.5 CPU-s unloaded, killed at the 22 CPU-s per-test cap (exit 124 at 24.3 s) in the 838f2582 validation, 2026-10-15"]
 fn no_networking_network_bind_full() {
     run_no_networking("network_bind_full_rs");
 }

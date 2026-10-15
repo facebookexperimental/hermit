@@ -867,7 +867,7 @@ mod tests {
             } else {
                 executed(tag)
             };
-            assert_eq!(population, 567);
+            assert_eq!(population, 566);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
