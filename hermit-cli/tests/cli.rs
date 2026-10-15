@@ -4009,6 +4009,108 @@ fn kvm_unavailable(test: &str) -> bool {
     true
 }
 
+/// Every backend that runs Detcore, in the order the cross-backend `/proc`
+/// tests compare them, ptrace first. SaBRe rewrites the guest statically and
+/// keeps ptrace's runtime; e9patch is preprocessing with the ptrace backend;
+/// LiteInst and in-guest-trap host Detcore's tool in the guest.
+const PROCFS_BACKENDS: [&str; 7] = [
+    "ptrace",
+    "dbt",
+    "kvm",
+    "sabre",
+    "liteinst",
+    "in-guest-trap",
+    "e9patch",
+];
+
+/// The backends that do not pass a cross-backend `/proc` test yet: the test,
+/// the backend, and what fails, with its issue. A listed backend is not run,
+/// and the test names it. When an in-guest backend's entry goes, its runs
+/// also need `--max-timeslice=disabled`, as the in-guest Tool host cannot
+/// deliver the preemption timer yet.
+const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
+    (
+        "detcore_fixes_the_virtual_kernel_files_on_every_backend",
+        "liteinst, in-guest-trap",
+        "a /proc descriptor kept across execve loses its position \
+         (https://github.com/rrnewton/hermit/issues/4450)",
+    ),
+    (
+        "detcore_omits_the_procfs_names_outside_the_level_on_every_backend",
+        "sabre",
+        "a thread with its own descriptor table aborts the run \
+         (https://github.com/rrnewton/hermit/issues/4448)",
+    ),
+    (
+        "detcore_omits_the_procfs_names_outside_the_level_on_every_backend",
+        "liteinst, in-guest-trap",
+        "clone without CLONE_FILES fails with EOPNOTSUPP \
+         (https://github.com/rrnewton/hermit/issues/4450)",
+    ),
+    (
+        "detcore_answers_its_procfs_links_on_every_backend",
+        "sabre",
+        "a thread with its own descriptor table aborts the run \
+         (https://github.com/rrnewton/hermit/issues/4448), and without it the \
+         runs diverge at a thread join (https://github.com/rrnewton/hermit/issues/4007)",
+    ),
+    (
+        "detcore_answers_its_procfs_links_on_every_backend",
+        "liteinst, in-guest-trap",
+        "pthread_create fails, and clone without CLONE_FILES fails with EOPNOTSUPP \
+         (https://github.com/rrnewton/hermit/issues/4450)",
+    ),
+    (
+        "detcore_lists_procfs_from_its_model_on_every_backend",
+        "sabre",
+        "a child of a parent ignoring SIGCHLD is not reaped \
+         (https://github.com/rrnewton/hermit/issues/4449), and the runs diverge at \
+         the child's exit (https://github.com/rrnewton/hermit/issues/3862)",
+    ),
+    (
+        "detcore_lists_procfs_from_its_model_on_every_backend",
+        "liteinst, in-guest-trap",
+        "the guest hangs (https://github.com/rrnewton/hermit/issues/4450)",
+    ),
+    (
+        "detcore_renders_its_procfs_files_on_every_backend",
+        "liteinst, in-guest-trap",
+        "a rendered file's position is not shared across fork, and the chroot \
+         checks fail (https://github.com/rrnewton/hermit/issues/4450)",
+    ),
+];
+
+/// The backends `test` runs on here, ptrace first: every backend in
+/// `PROCFS_BACKENDS` that this build has and this host can run, except those
+/// `PROCFS_NOT_YET` lists for `test`. Each one left out is named, with why.
+fn procfs_backends(test: &str) -> Vec<&'static str> {
+    PROCFS_BACKENDS
+        .into_iter()
+        .filter(|backend| {
+            if let Some((_, _, why)) = PROCFS_NOT_YET.iter().find(|(name, backends, _)| {
+                *name == test && backends.split(", ").any(|listed| listed == *backend)
+            }) {
+                eprintln!("{test}: NOT YET: {backend}: {why}");
+                return false;
+            }
+            let unavailable = match *backend {
+                "dbt" => dbt_unavailable(test),
+                "kvm" => kvm_unavailable(test),
+                "sabre" => !cfg!(feature = "sabre"),
+                "liteinst" | "in-guest-trap" => !cfg!(feature = "liteinst"),
+                "e9patch" => !cfg!(feature = "e9patch"),
+                _ => false,
+            };
+            if unavailable {
+                eprintln!(
+                    "{test}: NOT COMPARED: {backend} is not available on this host or in this build"
+                );
+            }
+            !unavailable
+        })
+        .collect()
+}
+
 #[test]
 fn run_dbt_executes_integrated_backend() {
     if dbt_unavailable("run_dbt_executes_integrated_backend") {
@@ -4353,8 +4455,9 @@ const VIRTUAL_KERNEL_FILES: [&str; 36] = [
 /// (https://github.com/rrnewton/hermit/issues/4266). Before, the host-process
 /// backends passed the kernel's files through and kept each table's host
 /// shape, and KVM made up its own files or refused them. Linux's own
-/// invariants are checked natively first. A backend that is not available
-/// here is named as not compared.
+/// invariants are checked natively first. Every backend that runs Detcore is
+/// compared (`procfs_backends`), but one not available here, named as not
+/// compared, and one `PROCFS_NOT_YET` lists, named with its issue.
 // Carried verbatim from reverie-kvm's removed regression test of its own copies of
 // these files, which Detcore's renderings replace (https://github.com/rrnewton/hermit/issues/4213):
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -4441,18 +4544,7 @@ fn detcore_fixes_the_virtual_kernel_files_on_every_backend() {
     );
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mut outputs = Vec::new();
-    for backend in ["ptrace", "dbt", "kvm"] {
-        if (backend == "dbt"
-            && dbt_unavailable("detcore_fixes_the_virtual_kernel_files_on_every_backend"))
-            || (backend == "kvm"
-                && kvm_unavailable("detcore_fixes_the_virtual_kernel_files_on_every_backend"))
-        {
-            eprintln!(
-                "detcore_fixes_the_virtual_kernel_files_on_every_backend: NOT COMPARED: \
-                 {backend} is not available on this host or in this build"
-            );
-            continue;
-        }
+    for backend in procfs_backends("detcore_fixes_the_virtual_kernel_files_on_every_backend") {
         let report = directory.path().join(format!("{backend}.json"));
         let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
         let mut args = vec![
@@ -4542,8 +4634,9 @@ fn host_kernel_at_least(major: u32, minor: u32) -> bool {
 /// lookup of one fails with ENOENT, by any spelling, and no listing shows it
 /// (https://github.com/rrnewton/hermit/issues/4266). The level's names stay.
 /// Natively the host has the names, so Hermit hides names that exist. At
-/// `--proc=minimal` the standard level's names go too. A backend that is not
-/// available here is named as not compared.
+/// `--proc=minimal` the standard level's names go too. Every backend that runs
+/// Detcore is compared (`procfs_backends`), but one not available here, named
+/// as not compared, and one `PROCFS_NOT_YET` lists, named with its issue.
 #[test]
 fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
     let guest = omitted_procfs_names_guest();
@@ -4664,28 +4757,26 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
     };
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mut compared = Vec::new();
-    for (backend, level, mode) in [
-        ("ptrace", "standard", Mode::Verified),
-        ("dbt", "standard", Mode::Verified),
-        ("kvm", "standard", Mode::Verified),
-        ("ptrace", "minimal", Mode::Verified),
-        ("dbt", "minimal", Mode::Verified),
-        ("kvm", "minimal", Mode::Verified),
+    let backends =
+        procfs_backends("detcore_omits_the_procfs_names_outside_the_level_on_every_backend");
+    let mut runs = Vec::new();
+    for level in ["standard", "minimal"] {
+        runs.extend(
+            backends
+                .iter()
+                .map(|backend| (*backend, level, Mode::Verified)),
+        );
+    }
+    runs.extend([
         ("ptrace", "standard", Mode::NoMetadata),
         ("ptrace", "standard", Mode::Recorded),
         ("ptrace", "minimal", Mode::Recorded),
         ("ptrace", "standard", Mode::IntoProc),
-        ("dbt", "standard", Mode::IntoProcUnverified),
-    ] {
-        let test = "detcore_omits_the_procfs_names_outside_the_level_on_every_backend";
-        if (backend == "dbt" && dbt_unavailable(test))
-            || (backend == "kvm" && kvm_unavailable(test))
-        {
-            eprintln!(
-                "{test}: NOT COMPARED: {backend} is not available on this host or in this build"
-            );
-            continue;
-        }
+    ]);
+    if backends.contains(&"dbt") {
+        runs.push(("dbt", "standard", Mode::IntoProcUnverified));
+    }
+    for (backend, level, mode) in runs {
         let report = directory.path().join(format!("{backend}-{level}.json"));
         let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
         let level_arg = format!("--proc={level}");
@@ -4798,7 +4889,9 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
 /// own /proc cannot open and which DBT's kernel answers with its own pid
 /// (named as not checked). Record and replay on ptrace give the same output
 /// and match (but for that empty pathname: the recorder does not record
-/// readlinkat). A backend that is not available here is named as not compared.
+/// readlinkat). Every backend that runs Detcore is compared
+/// (`procfs_backends`), but one not available here, named as not compared, and
+/// one `PROCFS_NOT_YET` lists, named with its issue.
 #[test]
 fn detcore_answers_its_procfs_links_on_every_backend() {
     let test = "detcore_answers_its_procfs_links_on_every_backend";
@@ -4810,15 +4903,7 @@ fn detcore_answers_its_procfs_links_on_every_backend() {
     assert!(native.status.success(), "native: {native:?}");
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mut outputs = Vec::new();
-    for backend in ["ptrace", "dbt", "kvm"] {
-        if (backend == "dbt" && dbt_unavailable(test))
-            || (backend == "kvm" && kvm_unavailable(test))
-        {
-            eprintln!(
-                "{test}: NOT COMPARED: {backend} is not available on this host or in this build"
-            );
-            continue;
-        }
+    for backend in procfs_backends(test) {
         let report = directory.path().join(format!("{backend}.json"));
         let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
         let mut args = vec![
@@ -4996,8 +5081,9 @@ fn detcore_answers_its_procfs_links_on_every_backend() {
 /// `--proc=standard` covers that level's process and thread directories.
 /// Record and replay on ptrace, where Detcore leaves listings to the
 /// kernel unfiltered by the level, keep the other relations and match (the
-/// lookups of listed entries are named as not checked). A backend that is
-/// not available here is named as not compared.
+/// lookups of listed entries are named as not checked). Every backend that runs
+/// Detcore is compared (`procfs_backends`), but one not available here, named
+/// as not compared, and one `PROCFS_NOT_YET` lists, named with its issue.
 #[test]
 fn detcore_lists_procfs_from_its_model_on_every_backend() {
     let test = "detcore_lists_procfs_from_its_model_on_every_backend";
@@ -5009,20 +5095,11 @@ fn detcore_lists_procfs_from_its_model_on_every_backend() {
     assert!(native.status.success(), "native: {native:?}");
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mut outputs = Vec::new();
-    for (backend, level) in [
-        ("ptrace", "minimal"),
-        ("dbt", "minimal"),
-        ("kvm", "minimal"),
-        ("ptrace", "standard"),
-    ] {
-        if (backend == "dbt" && dbt_unavailable(test))
-            || (backend == "kvm" && kvm_unavailable(test))
-        {
-            eprintln!(
-                "{test}: NOT COMPARED: {backend} is not available on this host or in this build"
-            );
-            continue;
-        }
+    let runs = procfs_backends(test)
+        .into_iter()
+        .map(|backend| (backend, "minimal"))
+        .chain([("ptrace", "standard")]);
+    for (backend, level) in runs {
         let report = directory.path().join(format!("{backend}-{level}.json"));
         let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
         let level_arg = format!("--proc={level}");
@@ -5149,8 +5226,9 @@ fn detcore_lists_procfs_from_its_model_on_every_backend() {
 /// Every backend gives the guest Linux's answers for these files, which the
 /// memfd standing in for each could not give, reaches bitwise parity, and
 /// shows the same identity: Detcore's procfs device and the inode each path
-/// names. Linux's own answers are checked natively first. A backend that is
-/// not available here is named as not compared.
+/// names. Linux's own answers are checked natively first. Every backend that
+/// runs Detcore is compared (`procfs_backends`), but one not available here,
+/// named as not compared, and one `PROCFS_NOT_YET` lists, named with its issue.
 #[test]
 fn detcore_renders_its_procfs_files_on_every_backend() {
     let guest = rendered_procfs_files_guest();
@@ -5187,18 +5265,7 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
     assert!(native.status.success(), "native: {native:?}");
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mut identities = Vec::new();
-    for backend in ["ptrace", "dbt", "kvm"] {
-        if (backend == "dbt"
-            && dbt_unavailable("detcore_renders_its_procfs_files_on_every_backend"))
-            || (backend == "kvm"
-                && kvm_unavailable("detcore_renders_its_procfs_files_on_every_backend"))
-        {
-            eprintln!(
-                "detcore_renders_its_procfs_files_on_every_backend: NOT COMPARED: {backend} \
-                 is not available on this host or in this build"
-            );
-            continue;
-        }
+    for backend in procfs_backends("detcore_renders_its_procfs_files_on_every_backend") {
         let report = directory.path().join(format!("{backend}.json"));
         let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
         let mut args = vec![
