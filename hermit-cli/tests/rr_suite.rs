@@ -99,8 +99,20 @@ fn rr_root() -> PathBuf {
     repository().join("third-party/rr")
 }
 
-/// Generates rr's syscall-enum headers once and returns the directory holding
-/// them (added to the include path when compiling each test program).
+/// A directory under `CARGO_TARGET_TMPDIR` that only this test process writes.
+/// Nextest runs each test in its own process, several at once, so headers and
+/// workloads written to a directory shared by every process could be read
+/// half-written by another test's compiler.
+fn process_build_root(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(name)
+        .join("build")
+        .join(std::process::id().to_string())
+}
+
+/// Generates rr's syscall-enum headers once per test process and returns the
+/// directory holding them (added to the include path when compiling each test
+/// program).
 fn generated_dir() -> &'static Path {
     GENERATED_DIR.get_or_init(|| {
         let rr = rr_root();
@@ -109,7 +121,7 @@ fn generated_dir() -> &'static Path {
             "rr submodule not initialized at {}; run: git submodule update --init third-party/rr",
             rr.display()
         );
-        let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("rr-generated");
+        let out = process_build_root("rr-generated");
         fs::create_dir_all(&out).expect("failed to create rr generated-header directory");
         let generator = rr.join("src/generate_syscalls.py");
         for header in GENERATED_HEADERS {
@@ -126,7 +138,7 @@ fn generated_dir() -> &'static Path {
 fn compile_test(basename: &str) -> PathBuf {
     let rr = rr_root();
     let generated = generated_dir();
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("rr-workloads");
+    let build_root = process_build_root("rr-workloads");
     fs::create_dir_all(&build_root).expect("failed to create rr workload directory");
     let binary = build_root.join(basename);
     // Always rebuild so cached target directories cannot preserve a binary

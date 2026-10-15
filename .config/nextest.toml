@@ -43,12 +43,20 @@ path = "junit.xml"
 # write, or run, the same file. test.cli and its hosted twin test.cli_on_host
 # run at the width the DAG assigns through NEXTEST_TEST_THREADS; every other
 # node that runs the cli binary passes -j 1.
+#
+# The `rr_suite` binary is outside the group too. Each of its tests runs one rr
+# program in a fresh scratch directory, compiles that program into, and
+# generates rr's headers into, a directory named for the test process
+# (process_build_root), and retries a typed PMU skid refusal on its own.
+# test.rr_suite_contract runs it with -j 8 (measured 2026-10-15: 171-179 s at
+# -j 1, 31-40 s at -j 8, every one of 192 tests passing in every run); its
+# hosted twin keeps -j 1.
 # ci/nextest-timeout-config.rs accepts exactly this filter.
 [test-groups.hermit-serialized]
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = "package(=hermit) & kind(=test) & !binary(=cli)"
+filter = "package(=hermit) & kind(=test) & !binary(=cli) & !binary(=rr_suite)"
 test-group = "hermit-serialized"
 
 # Stopgap for https://github.com/rrnewton/hermit/issues/3827. `hermit record

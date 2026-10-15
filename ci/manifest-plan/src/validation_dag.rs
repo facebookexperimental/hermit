@@ -367,7 +367,7 @@ fn hosted_exclusion_filterset(names: &[&str]) -> String {
 }
 
 /// Where the hosted rr twin's filterset goes: right after its one binary.
-const RR_SUITE_SELECTION: &str = "--test rr_suite -j 1";
+const RR_SUITE_SELECTION: &str = "--test rr_suite -j 8";
 
 fn hosted_portable_excludes(cell: &DagManifest) -> bool {
     cell.backend

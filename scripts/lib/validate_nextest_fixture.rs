@@ -591,12 +591,14 @@ fn actual_nextest_results_and_publication_failures() {
         "#[test]\nfn passes() { assert_eq!(2 + 2, 4); }\n",
         "#[test]\nfn fails() { assert_eq!(2 + 2, 5, \"intentional structured-result fixture assertion\"); }\n",
     )).unwrap();
-    // The canonical .config/nextest.toml names the `cli` test binary, and
-    // nextest refuses a config whose binary() matcher names no binary in the
-    // workspace. An empty `cli` target keeps the copied config loadable; it has
-    // no tests, so nothing it adds is selected or counted.
+    // The canonical .config/nextest.toml names the `cli` and `rr_suite` test
+    // binaries, and nextest refuses a config whose binary() matcher names no
+    // binary in the workspace. Empty targets keep the copied config loadable;
+    // they have no tests, so nothing they add is selected or counted.
     fs::create_dir_all(fixture.join("tests")).unwrap();
-    fs::write(fixture.join("tests/cli.rs"), b"").unwrap();
+    for binary in ["cli", "rr_suite"] {
+        fs::write(fixture.join(format!("tests/{binary}.rs")), b"").unwrap();
+    }
     let target = tree.target_dir();
     // Cargo's standard explicit/default home remains in force. Only the target
     // and temp directories below are fixture-owned; a test must not silently
