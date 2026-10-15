@@ -65,6 +65,8 @@ use detcore_model::backend_engagement::BackendEngagementReport;
 use hermit::Error;
 use hermit::ExitStatus;
 #[cfg(feature = "dbt")]
+use reverie::process::Bind;
+#[cfg(feature = "dbt")]
 use reverie_dbt::DbtEvidence;
 #[cfg(feature = "dbt")]
 use reverie_dbt::DbtEvidenceLogLevel;
@@ -1038,7 +1040,7 @@ impl DbtInvocation {
             }
         };
         if let Some(capture) = &stats {
-            self.runner = capture.configure(self.runner);
+            self.runner = self.execution.configure_stats(capture, self.runner)?;
         }
         let status = if std::io::stdin().is_terminal() {
             process_status(run_status(
@@ -1129,7 +1131,9 @@ impl DbtVerification {
     ) -> Result<super::run::VerificationRunOutput, Error> {
         let invocation = &self.invocation;
         let stats = invocation.execution.stats_capture()?;
-        let runner = stats.configure(invocation.runner.clone());
+        let runner = invocation
+            .execution
+            .configure_stats(&stats, invocation.runner.clone())?;
         let mut evidence_file = tempfile::tempfile()?;
         let evidence = Some(DbtRunEvidence {
             file: &evidence_file,
@@ -1316,7 +1320,7 @@ fn dbt_verify_run(
     };
     let mut evidence = tempfile::tempfile()?;
     let stats = execution.stats_capture()?;
-    let runner = stats.configure(runner);
+    let runner = execution.configure_stats(&stats, runner)?;
     let run_evidence = Some(DbtRunEvidence {
         file: &evidence,
         log_level: evidence_level,
@@ -1514,9 +1518,8 @@ const DYNAMORIO_CONFIG_DIR_ENV: &str = "DYNAMORIO_CONFIGDIR";
 #[cfg(feature = "dbt")]
 struct DbtExecution {
     options: super::run::RunOpts,
-    /// Statistics sinks, made below the original /tmp before the run, that
-    /// the client must still reach at the same path inside the private /tmp.
-    statistics: std::cell::RefCell<Vec<PathBuf>>,
+    /// The current physical run's unique host sink at its stable guest address.
+    statistics: std::cell::RefCell<Option<Bind>>,
     /// DynamoRIO's configuration directory inside the container; see
     /// `contained_command`.
     config_dir: PathBuf,
@@ -1547,15 +1550,38 @@ impl DbtExecution {
     }
 
     fn stats_capture(&self) -> Result<DbtStatsSink, Error> {
-        let capture = DbtStatsSink::with_prefix("hermit-dbt-verify-stats-").map_err(|error| {
+        // Also clear the preceding mapping when optional allocation fails.
+        self.statistics.replace(None);
+        DbtStatsSink::with_prefix("hermit-dbt-verify-stats-").map_err(|error| {
             Error::msg(format!(
                 "failed to create DBT whole-process statistics sink: {error}"
             ))
-        })?;
+        })
+    }
+
+    fn configure_stats(
+        &self,
+        capture: &DbtStatsSink,
+        runner: DbtRunner,
+    ) -> Result<DbtRunner, Error> {
+        if !self.options.uses_container() {
+            return Ok(capture.configure(runner));
+        }
+        let binds = self.options.dbt_binds();
+        // Admission accepts only normal descendants of /tmp. Each declared
+        // target can overlap at most one of these direct sibling directories.
+        // Do not consult host contents: those differ between physical runs.
+        let directory = (0..=binds.len())
+            .map(|slot| PathBuf::from(format!("/tmp/.hermit-dbt-stats-{slot}")))
+            .find(|candidate| {
+                binds.iter().all(|(_, target)| {
+                    !candidate.starts_with(target) && !target.starts_with(candidate)
+                })
+            })
+            .ok_or_else(|| Error::msg("DBT statistics directory conflicts with declared binds"))?;
         self.statistics
-            .borrow_mut()
-            .push(capture.directory().to_path_buf());
-        Ok(capture)
+            .replace(Some(Bind::new(capture.directory(), &directory)));
+        Ok(capture.configure_at(runner, &directory))
     }
 
     /// `guest`, copied, with DynamoRIO's configuration directory moved to a
@@ -1605,16 +1631,12 @@ impl DbtExecution {
         F: FnMut(&tokio::runtime::Runtime, &Config) -> Result<T, Error> + 'static,
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
-        // A verification's run-1 statistics sink is finished and removed before
-        // run 2; only the sinks that still exist are this run's to preserve.
-        let preserved = self
-            .statistics
-            .borrow()
-            .iter()
-            .filter(|path| path.exists())
-            .cloned()
-            .collect::<Vec<_>>();
-        let options = self.options.with_dbt_mounts(&preserved, Vec::new());
+        // Keep the mapping in the ephemeral launch options, not the original
+        // guest arguments or config. Common bind provenance presents its target
+        // as both mountinfo root and mountpoint, without exposing the host name.
+        let options = self
+            .options
+            .with_dbt_mounts(self.statistics.borrow().as_slice(), Vec::new());
         let config = config.clone();
         let config_dir = self
             .options
@@ -2837,6 +2859,63 @@ mod tests {
         options.set_backend(Some(hermit::Backend::Dbt));
         super::super::verify::write_pending_verification_json(&report).unwrap();
         (options, report)
+    }
+
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn dbt_stats_mapping_avoids_declared_targets_and_replaces_each_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut options, _) = common_dbt_verify_options(directory.path(), "success");
+        for target in [
+            "/tmp/.hermit-dbt-stats-0/child",
+            "/tmp/.hermit-dbt-stats-1",
+            "/tmp/.hermit-dbt-stats-2-other",
+            "/ignored/.hermit-dbt-stats-2",
+        ] {
+            options.bind.push(Bind::new(directory.path(), target));
+        }
+        let original = format!("{options:?}");
+        let execution = DbtExecution::new(&options, false);
+        let runner = DbtRunner::new("/bin/true", "/bin/true").unwrap();
+        let first = execution.stats_capture().unwrap();
+        let configured = execution.configure_stats(&first, runner.clone()).unwrap();
+        let target = Path::new("/tmp/.hermit-dbt-stats-2");
+        assert_eq!(
+            *execution.statistics.borrow(),
+            Some(Bind::new(first.directory(), target))
+        );
+        assert_eq!(
+            format!("{configured:?}"),
+            format!("{:?}", first.configure_at(runner.clone(), target))
+        );
+        // The prior sink can still exist; slot choice and replacement depend
+        // on declarations, not which random backing directories remain alive.
+        let second = execution.stats_capture().unwrap();
+        assert!(execution.statistics.borrow().is_none());
+        assert_ne!(first.directory(), second.directory());
+        execution.configure_stats(&second, runner).unwrap();
+        assert_eq!(
+            *execution.statistics.borrow(),
+            Some(Bind::new(second.directory(), target))
+        );
+        assert_eq!(format!("{options:?}"), original);
+        assert_eq!(format!("{:?}", execution.options), original);
+    }
+
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn dbt_stats_without_namespace_keep_the_host_address_and_no_bind() {
+        use clap::Parser;
+
+        let options =
+            super::super::run::RunOpts::parse_from(["run", "--no-namespace", "--", "/bin/true"]);
+        let execution = DbtExecution::new(&options, false);
+        let capture = execution.stats_capture().unwrap();
+        let runner = DbtRunner::new("/bin/true", "/bin/true").unwrap();
+        let expected = capture.configure(runner.clone());
+        let actual = execution.configure_stats(&capture, runner).unwrap();
+        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        assert!(execution.statistics.borrow().is_none());
     }
 
     #[test]

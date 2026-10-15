@@ -2859,6 +2859,42 @@ fn namespace_only_guest_command_preserves_sanitizer_environment() {
 
 #[cfg(feature = "dbt")]
 #[test]
+fn dbt_runtime_binds_do_not_change_original_options_or_guest_inputs() {
+    let options = run_opts_for(&[
+        "hermit",
+        "--backend=dbt",
+        "run",
+        "--strict",
+        "--",
+        "/bin/echo",
+        "guest argument",
+    ]);
+    let original = format!("{options:?}");
+    let guest = options.guest_command().unwrap();
+    let config = hermit::dbt_detconfig_json(&options.effective_det_config()).unwrap();
+    let binding = Bind::new("/host/private/stats", "/tmp/.hermit-dbt-stats-0");
+    let launch = options.with_dbt_mounts(std::slice::from_ref(&binding), Vec::new());
+    assert_eq!(launch.bind.last(), Some(&binding));
+    assert_eq!(format!("{options:?}"), original);
+    assert!(options.dbt_binds().is_empty());
+    assert_eq!(
+        hermit::dbt_detconfig_json(&launch.effective_det_config()).unwrap(),
+        config
+    );
+    let launched_guest = launch.guest_command().unwrap();
+    assert_eq!(guest.get_program(), launched_guest.get_program());
+    assert_eq!(
+        guest.get_args().collect::<Vec<_>>(),
+        launched_guest.get_args().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        guest.get_envs().collect::<Vec<_>>(),
+        launched_guest.get_envs().collect::<Vec<_>>()
+    );
+}
+
+#[cfg(feature = "dbt")]
+#[test]
 fn dbt_rejects_mount_but_accepts_bind_and_workdir() {
     let mut with_mount = run_opts_for(&[
         "hermit",
@@ -8156,7 +8192,7 @@ impl RunOpts {
     /// binds for every backend. It warns about any other bind, which has no
     /// effect.
     #[cfg(feature = "dbt")]
-    fn dbt_binds(&self) -> Vec<(PathBuf, PathBuf)> {
+    pub(super) fn dbt_binds(&self) -> Vec<(PathBuf, PathBuf)> {
         let mut binds = Vec::with_capacity(self.bind.len());
         for bind in &self.bind {
             let source = PathBuf::from(OsStr::from_bytes(bind.source.to_bytes()));
@@ -8169,19 +8205,11 @@ impl RunOpts {
     }
 
     /// These options with the DBT adapter's own container inputs added after
-    /// the caller's: each of `preserved`, a host path below /tmp made before
-    /// the run, bound at the same path in the private /tmp, and `mounts`.
+    /// the caller's, only for this physical launch.
     #[cfg(feature = "dbt")]
-    pub(super) fn with_dbt_mounts(&self, preserved: &[PathBuf], mounts: Vec<Mount>) -> Self {
+    pub(super) fn with_dbt_mounts(&self, binds: &[Bind], mounts: Vec<Mount>) -> Self {
         let mut options = self.clone();
-        for path in preserved.iter().filter(|path| path.starts_with(TMP_DIR)) {
-            let path = std::ffi::CString::new(path.as_os_str().as_bytes())
-                .expect("a path read from the filesystem has no NUL byte");
-            options.bind.push(Bind {
-                source: path.clone(),
-                target: path,
-            });
-        }
+        options.bind.extend_from_slice(binds);
         options.mount.extend(mounts);
         options
     }

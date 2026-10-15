@@ -1572,7 +1572,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 072f557c: 1091.
     // And metadata::tests::record_version_rejects_streams_from_before_parent_death_signals_are_sent_by_detcore
     // (https://github.com/rrnewton/hermit/issues/4440): 1092, listed.
-    ("test.hermit_unit", 1092),
+    // And +3 from 7a4a7b54: 1095.
+    ("test.hermit_unit", 1095),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3305,7 +3306,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from 072f557c: 444.
     // And a_parent_death_signal_reaches_the_child_when_its_parent_thread_leaves
     // (https://github.com/rrnewton/hermit/issues/4440): 445, listed.
-    ("test.cli", 445),
+    // And +2 from 7a4a7b54: 447.
+    ("test.cli", 447),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3694,7 +3696,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from 072f557c: 380.
     // And the 4440 parent-death signal test
     // (https://github.com/rrnewton/hermit/issues/4440): 381, listed.
-    ("test.cli_on_host", 381),
+    // And +2 from 7a4a7b54: 383.
+    ("test.cli_on_host", 383),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4206,7 +4209,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 072f557c: 1091.
     // And the 4440 record-version test
     // (https://github.com/rrnewton/hermit/issues/4440): 1092, listed.
-    ("test.hermit_unit_on_host", 1092),
+    // And +3 from 7a4a7b54: 1095.
+    ("test.hermit_unit_on_host", 1095),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

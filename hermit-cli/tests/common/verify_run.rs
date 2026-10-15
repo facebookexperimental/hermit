@@ -28,6 +28,13 @@ const EPOCH: &str = "2026-01-01T00:00:00Z";
 /// One Hermit invocation: `global` before the subcommand, `run_flags` after
 /// `run`, then `-- guest`.
 fn hermit_run(global: &[&str], run_flags: &[&str], guest: &[&str], epoch: &str) -> Output {
+    super::hermit_test::hermit_output(
+        &format!("hermit {global:?} run {run_flags:?}"),
+        &mut hermit_run_command(global, run_flags, guest, epoch),
+    )
+}
+
+fn hermit_run_command(global: &[&str], run_flags: &[&str], guest: &[&str], epoch: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.args(global).arg("run").args(run_flags);
     let mut rest = vec!["--"];
@@ -37,12 +44,10 @@ fn hermit_run(global: &[&str], run_flags: &[&str], guest: &[&str], epoch: &str) 
     } else {
         append_hermit_args(&mut command, &rest);
     }
-    super::hermit_test::hermit_output(
-        &format!("hermit {global:?} run {run_flags:?}"),
-        command
-            .env("HERMIT_EPOCH", epoch)
-            .stdin(std::process::Stdio::null()),
-    )
+    command
+        .env("HERMIT_EPOCH", epoch)
+        .stdin(std::process::Stdio::null());
+    command
 }
 
 fn log_diff(report: &Path, directories: [&Path; 2], extra: &[&str]) -> Output {
@@ -189,6 +194,202 @@ fn paired_verify_runs_report_what_run_verify_reports_on_dbt() {
         return;
     }
     assert_backend_pairs_like_run_verify("dbt", &["--backend=dbt"], &["--strict"]);
+}
+
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_stats_paths_are_private_in_plain_live_and_saved_runs() {
+    let _guard = hermit_run_guard();
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let run = |extra_flags: &[&str], guest: &[&str]| {
+        let mut flags = ["--strict", "--base-env=minimal"]
+            .into_iter()
+            .collect::<Vec<_>>();
+        // Keep the old random host sink under /tmp, where the container has to
+        // bind it. An enclosing test's TMPDIR must not bypass this regression.
+        flags.extend_from_slice(extra_flags);
+        super::hermit_test::hermit_output(
+            "DBT stats path regression",
+            hermit_run_command(&["--log=info", "--backend=dbt"], &flags, guest, EPOCH)
+                .env("TMPDIR", "/tmp"),
+        )
+    };
+    let assert_mountinfo = |output: &[u8]| {
+        let text = std::str::from_utf8(output).unwrap();
+        assert!(!text.is_empty());
+        assert!(
+            !text.contains("hermit-dbt-verify-stats-"),
+            "host stats path leaked"
+        );
+        assert!(
+            text.lines().any(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                fields.len() > 5
+                    && fields[3] == "/tmp/.hermit-dbt-stats-0"
+                    && fields[4] == "/tmp/.hermit-dbt-stats-0"
+            }),
+            "the real stats bind is missing its declared root and mountpoint"
+        );
+    };
+    let assert_matched = |path: &Path, output: &Output| {
+        let value = super::read_terminal_dbt_verdict(path);
+        assert_eq!(
+            value["verdict"],
+            "matched",
+            "{value}\nfull guest stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            stderr(output)
+        );
+        assert_eq!(value["verified"], true, "{value}");
+        assert_eq!(value["bitwise_parity"], true, "{value}");
+        assert_eq!(value["comparison"]["compare_io_buffers"], true, "{value}");
+        assert_eq!(value["comparison"]["full_trace"], true, "{value}");
+        assert_eq!(
+            value["compared_log_messages"]["left"],
+            value["compared_log_messages"]["right"]
+        );
+        value
+    };
+    let guest = ["/bin/cat", "/proc/self/mountinfo"];
+
+    // Run the unchanged full strict oracle first: the old mapping fails with
+    // an actual payload divergence, while both physical guests exit normally.
+    let live_report = root.path().join("live.json");
+    let live = run(
+        &[
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            live_report.to_str().unwrap(),
+        ],
+        &guest,
+    );
+    let live_value = assert_matched(&live_report, &live);
+    assert!(live.status.success(), "{}", stderr(&live));
+    assert_mountinfo(&live.stdout);
+
+    let plain_report = root.path().join("plain.json");
+    let plain = run(
+        &["--backend-engagement-json", plain_report.to_str().unwrap()],
+        &guest,
+    );
+    assert!(plain.status.success(), "{}", stderr(&plain));
+    let engagement = report(&plain_report);
+    assert_eq!(engagement["engagement"]["backend"], "dbt");
+    assert!(
+        engagement["engagement"]["counted_branches"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert_mountinfo(&plain.stdout);
+
+    let directories = [root.path().join("run1"), root.path().join("run2")];
+    for directory in &directories {
+        let saved = run(
+            &[
+                "--verify-strict",
+                "--verify-run",
+                directory.to_str().unwrap(),
+            ],
+            &guest,
+        );
+        assert!(saved.status.success(), "{}", stderr(&saved));
+        // --verify-run stores the guest output; log-diff publishes it after
+        // comparing the two complete saved runs.
+        assert!(saved.stdout.is_empty());
+        let saved_stdout = fs::read(directory.join("stdout")).unwrap();
+        assert_mountinfo(&saved_stdout);
+        assert_eq!(saved_stdout, live.stdout);
+        let stats =
+            reverie_dbt::backend_stats::DbtStatsCapture::read(&directory.join("dbt-stats.bin"))
+                .snapshot()
+                .unwrap();
+        assert!(stats.process_images() > 0);
+        assert!(stats.counted_branches() > 0);
+        assert!(stats.intercepted_syscalls() > 0);
+    }
+    let paired_report = root.path().join("paired.json");
+    let paired = log_diff(
+        &paired_report,
+        [&directories[0], &directories[1]],
+        &["--verify-allow", "success"],
+    );
+    assert!(paired.status.success(), "{}", stderr(&paired));
+    assert_eq!(assert_matched(&paired_report, &paired), live_value);
+    assert_eq!(paired.stdout, live.stdout);
+
+    let uncontained_report = root.path().join("uncontained.json");
+    // Host namespace mode intentionally cannot claim strict determinism.
+    // This checks only that its original host-path capture still works.
+    let uncontained = super::hermit_test::hermit_output(
+        "DBT stats without a namespace",
+        hermit_run_command(
+            &["--log=info", "--backend=dbt"],
+            &[
+                "--base-env=minimal",
+                "--no-namespace",
+                "--backend-engagement-json",
+                uncontained_report.to_str().unwrap(),
+            ],
+            &["/bin/true"],
+            EPOCH,
+        )
+        .env("TMPDIR", "/tmp"),
+    );
+    assert!(uncontained.status.success(), "{}", stderr(&uncontained));
+    let engagement = report(&uncontained_report);
+    assert_eq!(engagement["engagement"]["backend"], "dbt");
+    assert!(
+        engagement["engagement"]["counted_branches"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+}
+
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_stats_bind_preserves_supplied_tmp_contents() {
+    let _guard = hermit_run_guard();
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let backing = root.path().join("tmp");
+    fs::create_dir(&backing).unwrap();
+    let target = backing.join(".hermit-dbt-stats-0");
+    let run = |guest: &[&str]| {
+        super::hermit_test::hermit_output(
+            "DBT stats bind with supplied /tmp",
+            hermit_run_command(
+                &["--backend=dbt"],
+                &["--strict", "--tmp", backing.to_str().unwrap()],
+                guest,
+                EPOCH,
+            )
+            .env("TMPDIR", "/tmp"),
+        )
+    };
+    let created = run(&["/bin/true"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    assert!(target.is_dir());
+    assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+
+    let sentinel = target.join("user-data");
+    fs::write(&sentinel, b"preserve these bytes").unwrap();
+    let covered = run(&[
+        "/bin/sh",
+        "-c",
+        "test -d /tmp/.hermit-dbt-stats-0 && test ! -e /tmp/.hermit-dbt-stats-0/user-data",
+    ]);
+    assert!(covered.status.success(), "{}", stderr(&covered));
+    assert_eq!(fs::read(&sentinel).unwrap(), b"preserve these bytes");
+
+    fs::remove_file(sentinel).unwrap();
+    fs::remove_dir(&target).unwrap();
+    fs::write(&target, b"an incompatible user file").unwrap();
+    let refused = run(&["/bin/true"]);
+    assert!(
+        !refused.status.success(),
+        "file target was silently replaced"
+    );
+    assert_eq!(fs::read(target).unwrap(), b"an incompatible user file");
 }
 
 #[test]

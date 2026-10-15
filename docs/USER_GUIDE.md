@@ -748,6 +748,13 @@ Hermit starts.
 the real host `/tmp`, which is convenient for diagnosis but weakens isolation
 and reproducibility.
 
+DBT reserves `/tmp/.hermit-dbt-stats-N` for its current run's statistics, choosing
+the lowest number that does not overlap a declared bind target. The backing
+capture remains private to that run. With `--tmp=DIR`, this can create an empty
+directory or temporarily cover an existing directory at that name; existing
+contents are preserved. An incompatible file at the target is a mount error.
+`--no-namespace` keeps the host capture path and adds no statistics bind.
+
 Network modes are:
 
 - `--network=local` (default): isolated loopback networking.

@@ -1660,8 +1660,9 @@ fi
 # KVM MAP_FIXED_NOREPLACE SDK-BUDGET CARRY (2026-10-15): advance from 8f6e9b81 to 68e5db200dd63516fc779826069a086dd2b28b4b (KVM honours MAP_FIXED_NOREPLACE; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # KVM UPTIME-COPY-DELETION SDK-BUDGET CARRY (2026-10-15): advance from 68e5db20 to 361661a980278a363529b63246f173900d431fa6 (7858a5c3, the reverie-ptrace change ending the run on a guest syscall through the untraced private-page stub, changes only reverie-ptrace; 361661a9 deletes reverie-kvm's copies of /proc/uptime, which Detcore renders, and changes only reverie-kvm; inventory unchanged), so the budgets above carry.
 # KVM FILE-MMAP-STREAMING SDK-BUDGET CARRY (2026-10-15): advance from 361661a9 to f07e52b10ebb2ad4393a4fa2999bac5440c703ad (reverie-kvm streams a regular file's mmap into guest memory through one 64 KiB buffer, and unmaps the whole range when the mmap fails after its reservation; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f07e52b10ebb2ad4393a4fa2999bac5440c703ad ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie f07e52b10ebb2ad4393a4fa2999bac5440c703ad (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# DBT STATS-GUEST-PATH SDK-BUDGET CARRY (2026-10-15): advance from f07e52b10ebb2ad4393a4fa2999bac5440c703ad to 7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7 (a KVM shared-file test and the additive DBT launcher configure_at utility with capture tests; neither changes native sources, build.rs, vendor SDK inputs or the native build recipe), so the budgets above carry unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 7b42bb0361cc5288e2319d8ce76cbf7c52bebcf7 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
