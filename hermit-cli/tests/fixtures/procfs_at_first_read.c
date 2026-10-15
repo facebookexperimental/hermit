@@ -7,9 +7,11 @@
  */
 
 /*
- * Opens /proc/uptime, sleeps 5 seconds, then reads it, and prints what it
- * read: Linux renders the file when it is read (uptime_proc_show), so the
- * uptime is the read's, 5 seconds past the open's.
+ * Opens a procfs file (by default /proc/uptime, else the one named), sleeps
+ * 5 seconds, then reads it, and prints what it read: Linux renders
+ * /proc/uptime and /proc/stat when they are read (uptime_proc_show,
+ * show_stat), so the time they show is the read's, 5 seconds past the
+ * open's.
  */
 
 #include <fcntl.h>
@@ -17,10 +19,11 @@
 #include <time.h>
 #include <unistd.h>
 
-int main(void) {
-  int fd = open("/proc/uptime", O_RDONLY);
+int main(int argc, char** argv) {
+  const char* path = argc > 1 ? argv[1] : "/proc/uptime";
+  int fd = open(path, O_RDONLY);
   if (fd < 0) {
-    perror("open /proc/uptime");
+    perror(path);
     return 1;
   }
   struct timespec pause = {5, 0};
@@ -28,10 +31,10 @@ int main(void) {
     perror("nanosleep");
     return 1;
   }
-  char contents[64];
+  static char contents[1 << 20];
   ssize_t length = read(fd, contents, sizeof(contents));
   if (length <= 0) {
-    perror("read /proc/uptime");
+    perror(path);
     return 1;
   }
   if (write(STDOUT_FILENO, contents, (size_t)length) != length) {

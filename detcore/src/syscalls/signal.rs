@@ -5449,6 +5449,7 @@ mod before_park_tests {
                 sequentialize_threads: true,
                 backend_supports_blocked_wait_signal_interruption: true,
                 backend_delivers_timer_events: false,
+                backend_runs_guest_code_between_injections: false,
                 ..Config::default()
             };
             let state = GlobalState::for_tests(&config);
@@ -5505,6 +5506,7 @@ mod before_park_tests {
                 sequentialize_threads: true,
                 backend_supports_blocked_wait_signal_interruption: true,
                 backend_delivers_timer_events: false,
+                backend_runs_guest_code_between_injections: false,
                 ..Config::default()
             };
             let global = GlobalState::for_tests(&config);
@@ -5572,6 +5574,7 @@ mod before_park_tests {
                 sequentialize_threads: true,
                 backend_supports_blocked_wait_signal_interruption: true,
                 backend_delivers_timer_events: false,
+                backend_runs_guest_code_between_injections: false,
                 ..Config::default()
             };
             let global = GlobalState::for_tests(&config);
@@ -5656,6 +5659,7 @@ mod before_park_tests {
                 sequentialize_threads: true,
                 backend_supports_blocked_wait_signal_interruption: true,
                 backend_delivers_timer_events: false,
+                backend_runs_guest_code_between_injections: false,
                 ..Config::default()
             };
             let global = GlobalState::for_tests(&config);

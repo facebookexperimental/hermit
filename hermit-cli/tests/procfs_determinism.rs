@@ -564,7 +564,22 @@ fn proc_self_cmdline_is_deterministic() {
 // TODO-HUMAN-REVIEW(PR-843): Review process and system accounting coverage.
 #[test]
 fn proc_system_cpu_accounting_is_deterministic() {
+    // Linux's layout (`show_stat`), with nothing of the host's: one CPU,
+    // which spent the whole uptime (120 s) in its first column, in USER_HZ
+    // ticks; a count per interrupt number below 16, not one per host
+    // interrupt number; the ten softirqs; every count 0
+    // (https://github.com/rrnewton/hermit/issues/4213).
+    let expected = |ticks: u64| {
+        format!(
+            "cpu  {ticks} 0 0 0 0 0 0 0 0 0\ncpu0 {ticks} 0 0 0 0 0 0 0 0 0\nintr 0{}\n\
+             ctxt 0\nbtime 1767225480\nprocesses 0\nprocs_running 0\nprocs_blocked 0\n\
+             softirq 0{}\n",
+            " 0".repeat(16),
+            " 0".repeat(10),
+        )
+    };
     assert_deterministic_at_epoch("/proc/stat", Some(ACCOUNTING_EPOCH), |contents| {
+        assert_eq!(String::from_utf8_lossy(contents), expected(12_000));
         let text = std::str::from_utf8(contents).expect("stat should be UTF-8");
         let cpu_lines = text
             .lines()
@@ -595,6 +610,13 @@ fn proc_system_cpu_accounting_is_deterministic() {
         }
         assert!(text.contains("btime 1767225480\n"));
     });
+    // Opened, then read 5 seconds later: the snapshot is the read's, as
+    // Linux renders the file when it is read.
+    assert_eq!(
+        read_procfs_at_first_read("/proc/stat"),
+        expected(12_500),
+        "/proc/stat read 5 seconds after the open"
+    );
 }
 
 #[test]
@@ -916,13 +938,22 @@ fn proc_uptime_uses_virtual_time() {
     assert_deterministic_at_epoch("/proc/uptime", Some(ACCOUNTING_EPOCH), |contents| {
         assert_eq!(contents, b"120.00 0.00\n");
     });
+    assert_eq!(
+        read_procfs_at_first_read("/proc/uptime"),
+        "125.00 0.00\n",
+        "the uptime read 5 seconds after the open"
+    );
+}
 
+/// What the guest reads from `path` opened at the accounting epoch and read
+/// 5 seconds later (`tests/fixtures/procfs_at_first_read.c`).
+fn read_procfs_at_first_read(path: &str) -> String {
     let _guard = hermit_run_lock();
     let build =
         tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create guest build directory");
-    let guest = build.path().join("uptime-at-first-read");
+    let guest = build.path().join("procfs-at-first-read");
     compile_c(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/uptime_at_first_read.c"),
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/procfs_at_first_read.c"),
         &guest,
     );
     let mut command = Command::new(hermit_test::hermit_binary());
@@ -936,7 +967,8 @@ fn proc_uptime_uses_virtual_time() {
         ])
         .arg(format!("--epoch={ACCOUNTING_EPOCH}"))
         .arg("--")
-        .arg(&guest);
+        .arg(&guest)
+        .arg(path);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
@@ -944,15 +976,11 @@ fn proc_uptime_uses_virtual_time() {
         .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
     assert!(
         output.status.success(),
-        "uptime probe failed: {rendered}\nstatus: {}\nstderr:\n{}",
+        "{path} probe failed: {rendered}\nstatus: {}\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stderr),
     );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "125.00 0.00\n",
-        "the uptime read 5 seconds after the open: {rendered}"
-    );
+    String::from_utf8(output.stdout).expect("procfs contents are UTF-8")
 }
 
 #[test]

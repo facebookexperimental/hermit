@@ -7,9 +7,9 @@
 
 /* Guest for hermit-cli/tests/cli.rs: the procfs files Detcore renders without
  * the backend opening them (https://github.com/rrnewton/hermit/issues/4213),
- * /proc/sys/kernel/random/uuid, /proc/sys/kernel/pty/nr and /proc/uptime.
- * The first two are sysctl files and the last a seq_file, which Linux
- * seeks, maps and writes at a position differently (check_seeks,
+ * /proc/sys/kernel/random/uuid, /proc/sys/kernel/pty/nr, /proc/uptime and
+ * /proc/stat. The first two are sysctl files and the others seq_files, which
+ * Linux seeks, maps and writes at a position differently (check_seeks,
  * check_descriptor_refusals).
  *
  * Every check is one Linux gives for the real procfs file; most also fail
@@ -32,7 +32,8 @@
  *                              [--no-maps-or-chroot] [--chroot-only]
  *                              [--require-chroot] [--xattr-arguments-first]
  *                              [--detcore-xattr-order]
- *        rendered_procfs_files --inherited <fd> <ino> <offset>
+ *        rendered_procfs_files --inherited <fd> <duplicate> <ino> <offset> <kvm>
+ *                              <stat-fd> <stat-head> <uptime-fd>
  *
  * The program must be started by its absolute path, which it execs again.
  * Two options skip checks that need procfs files other than the two
@@ -91,6 +92,7 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef SYS_faccessat2
@@ -98,6 +100,15 @@
 #endif
 
 #define PROC_SUPER_MAGIC 0x9fa0
+
+/* Room for a whole /proc/stat in one read, whose size grows with the host's
+ * CPUs and interrupt numbers (some 40 KiB on a host of 128 CPUs). */
+#define READ_CAPACITY (1 << 20)
+static char contents_buffer[READ_CAPACITY];
+static char rest_buffer[READ_CAPACITY];
+
+/* How many bytes of /proc/stat the program reads before it execs itself. */
+#define STAT_HEAD 8
 
 static int failures;
 static int kvm_local_procfs;
@@ -222,8 +233,79 @@ static int is_uptime(const char* text, size_t length) {
   return fields == 2;
 }
 
+/* Whether the line at `*at` is `prefix` and then decimal numbers, each after
+ * one space, at least `minimum` and, unless `maximum` is 0, at most `maximum`
+ * of them, as show_stat prints its lines. Moves `*at` past it. */
+static int numbers_line(const char* text, size_t length, size_t* at, const char* prefix,
+                        int minimum, int maximum) {
+  size_t prefix_length = strlen(prefix);
+  size_t i = *at;
+  if (length - i < prefix_length || memcmp(text + i, prefix, prefix_length) != 0) {
+    return 0;
+  }
+  i += prefix_length;
+  int count = 0;
+  for (;;) {
+    size_t start = i;
+    while (i < length && text[i] >= '0' && text[i] <= '9') {
+      i++;
+    }
+    if (i == start) {
+      return 0;
+    }
+    count++;
+    if (i < length && text[i] == ' ') {
+      i++;
+      continue;
+    }
+    break;
+  }
+  if (i >= length || text[i] != '\n' || count < minimum || (maximum != 0 && count > maximum)) {
+    return 0;
+  }
+  *at = i + 1;
+  return 1;
+}
+
+/* /proc/stat in show_stat's layout: the aggregate line ("cpu" and two
+ * spaces), a "cpuN" line per CPU, "intr" with its total and a count per
+ * interrupt number, ctxt, btime, processes, procs_running, procs_blocked,
+ * and "softirq" with its total and a count for each of the ten softirqs. */
+static int is_stat(const char* text, size_t length) {
+  size_t at = 0;
+  if (!numbers_line(text, length, &at, "cpu  ", 4, 0)) {
+    return 0;
+  }
+  int cpus = 0;
+  while (length - at > 3 && memcmp(text + at, "cpu", 3) == 0 && text[at + 3] >= '0' &&
+         text[at + 3] <= '9') {
+    char prefix[32];
+    size_t name = 3;
+    while (at + name < length && name < sizeof(prefix) - 2 && text[at + name] >= '0' &&
+           text[at + name] <= '9') {
+      name++;
+    }
+    if (at + name >= length || text[at + name] != ' ') {
+      return 0;
+    }
+    memcpy(prefix, text + at, name + 1);
+    prefix[name + 1] = '\0';
+    if (!numbers_line(text, length, &at, prefix, 4, 0)) {
+      return 0;
+    }
+    cpus++;
+  }
+  return cpus > 0 && numbers_line(text, length, &at, "intr ", 2, 0) &&
+         numbers_line(text, length, &at, "ctxt ", 1, 1) &&
+         numbers_line(text, length, &at, "btime ", 1, 1) &&
+         numbers_line(text, length, &at, "processes ", 1, 1) &&
+         numbers_line(text, length, &at, "procs_running ", 1, 1) &&
+         numbers_line(text, length, &at, "procs_blocked ", 1, 1) &&
+         numbers_line(text, length, &at, "softirq ", 11, 11) && at == length;
+}
+
 /* The kinds of file this program checks. */
-enum kind { COUNT, UUID, UPTIME };
+enum kind { COUNT, UUID, UPTIME, STAT };
 
 static int has_contents(enum kind kind, const char* text, size_t length) {
   switch (kind) {
@@ -231,9 +313,77 @@ static int has_contents(enum kind kind, const char* text, size_t length) {
       return is_uuid(text, length);
     case UPTIME:
       return is_uptime(text, length);
+    case STAT:
+      return is_stat(text, length);
     default:
       return is_count(text, length);
   }
+}
+
+/* Whether the kind of file is a seq_file (every procfs file outside
+ * /proc/sys) rather than a sysctl file. */
+static int is_seq_file(enum kind kind) {
+  return kind == UPTIME || kind == STAT;
+}
+
+/* Prints `label`, then `text` with each newline but its last shown as \n, so
+ * that a file of several lines prints as one. */
+static void print_one_line(const char* label, const char* text, ssize_t length) {
+  printf("%s", label);
+  for (ssize_t i = 0; i < length; i++) {
+    if (text[i] == '\n' && i + 1 < length) {
+      printf("\\n");
+    } else {
+      putchar(text[i]);
+    }
+  }
+}
+
+/* Whether two timestamps are the same. */
+static int same_time(struct timespec a, struct timespec b) {
+  return a.tv_sec == b.tv_sec && a.tv_nsec == b.tv_nsec;
+}
+
+/* The times of the open file `fd` of `path`, a seq_file whose first read
+ * Detcore may have recorded on the memfd standing in for it, are the file's
+ * own through every view, fstat, statx with AT_EMPTY_PATH and a stat of the
+ * descriptor link, as a stat of the path shows them, and none is before 1970:
+ * nothing of the stand-in shows. `where` names the process for a failure. */
+static void check_hidden_times(int fd, const char* path, const char* where) {
+  struct stat by_path, by_fd, by_link;
+  struct statx by_statx;
+  char link[64];
+  snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+  int ok = stat(path, &by_path) == 0 && fstat(fd, &by_fd) == 0 && stat(link, &by_link) == 0 &&
+           statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &by_statx) == 0;
+  CHECK(ok, "%s times %s: %s", path, where, strerror(errno));
+  if (!ok) {
+    return;
+  }
+  CHECK(by_path.st_atim.tv_sec >= 0 && by_path.st_mtim.tv_sec >= 0 && by_path.st_ctim.tv_sec >= 0,
+        "%s times %s: before 1970 by path", path, where);
+  const struct stat* views[] = {&by_fd, &by_link};
+  for (size_t i = 0; i < sizeof(views) / sizeof(views[0]); i++) {
+    CHECK(same_time(views[i]->st_atim, by_path.st_atim) &&
+              same_time(views[i]->st_mtim, by_path.st_mtim) &&
+              same_time(views[i]->st_ctim, by_path.st_ctim),
+          "%s times %s: %s shows mtime %lld.%09ld, the path %lld.%09ld", path, where,
+          i == 0 ? "fstat" : "the descriptor link", (long long)views[i]->st_mtim.tv_sec,
+          views[i]->st_mtim.tv_nsec, (long long)by_path.st_mtim.tv_sec, by_path.st_mtim.tv_nsec);
+  }
+  struct timespec statx_mtime = {by_statx.stx_mtime.tv_sec, by_statx.stx_mtime.tv_nsec};
+  struct timespec statx_atime = {by_statx.stx_atime.tv_sec, by_statx.stx_atime.tv_nsec};
+  CHECK(same_time(statx_mtime, by_path.st_mtim) && same_time(statx_atime, by_path.st_atim),
+        "%s times %s: statx shows mtime %lld.%09ld", path, where, (long long)statx_mtime.tv_sec,
+        statx_mtime.tv_nsec);
+}
+
+/* A time before 1970 set on the open file `fd` is refused, as for any procfs
+ * file the caller does not own, and changes none of its times. */
+static void check_times_refused(int fd, const char* path, const char* where) {
+  struct timespec before_1970[2] = {{.tv_sec = -5}, {.tv_sec = -5}};
+  REFUSED(futimens(fd, before_1970), EPERM, path);
+  check_hidden_times(fd, path, where);
 }
 
 /* The value of `label` in this process's fdinfo for `fd`, or -1. */
@@ -315,7 +465,7 @@ static void check_descriptor_refusals(const char* path, int fd, enum kind kind) 
   /* A seq_file (every procfs file outside /proc/sys) is opened without
    * FMODE_PWRITE and maps through proc_reg_mmap, which has no method behind
    * it; a sysctl file has no mmap method at all. */
-  int seq_file = kind == UPTIME;
+  int seq_file = is_seq_file(kind);
   REFUSED(write(fd, "1\n", 2), EBADF, path);
   REFUSED(pwrite(fd, "1\n", 2, 0), seq_file ? ESPIPE : EBADF, path);
   REFUSED(pwrite(fd, "1\n", 2, -1), EINVAL, path);
@@ -592,7 +742,7 @@ static void check_path_calls(const char* path, const char* spelling) {
 static void check_seeks(const char* path, enum kind kind) {
   int fd = open(path, O_RDONLY);
   char contents[64];
-  if (kind == UPTIME) {
+  if (is_seq_file(kind)) {
     /* seq_lseek seeks only from the start or the position. */
     CHECK(fd >= 0, "open(%s): %s", path, strerror(errno));
     REFUSED(lseek(fd, 0, SEEK_END), EINVAL, path);
@@ -728,12 +878,28 @@ static void check_file(const char* path, enum kind kind) {
     CHECK(type == DT_LNK, "%s descriptor is not listed as a link", path);
   }
 
-  char contents[64];
-  ssize_t length = read(fd, contents, sizeof(contents));
+  char* contents = contents_buffer;
+  ssize_t length = read(fd, contents, READ_CAPACITY);
   CHECK(length > 0 && has_contents(kind, contents, length),
         "%s contents %.*s", path, (int)(length > 0 ? length : 0), contents);
-  char rest[64];
-  CHECK(read(fd, rest, sizeof(rest)) == 0, "%s second read is not at end", path);
+  char* rest = rest_buffer;
+  CHECK(read(fd, rest, READ_CAPACITY) == 0, "%s second read is not at end", path);
+  if (is_seq_file(kind)) {
+    /* Its first read took the snapshot; the times are still the file's, in
+     * this process and in a child before it reads. */
+    check_hidden_times(fd, path, "after the first read");
+    fflush(stdout);
+    pid_t viewer = fork();
+    if (viewer == 0) {
+      int inherited_failures = failures;
+      check_times_refused(fd, path, "in a child before it reads");
+      _exit(failures == inherited_failures ? 0 : 1);
+    }
+    int viewer_status = 0;
+    waitpid(viewer, &viewer_status, 0);
+    CHECK(WIFEXITED(viewer_status) && WEXITSTATUS(viewer_status) == 0,
+          "%s times in a child before it reads", path);
+  }
   CHECK(fdinfo_value(fd, "pos") == length, "%s fdinfo pos %lld", path,
         fdinfo_value(fd, "pos"));
   long long fdinfo_flags = fdinfo_value(fd, "flags");
@@ -745,7 +911,7 @@ static void check_file(const char* path, enum kind kind) {
         fdinfo_value(fd, "mnt_id"));
 
   /* Linux renders the file again for every read from its start. */
-  ssize_t preread = pread(fd, rest, sizeof(rest), 0);
+  ssize_t preread = pread(fd, rest, READ_CAPACITY, 0);
   CHECK(preread > 0 && has_contents(kind, rest, preread),
         "%s pread contents %.*s", path, (int)(preread > 0 ? preread : 0), rest);
 
@@ -768,7 +934,7 @@ static void check_file(const char* path, enum kind kind) {
     struct stat by_reopened;
     CHECK(fstat(reopened, &by_reopened) == 0 && by_reopened.st_ino == by_path.st_ino,
           "%s reopened identity differs", path);
-    ssize_t reread = read(reopened, rest, sizeof(rest));
+    ssize_t reread = read(reopened, rest, READ_CAPACITY);
     CHECK(reread > 0 && (has_contents(kind, rest, reread) &&
                               (kind != UUID || memcmp(rest, contents, 36) != 0)),
           "%s reopened contents %.*s", path, (int)(reread > 0 ? reread : 0), rest);
@@ -783,7 +949,7 @@ static void check_file(const char* path, enum kind kind) {
     CHECK(fstat(located, &by_located) == 0 && by_located.st_ino == by_path.st_ino &&
               by_located.st_dev == by_path.st_dev,
           "%s O_PATH identity differs", path);
-    REFUSED(read(located, rest, sizeof(rest)), EBADF, path);
+    REFUSED(read(located, rest, READ_CAPACITY), EBADF, path);
     char located_link[64];
     snprintf(located_link, sizeof(located_link), "/proc/self/fd/%d", located);
     CHECK(link_names(located_link, path), "%s O_PATH descriptor link", path);
@@ -820,8 +986,8 @@ static void check_file(const char* path, enum kind kind) {
     unlink(alias_link);
     CHECK(symlink(self_link, alias_link) == 0, "symlink: %s", strerror(errno));
     int through_alias = open(alias_link, O_RDONLY);
-    char aliased[64];
-    ssize_t aliased_length = through_alias >= 0 ? read(through_alias, aliased, sizeof(aliased)) : -1;
+    char* aliased = rest;
+    ssize_t aliased_length = through_alias >= 0 ? read(through_alias, aliased, READ_CAPACITY) : -1;
     CHECK(aliased_length > 0 && has_contents(kind, aliased, aliased_length),
           "%s through a link to its descriptor link: %zd", path, aliased_length);
     if (through_alias >= 0) {
@@ -858,8 +1024,8 @@ static void check_file(const char* path, enum kind kind) {
     if (reader == 0) {
       dup2(fd, 0);
       int again = open("/dev/stdin", O_RDONLY);
-      char text[64];
-      ssize_t again_length = again >= 0 ? pread(again, text, sizeof(text), 0) : -1;
+      char* text = rest;
+      ssize_t again_length = again >= 0 ? pread(again, text, READ_CAPACITY, 0) : -1;
       struct stat by_stdin;
       struct statfs stdin_filesystem;
       int ok = again_length > 0 &&
@@ -1024,22 +1190,30 @@ static void check_fork_shares_the_position(void) {
   close(fd);
 }
 
-/* Print the file's contents, as one read returns them. */
+/* Print the file's contents, as one read returns them, on one line. */
 static void print_contents(const char* path) {
-  char contents[64];
+  char* contents = contents_buffer;
   int fd = open(path, O_RDONLY);
-  ssize_t length = fd < 0 ? -1 : read(fd, contents, sizeof(contents));
+  ssize_t length = fd < 0 ? -1 : read(fd, contents, READ_CAPACITY);
   CHECK(length > 0 && contents[length - 1] == '\n', "%s contents", path);
   if (fd >= 0) {
     close(fd);
   }
-  printf("%s: %.*s", path, (int)(length > 0 ? length : 0), contents);
+  char label[96];
+  snprintf(label, sizeof(label), "%s: ", path);
+  print_one_line(label, contents, length > 0 ? length : 0);
 }
 
 /* After exec: the inherited descriptor and its duplicate are still the file,
  * one open file at its position. Prints what they read, which every backend
  * must agree on. */
-static int inherited(int fd, int duplicate, unsigned long long ino, long offset) {
+static int inherited(int fd, int duplicate, unsigned long long ino, long offset, int stat_fd,
+                     const char* stat_head, int uptime_fd) {
+  /* Before this image reads them, /proc/stat and /proc/uptime, whose first
+   * reads took their snapshots before exec, show the files' own times, and a
+   * time set on them is refused. */
+  check_times_refused(stat_fd, "/proc/stat", "after exec before it reads");
+  check_hidden_times(uptime_fd, "/proc/uptime", "after exec");
   /* Through a symbolic link to its descriptor link first, before anything
    * looks at the descriptor; then by the descriptor link, and through an
    * O_PATH reopen of it. */
@@ -1101,14 +1275,30 @@ static int inherited(int fd, int duplicate, unsigned long long ino, long offset)
   char whole[64];
   ssize_t whole_length = pread(fd, whole, sizeof(whole), 0);
   printf("exec whole: %.*s", (int)(whole_length > 0 ? whole_length : 0), whole);
+  /* /proc/stat, read in part before exec, continues from the snapshot that
+   * read took (Linux keeps the seq_file buffer with the open file), even a
+   * second later, when a new snapshot would show more time. */
+  struct timespec second = {1, 0};
+  CHECK(nanosleep(&second, NULL) == 0, "nanosleep: %s", strerror(errno));
+  CHECK(lseek(stat_fd, 0, SEEK_CUR) == STAT_HEAD, "inherited /proc/stat position %ld",
+        (long)lseek(stat_fd, 0, SEEK_CUR));
+  size_t head_length = strlen(stat_head);
+  memcpy(contents_buffer, stat_head, head_length);
+  ssize_t stat_rest = read(stat_fd, contents_buffer + head_length, READ_CAPACITY - head_length);
+  CHECK(head_length == STAT_HEAD && stat_rest > 0 &&
+            is_stat(contents_buffer, head_length + (size_t)stat_rest),
+        "inherited /proc/stat read %zd: %.*s", stat_rest,
+        (int)(stat_rest > 0 ? head_length + (size_t)stat_rest : 0), contents_buffer);
+  print_one_line("stat after exec: ", contents_buffer + head_length, stat_rest > 0 ? stat_rest : 0);
   return failures == 0 ? 0 : 1;
 }
 
 int main(int argc, char** argv) {
   program = argv[0];
-  if (argc == 7 && strcmp(argv[1], "--inherited") == 0) {
+  if (argc == 10 && strcmp(argv[1], "--inherited") == 0) {
     kvm_local_procfs = atoi(argv[6]);
-    return inherited(atoi(argv[2]), atoi(argv[3]), strtoull(argv[4], NULL, 10), atol(argv[5]));
+    return inherited(atoi(argv[2]), atoi(argv[3]), strtoull(argv[4], NULL, 10), atol(argv[5]),
+                     atoi(argv[7]), argv[8], atoi(argv[9]));
   }
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--kvm-local-procfs") == 0) {
@@ -1158,6 +1348,39 @@ int main(int argc, char** argv) {
    * backend. */
   print_contents("/proc/sys/kernel/random/uuid");
   print_contents("/proc/sys/kernel/pty/nr");
+  print_contents("/proc/stat");
+  /* The start of /proc/stat, whose first read takes its snapshot, in the
+   * same second as the read above; the rest is read after exec. */
+  int stat_fd = open("/proc/stat", O_RDONLY);
+  char stat_head[STAT_HEAD + 1] = {0};
+  if (stat_fd < 0 || read(stat_fd, stat_head, STAT_HEAD) != STAT_HEAD ||
+      memchr(stat_head, '\0', STAT_HEAD) != NULL) {
+    fprintf(stderr, "FAIL: cannot prepare the inherited /proc/stat: %s\n", strerror(errno));
+    return 1;
+  }
+  printf("stat before exec: %s\n", stat_head);
+  check_hidden_times(stat_fd, "/proc/stat", "after the first read");
+  {
+    pid_t viewer = fork();
+    if (viewer == 0) {
+      /* Before this process reads the shared open file: a time set on it is
+       * refused, and the read after exec still continues the snapshot. */
+      int inherited_failures = failures;
+      check_times_refused(stat_fd, "/proc/stat", "in a child before it reads");
+      _exit(failures == inherited_failures ? 0 : 1);
+    }
+    int viewer_status = 0;
+    waitpid(viewer, &viewer_status, 0);
+    CHECK(WIFEXITED(viewer_status) && WEXITSTATUS(viewer_status) == 0,
+          "/proc/stat times in a child before it reads");
+  }
+  /* /proc/uptime read whole, whose times the image after exec checks. */
+  int uptime_fd = open("/proc/uptime", O_RDONLY);
+  char uptime_text[64];
+  if (uptime_fd < 0 || read(uptime_fd, uptime_text, sizeof(uptime_text)) <= 0) {
+    fprintf(stderr, "FAIL: cannot prepare the inherited /proc/uptime: %s\n", strerror(errno));
+    return 1;
+  }
   check_fork_shares_the_position();
   int fd = open("/proc/sys/kernel/random/uuid", O_RDONLY);
   int duplicate = dup(fd);
@@ -1173,6 +1396,7 @@ int main(int argc, char** argv) {
   check_file("/proc/sys/kernel/random/uuid", UUID);
   check_file("/proc/sys/kernel/pty/nr", COUNT);
   check_file("/proc/uptime", UPTIME);
+  check_file("/proc/stat", STAT);
   if (!kvm_local_procfs && !no_maps_or_chroot) {
     check_chroot();
     check_thread_chroot();
@@ -1186,11 +1410,24 @@ int main(int argc, char** argv) {
   char fd_text[16];
   char duplicate_text[16];
   char ino_text[32];
+  char stat_fd_text[16];
+  snprintf(stat_fd_text, sizeof(stat_fd_text), "%d", stat_fd);
+  char uptime_fd_text[16];
+  snprintf(uptime_fd_text, sizeof(uptime_fd_text), "%d", uptime_fd);
   snprintf(fd_text, sizeof(fd_text), "%d", fd);
   snprintf(duplicate_text, sizeof(duplicate_text), "%d", duplicate);
   snprintf(ino_text, sizeof(ino_text), "%llu", (unsigned long long)by_fd.st_ino);
-  char* const arguments[] = {(char*)program, "--inherited",   fd_text, duplicate_text, ino_text,
-                             "10",          kvm_local_procfs ? "1" : "0", NULL};
+  char* const arguments[] = {(char*)program,
+                             "--inherited",
+                             fd_text,
+                             duplicate_text,
+                             ino_text,
+                             "10",
+                             kvm_local_procfs ? "1" : "0",
+                             stat_fd_text,
+                             stat_head,
+                             uptime_fd_text,
+                             NULL};
   execv(program, arguments);
   fprintf(stderr, "FAIL: exec: %s\n", strerror(errno));
   return 1;

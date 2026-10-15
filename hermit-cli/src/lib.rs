@@ -3765,6 +3765,11 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // syscall only when that thread's slice can end
     // (https://github.com/rrnewton/hermit/issues/4068).
     config.backend_delivers_timer_events = backend_delivers_preemption_timer(backend);
+    // Where guest code can run inside a Tool handler, Detcore makes no pair of
+    // injected calls that needs a descriptor number unchanged between them
+    // (`Config::backend_runs_guest_code_between_injections`).
+    config.backend_runs_guest_code_between_injections =
+        backend_runs_guest_code_between_injections(backend);
     // Only those waits read it (`Config::guest_may_inherit_a_terminal`), so the
     // host is asked only for them.
     config.guest_may_inherit_a_terminal =
@@ -3847,6 +3852,20 @@ pub fn backend_delivers_preemption_timer(backend: Backend) -> bool {
         Backend::Liteinst | Backend::InGuestTrap | Backend::Dbt | Backend::Sabre | Backend::Kvm => {
             false
         }
+    }
+}
+
+/// Whether guest code can run while a Tool handler is between two of its
+/// injected system calls (`Config::backend_runs_guest_code_between_injections`):
+/// SaBRe and in-guest LiteInst (`liteinst`, `in-guest-trap`) run an accepted
+/// native guest signal handler inside the Tool's handler, and their loaders
+/// pass its system calls to Linux. ptrace and e9patch stop the guest, DBT
+/// delivers guest signals between Tool handlers, and KVM's executor runs the
+/// guest only when the Tool lets it.
+pub fn backend_runs_guest_code_between_injections(backend: Backend) -> bool {
+    match backend {
+        Backend::Sabre | Backend::Liteinst | Backend::InGuestTrap => true,
+        Backend::Ptrace | Backend::E9patch | Backend::Dbt | Backend::Kvm => false,
     }
 }
 
@@ -6987,6 +7006,27 @@ mod tests {
             assert_eq!(
                 config.backend_delivers_timer_events, delivers,
                 "unexpected timer delivery for {backend:?}"
+            );
+        }
+    }
+
+    /// Only SaBRe and in-guest LiteInst run guest code inside a Tool handler,
+    /// between two injected calls.
+    #[test]
+    fn backend_guest_code_between_injections_is_explicit() {
+        for (backend, runs) in [
+            (Backend::Ptrace, false),
+            (Backend::Dbt, false),
+            (Backend::Kvm, false),
+            (Backend::Sabre, true),
+            (Backend::Liteinst, true),
+            (Backend::InGuestTrap, true),
+            (Backend::E9patch, false),
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            assert_eq!(
+                config.backend_runs_guest_code_between_injections, runs,
+                "unexpected guest code between injections for {backend:?}"
             );
         }
     }

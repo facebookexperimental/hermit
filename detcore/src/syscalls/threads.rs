@@ -5420,6 +5420,7 @@ mod tests {
             (
                 Config {
                     backend_delivers_timer_events: true,
+                    backend_runs_guest_code_between_injections: false,
                     ..Config::default()
                 },
                 SchedYieldRoute::EndTimeslice,
@@ -5428,6 +5429,7 @@ mod tests {
                 Config {
                     chaos: true,
                     backend_delivers_timer_events: true,
+                    backend_runs_guest_code_between_injections: false,
                     replay_schedule_from: path(),
                     ..Config::default()
                 },
@@ -5437,6 +5439,7 @@ mod tests {
                 Config {
                     chaos: true,
                     backend_delivers_timer_events: true,
+                    backend_runs_guest_code_between_injections: false,
                     ..Config::default()
                 },
                 SchedYieldRoute::ChaosYieldEpoch,
@@ -5445,6 +5448,7 @@ mod tests {
                 Config {
                     chaos: true,
                     backend_delivers_timer_events: true,
+                    backend_runs_guest_code_between_injections: false,
                     sched_heuristic: SchedHeuristic::Random,
                     ..Config::default()
                 },
@@ -5454,6 +5458,7 @@ mod tests {
                 Config {
                     chaos: true,
                     backend_delivers_timer_events: true,
+                    backend_runs_guest_code_between_injections: false,
                     sched_heuristic: SchedHeuristic::StickyRandom,
                     ..Config::default()
                 },
@@ -5463,6 +5468,7 @@ mod tests {
                 Config {
                     chaos: true,
                     backend_delivers_timer_events: true,
+                    backend_runs_guest_code_between_injections: false,
                     sched_heuristic: SchedHeuristic::ConnectBind,
                     ..Config::default()
                 },
@@ -5496,6 +5502,7 @@ mod tests {
                 Config {
                     chaos: true,
                     backend_delivers_timer_events: true,
+                    backend_runs_guest_code_between_injections: false,
                     replay_preemptions_from: path(),
                     ..Config::default()
                 },

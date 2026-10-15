@@ -65,6 +65,7 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
+use tracing::warn;
 
 use super::StatTarget;
 use crate::fd::FdType;
@@ -106,6 +107,58 @@ pub(crate) const PLACEHOLDER_SEALS: libc::c_int =
 /// in: the most a memfd name holds (`NAME_MAX` less `memfd:`), and its NUL.
 const PLACEHOLDER_NAME_CAPACITY: usize = 250;
 
+/// How many low bits of a carried uptime the nanoseconds of a placeholder's
+/// modification time hold ([`carried_uptime_mtime`]): fewer than 10^9 values,
+/// as `utimensat` requires.
+const CARRIED_UPTIME_NSEC_BITS: u32 = 29;
+
+/// The modification time that makes a placeholder carry `uptime_seconds`, the
+/// uptime of the first read of a file whose snapshot that read takes
+/// (`ProcfsFile::snapshot_at_first_read`): a time before 1970, the uptime's
+/// high bits counting down from -1 seconds and its low bits in the
+/// nanoseconds. Every `u64` has one. A memfd's own modification time is the
+/// host's time at its creation, which Linux never lets be before 1970
+/// (`settimeofday` refuses a negative time), so no placeholder carries an
+/// uptime it was not given.
+fn carried_uptime_mtime(uptime_seconds: u64) -> Timespec {
+    Timespec {
+        tv_sec: -1 - (uptime_seconds >> CARRIED_UPTIME_NSEC_BITS) as i64,
+        tv_nsec: (uptime_seconds & ((1 << CARRIED_UPTIME_NSEC_BITS) - 1)) as i64,
+    }
+}
+
+/// Whether nothing can change what a descriptor number names between two of
+/// Detcore's injected calls: threads are sequentialized, so Detcore holds the
+/// scheduler turn across both, and no guest code runs inside a Tool handler
+/// (`Config::backend_runs_guest_code_between_injections`: SaBRe's and
+/// in-guest LiteInst's accepted native signal handlers do).
+fn descriptor_stable_across_injections(sequentialized: bool, guest_code_between: bool) -> bool {
+    sequentialized && !guest_code_between
+}
+
+/// Whether a first read may read and write the uptime carried on the
+/// placeholder behind its descriptor (`Detcore::first_read_uptime`): only
+/// where the descriptor number keeps naming the same file between Detcore's
+/// look and its write ([`descriptor_stable_across_injections`]), and only if
+/// the descriptor is, by its kernel identity, the placeholder of `path` this
+/// tool process registered (`placeholder_identity`), so that neither another
+/// file's time is read as a carried uptime nor the carry written to another
+/// file.
+fn may_carry_uptime(stable: bool, identity: Option<&Path>, path: &Path) -> bool {
+    stable && identity == Some(path)
+}
+
+/// The uptime a placeholder whose modification time is `seconds` and
+/// `nanoseconds` carries ([`carried_uptime_mtime`]), if it carries one.
+fn carried_uptime(seconds: i64, nanoseconds: i64) -> Option<u64> {
+    if seconds >= 0 || !(0..1 << CARRIED_UPTIME_NSEC_BITS).contains(&nanoseconds) {
+        return None;
+    }
+    let high = (-1 - seconds) as u64;
+    (high < 1 << (64 - CARRIED_UPTIME_NSEC_BITS))
+        .then_some((high << CARRIED_UPTIME_NSEC_BITS) | nanoseconds as u64)
+}
+
 /// The placeholders this tool process made, by their memfd's kernel identity
 /// `(dev, ino)`, and the rendered file each stands in for. A kernel object
 /// with one of these identities is Detcore's placeholder however the guest
@@ -143,10 +196,11 @@ pub(crate) fn placeholder_identity(dev: u64, ino: u64) -> Option<&'static Path> 
 
 /// The procfs files Detcore renders from its run state, as opposed to the
 /// fixed files of `procfs::fixed`.
-const DYNAMIC_PATHS: [&std::ffi::CStr; 3] = [
+const DYNAMIC_PATHS: [&std::ffi::CStr; 4] = [
     c"/proc/sys/kernel/random/uuid",
     c"/proc/sys/kernel/pty/nr",
     c"/proc/uptime",
+    c"/proc/stat",
 ];
 
 /// The paths of every procfs file Detcore renders.
@@ -1242,6 +1296,139 @@ impl<T: RecordOrReplay> Detcore<T> {
             .to_vec()
     }
 
+    /// The uptime, in seconds, that the first read in this process of the
+    /// rendered file `path` behind `fd`, one whose snapshot its first read
+    /// takes (`ProcfsFile::snapshot_at_first_read`), renders: `uptime_seconds`,
+    /// the uptime now, unless an earlier read of the same open file already
+    /// took the snapshot and carried its uptime on the placeholder.
+    ///
+    /// Linux keeps that snapshot in the open file, for every process sharing
+    /// it and across `exec`. Detcore keeps it in its state of the open file,
+    /// which ptrace and KVM keep across `fork` and `exec` too; where the tool
+    /// runs in each guest process (DBT, SaBRe, in-guest LiteInst), that state
+    /// is the process's own, and a process that shares the open file, or the
+    /// image after `exec`, starts without it. Every other byte of the
+    /// snapshot is fixed for the run, so the uptime is all it needs, and the
+    /// placeholder, one kernel object per open file, carries it in its
+    /// modification time ([`carried_uptime_mtime`]). The guest never sees
+    /// that time (every stat of a rendered file is Detcore's
+    /// `rendered_stat`) and cannot set it (Detcore answers the guest's
+    /// `utimensat` of a rendered file, by descriptor too).
+    ///
+    /// The carry is read and written only where nothing can change what the
+    /// descriptor number names between Detcore's look and its write
+    /// ([`may_carry_uptime`]): with threads sequentialized, Detcore holds the
+    /// scheduler turn across both injected calls, no guest code runs inside
+    /// the handler, and the descriptor must be the placeholder of `path` this
+    /// tool process registered, by its kernel identity. Under
+    /// `--no-sequentialize-threads` another thread could replace the number
+    /// in between, and on SaBRe and in-guest LiteInst an accepted native
+    /// signal handler could, so the write could land on another file: there
+    /// is no carry there, and a process without Detcore's state of the open
+    /// file (after `exec` or `fork` on SaBRe) takes its own snapshot at its
+    /// next read, as before.
+    ///
+    /// If the write fails (the process no longer owns the placeholder after
+    /// changing its user), the snapshot is still taken, and is not carried.
+    pub(super) async fn first_read_uptime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        path: &'static Path,
+        uptime_seconds: u64,
+    ) -> u64 {
+        let stable = descriptor_stable_across_injections(
+            guest.config().sequentialize_threads,
+            guest.config().backend_runs_guest_code_between_injections,
+        );
+        if !stable {
+            return uptime_seconds;
+        }
+        let Ok(stat) = self.inject_fstat(guest, fd).await else {
+            return uptime_seconds;
+        };
+        if !may_carry_uptime(stable, placeholder_identity(stat.st_dev, stat.st_ino), path) {
+            return uptime_seconds;
+        }
+        if let Some(carried) = carried_uptime(stat.st_mtime, stat.st_mtime_nsec) {
+            return carried;
+        }
+        let times = [
+            Timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            carried_uptime_mtime(uptime_seconds),
+        ];
+        if let Err(errno) = Self::inject_futimens(guest, fd, times).await {
+            warn!(
+                "The first read of {} on fd {fd} could not carry its uptime on the \
+                 placeholder ({errno}); a process without Detcore's state of the open \
+                 file takes its own snapshot.",
+                path.display()
+            );
+        }
+        uptime_seconds
+    }
+
+    /// `utimensat(fd, NULL, times, 0)`, its times in guest stack scratch, or in
+    /// a private anonymous page mapped for this call only where the stack
+    /// cannot hold them (as `inject_fstat` falls back,
+    /// https://github.com/rrnewton/hermit/issues/3328).
+    async fn inject_futimens<G: Guest<Self>>(
+        guest: &mut G,
+        fd: RawFd,
+        times: [Timespec; 2],
+    ) -> Result<(), Errno> {
+        let call = |times| {
+            syscalls::Utimensat::new()
+                .with_dirfd(fd)
+                .with_path(None)
+                .with_times(Some(times))
+                .with_flags(0)
+        };
+        let mut stack = guest.stack().await;
+        let staged = stack.push(times);
+        // Keep the guard until the call has read the times: on backends whose
+        // scratch is a Tool-owned arena (DBT, SaBRe), dropping it frees them.
+        if let Ok(stack_guard) = stack.commit() {
+            let result = guest.inject(call(staged)).await;
+            drop(stack_guard);
+            if result != Err(Errno::EFAULT) {
+                return result.map(drop);
+            }
+        }
+        let len = std::mem::size_of::<[Timespec; 2]>();
+        let mapped = guest
+            .inject_with_retry(Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(len)
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await?;
+        let page = usize::try_from(mapped).map_err(|_| Errno::EFAULT)?;
+        let staged = Addr::<[Timespec; 2]>::from_raw(page).ok_or(Errno::EFAULT)?;
+        let written = AddrMut::<[Timespec; 2]>::from_raw(page)
+            .ok_or(Errno::EFAULT)
+            .and_then(|address| guest.memory().write_value(address, &times));
+        let result = match written {
+            Ok(()) => guest.inject(call(staged)).await.map(drop),
+            Err(errno) => Err(errno),
+        };
+        let _ = guest
+            .inject_with_retry(Syscall::Munmap(
+                syscalls::Munmap::new()
+                    .with_addr(Some(staged.cast()))
+                    .with_len(len),
+            ))
+            .await;
+        result
+    }
+
     /// Inject a placeholder for `path` open with `flags`, at the lowest free
     /// descriptor number, as `open` would place the file.
     async fn inject_placeholder<G: Guest<Self>>(
@@ -2206,7 +2393,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             None
         };
         let rendered = if by_descriptor {
-            let rendered = guest
+            let known = guest
                 .thread_state()
                 .with_detfd(dirfd, |detfd| {
                     detfd
@@ -2215,6 +2402,30 @@ impl<T: RecordOrReplay> Detcore<T> {
                 })
                 .ok()
                 .flatten();
+            // A placeholder Detcore did not record as one (an alias the kernel
+            // opened) is known by its kernel identity, as a stat of it is: a
+            // time set on it would change no file of the guest's and could be
+            // read as an uptime a first read carried (`first_read_uptime`).
+            let rendered = match known {
+                Some(known) => Some(known),
+                None if self.renders_procfs(guest) => {
+                    match self.placeholder_descriptor(guest, dirfd).await {
+                        Some(path) => {
+                            let status = guest
+                                .inject(
+                                    syscalls::Fcntl::new()
+                                        .with_fd(dirfd)
+                                        .with_cmd(syscalls::FcntlCmd::F_GETFL),
+                                )
+                                .await
+                                .unwrap_or(0);
+                            Some((path, status & i64::from(libc::O_PATH) != 0))
+                        }
+                        None => None,
+                    }
+                }
+                None => None,
+            };
             // `futimens` needs a descriptor opened for I/O: an `O_PATH` one
             // is EBADF, after the flags are checked and before the times are
             // (measured on Linux 7.1).
@@ -2604,8 +2815,12 @@ mod tests {
             crate::procfs::placeholder_link(b"/memfd:hermit-procfs:/proc/uptime@ (deleted)"),
             Some((Path::new("/proc/uptime"), Vec::new()))
         );
+        assert_eq!(
+            crate::procfs::placeholder_link(b"/memfd:hermit-procfs:/proc/stat@ (deleted)"),
+            Some((Path::new("/proc/stat"), Vec::new()))
+        );
         for link in [
-            b"/memfd:hermit-procfs:/proc/stat@30 (deleted)".as_slice(),
+            b"/memfd:hermit-procfs:/proc/diskstats@30 (deleted)".as_slice(),
             b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid (deleted)",
             b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid@3 (deleted)",
             b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid@zz (deleted)",
@@ -2623,7 +2838,59 @@ mod tests {
             rendered_path_within(Path::new("/uptime")),
             Some(Path::new("/proc/uptime"))
         );
-        assert_eq!(rendered_path_within(Path::new("/stat")), None);
+        assert_eq!(
+            rendered_path_within(Path::new("/stat")),
+            Some(Path::new("/proc/stat"))
+        );
+        assert_eq!(rendered_path_within(Path::new("/diskstats")), None);
+        assert_eq!(rendered_path_within(Path::new("/self/stat")), None);
+    }
+
+    /// A placeholder carries the uptime of its file's first read in its
+    /// modification time, exactly for every uptime, and only a time before
+    /// 1970 is read as one: a memfd's own time never is.
+    #[test]
+    fn a_placeholder_carries_the_uptime_of_the_first_read() {
+        for uptime in [
+            0,
+            1,
+            120,
+            (1 << 29) - 1,
+            1 << 29,
+            1 << 63,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            let mtime = carried_uptime_mtime(uptime);
+            assert!(mtime.tv_sec < 0, "{uptime}");
+            assert!((0..1_000_000_000).contains(&mtime.tv_nsec), "{uptime}");
+            assert_eq!(carried_uptime(mtime.tv_sec, mtime.tv_nsec), Some(uptime));
+        }
+        assert_eq!(carried_uptime(0, 0), None);
+        assert_eq!(carried_uptime(1_767_225_600, 123), None);
+        assert_eq!(carried_uptime(-1, 1 << 29), None);
+        assert_eq!(carried_uptime(-1, -1), None);
+        assert_eq!(carried_uptime(i64::MIN, 0), None);
+        // Only where no thread and no guest handler can change the
+        // descriptor between Detcore's injected calls, and only on the
+        // placeholder of the file read.
+        assert!(descriptor_stable_across_injections(true, false));
+        assert!(!descriptor_stable_across_injections(false, false));
+        assert!(!descriptor_stable_across_injections(true, true));
+        assert!(!descriptor_stable_across_injections(false, true));
+        let stat = Path::new("/proc/stat");
+        assert!(may_carry_uptime(true, Some(stat), stat));
+        assert!(!may_carry_uptime(false, Some(stat), stat));
+        assert!(!may_carry_uptime(true, None, stat));
+        assert!(!may_carry_uptime(
+            true,
+            Some(Path::new("/proc/uptime")),
+            stat
+        ));
+        assert_eq!(
+            carried_uptime(-(1 << 35), 7),
+            Some((((1 << 35) - 1) << 29) | 7)
+        );
     }
 
     #[test]

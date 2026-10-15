@@ -416,6 +416,13 @@ unknown              /dev/tty        4 1-63 console
 /// clock, on the I/O APIC, edge-triggered.
 const INTERRUPT_LINES: [(u32, u32, &str); 2] = [(0, 2, "timer"), (8, 8, "rtc0")];
 
+/// The interrupt numbers the machine has (Linux's `nr_irqs`), for which
+/// `/proc/stat`'s `intr` line shows a count each: the 16 legacy numbers
+/// (`NR_IRQS_LEGACY`) that every x86 kernel has, which hold every line
+/// `/proc/interrupts` lists. The host's own number depends on its CPUs and
+/// interrupt controllers.
+pub(super) const NR_IRQS: usize = 16;
+
 /// The x86 interrupts after the lines, with their descriptions
 /// (`arch_show_interrupts`).
 const ARCH_INTERRUPTS: [(&str, &str); 15] = [
@@ -462,7 +469,7 @@ fn interrupts(cpus: u32) -> String {
 }
 
 /// Linux's softirqs, in `softirq_to_name` order.
-const SOFTIRQS: [&str; 10] = [
+pub(super) const SOFTIRQS: [&str; 10] = [
     "HI", "TIMER", "NET_TX", "NET_RX", "BLOCK", "IRQ_POLL", "TASKLET", "SCHED", "HRTIMER", "RCU",
 ];
 
@@ -755,6 +762,11 @@ mod tests {
     /// line or page set per CPU, and the same populated zones.
     #[test]
     fn the_tables_describe_the_machine_consistently() {
+        // `/proc/stat` counts each interrupt number below NR_IRQS, which
+        // holds every line `/proc/interrupts` lists.
+        for (line, _, _) in INTERRUPT_LINES {
+            assert!((line as usize) < NR_IRQS, "{line}");
+        }
         for cpus in [1, 2, 3] {
             let machine = MachineDescription { cpus, ..machine() };
             let table = |file: FixedProcfsFile| String::from_utf8(file.contents(&machine)).unwrap();

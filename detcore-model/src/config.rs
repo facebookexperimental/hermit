@@ -203,6 +203,23 @@ pub struct Config {
     #[clap(skip)]
     pub backend_delivers_timer_events: bool,
 
+    /// Guest code can run while a Tool handler is between two of its injected
+    /// system calls, and reach Linux without Detcore: SaBRe and in-guest
+    /// LiteInst run an accepted native guest signal handler inside the Tool's
+    /// handler, and the loader passes that handler's system calls to Linux.
+    /// What a descriptor number names can then change between two injected
+    /// calls even with threads sequentialized, so Detcore makes no pair of
+    /// injected calls that needs it unchanged (the uptime a rendered procfs
+    /// file's first read carries on its placeholder). False where the backend
+    /// runs guest code only outside Tool handlers (ptrace, e9patch, DBT,
+    /// KVM). The host sets it from the backend's name, because
+    /// `reverie::BackendCapabilities` has no field for this fact yet. Like the
+    /// fields above it has no legacy key; it is false for DBT, the legacy
+    /// form's only reader.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_runs_guest_code_between_injections: bool,
+
     /// The guest may start with a terminal: one of the launcher's standard
     /// descriptors is a terminal, the launcher has a controlling terminal that
     /// the guest inherits with its session, or the launcher could not tell.
@@ -1841,7 +1858,9 @@ impl Default for Config {
 /// form never had, is left out too, and reads back as false: this form serves
 /// only DBT, whose launcher collects no host inputs. So is
 /// [`Config::backend_supports_blocked_wait_signal_interruption`] and
-/// [`Config::backend_delivers_timer_events`], which are false for DBT, and
+/// [`Config::backend_delivers_timer_events`] and
+/// [`Config::backend_runs_guest_code_between_injections`], which are false
+/// for DBT, and
 /// [`Config::guest_may_inherit_a_terminal`], which only
 /// that capability reads, and [`Config::in_guest_detlog_forward_policy`] and
 /// [`Config::in_guest_site_patching_off`], which are unset for DBT. So is [`Config::target_timeslice_syscalls_only`],
@@ -2237,9 +2256,10 @@ mod legacy_backend_json {
     /// `record_host_inputs` has no legacy key and no legacy value: the legacy
     /// form serves only DBT, whose launcher collects no host inputs, so it is
     /// never written and always reads as false.
-    /// `backend_supports_blocked_wait_signal_interruption` and
-    /// `backend_delivers_timer_events` are the same: they are false for DBT,
-    /// so they are never written and always read as false.
+    /// `backend_supports_blocked_wait_signal_interruption`,
+    /// `backend_delivers_timer_events` and
+    /// `backend_runs_guest_code_between_injections` are the same: they are
+    /// false for DBT, so they are never written and always read as false.
     /// So is `guest_may_inherit_a_terminal`, which only that capability reads.
     /// `target_timeslice_syscalls_only` came after the legacy form froze; the
     /// legacy form never carried it, so it is never written and reads as false,
@@ -2256,11 +2276,12 @@ mod legacy_backend_json {
     /// written and reads as unknown.
     /// `cpu_profile` and `cpu_profile_host` came after it as well. DBT refuses
     /// the x86-64-v3 profile, so they are never written and read as v2.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 14] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 15] = [
         "backend",
         "record_host_inputs",
         "backend_supports_blocked_wait_signal_interruption",
         "backend_delivers_timer_events",
+        "backend_runs_guest_code_between_injections",
         "guest_may_inherit_a_terminal",
         "in_guest_detlog_forward_policy",
         "in_guest_site_patching_off",
@@ -2362,6 +2383,7 @@ mod legacy_backend_json {
     /// there nor [`Config::record_host_inputs`],
     /// [`Config::backend_supports_blocked_wait_signal_interruption`],
     /// [`Config::backend_delivers_timer_events`],
+    /// [`Config::backend_runs_guest_code_between_injections`],
     /// [`Config::guest_may_inherit_a_terminal`],
     /// [`Config::in_guest_detlog_forward_policy`],
     /// [`Config::in_guest_site_patching_off`],
@@ -2402,6 +2424,7 @@ mod legacy_backend_json {
                     "record_host_inputs"
                     | "backend_supports_blocked_wait_signal_interruption"
                     | "backend_delivers_timer_events"
+                    | "backend_runs_guest_code_between_injections"
                     | "guest_may_inherit_a_terminal"
                     | "in_guest_site_patching_off"
                     | "target_timeslice_syscalls_only"
@@ -2675,6 +2698,7 @@ mod legacy_backend_json {
                 "record_host_inputs"
                 | "backend_supports_blocked_wait_signal_interruption"
                 | "backend_delivers_timer_events"
+                | "backend_runs_guest_code_between_injections"
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
@@ -2751,6 +2775,7 @@ mod tests {
         );
         assert!(!config.backend_supports_blocked_wait_signal_interruption);
         assert!(!config.backend_delivers_timer_events);
+        assert!(!config.backend_runs_guest_code_between_injections);
         assert!(!config.guest_may_inherit_a_terminal);
         assert!(config.in_guest_detlog_forward_policy.is_none());
         assert!(!config.in_guest_site_patching_off);
@@ -3270,7 +3295,9 @@ mod tests {
     /// The legacy form's positions are `Config`'s fields in declaration order
     /// with the fifteen legacy keys where `backend` stands and no
     /// `record_host_inputs`, `backend_supports_blocked_wait_signal_interruption`,
-    /// `backend_delivers_timer_events`, `guest_may_inherit_a_terminal`,
+    /// `backend_delivers_timer_events`,
+    /// `backend_runs_guest_code_between_injections`,
+    /// `guest_may_inherit_a_terminal`,
     /// `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
     /// `target_timeslice_syscalls_only`, `futex_wake_yields`, `replaying`,
     /// `scheduler_turn_cost` or
@@ -3293,6 +3320,7 @@ mod tests {
                 "record_host_inputs"
                 | "backend_supports_blocked_wait_signal_interruption"
                 | "backend_delivers_timer_events"
+                | "backend_runs_guest_code_between_injections"
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
@@ -3314,13 +3342,15 @@ mod tests {
         assert_eq!(keys, expected);
         // `backend` becomes fifteen keys; `record_host_inputs`,
         // `backend_supports_blocked_wait_signal_interruption`,
-        // `backend_delivers_timer_events`, `guest_may_inherit_a_terminal`,
+        // `backend_delivers_timer_events`,
+        // `backend_runs_guest_code_between_injections`,
+        // `guest_may_inherit_a_terminal`,
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
         // `target_timeslice_syscalls_only`, `futex_wake_yields`, `replaying`,
         // `scheduler_turn_cost`, `inherited_seccomp`, `cpu_profile` and
-        // `cpu_profile_host` none.
+        // `cpu_profile_host` none: fourteen more keys, and fourteen fewer.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 1, keys.len());
+        assert_eq!(fields.len(), keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -3396,6 +3426,7 @@ mod tests {
         let on = Config {
             backend_supports_blocked_wait_signal_interruption: true,
             backend_delivers_timer_events: false,
+            backend_runs_guest_code_between_injections: false,
             ..off.clone()
         };
         let json = to_legacy_backend_json(&on).unwrap();

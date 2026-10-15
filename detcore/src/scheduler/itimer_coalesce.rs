@@ -440,6 +440,7 @@ mod tests {
             sequentialize_threads: true,
             backend_supports_blocked_wait_signal_interruption: true,
             backend_delivers_timer_events: false,
+            backend_runs_guest_code_between_injections: false,
             ..Config::default()
         });
         assert!(scheduler.coalesces_alarms());

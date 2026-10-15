@@ -908,6 +908,7 @@ impl ProcfsFile {
             ProcfsKind::RandomUuid => Some(Path::new("/proc/sys/kernel/random/uuid")),
             ProcfsKind::PtyNr => Some(Path::new("/proc/sys/kernel/pty/nr")),
             ProcfsKind::Uptime => Some(Path::new("/proc/uptime")),
+            ProcfsKind::SystemStat => Some(Path::new("/proc/stat")),
             ProcfsKind::Fixed(file) => Some(file.path()),
             _ => None,
         }
@@ -961,11 +962,15 @@ impl ProcfsFile {
 
     /// Whether a rendered open of this file takes no snapshot, leaving it to
     /// the first read, as for a captured file: Linux renders `/proc/uptime`
-    /// when it is read (`uptime_proc_show`), and the time it shows is the
-    /// virtual time of that read, not of the open. Its placeholder carries no
-    /// snapshot across `exec`, so the new image renders it at its next read.
+    /// (`uptime_proc_show`) and `/proc/stat` (`show_stat`) when they are
+    /// read, and the time they show is the virtual time of that read, not of
+    /// the open. Each snapshot is a function of the uptime seconds of that
+    /// read and of facts fixed for the run, so the first read records those
+    /// seconds on the placeholder (`syscalls::files::rendered_procfs`), where
+    /// a process that shares the open file, or the image after `exec`, finds
+    /// them on a backend that keeps Detcore's state per process.
     pub(crate) fn snapshot_at_first_read(&self) -> bool {
-        self.kind == ProcfsKind::Uptime
+        matches!(self.kind, ProcfsKind::Uptime | ProcfsKind::SystemStat)
     }
 
     /// Whether this file's every snapshot is the same, a fact of the run's
@@ -984,6 +989,7 @@ impl ProcfsFile {
             ProcfsKind::RandomUuid => b"00000000-0000-4000-8000-000000000000\n",
             ProcfsKind::PtyNr => b"0\n",
             ProcfsKind::Uptime => b"0.00 0.00\n",
+            ProcfsKind::SystemStat => SYSTEM_STAT_TEMPLATE,
             ProcfsKind::Fixed(_) => b"",
             _ => unreachable!("{:?} has no rendered path", self.kind),
         }
@@ -1149,6 +1155,7 @@ impl ProcfsFile {
                 &contents,
                 virtual_uptime_seconds,
                 virtual_boot_time_seconds.expect("system stat snapshot omitted its boot time"),
+                machine.cpus,
             ),
             ProcfsKind::Cpuinfo => virtual_cpuinfo.unwrap_or_else(|| sanitize_cpuinfo(&contents)),
             ProcfsKind::Diskstats => sanitize_diskstats(&contents),
@@ -2234,92 +2241,74 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-843): Review deterministic procfs system accounting.
+/// `/proc/stat` for a snapshot the kernel's file was captured for (under
+/// record and replay, or after a `chroot`): the same bytes Detcore renders
+/// for its own open ([`render_system_stat`]), so that the file has one layout
+/// whichever opened it. Nothing of the capture is kept but whether it was
+/// empty: the host's lines, such as its `intr` line with a field per host
+/// interrupt number, would show the host.
 fn sanitize_system_stat(
     contents: &[u8],
     virtual_uptime_seconds: u64,
     virtual_boot_time_seconds: i64,
+    cpus: u32,
 ) -> Vec<u8> {
-    const VOLATILE_FIELDS: &[&[u8]] = &[
-        b"intr",
-        b"ctxt",
-        b"processes",
-        b"procs_running",
-        b"procs_blocked",
-        b"softirq",
-    ];
-
-    // Hermit has one virtual CPU, so only the aggregate `cpu` line and the
-    // `cpu0` line are kept; the host's other per-CPU lines would report its
-    // CPU count (glibc's `get_nprocs` falls back to counting them).
-    let single_cpu = contents
-        .split_inclusive(|byte| *byte == b'\n')
-        .filter(|line| {
-            let name = line
-                .split(|byte| byte.is_ascii_whitespace())
-                .next()
-                .unwrap_or_default();
-            !name.starts_with(b"cpu") || name == b"cpu" || name == b"cpu0"
-        })
-        .flatten()
-        .copied()
-        .collect::<Vec<u8>>();
-    // With one CPU the aggregate line and `cpu0` both report its idle time.
-    let idle_ticks = virtual_uptime_seconds.saturating_mul(100);
-    let counters = sanitize_named_counters(
-        &single_cpu,
-        |name| name.starts_with(b"cpu") || VOLATILE_FIELDS.contains(&name),
-        |name, index| {
-            if index == 0 && name.starts_with(b"cpu") {
-                idle_ticks
-            } else {
-                0
-            }
-        },
-    );
-
-    let mut normalized = Vec::with_capacity(counters.len());
-    for line in counters.split_inclusive(|byte| *byte == b'\n') {
-        let has_newline = line.last() == Some(&b'\n');
-        let body = line.strip_suffix(b"\n").unwrap_or(line);
-        if body.starts_with(b"btime ") {
-            normalized.extend_from_slice(format!("btime {virtual_boot_time_seconds}").as_bytes());
-        } else {
-            normalized.extend_from_slice(body);
-        }
-        if has_newline {
-            normalized.push(b'\n');
-        }
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        render_system_stat(virtual_uptime_seconds, virtual_boot_time_seconds, cpus)
     }
-    normalized
 }
 
-fn sanitize_named_counters(
-    contents: &[u8],
-    should_normalize: impl Fn(&[u8]) -> bool,
-    counter_value: impl Fn(&[u8], usize) -> u64,
+/// The kernel-shaped bytes a rendered `/proc/stat` snapshot starts from:
+/// [`render_system_stat`] at uptime 0 and boot time 0 on one CPU.
+const SYSTEM_STAT_TEMPLATE: &[u8] = b"cpu  0 0 0 0 0 0 0 0 0 0\n\
+cpu0 0 0 0 0 0 0 0 0 0 0\n\
+intr 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+ctxt 0\n\
+btime 0\n\
+processes 0\n\
+procs_running 0\n\
+procs_blocked 0\n\
+softirq 0 0 0 0 0 0 0 0 0 0 0\n";
+
+/// `/proc/stat` in the layout of Linux's `show_stat` (`fs/proc/stat.c`), for
+/// a machine of `cpus` CPUs whose uptime is `virtual_uptime_seconds` and whose
+/// boot instant is `virtual_boot_time_seconds`:
+///
+/// - the aggregate line, spelled `cpu` and two spaces as Linux spells it, and
+///   a `cpuN` line per CPU, each with Linux's ten columns in USER_HZ (100)
+///   ticks. Every CPU spent the whole uptime in the first column (user),
+///   none of it idle, as `/proc/uptime`'s idle time of 0 says; the aggregate
+///   is their sum.
+/// - `intr`, the total and one count per interrupt number, for the
+///   [`fixed::NR_IRQS`] numbers every x86 kernel has (`/proc/interrupts`
+///   lists lines below it); `ctxt`; `btime`, the boot instant, which is fixed
+///   for the run; `processes`, `procs_running` and `procs_blocked`; and
+///   `softirq`, the total and one count per softirq ([`fixed::SOFTIRQS`],
+///   Linux's `NR_SOFTIRQS`). Every count is 0, as `/proc/interrupts` and
+///   `/proc/softirqs` show.
+///
+/// Nothing here comes from the host, so every backend renders the same bytes.
+fn render_system_stat(
+    virtual_uptime_seconds: u64,
+    virtual_boot_time_seconds: i64,
+    cpus: u32,
 ) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in contents.split_inclusive(|byte| *byte == b'\n') {
-        let has_newline = line.last() == Some(&b'\n');
-        let body = line.strip_suffix(b"\n").unwrap_or(line);
-        let mut fields = body
-            .split(|byte| byte.is_ascii_whitespace())
-            .filter(|field| !field.is_empty());
-        let name = fields.next().unwrap_or_default();
-        if should_normalize(name) {
-            normalized.extend_from_slice(name);
-            for (index, _) in fields.enumerate() {
-                normalized.push(b' ');
-                normalized.extend_from_slice(counter_value(name, index).to_string().as_bytes());
-            }
-        } else {
-            normalized.extend_from_slice(body);
-        }
-        if has_newline {
-            normalized.push(b'\n');
-        }
+    // USER_HZ.
+    let per_cpu = virtual_uptime_seconds.saturating_mul(100);
+    let total = per_cpu.saturating_mul(u64::from(cpus));
+    let idle_columns = " 0".repeat(9);
+    let mut out = format!("cpu  {total}{idle_columns}\n");
+    for cpu in 0..cpus {
+        out += &format!("cpu{cpu} {per_cpu}{idle_columns}\n");
     }
-    normalized
+    out += &format!("intr 0{}\n", " 0".repeat(fixed::NR_IRQS));
+    out += &format!(
+        "ctxt 0\nbtime {virtual_boot_time_seconds}\nprocesses 0\nprocs_running 0\nprocs_blocked 0\n"
+    );
+    out += &format!("softirq 0{}\n", " 0".repeat(fixed::SOFTIRQS.len()));
+    out.into_bytes()
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5611,14 +5600,46 @@ Rss:                   4 kB\n" as &[u8];
 
     #[test]
     fn system_stat_uses_virtual_uptime_and_boot_time() {
-        assert_eq!(
-            sanitize_system_stat(
-                b"cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4 5 6 7 8 9 10\nintr 9 8 7\nbtime 1234\nprocesses 55\n",
-                120,
-                1_767_225_480,
+        // Linux's layout (`show_stat`): `cpu` and two spaces, ten columns, a
+        // count per interrupt number below NR_IRQS, and the ten softirqs.
+        let expected: &[u8] = b"cpu  12000 0 0 0 0 0 0 0 0 0\n\
+cpu0 12000 0 0 0 0 0 0 0 0 0\n\
+intr 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+ctxt 0\n\
+btime 1767225480\n\
+processes 0\n\
+procs_running 0\n\
+procs_blocked 0\n\
+softirq 0 0 0 0 0 0 0 0 0 0 0\n";
+        assert_eq!(render_system_stat(120, 1_767_225_480, 1), expected);
+        // A captured kernel file gives the same bytes, whatever the host's
+        // lines were: none of them is kept.
+        for host in [
+            &b"cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4 5 6 7 8 9 10\nintr 9 8 7\nbtime 1234\nprocesses 55\n"[..],
+            b"cpu  1 2 3\ncpu0 1 2 3\ncpu1 4 5 6\nintr 400 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20\nctxt 99\nbtime 7\nsoftirq 5 1 1 1 1 1\n",
+            b"x",
+        ] {
+            assert_eq!(
+                sanitize_system_stat(host, 120, 1_767_225_480, 1),
+                expected,
+                "{}",
+                String::from_utf8_lossy(host)
+            );
+        }
+        assert_eq!(sanitize_system_stat(b"", 120, 1_767_225_480, 1), b"");
+        // Every column is a count of USER_HZ ticks; the aggregate is the sum
+        // of the CPUs', and saturates.
+        let two = String::from_utf8(render_system_stat(120, -5, 2)).unwrap();
+        assert!(
+            two.starts_with(
+                "cpu  24000 0 0 0 0 0 0 0 0 0\ncpu0 12000 0 0 0 0 0 0 0 0 0\n\
+                 cpu1 12000 0 0 0 0 0 0 0 0 0\nintr 0"
             ),
-            b"cpu 12000 0 0 0 0 0 0 0 0 0\ncpu0 12000 0 0 0 0 0 0 0 0 0\nintr 0 0 0\nbtime 1767225480\nprocesses 0\n"
+            "{two}"
         );
+        assert!(two.contains("\nbtime -5\n"), "{two}");
+        let huge = String::from_utf8(render_system_stat(u64::MAX / 10, 0, 1)).unwrap();
+        assert!(huge.starts_with(&format!("cpu  {} 0", u64::MAX)), "{huge}");
     }
 
     #[test]
@@ -5898,13 +5919,46 @@ Rss:                   4 kB\n" as &[u8];
 
     #[test]
     fn system_stat_reports_one_virtual_cpu() {
+        // The host's other CPUs are not shown: the machine has one, whose
+        // line is the aggregate's. The whole file is the rendered layout.
+        let stat = sanitize_system_stat(
+            b"cpu  1 2 3\ncpu0 1 2 3\ncpu1 4 5 6\ncpu315 7 8 9\nintr 9 8 7\nbtime 1234\n",
+            120,
+            1_767_225_480,
+            MachineDescription::default().cpus,
+        );
         assert_eq!(
-            sanitize_system_stat(
-                b"cpu  1 2 3\ncpu0 1 2 3\ncpu1 4 5 6\ncpu315 7 8 9\nintr 9 8 7\nbtime 1234\n",
-                120,
-                1_767_225_480,
-            ),
-            b"cpu 12000 0 0\ncpu0 12000 0 0\nintr 0 0 0\nbtime 1767225480\n"
+            String::from_utf8(stat).unwrap(),
+            "cpu  12000 0 0 0 0 0 0 0 0 0\n\
+             cpu0 12000 0 0 0 0 0 0 0 0 0\n\
+             intr 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+             ctxt 0\n\
+             btime 1767225480\n\
+             processes 0\n\
+             procs_running 0\n\
+             procs_blocked 0\n\
+             softirq 0 0 0 0 0 0 0 0 0 0 0\n"
+        );
+        // Detcore's own open renders the same file from its template, at the
+        // uptime and boot instant of the first read.
+        let mut rendered = ProcfsFile::from_path(Path::new("/proc/stat"))
+            .unwrap()
+            .into_rendered();
+        assert!(rendered.snapshot_at_first_read());
+        assert!(!rendered.snapshot_is_fixed());
+        assert_eq!(rendered.rendering_template(), render_system_stat(0, 0, 1));
+        let template = rendered.rendering_template().to_vec();
+        rendered.initialize(
+            template,
+            ProcfsSnapshotContext {
+                virtual_uptime_seconds: 120,
+                virtual_boot_time_seconds: Some(1_767_225_480),
+                ..ProcfsSnapshotContext::default()
+            },
+        );
+        assert_eq!(
+            rendered.rendered_snapshot().unwrap(),
+            render_system_stat(120, 1_767_225_480, 1)
         );
     }
 

@@ -4156,13 +4156,17 @@ const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
         "detcore_renders_its_procfs_files_on_every_backend",
         "liteinst, in-guest-trap",
         "a rendered file's position is not shared across fork, and the chroot \
-         checks fail (https://github.com/rrnewton/hermit/issues/4450)",
+         checks fail (https://github.com/rrnewton/hermit/issues/4450); and with no \
+         snapshot carry, /proc/stat read across exec is not continued \
+         (https://github.com/rrnewton/hermit/issues/4480)",
     ),
     (
         "detcore_renders_its_procfs_files_on_every_backend",
         "sabre",
         "a thread makes a varying number of futex waits, so the runs diverge \
-         (https://github.com/rrnewton/hermit/issues/4473)",
+         (https://github.com/rrnewton/hermit/issues/4473); and with no snapshot \
+         carry, /proc/stat read across exec is not continued \
+         (https://github.com/rrnewton/hermit/issues/4480)",
     ),
 ];
 
@@ -5306,8 +5310,8 @@ fn detcore_lists_procfs_from_its_model_on_every_backend() {
     );
 }
 
-/// Detcore renders `/proc/sys/kernel/random/uuid`, `/proc/sys/kernel/pty/nr`
-/// and `/proc/uptime` without the backend opening them
+/// Detcore renders `/proc/sys/kernel/random/uuid`, `/proc/sys/kernel/pty/nr`,
+/// `/proc/uptime` and `/proc/stat` without the backend opening them
 /// (https://github.com/rrnewton/hermit/issues/4213).
 /// Every backend gives the guest Linux's answers for these files, which the
 /// memfd standing in for each could not give, reaches bitwise parity, and
@@ -5365,7 +5369,10 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
             "--verify-json",
             &report_arg,
         ];
+        // One epoch for every backend: /proc/stat shows the boot instant,
+        // which an omitted epoch takes from the host clock at each start.
         args.extend([
+            "--epoch=2026-01-01T00:00:00Z",
             "--base-env=minimal",
             "--",
             guest.to_str().expect("guest path is UTF-8"),
@@ -5448,20 +5455,24 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
     );
     let (_, first) = &identities[0];
     let lines = first.lines().collect::<Vec<_>>();
-    // The guest's lines, in order: each file's contents, a read shared across
-    // fork and the whole file read from its start, the bytes read before exec,
-    // each file's identity, and the bytes read after exec and the whole file.
+    // The guest's lines, in order: each file's contents (/proc/stat's on one
+    // line, its newlines shown as \n), the start of /proc/stat read before
+    // exec, a read shared across fork and the whole file read from its
+    // start, the bytes of the UUID read before exec, each file's identity,
+    // and the bytes read after exec, the whole UUID, and the rest of
+    // /proc/stat.
     let line = |index: usize, prefix: &str| {
         lines
             .get(index)
             .and_then(|line| line.strip_prefix(prefix))
             .unwrap_or_else(|| panic!("line {index} is not {prefix:?}: {first}"))
     };
-    assert_eq!(lines.len(), 11, "{first}");
+    assert_eq!(lines.len(), 15, "{first}");
     for (index, path) in [
-        (6, "/proc/sys/kernel/random/uuid"),
-        (7, "/proc/sys/kernel/pty/nr"),
-        (8, "/proc/uptime"),
+        (8, "/proc/sys/kernel/random/uuid"),
+        (9, "/proc/sys/kernel/pty/nr"),
+        (10, "/proc/uptime"),
+        (11, "/proc/stat"),
     ] {
         let identity = line(index, &format!("{path} dev=0xf000ff ino="));
         let ino: u64 = identity
@@ -5491,12 +5502,44 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
         line(1, "/proc/sys/kernel/pty/nr: ").parse::<u32>().is_ok(),
         "{first}"
     );
-    let forked = format!("{}{}", line(2, "fork child: "), line(3, "fork parent: "));
+    // /proc/stat in Linux's layout (`show_stat`), the same on every backend
+    // and never the host's: one CPU, which spent the whole uptime in its
+    // first column, a count per interrupt number below 16 (not the host's
+    // interrupt numbers), and the ten softirqs, every count 0.
+    let stat = line(2, "/proc/stat: ").replace("\\n", "\n");
+    let stat_lines = stat.lines().collect::<Vec<_>>();
+    let user = stat_lines
+        .first()
+        .and_then(|line| line.strip_prefix("cpu  "))
+        .and_then(|line| line.strip_suffix(" 0 0 0 0 0 0 0 0 0"))
+        .and_then(|ticks| ticks.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("no aggregate CPU line: {stat}"));
+    assert!(user > 0 && user % 100 == 0, "{stat}");
+    // The epoch less the default uptime offset (120 s).
+    let rendering = |ticks: u64| {
+        format!(
+            "cpu  {ticks} 0 0 0 0 0 0 0 0 0\ncpu0 {ticks} 0 0 0 0 0 0 0 0 0\nintr 0{}\nctxt 0\n\
+             btime 1767225480\nprocesses 0\nprocs_running 0\nprocs_blocked 0\nsoftirq 0{}",
+            " 0".repeat(16),
+            " 0".repeat(10),
+        )
+    };
+    assert_eq!(stat, rendering(user), "{first}");
+    let forked = format!("{}{}", line(4, "fork child: "), line(5, "fork parent: "));
     assert!(uuid_shape(&forked), "{first}");
-    assert_eq!(forked, line(4, "fork whole: "), "{first}");
-    let execed = format!("{}{}", line(5, "before exec: "), line(9, "after exec: "));
+    assert_eq!(forked, line(6, "fork whole: "), "{first}");
+    let execed = format!("{}{}", line(7, "before exec: "), line(12, "after exec: "));
     assert!(uuid_shape(&execed), "{first}");
-    assert_eq!(execed, line(10, "exec whole: "), "{first}");
+    assert_eq!(execed, line(13, "exec whole: "), "{first}");
+    // /proc/stat read in part before exec and in the rest a second after it
+    // continues from the snapshot its first read took, in the same second as
+    // the read above: a new snapshot would show 100 more ticks.
+    let stat_execed = format!(
+        "{}{}",
+        line(3, "stat before exec: "),
+        line(14, "stat after exec: ")
+    );
+    assert_eq!(stat_execed, line(2, "/proc/stat: "), "{first}");
     for (backend, identity) in &identities {
         assert_eq!(
             identity, first,

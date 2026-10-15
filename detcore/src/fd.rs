@@ -1017,6 +1017,18 @@ impl DetFd {
         })
     }
 
+    /// Whether Detcore opened this procfs file without a kernel object behind
+    /// it and its first read takes its snapshot
+    /// (`ProcfsFile::snapshot_at_first_read`), at an uptime the placeholder
+    /// carries (`Detcore::first_read_uptime`).
+    pub(crate) fn procfs_rendered_at_first_read(&self) -> bool {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .is_some_and(|procfs| procfs.is_rendered() && procfs.snapshot_at_first_read())
+        })
+    }
+
     /// Whether this procfs open file description still needs its initial snapshot.
     pub(crate) fn procfs_needs_snapshot(&self) -> bool {
         self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::needs_snapshot))

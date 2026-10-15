@@ -4154,6 +4154,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             raw_contents
         };
         let virtual_uptime_seconds = self.calculate_procfs_uptime(guest).await?;
+        // A file Detcore renders at its first read: at the uptime an earlier
+        // read of the same open file took its snapshot at, which a process
+        // without Detcore's state of it (after `exec` or `fork` where the
+        // tool runs in each guest process) finds on the placeholder.
+        let virtual_uptime_seconds = match guest.thread_state().with_detfd(call.fd(), |detfd| {
+            detfd
+                .procfs_rendered_at_first_read()
+                .then(|| detfd.procfs_rendered_path())
+                .flatten()
+        })? {
+            Some(path) => {
+                self.first_read_uptime(guest, call.fd(), path, virtual_uptime_seconds)
+                    .await
+            }
+            None => virtual_uptime_seconds,
+        };
         // Only `/proc/stat` renders btime. Computing it for every snapshot let
         // an unrepresentable boot instant refuse unrelated files such as
         // `/proc/uptime`.
