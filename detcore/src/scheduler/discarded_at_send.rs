@@ -48,6 +48,9 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::Scheduler;
+use super::signal_lists::KernelSiginfo;
+use super::signal_lists::SignalLists;
+use super::signal_lists::siginfo_code;
 use crate::resources::ResourceID;
 use crate::scheduler::kernel_signal_bit;
 use crate::syscalls::KernelSignalState;
@@ -178,6 +181,30 @@ pub(crate) struct DiscardedAtSend {
     /// expiry is still current (`posixtimer_sig_ignore`,
     /// `posixtimer_sig_unignore`).
     parked: BTreeMap<(DetPid, i32), ParkedExpiry>,
+    /// The logical entries of each pending standard signal of an observable
+    /// pair (<https://github.com/rrnewton/hermit/issues/4262>,
+    /// `signal_lists`).
+    pub(crate) lists: SignalLists,
+    /// The (process, signal) pairs that have, or have had, a POSIX timer
+    /// notifying that signal. A kept ordinary send standing on a discarded
+    /// copy is a `Proxy` only in such a pair (4262 design rev 8, E'). The
+    /// history survives exec, and a child of `fork` starts without it, as it
+    /// starts without timers.
+    timer_history: BTreeSet<(DetPid, i32)>,
+    /// The (queue, signal) whose discarded copy, the one its bit stands for,
+    /// carries `SI_TIMER` (a guest's forged `rt_sigqueueinfo`, or a timer's
+    /// own discarded expiry): exec flushes such a record.
+    discarded_si_timer: BTreeSet<(QueueId, i32)>,
+}
+
+/// What a recorded send carries for the lists (`DiscardedAtSend::note_send_listed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendRecord {
+    /// The sender's siginfo, as the receiver would see it.
+    pub siginfo: KernelSiginfo,
+    /// Whether the receiving pair is observable (`Scheduler::signal_observable`),
+    /// so a kept send joins its list.
+    pub listed: bool,
 }
 
 /// A periodic POSIX timer's discarded expiry, parked (`DiscardedAtSend::parked`).
@@ -328,6 +355,72 @@ impl DiscardedAtSend {
                 },
             );
         }
+    }
+
+    /// [`Self::note_send`] for a send into a queue of `process` whose siginfo
+    /// is known (`record`). A
+    /// discarded copy that its bit now stands for records whether it carries
+    /// `SI_TIMER`. A kept send of a listed pair joins its list (A1): only as
+    /// the front of an empty list, since Linux drops an ordinary send of a
+    /// pending standard signal (`legacy_queue`), and standing on the
+    /// discarded copy if one is pending.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "note_send's facts, plus the receiving process and the record"
+    )]
+    pub(crate) fn note_send_listed(
+        &mut self,
+        process: DetPid,
+        queue: QueueId,
+        signal: i32,
+        discarded: bool,
+        pre: PreSend,
+        producer: Option<TimerProducer>,
+        record: SendRecord,
+    ) {
+        if kernel_signal_bit(signal) & STANDARD_SIGNALS == 0 {
+            return;
+        }
+        let standing = self
+            .is_discarded(queue, signal)
+            .then(|| self.discarded_si_timer.contains(&(queue, signal)));
+        self.note_send(queue, signal, discarded, pre, producer);
+        if discarded {
+            if standing.is_none() && self.is_discarded(queue, signal) {
+                self.note_discarded_si_timer(queue, signal, siginfo_code(&record.siginfo));
+            }
+            return;
+        }
+        if record.listed {
+            let timer_pair = self.has_timer_history(process, signal);
+            self.lists
+                .append_plain(queue, signal, record.siginfo, standing, timer_pair);
+        }
+    }
+
+    /// Record the `si_code` of the discarded copy `queue`'s bit for `signal`
+    /// stands for.
+    pub(crate) fn note_discarded_si_timer(&mut self, queue: QueueId, signal: i32, code: i32) {
+        if code == super::signal_lists::SI_TIMER {
+            self.discarded_si_timer.insert((queue, signal));
+        } else {
+            self.discarded_si_timer.remove(&(queue, signal));
+        }
+    }
+
+    /// Whether `queue`'s discarded copy of `signal` carries `SI_TIMER`.
+    pub(crate) fn discarded_is_si_timer(&self, queue: QueueId, signal: i32) -> bool {
+        self.is_discarded(queue, signal) && self.discarded_si_timer.contains(&(queue, signal))
+    }
+
+    /// `process` has a POSIX timer notifying `signal`.
+    pub(crate) fn note_timer_history(&mut self, process: DetPid, signal: i32) {
+        self.timer_history.insert((process, signal));
+    }
+
+    /// Whether `process` has, or has had, a POSIX timer notifying `signal`.
+    pub(crate) fn has_timer_history(&self, process: DetPid, signal: i32) -> bool {
+        self.timer_history.contains(&(process, signal))
     }
 
     /// A consumption hook saw `signal` taken from, or left in, the queues of
@@ -536,11 +629,26 @@ impl DiscardedAtSend {
                 parked.queue = new;
             }
         }
+        let si_timer: Vec<i32> = self
+            .discarded_si_timer
+            .iter()
+            .filter(|(queue, _)| *queue == old)
+            .map(|(_, signal)| *signal)
+            .collect();
+        for signal in si_timer {
+            self.discarded_si_timer.remove(&(old, signal));
+            self.discarded_si_timer.insert((new, signal));
+        }
+        self.lists.rekey_thread(old, new);
     }
 
-    /// Forget `queue`: its thread or process is gone.
+    /// Forget `queue`: its thread or process is gone. A process takes its
+    /// timer history with it.
     pub(crate) fn retire(&mut self, queue: QueueId) {
+        self.lists.retire(queue);
+        self.discarded_si_timer.retain(|&(owner, _)| owner != queue);
         if let QueueId::Process(process) = queue {
+            self.timer_history.retain(|&(owner, _)| owner != process);
             self.alarm_unreported.remove(&process);
         }
         self.alarm_first.remove(&queue);
@@ -576,6 +684,7 @@ impl DiscardedAtSend {
         if let Some(bits) = self.bits.get_mut(&queue) {
             *bits &= !kernel_signal_bit(signal);
         }
+        self.discarded_si_timer.remove(&(queue, signal));
         self.prune(queue);
     }
 
@@ -1410,6 +1519,95 @@ mod tests {
         send(&mut record, QueueId::Process(P), true, false);
         assert!(record.unignore(P, USR1, |_| true).is_empty());
         assert!(record.is_discarded(QueueId::Process(P), USR1));
+    }
+
+    fn siginfo(code: i32) -> KernelSiginfo {
+        let mut info = [0u8; super::super::signal_lists::KERNEL_SIGINFO_SIZE];
+        info[0..4].copy_from_slice(&USR1.to_ne_bytes());
+        info[8..12].copy_from_slice(&code.to_ne_bytes());
+        KernelSiginfo(info)
+    }
+
+    fn listed_send(
+        record: &mut DiscardedAtSend,
+        queue: QueueId,
+        discarded: bool,
+        code: i32,
+        listed: bool,
+    ) {
+        let present = record.is_discarded(queue, USR1) || record.lists.is_listed(queue, USR1);
+        let pre = record.pre_send(queue, USR1, present);
+        let record_ = SendRecord {
+            siginfo: siginfo(code),
+            listed,
+        };
+        record.note_send_listed(P, queue, USR1, discarded, pre, None, record_);
+    }
+
+    const SI_QUEUE: i32 = -1;
+    const SI_TIMER: i32 = super::super::signal_lists::SI_TIMER;
+
+    #[test]
+    fn a_kept_send_of_a_listed_pair_becomes_the_front_of_an_empty_list() {
+        let mut record = DiscardedAtSend::default();
+        listed_send(&mut record, thread(), false, 0, true);
+        assert_eq!(record.lists.entries(thread(), USR1).len(), 1);
+        // Linux drops a second ordinary send (`legacy_queue`).
+        listed_send(&mut record, thread(), false, SI_QUEUE, true);
+        assert_eq!(record.lists.entries(thread(), USR1).len(), 1);
+        assert!(record.lists.invariants_hold());
+    }
+
+    #[test]
+    fn an_unlisted_pair_keeps_no_list() {
+        let mut record = DiscardedAtSend::default();
+        listed_send(&mut record, thread(), false, 0, false);
+        assert!(!record.lists.is_listed(thread(), USR1));
+    }
+
+    #[test]
+    fn a_kept_send_on_a_discarded_si_timer_copy_is_a_proxy_only_in_a_timer_pair() {
+        use super::super::signal_lists::FrontClass;
+        for (history, class) in [(false, FrontClass::Own), (true, FrontClass::Proxy)] {
+            let mut record = DiscardedAtSend::default();
+            if history {
+                record.note_timer_history(P, USR1);
+            }
+            listed_send(&mut record, thread(), true, SI_TIMER, true);
+            assert!(record.discarded_is_si_timer(thread(), USR1));
+            listed_send(&mut record, thread(), false, SI_QUEUE, true);
+            let (_, front_class, physical_si_timer) = record.lists.front(thread(), USR1).unwrap();
+            assert_eq!(front_class, class);
+            // The physical record is the forged one either way.
+            assert!(physical_si_timer);
+            assert!(!record.is_discarded(thread(), USR1));
+            assert!(!record.discarded_is_si_timer(thread(), USR1));
+        }
+    }
+
+    #[test]
+    fn a_discarded_send_coalescing_into_a_pending_copy_records_no_si_code() {
+        let mut record = DiscardedAtSend::default();
+        listed_send(&mut record, thread(), true, 0, true);
+        listed_send(&mut record, thread(), true, SI_TIMER, true);
+        assert!(record.is_discarded(thread(), USR1));
+        assert!(!record.discarded_is_si_timer(thread(), USR1));
+    }
+
+    #[test]
+    fn the_timer_history_survives_rekey_and_goes_with_the_process() {
+        let mut record = DiscardedAtSend::default();
+        record.note_timer_history(P, USR1);
+        listed_send(&mut record, QueueId::Thread(U), false, 0, true);
+        record.rekey_thread(U, T);
+        assert!(record.lists.is_listed(thread(), USR1));
+        assert!(!record.lists.is_listed(QueueId::Thread(U), USR1));
+        assert!(record.has_timer_history(P, USR1));
+        record.retire(thread());
+        assert!(!record.lists.is_listed(thread(), USR1));
+        assert!(record.has_timer_history(P, USR1));
+        record.retire(QueueId::Process(P));
+        assert!(!record.has_timer_history(P, USR1));
     }
 }
 

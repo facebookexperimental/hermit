@@ -25,6 +25,7 @@ pub mod runqueue;
 mod sigalrm;
 pub mod sigkill_retirement;
 pub(crate) mod signal_control;
+pub(crate) mod signal_lists;
 mod sleep_signal;
 pub mod timed_waiters;
 
