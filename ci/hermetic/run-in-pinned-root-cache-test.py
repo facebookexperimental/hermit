@@ -323,6 +323,20 @@ class CargoCacheMounts(unittest.TestCase):
             ],
         )
 
+    def test_payload_takes_no_optional_git_locks(self):
+        # A read-only `git status` in one node otherwise creates and deletes
+        # .git/index.lock in a Cargo git checkout that another node is copying
+        # (71e738ab's validation: "cp: cannot stat '.git/index.lock'").
+        result, calls = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[1]
+        settings = [argv[index + 1] for index, arg in enumerate(argv) if arg == "-e"]
+        self.assertIn("GIT_OPTIONAL_LOCKS=0", settings)
+        image = argv.index(
+            "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        self.assertLess(argv.index("GIT_OPTIONAL_LOCKS=0"), image)
+
     def test_payload_keeps_caller_affinity_when_runtime_widens_it(self):
         available = sorted(os.sched_getaffinity(0))
         if len(available) < 2:

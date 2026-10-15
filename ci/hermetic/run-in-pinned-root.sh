@@ -478,6 +478,18 @@ PY
     env_args+=(-e "HERMIT_PROC_LOCKS_LEASE_ID=$proc_locks_identity")
 fi
 
+# No optional Git locks. `git status` takes .git/index.lock to refresh the index
+# opportunistically, even when it then writes nothing, so a read-only status
+# creates and deletes a file in the repository it reads. Pinned-root nodes run
+# side by side over the same Cargo git checkouts: the LiteInst tests resolve
+# their compiled Reverie sources with `git status` (reverie/scripts/
+# m1_artifact.rs) while source_copy::gitless_standalone_compiler_sources
+# `cp -a`s that same checkout, and cp failed with "cannot stat
+# '.git/index.lock'" (71e738ab's validation, 2026-10-15). Reproduced: 10 of 40
+# copies failed beside a `git status` loop, 0 of 40 with GIT_OPTIONAL_LOCKS=0.
+# ci/verify-submodules.sh already reads repositories this way.
+env_args+=(-e GIT_OPTIONAL_LOCKS=0)
+
 # `--network=none` is the point, not a precaution: if the run can reach the
 # network it can pick up something the lock does not describe, and the rebuild
 # guarantee is void. CARGO_NET_OFFLINE in the image makes that fail loudly.
