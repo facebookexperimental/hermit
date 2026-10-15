@@ -80,6 +80,16 @@ fn reap_killed_child(child: &mut std::process::Child, label: &str) -> std::proce
 
 fn bounded_command_output(mut command: Command, label: &str) -> (Output, bool, Duration) {
     hermit_test::configure_guest_execution(&mut command);
+    // A typed PMU skid-overshoot refusal, and nothing else, runs it again.
+    let (output, (timed_out, elapsed)) = hermit_test::hermit_output_with(label, || {
+        let (output, timed_out, elapsed) = bounded_command_output_once(&mut command, label);
+        (output, (timed_out, elapsed))
+    });
+    (output, timed_out, elapsed)
+}
+
+/// One attempt of [`bounded_command_output`].
+fn bounded_command_output_once(command: &mut Command, label: &str) -> (Output, bool, Duration) {
     let mut stdout = tempfile::tempfile()
         .unwrap_or_else(|error| panic!("failed to create {label} stdout capture: {error}"));
     let mut stderr = tempfile::tempfile()

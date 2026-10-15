@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 #[path = "common/dispatch_stats.rs"]
 mod dispatch_stats;
 
@@ -213,6 +216,30 @@ fn run_bounded_polling(
     diagnostic_log: Option<&Path>,
     mut poll: impl FnMut(),
 ) -> Output {
+    // A typed PMU skid-overshoot refusal, and nothing else, runs it again.
+    let (output, (timed_out, rendered)) = hermit_test::hermit_output_with(label, || {
+        run_bounded_polling_once(&mut command, label, diagnostic_log, &mut poll)
+    });
+    if timed_out || !output.status.success() {
+        panic!(
+            "{label} failed: {rendered}\nstatus: {}\ntimed out: {timed_out}\nstdout:\n{}\nstderr:\n{}\ncontroller diagnostics:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            controller_diagnostics(diagnostic_log),
+        );
+    }
+    output
+}
+
+/// One attempt of [`run_bounded_polling`]: its output, whether it timed out,
+/// and the rendered command.
+fn run_bounded_polling_once(
+    command: &mut Command,
+    label: &str,
+    diagnostic_log: Option<&Path>,
+    poll: &mut impl FnMut(),
+) -> (Output, (bool, String)) {
     // Verification observes the guest's current directory. The source checkout is shared by
     // concurrent validation nodes, so Cargo or another test can change its metadata or entries
     // between Run1 and Run2. Keep this invocation in one empty directory until both runs and
@@ -266,16 +293,7 @@ fn run_bounded_polling(
             controller_diagnostics(diagnostic_log),
         )
     });
-    if timed_out || !output.status.success() {
-        panic!(
-            "{label} failed: {rendered}\nstatus: {}\ntimed out: {timed_out}\nstdout:\n{}\nstderr:\n{}\ncontroller diagnostics:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-            controller_diagnostics(diagnostic_log),
-        );
-    }
-    output
+    (output, (timed_out, rendered))
 }
 
 fn example_command(
@@ -1660,6 +1678,24 @@ fn compile_guest_with(dir: &Path, name: &str, source: &str, flags: &[&str]) -> P
 /// Runs `command` to its end (at most 45 s), with stdout and stderr in files,
 /// and returns its status and stderr, whatever the status.
 fn run_expecting_failure(mut command: Command, label: &str) -> (std::process::ExitStatus, String) {
+    // A typed PMU skid-overshoot refusal, and nothing else, runs it again.
+    hermit_test::hermit_output_with(label, || {
+        let (status, stderr) = run_expecting_failure_once(&mut command, label);
+        let output = Output {
+            status,
+            stdout: Vec::new(),
+            stderr: stderr.clone().into_bytes(),
+        };
+        (output, (status, stderr))
+    })
+    .1
+}
+
+/// One attempt of [`run_expecting_failure`].
+fn run_expecting_failure_once(
+    command: &mut Command,
+    label: &str,
+) -> (std::process::ExitStatus, String) {
     let stderr = tempfile::Builder::new()
         .prefix("sabre-expected-failure-")
         .tempfile_in(env!("CARGO_TARGET_TMPDIR"))

@@ -226,6 +226,28 @@ fn run_bounded_for_backend_with_limits(
     verify_report: Option<&Path>,
     limits: WatchdogLimits,
 ) -> GuestRun {
+    // A typed PMU skid-overshoot refusal, and nothing else, runs it again.
+    let label = format!("{backend} {args:?}");
+    hermit_test::hermit_output_with(&label, || {
+        let run = run_bounded_attempt(backend, args, trace_retries, verify_report, limits);
+        let output = std::process::Output {
+            status: run.status,
+            stdout: run.stdout.clone().into_bytes(),
+            stderr: run.stderr.clone().into_bytes(),
+        };
+        (output, run)
+    })
+    .1
+}
+
+/// One attempt of [`run_bounded_for_backend_with_limits`].
+fn run_bounded_attempt(
+    backend: &str,
+    args: &[&str],
+    trace_retries: bool,
+    verify_report: Option<&Path>,
+    limits: WatchdogLimits,
+) -> GuestRun {
     let build_root = waitid_guest()
         .parent()
         .expect("waitid guest should have a parent");

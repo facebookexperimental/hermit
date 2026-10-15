@@ -9,6 +9,9 @@
 //! End-to-end L2 coverage for standard command-line tools that are expected on
 //! the portable CI runner.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io::Write;
@@ -122,20 +125,24 @@ fn assert_l2_under_strict_verify_with(case: &StrictCommandCase, run_args: &[&str
         .stderr(Stdio::piped());
 
     let rendered = format!("{command:?}");
-    let mut child = command
-        .spawn()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
-    if let Some(input) = case.stdin {
-        child
-            .stdin
-            .take()
-            .expect("piped stdin should be available")
-            .write_all(input)
-            .unwrap_or_else(|error| panic!("failed to write stdin for {rendered}: {error}"));
-    }
-    let output = child
-        .wait_with_output()
-        .unwrap_or_else(|error| panic!("failed to collect {rendered}: {error}"));
+    // A typed PMU skid-overshoot refusal, and nothing else, runs it again.
+    let (output, ()) = hermit_test::hermit_output_with(&rendered, || {
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+        if let Some(input) = case.stdin {
+            child
+                .stdin
+                .take()
+                .expect("piped stdin should be available")
+                .write_all(input)
+                .unwrap_or_else(|error| panic!("failed to write stdin for {rendered}: {error}"));
+        }
+        let output = child
+            .wait_with_output()
+            .unwrap_or_else(|error| panic!("failed to collect {rendered}: {error}"));
+        (output, ())
+    });
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 

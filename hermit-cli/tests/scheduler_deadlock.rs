@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fs;
@@ -781,7 +784,36 @@ fn wait_for_teardown(
     }
 }
 
+/// [`bounded_output_once`], run again only after a typed PMU skid-overshoot
+/// refusal ([`hermit_test::hermit_output_with`]). An I/O error or a timeout ends
+/// the loop at once and is returned.
 fn bounded_output(command: &mut Command, bound: Duration, description: &str) -> io::Result<Output> {
+    let (output, error) =
+        hermit_test::hermit_output_with(description, || {
+            match bounded_output_once(command, bound, description) {
+                Ok(output) => (output, None),
+                Err(error) => {
+                    use std::os::unix::process::ExitStatusExt;
+                    let unclassified = Output {
+                        status: std::process::ExitStatus::from_raw(libc::SIGKILL),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    };
+                    (unclassified, Some(error))
+                }
+            }
+        });
+    match error {
+        Some(error) => Err(error),
+        None => Ok(output),
+    }
+}
+
+fn bounded_output_once(
+    command: &mut Command,
+    bound: Duration,
+    description: &str,
+) -> io::Result<Output> {
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
     command

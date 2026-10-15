@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::OpenOptions;
@@ -26,11 +29,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
+use hermit_test::skid_overshoot::retry_typed_skid_refusal;
 use reverie::process::Command as ReverieCommand;
-use skid_overshoot::retry_typed_skid_refusal;
-
-#[path = "common/skid_overshoot.rs"]
-mod skid_overshoot;
 use reverie::process::Mount;
 use reverie::process::Namespace;
 
@@ -376,7 +376,7 @@ fn record_then_replay(
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .stdout(replay_stdout)
         .stderr(Stdio::piped());
-    replay.output().expect("failed to start replay")
+    hermit_test::hermit_output(&format!("{replay:?}"), &mut replay)
 }
 
 /// `/proc/1/root` reads as `/`, a path inside the replay root, but the guest's
@@ -536,9 +536,7 @@ use record_workloads::Workload;
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -793,7 +791,7 @@ fn canonical_record_replay_command_retrying_skid(
             let rendered = format!("{command:?}");
             let output = command
                 .output()
-                .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+                .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
             (output, (rendered, verdict_path, (data_dir, verdict_dir)))
         });
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -909,15 +907,16 @@ fn record_rejects_initial_executable_without_shebang() {
         .expect("failed to mark ENOEXEC fixture executable");
     let data_dir = tempfile::tempdir().expect("failed to create recording directory");
 
-    let output = Command::new("timeout")
-        .args(["--kill-after=5s", "45s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "record", "start", "--record-timeout=30"])
-        .arg(format!("--data-dir={}", data_dir.path().display()))
-        .arg("--")
-        .arg(&executable)
-        .output()
-        .expect("failed to start ENOEXEC recording");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after=5s", "45s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log=off", "record", "start", "--record-timeout=30"])
+            .arg(format!("--data-dir={}", data_dir.path().display()))
+            .arg("--")
+            .arg(&executable),
+    );
 
     assert!(
         !output.status.success(),
@@ -1349,9 +1348,7 @@ fn replay_output_sink_failure_aborts_once_without_guest_retry() {
         .arg(data_dir.path())
         .stdout(Stdio::from(full));
     let rendered = format!("{replay:?}");
-    let replay_output = replay
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start replay: {rendered}: {error}"));
+    let replay_output = hermit_test::hermit_output(&rendered, &mut replay);
     let elapsed = started.elapsed();
     let stderr = String::from_utf8_lossy(&replay_output.stderr);
 
@@ -1442,9 +1439,7 @@ fn replay_captured_output_ftruncate_failure_aborts_without_panicking() {
         .args(["--log=off", "replay", "--autopilot", "--data-dir"])
         .arg(data_dir.path());
     let rendered = format!("{replay:?}");
-    let replay_output = replay
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start replay: {rendered}: {error}"));
+    let replay_output = hermit_test::hermit_output(&rendered, &mut replay);
     let elapsed = started.elapsed();
     let stderr = String::from_utf8_lossy(&replay_output.stderr);
 
@@ -1491,9 +1486,7 @@ fn recording_rejects_an_unsupported_syscall_by_name() {
         .arg("--")
         .arg(&guest.path);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start unsupported recording: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -1565,9 +1558,7 @@ fn replay_rejects_an_unsupported_syscall_by_name() {
         .args(["replay", "--autopilot", "--data-dir"])
         .arg(data_dir.path());
     let rendered = format!("{replay:?}");
-    let output = replay
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start unsupported replay: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut replay);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -2197,7 +2188,7 @@ fn record_timeout_kills_guest_without_committing_partial_data() {
         .args(["record", "start", "--record-timeout=1"])
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .args(["--", "/bin/sh", "-c", "while :; do :; done"]);
-    let output = command.output().expect("failed to start timeout recording");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
 
     assert!(
         !output.status.success(),
@@ -2272,9 +2263,7 @@ fn record_timeout_fires_even_when_sigalrm_is_blocked() {
             Ok(())
         });
     }
-    let output = command
-        .output()
-        .expect("failed to start timeout recording with SIGALRM blocked");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
 
     assert!(
         !output.status.success(),
@@ -2326,7 +2315,7 @@ fn record_timeout_preserves_existing_last() {
         1,
         &["/bin/sh", "-c", "while :; do :; done"],
     );
-    let output = command.output().expect("failed to start timeout recording");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
 
     assert!(
         !output.status.success(),
@@ -2368,9 +2357,7 @@ fn record_timeout_terminates_descendant_processes() {
         1,
         &["/bin/sh", "-c", "sleep 300 & while :; do :; done"],
     );
-    let output = command
-        .output()
-        .expect("failed to start timeout recording with a descendant");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
 
     assert!(
         !output.status.success(),
@@ -2872,9 +2859,7 @@ fn record_refuses_a_removed_working_directory() {
         .arg(&guest.path)
         .arg("--removed-cwd");
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start removed-cwd recording: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -3681,9 +3666,7 @@ fn record_replay_output_failures_with(
     let mut failures = Vec::new();
     let mut stderrs = Vec::new();
     for (phase, mut command) in [("record", record), ("replay", replay)] {
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to start {label} {phase}: {error}"));
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if !output.status.success() || stdout != expected {
@@ -3923,9 +3906,7 @@ fn assert_recording_refuses_mmsg_on_an_accepted_connection(mode: &str, sysno: &s
         .arg(&workload("c_record_replay_socket_mmsg").path)
         .arg(mode);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start the {sysno} recording: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_ne!(
@@ -4021,7 +4002,7 @@ fn assert_threaded_accept_replays_agree(guest_args: &[&str]) {
                 .arg(env!("CARGO_BIN_EXE_hermit"))
                 .args(["--log=off", "replay", "--autopilot"])
                 .arg(format!("--data-dir={}", data_dir.path().display()));
-            let output = replay.output().expect("failed to start replay");
+            let output = hermit_test::hermit_output(&format!("{replay:?}"), &mut replay);
             (
                 output.status.code(),
                 String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -4132,9 +4113,7 @@ fn assert_recording_refuses(
         .arg(program)
         .args(args);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start the {mode} recording: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_ne!(
@@ -4244,7 +4223,7 @@ fn record_blocking_accept_without_a_connector_waits_for_the_record_timeout() {
         .arg("--")
         .arg(&workload("c_record_replay_accept_in_turn").path)
         .arg("unwakeable");
-    let output = command.output().expect("failed to start the recording");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     // Hermit's deadline and the outer `timeout` both exit 124, so the elapsed
@@ -4564,7 +4543,7 @@ fn record_accept_refuses_an_export_before_its_first_attempt() {
             .arg("--")
             .arg(program)
             .args(["export-at-entry", &spins]);
-        let output = command.output().expect("failed to start the recording");
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         if output.status.success() && stdout == "export-at-entry: accept=fd export=0\n" {
@@ -4626,7 +4605,7 @@ fn replay_refuses_a_missing_or_unexhausted_rejoin_log() {
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args(["--log=off", "replay", "--autopilot"])
             .arg(format!("--data-dir={}", data_dir.path().display()));
-        replay.output().expect("failed to start the replay")
+        hermit_test::hermit_output(&format!("{replay:?}"), &mut replay)
     };
     let intact = replay();
     assert!(
