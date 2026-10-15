@@ -5029,6 +5029,23 @@ record_replay_tests! {
     record_rs_select => "rustbin_select",
     record_rs_stack_ptr => "rustbin_stack_ptr",
     record_rs_thread_random => "rustbin_thread_random",
+    record_rs_bind_connect_race => "rustbin_bind_connect_race",
+    record_rs_interrogate_tty => "rustbin_interrogate_tty",
+    record_rs_mem_race => "rustbin_mem_race",
+    record_rs_network_hello_world => "rustbin_network_hello_world",
+    record_rs_print_clock_nanosleep_monotonic_abs_race => "rustbin_print_clock_nanosleep_monotonic_abs_race",
+    record_rs_print_clock_nanosleep_monotonic_race => "rustbin_print_clock_nanosleep_monotonic_race",
+    record_rs_print_clock_nanosleep_realtime_abs_race => "rustbin_print_clock_nanosleep_realtime_abs_race",
+    record_rs_socketpair => "rustbin_socketpair",
+}
+
+/// The internal matrix records this guest too, but its main thread spins until
+/// four children have run, and record/replay has no PMU preemption to cut the
+/// spin short.
+#[test]
+#[ignore = "over budget: 19.3 of the 22 CPU-s per-test cap in the pinned root, 2026-10-15"]
+fn record_rs_futex_and_print() {
+    run_record_replay("rustbin_futex_and_print");
 }
 
 #[path = "record_replay/network_trace.rs"]

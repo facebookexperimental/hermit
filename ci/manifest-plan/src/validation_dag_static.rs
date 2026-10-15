@@ -2720,7 +2720,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And record_replay_serves_a_directory_seek_from_the_recording and
     // record_replay_seeks_by_the_calling_threads_descriptor_table
     // (https://github.com/rrnewton/hermit/issues/4373): 203.
-    ("test.record_replay", 203),
+    // And eight of the internal Buck matrix's nine unrecorded tests/rust
+    // guests, record_rs_bind_connect_race through record_rs_socketpair; the
+    // ninth, record_rs_futex_and_print, is ignored for its CPU budget: 211.
+    ("test.record_replay", 211),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.

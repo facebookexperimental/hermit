@@ -165,7 +165,7 @@ pub const C_SOURCES: [(&str, &str); 47] = [
 
 // Alias, Cargo target, repository-relative source. The clock now uses the
 // declared Cargo dev profile, rather than the former manual debuginfo=1 build.
-pub const RUST_SOURCES: [(&str, &str, &str); 17] = [
+pub const RUST_SOURCES: [(&str, &str, &str); 26] = [
     (
         "rs_clock_gettime",
         "rustbin_clock_gettime",
@@ -238,6 +238,51 @@ pub const RUST_SOURCES: [(&str, &str, &str); 17] = [
         "rustbin_thread_random",
         "rustbin_thread_random",
         "tests/rust/thread_random.rs",
+    ),
+    (
+        "rustbin_bind_connect_race",
+        "rustbin_bind_connect_race",
+        "tests/rust/bind_connect_race.rs",
+    ),
+    (
+        "rustbin_futex_and_print",
+        "rustbin_futex_and_print",
+        "tests/rust/futex_and_print.rs",
+    ),
+    (
+        "rustbin_interrogate_tty",
+        "rustbin_interrogate_tty",
+        "tests/rust/interrogate_tty.rs",
+    ),
+    (
+        "rustbin_mem_race",
+        "rustbin_mem_race",
+        "tests/rust/mem_race.rs",
+    ),
+    (
+        "rustbin_network_hello_world",
+        "rustbin_network_hello_world",
+        "tests/rust/network_hello_world.rs",
+    ),
+    (
+        "rustbin_print_clock_nanosleep_monotonic_abs_race",
+        "rustbin_print_clock_nanosleep_monotonic_abs_race",
+        "tests/rust/print_clock_nanosleep_monotonic_abs_race.rs",
+    ),
+    (
+        "rustbin_print_clock_nanosleep_monotonic_race",
+        "rustbin_print_clock_nanosleep_monotonic_race",
+        "tests/rust/print_clock_nanosleep_monotonic_race.rs",
+    ),
+    (
+        "rustbin_print_clock_nanosleep_realtime_abs_race",
+        "rustbin_print_clock_nanosleep_realtime_abs_race",
+        "tests/rust/print_clock_nanosleep_realtime_abs_race.rs",
+    ),
+    (
+        "rustbin_socketpair",
+        "rustbin_socketpair",
+        "tests/rust/socketpair.rs",
     ),
 ];
 
@@ -895,7 +940,7 @@ mod tests {
         fs::rename(events[0]["executable"].as_str().unwrap(), &artifact).unwrap();
         events[0]["executable"] = serde_json::json!(artifact);
         let paths = cargo_executables(&jsonl(&events), &cargo, &fixture.0, &fixture.0).unwrap();
-        assert_eq!(paths.len(), 17);
+        assert_eq!(paths.len(), 26);
         assert_eq!(paths["rs_clock_gettime"], artifact);
         assert!(!paths.contains_key("rustbin_clock_gettime"));
     }
