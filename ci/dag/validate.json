@@ -1190,6 +1190,13 @@
           "category": "c-programs",
           "test": "c-programs/acct-refusal-probe",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/acct-refusal-probe",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -1219,6 +1226,13 @@
           "test": "c-programs/acct-refusal-probe",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/add-key-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -1463,6 +1477,13 @@
           "category": "c-programs",
           "test": "c-programs/bpf-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/bpf-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -1492,6 +1513,13 @@
           "test": "c-programs/bpf-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/cachestat-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -3003,6 +3031,13 @@
           "category": "c-programs",
           "test": "c-programs/futex-requeue-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/futex-requeue-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -3038,6 +3073,13 @@
           "category": "c-programs",
           "test": "c-programs/futex-waitv-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/futex-waitv-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -3067,6 +3109,13 @@
           "test": "c-programs/futex-waitv-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/futex-wake-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -3970,6 +4019,13 @@
           "test": "c-programs/just-spin",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/kcmp-eperm",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -31037,6 +31093,13 @@
           "category": "c-programs",
           "test": "c-programs/acct-refusal-probe",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/acct-refusal-probe",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -31045,6 +31108,13 @@
           "test": "c-programs/acct-refusal-probe",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/add-key-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -31163,6 +31233,13 @@
           "category": "c-programs",
           "test": "c-programs/bpf-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/bpf-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -31171,6 +31248,13 @@
           "test": "c-programs/bpf-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/cachestat-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -31940,6 +32024,13 @@
           "category": "c-programs",
           "test": "c-programs/futex-requeue-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/futex-requeue-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -31954,6 +32045,13 @@
           "category": "c-programs",
           "test": "c-programs/futex-waitv-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/futex-waitv-enosys",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -31962,6 +32060,13 @@
           "test": "c-programs/futex-waitv-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/futex-wake-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -32452,6 +32557,13 @@
           "test": "c-programs/just-spin",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/kcmp-eperm",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -47420,6 +47532,13 @@
           "category": "c-programs",
           "test": "c-programs/acct-refusal-probe",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/acct-refusal-probe",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -47449,6 +47568,13 @@
           "test": "c-programs/acct-refusal-probe",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/add-key-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -47693,6 +47819,13 @@
           "category": "c-programs",
           "test": "c-programs/bpf-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/bpf-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -47722,6 +47855,13 @@
           "test": "c-programs/bpf-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/cachestat-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -49233,6 +49373,13 @@
           "category": "c-programs",
           "test": "c-programs/futex-requeue-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/futex-requeue-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -49268,6 +49415,13 @@
           "category": "c-programs",
           "test": "c-programs/futex-waitv-enosys",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/futex-waitv-enosys",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -49297,6 +49451,13 @@
           "test": "c-programs/futex-waitv-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/futex-wake-enosys",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -50200,6 +50361,13 @@
           "test": "c-programs/just-spin",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/kcmp-eperm",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
