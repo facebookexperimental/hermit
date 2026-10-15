@@ -37,6 +37,12 @@
 //! this workspace's `rustbin_<name>` binaries (package
 //! hermetic_infra_hermit_tests), found beside `hermit-verify`.
 //!
+//! The six `tests/shell` scripts (the internal `tests/shell/*.sh` glob) run
+//! in the same five modes, with that matrix's exemptions: py_hello and
+//! devrand have no chaos replay, and py_hello and par_work have no chaotic
+//! trace replay. The internal targets' raw and relaxed `hermit run` targets
+//! are not ported, nor is `non_strict/curl.sh`, which needs the network.
+//!
 //! The Hermit binary is `HERMIT_BIN`, or the `hermit` built beside this
 //! package's `hermit-verify`. Both need the PMU and user and mount namespaces,
 //! as every Hermit integration test does.
@@ -171,7 +177,28 @@ fn run_rust_replay_case(guest: &str, mode: Mode) {
     run_replay(&rust_guest(guest), None, mode);
 }
 
+/// Runs `tests/shell/<script>`, which Hermit executes through its `#!` line.
+///
+/// The scripts call `hexdump`, `taskset` and `python3` by name. Under
+/// `--base-env=empty` bash falls back to its default `/usr/bin:/bin`, which
+/// holds them on an FHS host such as the internal targets' but not in the
+/// pinned root, where they are Nix store paths. So the guest gets this test's
+/// own PATH, the same in both of hermit-verify's runs.
+fn run_shell_replay_case(script: &str, mode: Mode) {
+    let path = std::env::var("PATH").expect("the shell cases need a PATH");
+    run_replay_with(
+        &repository().join("tests/shell").join(script),
+        None,
+        mode,
+        &[format!("--hermit-arg=--env=PATH={path}")],
+    );
+}
+
 fn run_replay(binary: &Path, scenario: Option<&str>, mode: Mode) {
+    run_replay_with(binary, scenario, mode, &[]);
+}
+
+fn run_replay_with(binary: &Path, scenario: Option<&str>, mode: Mode, hermit_args: &[String]) {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "10s", VERIFY_TIMEOUT])
@@ -181,6 +208,7 @@ fn run_replay(binary: &Path, scenario: Option<&str>, mode: Mode) {
         .arg("--verbose")
         .args(mode.args())
         .arg("--hermit-arg=--base-env=empty")
+        .args(hermit_args)
         .arg("--")
         .arg(binary)
         .args(scenario)
@@ -201,6 +229,22 @@ fn run_replay(binary: &Path, scenario: Option<&str>, mode: Mode) {
         "{rendered} did not replay its recording\n{}",
         render(&output)
     );
+}
+
+macro_rules! shell_replay_case {
+    (#[ignore = $reason:literal] $name:ident, $script:literal, $mode:expr) => {
+        #[test]
+        #[ignore = $reason]
+        fn $name() {
+            run_shell_replay_case($script, $mode);
+        }
+    };
+    ($name:ident, $script:literal, $mode:expr) => {
+        #[test]
+        fn $name() {
+            run_shell_replay_case($script, $mode);
+        }
+    };
 }
 
 macro_rules! rust_replay_case {
@@ -2817,4 +2861,80 @@ rust_replay_case!(
     verify_run_chaos_rust_thread_random,
     "thread_random",
     Mode::Chaos
+);
+
+// The internal tests/shell targets: strict, chaos, chaos replay, trace replay
+// and chaotic trace replay, with their exemptions.
+shell_replay_case!(verify_run_strict_shell_date, "date.sh", Mode::Strict);
+shell_replay_case!(verify_run_chaos_shell_date, "date.sh", Mode::Chaos);
+shell_replay_case!(trace_replay_shell_date, "date.sh", Mode::TraceReplay);
+shell_replay_case!(chaos_replay_shell_date, "date.sh", Mode::ChaosReplay);
+shell_replay_case!(
+    trace_replay_chaos_shell_date,
+    "date.sh",
+    Mode::TraceReplayChaos
+);
+shell_replay_case!(verify_run_strict_shell_devrand, "devrand.sh", Mode::Strict);
+shell_replay_case!(verify_run_chaos_shell_devrand, "devrand.sh", Mode::Chaos);
+shell_replay_case!(trace_replay_shell_devrand, "devrand.sh", Mode::TraceReplay);
+shell_replay_case!(
+    trace_replay_chaos_shell_devrand,
+    "devrand.sh",
+    Mode::TraceReplayChaos
+);
+shell_replay_case!(
+    verify_run_strict_shell_par_work,
+    "par_work.sh",
+    Mode::Strict
+);
+shell_replay_case!(
+    #[ignore = "over budget: 24.0 CPU-s (killed at the cap) against the 22 CPU-s per-test cap in the pinned root, 2026-10-15"]
+    verify_run_chaos_shell_par_work,
+    "par_work.sh",
+    Mode::Chaos
+);
+shell_replay_case!(
+    #[ignore = "https://github.com/rrnewton/hermit/issues/4472: the schedule replay panics in Detcore when a non-root process spawns"]
+    trace_replay_shell_par_work,
+    "par_work.sh",
+    Mode::TraceReplay
+);
+shell_replay_case!(
+    chaos_replay_shell_par_work,
+    "par_work.sh",
+    Mode::ChaosReplay
+);
+shell_replay_case!(
+    verify_run_strict_shell_py_hello,
+    "py_hello.sh",
+    Mode::Strict
+);
+shell_replay_case!(
+    #[ignore = "over budget: 24.0 CPU-s (killed at the cap) against the 22 CPU-s per-test cap in the pinned root, 2026-10-15"]
+    verify_run_chaos_shell_py_hello,
+    "py_hello.sh",
+    Mode::Chaos
+);
+shell_replay_case!(
+    trace_replay_shell_py_hello,
+    "py_hello.sh",
+    Mode::TraceReplay
+);
+shell_replay_case!(verify_run_strict_shell_race, "race.sh", Mode::Strict);
+shell_replay_case!(verify_run_chaos_shell_race, "race.sh", Mode::Chaos);
+shell_replay_case!(trace_replay_shell_race, "race.sh", Mode::TraceReplay);
+shell_replay_case!(chaos_replay_shell_race, "race.sh", Mode::ChaosReplay);
+shell_replay_case!(
+    trace_replay_chaos_shell_race,
+    "race.sh",
+    Mode::TraceReplayChaos
+);
+shell_replay_case!(verify_run_strict_shell_taskset, "taskset.sh", Mode::Strict);
+shell_replay_case!(verify_run_chaos_shell_taskset, "taskset.sh", Mode::Chaos);
+shell_replay_case!(trace_replay_shell_taskset, "taskset.sh", Mode::TraceReplay);
+shell_replay_case!(chaos_replay_shell_taskset, "taskset.sh", Mode::ChaosReplay);
+shell_replay_case!(
+    trace_replay_chaos_shell_taskset,
+    "taskset.sh",
+    Mode::TraceReplayChaos
 );

@@ -4461,44 +4461,44 @@
     {
       "disposition": "guest-fixture",
       "path": "tests/shell/date.sh",
-      "runner": "hermit-cli shell integration targets",
-      "why": "tests/shell/date.sh is owned by hermit-cli shell integration targets: The `date.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+      "runner": "hermit-verify/tests/replay_modes.rs",
+      "why": "tests/shell/date.sh is owned by hermit-verify/tests/replay_modes.rs: it runs the internal Buck matrix's hermit-verify targets for this script (strict, chaos, chaos replay, trace replay and chaotic trace replay, less that matrix's exemptions), with the script executed through its own #! line."
     },
     {
       "disposition": "guest-fixture",
       "path": "tests/shell/devrand.sh",
-      "runner": "hermit-cli shell integration targets",
-      "why": "tests/shell/devrand.sh is owned by hermit-cli shell integration targets: The `devrand.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+      "runner": "hermit-verify/tests/replay_modes.rs",
+      "why": "tests/shell/devrand.sh is owned by hermit-verify/tests/replay_modes.rs: it runs the internal Buck matrix's hermit-verify targets for this script (strict, chaos, chaos replay, trace replay and chaotic trace replay, less that matrix's exemptions), with the script executed through its own #! line."
     },
     {
       "disposition": "guest-fixture",
       "path": "tests/shell/non_strict/curl.sh",
-      "runner": "hermit-cli shell integration targets",
-      "why": "tests/shell/non_strict/curl.sh is owned by hermit-cli shell integration targets: The `curl.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+      "runner": "none: the internal Buck matrix's relaxed hermit run target only",
+      "why": "tests/shell/non_strict/curl.sh is the source of the internal Buck matrix's relaxed (non_strict) raw and run targets. No test here runs it: it fetches from the network, which validation does not allow, and it has no strict, chaos or replay target to port."
     },
     {
       "disposition": "guest-fixture",
       "path": "tests/shell/par_work.sh",
-      "runner": "hermit-cli shell integration targets",
-      "why": "tests/shell/par_work.sh is owned by hermit-cli shell integration targets: The `par_work.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+      "runner": "hermit-verify/tests/replay_modes.rs",
+      "why": "tests/shell/par_work.sh is owned by hermit-verify/tests/replay_modes.rs: it runs the internal Buck matrix's hermit-verify targets for this script (strict, chaos, chaos replay, trace replay and chaotic trace replay, less that matrix's exemptions), with the script executed through its own #! line."
     },
     {
       "disposition": "guest-fixture",
       "path": "tests/shell/py_hello.sh",
-      "runner": "hermit-cli shell integration targets",
-      "why": "tests/shell/py_hello.sh is owned by hermit-cli shell integration targets: The `py_hello.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+      "runner": "hermit-verify/tests/replay_modes.rs",
+      "why": "tests/shell/py_hello.sh is owned by hermit-verify/tests/replay_modes.rs: it runs the internal Buck matrix's hermit-verify targets for this script (strict, chaos, chaos replay, trace replay and chaotic trace replay, less that matrix's exemptions), with the script executed through its own #! line."
     },
     {
       "disposition": "guest-fixture",
       "path": "tests/shell/race.sh",
-      "runner": "hermit-cli shell integration targets",
-      "why": "tests/shell/race.sh is owned by hermit-cli shell integration targets: The `race.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+      "runner": "hermit-verify/tests/replay_modes.rs",
+      "why": "tests/shell/race.sh is owned by hermit-verify/tests/replay_modes.rs: it runs the internal Buck matrix's hermit-verify targets for this script (strict, chaos, chaos replay, trace replay and chaotic trace replay, less that matrix's exemptions), with the script executed through its own #! line."
     },
     {
       "disposition": "guest-fixture",
       "path": "tests/shell/taskset.sh",
-      "runner": "hermit-cli shell integration targets",
-      "why": "tests/shell/taskset.sh is owned by hermit-cli shell integration targets: The `taskset.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+      "runner": "hermit-verify/tests/replay_modes.rs",
+      "why": "tests/shell/taskset.sh is owned by hermit-verify/tests/replay_modes.rs: it runs the internal Buck matrix's hermit-verify targets for this script (strict, chaos, chaos replay, trace replay and chaotic trace replay, less that matrix's exemptions), with the script executed through its own #! line."
     },
     {
       "disposition": "support-data",

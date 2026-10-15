@@ -1059,7 +1059,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // internal hermit_run_strict__ and hermit_run_chaos__ targets, for the 75
     // C guest scenarios and 25 Rust guests: 200 cases, 10 of them ignored for
     // the per-test CPU budget: 1545, listed.
-    ("test.regular_crates", 1545),
+    // And replay_modes' internal tests/shell targets: 26 cases for the six
+    // scripts, one ignored for https://github.com/rrnewton/hermit/issues/4472
+    // and two for the per-test CPU budget: 1568, listed.
+    ("test.regular_crates", 1568),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4318,7 +4321,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And replay_modes' 190 running strict and chaos `hermit-verify run`
     // cases, less the five that HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS now
     // also excludes: 1531.
-    ("test.regular_crates_on_host", 1531),
+    // And replay_modes' 23 running tests/shell cases, which all pass with
+    // the timer disabled: 1554.
+    ("test.regular_crates_on_host", 1554),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),
