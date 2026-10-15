@@ -2023,6 +2023,13 @@
           "category": "c-programs",
           "test": "c-programs/dbt-self-sigqueue",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-self-sigqueue",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -31102,6 +31109,13 @@
           "category": "c-programs",
           "test": "c-programs/dbt-self-sigqueue",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-self-sigqueue",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -47625,6 +47639,13 @@
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-self-sigqueue",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",

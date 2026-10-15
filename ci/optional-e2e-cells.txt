@@ -13,7 +13,6 @@ c-programs/clock-adjtime-deterministic verify dbt
 c-programs/copy-file-range-refusal-probe verify dbt
 c-programs/dbt-execveat-unsupported verify dbt
 c-programs/dbt-execveat-unsupported verify sabre
-c-programs/dbt-self-sigqueue verify dbt
 c-programs/dbt-unsupported-syscall verify ptrace
 c-programs/futex-requeue-enosys verify dbt
 c-programs/futex-waitv-enosys verify dbt

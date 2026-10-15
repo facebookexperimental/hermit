@@ -10,20 +10,20 @@
     "all": {
       "cells": 2995,
       "applicable": 1930,
-      "selectable": 1636,
+      "selectable": 1637,
       "population": 2925,
-      "population_candidate_selected": 1636,
-      "population_candidate_not_selected": 283,
+      "population_candidate_selected": 1637,
+      "population_candidate_not_selected": 282,
       "population_candidate_disabled": 1006
     },
     "by_backend": {
       "dbt": {
         "cells": 599,
         "applicable": 254,
-        "selectable": 207,
+        "selectable": 208,
         "population": 585,
-        "population_candidate_selected": 207,
-        "population_candidate_not_selected": 46,
+        "population_candidate_selected": 208,
+        "population_candidate_not_selected": 45,
         "population_candidate_disabled": 332
       },
       "in-guest-trap": {
@@ -235,7 +235,7 @@
     {"test_id":"c-programs/dbt-prlimit-self","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/dbt-prlimit-self","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/dbt-prlimit-self","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/dbt-self-sigqueue","backend":"dbt","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: dbt verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
+    {"test_id":"c-programs/dbt-self-sigqueue","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/dbt-self-sigqueue","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
     {"test_id":"c-programs/dbt-self-sigqueue","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/dbt-self-sigqueue","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)"},
