@@ -3181,7 +3181,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_fuse_directory_with_procfs_block_size_is_not_procfs and
     // dbt_a_procfs_directory_keeps_its_size
     // (https://github.com/rrnewton/hermit/issues/4162): 438.
-    ("test.cli", 438),
+    // And library_runs_return_on_a_four_mib_thread
+    // (https://github.com/rrnewton/hermit/issues/4389): 439, listed.
+    ("test.cli", 439),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3554,7 +3556,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +6 from the discarded-at-send record (https://github.com/rrnewton/hermit/issues/4293): 364, listed.
     // And the chaos spinner-bound and bounded-replay tests (https://github.com/rrnewton/hermit/issues/4374): 366, listed.
     // And the eight directory-size tests: 374.
-    ("test.cli_on_host", 374),
+    // And the 4 MiB library-launch test (https://github.com/rrnewton/hermit/issues/4389): 375, listed.
+    ("test.cli_on_host", 375),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

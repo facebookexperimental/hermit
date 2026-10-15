@@ -30227,6 +30227,43 @@ fn cpu_profile_v3_library_run_with_unqualified_facts_is_refused() {
     assert_eq!(refusals, [expected, expected]);
 }
 
+/// A library caller may launch from a spawned thread with the 4 MiB stack the
+/// launch functions document (more than a debug build needs, about 2.2 MiB;
+/// https://github.com/rrnewton/hermit/issues/4389). Both launch families run
+/// a guest to completion there.
+#[test]
+fn library_runs_return_on_a_four_mib_thread() {
+    let (status, output) = std::thread::Builder::new()
+        .stack_size(4 << 20)
+        .spawn(|| {
+            let status = hermit::run(
+                reverie::process::Command::new("/bin/true"),
+                hermit::DetConfig::default(),
+                false,
+                &None,
+            );
+            let output = hermit::run_with_output(
+                reverie::process::Command::new("/bin/true"),
+                hermit::DetConfig::default(),
+                false,
+                &None,
+            );
+            (
+                status
+                    .map(|status| status.code())
+                    .map_err(|e| format!("{e:#}")),
+                output
+                    .map(|output| output.status.code())
+                    .map_err(|e| format!("{e:#}")),
+            )
+        })
+        .unwrap()
+        .join()
+        .expect("the launching thread failed");
+    assert_eq!(status, Ok(Some(0)));
+    assert_eq!(output, Ok(Some(0)));
+}
+
 /// Under `--cpu-profile x86-64-v3` the guest sees the v3 CPU: every v3 feature
 /// advertised and executable, the hypervisor bit, HLE and RTM clear, leaf 0xD
 /// matching XGETBV with XSAVEOPT and the rest of 0xD.1 hidden, an XSAVE of

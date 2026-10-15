@@ -3593,6 +3593,23 @@ async fn run_dbt(
 // runs on different machines with a different number of cores will not be the
 // same.
 /// Run the given command as deterministically as possible.
+///
+/// # Stack size
+///
+/// This and the other `run*` launch functions run the tracer on the calling
+/// thread, which then needs more than 2 MiB of stack in a debug build with the
+/// `third-party-backends` feature: running `/bin/true` under a default
+/// configuration returned on a 2176 KiB thread and overflowed on 2112 KiB
+/// (<https://github.com/rrnewton/hermit/issues/4389>). A default-feature debug
+/// build needs just under 2 MiB (2048 KiB returned, 1792 KiB overflowed), so
+/// it fits a 2 MiB thread with little to spare. Most of it is Detcore's
+/// syscall handler, which at opt-level 0 keeps every syscall arm's
+/// temporaries in one stack frame. Rust's default for a spawned thread, and
+/// for a test, is 2 MiB, so launching from a thread spawned with 4 MiB
+/// (`std::thread::Builder::stack_size`) is recommended. The main thread
+/// usually has 8 MiB (the default `ulimit -s`), which is enough. Optimised
+/// builds need much less: in the `validate` profile a 512 KiB thread was
+/// enough.
 pub fn run(
     command: Command,
     config: DetConfig,
@@ -3609,6 +3626,8 @@ pub fn run(
 }
 
 /// Run the given command using the selected instrumentation backend.
+///
+/// A 4 MiB stack is recommended for the calling thread; see [`run`].
 pub fn run_with_backend(
     command: Command,
     config: DetConfig,
@@ -3627,6 +3646,8 @@ pub fn run_with_backend(
 }
 
 /// [`run_with_backend`] with a hermit-enforced wall-clock bound on the guest.
+///
+/// A 4 MiB stack is recommended for the calling thread; see [`run`].
 ///
 /// This library never installs a process alarm. Ordinary ptrace keeps the
 /// original runtime, operation, failed GlobalState and backing guards when a
@@ -4109,6 +4130,8 @@ async fn dispatch_backend(
 }
 
 /// Variant of `run` that also captures stdout/stderr.
+///
+/// A 4 MiB stack is recommended for the calling thread; see [`run`].
 pub fn run_with_output(
     command: Command,
     config: DetConfig,
@@ -4125,6 +4148,8 @@ pub fn run_with_output(
 }
 
 /// Variant of [`run_with_backend`] that also captures stdout/stderr.
+///
+/// A 4 MiB stack is recommended for the calling thread; see [`run`].
 pub fn run_with_output_backend(
     command: Command,
     config: DetConfig,
@@ -4147,7 +4172,8 @@ pub fn run_with_output_backend(
 
 /// [`run_with_output_backend`] with a hermit-enforced wall-clock bound.
 ///
-/// See [`run_with_backend_timeout`]; the teardown semantics are identical.
+/// See [`run_with_backend_timeout`]; the teardown semantics are identical. A
+/// 4 MiB stack is recommended for the calling thread; see [`run`].
 pub fn run_with_output_backend_timeout(
     command: Command,
     config: DetConfig,
