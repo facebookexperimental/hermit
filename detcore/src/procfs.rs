@@ -325,6 +325,16 @@ fn sysfs_rtc_kind(path: &Path) -> Option<ProcfsKind> {
     }
 }
 
+/// Whether the procfs file at `path`, one Detcore renders, is a `seq_file`, as
+/// every procfs file outside `/proc/sys` is, rather than a sysctl file. Linux
+/// opens a `seq_file` without `FMODE_PWRITE` (so `pwrite` is `ESPIPE`), seeks
+/// it only from its start or position (`seq_lseek`), and maps it through
+/// `proc_reg_mmap`, which has no method behind it (`EIO`); a sysctl file has
+/// none of these, so a mapping is `ENODEV` and `SEEK_END` lands at its size, 0.
+pub(crate) fn rendered_path_is_seq_file(path: &Path) -> bool {
+    !path.starts_with("/proc/sys")
+}
+
 /// What the name of the memfd standing in for a procfs file Detcore renders
 /// starts with (`syscalls::files::rendered_procfs`); the file's path follows.
 /// Linux shows a memfd named `N` as `/memfd:N (deleted)` in descriptor links.
@@ -896,6 +906,7 @@ impl ProcfsFile {
         match self.kind {
             ProcfsKind::RandomUuid => Some(Path::new("/proc/sys/kernel/random/uuid")),
             ProcfsKind::PtyNr => Some(Path::new("/proc/sys/kernel/pty/nr")),
+            ProcfsKind::Uptime => Some(Path::new("/proc/uptime")),
             ProcfsKind::Fixed(file) => Some(file.path()),
             _ => None,
         }
@@ -920,7 +931,9 @@ impl ProcfsFile {
         self.rendered
     }
 
-    /// The snapshot of this rendered file, once taken (at its open).
+    /// The snapshot of this rendered file, once taken: at its open, or at its
+    /// first read for a file Linux renders when it is read
+    /// ([`Self::snapshot_at_first_read`]).
     pub(crate) fn rendered_snapshot(&self) -> Option<&[u8]> {
         self.contents.as_deref().filter(|_| self.rendered)
     }
@@ -945,6 +958,15 @@ impl ProcfsFile {
         }
     }
 
+    /// Whether a rendered open of this file takes no snapshot, leaving it to
+    /// the first read, as for a captured file: Linux renders `/proc/uptime`
+    /// when it is read (`uptime_proc_show`), and the time it shows is the
+    /// virtual time of that read, not of the open. Its placeholder carries no
+    /// snapshot across `exec`, so the new image renders it at its next read.
+    pub(crate) fn snapshot_at_first_read(&self) -> bool {
+        self.kind == ProcfsKind::Uptime
+    }
+
     /// Whether this file's every snapshot is the same, a fact of the run's
     /// [`MachineDescription`](crate::machine::MachineDescription), so that a
     /// placeholder need not carry it across `exec`: the new image renders it
@@ -960,6 +982,7 @@ impl ProcfsFile {
         match self.kind {
             ProcfsKind::RandomUuid => b"00000000-0000-4000-8000-000000000000\n",
             ProcfsKind::PtyNr => b"0\n",
+            ProcfsKind::Uptime => b"0.00 0.00\n",
             ProcfsKind::Fixed(_) => b"",
             _ => unreachable!("{:?} has no rendered path", self.kind),
         }

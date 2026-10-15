@@ -4576,7 +4576,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             })?;
         // A descriptor that cannot read (`O_PATH`, write-only, access mode 3)
         // reads nothing (EBADF), before its buffer is looked at, as Linux's
-        // `vfs_read` checks; a rendered file's snapshot exists from its open.
+        // `vfs_read` checks, whether or not a rendered file's snapshot is
+        // taken yet (`/proc/uptime`'s is taken at its first read).
         if serves_procfs_snapshot && cannot_read {
             return Err(Errno::EBADF.into());
         }
@@ -4799,7 +4800,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             })?;
         // A descriptor that cannot read (`O_PATH`, write-only, access mode 3)
         // reads nothing (EBADF), before its buffer is looked at, as Linux's
-        // `vfs_read` checks; a rendered file's snapshot exists from its open.
+        // `vfs_read` checks, whether or not a rendered file's snapshot is
+        // taken yet (`/proc/uptime`'s is taken at its first read).
         if serves_procfs_snapshot && cannot_read {
             return Err(Errno::EBADF.into());
         }
@@ -5050,10 +5052,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if status_flags & libc::O_PATH != 0 {
                 return Err(Errno::EBADF.into());
             }
-            let seq_file = rendered
-                .to_str()
-                .and_then(crate::procfs::FixedProcfsFile::from_path)
-                .is_some_and(crate::procfs::FixedProcfsFile::is_seq_file);
+            let seq_file = crate::procfs::rendered_path_is_seq_file(rendered);
             let requested = i128::from(call.offset());
             let new_offset = match call.whence() {
                 Whence::SEEK_SET => requested,

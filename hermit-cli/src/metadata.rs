@@ -568,7 +568,15 @@ impl RecordVersion {
 // which was not open at its grant, keeps a woken sleep from claiming its
 // SIGCHLD (https://github.com/rrnewton/hermit/issues/4410). An older
 // recording of such a sleep holds the claim, which a new replay would not make.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x15c);
+// 0x15c -> 0x15d (taken at land time, as the reservation file's land-time
+// numbering rule gives a ready change HIGHEST_SHIPPED + 1; reserved as
+// 0x15d): /proc/uptime is a procfs file Detcore renders
+// (https://github.com/rrnewton/hermit/issues/4213), and a /proc/uptime the
+// kernel opened (under record and replay, after chroot) now takes Detcore's
+// rendered-file path for readv, preadv, preadv2 and lseek. A vectored read of
+// it records a capture where an older binary refused it with ENOSYS, so an
+// older recording containing one would replay out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x15d);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -593,7 +601,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x15c);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x15c;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x15d;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1572,6 +1580,15 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_replaced_read_descriptors_block_the_claim() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15b)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x15d refused a vectored read of a /proc/uptime
+    /// the kernel opened (ENOSYS) where Detcore now captures it, as it
+    /// renders /proc/uptime (https://github.com/rrnewton/hermit/issues/4213).
+    #[test]
+    fn record_version_rejects_streams_from_before_uptime_is_rendered() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15c)));
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 

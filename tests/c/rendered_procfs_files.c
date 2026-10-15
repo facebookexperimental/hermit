@@ -7,7 +7,10 @@
 
 /* Guest for hermit-cli/tests/cli.rs: the procfs files Detcore renders without
  * the backend opening them (https://github.com/rrnewton/hermit/issues/4213),
- * /proc/sys/kernel/random/uuid and /proc/sys/kernel/pty/nr.
+ * /proc/sys/kernel/random/uuid, /proc/sys/kernel/pty/nr and /proc/uptime.
+ * The first two are sysctl files and the last a seq_file, which Linux
+ * seeks, maps and writes at a position differently (check_seeks,
+ * check_descriptor_refusals).
  *
  * Every check is one Linux gives for the real procfs file; most also fail
  * for a memfd standing in for it, which is how a missed spelling shows: the
@@ -24,7 +27,8 @@
  * file with the identity the guest sees, which must be the same on every
  * backend, and exits 0 only if every check passed.
  *
- * usage: rendered_procfs_files [--no-foreign-fd-links] [--kvm-local-procfs]
+ * usage: rendered_procfs_files [--no-foreign-fd-links] [--noreplace-overlap-eperm]
+ *                              [--kvm-local-procfs]
  *                              [--no-maps-or-chroot] [--chroot-only]
  *                              [--require-chroot] [--xattr-arguments-first]
  *                              [--detcore-xattr-order]
@@ -60,6 +64,10 @@
  *   --chroot-only runs only the process chroot checks, for a run that
  *     cannot verify them (see the previous option); not a thread's chroot,
  *     which hangs under DBT (https://github.com/rrnewton/hermit/issues/4254).
+ *   --noreplace-overlap-eperm expects EPERM rather than EEXIST from
+ *     MAP_FIXED_NOREPLACE over an existing mapping, as DBT answers it for
+ *     every mapping (https://github.com/rrnewton/hermit/issues/4429); the
+ *     call is still made and the mapping must still survive.
  * --inherited is the program after it execs itself.
  */
 
@@ -94,6 +102,7 @@
 static int failures;
 static int kvm_local_procfs;
 static int no_foreign_fd_links;
+static int noreplace_overlap_eperm;
 /* The checks assume none of the capabilities that bypass the refusals they
  * expect; with --no-bypass-capabilities the guest checks that first. */
 static int no_bypass_capabilities;
@@ -185,6 +194,48 @@ static int is_count(const char* text, size_t length) {
   return 1;
 }
 
+/* "<seconds>.<cc> <idle>.<cc>\n", as /proc/uptime reads. */
+static int is_uptime(const char* text, size_t length) {
+  if (length < 10 || text[length - 1] != '\n') {
+    return 0;
+  }
+  int fields = 0;
+  size_t i = 0;
+  while (i + 1 < length) {
+    size_t start = i;
+    while (i + 1 < length && text[i] >= '0' && text[i] <= '9') {
+      i++;
+    }
+    if (i == start || i + 3 >= length || text[i] != '.' || text[i + 1] < '0' || text[i + 1] > '9' ||
+        text[i + 2] < '0' || text[i + 2] > '9') {
+      return 0;
+    }
+    i += 3;
+    fields++;
+    if (fields == 1) {
+      if (text[i] != ' ') {
+        return 0;
+      }
+      i++;
+    }
+  }
+  return fields == 2;
+}
+
+/* The kinds of file this program checks. */
+enum kind { COUNT, UUID, UPTIME };
+
+static int has_contents(enum kind kind, const char* text, size_t length) {
+  switch (kind) {
+    case UUID:
+      return is_uuid(text, length);
+    case UPTIME:
+      return is_uptime(text, length);
+    default:
+      return is_count(text, length);
+  }
+}
+
 /* The value of `label` in this process's fdinfo for `fd`, or -1. */
 static long long fdinfo_value(int fd, const char* label) {
   char path[64];
@@ -260,9 +311,14 @@ static void check_open_errors(const char* path) {
   REFUSED(stat(spelling, &ignored), ENOTDIR, spelling);
 }
 
-static void check_descriptor_refusals(const char* path, int fd) {
+static void check_descriptor_refusals(const char* path, int fd, enum kind kind) {
+  /* A seq_file (every procfs file outside /proc/sys) is opened without
+   * FMODE_PWRITE and maps through proc_reg_mmap, which has no method behind
+   * it; a sysctl file has no mmap method at all. */
+  int seq_file = kind == UPTIME;
   REFUSED(write(fd, "1\n", 2), EBADF, path);
-  REFUSED(pwrite(fd, "1\n", 2, 0), EBADF, path);
+  REFUSED(pwrite(fd, "1\n", 2, 0), seq_file ? ESPIPE : EBADF, path);
+  REFUSED(pwrite(fd, "1\n", 2, -1), EINVAL, path);
   REFUSED(ftruncate(fd, 0), EINVAL, path);
   REFUSED(fallocate(fd, 0, 0, 1), EBADF, path);
   struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
@@ -270,9 +326,47 @@ static void check_descriptor_refusals(const char* path, int fd) {
   int source = open(program, O_RDONLY);
   REFUSED(sendfile(fd, source, NULL, 1), EBADF, path);
   close(source);
-  REFUSED(mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0), ENODEV, path);
+  REFUSED(mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0), seq_file ? EIO : ENODEV, path);
   REFUSED(mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0), EACCES, path);
   REFUSED(mmap(NULL, 0, PROT_READ, MAP_PRIVATE, fd, 0), EINVAL, path);
+  /* The checks before the file's own, in do_mmap's order, and what the
+   * mapping leaves: MAP_FIXED_NOREPLACE over a mapping is EEXIST and keeps
+   * it; a seq_file refuses MAP_GROWSDOWN, and its MAP_FIXED mapping unmaps
+   * the range before proc_reg_mmap fails (EIO), where a sysctl file's fails
+   * first (ENODEV) and keeps it; a vacant range stays vacant. */
+  char* page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  CHECK(page != MAP_FAILED, "%s anonymous page: %s", path, strerror(errno));
+  if (page != MAP_FAILED) {
+    page[0] = 'p';
+    REFUSED(mmap(page, 4096, PROT_READ, MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, 0),
+            noreplace_overlap_eperm ? EPERM : EEXIST, path);
+    CHECK(msync(page, 4096, MS_ASYNC) == 0 && page[0] == 'p',
+          "%s MAP_FIXED_NOREPLACE disturbed the mapping it refused", path);
+    REFUSED(mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_GROWSDOWN, fd, 0),
+            seq_file ? EINVAL : ENODEV, path);
+    /* MAP_SHARED_VALIDATE refuses a flag procfs does not support before any
+     * MAP_FIXED unmapping. */
+    REFUSED(mmap(page, 4096, PROT_READ, 0x03 /* MAP_SHARED_VALIDATE */ | MAP_FIXED | (int)0x80000000,
+                 fd, 0),
+            EOPNOTSUPP, path);
+    CHECK(msync(page, 4096, MS_ASYNC) == 0 && page[0] == 'p',
+          "%s a refused MAP_SHARED_VALIDATE disturbed the mapping", path);
+    REFUSED(mmap(page, 4096, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0), seq_file ? EIO : ENODEV,
+            path);
+    errno = 0;
+    int kept = msync(page, 4096, MS_ASYNC) == 0;
+    CHECK(seq_file ? !kept && errno == ENOMEM : kept && page[0] == 'p',
+          "%s MAP_FIXED left the range %s", path, kept ? "mapped" : "unmapped");
+    if (kept) {
+      munmap(page, 4096);
+    }
+    /* The range is free now: a NOREPLACE mapping fails and maps nothing. */
+    REFUSED(mmap(page, 4096, PROT_READ, MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, 0),
+            seq_file ? EIO : ENODEV, path);
+    errno = 0;
+    CHECK(msync(page, 4096, MS_ASYNC) == -1 && errno == ENOMEM,
+          "%s MAP_FIXED_NOREPLACE left a mapping", path);
+  }
   REFUSED(fsync(fd), EINVAL, path);
   REFUSED(fdatasync(fd), EINVAL, path);
   REFUSED(fchmod(fd, 0644), EPERM, path);
@@ -495,14 +589,24 @@ static void check_path_calls(const char* path, const char* spelling) {
 /* Seeking a sysctl file: a file of size 0 (`default_llseek`), so SEEK_END
  * is the offset alone and SEEK_DATA finds nothing; an O_PATH descriptor has
  * no position. */
-static void check_seeks(const char* path) {
+static void check_seeks(const char* path, enum kind kind) {
   int fd = open(path, O_RDONLY);
-  CHECK(fd >= 0 && lseek(fd, 0, SEEK_END) == 0, "%s SEEK_END %ld", path,
-        (long)lseek(fd, 0, SEEK_CUR));
   char contents[64];
-  CHECK(read(fd, contents, sizeof(contents)) > 0, "%s read after SEEK_END", path);
-  REFUSED(lseek(fd, 0, SEEK_DATA), ENXIO, path);
-  REFUSED(lseek(fd, 0, SEEK_HOLE), ENXIO, path);
+  if (kind == UPTIME) {
+    /* seq_lseek seeks only from the start or the position. */
+    CHECK(fd >= 0, "open(%s): %s", path, strerror(errno));
+    REFUSED(lseek(fd, 0, SEEK_END), EINVAL, path);
+    REFUSED(lseek(fd, 0, SEEK_DATA), EINVAL, path);
+    REFUSED(lseek(fd, 0, SEEK_HOLE), EINVAL, path);
+    CHECK(read(fd, contents, sizeof(contents)) > 0, "%s read after the refused seeks", path);
+    REFUSED(lseek(fd, 0, SEEK_END), EINVAL, path);
+  } else {
+    CHECK(fd >= 0 && lseek(fd, 0, SEEK_END) == 0, "%s SEEK_END %ld", path,
+          (long)lseek(fd, 0, SEEK_CUR));
+    CHECK(read(fd, contents, sizeof(contents)) > 0, "%s read after SEEK_END", path);
+    REFUSED(lseek(fd, 0, SEEK_DATA), ENXIO, path);
+    REFUSED(lseek(fd, 0, SEEK_HOLE), ENXIO, path);
+  }
   REFUSED(lseek(fd, -1, SEEK_SET), EINVAL, path);
   close(fd);
   int located = open(path, O_PATH);
@@ -511,7 +615,7 @@ static void check_seeks(const char* path) {
   close(located);
 }
 
-static void check_file(const char* path, int uuid) {
+static void check_file(const char* path, enum kind kind) {
   struct stat by_path;
   CHECK(stat(path, &by_path) == 0, "stat(%s): %s", path, strerror(errno));
   CHECK(S_ISREG(by_path.st_mode) && (by_path.st_mode & 07777) == 0444, "%s mode %o", path,
@@ -519,7 +623,7 @@ static void check_file(const char* path, int uuid) {
   CHECK(by_path.st_size == 0 && by_path.st_nlink == 1, "%s size %lld nlink %lld", path,
         (long long)by_path.st_size, (long long)by_path.st_nlink);
   check_open_errors(path);
-  check_seeks(path);
+  check_seeks(path, kind);
   check_path_calls(path, path);
   if (!kvm_local_procfs) {
     /* One procfs device, Detcore's, for every procfs file. */
@@ -571,7 +675,9 @@ static void check_file(const char* path, int uuid) {
     CHECK(symlink("/proc/self/fd", directory_link) == 0, "symlink: %s", strerror(errno));
     snprintf(through, sizeof(through), "%s/%d", directory_link, fd);
     ssize_t short_length = readlink(through, target, sizeof(target));
-    CHECK(short_length == (ssize_t)sizeof(target) && memcmp(target, path, sizeof(target)) == 0,
+    /* A path shorter than the buffer, as /proc/uptime, is read whole. */
+    size_t expected = strlen(path) < sizeof(target) ? strlen(path) : sizeof(target);
+    CHECK(short_length == (ssize_t)expected && memcmp(target, path, expected) == 0,
           "%s read into %zu bytes: %.*s", through, sizeof(target),
           (int)(short_length > 0 ? short_length : 0), target);
     unlink(directory_link);
@@ -624,7 +730,7 @@ static void check_file(const char* path, int uuid) {
 
   char contents[64];
   ssize_t length = read(fd, contents, sizeof(contents));
-  CHECK(length > 0 && (uuid ? is_uuid(contents, length) : is_count(contents, length)),
+  CHECK(length > 0 && has_contents(kind, contents, length),
         "%s contents %.*s", path, (int)(length > 0 ? length : 0), contents);
   char rest[64];
   CHECK(read(fd, rest, sizeof(rest)) == 0, "%s second read is not at end", path);
@@ -640,10 +746,10 @@ static void check_file(const char* path, int uuid) {
 
   /* Linux renders the file again for every read from its start. */
   ssize_t preread = pread(fd, rest, sizeof(rest), 0);
-  CHECK(preread > 0 && (uuid ? is_uuid(rest, preread) : is_count(rest, preread)),
+  CHECK(preread > 0 && has_contents(kind, rest, preread),
         "%s pread contents %.*s", path, (int)(preread > 0 ? preread : 0), rest);
 
-  check_descriptor_refusals(path, fd);
+  check_descriptor_refusals(path, fd, kind);
   if (!no_maps_or_chroot) {
     CHECK(!maps_name_placeholder(), "/proc/self/maps names a placeholder");
   }
@@ -663,8 +769,8 @@ static void check_file(const char* path, int uuid) {
     CHECK(fstat(reopened, &by_reopened) == 0 && by_reopened.st_ino == by_path.st_ino,
           "%s reopened identity differs", path);
     ssize_t reread = read(reopened, rest, sizeof(rest));
-    CHECK(reread > 0 && (uuid ? is_uuid(rest, reread) && memcmp(rest, contents, 36) != 0
-                              : is_count(rest, reread)),
+    CHECK(reread > 0 && (has_contents(kind, rest, reread) &&
+                              (kind != UUID || memcmp(rest, contents, 36) != 0)),
           "%s reopened contents %.*s", path, (int)(reread > 0 ? reread : 0), rest);
     close(reopened);
   }
@@ -716,8 +822,7 @@ static void check_file(const char* path, int uuid) {
     int through_alias = open(alias_link, O_RDONLY);
     char aliased[64];
     ssize_t aliased_length = through_alias >= 0 ? read(through_alias, aliased, sizeof(aliased)) : -1;
-    CHECK(aliased_length > 0 && (uuid ? is_uuid(aliased, aliased_length)
-                                      : is_count(aliased, aliased_length)),
+    CHECK(aliased_length > 0 && has_contents(kind, aliased, aliased_length),
           "%s through a link to its descriptor link: %zd", path, aliased_length);
     if (through_alias >= 0) {
       close(through_alias);
@@ -758,7 +863,7 @@ static void check_file(const char* path, int uuid) {
       struct stat by_stdin;
       struct statfs stdin_filesystem;
       int ok = again_length > 0 &&
-               (uuid ? is_uuid(text, again_length) : is_count(text, again_length)) &&
+               has_contents(kind, text, again_length) &&
                stat("/dev/stdin", &by_stdin) == 0 && by_stdin.st_ino == by_path.st_ino &&
                statfs("/dev/stdin", &stdin_filesystem) == 0 &&
                stdin_filesystem.f_type == PROC_SUPER_MAGIC &&
@@ -1009,6 +1114,8 @@ int main(int argc, char** argv) {
     if (strcmp(argv[i], "--kvm-local-procfs") == 0) {
       kvm_local_procfs = 1;
       no_foreign_fd_links = 1;
+    } else if (strcmp(argv[i], "--noreplace-overlap-eperm") == 0) {
+      noreplace_overlap_eperm = 1;
     } else if (strcmp(argv[i], "--no-foreign-fd-links") == 0) {
       no_foreign_fd_links = 1;
     } else if (strcmp(argv[i], "--no-maps-or-chroot") == 0) {
@@ -1063,8 +1170,9 @@ int main(int argc, char** argv) {
   }
   printf("before exec: %.*s\n", (int)sizeof(head), head);
 
-  check_file("/proc/sys/kernel/random/uuid", 1);
-  check_file("/proc/sys/kernel/pty/nr", 0);
+  check_file("/proc/sys/kernel/random/uuid", UUID);
+  check_file("/proc/sys/kernel/pty/nr", COUNT);
+  check_file("/proc/uptime", UPTIME);
   if (!kvm_local_procfs && !no_maps_or_chroot) {
     check_chroot();
     check_thread_chroot();

@@ -3305,10 +3305,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Some(refusal) => Some(refusal),
                 None => match self.answer_rendered_procfs_operation(guest, &call) {
                     Some(answer) => Some(answer),
-                    None => self
-                        .answer_rendered_procfs_path_call(guest, &call)
-                        .await
-                        .transpose(),
+                    None => match self.answer_rendered_procfs_mapping(guest, &call).await {
+                        Some(answer) => Some(answer),
+                        None => self
+                            .answer_rendered_procfs_path_call(guest, &call)
+                            .await
+                            .transpose(),
+                    },
                 },
             }
         } else {

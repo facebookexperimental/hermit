@@ -908,11 +908,51 @@ fn proc_loadavg_uses_virtual_values() {
     }
 }
 
+/// /proc/uptime shows the virtual uptime, and the one of the read: opened,
+/// then read 5 seconds later, it shows the later uptime, as Linux renders it
+/// when it is read (https://github.com/rrnewton/hermit/issues/4213).
 #[test]
 fn proc_uptime_uses_virtual_time() {
     assert_deterministic_at_epoch("/proc/uptime", Some(ACCOUNTING_EPOCH), |contents| {
         assert_eq!(contents, b"120.00 0.00\n");
     });
+
+    let _guard = hermit_run_lock();
+    let build =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create guest build directory");
+    let guest = build.path().join("uptime-at-first-read");
+    compile_c(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/uptime_at_first_read.c"),
+        &guest,
+    );
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
+        .args([
+            "--log=error",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+        ])
+        .arg(format!("--epoch={ACCOUNTING_EPOCH}"))
+        .arg("--")
+        .arg(&guest);
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "uptime probe failed: {rendered}\nstatus: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "125.00 0.00\n",
+        "the uptime read 5 seconds after the open: {rendered}"
+    );
 }
 
 #[test]
