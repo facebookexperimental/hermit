@@ -8,6 +8,9 @@
 
 //! Runtime coverage for scheduler-owned terminal child selectors.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -59,9 +62,7 @@ fn run_selector_guest(backend: &str, guest_args: &[&str]) -> std::process::Outpu
     }
     command.arg("--tmp=/tmp");
     command.arg("--").arg(selector_guest()).args(guest_args);
-    command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run selector guest under {backend}: {error}"))
+    hermit_test::hermit_output(&format!("{command:?}"), &mut command)
 }
 
 #[test]

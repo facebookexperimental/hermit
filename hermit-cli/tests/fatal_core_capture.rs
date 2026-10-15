@@ -10,6 +10,9 @@
 //! compressed core for each guest process a core-dumping signal kills, without
 //! changing what the run reports.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -67,7 +70,7 @@ fn hermit(run_args: &[&str], guest: &Path, guest_args: &[&str]) -> Output {
         .arg("--")
         .arg(guest)
         .args(guest_args);
-    command.output().expect("failed to start hermit")
+    hermit_test::hermit_output(&format!("{command:?}"), &mut command)
 }
 
 fn stderr(output: &Output) -> String {

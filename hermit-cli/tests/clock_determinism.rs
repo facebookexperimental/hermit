@@ -129,9 +129,7 @@ fn run_replay_epoch_guest(options: &[String], epoch_env: Option<&str>) -> Output
     command.args(options).arg("--").arg(replay_epoch_guest());
     hermit_binary::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"))
+    common::hermit_binary::hermit_output(&rendered, &mut command)
 }
 
 fn assert_success(output: &Output, label: &str) {

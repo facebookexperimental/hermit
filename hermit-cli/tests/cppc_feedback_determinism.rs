@@ -54,9 +54,7 @@ fn assert_normalized_feedback() {
     });
     command.arg(cat).arg(FEEDBACK_COUNTERS);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
 
     assert!(
         output.status.success(),

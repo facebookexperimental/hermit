@@ -340,30 +340,29 @@ fn run_verify(
     let _ = fs::remove_dir_all(&log_dir);
     fs::create_dir_all(&log_dir).expect("failed to create verification log directory");
 
-    let output = Command::new("timeout")
-        .args(["--kill-after", "10s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log", "info", "--backend", backend])
-        .args([
-            "run",
-            "--strict",
-            EPOCH,
-            "--verify",
-            "--verify-strict",
-            "--keep-logs",
-            "--verify-log-dir",
-        ])
-        .arg(&log_dir)
-        .args(extra_run_flags)
-        .arg("--verify-json")
-        .arg(&report_path)
-        .arg("--tmp=/tmp")
-        .arg("--")
-        .arg(binary)
-        .output()
-        .unwrap_or_else(|error| {
-            panic!("failed to verify io-buffer guest under {backend}: {error}")
-        });
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after", "10s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log", "info", "--backend", backend])
+            .args([
+                "run",
+                "--strict",
+                EPOCH,
+                "--verify",
+                "--verify-strict",
+                "--keep-logs",
+                "--verify-log-dir",
+            ])
+            .arg(&log_dir)
+            .args(extra_run_flags)
+            .arg("--verify-json")
+            .arg(&report_path)
+            .arg("--tmp=/tmp")
+            .arg("--")
+            .arg(binary),
+    );
     let report = serde_json::from_slice(&fs::read(&report_path).unwrap_or_else(|error| {
         panic!(
             "{backend} verification did not write {}: {error}; stderr:\n{}",

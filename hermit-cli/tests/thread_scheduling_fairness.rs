@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -82,9 +85,7 @@ fn run_workload(workload: &str, run: usize) -> String {
         .arg(fairness_guest())
         .arg(workload);
     let rendered = format!("{command:?}");
-    let output = command.output().unwrap_or_else(|error| {
-        panic!("failed to start {workload} fairness run {run}: {rendered}: {error}")
-    });
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert!(
         output.status.success(),
         "{workload} fairness run {run} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",

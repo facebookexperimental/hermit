@@ -663,13 +663,14 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log=off", "run", "--strict"]);
     configure_pinned_root(&mut strict_command);
-    let strict_output = strict_command
-        .arg("--")
-        .arg(&python)
-        .args(["-c", query])
-        .current_dir(working_directory.path())
-        .output()
-        .expect("failed to start Python prlimit64 strict-mode value regression");
+    let strict_output = hermit_test::hermit_output(
+        "hermit run",
+        strict_command
+            .arg("--")
+            .arg(&python)
+            .args(["-c", query])
+            .current_dir(working_directory.path()),
+    );
     let strict_stdout = String::from_utf8_lossy(&strict_output.stdout);
     let strict_stderr = String::from_utf8_lossy(&strict_output.stderr);
     assert!(
@@ -694,13 +695,14 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log=info", "run", "--strict", "--verify"]);
     configure_pinned_root(&mut command);
-    let output = command
-        .arg("--")
-        .arg(&python)
-        .args(["-c", query])
-        .current_dir(working_directory.path())
-        .output()
-        .expect("failed to start Python prlimit64 strict/verify regression");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        command
+            .arg("--")
+            .arg(&python)
+            .args(["-c", query])
+            .current_dir(working_directory.path()),
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

@@ -6549,12 +6549,13 @@ fn run_liteinst_finds_the_runtime_staged_as_an_installed_resource() {
     let run_installed = || {
         let mut command = Command::new(&installed_hermit);
         append_hermit_args(&mut command, &args);
-        command
-            .env_remove("HERMIT_INSTALL_DIR")
-            .env_remove("HERMIT_LITEINST_TOOL_RUNTIME")
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run the installed Hermit")
+        hermit_test::hermit_output(
+            "hermit run",
+            command
+                .env_remove("HERMIT_INSTALL_DIR")
+                .env_remove("HERMIT_LITEINST_TOOL_RUNTIME")
+                .stdin(Stdio::null()),
+        )
     };
 
     let missing = run_installed();
@@ -15646,15 +15647,16 @@ fn max_log_bytes_is_refused_under_no_namespace_on_the_ptrace_runtime() {
 #[test]
 fn max_log_bytes_is_refused_for_sabre_strace_and_leaves_other_strace_alone() {
     let strace = |args: &[&str]| {
-        hermit_command(args)
-            .env_remove("HERMIT_LOG")
-            .env_remove("HERMIT_LOG_FILE")
-            .env_remove("HERMIT_SABRE_RUNNER")
-            .env_remove("HERMIT_SABRE_BINARY")
-            .env_remove("HERMIT_SABRE_PLUGIN")
-            .stdin(Stdio::null())
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"))
+        hermit_test::hermit_output(
+            "hermit run",
+            hermit_command(args)
+                .env_remove("HERMIT_LOG")
+                .env_remove("HERMIT_LOG_FILE")
+                .env_remove("HERMIT_SABRE_RUNNER")
+                .env_remove("HERMIT_SABRE_BINARY")
+                .env_remove("HERMIT_SABRE_PLUGIN")
+                .stdin(Stdio::null()),
+        )
     };
     let args = [
         "--max-log-bytes=1M",
@@ -18343,11 +18345,12 @@ fn hermit_dap_listen_without_an_adapter_names_the_build_command() {
         let data_dir = work.path().join("recordings");
         fs::create_dir_all(data_dir.join("0123456789abcdef0123456789abcdef"))
             .expect("failed to create the recording dir");
-        let output = command
-            .env("HERMIT_DATA_DIR", &data_dir)
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run the lone hermit");
+        let output = hermit_test::hermit_output(
+            "hermit run",
+            command
+                .env("HERMIT_DATA_DIR", &data_dir)
+                .stdin(Stdio::null()),
+        );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !output.status.success()
@@ -18384,10 +18387,7 @@ fn hermit_dap_listen_without_an_adapter_names_the_build_command() {
     ] {
         let mut command = Command::new(&lonely);
         append_hermit_args(&mut command, args);
-        let output = command
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run the lone hermit");
+        let output = hermit_test::hermit_output("hermit run", command.stdin(Stdio::null()));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !output.status.success()

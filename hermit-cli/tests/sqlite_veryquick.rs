@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -40,13 +43,14 @@ PRAGMA integrity_check;";
 
     // Compatibility workloads keep deterministic defaults while normal mode reports any
     // unsupported syscalls; strict fail-closed behavior is covered by dedicated tests.
-    Command::new(hermit)
-        .args(["--log", "off", "run", EPOCH, "--"])
-        .arg(sqlite)
-        .arg(database)
-        .arg(SQL)
-        .output()
-        .expect("failed to run the fast SQLite workload under Hermit")
+    hermit_test::hermit_output(
+        "hermit run",
+        Command::new(hermit)
+            .args(["--log", "off", "run", EPOCH, "--"])
+            .arg(sqlite)
+            .arg(database)
+            .arg(SQL),
+    )
 }
 
 #[test]
@@ -85,11 +89,12 @@ fn sqlite_veryquick_is_deterministic_under_strict_hermit() {
         std::env::var_os("HERMIT_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_hermit").into());
     let artifact_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sqlite-veryquick");
 
-    let output = Command::new(&runner)
-        .env("HERMIT_BIN", hermit)
-        .env("SQLITE_VERYQUICK_ARTIFACT_ROOT", artifact_root)
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {}: {error}", runner.display()));
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new(&runner)
+            .env("HERMIT_BIN", hermit)
+            .env("SQLITE_VERYQUICK_ARTIFACT_ROOT", artifact_root),
+    );
 
     assert!(
         output.status.success(),

@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -40,9 +43,7 @@ fn hermit_output(case: &ProgramCase, verify: bool) -> std::process::Output {
         .args(case.args);
 
     let rendered = format!("{command:?}");
-    command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"))
+    hermit_test::hermit_output(&rendered, &mut command)
 }
 
 fn assert_l2(case: &ProgramCase) {

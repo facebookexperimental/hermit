@@ -151,13 +151,14 @@ fn run_guest(backend: Backend, mode: &str, prefix: &str, guest_source: &str) {
     eprintln!("inherited terminal evidence: {}", root.display());
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let guest = root.join("inherited_terminal_read");
-    let compiled = Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()))
-        .args(["-O2", "-g", "-std=c11", "-Wall", "-Wextra", "-Werror"])
-        .arg(repository.join("tests/c").join(guest_source))
-        .arg("-o")
-        .arg(&guest)
-        .output()
-        .expect("compile terminal guest");
+    let compiled = hermit_binary::hermit_output(
+        "hermit run",
+        Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()))
+            .args(["-O2", "-g", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c").join(guest_source))
+            .arg("-o")
+            .arg(&guest),
+    );
     fs::write(root.join("compile.stdout"), &compiled.stdout).unwrap();
     fs::write(root.join("compile.stderr"), &compiled.stderr).unwrap();
     assert!(

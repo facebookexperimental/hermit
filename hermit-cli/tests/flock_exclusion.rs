@@ -145,11 +145,10 @@ fn hermit_run_backend_timeout(
     // In the pinned validate root this adds the hermetic `--workdir=/test`,
     // without which the DBT backend refuses the run.
     hermit_test::configure_guest_execution(&mut command);
-    finish(
-        command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to start hermit for {scenario}: {error}")),
-    )
+    finish(hermit_test::hermit_output(
+        &format!("{command:?}"),
+        &mut command,
+    ))
 }
 
 /// Mutual exclusion, the property the pre-#2373 no-op removed outright: under
@@ -396,11 +395,10 @@ fn dbt_nested_vfork_child_blocking_flock_reaches_the_copied_policy() {
         .args(["--kill-after", "1s", "2s"])
         .arg(guest())
         .arg("fork-vfork-blocking");
-    let native = finish(
-        native
-            .output()
-            .expect("failed to start the native nested-vfork control"),
-    );
+    let native = finish(hermit_test::hermit_output(
+        &format!("{native:?}"),
+        &mut native,
+    ));
     assert_eq!(
         native.status.code(),
         Some(124),
@@ -724,12 +722,10 @@ fn dbt_clone_vfork_forms_fail_closed_before_copy() {
 #[test]
 fn dbt_process_clone_files_is_refused_before_copied_child_mutation() {
     for scenario in ["clone-files-process", "clone3-files-process"] {
-        let native = finish(
-            Command::new(guest())
-                .arg(scenario)
-                .output()
-                .unwrap_or_else(|error| panic!("failed to start native {scenario}: {error}")),
-        );
+        let native = finish(hermit_test::hermit_output(
+            "hermit run",
+            Command::new(guest()).arg(scenario),
+        ));
         assert!(
             native.status.success()
                 && native
@@ -788,7 +784,10 @@ fn replay_reissues_every_flock_for_a_materialized_file() {
         .args(["--"])
         .arg(guest())
         .arg("exclusion");
-    let recorded = finish(record.output().expect("failed to start hermit record"));
+    let recorded = finish(hermit_test::hermit_output(
+        &format!("{record:?}"),
+        &mut record,
+    ));
     assert!(
         recorded.status.success(),
         "recording the flock exclusion guest failed\n{}",
@@ -809,7 +808,10 @@ fn replay_reissues_every_flock_for_a_materialized_file() {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log=debug", "replay", "--autopilot"])
         .arg(format!("--data-dir={}", data_dir.path().display()));
-    let replayed = finish(replay.output().expect("failed to start hermit replay"));
+    let replayed = finish(hermit_test::hermit_output(
+        &format!("{replay:?}"),
+        &mut replay,
+    ));
     assert!(
         replayed.status.success(),
         "replaying the flock exclusion guest failed\n{}",
@@ -867,11 +869,10 @@ fn replay_reissues_pidfd_getfd_success_and_failure() {
         .args(["--"])
         .arg(guest())
         .arg("pidfd-getfd-record");
-    let recorded = finish(
-        record
-            .output()
-            .expect("failed to start pidfd_getfd recording"),
-    );
+    let recorded = finish(hermit_test::hermit_output(
+        &format!("{record:?}"),
+        &mut record,
+    ));
     assert!(
         recorded.status.success(),
         "recording pidfd_getfd failed\n{}",
@@ -885,7 +886,10 @@ fn replay_reissues_pidfd_getfd_success_and_failure() {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log=debug", "replay", "--autopilot"])
         .arg(format!("--data-dir={}", data_dir.path().display()));
-    let replayed = finish(replay.output().expect("failed to start pidfd_getfd replay"));
+    let replayed = finish(hermit_test::hermit_output(
+        &format!("{replay:?}"),
+        &mut replay,
+    ));
     assert!(
         replayed.status.success(),
         "replaying pidfd_getfd failed\n{}",
@@ -931,7 +935,10 @@ fn replay_refuses_flock_for_a_non_materialized_file() {
         .arg(guest())
         .arg("holder")
         .arg("/etc/hosts");
-    let recorded = finish(record.output().expect("failed to start hermit record"));
+    let recorded = finish(hermit_test::hermit_output(
+        &format!("{record:?}"),
+        &mut record,
+    ));
     assert!(
         recorded.status.success(),
         "recording flock on the external file failed\\n{}",
@@ -945,7 +952,10 @@ fn replay_refuses_flock_for_a_non_materialized_file() {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log=off", "replay", "--autopilot"])
         .arg(format!("--data-dir={}", data_dir.path().display()));
-    let replayed = finish(replay.output().expect("failed to start hermit replay"));
+    let replayed = finish(hermit_test::hermit_output(
+        &format!("{replay:?}"),
+        &mut replay,
+    ));
     assert_ne!(
         replayed.status.code(),
         Some(124),
@@ -983,7 +993,10 @@ fn recording_refuses_a_contended_blocking_flock() {
         .args(["--"])
         .arg(guest())
         .arg("upgrade");
-    let recorded = finish(record.output().expect("failed to start hermit record"));
+    let recorded = finish(hermit_test::hermit_output(
+        &format!("{record:?}"),
+        &mut record,
+    ));
     assert_ne!(
         recorded.status.code(),
         Some(124),
@@ -1040,7 +1053,10 @@ fn pre_flock_recordings_are_refused_by_the_version_gate() {
         .args(["--"])
         .arg(guest())
         .arg("holder");
-    let recorded = finish(record.output().expect("failed to start hermit record"));
+    let recorded = finish(hermit_test::hermit_output(
+        &format!("{record:?}"),
+        &mut record,
+    ));
     assert!(
         recorded.status.success(),
         "recording the flock holder guest failed\n{}",
@@ -1054,7 +1070,10 @@ fn pre_flock_recordings_are_refused_by_the_version_gate() {
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args(["--log=off", "replay", "--autopilot"])
             .arg(format!("--data-dir={}", dir.display()));
-        finish(replay.output().expect("failed to start hermit replay"))
+        finish(hermit_test::hermit_output(
+            &format!("{replay:?}"),
+            &mut replay,
+        ))
     };
 
     // Positive half of the bracket: the untouched recording replays.

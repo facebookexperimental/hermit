@@ -37,13 +37,12 @@ fn hermit_run(global: &[&str], run_flags: &[&str], guest: &[&str], epoch: &str) 
     } else {
         append_hermit_args(&mut command, &rest);
     }
-    command
-        .env("HERMIT_EPOCH", epoch)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap_or_else(|error| {
-            panic!("failed to run hermit {global:?} run {run_flags:?}: {error}")
-        })
+    super::hermit_test::hermit_output(
+        &format!("hermit {global:?} run {run_flags:?}"),
+        command
+            .env("HERMIT_EPOCH", epoch)
+            .stdin(std::process::Stdio::null()),
+    )
 }
 
 fn log_diff(report: &Path, directories: [&Path; 2], extra: &[&str]) -> Output {
@@ -346,14 +345,15 @@ fn paired_recording_and_replay_report_what_record_verify_reports() {
     let _guard = hermit_run_guard();
     let record = |flags: &[&str], guest: &[&str]| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-        command
-            .args(["record", "start", "--strict", "--verify-strict"])
-            .args(flags)
-            .arg("--")
-            .args(guest)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("failed to run hermit record start")
+        super::hermit_test::hermit_output(
+            "hermit run",
+            command
+                .args(["record", "start", "--strict", "--verify-strict"])
+                .args(flags)
+                .arg("--")
+                .args(guest)
+                .stdin(std::process::Stdio::null()),
+        )
     };
     for (label, guest) in [
         ("echo", &["/bin/echo", "recorded"][..]),

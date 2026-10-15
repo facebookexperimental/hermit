@@ -57,9 +57,7 @@ fn hermit(args: &[&str], guest: Option<&Path>) -> Output {
         command.arg("--").arg(guest);
     }
     hermit_test::configure_guest_execution(&mut command);
-    command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start hermit {args:?}: {error}"))
+    hermit_test::hermit_output(&format!("{command:?}"), &mut command)
 }
 
 fn assert_success(label: &str, output: &Output) {

@@ -51,9 +51,7 @@ fn hermit_output(case: &ProgramCase, verify: bool) -> std::process::Output {
     hermit_test::configure_guest_execution(&mut command);
 
     let rendered = format!("{command:?}");
-    command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"))
+    hermit_test::hermit_output(&rendered, &mut command)
 }
 
 fn assert_l2(case: &ProgramCase) {

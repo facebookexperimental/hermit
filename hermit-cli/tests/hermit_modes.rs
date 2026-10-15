@@ -967,9 +967,7 @@ fn default_exit_codes() {
         let mut command = default_hermit_command("minimal");
         command.arg("--").arg(program).args(args);
         let rendered = format!("{command:?}");
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to start exit-code check: {rendered}: {error}"));
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         assert_eq!(
             output.status.code(),
             Some(expected),
@@ -1195,7 +1193,7 @@ fn verify_reports_stdout_divergence() {
         &[],
     );
 
-    let output = command.output().expect("failed to run stdout verification");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
@@ -1229,9 +1227,7 @@ fn verify_reports_exit_status_divergence() {
         &["--verify-allow=both"],
     );
 
-    let output = command
-        .output()
-        .expect("failed to run exit-status verification");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
@@ -1263,9 +1259,7 @@ fn verify_verbose_compares_the_full_trace() {
         .arg(report.path())
         .args(["--", "/bin/true"]);
 
-    let output = command
-        .output()
-        .expect("failed to run verbose verification");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
@@ -1327,11 +1321,7 @@ fn verify_strict_info_reports_typed_memory_parity_on_landed_fixture() {
             "--max-timeslice=disabled",
         ]);
     configure_execution_root(&mut command);
-    let output = command
-        .arg("--")
-        .arg(&guest)
-        .output()
-        .expect("failed to run strict INFO verification");
+    let output = hermit_test::hermit_output("hermit run", command.arg("--").arg(&guest));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),

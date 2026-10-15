@@ -377,7 +377,7 @@ fn proc_self_cgroup_seeks_as_a_seq_file() {
         .arg(&guest)
         .arg("seek");
     hermit_test::configure_guest_execution(&mut command);
-    let output = command.output().expect("failed to run hermit");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
@@ -431,7 +431,7 @@ fn a_bind_mounted_cgroup_file_reads_as_the_root_cgroup() {
         ])
         .arg(&guest);
     hermit_test::configure_guest_execution(&mut command);
-    let output = command.output().expect("failed to run hermit");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
@@ -482,7 +482,7 @@ fn a_bind_of_proc_reads_cgroup_as_root_and_leaves_mountinfo_alone() {
         ])
         .arg(&guest);
     hermit_test::configure_guest_execution(&mut command);
-    let output = command.output().expect("failed to run hermit");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
@@ -530,7 +530,7 @@ fn a_bind_mounted_status_file_keeps_its_seeks() {
         ])
         .arg(&guest);
     hermit_test::configure_guest_execution(&mut command);
-    let output = command.output().expect("failed to run hermit");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),

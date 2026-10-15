@@ -41,14 +41,19 @@ fn run_words(directory: &Path, guest: &[&str]) -> String {
 /// Run `script` with bash under `hermit verify-inputs`, sealing `data` as one
 /// input and feeding `stdin` as its stdin.
 fn under_verify_inputs(data: &Path, stdin: &Path, script: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["verify-inputs", "--manifest-fd", MANIFEST_FD, "--input"])
-        .arg(format!("data:{}", data.display()))
-        .args(["--", "bash", "-c", script])
-        .env("HERMIT_EPOCH", EPOCH)
-        .stdin(fs::File::open(stdin).unwrap())
-        .output()
-        .expect("failed to run hermit verify-inputs")
+    // A fresh stdin per attempt, should a typed skid refusal run it again.
+    super::hermit_test::hermit_output_with("hermit verify-inputs", || {
+        let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args(["verify-inputs", "--manifest-fd", MANIFEST_FD, "--input"])
+            .arg(format!("data:{}", data.display()))
+            .args(["--", "bash", "-c", script])
+            .env("HERMIT_EPOCH", EPOCH)
+            .stdin(fs::File::open(stdin).unwrap())
+            .output()
+            .expect("failed to run hermit verify-inputs");
+        (output, ())
+    })
+    .0
 }
 
 #[test]

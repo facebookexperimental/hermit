@@ -608,17 +608,18 @@ fn liteinst_in_guest_sigalrm_handler_is_virtual_and_published() {
              ignore=0\nsocket_after=ok errno=0\n",
         ),
     ] {
-        let output = liteinst_command("info")
-            .arg("--verify")
-            .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
-            .arg(format!(
-                "--env=REVERIE_LITEINST_SIGALRM_HANDLERS={admitted}"
-            ))
-            .arg("--")
-            .arg(&guest)
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run Hermit LiteInst");
+        let output = super::hermit_test::hermit_output(
+            "hermit run",
+            liteinst_command("info")
+                .arg("--verify")
+                .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
+                .arg(format!(
+                    "--env=REVERIE_LITEINST_SIGALRM_HANDLERS={admitted}"
+                ))
+                .arg("--")
+                .arg(&guest)
+                .stdin(Stdio::null()),
+        );
         let output = assert_liteinst_in_guest_output(output);
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
@@ -642,14 +643,15 @@ fn liteinst_in_guest_sigalrm_handler_is_virtual_and_published() {
         assert!(raw >= 0, "signalfd: {}", std::io::Error::last_os_error());
         unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }
     };
-    let output = liteinst_command("info")
-        .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
-        .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
-        .arg("--")
-        .arg(&guest)
-        .stdin(Stdio::from(signalfd))
-        .output()
-        .expect("failed to run Hermit LiteInst");
+    let output = super::hermit_test::hermit_output(
+        "hermit run",
+        liteinst_command("info")
+            .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
+            .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
+            .arg("--")
+            .arg(&guest)
+            .stdin(Stdio::from(signalfd)),
+    );
     let output = assert_liteinst_in_guest_output(output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), not_admitted);
 }
@@ -897,27 +899,29 @@ fn assert_entry_delivery_runs_and_refuses_verification(
     extra_args: &[&str],
     expected: &str,
 ) {
-    let output = liteinst_command("info")
-        .args(extra_args)
-        .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
-        .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
-        .arg("--")
-        .arg(guest)
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run Hermit LiteInst");
+    let output = super::hermit_test::hermit_output(
+        "hermit run",
+        liteinst_command("info")
+            .args(extra_args)
+            .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
+            .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
+            .arg("--")
+            .arg(guest)
+            .stdin(Stdio::null()),
+    );
     let output = assert_liteinst_in_guest_output(output);
     assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
-    let output = liteinst_command("info")
-        .arg("--verify")
-        .args(extra_args)
-        .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
-        .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
-        .arg("--")
-        .arg(guest)
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run Hermit LiteInst with --verify");
+    let output = super::hermit_test::hermit_output(
+        "hermit run",
+        liteinst_command("info")
+            .arg("--verify")
+            .args(extra_args)
+            .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
+            .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
+            .arg("--")
+            .arg(guest)
+            .stdin(Stdio::null()),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "verification matched: {stderr}");
     assert!(
@@ -1000,7 +1004,7 @@ fn liteinst_in_guest_an_undeliverable_sigalrm_is_a_loss_and_stops_the_guest() {
             Ok(())
         })
     };
-    let output = command.output().expect("failed to run Hermit LiteInst");
+    let output = super::hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stdout} {stderr}");
@@ -1036,15 +1040,16 @@ fn liteinst_in_guest_sigalrm_handler_runs_at_syscall_completion() {
         .output()
         .expect("failed to compile the SIGALRM guest");
     assert!(compiled.status.success(), "{compiled:?}");
-    let output = liteinst_command("info")
-        .arg("--verify")
-        .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
-        .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
-        .arg("--")
-        .arg(&guest)
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run Hermit LiteInst");
+    let output = super::hermit_test::hermit_output(
+        "hermit run",
+        liteinst_command("info")
+            .arg("--verify")
+            .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
+            .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
+            .arg("--")
+            .arg(&guest)
+            .stdin(Stdio::null()),
+    );
     let output = assert_liteinst_in_guest_output(output);
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
@@ -1078,15 +1083,16 @@ fn liteinst_in_guest_tool_directory_reads_stay_out_of_the_guest_heap() {
         .output()
         .expect("failed to compile the guest");
     assert!(compiled.status.success(), "{compiled:?}");
-    let output = liteinst_command("info")
-        .arg("--verify")
-        .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
-        .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
-        .arg("--")
-        .arg(&guest)
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run Hermit LiteInst");
+    let output = super::hermit_test::hermit_output(
+        "hermit run",
+        liteinst_command("info")
+            .arg("--verify")
+            .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
+            .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
+            .arg("--")
+            .arg(&guest)
+            .stdin(Stdio::null()),
+    );
     let output = assert_liteinst_in_guest_output(output);
     let mut expected = String::from("install=0\nrecord 0 pad: 00 00 00\nrecord 1 pad: 00 00\n");
     for record in 2..10 {
@@ -1149,21 +1155,22 @@ fn liteinst_in_guest_runtime_leaves_the_guest_heap_as_the_program_made_it() {
     ] {
         for extra_mounts in 0..=3 {
             let label = format!("--backend={backend} with {extra_mounts} extra mounts");
-            let output = Command::new(hermit_binary())
-                .args(["--log=error", "--backend", backend, "run"])
-                .args([
-                    "--max-timeslice=disabled",
-                    "--strict",
-                    "--base-env=minimal",
-                    "--mount=type=tmpfs,target=/test",
-                    "--workdir=/test",
-                ])
-                .args((0..extra_mounts).map(|_| "--mount=type=tmpfs,target=/test"))
-                .arg("--")
-                .arg(&guest)
-                .stdin(Stdio::null())
-                .output()
-                .expect("failed to run Hermit");
+            let output = super::hermit_test::hermit_output(
+                "hermit run",
+                Command::new(hermit_binary())
+                    .args(["--log=error", "--backend", backend, "run"])
+                    .args([
+                        "--max-timeslice=disabled",
+                        "--strict",
+                        "--base-env=minimal",
+                        "--mount=type=tmpfs,target=/test",
+                        "--workdir=/test",
+                    ])
+                    .args((0..extra_mounts).map(|_| "--mount=type=tmpfs,target=/test"))
+                    .arg("--")
+                    .arg(&guest)
+                    .stdin(Stdio::null()),
+            );
             let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
@@ -1339,12 +1346,10 @@ fn liteinst_in_guest_runtime_calls_none_of_the_converted_libc_wrappers() {
             if let Some(preload) = preload {
                 command.arg(format!("--env=LD_PRELOAD={preload}"));
             }
-            let output = command
-                .arg("--")
-                .arg(&guest)
-                .stdin(Stdio::null())
-                .output()
-                .expect("failed to run Hermit");
+            let output = super::hermit_test::hermit_output(
+                "hermit run",
+                command.arg("--").arg(&guest).stdin(Stdio::null()),
+            );
             let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             assert!(
@@ -1439,20 +1444,21 @@ fn liteinst_in_guest_fork_child_heap_is_the_parents() {
         ("liteinst", IN_GUEST_SELECTED),
         ("in-guest-trap", IN_GUEST_TRAP_SELECTED),
     ] {
-        let output = Command::new(hermit_binary())
-            .args(["--log=error", "--backend", backend, "run"])
-            .args([
-                "--max-timeslice=disabled",
-                "--strict",
-                "--base-env=minimal",
-                "--mount=type=tmpfs,target=/test",
-                "--workdir=/test",
-                "--",
-            ])
-            .arg(&guest)
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run Hermit");
+        let output = super::hermit_test::hermit_output(
+            "hermit run",
+            Command::new(hermit_binary())
+                .args(["--log=error", "--backend", backend, "run"])
+                .args([
+                    "--max-timeslice=disabled",
+                    "--strict",
+                    "--base-env=minimal",
+                    "--mount=type=tmpfs,target=/test",
+                    "--workdir=/test",
+                    "--",
+                ])
+                .arg(&guest)
+                .stdin(Stdio::null()),
+        );
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -1522,22 +1528,23 @@ fn liteinst_in_guest_admitted_sigalrm_leaves_the_guest_heap_as_the_program_made_
             Some("--env=REVERIE_LITEINST_SITE_PATCHING=0"),
         ),
     ] {
-        let output = Command::new(hermit_binary())
-            .args(["--log=error", "--backend", backend, "run"])
-            .args([
-                "--max-timeslice=disabled",
-                "--strict",
-                "--base-env=minimal",
-                "--mount=type=tmpfs,target=/test",
-                "--workdir=/test",
-                "--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1",
-            ])
-            .args(site_patching)
-            .arg("--")
-            .arg(&guest)
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run Hermit");
+        let output = super::hermit_test::hermit_output(
+            "hermit run",
+            Command::new(hermit_binary())
+                .args(["--log=error", "--backend", backend, "run"])
+                .args([
+                    "--max-timeslice=disabled",
+                    "--strict",
+                    "--base-env=minimal",
+                    "--mount=type=tmpfs,target=/test",
+                    "--workdir=/test",
+                    "--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1",
+                ])
+                .args(site_patching)
+                .arg("--")
+                .arg(&guest)
+                .stdin(Stdio::null()),
+        );
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -2158,28 +2165,30 @@ fn liteinst_in_guest_cpuid_in_a_late_loaded_library_runs() {
         assert_eq!(main, loaded, "{backend}: {stdout:?}");
     };
 
-    let control = Command::new(hermit_binary())
-        .args(["--log=error", "--backend=ptrace", "run"])
-        .args([
-            "--strict",
-            "--max-timeslice=disabled",
-            "--base-env=minimal",
-            "--",
-        ])
-        .arg(guest)
-        .arg(library)
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run the late-CPUID guest under ptrace");
+    let control = super::hermit_test::hermit_output(
+        "hermit run",
+        Command::new(hermit_binary())
+            .args(["--log=error", "--backend=ptrace", "run"])
+            .args([
+                "--strict",
+                "--max-timeslice=disabled",
+                "--base-env=minimal",
+                "--",
+            ])
+            .arg(guest)
+            .arg(library)
+            .stdin(Stdio::null()),
+    );
     check(&control, "ptrace");
 
-    let output = liteinst_command("error")
-        .arg("--")
-        .arg(guest)
-        .arg(library)
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run the late-CPUID guest under in-guest LiteInst");
+    let output = super::hermit_test::hermit_output(
+        "hermit run",
+        liteinst_command("error")
+            .arg("--")
+            .arg(guest)
+            .arg(library)
+            .stdin(Stdio::null()),
+    );
     check(&output, "liteinst");
     assert_in_guest_selected(&String::from_utf8_lossy(&output.stderr));
 }
@@ -2337,15 +2346,16 @@ fn bootstrap_time_host_identity() -> &'static Path {
 fn liteinst_in_guest_runtime_bootstrap_is_not_charged_to_host_identity_uptime() {
     let _guard = hermit_run_guard();
     let home = tempfile::tempdir().expect("failed to create bootstrap-time HOME");
-    let output = liteinst_command_at_epoch("info", Some(VIRTUAL_TIME_EPOCH))
-        .args(["--env=LC_ALL=C", "--env=TZ=UTC"])
-        .arg(format!("--env=HOME={}", home.path().display()))
-        .env("HOME", home.path())
-        .arg("--")
-        .arg(bootstrap_time_host_identity())
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run Hermit LiteInst on host_identity");
+    let output = super::hermit_test::hermit_output(
+        "hermit run",
+        liteinst_command_at_epoch("info", Some(VIRTUAL_TIME_EPOCH))
+            .args(["--env=LC_ALL=C", "--env=TZ=UTC"])
+            .arg(format!("--env=HOME={}", home.path().display()))
+            .env("HOME", home.path())
+            .arg("--")
+            .arg(bootstrap_time_host_identity())
+            .stdin(Stdio::null()),
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -2440,25 +2450,26 @@ fn in_guest_trap_verifies_a_program_with_no_site_patched() {
     let report_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let report_path = report_dir.path().join("verify.json");
     let listed = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/common");
-    let output = Command::new(hermit_binary())
-        .args(["--log=info", "--backend", "in-guest-trap", "run"])
-        .args([
-            "--max-timeslice=disabled",
-            "--strict",
-            "--base-env=minimal",
-            "--verify",
-            "--verify-strict",
-        ])
-        .arg(format!("--verify-json={}", report_path.display()))
-        .arg("--")
-        .args(["/bin/ls", "-1"])
-        .arg(&listed)
-        .env_remove("RUST_LOG")
-        .env_remove("HERMIT_LOG")
-        .env_remove("HERMIT_LOG_FILE")
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run Hermit in-guest-trap");
+    let output = super::hermit_test::hermit_output(
+        "hermit run",
+        Command::new(hermit_binary())
+            .args(["--log=info", "--backend", "in-guest-trap", "run"])
+            .args([
+                "--max-timeslice=disabled",
+                "--strict",
+                "--base-env=minimal",
+                "--verify",
+                "--verify-strict",
+            ])
+            .arg(format!("--verify-json={}", report_path.display()))
+            .arg("--")
+            .args(["/bin/ls", "-1"])
+            .arg(&listed)
+            .env_remove("RUST_LOG")
+            .env_remove("HERMIT_LOG")
+            .env_remove("HERMIT_LOG_FILE")
+            .stdin(Stdio::null()),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -2522,19 +2533,20 @@ fn in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on() {
         if let Some(value) = env {
             command.arg(format!("--env=REVERIE_LITEINST_SITE_PATCHING={value}"));
         }
-        command
-            // A shell builtin prints the guest's value: no exec, and bash is
-            // one of the pinned root's declared guest programs.
-            .args([
-                "--",
-                "/usr/bin/bash",
-                "-c",
-                "printf '%s\\n' \"${REVERIE_LITEINST_SITE_PATCHING-unset}\"",
-            ])
-            .env_remove("REVERIE_LITEINST_SITE_PATCHING")
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run Hermit in-guest-trap")
+        super::hermit_test::hermit_output(
+            "hermit run",
+            command
+                // A shell builtin prints the guest's value: no exec, and bash is
+                // one of the pinned root's declared guest programs.
+                .args([
+                    "--",
+                    "/usr/bin/bash",
+                    "-c",
+                    "printf '%s\\n' \"${REVERIE_LITEINST_SITE_PATCHING-unset}\"",
+                ])
+                .env_remove("REVERIE_LITEINST_SITE_PATCHING")
+                .stdin(Stdio::null()),
+        )
     };
     for env in [None, Some("0")] {
         let output = run(env);
@@ -2598,18 +2610,19 @@ fn constructor_mutation_guest() -> &'static Path {
 }
 
 fn run_constructor_mutation_guest(backend: &str, mode: &str) -> Output {
-    Command::new(hermit_binary())
-        // Quiet, so the guest's refusal message is not interleaved with
-        // Detcore's own records on the same stderr.
-        .args(["--log=error", "--backend", backend, "run"])
-        .args(["--max-timeslice=disabled", "--strict", "--base-env=minimal"])
-        .arg(format!("--env=IN_GUEST_TRAP_FIXTURE_CONSTRUCTOR={mode}"))
-        .arg("--")
-        .arg(constructor_mutation_guest())
-        .env_remove("REVERIE_LITEINST_SITE_PATCHING")
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run Hermit")
+    super::hermit_test::hermit_output(
+        "hermit run",
+        Command::new(hermit_binary())
+            // Quiet, so the guest's refusal message is not interleaved with
+            // Detcore's own records on the same stderr.
+            .args(["--log=error", "--backend", backend, "run"])
+            .args(["--max-timeslice=disabled", "--strict", "--base-env=minimal"])
+            .arg(format!("--env=IN_GUEST_TRAP_FIXTURE_CONSTRUCTOR={mode}"))
+            .arg("--")
+            .arg(constructor_mutation_guest())
+            .env_remove("REVERIE_LITEINST_SITE_PATCHING")
+            .stdin(Stdio::null()),
+    )
 }
 
 /// A shared library's constructor runs before the in-guest runtime's and can
@@ -2743,9 +2756,8 @@ fn userfaultfd_guest() -> &'static Path {
 fn liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered() {
     // Skip only when the host itself refuses an unprivileged userfaultfd, so
     // a backend failure can never pass as an unavailable host.
-    let native = Command::new(userfaultfd_guest())
-        .output()
-        .expect("failed to run the userfaultfd guest natively");
+    let native =
+        super::hermit_test::hermit_output("hermit run", &mut Command::new(userfaultfd_guest()));
     let native_stdout = String::from_utf8_lossy(&native.stdout);
     assert!(native.status.success(), "native run failed: {native:?}");
     if let Some(reason) = native_stdout.strip_prefix("userfaultfd-unavailable ") {
@@ -2757,13 +2769,14 @@ fn liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered() {
     }
     assert_eq!(native_stdout, "userfaultfd-served pages=2 sum=798720\n");
     let _guard = hermit_run_guard();
-    let output = liteinst_command("info")
-        .args(["--verify", "--verify-strict"])
-        .arg("--")
-        .arg(userfaultfd_guest())
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run Hermit LiteInst on the userfaultfd guest");
+    let output = super::hermit_test::hermit_output(
+        "hermit run",
+        liteinst_command("info")
+            .args(["--verify", "--verify-strict"])
+            .arg("--")
+            .arg(userfaultfd_guest())
+            .stdin(Stdio::null()),
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -2827,12 +2840,13 @@ fn liteinst_in_guest_refuses_a_guest_that_opens_dev_fuse() {
     assert_in_guest_selected(&stderr);
 
     // ptrace runs the same program: the refusal is in-guest LiteInst's.
-    let output = Command::new(hermit_binary())
-        .args(["--log=info", "run", "--strict", "--"])
-        .args(["/bin/sh", "-c", ": < /dev/fuse; echo opened"])
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run Hermit with ptrace");
+    let output = super::hermit_test::hermit_output(
+        "hermit run",
+        Command::new(hermit_binary())
+            .args(["--log=info", "run", "--strict", "--"])
+            .args(["/bin/sh", "-c", ": < /dev/fuse; echo opened"])
+            .stdin(Stdio::null()),
+    );
     assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "opened\n");
 }
@@ -2870,12 +2884,13 @@ fn liteinst_in_guest_reads_a_plain_file_on_a_fuse_filesystem() {
         .expect("reading the FUSE file natively");
     expected.truncate(read);
     let _guard = hermit_run_guard();
-    let output = liteinst_command("info")
-        .args(["--", "/usr/bin/head", "-c", "16"])
-        .arg(&file)
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run Hermit LiteInst");
+    let output = super::hermit_test::hermit_output(
+        "hermit run",
+        liteinst_command("info")
+            .args(["--", "/usr/bin/head", "-c", "16"])
+            .arg(&file)
+            .stdin(Stdio::null()),
+    );
     let output = assert_liteinst_in_guest_output(output);
     assert_eq!(output.stdout, expected, "{}", file.display());
 }
@@ -2961,13 +2976,14 @@ fn liteinst_in_guest_exit_reaping_matches_ptrace() {
             if backend == "liteinst" {
                 command.arg("--max-timeslice=disabled");
             }
-            let output = command
-                .args(["--strict", "--verify", "--verify-strict", "--"])
-                .arg(guest)
-                .arg(mode)
-                .stdin(Stdio::null())
-                .output()
-                .expect("failed to run Hermit");
+            let output = super::hermit_test::hermit_output(
+                "hermit run",
+                command
+                    .args(["--strict", "--verify", "--verify-strict", "--"])
+                    .arg(guest)
+                    .arg(mode)
+                    .stdin(Stdio::null()),
+            );
             let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
@@ -3022,22 +3038,23 @@ const SELF_SIGNAL_DEATH_CHILDREN: &str = "abort: signal 6\n\
 /// at log level `info`, with `extra` run options.
 fn run_self_signal_death_probe(backend: &str, extra: &[&str], mode: &str) -> Output {
     let guest = c_guest(&SELF_SIGNAL_DEATH_GUEST, "self_signal_death_probe");
-    Command::new(hermit_binary())
-        .args(["--log=info", "--backend", backend, "run"])
-        .args([
-            "--max-timeslice=disabled",
-            "--strict",
-            "--base-env=minimal",
-            "--mount=type=tmpfs,target=/test",
-            "--workdir=/test",
-        ])
-        .args(extra)
-        .arg("--")
-        .arg(guest)
-        .arg(mode)
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run Hermit")
+    super::hermit_test::hermit_output(
+        "hermit run",
+        Command::new(hermit_binary())
+            .args(["--log=info", "--backend", backend, "run"])
+            .args([
+                "--max-timeslice=disabled",
+                "--strict",
+                "--base-env=minimal",
+                "--mount=type=tmpfs,target=/test",
+                "--workdir=/test",
+            ])
+            .args(extra)
+            .arg("--")
+            .arg(guest)
+            .arg(mode)
+            .stdin(Stdio::null()),
+    )
 }
 
 /// A process that ends itself with a signal it sends itself (`abort`, `raise`,
@@ -3184,23 +3201,25 @@ fn liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification() {
             "vfork-parent-killed parent-signal=9 surviving-work-done=1\n",
         ),
     ] {
-        let output = liteinst_command("info")
-            .arg("--")
-            .arg(guest)
-            .arg(mode)
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run Hermit LiteInst");
+        let output = super::hermit_test::hermit_output(
+            "hermit run",
+            liteinst_command("info")
+                .arg("--")
+                .arg(guest)
+                .arg(mode)
+                .stdin(Stdio::null()),
+        );
         let output = assert_liteinst_in_guest_output(output);
         assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "{mode}");
 
-        let output = liteinst_command("info")
-            .args(["--verify", "--verify-strict", "--"])
-            .arg(guest)
-            .arg(mode)
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run Hermit LiteInst with --verify");
+        let output = super::hermit_test::hermit_output(
+            "hermit run",
+            liteinst_command("info")
+                .args(["--verify", "--verify-strict", "--"])
+                .arg(guest)
+                .arg(mode)
+                .stdin(Stdio::null()),
+        );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !output.status.success(),
@@ -3262,13 +3281,14 @@ fn liteinst_in_guest_dup_aliases_share_one_cursor_after_fork() {
         if backend == "liteinst" {
             command.arg("--max-timeslice=disabled");
         }
-        let output = command
-            .arg(format!("--epoch={VIRTUAL_TIME_EPOCH}"))
-            .args(["--strict", "--"])
-            .arg(guest)
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run Hermit");
+        let output = super::hermit_test::hermit_output(
+            "hermit run",
+            command
+                .arg(format!("--epoch={VIRTUAL_TIME_EPOCH}"))
+                .args(["--strict", "--"])
+                .arg(guest)
+                .stdin(Stdio::null()),
+        );
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         assert!(output.status.success(), "{backend}: {output:?}");
         assert!(
@@ -3301,13 +3321,14 @@ fn liteinst_in_guest_close_range_releases_ports_like_ptrace() {
         if backend == "liteinst" {
             command.arg("--max-timeslice=disabled");
         }
-        let output = command
-            .arg(format!("--epoch={VIRTUAL_TIME_EPOCH}"))
-            .args(["--strict", "--"])
-            .arg(guest)
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run Hermit");
+        let output = super::hermit_test::hermit_output(
+            "hermit run",
+            command
+                .arg(format!("--epoch={VIRTUAL_TIME_EPOCH}"))
+                .args(["--strict", "--"])
+                .arg(guest)
+                .stdin(Stdio::null()),
+        );
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         assert!(output.status.success(), "{backend}: {output:?}");
         assert_eq!(stdout, "port reused=1\n", "{backend}: {output:?}");
@@ -3335,26 +3356,27 @@ fn verify_digest_records_an_unobservable_recvmsg_and_keeps_the_kernel_result() {
     for (mode, unobservable) in [("plain", false), ("overwritten", true)] {
         let log_dir = logs.path().join(mode);
         fs::create_dir(&log_dir).expect("failed to create a verify-log directory");
-        let output = Command::new(hermit_binary())
-            .args([
-                "--log",
-                "info",
-                "--backend",
-                "ptrace",
-                "run",
-                "--strict",
-                "--verify",
-            ])
-            .arg(format!("--epoch={VIRTUAL_TIME_EPOCH}"))
-            .arg("--keep-logs")
-            .arg("--verify-log-dir")
-            .arg(&log_dir)
-            .arg("--")
-            .arg(guest)
-            .arg(mode)
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run Hermit");
+        let output = super::hermit_test::hermit_output(
+            "hermit run",
+            Command::new(hermit_binary())
+                .args([
+                    "--log",
+                    "info",
+                    "--backend",
+                    "ptrace",
+                    "run",
+                    "--strict",
+                    "--verify",
+                ])
+                .arg(format!("--epoch={VIRTUAL_TIME_EPOCH}"))
+                .arg("--keep-logs")
+                .arg("--verify-log-dir")
+                .arg(&log_dir)
+                .arg("--")
+                .arg(guest)
+                .arg(mode)
+                .stdin(Stdio::null()),
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{mode}: {output:?}");
@@ -3557,12 +3579,13 @@ fn liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno() {
         if backend == "liteinst" {
             command.arg("--max-timeslice=disabled");
         }
-        let output = command
-            .args(["--strict", "--"])
-            .arg(guest)
-            .stdin(Stdio::null())
-            .output()
-            .expect("failed to run Hermit");
+        let output = super::hermit_test::hermit_output(
+            "hermit run",
+            command
+                .args(["--strict", "--"])
+                .arg(guest)
+                .stdin(Stdio::null()),
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success(), "{backend}: {output:?}");
         assert_eq!(

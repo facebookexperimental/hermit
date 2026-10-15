@@ -17,6 +17,9 @@
 //! program, and a threaded observation program that exercises clocks,
 //! metadata, CPUID, and randomness.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::env;
 use std::fs;
 use std::fs::File;
@@ -241,12 +244,7 @@ fn run_case(configuration: &Configuration, program: Program<'_>) -> (String, u12
         .env_remove("HERMIT_FAIL_CLOSED");
     let rendered = format!("{command:?}");
     let started = Instant::now();
-    let output = command.output().unwrap_or_else(|error| {
-        panic!(
-            "failed to start configuration {} / {}: {rendered}: {error}",
-            configuration.name, program.name,
-        )
-    });
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let elapsed_ms = started.elapsed().as_millis();
     let combined = format!(
         "{}\n{}",
@@ -368,9 +366,7 @@ fn invalid_matrix_states_are_rejected_without_panicking() {
             .arg("run")
             .args(args)
             .args(["--", "/bin/true"]);
-        let output = command.output().unwrap_or_else(|error| {
-            panic!("failed to start invalid-state probe {args:?}: {error}")
-        });
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         let combined = format!(
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),

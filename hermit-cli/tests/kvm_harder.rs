@@ -51,9 +51,7 @@ fn run_guest(backend: &str, binary: &Path, verify: bool) -> Output {
         command.arg("--verify");
     }
     command.arg("--").arg(binary);
-    command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {binary:?} on {backend}: {error}"))
+    hermit_test::hermit_output(&format!("{command:?}"), &mut command)
 }
 
 fn assert_ptrace_kvm_parity(name: &str, source: &str, extra_args: &[&str], expected_stdout: &str) {

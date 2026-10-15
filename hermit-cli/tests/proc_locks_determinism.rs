@@ -239,7 +239,7 @@ fn run_guest(guest: &Path, verify: bool) -> Output {
         .arg("--")
         .arg(guest);
     hermit_test::configure_guest_execution(&mut command);
-    command.output().expect("failed to run proc-locks guest")
+    hermit_test::hermit_output(&format!("{command:?}"), &mut command)
 }
 
 #[test]

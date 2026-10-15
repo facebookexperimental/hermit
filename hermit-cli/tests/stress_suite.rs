@@ -243,9 +243,7 @@ fn chaos_demo_command_targeted(seed: u64, targeted: bool) -> Command {
 fn run_chaos_demo_targeted(seed: u64, targeted: bool) -> Output {
     let mut command = chaos_demo_command_targeted(seed, targeted);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert!(
         matches!(output.status.code(), Some(0 | 1)),
         "chaos demo (seed={seed}, targeted={targeted}) failed unexpectedly: {rendered}\n\
@@ -264,9 +262,7 @@ fn run_chaos_demo(seed: Option<u64>) -> Output {
     );
     let mut command = chaos_demo_command(seed);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert!(
         matches!(output.status.code(), Some(0 | 1)),
         "{label} failed unexpectedly: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
