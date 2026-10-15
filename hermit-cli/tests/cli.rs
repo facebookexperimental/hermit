@@ -192,6 +192,7 @@ static SIGSUSPEND_AFTER_WNOHANG_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_SHARED_MASK_REWRITE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_SHARED_STACK_MASK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_ONCE_PER_CHILD_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SIGNAL_THEN_SIBLING_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1727,6 +1728,32 @@ fn sigsuspend_shared_mask_rewrite_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "sigsuspend-shared-mask-rewrite guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn signal_then_sibling_exit_guest() -> &'static Path {
+    SIGNAL_THEN_SIBLING_EXIT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("signal-then-sibling-exit");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the signal-then-sibling-exit guest directory");
+        let guest = build_root.join("signal_then_sibling_exit");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/signal_then_sibling_exit.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the signal-then-sibling-exit guest");
+        assert!(
+            output.status.success(),
+            "signal-then-sibling-exit guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -9646,6 +9673,82 @@ fn a_child_exit_is_notified_once_with_linuxs_siginfo() {
                 stderr(&output).contains("Determinism verified"),
                 "{mode} {timeslice:?}: missing verification success marker:\n{}",
                 stderr(&output)
+            );
+        }
+    }
+}
+
+/// tests/c/signal_then_sibling_exit.c on KVM: a worker signals the main thread
+/// and exits at once, while the main thread takes the signal at a system-call
+/// return (`spin`, a getpid loop) or in a `sigsuspend` loop. The waiting
+/// thread holds a delivery permit until its `InboundSignal` turn, and the
+/// protocol allows one boundary per process, so the worker's controlled exit
+/// was refused as a protocol failure ("KVM parked signal protocol failed ...
+/// Identity"), on main 2bf536af for `spin` in 4 of 4 runs. The exit now waits
+/// for the permit's release (https://github.com/rrnewton/hermit/issues/4367).
+/// `sigsuspend` also runs under three chaos seeds; `spin` busy-waits with no
+/// blocking call, which chaos can starve on KVM
+/// (https://github.com/rrnewton/hermit/issues/4374), so it runs at the default
+/// schedule. Every run must reach bitwise parity.
+#[test]
+fn run_kvm_a_sibling_may_exit_while_its_signal_is_taken() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM signal-then-exit case: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = signal_then_sibling_exit_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let cases: [(&str, &[&str]); 7] = [
+        ("spin", &[]),
+        ("spin", &[]),
+        ("spin", &[]),
+        ("sigsuspend", &[]),
+        ("sigsuspend", &["--chaos", "--sched-seed=1"]),
+        ("sigsuspend", &["--chaos", "--sched-seed=2"]),
+        ("sigsuspend", &["--chaos", "--sched-seed=7"]),
+    ];
+    for (mode, schedule) in cases {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report_arg = report.to_str().expect("report path should be UTF-8");
+        let mut args = vec![
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+        ];
+        args.extend_from_slice(schedule);
+        args.extend([
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
+            "--",
+            guest,
+            mode,
+        ]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            format!("{mode}: woken\n"),
+            "{mode} {schedule:?}"
+        );
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(
+            verdict["bitwise_parity"], true,
+            "{mode} {schedule:?}: {verdict}"
+        );
+        for side in ["left", "right"] {
+            assert!(
+                verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+                "{mode} {schedule:?}: no INFO messages compared: {verdict}"
             );
         }
     }

@@ -2048,6 +2048,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/signal_then_sibling_exit.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/signal_then_sibling_exit.c is owned by hermit-cli/tests/cli.rs: run_kvm_a_sibling_may_exit_while_its_signal_is_taken runs it on the KVM backend, where a worker signals the main thread and exits at once while the main thread takes the signal at a system-call return (spin) or in a sigsuspend loop; the worker's exit must wait for the delivery permit rather than fail the parked signal protocol (https://github.com/rrnewton/hermit/issues/4367). It requires repeated run --strict --verify --verify-strict runs, with chaos seeds for sigsuspend, at bitwise parity, so it remains a guest fixture rather than a manifest cell."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/signal_waiting_beside_background.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/signal_waiting_beside_background.c is owned by hermit-cli/tests/cli.rs: The integration tests a_scheduler_signal_wait_beside_a_background_call_is_armed and a_scheduler_signal_wait_beside_a_background_call_is_armed_under_chaos run its four modes under run --strict, plain and at chaos seed 4, and require the line Linux prints: a scheduler SIGCHLD waiting in the shared queue beside a vfork, a closed signalfd, another process's signalfd or an unrelated select must still arm main's sigsuspend, and a parent whose SIGCHLD delivery was deferred must not panic Hermit (https://github.com/rrnewton/hermit/pull/4314); a generic manifest cannot assert per-mode output under chaos."

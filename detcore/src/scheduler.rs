@@ -5600,6 +5600,7 @@ impl Scheduler {
             !waiters.is_empty()
         });
         self.pending_run_queue_admissions.remove(dtid);
+        self.parked.exits_awaiting_permit.remove(dtid);
         self.forget_poll_deadline(*dtid);
         let _ = self.remove_futex_waiter(dtid);
         // A killed thread must not keep the scheduler loop alive as a parked
@@ -7417,8 +7418,18 @@ impl Scheduler {
                 }
             }
         }
+        // A thread whose exit waits for a sibling's delivery permit
+        // (`exits_awaiting_permit`) is still live, and so still among
+        // `process_signal_targets`, but it is exiting: the kernel passes it by
+        // (`wants_signal` skips an exiting thread), and a signal sent to it
+        // would never be delivered (`wake_signaled_guest`). So it is not chosen
+        // here; a live sibling is (the Codex review of
+        // https://github.com/rrnewton/hermit/issues/4367).
         match self.thread_status(detpid) {
-            ThreadStatus::Gone => self.process_signal_targets(detpid).into_iter().next(),
+            ThreadStatus::Gone => self
+                .process_signal_targets(detpid)
+                .into_iter()
+                .find(|thread| !self.parked.exits_awaiting_permit.contains(thread)),
             ThreadStatus::Running | ThreadStatus::NotRunning => Some(detpid),
         }
     }
@@ -8061,6 +8072,21 @@ impl Scheduler {
     fn wake_signaled_guest(&mut self, dettid: DetTid, signal: impl Into<SigWrapper>) {
         let signal = signal.into();
         if self.in_guest_fatal_alarm_pending(dettid) {
+            return;
+        }
+        // A thread whose exit waits for a sibling's delivery permit
+        // (`exits_awaiting_permit`) has already made its exit call, and Linux
+        // runs an exit to completion: a signal sent to an exiting thread is
+        // never delivered to it, and process-directed signals pass it by
+        // (`thread_status` reports it gone, so no target selection picks it).
+        // Its retained `Exit` request is left as it is, and the permit's
+        // release re-admits it (https://github.com/rrnewton/hermit/issues/4367).
+        // Before, it was found in no pool, and the send panicked.
+        if self.parked.exits_awaiting_permit.contains(&dettid) {
+            debug!(
+                "[dtid {}] signal {} not woken: the thread is exiting.",
+                dettid, signal
+            );
             return;
         }
         // The physical send has already happened. Preserve its real kernel
@@ -10859,6 +10885,14 @@ impl Scheduler {
             // SI_TKILL for one child, so only the scheduler wait readiness is
             // synthesized on that path.
             ResourceID::Exit { group, process, mm } => {
+                if self.exit_awaits_sibling_permit(dettid, *process) {
+                    info!(
+                        "[scheduler] NONCOMMIT turn {}, parking dettid {}'s exit behind a sibling's signal delivery",
+                        self.turn, dettid
+                    );
+                    self.parked.exits_awaiting_permit.insert(dettid);
+                    return self.skip_turn_blocked(dettid);
+                }
                 let reserve_mode = match self.reserve_exit_boundary(dettid, *process, *mm, *group) {
                     Ok(mode) => mode,
                     Err(failure) => {

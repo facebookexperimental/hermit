@@ -846,6 +846,70 @@ impl Scheduler {
         })
     }
 
+    /// The thread-group leader of `tid` (itself when it leads, or when it is
+    /// unknown), as `fail_parked` names a thread's process.
+    fn permit_leader(&self, tid: DetTid) -> DetTid {
+        self.thread_tree
+            .thread_to_leader
+            .get(&tid)
+            .copied()
+            .unwrap_or(tid)
+    }
+
+    /// Whether `tid`'s controlled exit must wait because another thread of its
+    /// process holds a delivery permit: that thread is at a signal boundary,
+    /// waiting for its `InboundSignal` turn, and the protocol allows one
+    /// boundary per process at a time, so `reserve_exit_boundary` would refuse
+    /// the exit as a protocol failure. The exit waits instead, and the
+    /// permit's release re-admits it (`admit_exits_released_by`), as Linux
+    /// lets a thread exit while a sibling handles a signal
+    /// (https://github.com/rrnewton/hermit/issues/4367).
+    pub(crate) fn exit_awaits_sibling_permit(&self, tid: DetTid, process: DetPid) -> bool {
+        if self.parked.control.is_none() {
+            return false;
+        }
+        let Some((_, task)) = self.real_timers.task_identity(process, tid) else {
+            return false;
+        };
+        self.parked
+            .permits
+            .iter()
+            .any(|(holder, permit)| *holder != tid && permit.task.process == task.process)
+    }
+
+    /// Admit, at the next drain and at the front of its band, every exit that
+    /// waited (`exit_awaits_sibling_permit`) for the permit `holder` just
+    /// released, once no other permit of `process` remains. Called at every
+    /// release of a permit, so no waiter outlives the permits it waits for.
+    /// Each release is ordered before the next selection, so the drain that
+    /// admits the exit is a deterministic one (`admit_to_run_queue`): the
+    /// delivery receipt arrives while `holder` holds its turn, before it files
+    /// its next request, and an observation's release runs in the scheduler's
+    /// own control drain, while the observed thread's empty request holds the
+    /// scheduler.
+    pub(super) fn admit_exits_released_by(&mut self, holder: DetTid, process: SignalProcessId) {
+        if self
+            .parked
+            .permits
+            .values()
+            .any(|permit| permit.task.process == process)
+        {
+            return;
+        }
+        let leader = self.permit_leader(holder);
+        let ready: Vec<DetTid> = self
+            .parked
+            .exits_awaiting_permit
+            .iter()
+            .copied()
+            .filter(|waiter| self.permit_leader(*waiter) == leader)
+            .collect();
+        for waiter in ready {
+            self.parked.exits_awaiting_permit.remove(&waiter);
+            self.admit_to_run_queue(waiter, super::AdmitIntent::Fixed(super::AdmitSide::Front));
+        }
+    }
+
     /// Fence one scheduler-committed exit until KVM reports the exact terminal
     /// boundary after committing its process-family snapshot. The selected
     /// `(tid, request, response)` transaction is the authority here: step 5
@@ -1011,7 +1075,9 @@ impl Scheduler {
         // Cleanup/failure may already have logically killed the task. Exact
         // duplicates remain recognizable after timer/task retirement. No turn
         // or membership is created by this consuming notification.
-        self.parked.permits.remove(&tid);
+        if let Some(released) = self.parked.permits.remove(&tid) {
+            self.admit_exits_released_by(tid, released.task.process);
+        }
         if exit_fence.is_some() {
             self.parked.exit_fences.remove(&tid);
         }

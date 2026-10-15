@@ -260,6 +260,11 @@ pub(super) struct ParkedRequests {
     pub failure: Option<ProtocolFailure>,
     pub control: Option<reverie::BackendSignalControl>,
     pub permits: BTreeMap<DetTid, SignalDeliveryPermit>,
+    /// Exiting threads whose `Exit` grant waits while another thread of their
+    /// process holds a delivery permit (`Scheduler::exit_awaits_sibling_permit`).
+    /// Releasing that permit (`consume_signal_boundary`) records each for
+    /// admission at the next deterministic drain.
+    pub exits_awaiting_permit: std::collections::BTreeSet<DetTid>,
     pub exit_fences: BTreeMap<DetTid, ExitBoundaryFence>,
     pub child_exit_reservations: BTreeMap<ProcessGeneration, ChildExitReservation>,
     pub completed_child_exits: BTreeMap<ProcessGeneration, CompletedChildExit>,
@@ -1484,6 +1489,10 @@ impl Scheduler {
                         .permits
                         .remove(&wait.dettid)
                         .ok_or(ProtocolFailure::Identity)?;
+                    // Released here too, so an exit that waits for it
+                    // (https://github.com/rrnewton/hermit/issues/4367) is
+                    // never stranded.
+                    self.admit_exits_released_by(wait.dettid, permit.task.process);
                     self.parked
                         .control
                         .as_ref()

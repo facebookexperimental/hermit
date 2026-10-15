@@ -613,6 +613,168 @@ fn return_permit_requires_real_grant_and_receipt_is_exactly_once() {
     assert!(s.next_turns.contains_key(&peer));
 }
 
+/// A sibling's exit waits while a thread of its process holds a delivery
+/// permit, rather than failing the protocol (`reserve_exit_boundary` refuses a
+/// second boundary of the process), and the permit's release records the
+/// waiting exit for admission at the next drain, once no permit of the
+/// process remains (https://github.com/rrnewton/hermit/issues/4367). The
+/// permit holder's own exit, and a thread of another process, do not wait.
+#[test]
+fn an_exit_waits_for_a_sibling_permit_and_is_admitted_at_its_release() {
+    let (mut s, _b) = fixture();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let (peer, peer_mm, _) = add(&mut s, 100, 101);
+    let (stranger, _, _) = add(&mut s, 200, 200);
+    s.parked.running = Some(tid);
+    assert!(!s.exit_awaits_sibling_permit(peer, DetPid::from_raw(100)));
+    let permit = s
+        .authorize_signal_boundary(task(100, 100))
+        .unwrap()
+        .unwrap();
+    assert!(s.exit_awaits_sibling_permit(peer, DetPid::from_raw(100)));
+    assert!(
+        !s.exit_awaits_sibling_permit(tid, DetPid::from_raw(100)),
+        "the holder's own exit"
+    );
+    assert!(
+        !s.exit_awaits_sibling_permit(stranger, DetPid::from_raw(200)),
+        "another process"
+    );
+
+    // The sibling's exit, through the complete `Exit` resource arm: it waits,
+    // out of the run queue, with no exit boundary reserved and nothing failed.
+    s.runqueue_push_back(peer);
+    assert_eq!(s.run_queue.tentative_pop_next(), Some(peer));
+    let exit = ResourceID::Exit {
+        group: false,
+        process: DetPid::from_raw(100),
+        mm: peer_mm,
+    };
+    assert!(
+        s.block_for_one_resource(peer, &exit, &Permission::RW, None, None, &Ivar::new())
+            .is_err(),
+        "the waiting exit skips its turn"
+    );
+    assert!(!s.backend_failed());
+    assert!(s.parked.exits_awaiting_permit.contains(&peer));
+    assert!(!s.parked.exit_fences.contains_key(&peer));
+    assert!(!s.run_queue.contains_tid(peer));
+    assert!(!s.run_queue.tentative_pop_in_progress());
+
+    // A signal the scheduler sends it meanwhile neither panics nor wakes it:
+    // the thread is exiting (the Codex review of
+    // https://github.com/rrnewton/hermit/issues/4367).
+    s.wake_signaled_guest(peer, Signal::SIGUSR1);
+    assert!(s.parked.exits_awaiting_permit.contains(&peer));
+    assert!(!s.run_queue.contains_tid(peer));
+    assert!(!s.pending_run_queue_admissions.contains_key(&peer));
+
+    // The permit's receipt re-admits it at the next drain, front of its band.
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Caught,
+    })
+    .unwrap();
+    assert!(s.parked.exits_awaiting_permit.is_empty());
+    assert_eq!(
+        s.pending_run_queue_admissions.get(&peer),
+        Some(&super::AdmitIntent::Fixed(super::AdmitSide::Front))
+    );
+    assert!(!s.exit_awaits_sibling_permit(peer, DetPid::from_raw(100)));
+}
+
+/// Each process's waiting exit is admitted only by its own process's permit,
+/// and a waiter retired while it waits leaves the wait set.
+#[test]
+fn a_waiting_exit_is_admitted_only_by_its_own_process_permit() {
+    let (mut s, _b) = fixture();
+    let (a, _, _) = add(&mut s, 100, 100);
+    let (a_peer, a_mm, _) = add(&mut s, 100, 101);
+    let (b, _, _) = add(&mut s, 200, 200);
+    let (b_peer, b_mm, _) = add(&mut s, 200, 201);
+    s.parked.running = Some(a);
+    let a_permit = s
+        .authorize_signal_boundary(task(100, 100))
+        .unwrap()
+        .unwrap();
+    s.parked.running = Some(b);
+    let _b_permit = s
+        .authorize_signal_boundary(task(200, 200))
+        .unwrap()
+        .unwrap();
+    for (peer, pid, mm) in [(a_peer, 100, a_mm), (b_peer, 200, b_mm)] {
+        s.runqueue_push_back(peer);
+        assert_eq!(s.run_queue.tentative_pop_tid(peer), Some(peer));
+        let exit = ResourceID::Exit {
+            group: true,
+            process: DetPid::from_raw(pid),
+            mm,
+        };
+        assert!(
+            s.block_for_one_resource(peer, &exit, &Permission::RW, None, None, &Ivar::new())
+                .is_err()
+        );
+    }
+    assert_eq!(
+        s.parked.exits_awaiting_permit,
+        [a_peer, b_peer].into_iter().collect()
+    );
+    s.parked.running = Some(a);
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit: a_permit,
+        outcome: SignalBoundaryOutcome::Caught,
+    })
+    .unwrap();
+    assert!(s.pending_run_queue_admissions.contains_key(&a_peer));
+    assert!(
+        !s.pending_run_queue_admissions.contains_key(&b_peer),
+        "another process's permit is still held"
+    );
+    assert_eq!(
+        s.parked.exits_awaiting_permit,
+        [b_peer].into_iter().collect()
+    );
+    s.remove_blocking_entries(&b_peer);
+    assert!(s.parked.exits_awaiting_permit.is_empty());
+}
+
+/// A leader whose exit waits for a sibling's permit is exiting: a
+/// process-directed signal goes to a live sibling instead, as the kernel
+/// passes an exiting thread by (the Codex review of
+/// https://github.com/rrnewton/hermit/issues/4367).
+#[test]
+fn a_process_signal_passes_by_an_exiting_leader() {
+    let (mut s, _b) = fixture();
+    let (leader, leader_mm, _) = add(&mut s, 100, 100);
+    let (holder, _, _) = add(&mut s, 100, 101);
+    let (other, _, _) = add(&mut s, 100, 102);
+    let process = DetPid::from_raw(100);
+    assert_eq!(s.live_signal_target(process, None), Some(leader));
+    s.runqueue_push_back(other);
+    s.parked.running = Some(holder);
+    let _permit = s
+        .authorize_signal_boundary(task(100, 101))
+        .unwrap()
+        .unwrap();
+    s.runqueue_push_back(leader);
+    assert_eq!(s.run_queue.tentative_pop_tid(leader), Some(leader));
+    let exit = ResourceID::Exit {
+        group: false,
+        process,
+        mm: leader_mm,
+    };
+    assert!(
+        s.block_for_one_resource(leader, &exit, &Permission::RW, None, None, &Ivar::new())
+            .is_err()
+    );
+    assert!(s.parked.exits_awaiting_permit.contains(&leader));
+    // Still a live thread of the process, but never the delivery target.
+    assert!(s.process_signal_targets(process).contains(&leader));
+    assert_eq!(s.live_signal_target(process, None), Some(holder));
+    assert_eq!(s.live_signal_target(process, Some(leader)), Some(holder));
+    assert_eq!(s.live_signal_target(process, Some(other)), Some(other));
+}
+
 #[test]
 fn committed_failure_reenters_only_after_scheduler_terminal_and_unlock() {
     use std::sync::atomic::AtomicUsize;
