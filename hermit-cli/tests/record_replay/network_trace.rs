@@ -41,6 +41,15 @@ const REPLAY_CELLS: &[(u64, u64)] = &[
     (3, 4_000_000),
 ];
 
+// The predeclared cells are a sample, not a guarantee, that the two competing
+// readers can each win. Which one wins under a seed depends on where the
+// guest's branch counts put the preemption points, so a different build of the
+// same guest can give all four the same winner: validation of Hermit main
+// 6ae2cba5 in the pinned root printed {"0:abc,1:def"} for all four, where this
+// host's build prints both orders. When the predeclared cells show one winner,
+// up to this many further seeds are tried, each checked like the others.
+const EXTRA_SCHEDULE_SEEDS: u64 = 16;
+
 const OUTBOUND_HEX: &str = "726571756573740a6e6578740a646f6e650a";
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -1181,11 +1190,10 @@ fn tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
 
     // Replay with no server. Each cell verifies twice under one fixed seed;
     // across cells the race winner must change while the input does not.
-    let mut reader_markers = BTreeSet::new();
-    for (seed, max_timeslice) in REPLAY_CELLS {
+    let replay_cell = |seed: u64, max_timeslice: u64| {
         let label = format!("replay-seed-{seed}-timeslice-{max_timeslice}");
         let report = evidence.join(format!("{label}.verify.json"));
-        let mut arguments = run_arguments(*seed, *max_timeslice);
+        let mut arguments = run_arguments(seed, max_timeslice);
         arguments.extend([
             "--verify".into(),
             "--verify-strict".into(),
@@ -1200,17 +1208,41 @@ fn tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
             &["client", &port, "match"],
         );
         assert_success(&replayed, &label);
-        reader_markers.insert(assert_guest_invariants(&replayed.stdout, &label));
+        let marker = assert_guest_invariants(&replayed.stdout, &label);
         assert_l2_report(&report, &label);
         assert_eq!(
             fs::read(&trace).expect("replay removed its network trace"),
             original_trace,
             "{label} changed the network trace"
         );
+        (label, marker)
+    };
+    let mut cells = REPLAY_CELLS
+        .iter()
+        .map(|(seed, max_timeslice)| replay_cell(*seed, *max_timeslice))
+        .collect::<Vec<_>>();
+    let first_extra = REPLAY_CELLS.len() as u64;
+    for seed in first_extra..first_extra + EXTRA_SCHEDULE_SEEDS {
+        if cells
+            .iter()
+            .map(|(_, marker)| marker)
+            .collect::<BTreeSet<_>>()
+            .len()
+            >= 2
+        {
+            break;
+        }
+        let max_timeslice = if seed % 2 == 0 { 1_000_000 } else { 4_000_000 };
+        cells.push(replay_cell(seed, max_timeslice));
     }
+    let reader_markers = cells
+        .iter()
+        .map(|(_, marker)| marker)
+        .collect::<BTreeSet<_>>();
     assert!(
         reader_markers.len() >= 2,
-        "the replay seeds and timeslices exposed no schedule variation: {reader_markers:?}"
+        "the replay seeds and timeslices exposed no schedule variation in {} cells: {cells:?}",
+        cells.len()
     );
 
     // A changed outbound byte ends replay rather than accepting a different
