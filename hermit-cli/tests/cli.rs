@@ -35515,9 +35515,18 @@ fn pipe_wake_args(
     // A hard link, not a copy: each mode's directory outlives the run, and a
     // copy left 92 KB behind per mode and test process. The guest is built in
     // the same build root, so linking is expected to work; copy if it fails.
+    // Never copy onto an existing name: that would be a link to the guest
+    // itself, and the copy would truncate the shared guest to nothing.
     let guest = dir.join("fifo_peer");
-    if fs::hard_link(fifo_peer_guest(), &guest).is_err() {
-        fs::copy(fifo_peer_guest(), &guest).expect("failed to place the guest");
+    let _ = fs::remove_file(&guest);
+    match fs::hard_link(fifo_peer_guest(), &guest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            panic!("{} survived its removal: {error}", guest.display())
+        }
+        Err(_) => {
+            fs::copy(fifo_peer_guest(), &guest).expect("failed to place the guest");
+        }
     }
     let mut args = vec![
         "run".to_owned(),

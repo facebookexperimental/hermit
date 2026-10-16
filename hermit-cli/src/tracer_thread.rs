@@ -194,8 +194,10 @@ fn execute_with<R: Send + 'static>(
     }
 }
 
-/// Runs `job` with [`execute`] if `owner` is the calling thread's tracer
-/// thread, which is where that owner's operations live. `None` otherwise.
+/// Runs `job` on the calling thread's tracer thread, as [`execute`] does, if
+/// `owner` is that thread, which is where that owner's operations live (it
+/// reads the identity once and uses [`execute_with`]). `None` otherwise,
+/// including whenever [`tracer_identity`] says the launch runs in place.
 pub(crate) fn execute_on<R: Send + 'static>(
     owner: ThreadId,
     job: impl FnOnce() -> R + Send + 'static,
