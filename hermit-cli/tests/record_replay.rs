@@ -3291,7 +3291,10 @@ fn record_exec_discards_posix_timer_copies_as_on_linux() {
             "{mode}: the guest must print {expected:?}:\n{output}"
         );
     }
-    for mode in ["sfd_thread", "shared_sfd"] {
+    // worker_sfd_thread: the same as sfd_thread, by a non-leader that execs,
+    // so its queue moves to the leader's tid (the Codex re-review of
+    // https://github.com/rrnewton/hermit/pull/4491, P1).
+    for mode in ["sfd_thread", "shared_sfd", "worker_sfd_thread"] {
         let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
         let mut record = Command::new(env!("CARGO_BIN_EXE_hermit"));
         record

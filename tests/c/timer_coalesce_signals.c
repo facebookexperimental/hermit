@@ -196,12 +196,19 @@ static void set2(sigset_t *w, int a, int b) {
  * timer on its grid, so the deliveries plus their overruns count the grid
  * points up to the last dequeue: between the grid points before the clock
  * read just ahead of the last handler and those up to the read inside it. */
-static volatile long storm_before[MAXREC], storm_inside[MAXREC];
-static volatile long storm_loop;
+/* The storm's handler keeps its own count and sum, with no MAXREC cap: how
+ * many deliveries a native run takes depends on the host's speed. */
+static volatile long storm_loop, storm_last, storm_sum;
+static volatile int storm_n, storm_all_si_timer = 1;
 static void storm_handler(int s, siginfo_t *si, void *u) {
-  long t = now_ns();
-  if (n < MAXREC) storm_inside[n] = t;
-  handler(s, si, u);
+  (void)s;
+  (void)u;
+  storm_last = now_ns();
+  storm_n++;
+  if (si->si_code == SI_TIMER)
+    storm_sum += 1 + si->si_overrun;
+  else
+    storm_all_si_timer = 0;
 }
 static void storm(void) {
   struct sigaction a;
@@ -216,19 +223,15 @@ static void storm(void) {
   for (long i = 0; i < 30000000L; i++) storm_loop = i;
   mask(SIG_BLOCK, SIGUSR1);
   timer_delete(t);
-  int got = n < MAXREC ? n : MAXREC;
-  long sum = 0;
-  for (int i = 0; i < got; i++) sum += 1 + rov[i];
   int ok = 0;
-  if (got > 0 && got == n) {
-    long last = storm_inside[got - 1];
-    /* Grid points start + k ms (k >= 1) up to `last`; the timer was armed
-     * between `start` and `armed`. */
-    long lo = (last - armed) / 1000000L, hi = (last - start) / 1000000L;
-    ok = sum >= lo && sum <= hi + 1;
+  if (storm_n > 0 && storm_all_si_timer) {
+    /* Grid points start + k ms (k >= 1) up to the last handler's entry; the
+     * timer was armed between `start` and `armed`. */
+    long lo = (storm_last - armed) / 1000000L, hi = (storm_last - start) / 1000000L;
+    ok = storm_sum >= lo && storm_sum <= hi + 1;
   }
-  printf("storm deliveries_positive=%d all_si_timer=%d recurrence_ok=%d\n", n > 0,
-         got > 0 && rcode[0] == SI_TIMER, ok);
+  printf("storm deliveries_positive=%d all_si_timer=%d recurrence_ok=%d\n", storm_n > 0,
+         storm_n > 0 && storm_all_si_timer, ok);
 }
 
 /* D1: a copy discarded while ignored (SI_QUEUE, nonzero bytes 32-47) waits in
@@ -967,6 +970,30 @@ static void cx_stale_middle(void) {
   cx_print_read("stale_middle first", fd);
   cx_print_read("stale_middle second", fd);
 }
+/* The Codex re-review's P2: [Plain, 80 stale entries, valid B] read by one
+ * signalfd read with room for 4. Linux skips every stale entry inside the
+ * dequeue, so the read returns the Plain and B. */
+static void cx_many_stale(void) {
+  enum { STALE = 80 };
+  mask(SIG_BLOCK, SIGUSR1);
+  kill(getpid(), SIGUSR1);
+  int old[STALE];
+  for (int i = 0; i < STALE; i++) {
+    old[i] = cx_timer(100 + i);
+    cx_arm(old[i], 1000000, 0);
+    cx_sleep_ms(3);
+  }
+  int b = cx_timer(222);
+  cx_arm(b, 1000000, 0);
+  cx_sleep_ms(3);
+  for (int i = 0; i < STALE; i++) cx_arm(old[i], 0, 0);
+  sigset_t s;
+  sigemptyset(&s);
+  sigaddset(&s, SIGUSR1);
+  int fd = signalfd(-1, &s, SFD_NONBLOCK);
+  cx_print_read("many_stale first", fd);
+  cx_print_read("many_stale second", fd);
+}
 /* P2-2: a disarm whose old_value copy faults still disarms. */
 static void cx_bad_old_disarm(void) {
   mask(SIG_BLOCK, SIGUSR1);
@@ -1080,6 +1107,7 @@ int main(int argc, char **argv) {
   else if (!strcmp(m, "d1_transition_queued")) d1_transition(1);
   else if (!strcmp(m, "delivery_turn")) delivery_turn();
   else if (!strcmp(m, "stale_middle")) cx_stale_middle();
+  else if (!strcmp(m, "many_stale")) cx_many_stale();
   else if (!strcmp(m, "bad_old_disarm")) cx_bad_old_disarm();
   else if (!strcmp(m, "bad_old_overrun")) cx_bad_old_overrun();
   else if (!strcmp(m, "setsig_periodic")) cx_setsig_periodic();

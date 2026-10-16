@@ -32228,6 +32228,10 @@ fn posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity() {
             "stale_middle first bytes=256 errno=0 code0=0 val0=0 code1=-2 val1=222\nstale_middle second bytes=-1 errno=11\n",
         ),
         (
+            "many_stale",
+            "many_stale first bytes=256 errno=0 code0=0 val0=0 code1=-2 val1=222\nmany_stale second bytes=-1 errno=11\n",
+        ),
+        (
             "bad_old_disarm",
             "bad_old_disarm settime=-1 errno=14 take=-1 errno=11 code=0 value=0\n",
         ),
@@ -32654,6 +32658,10 @@ fn exec_discards_a_posix_timers_pending_signal_at_bitwise_parity() {
         // flush removes it: native, 5 runs each, 2026-10-15.
         ("sfd_process", "sfd_process pending_after_exec=0 hits=0\n"),
         ("sfd_thread", "sfd_thread pending_after_exec=1 hits=1\n"),
+        (
+            "worker_sfd_thread",
+            "worker_sfd_thread pending_after_exec=1 hits=1\n",
+        ),
         ("cont_flush", "cont_flush pending_after_exec=1 hits=1\n"),
         ("stw_other", "stw_other pending_after_exec=0 hits=0\n"),
         (

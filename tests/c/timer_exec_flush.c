@@ -133,7 +133,16 @@ static void *arming_worker(void *arg) {
 /* A worker that leaves a copy of SIGUSR1 pending on itself and execs. */
 static void *exec_worker(void *arg) {
   (void)arg;
-  if (!strcmp(exec_mode, "worker_timer")) {
+  if (!strcmp(exec_mode, "worker_sfd_thread")) {
+    if (expire(SIGUSR1, 1)) _exit(80);
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    int fd = signalfd(-1, &set, SFD_CLOEXEC);
+    struct signalfd_siginfo record;
+    if (fd < 0 || read(fd, &record, sizeof record) != (ssize_t)sizeof record) _exit(77);
+    tgkill_self(SIGUSR1);
+  } else if (!strcmp(exec_mode, "worker_timer")) {
     if (expire(SIGUSR1, 1)) _exit(80);
   } else {
     tgkill_self(SIGUSR1);
@@ -173,7 +182,8 @@ int main(int argc, char **argv) {
     printf("taken_then_kill before_exec hits=%d\n", (int)hits);
     fflush(stdout);
     kill(getpid(), signo);
-  } else if (!strcmp(mode, "worker_timer") || !strcmp(mode, "leader_exec")) {
+  } else if (!strcmp(mode, "worker_timer") || !strcmp(mode, "leader_exec") ||
+             !strcmp(mode, "worker_sfd_thread")) {
     if (!strcmp(mode, "leader_exec") && (rc = expire(signo, 1))) return rc;
     exec_mode = mode;
     exec_self = argv[0];

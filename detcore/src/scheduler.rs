@@ -5482,6 +5482,7 @@ impl Scheduler {
             self.parent_death_exec_survivor = None;
             siblings
         };
+        self.transfer_replay_copies(caller, new_leader, &siblings);
 
         if caller == new_leader {
             self.next_turns

@@ -301,6 +301,42 @@ fn a_periodic_timer_waits_for_its_dequeue_and_reports_the_overrun() {
     );
 }
 
+/// A delivery's siginfo is the timer's as the stop dequeued it: a
+/// `timer_delete` another thread commits before the delivery's turn changes
+/// neither its `si_value` nor its overrun, which Linux fills at the dequeue.
+#[test]
+fn a_delivery_reports_the_timer_as_its_stop_found_it() {
+    let mut f = family();
+    f.arm(0, SignalTarget::Process(f.leader), 10, 10);
+    f.pop(10);
+    f.queues(0, kernel_signal_bit(USR1));
+    assert_eq!(
+        f.sched
+            .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(55))),
+        DeliveryAnswer::TimerEntry
+    );
+    // Deleted between the stop and the delivery's turn.
+    f.sched
+        .note_posix_timer_notification(f.process, 0, USR1, VALUE, true);
+    f.sched.register_posix_timer(
+        f.process,
+        SignalTarget::Process(f.leader),
+        0,
+        None,
+        LogicalTime::from_nanos(0),
+        Signal::SIGUSR1.into(),
+    );
+    let info = f
+        .sched
+        .timer_delivery_info(f.leader, USR1, LogicalTime::from_nanos(55))
+        .expect("a timer entry's siginfo");
+    assert_eq!(
+        timer_fields(&info),
+        (SI_TIMER, 0, 4, VALUE),
+        "the stop's si_value, and periods 20 to 50 missed on the stop's grid"
+    );
+}
+
 /// An entry whose timer was set again since it was queued is skipped at the
 /// stop, and its pop sends what is behind it.
 #[test]
@@ -1036,4 +1072,44 @@ fn exec_resends_to_the_survivors_tid_after_a_non_leader_exec() {
     assert_eq!(f.sent(), vec![(f.leader, USR1, None, Some(f.process))]);
     assert!(f.entries(worker).is_empty());
     assert_eq!(f.entries(private(&f)).len(), 1);
+}
+
+/// Under record and replay, a non-leader exec moves the caller's replay
+/// records to the leader's tid with its queue, and drops the records of the
+/// queues the exec destroyed, the former leader's among them; the exec's
+/// refusal then finds the caller's unproven copy (the Codex re-review of
+/// https://github.com/rrnewton/hermit/pull/4491, P1).
+#[test]
+fn a_non_leader_exec_carries_its_replay_records_to_the_leaders_tid() {
+    let mut f = family();
+    f.sched.recordreplay_modes = true;
+    let (worker, leader) = (f.sibling, f.leader);
+    let usr2 = libc::SIGUSR2;
+    for set in [
+        &mut f.sched.replayed_timer_copies,
+        &mut f.sched.replay_unproven_copies,
+    ] {
+        set.insert((QueueId::Thread(worker), USR1));
+        set.insert((QueueId::Thread(leader), usr2));
+    }
+    f.sched.transfer_replay_copies(worker, leader, &[leader]);
+    for set in [
+        &f.sched.replayed_timer_copies,
+        &f.sched.replay_unproven_copies,
+    ] {
+        assert_eq!(
+            set.iter().copied().collect::<Vec<_>>(),
+            vec![(QueueId::Thread(leader), USR1)],
+            "the worker's record moved; the destroyed leader queue's went"
+        );
+    }
+    f.queues(kernel_signal_bit(USR1), 0);
+    let refusal = f
+        .sched
+        .replay_exec_refusal(leader, f.process)
+        .expect("the moved unproven copy is refused");
+    assert!(
+        refusal.contains("signal 10 is pending in Thread"),
+        "{refusal}"
+    );
 }

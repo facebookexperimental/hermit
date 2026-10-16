@@ -364,6 +364,36 @@ impl Scheduler {
         self.replay_unproven_copies.extend(covered);
     }
 
+    /// Under record and replay, an exec by `caller` that survives as
+    /// `leader` destroyed every other thread of the group (`siblings`, the
+    /// former leader among them) with its own queue, and moved the caller's
+    /// queue to the leader's tid: the replay records move with it, so that
+    /// `replay_exec_refusal` finds them (the Codex re-review of
+    /// https://github.com/rrnewton/hermit/pull/4491, P1).
+    pub(crate) fn transfer_replay_copies(
+        &mut self,
+        caller: DetTid,
+        leader: DetTid,
+        siblings: &[DetTid],
+    ) {
+        let destroyed =
+            |queue: &QueueId| matches!(queue, QueueId::Thread(t) if siblings.contains(t));
+        let rekey = |(queue, signal): (QueueId, i32)| match queue {
+            QueueId::Thread(t) if t == caller => (QueueId::Thread(leader), signal),
+            other => (other, signal),
+        };
+        for set in [
+            &mut self.replayed_timer_copies,
+            &mut self.replay_unproven_copies,
+        ] {
+            *set = std::mem::take(set)
+                .into_iter()
+                .filter(|(queue, _)| !destroyed(queue))
+                .map(rekey)
+                .collect();
+        }
+    }
+
     /// Under record and replay, an exec of `process` whose survivor is
     /// `survivor`, with a signal pending that a timer copy may have been
     /// taken for unobserved: a replayed take dequeues nothing, so replay would

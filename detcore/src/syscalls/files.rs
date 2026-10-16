@@ -5170,8 +5170,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mask = crate::syscalls::signal::signalfd_mask(guest.pid().as_raw(), call.fd());
         let mut done = 0usize;
         // A read whose records were all dropped (stale timer entries) frees
-        // its slot; each drop pops an entry, so this bounds the extra reads.
-        let mut drops_left = call.len() / RECORD + 64;
+        // its slot. Each such read dequeued a physical record and popped its
+        // entry, and the lists are finite, so the refills end without a cap
+        // (the Codex re-review of
+        // https://github.com/rrnewton/hermit/pull/4491, P2: 80 stale entries).
         while done + RECORD <= call.len() {
             if done > 0 {
                 let pending =
@@ -5194,8 +5196,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // Linux skips a stale entry inside the dequeue and fills the
                 // slot with the next pending signal (the Claude review of
                 // https://github.com/rrnewton/hermit/pull/4491, P2-1).
-                Ok(_) if drops_left > 0 => drops_left -= 1,
-                Ok(_) => break,
+                Ok(_) => {}
                 Err(error) if done == 0 => return Err(error),
                 Err(_) => break,
             }
