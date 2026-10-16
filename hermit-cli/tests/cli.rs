@@ -26633,6 +26633,41 @@ fn a_sigkill_to_an_exited_leader_leaves_its_group_running() {
     ]);
 }
 
+/// A SIGKILL sent with rt_tgsigqueueinfo to a pausing child's only thread is
+/// reserved and retired at the kill turn, as tgkill's is, and the parent gets
+/// Linux's SIGCHLD siginfo. Before, the child was retired at its host-timed
+/// death, and on base a5b4b917 the run matched under `--verify-strict` in 7
+/// of 10 tries, so eight tries pass there about 6% of the time. A send the
+/// kernel refuses (EFAULT, EPERM) kills nothing, whether it names another
+/// process or a sibling thread of the sender's own; a reserved send to the
+/// sender's own process ended the run after 30 s (the follow-up to
+/// https://github.com/rrnewton/hermit/issues/4445; see
+/// `verify_sigkill_cross_process_modes`).
+#[test]
+fn a_sigqueue_sigkill_is_retired_at_the_kill_turn() {
+    verify_sigkill_cross_process_modes(&[
+        (
+            "parenttgsigqueue",
+            "rt_tgsigqueueinfo: 0\nchild killed by signal 9\nSIGCHLD: CLD_KILLED, status 9, from child: 1\n",
+            8,
+        ),
+        // Sends the kernel refuses kill nothing. To another process a refused
+        // send gives its reservation back; to the sender's own process none is
+        // taken, since it would take the Exit grant before the call runs
+        // (Codex review).
+        (
+            "crosstgsigqueue_refused",
+            "bad pointer: -1 EFAULT; SI_USER: -1 EPERM; child alive: 1\nchild killed by signal 9\n",
+            2,
+        ),
+        (
+            "selftgsigqueue_refused",
+            "bad pointer: -1 EFAULT; SI_USER: -1 EPERM; still running\n",
+            2,
+        ),
+    ]);
+}
+
 /// After a SIGKILL to an exited leader (by tgkill, a thread-scoped
 /// pidfd_send_signal or rt_tgsigqueueinfo), which kills nothing, a wait for
 /// that child, whose sibling pauses for ever, is a deadlock that Hermit

@@ -15,7 +15,10 @@
 // takes turns; in "pgself" A, leading a group that also holds its child A2,
 // sends kill(-pgid, SIGKILL) to its own group. main waits for A.
 // Modes where the sender is the victim's parent (main): "parentkill" kills a
-// pausing child and prints its SIGCHLD siginfo; "twice" sends SIGKILL twice,
+// pausing child and prints its SIGCHLD siginfo ("parenttgsigqueue" sends that
+// SIGKILL with rt_tgsigqueueinfo; "crosstgsigqueue_refused" and
+// "selftgsigqueue_refused" send two that the kernel refuses, to the child and
+// to a sibling thread of the sender's own process); "twice" sends SIGKILL twice,
 // and the second, to the dead and unreaped child, succeeds; "zombie" waits
 // for an exited child with WNOWAIT and then signals the zombie; "pipeeof"
 // kills a pipe's sole writer and reads to EOF; "cleartid" kills a CLONE_VM |
@@ -609,6 +612,114 @@ static int exited_leader_mode(enum thread_kill how, int then_wait) {
   return 0;
 }
 
+/* "crosstgsigqueue_refused": main sends SIGKILL with rt_tgsigqueueinfo to
+ * its pausing child twice, in ways the kernel refuses (a siginfo pointer into
+ * an unmapped page: EFAULT; si_code SI_USER from another process: EPERM).
+ * The child keeps running until main kills it with kill(2). */
+static int cross_tgsigqueue_refused_mode(void) {
+  pid_t child = pausing_child();
+  long page = sysconf(_SC_PAGESIZE);
+  void *gone = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (gone == MAP_FAILED || munmap(gone, page) != 0) {
+    return 1;
+  }
+  long efault = syscall(SYS_rt_tgsigqueueinfo, child, child, SIGKILL, gone);
+  int efault_errno = efault == 0 ? 0 : errno;
+  siginfo_t info;
+  memset(&info, 0, sizeof(info));
+  info.si_signo = SIGKILL;
+  info.si_code = SI_USER;
+  long eperm = syscall(SYS_rt_tgsigqueueinfo, child, child, SIGKILL, &info);
+  int eperm_errno = eperm == 0 ? 0 : errno;
+  struct timespec tick = {0, 10 * 1000 * 1000};
+  nanosleep(&tick, NULL);
+  int status = 0;
+  pid_t early = waitpid(child, &status, WNOHANG);
+  printf("bad pointer: %ld %s; SI_USER: %ld %s; child alive: %d\n", efault,
+         efault_errno == EFAULT ? "EFAULT" : strerror(efault_errno), eperm,
+         eperm_errno == EPERM ? "EPERM" : strerror(eperm_errno), early == 0);
+  if (early == 0) {
+    kill(child, SIGKILL);
+    if (waitpid(child, &status, 0) != child) {
+      return 1;
+    }
+  }
+  printf("child killed by signal %d\n", WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+  fflush(stdout);
+  return 0;
+}
+
+/* "parenttgsigqueue": like "parentkill", but the SIGKILL to the pausing
+ * child goes through rt_tgsigqueueinfo to its only thread. */
+static int parent_tgsigqueue_mode(void) {
+  if (catch_sigchld(0) != 0) {
+    return 1;
+  }
+  pid_t child = pausing_child();
+  long sent = kill_thread(child, BY_TGSIGQUEUE);
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    perror("waitpid");
+    return 1;
+  }
+  printf("rt_tgsigqueueinfo: %ld\n", sent);
+  printf("child killed by signal %d\n", WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+  print_notification(child);
+  fflush(stdout);
+  return 0;
+}
+
+static int sibling_tid_pipe[2];
+
+static void *report_tid_and_pause(void *arg) {
+  (void)arg;
+  pid_t tid = (pid_t)syscall(SYS_gettid);
+  if (write(sibling_tid_pipe[1], &tid, sizeof(tid)) != (ssize_t)sizeof(tid)) {
+    _exit(9);
+  }
+  for (;;) {
+    pause();
+  }
+  return NULL;
+}
+
+/* "selftgsigqueue_refused": main sends SIGKILL with rt_tgsigqueueinfo to a
+ * sibling thread of its own process twice, in ways the kernel refuses before
+ * sending: with a siginfo pointer into an unmapped page (EFAULT), and with
+ * si_code SI_USER, which only the target thread itself may use (EPERM). The
+ * process keeps running. */
+static int self_tgsigqueue_refused_mode(void) {
+  if (pipe(sibling_tid_pipe) != 0) {
+    return 1;
+  }
+  pthread_t sibling;
+  if (pthread_create(&sibling, NULL, report_tid_and_pause, NULL) != 0) {
+    return 1;
+  }
+  pid_t tid;
+  if (read(sibling_tid_pipe[0], &tid, sizeof(tid)) != (ssize_t)sizeof(tid)) {
+    return 1;
+  }
+  long page = sysconf(_SC_PAGESIZE);
+  void *gone = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (gone == MAP_FAILED || munmap(gone, page) != 0) {
+    return 1;
+  }
+  long efault = syscall(SYS_rt_tgsigqueueinfo, getpid(), tid, SIGKILL, gone);
+  int efault_errno = efault == 0 ? 0 : errno;
+  siginfo_t info;
+  memset(&info, 0, sizeof(info));
+  info.si_signo = SIGKILL;
+  info.si_code = SI_USER;
+  long eperm = syscall(SYS_rt_tgsigqueueinfo, getpid(), tid, SIGKILL, &info);
+  int eperm_errno = eperm == 0 ? 0 : errno;
+  printf("bad pointer: %ld %s; SI_USER: %ld %s; still running\n", efault,
+         efault_errno == EFAULT ? "EFAULT" : strerror(efault_errno), eperm,
+         eperm_errno == EPERM ? "EPERM" : strerror(eperm_errno));
+  fflush(stdout);
+  return 0;
+}
+
 static int intmin_mode(void) {
   int sent = kill(-2147483647 - 1, SIGKILL);
   int sent_errno = errno;
@@ -1109,6 +1220,15 @@ int main(int argc, char **argv) {
   }
   if (strcmp(mode, "exitedleader_tgsigqueue") == 0) {
     return exited_leader_mode(BY_TGSIGQUEUE, 0);
+  }
+  if (strcmp(mode, "crosstgsigqueue_refused") == 0) {
+    return cross_tgsigqueue_refused_mode();
+  }
+  if (strcmp(mode, "selftgsigqueue_refused") == 0) {
+    return self_tgsigqueue_refused_mode();
+  }
+  if (strcmp(mode, "parenttgsigqueue") == 0) {
+    return parent_tgsigqueue_mode();
   }
   if (strcmp(mode, "exitedleader_wait") == 0) {
     return exited_leader_mode(BY_TGKILL, 1);

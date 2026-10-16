@@ -3028,6 +3028,41 @@ impl<T: RecordOrReplay> Detcore<T> {
             && guest.config().sequentialize_threads
             && tid > 0
             && sigkill_names_an_exited_leader(guest, DetTid::from_raw(tid)).await;
+        // Any other SIGKILL to a thread of a valid pair in another process
+        // ends that thread's whole process, and is reserved and retired at
+        // this turn as `tgkill`'s is
+        // (https://github.com/rrnewton/hermit/issues/3994); before, its victims
+        // were retired at their host-timed deaths. A send the kernel then
+        // refuses (EFAULT, EPERM, E2BIG: its siginfo checks are subtle)
+        // releases the reservation, because `send_reserved_sigkill` commits a
+        // send that excludes the sender with its outcome. A send to the
+        // sender's own process is not reserved: it would take the sender's
+        // Exit grant before the call runs, and so must know beforehand that
+        // the kernel accepts the siginfo (Codex review); it keeps its
+        // host-timed retirement. Nor is a nested caller's send, whose tgid
+        // names its own namespace.
+        if call.sig() == libc::SIGKILL
+            && !nested
+            && !exited_leader
+            && guest.config().sequentialize_threads
+            && call.tgid() > 0
+            && tid > 0
+            && guest
+                .thread_state()
+                .detpid
+                .is_none_or(|own| own.as_raw() != call.tgid())
+            && registered_process_of(guest, DetTid::from_raw(tid)).await
+                == Some(DetPid::from_raw(call.tgid()))
+            && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(tid)).await
+        {
+            if reservation.includes_sender {
+                // Only when the sender's own process was not known above: give
+                // the reservation back and take the unreserved path.
+                commit_sigkill(guest, reservation.token, false).await;
+            } else {
+                return self.send_reserved_sigkill(guest, reservation, call).await;
+            }
+        }
         let value = self
             .send_guest_signal(
                 guest,

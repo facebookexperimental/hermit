@@ -3344,7 +3344,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_wait_after_a_sigkill_to_an_exited_leader_is_a_deadlock
     // (https://github.com/rrnewton/hermit/issues/4445): 450, listed.
     // And the nine PMU-free --pipe-wake-latency tests (their tenth, a PMU subject, runs in privileged-test.pmu_cli_cases) (https://github.com/rrnewton/hermit/issues/4380): 459, listed.
-    ("test.cli", 459),
+    // And +1 from ae5ca666: 460.
+    ("test.cli", 460),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3743,7 +3744,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two 4445 exited-leader SIGKILL tests
     // (https://github.com/rrnewton/hermit/issues/4445): 386, listed.
     // And the nine PMU-free --pipe-wake-latency tests (https://github.com/rrnewton/hermit/issues/4380): 395, listed.
-    ("test.cli_on_host", 395),
+    // And +1 from ae5ca666: 396.
+    ("test.cli_on_host", 396),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
