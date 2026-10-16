@@ -34609,21 +34609,43 @@ fn pipe_wake_run_without_pmu(
     )
 }
 
+/// Where the pipe-wake guest and its FIFOs are, inside the guest.
+const PIPE_WAKE_GUEST_DIR: &str = "/tmp/pipe-wake";
+
+/// The `hermit run` arguments for one pipe-wake run. The guest's initial stack
+/// is the same on every host and harness: its environment is Hermit's minimal
+/// one, and it runs from its own directory bound at [`PIPE_WAKE_GUEST_DIR`],
+/// which is also its directory argument, so neither the checkout path nor the
+/// test process's ID (both in the host directory) reaches its arguments or
+/// its `AT_EXECFN`. The PMU rows need that: their latency counts retired
+/// branches, and the guest's startup branches depend on its stack layout. On
+/// main the readied iteration moved at 42 of 128 environment sizes, repeating
+/// every 64 bytes (the review of the test lock for
+/// https://github.com/rrnewton/hermit/pull/4424).
 fn pipe_wake_args(
     mode: &str,
     latency: Option<&str>,
     extra: &[&str],
     guest_args: &[&str],
 ) -> Vec<String> {
-    let guest = fifo_peer_guest().to_str().unwrap();
     let dir = process_build_root("fifo-peer").join("wake").join(mode);
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
-    let mut args = vec!["run".to_owned(), "--strict".to_owned()];
+    fs::copy(fifo_peer_guest(), dir.join("fifo_peer")).expect("failed to copy the guest");
+    let mut args = vec![
+        "run".to_owned(),
+        "--strict".to_owned(),
+        "--base-env=minimal".to_owned(),
+        format!("--bind={}:{PIPE_WAKE_GUEST_DIR}", dir.display()),
+    ];
     args.extend(latency.map(|latency| format!("--pipe-wake-latency={latency}")));
     args.extend(extra.iter().map(|arg| (*arg).to_owned()));
-    args.extend(["--".to_owned(), guest.to_owned(), mode.to_owned()]);
-    args.push(dir.to_str().unwrap().to_owned());
+    args.extend([
+        "--".to_owned(),
+        format!("{PIPE_WAKE_GUEST_DIR}/fifo_peer"),
+        mode.to_owned(),
+        PIPE_WAKE_GUEST_DIR.to_owned(),
+    ]);
     args.extend(guest_args.iter().map(|arg| (*arg).to_owned()));
     args
 }
