@@ -1613,7 +1613,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the tracer thread's PID-namespace tests
     // (a_child_with_its_parents_pid_in_a_new_pid_namespace_has_its_own_tracer,
     // without_a_readable_pid_namespace_launches_stay_on_the_caller): 1130.
-    ("test.hermit_unit", 1130),
+    // And metadata::tests::record_version_rejects_streams_from_before_cleartid_wakes_are_admitted
+    // (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b): 1131.
+    ("test.hermit_unit", 1131),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2375,7 +2377,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +18 ITIMER_REAL metadata/coalescing controls: 1848, listed.
     // And scheduler::test::process_groups_and_sessions_follow_linux (B3a-4c): 1849.
     // And +1 from 699c6948: 1849.
-    ("test.detcore_unit", 1849),
+    // And scheduler::test::a_cleartid_joiner_is_admitted_in_dettid_order_with_pending_admissions
+    // and scheduler::test::unreported_exit_defers_clear_tid_wake_during_tentative_selection
+    // (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b): 1851, listed.
+    ("test.detcore_unit", 1851),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2858,7 +2863,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_sendfile_into_its_own_file_meets_the_file_size_limit and
     // record_sendfile_without_kcmp
     // (https://github.com/rrnewton/hermit/issues/4416): 217.
-    ("test.record_replay", 217),
+    // And record_replay_keeps_the_order_of_a_cleartid_join_wake_beside_an_admission
+    // (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b): 218.
+    ("test.record_replay", 218),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -4090,7 +4097,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +18 ITIMER_REAL metadata/coalescing controls: 1848, listed.
     // And the B3a-4c process-group test: 1849.
     // And +1 from 699c6948: 1849.
-    ("test.detcore_unit_on_host", 1849),
+    // And the two 4362 step-0b clear-TID admission tests: 1851.
+    ("test.detcore_unit_on_host", 1851),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4359,7 +4367,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the tracer thread's PID-namespace tests
     // (a_child_with_its_parents_pid_in_a_new_pid_namespace_has_its_own_tracer,
     // without_a_readable_pid_namespace_launches_stay_on_the_caller): 1130.
-    ("test.hermit_unit_on_host", 1130),
+    // And the 4362 step-0b record-version test: 1131.
+    ("test.hermit_unit_on_host", 1131),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

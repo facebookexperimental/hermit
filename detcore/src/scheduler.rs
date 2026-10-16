@@ -6790,7 +6790,20 @@ impl Scheduler {
         );
         // Wakes only one thread, as per:
         // https://man7.org/linux/man-pages/man2/set_tid_address.2.html
-        self.wake_futex_waiters(dettid, futid, 1, u32::MAX);
+        if self.backend_failed() {
+            // Failure closed the selection transaction permanently. Account
+            // cleanup now: the stopped scheduler will never drain admissions,
+            // and no waiter can receive another grant.
+            assert!(!self.run_queue.tentative_pop_in_progress());
+            self.wake_futex_waiters(dettid, futid, 1, u32::MAX);
+        } else {
+            // A thread's retirement can arrive while a tentative selection is
+            // open, where a direct run-queue push is illegal. Keep the same
+            // one-waiter choice, but admit it at the next drain, in DetTid
+            // order with the admissions already pending
+            // (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b).
+            self.wake_futex_waiters_after_exit(&[(dettid, futid)]);
+        }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -26081,6 +26094,99 @@ mod test {
         assert!(!scheduler.note_deregistration_accounted(dead));
         // Consuming twice is a no-op.
         assert!(!scheduler.consume_unreported_exit(dead));
+    }
+
+    /// A joiner woken by a thread's CLONE_CHILD_CLEARTID is admitted at the
+    /// next drain, in DetTid order with the other admissions of that drain,
+    /// whichever arrived first; it is not pushed at once. On the base code it
+    /// was pushed at the wake, so it ran ahead of a lower DetTid
+    /// (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b). The
+    /// joiner here has the higher DetTid: with a lower one, both orders agree
+    /// and the case could not tell them apart (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4453, F2).
+    #[test]
+    fn a_cleartid_joiner_is_admitted_in_dettid_order_with_pending_admissions() {
+        for wake_first in [false, true] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            let lower = DetTid::from_raw(5);
+            let dead = DetTid::from_raw(9);
+            let joiner = DetTid::from_raw(11);
+            let mm = MmId::initial(dead);
+            let address = 0x404100;
+            let futex = FutexID::private(mm, address);
+            for tid in [lower, dead, joiner] {
+                scheduler.thread_tree.add_child(tid, tid, true);
+                register_known_thread(&mut scheduler, tid);
+                scheduler.record_thread_mm(tid, mm);
+            }
+            scheduler.next_turns.get_mut(&dead).unwrap().child_tid_addr = address;
+            scheduler.sleep_futex_waiter(&joiner, futex, None, u32::MAX, None);
+            if wake_first {
+                scheduler.wake_futex_child_cleartid(futex, dead);
+                scheduler.admit_to_run_queue(lower, AdmitIntent::Fixed(AdmitSide::Back));
+            } else {
+                scheduler.admit_to_run_queue(lower, AdmitIntent::Fixed(AdmitSide::Back));
+                scheduler.wake_futex_child_cleartid(futex, dead);
+            }
+            assert!(
+                scheduler.admission_pending(joiner),
+                "wake_first={wake_first}"
+            );
+            scheduler.drain_pending_run_queue_admissions();
+
+            assert_eq!(
+                scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+                vec![lower, joiner],
+                "wake_first={wake_first}"
+            );
+        }
+    }
+
+    /// A thread retired while a tentative selection is open wakes its
+    /// clear-TID joiner by admission, which is legal there, instead of a run
+    /// queue push, which panics (2ee7190125's test).
+    #[test]
+    fn unreported_exit_defers_clear_tid_wake_during_tentative_selection() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let anchor = DetTid::from_raw(5);
+        let dead = DetTid::from_raw(9);
+        let waiters = [11, 12].map(DetTid::from_raw);
+        let mm = MmId::initial(dead);
+        let address = 0x404100;
+        let futex = FutexID::private(mm, address);
+        for process in [anchor, dead, waiters[0]] {
+            scheduler.thread_tree.add_child(process, process, true);
+        }
+        scheduler
+            .thread_tree
+            .add_child(waiters[0], waiters[1], false);
+        for tid in [anchor, dead, waiters[0], waiters[1]] {
+            register_known_thread(&mut scheduler, tid);
+            scheduler.record_thread_mm(tid, mm);
+        }
+        // A CLONE_VM process can leave a clear-TID waiter in a different,
+        // surviving thread group that shares its address space.
+        scheduler.next_turns.get_mut(&dead).unwrap().child_tid_addr = address;
+        scheduler.runqueue_push_back(anchor);
+        scheduler.runqueue_push_back(dead);
+        for waiter in waiters {
+            scheduler.sleep_futex_waiter(&waiter, futex, None, u32::MAX, None);
+        }
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(anchor));
+        assert!(scheduler.consume_unreported_exit(dead));
+        assert!(scheduler.run_queue.tentative_pop_in_progress());
+        assert!(scheduler.child_tid_was_cleared(futex, dead.as_raw()));
+        assert!(scheduler.admission_pending(waiters[0]));
+        assert!(!scheduler.admission_pending(waiters[1]));
+        assert!(!scheduler.is_parked_futex_waiter(waiters[0]));
+        assert!(scheduler.is_parked_futex_waiter(waiters[1]));
+        scheduler.run_queue.undo_tentative_pop();
+        scheduler.drain_pending_run_queue_removals();
+        scheduler.drain_pending_run_queue_admissions();
+        assert_eq!(
+            scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+            vec![anchor, waiters[0]]
+        );
     }
 
     #[test]

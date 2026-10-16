@@ -2588,6 +2588,69 @@ fn record_replay_serves_a_directory_seek_from_the_recording() {
     );
 }
 
+/// A clear-TID join wake that overlaps another admission records and replays
+/// to the same order. In each of 20 rounds the main thread waits for a forked
+/// child while a second thread joins a thread that exits, and each records in
+/// shared memory the order in which it resumed. The clear-TID wake is admitted
+/// at the next drain, in DetTid order with the other admissions
+/// (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b; Codex
+/// review of https://github.com/rrnewton/hermit/pull/4453, P2). This is a
+/// smoke test of recording and replaying that overlap, not a before/after
+/// bite: the same guest also records and replays on the base code. The
+/// scheduler unit tests carry the bite.
+#[test]
+fn record_replay_keeps_the_order_of_a_cleartid_join_wake_beside_an_admission() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let compile = |name: &str, extra: &[&str]| {
+        let guest = build.path().join(name);
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .args(extra)
+            .arg(repository.join("tests/c/record_replay_cleartid_admission.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile tests/c/record_replay_cleartid_admission.c");
+        assert!(
+            output.status.success(),
+            "tests/c/record_replay_cleartid_admission.c ({name}) failed to compile:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        guest
+    };
+    // The guest is its own oracle: with every inner pthread_create failing,
+    // a round in which the joiner never ran must fail the guest, never print
+    // an order (Codex re-check of https://github.com/rrnewton/hermit/pull/4453
+    // at 840f3e85).
+    let failing = compile(
+        "record_replay_cleartid_admission_fail_inner_create",
+        &["-DFAIL_INNER_CREATE", "-Wl,--wrap=pthread_create"],
+    );
+    let output = Command::new(&failing)
+        .output()
+        .expect("failed to run the forced-failure guest");
+    assert!(
+        !output.status.success()
+            && String::from_utf8_lossy(&output.stderr).contains("the joiner failed"),
+        "the guest must fail when the joiner cannot create its thread: {output:?}"
+    );
+    let guest = compile("record_replay_cleartid_admission", &[]);
+    let output = canonical_record_replay_command("clear-TID join beside an admission", &guest, &[]);
+    let order = output
+        .lines()
+        .find_map(|line| line.strip_prefix("cleartid admission order "))
+        .unwrap_or_else(|| panic!("the guest must print its order:\n{output}"));
+    assert!(
+        order.len() == 20 && order.chars().all(|c| c == 'M' || c == 'J'),
+        "the guest must print one M or J per round, not {order:?}:\n{output}"
+    );
+}
+
 /// A seek in a thread whose descriptor table is its own (CLONE_THREAD without
 /// CLONE_FILES), where descriptor 60 names a directory in one table and a
 /// regular file in the other, replays by the calling thread's file. Classified

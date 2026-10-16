@@ -629,7 +629,14 @@ impl RecordVersion {
 // instead of copying again (https://github.com/rrnewton/hermit/issues/4416).
 // An older recording holds sendfile's count alone, which a new replay cannot
 // read as its event.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x165);
+// 0x165 -> 0x166 (taken at land time, HIGHEST_SHIPPED + 1): a joiner woken by
+// a thread's CLONE_CHILD_CLEARTID is admitted at the next run-queue drain, in
+// DetTid order with the other admissions, where it was pushed at once
+// (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b). That moves
+// it behind a lower-DetTid admission already pending, which turn selection,
+// unrecorded, recomputes: an older recording could replay another order
+// (Codex review of https://github.com/rrnewton/hermit/pull/4453, P2).
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x166);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -654,7 +661,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x165);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x165;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x166;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1717,6 +1724,16 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_parent_death_signals_are_sent_by_detcore() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x161)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x166 was made while a clear-TID joiner was
+    /// pushed onto the run queue at once, ahead of pending admissions; it is
+    /// now admitted in DetTid order with them
+    /// (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b).
+    #[test]
+    fn record_version_rejects_streams_from_before_cleartid_wakes_are_admitted() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x165)));
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 
