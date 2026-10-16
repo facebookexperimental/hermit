@@ -47,7 +47,6 @@ use detcore_model::network_engine::NetworkRequest;
 use detcore_model::network_trace::NetworkTraceMode;
 use detcore_model::network_trace::NetworkTraceV2;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
-use detcore_model::summary::PreemptionSummary;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
 pub(crate) use exec_identity::reconnect_exec;
@@ -1763,11 +1762,6 @@ impl GlobalState {
             sched.generate_partial_run_summary_for_log(self.cfg.record_preemptions_to.as_ref())?
         };
         // Second, we fill in the rest based on global state.
-        // Record what Detcore actually used after launch-time default resolution,
-        // including disabled preemption. This is report metadata, not INFO guest behavior.
-        summary.preemption = Some(PreemptionSummary {
-            max_timeslice_ns: self.cfg.max_timeslice.map(|maximum| maximum.get()),
-        });
         //
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the
@@ -8515,35 +8509,6 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), recorded);
         assert_eq!(summary.to_string(), full);
         assert_eq!(serde_json::to_vec(&summary).unwrap(), json);
-    }
-
-    #[test]
-    fn run_summary_records_the_effective_shared_preemption_configuration() {
-        for (config, expected) in [
-            (Config::default(), Some(200_000_000)),
-            (
-                Config {
-                    max_timeslice: None,
-                    ..Config::default()
-                },
-                None,
-            ),
-            (
-                Config {
-                    max_timeslice: std::num::NonZeroU64::new(12_340),
-                    ..Config::default()
-                },
-                Some(12_340),
-            ),
-        ] {
-            let summary = GlobalState::for_tests(&config).into_run_summary().unwrap();
-            assert_eq!(
-                summary.preemption,
-                Some(super::PreemptionSummary {
-                    max_timeslice_ns: expected,
-                })
-            );
-        }
     }
 
     #[test]

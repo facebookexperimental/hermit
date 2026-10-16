@@ -19,6 +19,7 @@ use anyhow::Context;
 use anyhow::bail;
 use clap::CommandFactory;
 use clap::FromArgMatches;
+use clap::Parser;
 use clap::parser::ValueSource;
 use colored::Colorize;
 use detcore::preemptions::PreemptionReader;
@@ -398,44 +399,40 @@ impl RunData {
         for arg in &aopts.run_args {
             run_cmd.push(arg.to_string());
         }
-        let matches = RunOpts::command()
-            .try_get_matches_from(run_cmd.iter())
-            .unwrap_or_else(|error| {
-                if crate::misplaced_backend_argument(&error).is_some() {
-                    // `--backend` is global. Point at the spelling that selects the
-                    // trials' backend instead of letting clap suggest the unrelated
-                    // `--backend-engagement-json`. clap reports only the flag name,
-                    // so read the value from the run arguments themselves.
-                    // The first `--backend` is the one clap refused; later tokens may
-                    // be the guest's own arguments.
-                    let value = run_cmd
-                        .iter()
-                        .enumerate()
-                        .find_map(|(index, arg)| {
-                            if arg == "--backend" {
-                                Some(run_cmd.get(index + 1).map(String::as_str).unwrap_or(""))
-                            } else {
-                                arg.strip_prefix("--backend=")
-                            }
-                        })
-                        .filter(|value| !value.is_empty() && !value.starts_with('-'))
-                        .unwrap_or("<BACKEND>");
-                    clap::Error::raw(
-                        clap::error::ErrorKind::UnknownArgument,
-                        format!(
-                            "`--backend` is not a `run` option, so it cannot be passed through \
+        let mut runopts = RunOpts::try_parse_from(run_cmd.iter()).unwrap_or_else(|error| {
+            if crate::misplaced_backend_argument(&error).is_some() {
+                // `--backend` is global. Point at the spelling that selects the
+                // trials' backend instead of letting clap suggest the unrelated
+                // `--backend-engagement-json`. clap reports only the flag name,
+                // so read the value from the run arguments themselves.
+                // The first `--backend` is the one clap refused; later tokens may
+                // be the guest's own arguments.
+                let value = run_cmd
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, arg)| {
+                        if arg == "--backend" {
+                            Some(run_cmd.get(index + 1).map(String::as_str).unwrap_or(""))
+                        } else {
+                            arg.strip_prefix("--backend=")
+                        }
+                    })
+                    .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                    .unwrap_or("<BACKEND>");
+                clap::Error::raw(
+                    clap::error::ErrorKind::UnknownArgument,
+                    format!(
+                        "`--backend` is not a `run` option, so it cannot be passed through \
                          the run arguments of `hermit analyze` or `hermit bisect`. It is a \
                          global option: select the backend for every trial with `hermit \
                          --backend={value} analyze ...` or `hermit --backend={value} bisect \
                          ...`.\n"
-                        ),
-                    )
-                    .exit()
-                }
-                error.exit()
-            });
-        let mut runopts = RunOpts::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
-        runopts.capture_max_timeslice_source(&matches);
+                    ),
+                )
+                .exit()
+            }
+            error.exit()
+        });
         // Apply the global backend before `get_base_runopts` validates these
         // options, so backend-specific validation sees the backend the trials
         // will run on.
@@ -894,8 +891,6 @@ impl AnalyzeOpts {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
-
     use super::*;
 
     /// Round-2 review of https://github.com/rrnewton/hermit/pull/3686, finding
@@ -1610,44 +1605,6 @@ mod tests {
                 repro.contains(&format!(" --backend={flag} run ")),
                 "{flag}: reproducer does not select the backend: {repro}"
             );
-        }
-    }
-
-    #[test]
-    fn trial_preemption_keeps_the_explicit_maximum_request() {
-        for maximum in [
-            None,
-            Some("--max-timeslice=disabled"),
-            Some("--max-timeslice=200000000"),
-        ] {
-            let mut argv = vec!["hermit", "--backend=kvm", "analyze", "--"];
-            argv.extend(maximum);
-            argv.push("/bin/true");
-            let args = crate::Args::try_parse_from(argv).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
-                panic!("expected analyze")
-            };
-            options.apply_global(&args.global);
-            let workspace = tempfile::tempdir().unwrap();
-            options.tmp_dir = Some(workspace.path().to_path_buf());
-            let result = RunData::new_baseline(&options, "preemption".to_owned());
-            if maximum == Some("--max-timeslice=200000000") {
-                let error = result.err().expect("explicit maximum must refuse");
-                assert!(
-                    error
-                        .downcast_ref::<crate::container::PolicyRefusal>()
-                        .is_some()
-                );
-                assert!(
-                    format!("{error:#}")
-                        .contains("unsupported_preemption: --backend=kvm refuses --max-timeslice")
-                );
-            } else {
-                assert_eq!(
-                    result.unwrap().runopts.det_opts.det_config.max_timeslice,
-                    None
-                );
-            }
         }
     }
 

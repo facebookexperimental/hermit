@@ -47,7 +47,6 @@ pub mod xstate_probe;
 /// own stderr writer reads the same flag.
 pub use detcore::nonwaiting_write;
 pub mod physical_exit_watch;
-pub mod preemption_admission;
 pub mod proc_mount;
 mod ptrace_completion;
 
@@ -1122,9 +1121,15 @@ fn refuse_in_guest_liteinst_run(
     config: &DetConfig,
     backend: Backend,
 ) -> Result<(), Error> {
-    preemption_admission::refuse_unsupported_preemption(config, backend, false)?;
     let reason = if let Some(conflict) = in_guest_trap_site_patching_conflict(command, backend) {
         Some(conflict)
+    } else if config.max_timeslice.is_some() {
+        Some(
+            "it cannot deliver Detcore's preemption timer yet (the in-guest Tool host refuses \
+             set_timer with ENOSYS), so the run would fail at its first timeslice; pass \
+             --max-timeslice=disabled"
+                .to_owned(),
+        )
     } else if let Some(gap) = in_guest_liteinst_kernel_gap(&running_kernel_release()) {
         Some(gap)
     } else {
@@ -3780,11 +3785,6 @@ pub fn run_with_backend(
 /// and reasoned about as guest-visible. Threading a real-time deadline through
 /// it would put a nondeterministic quantity inside the structure whose entire
 /// job is to exclude them.
-///
-/// `config` is an effective configuration: a positive maximum is an explicit
-/// request and is refused if the backend cannot deliver preemption events.
-/// CLI defaults are resolved before this boundary; direct callers requesting
-/// no preemption must set `max_timeslice` to `None`.
 pub fn run_with_backend_timeout(
     command: Command,
     config: DetConfig,
@@ -3793,7 +3793,6 @@ pub fn run_with_backend_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<ExitStatus, Error> {
-    preemption_admission::refuse_unsupported_preemption(&config, backend, false)?;
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
         let command = tracer_thread::SendCommand::new(command);
@@ -4106,8 +4105,6 @@ async fn dispatch_backend(
     backend: Backend,
     control: Option<std::rc::Rc<ptrace_completion::Control>>,
 ) -> Result<ExitStatus, Error> {
-    // Library callers supply an effective configuration, not CLI defaults.
-    preemption_admission::refuse_unsupported_preemption(&config, backend, false)?;
     // Every launch path, ptrace's included, reaches the guest through here.
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
     if backend == Backend::Kvm {
@@ -4348,7 +4345,6 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<(Output, u64), Error> {
-    preemption_admission::refuse_unsupported_preemption(&config, backend, false)?;
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
         let command = tracer_thread::SendCommand::new(command);
@@ -4423,7 +4419,6 @@ async fn dispatch_output_backend(
     backend: Backend,
     control: Option<std::rc::Rc<ptrace_completion::Control>>,
 ) -> Result<Output, Error> {
-    preemption_admission::refuse_unsupported_preemption(&config, backend, false)?;
     // Every launch path, ptrace's included, reaches the guest through here.
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
     if backend == Backend::Kvm {
@@ -5643,14 +5638,11 @@ mod tests {
             assert!(conflict.contains(&format!("{name}={value},")), "{conflict}");
             assert!(conflict.contains("--backend=liteinst"), "{conflict}");
             assert!(conflict.contains("drop the variable"), "{conflict}");
-            // With preemption disabled, the in-guest refusal precedes the
-            // program and kernel checks and leaves the value untouched.
+            // The whole refusal path stops on it first, before the program,
+            // kernel or timeslice checks, and leaves the value untouched.
             let error = refuse_in_guest_liteinst_run(
                 &mut command,
-                &DetConfig {
-                    max_timeslice: None,
-                    ..DetConfig::default()
-                },
+                &DetConfig::default(),
                 Backend::InGuestTrap,
             )
             .unwrap_err();
@@ -6315,10 +6307,7 @@ mod tests {
         let program = "/hermit-missing-disabled-sabre-program";
         let error = super::dispatch_backend(
             super::Command::new(program),
-            super::DetConfig {
-                max_timeslice: None,
-                ..Default::default()
-            },
+            super::DetConfig::default(),
             false,
             &None,
             Backend::Sabre,
@@ -6333,10 +6322,7 @@ mod tests {
         );
         let error = super::dispatch_output_backend(
             super::Command::new(program),
-            super::DetConfig {
-                max_timeslice: None,
-                ..Default::default()
-            },
+            super::DetConfig::default(),
             false,
             &None,
             Backend::Sabre,
@@ -7605,7 +7591,6 @@ mod tests {
     fn dbt_public_dispatch_requires_sequentialized_threads() {
         let command = super::Command::new("/bin/true");
         let config = super::DetConfig {
-            max_timeslice: None,
             sequentialize_threads: false,
             ..Default::default()
         };
@@ -7631,8 +7616,7 @@ mod tests {
 
         let mut command = super::Command::new("/bin/echo");
         command.arg("hello");
-        let mut config =
-            super::DetConfig::parse_from(["hermit-dbt-test", "--max-timeslice=disabled"]);
+        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
         config.sequentialize_threads = true;
         config.validate();
         let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
@@ -7666,8 +7650,7 @@ mod tests {
         }
 
         let command = super::Command::new("/bin/true");
-        let mut config =
-            super::DetConfig::parse_from(["hermit-dbt-test", "--max-timeslice=disabled"]);
+        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
         config.sequentialize_threads = true;
         config.validate();
         let status = super::run_with_backend(command, config, true, &None, Backend::Dbt)
@@ -7686,8 +7669,7 @@ mod tests {
 
         let mut command = super::Command::new("/bin/echo");
         command.arg("hello");
-        let mut config =
-            super::DetConfig::parse_from(["hermit-kvm-test", "--max-timeslice=disabled"]);
+        let mut config = super::DetConfig::parse_from(["hermit-kvm-test"]);
         config.validate();
         let output = super::run_with_output_backend(command, config, false, &None, Backend::Kvm)
             .expect("run dynamic /bin/echo through KvmGuest<Detcore>");

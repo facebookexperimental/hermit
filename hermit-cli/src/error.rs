@@ -187,9 +187,6 @@ fn classify_unwrapped(error: &Error) -> FailureKind {
         || error
             .chain()
             .any(|cause| cause.is::<crate::cpu_profile_admission::CpuProfileRefusal>())
-        || error
-            .chain()
-            .any(|cause| cause.is::<crate::preemption_admission::UnsupportedPreemption>())
     {
         FailureKind::PolicyRefusal
     } else if error.downcast_ref::<crate::GuestTimedOut>().is_some() {
@@ -247,21 +244,6 @@ impl From<SerializableError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn unsupported_preemption_keeps_its_policy_class_across_the_container_boundary() {
-        let refusal = crate::preemption_admission::refuse_unsupported_preemption(
-            &detcore::Config::default(),
-            crate::Backend::Dbt,
-            false,
-        )
-        .unwrap_err();
-        let serialized = SerializableError::from(Error::new(refusal).context("launch refused"));
-        assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
-        assert!(serialized.context.iter().any(|message| {
-            message.contains("unsupported_preemption") && message.contains("--backend=dbt")
-        }));
-    }
 
     #[test]
     fn into_serializable_error() {

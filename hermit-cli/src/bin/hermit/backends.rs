@@ -1067,14 +1067,6 @@ impl DbtInvocation {
             .map(|capture| finish_single_run_dbt_stats(capture, summary, engagement_json))
             .transpose()?
             .flatten();
-        if summary {
-            eprintln!(
-                "{}",
-                detcore_model::summary::PreemptionSummary {
-                    max_timeslice_ns: self.config.max_timeslice.map(|maximum| maximum.get()),
-                }
-            );
-        }
         Ok(fail_on_dbt_backend_failure(status, stats.as_ref()))
     }
 

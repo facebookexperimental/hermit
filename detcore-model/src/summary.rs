@@ -98,23 +98,6 @@ impl TimesliceStats {
     }
 }
 
-/// Effective preemption configuration used by a run, after launch resolution.
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-pub struct PreemptionSummary {
-    /// Maximum timeslice in virtual nanoseconds, or `None` when disabled.
-    /// This is configuration, not a measurement of delivered timer events.
-    pub max_timeslice_ns: Option<u64>,
-}
-
-impl fmt::Display for PreemptionSummary {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.max_timeslice_ns {
-            Some(maximum) => write!(f, "Effective maximum timeslice: {maximum} virtual ns"),
-            None => write!(f, "Effective maximum timeslice: disabled"),
-        }
-    }
-}
-
 /// Statistics that summarize a hermit run.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct RunSummary {
@@ -162,14 +145,6 @@ pub struct RunSummary {
     /// output.
     pub per_thread_timeslice: Vec<(DetTid, TimesliceStats)>,
 
-    /// Effective preemption configuration from the run's shared Detcore config.
-    /// Absent for older summaries or producers that did not record it; a present
-    /// object with a null maximum explicitly records disabled preemption.
-    /// Shown in the full report, but not the INFO guest-behavior view used by
-    /// `--verify`, since backend capabilities can resolve CLI defaults differently.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preemption: Option<PreemptionSummary>,
-
     /// How the backend dispatched guest syscalls: through signals, patched
     /// direct calls, or ptrace stops. The record carries its own schema
     /// version. Absent when the run did not collect it or the backend has no
@@ -179,7 +154,7 @@ pub struct RunSummary {
     pub dispatch_stats: Option<DispatchStats>,
 }
 
-/// The full human-readable report, including recorded launch configuration.
+/// A human-readable, multi-line summary. Serialized report fields are unchanged.
 impl fmt::Display for RunSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.fmt_summary(f, true, self.reprio_descrip.as_deref())
@@ -187,8 +162,7 @@ impl fmt::Display for RunSummary {
 }
 
 /// INFO view built with the producer's preemption description, before its host
-/// destination is appended. Launch configuration is separate report metadata;
-/// this view preserves the guest-behavior fields compared by `--verify`.
+/// destination is appended. It does not alter the full report or serialized fields.
 pub struct RunSummaryInfo<'a> {
     summary: &'a RunSummary,
     reprio_description: Option<&'a str>,
@@ -211,7 +185,7 @@ impl RunSummary {
     fn fmt_summary(
         &self,
         f: &mut fmt::Formatter<'_>,
-        include_report_metadata: bool,
+        include_replay_bookkeeping: bool,
         reprio_description: Option<&str>,
     ) -> fmt::Result {
         let RunSummary {
@@ -230,7 +204,6 @@ impl RunSummary {
             threads_descrip,
             timeslice_stats,
             per_thread_timeslice,
-            preemption,
             dispatch_stats: _,
         } = self;
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;
@@ -242,7 +215,7 @@ impl RunSummary {
         if let Some(syscalls) = syscalls {
             writeln!(f, "Guest threads completed {syscalls} syscalls.")?;
         }
-        if include_report_metadata {
+        if include_replay_bookkeeping {
             writeln!(
                 f,
                 "Internally, the hermit scheduler ran {} turns, recorded {} events, replayed {} events ({} desynced)",
@@ -254,10 +227,6 @@ impl RunSummary {
                 "Internally, the hermit scheduler ran {} turns, recorded {} events ({} desynced)",
                 sched_turns, schedevent_recorded, schedevent_desynced,
             )?;
-        }
-
-        if include_report_metadata && let Some(preemption) = preemption {
-            writeln!(f, "{preemption}")?;
         }
 
         if let Some(txt) = desync_descrip {
@@ -331,7 +300,6 @@ Timeslice stats: min=199999995ns max=200000000ns mean=199999998ns count=4
 #[cfg(test)]
 mod tests {
     use super::PathEvidence;
-    use super::PreemptionSummary;
     use super::RunSummary;
     use super::TimesliceStats;
 
@@ -433,71 +401,5 @@ mod tests {
         assert_eq!(value["syscalls"], 0);
         let parsed: RunSummary = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.syscalls, Some(0));
-    }
-
-    #[test]
-    fn older_summary_json_keeps_preemption_configuration_unknown() {
-        let value = serde_json::to_value(RunSummary::default()).unwrap();
-        assert!(value.get("preemption").is_none());
-        let parsed: RunSummary = serde_json::from_value(value).unwrap();
-        assert_eq!(parsed.preemption, None);
-
-        let mut value = serde_json::to_value(&parsed).unwrap();
-        value["preemption"] = serde_json::Value::Null;
-        let parsed: RunSummary = serde_json::from_value(value).unwrap();
-        assert_eq!(parsed.preemption, None);
-    }
-
-    #[test]
-    fn summary_json_distinguishes_disabled_and_positive_preemption() {
-        for (max_timeslice_ns, expected) in [
-            (None, serde_json::json!({ "max_timeslice_ns": null })),
-            (
-                Some(200_000_000),
-                serde_json::json!({ "max_timeslice_ns": 200_000_000 }),
-            ),
-            (
-                Some(12_340),
-                serde_json::json!({ "max_timeslice_ns": 12_340 }),
-            ),
-        ] {
-            let summary = RunSummary {
-                preemption: Some(PreemptionSummary { max_timeslice_ns }),
-                ..Default::default()
-            };
-            let value = serde_json::to_value(&summary).unwrap();
-            assert_eq!(value["preemption"], expected);
-            let parsed: RunSummary = serde_json::from_value(value).unwrap();
-            assert_eq!(parsed.preemption, summary.preemption);
-        }
-    }
-
-    #[test]
-    fn full_summary_shows_effective_preemption_without_changing_guest_info() {
-        let baseline = RunSummary {
-            syscalls: Some(7),
-            ..Default::default()
-        };
-        let baseline_info = baseline.info(None).to_string();
-        assert!(baseline_info.contains("Guest threads completed 7 syscalls."));
-        assert!(
-            !baseline
-                .to_string()
-                .contains("Effective maximum timeslice:")
-        );
-        for (max_timeslice_ns, expected) in [
-            (None, "Effective maximum timeslice: disabled"),
-            (
-                Some(12_340),
-                "Effective maximum timeslice: 12340 virtual ns",
-            ),
-        ] {
-            let summary = RunSummary {
-                preemption: Some(PreemptionSummary { max_timeslice_ns }),
-                ..baseline.clone()
-            };
-            assert!(summary.to_string().contains(expected));
-            assert_eq!(summary.info(None).to_string(), baseline_info);
-        }
     }
 }
