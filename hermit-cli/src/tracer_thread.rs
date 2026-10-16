@@ -20,6 +20,13 @@
 //! teardown) stays on one tracer thread. The tracer thread exits with its
 //! caller; a retained operation then cannot recover, as one whose original
 //! thread exited could not before.
+//!
+//! Two consequences for callers. A tracing subscriber the caller installed for
+//! its own thread only (`tracing::subscriber::set_default`) does not see the
+//! session's events, which happen on the tracer thread; a global subscriber
+//! does. And each calling thread that has launched keeps one idle tracer
+//! thread, with 8 MiB of reserved stack, until the caller exits. A child forked
+//! from the caller gets a tracer thread of its own at its first launch.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -57,6 +64,10 @@ fn in_place() -> bool {
 struct TracerThread {
     jobs: mpsc::Sender<Job>,
     id: ThreadId,
+    // The process the tracer thread runs in. A child forked from the caller
+    // inherits this handle but not the thread, so a handle from another
+    // process is stale there.
+    pid: u32,
 }
 
 thread_local! {
@@ -80,7 +91,22 @@ fn spawn() -> std::io::Result<TracerThread> {
     Ok(TracerThread {
         jobs,
         id: handle.thread().id(),
+        pid: std::process::id(),
     })
+}
+
+/// The calling thread's tracer thread in this process, if it has one. A
+/// handle inherited across `fork` names a thread the child does not have: it
+/// is forgotten (dropping it could take a lock another thread of the parent
+/// held at the fork) and the caller gets a fresh tracer thread.
+fn current(tracer: &mut Option<TracerThread>) -> Option<&TracerThread> {
+    if tracer
+        .as_ref()
+        .is_some_and(|tracer| tracer.pid != std::process::id())
+    {
+        std::mem::forget(tracer.take());
+    }
+    tracer.as_ref()
 }
 
 /// Runs `job` on the calling thread's tracer thread and returns its result.
@@ -92,13 +118,19 @@ pub(crate) fn execute<R: Send + 'static>(
     if in_place() {
         return Ok(job());
     }
+    if TRACER.try_with(|_| ()).is_err() {
+        // During the calling thread's teardown its storage is gone: run in
+        // place, where the launch refuses as it always did
+        // (`StorageUnavailable`).
+        return Ok(job());
+    }
     let (send, receive) = mpsc::channel();
     let job: Job = Box::new(move || {
         let _ = send.send(panic::catch_unwind(AssertUnwindSafe(job)));
     });
-    TRACER.with(|tracer| {
+    let sent = TRACER.try_with(|tracer| {
         let mut tracer = tracer.borrow_mut();
-        if tracer.is_none() {
+        if current(&mut tracer).is_none() {
             *tracer = Some(spawn()?);
         }
         tracer
@@ -107,7 +139,8 @@ pub(crate) fn execute<R: Send + 'static>(
             .jobs
             .send(job)
             .map_err(|_| std::io::Error::other("Hermit's tracer thread has exited"))
-    })?;
+    });
+    sent.map_err(|_| std::io::Error::other("Hermit's tracer thread storage is gone"))??;
     match receive.recv() {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(payload)) => panic::resume_unwind(payload),
@@ -126,7 +159,12 @@ pub(crate) fn execute_on<R: Send + 'static>(
     if in_place() {
         return None;
     }
-    let mine = TRACER.with(|tracer| tracer.borrow().as_ref().map(|tracer| tracer.id));
+    // A tracer thread of another process (a handle a forked child inherited)
+    // owns nothing here: the caller's identity check refuses instead.
+    let mine = TRACER
+        .try_with(|tracer| current(&mut tracer.borrow_mut()).map(|tracer| tracer.id))
+        .ok()
+        .flatten();
     (mine == Some(owner)).then(|| execute(job))
 }
 

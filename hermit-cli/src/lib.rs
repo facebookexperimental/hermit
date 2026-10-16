@@ -3640,7 +3640,9 @@ async fn run_dbt(
 /// particular stack: a recording through the library returned on a 95 KiB
 /// caller thread. One tracer thread serves each calling thread for the
 /// caller's lifetime, so an operation kept at a [`HermitCleanupUnconfirmed`]
-/// checkpoint is resumed from the same caller. The session itself, in a debug
+/// checkpoint is resumed from the same caller. That thread stays, idle, until
+/// the caller exits, and a tracing subscriber set for the calling thread only
+/// does not see the session's events (a global subscriber does). The session itself, in a debug
 /// build, needs about 2 MiB, mostly Detcore's syscall handler, which at
 /// opt-level 0 keeps every syscall arm's temporaries in one frame
 /// (<https://github.com/rrnewton/hermit/issues/4389>).

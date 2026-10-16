@@ -196,6 +196,84 @@ fn a_tracer_thread_operation_resumes_from_its_caller() {
     });
 }
 
+/// Runs `child` in a forked child and returns its exit status: 0 when it
+/// returned true. `None` if it had not exited within two seconds, when it is
+/// killed; a stale tracer handle shows as such a hang.
+fn in_forked_child(child: impl FnOnce() -> bool) -> Option<i32> {
+    match unsafe { libc::fork() } {
+        0 => {
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(child)).unwrap_or(false);
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) }
+        }
+        pid => {
+            assert!(pid > 0, "fork failed");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut status = 0;
+            loop {
+                if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid {
+                    return libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status));
+                }
+                if Instant::now() >= deadline {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                        libc::waitpid(pid, &mut status, 0);
+                    }
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+/// A child forked after a launch inherits its parent's tracer handle but not
+/// the thread. Its own launch gets a tracer thread of its own instead of
+/// waiting on the parent's forever (Claude review of the tracer thread,
+/// https://github.com/rrnewton/hermit/issues/4389).
+#[test]
+fn a_forked_child_launches_on_a_tracer_thread_of_its_own() {
+    isolated(
+        "a_forked_child_launches_on_a_tracer_thread_of_its_own",
+        || {
+            assert_eq!(
+                run_on_tracer_thread(None, |_| async { Ok(1u32) }).unwrap(),
+                1
+            );
+            let child = in_forked_child(|| {
+                run_on_tracer_thread(None, |_| async { Ok(2u32) }).is_ok_and(|value| value == 2)
+            });
+            assert_eq!(child, Some(0));
+            assert_eq!(
+                run_on_tracer_thread(None, |_| async { Ok(3u32) }).unwrap(),
+                3
+            );
+        },
+    );
+}
+
+/// A forked child cannot resume its parent's retained operation: its resume is
+/// not sent to the parent's tracer thread, which it does not have, and the
+/// identity check refuses it, as before the tracer thread.
+#[test]
+fn a_forked_child_cannot_resume_its_parents_operation() {
+    isolated("a_forked_child_cannot_resume_its_parents_operation", || {
+        let diagnostic = pending(run_on_tracer_thread(None, |control| async move {
+            control.yield_checkpoint().await;
+            Ok(5u32)
+        }));
+        let other = diagnostic.clone();
+        let child = in_forked_child(move || {
+            other
+                .resume::<u32>()
+                .unwrap_err()
+                .downcast::<RecoveryRefusal>()
+                .is_ok_and(|e| matches!(e, RecoveryRefusal::WrongIdentity))
+        });
+        assert_eq!(child, Some(0));
+        assert_eq!(diagnostic.resume::<u32>().unwrap(), 5);
+    });
+}
+
 #[test]
 fn nested_runtime_refuses_before_factory() {
     isolated("nested_runtime_refuses_before_factory", || {

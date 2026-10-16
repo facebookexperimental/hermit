@@ -1601,7 +1601,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tracer_thread::tests::one_tracer_thread_serves_its_caller and
     // ptrace_completion::tests::a_tracer_thread_operation_resumes_from_its_caller
     // (https://github.com/rrnewton/hermit/issues/4389): 1123, listed.
-    ("test.hermit_unit", 1123),
+    // And ptrace_completion::tests::a_forked_child_launches_on_a_tracer_thread_of_its_own
+    // and a_forked_child_cannot_resume_its_parents_operation (Claude review of
+    // the tracer thread): 1125, listed.
+    ("test.hermit_unit", 1125),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4309,7 +4312,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the five --pipe-wake-latency tests (https://github.com/rrnewton/hermit/issues/4380): 1120, listed.
     // And +1 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 1121, listed.
     // And the two tracer-thread tests: 1123.
-    ("test.hermit_unit_on_host", 1123),
+    // And the two fork tests: 1125.
+    ("test.hermit_unit_on_host", 1125),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
