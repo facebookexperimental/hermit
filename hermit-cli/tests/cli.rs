@@ -14852,9 +14852,15 @@ fn a_desynced_schedule_replay_admits_a_non_root_process_child() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let schedule = directory.path().join("schedule.json");
     let record = format!("--record-preemptions-to={}", schedule.display());
+    // No timer preemption in either run: a preemption point that lands
+    // elsewhere under host load changes how many events the recording holds,
+    // and then the replay can use up the recording before it leaves it, so
+    // no thread registers unguided and this is not the case under test (it
+    // failed twice that way in a loaded full cli run, 2026-10-16).
     let recorded = hermit(&[
         "run",
         "--strict",
+        "--max-timeslice=disabled",
         &record,
         "--",
         "/bin/sh",
@@ -14869,6 +14875,7 @@ fn a_desynced_schedule_replay_admits_a_non_root_process_child() {
         "--log=info",
         "run",
         "--strict",
+        "--max-timeslice=disabled",
         &replay,
         "--",
         "/bin/sh",
