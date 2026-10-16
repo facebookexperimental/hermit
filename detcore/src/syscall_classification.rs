@@ -692,6 +692,13 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::fchown
         | Sysno::fchownat
         | Sysno::lchown => SyscallClassification::Determinized,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-b3a4c): Process groups and sessions are answered
+        // from Detcore's model on every backend, not by the backend's kernel or
+        // executor: they differed (DBT's launcher makes the guest a group
+        // leader, KVM's executor failed getsid; slice B3a-4c of
+        // https://github.com/rrnewton/hermit/issues/4266). Dispatched in lib.rs.
+        Sysno::getpgid | Sysno::getpgrp | Sysno::getsid => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -703,10 +710,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getcwd
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#663)
-        | Sysno::getpgid
-        | Sysno::getpgrp
         | Sysno::getppid
-        | Sysno::getsid
         | Sysno::mprotect
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-889): Review process-local robust-list
@@ -1460,6 +1464,8 @@ mod tests {
         "getgid",
         "getitimer",
         "getpeername",
+        "getpgid",
+        "getpgrp",
         "getpid",
         "getpmsg",
         "getpriority",
@@ -1468,6 +1474,7 @@ mod tests {
         "getresuid",
         "getrlimit",
         "getrusage",
+        "getsid",
         "getsockname",
         "getsockopt",
         "gettid",
@@ -1710,10 +1717,7 @@ mod tests {
         "get_thread_area",
         "getcwd",
         "getgroups",
-        "getpgid",
-        "getpgrp",
         "getppid",
-        "getsid",
         "getxattr",
         "lgetxattr",
         "link",
@@ -2070,9 +2074,6 @@ mod tests {
             Sysno::getgroups,
             Sysno::getppid,
             Sysno::getxattr,
-            Sysno::getpgid,
-            Sysno::getpgrp,
-            Sysno::getsid,
             Sysno::lgetxattr,
             Sysno::link,
             Sysno::linkat,

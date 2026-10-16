@@ -47,6 +47,16 @@
  * groups at all. If that is answered by building a model, these values are
  * expected to CHANGE and this cell is expected to be updated with them. A red
  * here after such a change is the cell doing its job, not a defect.
+ *
+ * UPDATE 2026-10-16 (slice B3a-4c of
+ * https://github.com/rrnewton/hermit/issues/4266): the model was built.
+ * getsid, getpgid and getpgrp are now answered from Detcore's model, and
+ * setpgid and setsid are decided from it by Linux's rules, the same on every
+ * backend (hermit-cli/tests/cli.rs
+ * process_groups_and_sessions_answer_as_linux_on_every_backend). The values
+ * above did not change: the model gives the root the group and session it
+ * inherited from outside the namespace (0), as the kernel did. The notes
+ * above about passthrough reads describe the state before that change.
  */
 
 /* getsid and getpgid need the POSIX feature-test macro; the harness compiles

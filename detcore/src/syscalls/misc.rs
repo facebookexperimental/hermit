@@ -778,15 +778,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         crate::random::getrandom(guest.thread_state_mut().thread_prng(), memory, dettid, call)
     }
 
-    /// setsid system call
+    /// setsid system call, answered as Linux answers it from Detcore's model
+    /// of the guest's sessions and process groups (`ThreadTree`), the same on
+    /// every backend (slice B3a-4c of
+    /// https://github.com/rrnewton/hermit/issues/4266). The call then goes to
+    /// the backend too, so that a kernel that keeps process groups (ptrace's)
+    /// stays in step; a backend that keeps none answers ENOSYS (KVM's
+    /// executor), and the model is the guest's answer. Any other disagreement
+    /// is refused by name, never answered with the backend's errno. A caller
+    /// in a nested PID namespace, whose ids are not the model's, is answered
+    /// by the kernel and mirrored, as before.
+    // TODO-HUMAN-REVIEW(PR-b3a4c): Review setsid from the model.
     pub async fn handle_setsid<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Setsid,
     ) -> Result<i64, Error> {
-        let res = guest.inject(call).await?;
         let process = guest.thread_state().detpid.expect("detpid unset");
-        let _ = create_session(guest, process).await;
+        let res = if guest.thread_state().nested_pid_namespace {
+            let res = guest.inject(call).await?;
+            let _ = create_session(guest, process).await;
+            res
+        } else {
+            crate::tool_global::setsid_decision(guest, process).await?;
+            self.mirror_group_change(guest, reverie::syscalls::Syscall::Setsid(call))
+                .await?;
+            let _ = create_session(guest, process).await;
+            i64::from(process.as_raw())
+        };
 
         // task is trying to become a daemon process. for more details
         // see: https://notes.shichao.io/apue/ch13/
@@ -796,16 +815,70 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(res)
     }
 
-    /// setpgid system call. The kernel remains authoritative for validation;
-    /// after success Detcore mirrors the guest-visible process-group change so
-    /// group-selecting waits do not consult host `/proc` state.
+    /// `getpgrp`, `getpgid` and `getsid`, answered from Detcore's model of the
+    /// guest's process groups and sessions (`ThreadTree`), which `setpgid` and
+    /// `setsid` keep, the same on every backend. The root process's group and
+    /// session come from outside the container's PID namespace and read as 0,
+    /// as on Linux (`scheduler::OUTSIDE_NAMESPACE`). A pid that names no
+    /// process or thread Detcore registered is ESRCH; a negative one too, as
+    /// Linux finds no task for it. A caller in a nested PID namespace, whose
+    /// ids are not the model's, is answered by the kernel as before.
+    // TODO-HUMAN-REVIEW(PR-b3a4c): Review the group and session model answers
+    // (slice B3a-4c of https://github.com/rrnewton/hermit/issues/4266).
+    pub async fn handle_group_or_session_getter<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: reverie::syscalls::Syscall,
+    ) -> Result<i64, Error> {
+        if guest.thread_state().nested_pid_namespace {
+            return Ok(guest.inject(call).await?);
+        }
+        let (sysno, args) = reverie::syscalls::SyscallInfo::into_parts(call);
+        let pid = if sysno == Sysno::getpgrp {
+            0
+        } else {
+            args.arg0 as libc::pid_t
+        };
+        let process = match pid {
+            0 => guest.thread_state().detpid.expect("detpid unset"),
+            pid if pid < 0 => return Err(Errno::ESRCH.into()),
+            pid => crate::tool_global::registered_process_of(
+                guest,
+                crate::types::DetTid::from_raw(pid),
+            )
+            .await
+            .ok_or(Errno::ESRCH)?,
+        };
+        let answer = if sysno == Sysno::getsid {
+            crate::tool_global::session(guest, process).await
+        } else {
+            crate::tool_global::process_group(guest, process).await
+        };
+        Ok(i64::from(answer.ok_or(Errno::ESRCH)?.as_raw()))
+    }
+
+    /// setpgid system call, answered as Linux answers it from Detcore's model
+    /// (`ThreadTree::setpgid_decision`), and mirrored to the backend, as
+    /// `handle_setsid`. A caller in a nested PID namespace is answered by the
+    /// kernel and the model mirrors it, as before: the kernel validates, and
+    /// group-selecting waits read the model rather than host `/proc` state.
+    // TODO-HUMAN-REVIEW(PR-b3a4c): Review setpgid from the model.
     pub async fn handle_setpgid<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Setpgid,
     ) -> Result<i64, Error> {
-        let res = guest.inject(call).await?;
         let caller = guest.thread_state().detpid.expect("detpid unset");
+        if !guest.thread_state().nested_pid_namespace {
+            let (process, group) =
+                crate::tool_global::setpgid_decision(guest, caller, call.pid(), call.pgid())
+                    .await?;
+            self.mirror_group_change(guest, reverie::syscalls::Syscall::Setpgid(call))
+                .await?;
+            let _ = set_process_group(guest, process, group).await;
+            return Ok(0);
+        }
+        let res = guest.inject(call).await?;
         // A nested caller's ids are its own PID namespace's; the kernel took
         // them so, and the model records the tasks they name
         // (https://github.com/rrnewton/hermit/issues/4155).
@@ -823,6 +896,33 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let _ = set_process_group(guest, process, group).await;
         Ok(res)
+    }
+
+    /// Give the backend a `setsid` or `setpgid` the model accepted, so that a
+    /// kernel that keeps process groups stays in step with the model. ENOSYS
+    /// means the backend keeps none, and the model's answer stands. Any other
+    /// failure means the backend's process groups disagree with the model's:
+    /// refused by name rather than answered with the backend's errno.
+    async fn mirror_group_change<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: reverie::syscalls::Syscall,
+    ) -> Result<(), Error> {
+        match guest.inject(call).await {
+            Ok(_) | Err(Errno::ENOSYS) => Ok(()),
+            Err(errno) => {
+                let sysno = reverie::syscalls::SyscallInfo::number(&call);
+                tracing::error!(
+                    "[detcore, dtid {}] {} was accepted by Detcore's process-group model but the backend answered {}: its process groups disagree with the model's (slice B3a-4c of https://github.com/rrnewton/hermit/issues/4266)",
+                    guest.thread_state().dettid,
+                    sysno,
+                    errno,
+                );
+                self.refuse_unserviceable_operation(guest, sysno, errno)
+                    .await
+                    .map(|_| ())
+            }
+        }
     }
 
     /// The task a positive id the calling thread passed names, after the

@@ -3832,6 +3832,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 Syscall::Setpgid(s) => self.handle_setpgid(guest, s).await,
                 Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Getpgrp(_) | Syscall::Getpgid(_) | Syscall::Getsid(_) => {
+                    self.handle_group_or_session_getter(guest, call).await
+                }
                 // Without virtual time the guest reads the host clock. Each of these
                 // must have a record/replay handler: a recording captures the value
                 // the guest observed, and replay returns it without reading the host.

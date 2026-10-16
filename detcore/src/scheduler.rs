@@ -2052,10 +2052,20 @@ struct ProcessWaitMetadata {
     parent_exec_generation: u64,
     process_group: DetPid,
     session: DetPid,
+    /// Whether the process has not exec'd since it was created (Linux's
+    /// `PF_FORKNOEXEC`): its parent may move it to another process group only
+    /// until it execs (`ThreadTree::setpgid_decision`).
+    forked_without_exec: bool,
 }
 
 use pretty::Doc;
 use pretty::RcDoc;
+
+/// The process group or session a process inherited from outside the
+/// container's PID namespace: the root process's, until it calls `setsid` or
+/// `setpgid`, and every descendant's that keeps it. Linux shows a process's
+/// group or session from outside the reader's namespace as 0.
+pub(crate) const OUTSIDE_NAMESPACE: DetPid = DetPid::from_raw(0);
 
 use self::replayer::DesyncStats;
 use self::replayer::Replayer;
@@ -2242,8 +2252,13 @@ impl ThreadTree {
                         wait_owner: child_dettid,
                         exit_signal: libc::SIGCHLD,
                         parent_exec_generation: 0,
-                        process_group: child_dettid,
-                        session: child_dettid,
+                        // The root process inherits its process group and
+                        // session from outside the container's PID namespace,
+                        // as a process started by `unshare --pid --fork` does,
+                        // and Linux shows such ids as 0 (`OUTSIDE_NAMESPACE`).
+                        process_group: OUTSIDE_NAMESPACE,
+                        session: OUTSIDE_NAMESPACE,
+                        forked_without_exec: true,
                     },
                 );
             } else {
@@ -2260,6 +2275,7 @@ impl ThreadTree {
                         parent_exec_generation: 0,
                         process_group: parent_process,
                         session: parent_process,
+                        forked_without_exec: true,
                     },
                 );
                 // CLONE_PARENT makes the child a sibling of its creator: Linux
@@ -2307,6 +2323,7 @@ impl ThreadTree {
                         parent_exec_generation,
                         process_group: parent_metadata.process_group,
                         session: parent_metadata.session,
+                        forked_without_exec: true,
                     },
                 );
             }
@@ -2396,6 +2413,7 @@ impl ThreadTree {
         }
         if let Some(metadata) = self.process_wait.get_mut(&process) {
             metadata.exit_signal = libc::SIGCHLD;
+            metadata.forked_without_exec = false;
         }
     }
 
@@ -2420,6 +2438,100 @@ impl ThreadTree {
         self.process_wait
             .get(&pid)
             .map(|metadata| metadata.process_group)
+    }
+
+    /// The session of the process `pid`, as [`Self::process_group`].
+    pub fn session(&self, pid: DetPid) -> Option<DetPid> {
+        self.process_wait.get(&pid).map(|metadata| metadata.session)
+    }
+
+    /// Whether a process group `group` exists: whether any process of the
+    /// model, exited and not yet reaped included, belongs to it.
+    fn process_group_exists(&self, group: DetPid) -> bool {
+        self.process_wait
+            .values()
+            .any(|metadata| metadata.process_group == group)
+    }
+
+    /// Linux's answer to `setsid()` by the process `process`
+    /// (`ksys_setsid`): EPERM where a process group with its id exists, its
+    /// own included, and otherwise success, which makes it the leader of a
+    /// new session and process group (`Self::create_session` records that).
+    pub fn setsid_decision(&self, process: DetPid) -> Result<(), Errno> {
+        if self.process_group_exists(process) {
+            return Err(Errno::EPERM);
+        }
+        if !self.process_wait.contains_key(&process) {
+            return Err(Errno::ESRCH);
+        }
+        Ok(())
+    }
+
+    /// Linux's answer to `setpgid(pid, pgid)` by the process `caller`
+    /// (`sys_setpgid`), and on success the process to move and the group to
+    /// move it to (`Self::set_process_group` records that):
+    /// - `pid` 0 is the caller, and `pgid` 0 is the process `pid` names;
+    ///   a negative `pgid` is EINVAL;
+    /// - `pid` must name a process (EINVAL for another thread, ESRCH for
+    ///   none), the caller or a child of it (ESRCH);
+    /// - a child must be in the caller's session (EPERM) and not have
+    ///   exec'd since it was created (EACCES);
+    /// - a session leader cannot move (EPERM);
+    /// - a group other than the process's own id must exist in the caller's
+    ///   session (EPERM).
+    pub fn setpgid_decision(
+        &self,
+        caller: DetPid,
+        pid: libc::pid_t,
+        pgid: libc::pid_t,
+    ) -> Result<(DetPid, DetPid), Errno> {
+        if pgid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let target = if pid == 0 {
+            caller
+        } else {
+            DetPid::from_raw(pid)
+        };
+        let group = if pgid == 0 {
+            target
+        } else {
+            DetPid::from_raw(pgid)
+        };
+        let Some(target_metadata) = self.process_wait.get(&target) else {
+            return Err(if self.thread_to_leader.contains_key(&target) {
+                Errno::EINVAL
+            } else {
+                Errno::ESRCH
+            });
+        };
+        let caller_session = self
+            .process_wait
+            .get(&caller)
+            .map(|metadata| metadata.session)
+            .ok_or(Errno::ESRCH)?;
+        if target != caller {
+            if target_metadata.wait_parent != Some(caller) {
+                return Err(Errno::ESRCH);
+            }
+            if target_metadata.session != caller_session {
+                return Err(Errno::EPERM);
+            }
+            if !target_metadata.forked_without_exec {
+                return Err(Errno::EACCES);
+            }
+        }
+        if target_metadata.session == target {
+            return Err(Errno::EPERM);
+        }
+        if group != target
+            && !self.process_wait.values().any(|metadata| {
+                metadata.process_group == group && metadata.session == caller_session
+            })
+        {
+            return Err(Errno::EPERM);
+        }
+        Ok((target, group))
     }
 
     pub fn set_process_group(&mut self, pid: DetPid, process_group: DetPid) -> bool {
@@ -15282,6 +15394,66 @@ mod test {
     fn exit_process(scheduler: &mut Scheduler, pid: DetPid) {
         scheduler.thread_tree.granted_exits.insert(pid);
         scheduler.logically_kill_thread(&pid, &pid, MmId::initial(pid));
+    }
+
+    /// Detcore's process groups and sessions answer as Linux's
+    /// (`setsid_decision`, `setpgid_decision`; slice B3a-4c of
+    /// https://github.com/rrnewton/hermit/issues/4266).
+    #[test]
+    fn process_groups_and_sessions_follow_linux() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let root = DetPid::from_raw(3);
+        let child = DetPid::from_raw(5);
+        let other = DetPid::from_raw(7);
+        let tree = &mut scheduler.thread_tree;
+        tree.add_child(root, root, true);
+        tree.add_child(root, child, true);
+        tree.add_child(root, other, true);
+        // The root's group and session come from outside the namespace.
+        assert_eq!(tree.process_group(root), Some(OUTSIDE_NAMESPACE));
+        assert_eq!(tree.session(child), Some(OUTSIDE_NAMESPACE));
+        // A child may lead its own group, and a sibling may join it.
+        assert_eq!(tree.setpgid_decision(child, 0, 0), Ok((child, child)));
+        tree.set_process_group(child, child);
+        assert_eq!(
+            tree.setpgid_decision(root, other.as_raw(), child.as_raw()),
+            Ok((other, child))
+        );
+        // No such group, a negative group, no such process.
+        assert_eq!(
+            tree.setpgid_decision(root, other.as_raw(), 99),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(tree.setpgid_decision(root, 0, -1), Err(Errno::EINVAL));
+        assert_eq!(tree.setpgid_decision(root, 42, 0), Err(Errno::ESRCH));
+        // Not the caller's child.
+        assert_eq!(
+            tree.setpgid_decision(child, other.as_raw(), 0),
+            Err(Errno::ESRCH)
+        );
+        // A group with the caller's id exists: setsid is EPERM.
+        assert_eq!(tree.setsid_decision(child), Err(Errno::EPERM));
+        // The root leads no group: setsid succeeds, and it then leads both.
+        assert_eq!(tree.setsid_decision(root), Ok(()));
+        tree.create_session(root);
+        assert_eq!(tree.process_group(root), Some(root));
+        assert_eq!(tree.session(root), Some(root));
+        // A session leader cannot move; a child in another session cannot be
+        // moved.
+        assert_eq!(tree.setpgid_decision(root, 0, 0), Err(Errno::EPERM));
+        assert_eq!(
+            tree.setpgid_decision(root, other.as_raw(), 0),
+            Err(Errno::EPERM)
+        );
+        // A child that exec'd cannot be moved by its parent.
+        let late = DetPid::from_raw(9);
+        tree.add_child(root, late, true);
+        tree.record_successful_exec(late);
+        assert_eq!(
+            tree.setpgid_decision(root, late.as_raw(), 0),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(tree.setpgid_decision(late, 0, 0), Ok((late, late)));
     }
 
     /// Where the backend registers the kernel's ids (DBT), the guest's and
@@ -28834,6 +29006,10 @@ mod test {
         let child = DetTid::from_raw(5);
         let child_worker = DetTid::from_raw(6);
         scheduler.thread_tree.add_child(parent, parent, true);
+        // The root inherits its process group from outside the namespace; this
+        // test's root leads its own, as after setpgid(0, 0), so its children's
+        // group is its pid.
+        scheduler.thread_tree.set_process_group(parent, parent);
         scheduler.thread_tree.add_child(parent, child, true);
         register_known_thread(&mut scheduler, child);
         let spec = ChildWaitSpec {

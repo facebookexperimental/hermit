@@ -326,6 +326,12 @@ fn add_with_mm(
 ) -> (DetTid, MmId, reverie::CallbackSignalSite) {
     let (pid, tid) = (DetTid::from_raw(pid), DetTid::from_raw(tid));
     s.thread_tree.add_child(pid, tid, pid == tid);
+    if pid == tid {
+        // The root inherits its process group from outside the namespace; this
+        // test's root leads its own, as after setpgid(0, 0), so its children's
+        // group is its pid.
+        s.thread_tree.set_process_group(pid, pid);
+    }
     s.priorities.insert(tid, DEFAULT_PRIORITY);
     s.next_turns.insert(
         tid,

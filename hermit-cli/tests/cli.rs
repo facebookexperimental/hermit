@@ -1584,6 +1584,77 @@ fn v3_run_or_refusal<T>(
     unreachable!()
 }
 
+static PROCESS_GROUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+fn process_groups_guest() -> &'static Path {
+    PROCESS_GROUPS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("process-groups");
+        fs::create_dir_all(&build_root).expect("failed to create process-groups directory");
+        let guest = build_root.join("process_groups");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/process_groups.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile process-groups guest");
+        assert!(
+            output.status.success(),
+            "process-groups guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// Process groups and sessions answer as Linux answers a process started in a
+/// new PID namespace with its parent's group and session outside it (under
+/// `unshare --pid --fork`): getpgrp and getsid read 0 there, a child leads or
+/// joins a group, setsid makes the caller lead a new session and group, and
+/// each of Linux's refusals (no such group, a negative group, no such process,
+/// a group or session leader, another session, a child that exec'd) is the
+/// same on every backend. Detcore answers them from its model (slice B3a-4c of
+/// https://github.com/rrnewton/hermit/issues/4266); before, DBT's runtime made
+/// the guest a group leader and refused setsid and setpgid with EPERM, and
+/// KVM's executor answered ENOSYS. The guest names each id by the process it
+/// equals, so how a backend numbers processes does not matter.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-b3a4c): regression coverage for process groups and
+// sessions from Detcore's model.
+#[test]
+fn process_groups_and_sessions_answer_as_linux_on_every_backend() {
+    let test = "process_groups_and_sessions_answer_as_linux_on_every_backend";
+    let guest = process_groups_guest();
+    let expected = "root pgrp=0 sid=0\n\
+                    setpgid(a, 0)=ok pgid(a)=a\n\
+                    setpgid(b, a)=ok pgid(b)=a\n\
+                    setpgid(b, no group)=EPERM\n\
+                    setpgid(0, -1)=EINVAL\n\
+                    getpgid(no process)=ESRCH\n\
+                    setsid=self ok pgrp=self sid=self\n\
+                    setsid as leader=EPERM\n\
+                    setpgid(0, 0) as session leader=EPERM\n\
+                    setpgid(b, b) in another session=EPERM\n\
+                    a pgrp=self sid=0\n\
+                    setpgid(child that exec'd)=EACCES\n";
+    let backends = procfs_backends(test);
+    for backend in &backends {
+        let mut args = vec!["--backend", backend, "run", "--strict"];
+        if *backend == "liteinst" || *backend == "in-guest-trap" {
+            args.push("--max-timeslice=disabled");
+        }
+        args.extend(["--", guest.to_str().expect("guest path is UTF-8")]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{backend}");
+    }
+    eprintln!("{test} compared {backends:?}");
+}
+
 fn virtual_kernel_files_guest() -> &'static Path {
     VIRTUAL_KERNEL_FILES_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4144,6 +4215,19 @@ const PROCFS_BACKENDS: [&str; 7] = [
 /// also need `--max-timeslice=disabled`, as the in-guest Tool host cannot
 /// deliver the preemption timer yet.
 const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
+    (
+        "process_groups_and_sessions_answer_as_linux_on_every_backend",
+        "dbt",
+        "the DBT runtime answers setsid and setpgid with EPERM itself, before Detcore, to keep \
+         its process-group containment (reverie-dbt native/client.c; slice B3a-4c of \
+         https://github.com/rrnewton/hermit/issues/4266)",
+    ),
+    (
+        "process_groups_and_sessions_answer_as_linux_on_every_backend",
+        "liteinst, in-guest-trap",
+        "a guest's execve fails, so its child never execs \
+         (https://github.com/rrnewton/hermit/issues/4476)",
+    ),
     (
         "detcore_fixes_the_virtual_kernel_files_on_liteinst",
         "liteinst",

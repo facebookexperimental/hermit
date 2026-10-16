@@ -3250,6 +3250,26 @@ impl GlobalState {
                     .await
                     .procfs_ids(to_kernel, &ids),
             ),
+            GlobalRequest::Session(process) => R::Session(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .thread_tree
+                    .session(process),
+            ),
+            GlobalRequest::SetsidDecision(process) => R::SetsidDecision(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .thread_tree
+                    .setsid_decision(process)
+                    .map_err(|errno| errno.into_raw()),
+            ),
+            GlobalRequest::SetpgidDecision(caller, pid, pgid) => R::SetpgidDecision(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .thread_tree
+                    .setpgid_decision(caller, pid, pgid)
+                    .map_err(|errno| errno.into_raw()),
+            ),
             GlobalRequest::LocalPid(caller, task) => R::LocalPid(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -5286,6 +5306,15 @@ pub enum GlobalRequest {
     /// the guest's for kernel numbers (`false`), as `/proc` spells them
     /// (`Scheduler::procfs_ids`). Appended last, for the same reason.
     ProcfsIds(bool, Vec<i32>),
+    /// The session of a process (`ThreadTree::session`). Appended last, for
+    /// the same reason.
+    Session(DetPid),
+    /// Linux's answer to `setsid()` by a process
+    /// (`ThreadTree::setsid_decision`), deciding nothing yet. Appended last.
+    SetsidDecision(DetPid),
+    /// Linux's answer to `setpgid(pid, pgid)` by a process
+    /// (`ThreadTree::setpgid_decision`), deciding nothing yet. Appended last.
+    SetpgidDecision(DetPid, i32, i32),
 }
 
 /// Responses from the global object
@@ -5454,6 +5483,13 @@ pub enum GlobalResponse {
     NamesARetiredExitedLeader(bool),
     /// Appended last, for the same reason.
     ProcfsIds(Vec<Option<i32>>),
+    /// Appended last, for the same reason.
+    Session(Option<DetPid>),
+    /// Appended last; the error is an errno.
+    SetsidDecision(Result<(), i32>),
+    /// The process to move and its new group; the error is an errno. Appended
+    /// last.
+    SetpgidDecision(Result<(DetPid, DetPid), i32>),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -7432,6 +7468,53 @@ where
     }
 }
 
+/// Linux's answer to `setsid()` by `process`, from Detcore's model
+/// (`ThreadTree::setsid_decision`).
+pub async fn setsid_decision<G, T>(guest: &mut G, process: DetPid) -> Result<(), reverie::Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::SetsidDecision(process)).await;
+    match response.1 {
+        GlobalResponse::SetsidDecision(decision) => decision.map_err(reverie::Errno::new),
+        _ => unreachable!(),
+    }
+}
+
+/// Linux's answer to `setpgid(pid, pgid)` by `caller`, from Detcore's model
+/// (`ThreadTree::setpgid_decision`): the process to move and its group.
+pub async fn setpgid_decision<G, T>(
+    guest: &mut G,
+    caller: DetPid,
+    pid: i32,
+    pgid: i32,
+) -> Result<(DetPid, DetPid), reverie::Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response =
+        send_and_update_time(guest, GlobalRequest::SetpgidDecision(caller, pid, pgid)).await;
+    match response.1 {
+        GlobalResponse::SetpgidDecision(decision) => decision.map_err(reverie::Errno::new),
+        _ => unreachable!(),
+    }
+}
+
+/// The session of `process` in Detcore's model (`ThreadTree::session`).
+pub async fn session<G, T>(guest: &mut G, process: DetPid) -> Option<DetPid>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::Session(process)).await;
+    match response.1 {
+        GlobalResponse::Session(session) => session,
+        _ => unreachable!(),
+    }
+}
+
 pub async fn set_process_group<G, T>(guest: &mut G, process: DetPid, group: DetPid) -> bool
 where
     G: Guest<Detcore<T>>,
@@ -9263,6 +9346,14 @@ mod tests {
             .unwrap()
             .thread_tree
             .add_child(dettid, dettid, true);
+        // The root inherits its process group from outside the namespace; this
+        // test's root leads its own, as after setpgid(0, 0).
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .set_process_group(detpid, detpid);
         (config, state, dettid, detpid)
     }
 

@@ -626,6 +626,10 @@ mod tests {
             exited.record_exited_child_process_cpu_time(child);
             let mut scheduler = Scheduler::new(&config);
             scheduler.thread_tree.add_child(parent, parent, true);
+            // The root inherits its process group from outside the namespace; this
+            // test's root leads its own, as after setpgid(0, 0), so its children's
+            // group is its pid.
+            scheduler.thread_tree.set_process_group(parent, parent);
             scheduler.thread_tree.add_child(parent, child, true);
             scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
             Self {
@@ -1139,6 +1143,10 @@ mod tests {
         let child = DetPid::from_raw(7);
         let sibling = DetPid::from_raw(9);
         scheduler.thread_tree.add_child(parent, parent, true);
+        // The root inherits its process group from outside the namespace; this
+        // test's root leads its own, as after setpgid(0, 0), so its children's
+        // group is its pid.
+        scheduler.thread_tree.set_process_group(parent, parent);
         scheduler.thread_tree.add_child(parent, peer, false);
         scheduler.thread_tree.add_child(parent, child, true);
         scheduler.thread_tree.add_child(peer, sibling, true);
