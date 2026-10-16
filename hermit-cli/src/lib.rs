@@ -3332,6 +3332,11 @@ mod dbt_detconfig_tests {
             config.backend.tool_shares_guest_descriptor_table = false;
             config.backend.rediscovers_descriptors_after_exec = false;
             config.backend.supports_guest_memory_compare_exchange = false;
+            // These three were `Config` fields, false unless the host set them
+            // for the backend, until they became stated capabilities.
+            config.backend.supports_blocked_wait_signal_interruption = false;
+            config.backend.delivers_preemption_timer_events = false;
+            config.backend.runs_guest_code_between_injections = false;
             assert_eq!(name, golden_name);
             let encoded = dbt_detconfig_json(&config).unwrap();
             assert_eq!(
@@ -3777,30 +3782,19 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // here: Detcore installs the backend's process signal control when the
     // backend offers it and threads are sequentialized, and reads the installed
     // control from then on.
-    // Only ptrace has been measured to report a thread's signal state in /proc
-    // (https://github.com/rrnewton/hermit/issues/3146). It hands a restart errno
-    // to the kernel's signal delivery at the syscall stop, which turns it into
-    // `EINTR` or a restart as Linux does. Every other backend keeps the previous
-    // blocking-wait behavior. That includes LiteInst, which now runs only
-    // in-guest: it has no ptrace stop at which the kernel turns a restart errno
-    // such as ERESTARTNOHAND into `EINTR` or a restart, so the value could
-    // reach guest code. `reverie::BackendCapabilities` has no field for this
-    // fact yet, and no combination of its fields selects ptrace alone (its
-    // `E9PATCH` constant is `PTRACE`), so it is set here from the backend's name.
-    config.backend_supports_blocked_wait_signal_interruption = backend == Backend::Ptrace;
-    // A chaos `sched_yield` may hand its turn to a thread that never makes a
-    // syscall only when that thread's slice can end
-    // (https://github.com/rrnewton/hermit/issues/4068).
-    config.backend_delivers_timer_events = backend_delivers_preemption_timer(backend);
-    // Where guest code can run inside a Tool handler, Detcore makes no pair of
-    // injected calls that needs a descriptor number unchanged between them
-    // (`Config::backend_runs_guest_code_between_injections`).
-    config.backend_runs_guest_code_between_injections =
-        backend_runs_guest_code_between_injections(backend);
+    // Whether blocked waits decide signal interruption from the kernel's
+    // signal state (https://github.com/rrnewton/hermit/issues/3146), whether a
+    // `--max-timeslice` really preempts (https://github.com/rrnewton/hermit/issues/4068)
+    // and whether guest code can run between two injected calls are the
+    // backend's own stated facts in `config.backend`
+    // (`supports_blocked_wait_signal_interruption`,
+    // `delivers_preemption_timer_events`, `runs_guest_code_between_injections`),
+    // not derived from its name here (audit step A9 of
+    // https://github.com/rrnewton/hermit/issues/4485).
     // Only those waits read it (`Config::guest_may_inherit_a_terminal`), so the
     // host is asked only for them.
     config.guest_may_inherit_a_terminal =
-        config.backend_supports_blocked_wait_signal_interruption && launcher_may_pass_a_terminal();
+        config.backend.supports_blocked_wait_signal_interruption && launcher_may_pass_a_terminal();
     config
 }
 
@@ -3858,6 +3852,9 @@ pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
             // the robust-list transition left undeferred, and this keeps that.
             // TODO: decide whether this direct path should inherit ptrace's value.
             capabilities.runs_exit_robust_list = false;
+            // The same direct path never interrupted blocked waits with
+            // signals: that was set only for `Backend::Ptrace` by name.
+            capabilities.supports_blocked_wait_signal_interruption = false;
             capabilities
         }
         // Site patching changes how a syscall reaches the Tool, not what the
@@ -3869,31 +3866,12 @@ pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
 }
 
 /// Whether `backend`'s runtime arms Reverie ptrace's PMU timer and delivers its
-/// events, so `--max-timeslice` really preempts a thread that makes no syscall.
-/// Only ptrace does (e9patch preprocessing runs on it). SaBRe and KVM accept a
-/// timer request and deliver nothing; DBT and in-guest LiteInst refuse it.
-/// `reverie::BackendCapabilities` has no field for this fact yet.
+/// events, so `--max-timeslice` really preempts a thread that makes no syscall:
+/// the backend's stated `delivers_preemption_timer_events`. Only ptrace does
+/// (e9patch preprocessing runs on it). SaBRe and KVM accept a timer request and
+/// deliver nothing; DBT and in-guest LiteInst refuse it.
 pub fn backend_delivers_preemption_timer(backend: Backend) -> bool {
-    match backend {
-        Backend::Ptrace | Backend::E9patch => true,
-        Backend::Liteinst | Backend::InGuestTrap | Backend::Dbt | Backend::Sabre | Backend::Kvm => {
-            false
-        }
-    }
-}
-
-/// Whether guest code can run while a Tool handler is between two of its
-/// injected system calls (`Config::backend_runs_guest_code_between_injections`):
-/// SaBRe and in-guest LiteInst (`liteinst`, `in-guest-trap`) run an accepted
-/// native guest signal handler inside the Tool's handler, and their loaders
-/// pass its system calls to Linux. ptrace and e9patch stop the guest, DBT
-/// delivers guest signals between Tool handlers, and KVM's executor runs the
-/// guest only when the Tool lets it.
-pub fn backend_runs_guest_code_between_injections(backend: Backend) -> bool {
-    match backend {
-        Backend::Sabre | Backend::Liteinst | Backend::InGuestTrap => true,
-        Backend::Ptrace | Backend::E9patch | Backend::Dbt | Backend::Kvm => false,
-    }
+    backend_capabilities(backend).delivers_preemption_timer_events
 }
 
 /// After an in-guest LiteInst run, waits (bounded) until the watcher has
@@ -6755,6 +6733,13 @@ mod tests {
             // Reverie reports it for DBT (ABI 8); Hermit withholds it until a
             // Detcore consumer lands (`detcore::hermit_consumed_capabilities`).
             "supports_guest_memory_compare_exchange": false,
+            // Each was a Config field Hermit set from the backend's name
+            // before it was a stated capability; the values are the ones that
+            // name test gave.
+            "supports_blocked_wait_signal_interruption": backend == Backend::Ptrace,
+            "delivers_preemption_timer_events":
+                matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "runs_guest_code_between_injections": sabre || in_guest_liteinst,
         })
     }
 
@@ -6903,6 +6888,10 @@ mod tests {
             // The historical fifteen-key form predates native atomic memory.
             // Preserve its exact bytes and its false capability on decoding.
             config.backend.supports_guest_memory_compare_exchange = false;
+            // Read back as false, as the `Config` fields they replace were.
+            config.backend.supports_blocked_wait_signal_interruption = false;
+            config.backend.delivers_preemption_timer_events = false;
+            config.backend.runs_guest_code_between_injections = false;
             assert_eq!(
                 detcore::to_legacy_backend_json(&config).unwrap(),
                 before,
@@ -7033,7 +7022,7 @@ mod tests {
         ] {
             let config = prepare_backend_config(super::DetConfig::default(), backend);
             assert_eq!(
-                config.backend_delivers_timer_events, delivers,
+                config.backend.delivers_preemption_timer_events, delivers,
                 "unexpected timer delivery for {backend:?}"
             );
         }
@@ -7054,7 +7043,7 @@ mod tests {
         ] {
             let config = prepare_backend_config(super::DetConfig::default(), backend);
             assert_eq!(
-                config.backend_runs_guest_code_between_injections, runs,
+                config.backend.runs_guest_code_between_injections, runs,
                 "unexpected guest code between injections for {backend:?}"
             );
         }
@@ -7073,7 +7062,7 @@ mod tests {
         ] {
             let config = prepare_backend_config(super::DetConfig::default(), backend);
             assert_eq!(
-                config.backend_supports_blocked_wait_signal_interruption, supports_interruption,
+                config.backend.supports_blocked_wait_signal_interruption, supports_interruption,
                 "unexpected blocked-wait signal support for {backend:?}"
             );
         }

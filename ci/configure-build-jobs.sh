@@ -1672,8 +1672,18 @@ fi
 # post-Tool override deletion and its regression. build.rs and vendor/dynamorio
 # are unchanged; the SDK budget carries. The added live test changes the
 # tracked reverie-dbt inventory from 955 to 956. No budget is increased.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 14bae9ad147c97b4d29f0cb8d49cdf772eb5bfce ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 14bae9ad147c97b4d29f0cb8d49cdf772eb5bfce (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# ARCHITECTURE A9/A10 SDK-BUDGET CARRY (2026-10-15): advance
+# 14bae9ad147c97b4d29f0cb8d49cdf772eb5bfce to 42d75dd6fdb656a174331244bea298d92e0e7b02.
+# The interval deletes the unwired reverie-elf-loader crate, moves the LiteInst
+# census from reverie-ptrace into reverie-liteinst, adds reverie-kvm's
+# provider-neutral memory traits (U1), one reserved-descriptor rule for
+# reverie-inguest, reverie-e9patch and SaBRe (A4 step 1), three
+# BackendCapabilities fields, the in-guest typed thread-creation refusal and
+# the M1 source-catalog qualification. No reverie-dbt source, build.rs, vendor SDK input
+# or native recipe changes; the reverie-dbt inventory stays 956 and the budget
+# carries.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 42d75dd6fdb656a174331244bea298d92e0e7b02 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 42d75dd6fdb656a174331244bea298d92e0e7b02 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

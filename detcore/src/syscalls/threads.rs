@@ -1160,7 +1160,7 @@ pub(crate) enum SignalQueue {
 /// if any, chosen by host thread-ID allocation, so its signal state must never
 /// decide a guest-visible outcome. Every read that exists today is gated off on
 /// such a backend by a capability (`models_signal_targets`,
-/// `backend_supports_blocked_wait_signal_interruption`,
+/// `supports_blocked_wait_signal_interruption`,
 /// `reports_child_exit_publication`, a nested PID namespace, or the guard in
 /// `restartable_internal_io_interrupting_signals`); this latch is the backstop
 /// for a future path that misses its gate.
@@ -1634,7 +1634,7 @@ enum SchedYieldRoute {
 ///   preemption point, so a preemption replay under `--chaos` makes the same
 ///   decision. A schedule replay keeps the weak yield it always had, and so
 ///   does a backend that does not deliver the preemption timer
-///   (`Config::backend_delivers_timer_events`): there a thread handed the
+///   (`BackendCapabilities::delivers_preemption_timer_events`): there a thread handed the
 ///   turn that never makes a syscall would never give it back.
 /// - `--sched-heuristic=random` also keeps the weak yield. It draws a uniform
 ///   pick among the queued threads at every turn, so a yielder cannot hold
@@ -1650,7 +1650,7 @@ fn sched_yield_route(cfg: &Config) -> SchedYieldRoute {
         SchedYieldRoute::ReplayStrongYield
     } else if cfg.chaos
         && cfg.replay_schedule_from.is_none()
-        && cfg.backend_delivers_timer_events
+        && cfg.backend.delivers_preemption_timer_events
         && cfg.sched_heuristic != SchedHeuristic::Random
     {
         SchedYieldRoute::ChaosYieldEpoch
@@ -1829,7 +1829,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if exit_signals != 0
             && guest
                 .config()
-                .backend_supports_blocked_wait_signal_interruption
+                .backend
+                .supports_blocked_wait_signal_interruption
         {
             record_host_timed_signals(guest, HostTimedSignalScope::Caller, exit_signals).await;
         }
@@ -2757,7 +2758,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let maybe_timeout_lt = self.futex_deadline(guest, call, deadline).await?;
                     let signal_interruption = guest
                         .config()
-                        .backend_supports_blocked_wait_signal_interruption;
+                        .backend
+                        .supports_blocked_wait_signal_interruption;
                     // Whether this wait was woken for a signal and is checking again.
                     let mut rewait = false;
                     // The signals the scheduler committed to this waiter at that wake
@@ -5229,7 +5231,8 @@ fn read_futex_word<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     // virtual) the user-access read above is the backend's whole answer.
     if !guest
         .config()
-        .backend_supports_blocked_wait_signal_interruption
+        .backend
+        .supports_blocked_wait_signal_interruption
         || !mapping_is_writable(guest.pid().as_raw(), address)
     {
         return Err(Error::Errno(Errno::EFAULT));
@@ -5294,7 +5297,8 @@ fn read_user_timespec<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     }
     if !guest
         .config()
-        .backend_supports_blocked_wait_signal_interruption
+        .backend
+        .supports_blocked_wait_signal_interruption
     {
         // No host `/proc` describes this guest (KVM's guest pid is virtual), so
         // the backend's own user-access read decides, all or nothing.
@@ -5507,59 +5511,71 @@ mod tests {
             // The ordinary ptrace run: timers delivered, no chaos.
             (
                 Config {
-                    backend_delivers_timer_events: true,
-                    backend_runs_guest_code_between_injections: false,
                     ..Config::default()
-                },
+                }
+                .with_backend(|backend| {
+                    backend.delivers_preemption_timer_events = true;
+                    backend.runs_guest_code_between_injections = false;
+                }),
                 SchedYieldRoute::EndTimeslice,
             ),
             (
                 Config {
                     chaos: true,
-                    backend_delivers_timer_events: true,
-                    backend_runs_guest_code_between_injections: false,
                     replay_schedule_from: path(),
                     ..Config::default()
-                },
+                }
+                .with_backend(|backend| {
+                    backend.delivers_preemption_timer_events = true;
+                    backend.runs_guest_code_between_injections = false;
+                }),
                 SchedYieldRoute::WeakYield,
             ),
             (
                 Config {
                     chaos: true,
-                    backend_delivers_timer_events: true,
-                    backend_runs_guest_code_between_injections: false,
                     ..Config::default()
-                },
+                }
+                .with_backend(|backend| {
+                    backend.delivers_preemption_timer_events = true;
+                    backend.runs_guest_code_between_injections = false;
+                }),
                 SchedYieldRoute::ChaosYieldEpoch,
             ),
             (
                 Config {
                     chaos: true,
-                    backend_delivers_timer_events: true,
-                    backend_runs_guest_code_between_injections: false,
                     sched_heuristic: SchedHeuristic::Random,
                     ..Config::default()
-                },
+                }
+                .with_backend(|backend| {
+                    backend.delivers_preemption_timer_events = true;
+                    backend.runs_guest_code_between_injections = false;
+                }),
                 SchedYieldRoute::WeakYield,
             ),
             (
                 Config {
                     chaos: true,
-                    backend_delivers_timer_events: true,
-                    backend_runs_guest_code_between_injections: false,
                     sched_heuristic: SchedHeuristic::StickyRandom,
                     ..Config::default()
-                },
+                }
+                .with_backend(|backend| {
+                    backend.delivers_preemption_timer_events = true;
+                    backend.runs_guest_code_between_injections = false;
+                }),
                 SchedYieldRoute::ChaosYieldEpoch,
             ),
             (
                 Config {
                     chaos: true,
-                    backend_delivers_timer_events: true,
-                    backend_runs_guest_code_between_injections: false,
                     sched_heuristic: SchedHeuristic::ConnectBind,
                     ..Config::default()
-                },
+                }
+                .with_backend(|backend| {
+                    backend.delivers_preemption_timer_events = true;
+                    backend.runs_guest_code_between_injections = false;
+                }),
                 SchedYieldRoute::ChaosYieldEpoch,
             ),
             (
@@ -5571,11 +5587,13 @@ mod tests {
                 },
                 SchedYieldRoute::ChaosReprioritize,
             ),
+            // A backend that delivers no preemption timer events.
             (
                 Config {
                     chaos: true,
                     ..Config::default()
-                },
+                }
+                .with_backend(|backend| backend.delivers_preemption_timer_events = false),
                 SchedYieldRoute::WeakYield,
             ),
             (
@@ -5589,11 +5607,13 @@ mod tests {
             (
                 Config {
                     chaos: true,
-                    backend_delivers_timer_events: true,
-                    backend_runs_guest_code_between_injections: false,
                     replay_preemptions_from: path(),
                     ..Config::default()
-                },
+                }
+                .with_backend(|backend| {
+                    backend.delivers_preemption_timer_events = true;
+                    backend.runs_guest_code_between_injections = false;
+                }),
                 SchedYieldRoute::ChaosYieldEpoch,
             ),
             (
@@ -5625,7 +5645,7 @@ mod tests {
                 route,
                 "chaos={} timer delivered={} heuristic={:?} max_timeslice={:?} preemptions={:?} schedule={:?}",
                 cfg.chaos,
-                cfg.backend_delivers_timer_events,
+                cfg.backend.delivers_preemption_timer_events,
                 cfg.sched_heuristic,
                 cfg.max_timeslice,
                 cfg.replay_preemptions_from,

@@ -32,8 +32,24 @@ use crate::time::NANOS_PER_SCHED;
 use crate::time::RcbTimeMultiplier;
 
 const fn default_backend_capabilities() -> BackendCapabilities {
-    BackendCapabilities::PTRACE
+    DEFAULT_BACKEND_CAPABILITIES
 }
+
+/// The capabilities a [`Config`] has before the host prepares it for the
+/// backend that runs it: ptrace's, the backend Detcore's own tests use, except
+/// that three facts stay off (`supports_blocked_wait_signal_interruption`,
+/// `delivers_preemption_timer_events`, `runs_guest_code_between_injections`).
+/// Until they became backend capabilities they were `Config` fields that only
+/// the host set, for the backend it had selected, and were false otherwise;
+/// a configuration nobody prepared keeps that behaviour. The host copies the
+/// running backend's own answer over all of these before a run.
+pub const DEFAULT_BACKEND_CAPABILITIES: BackendCapabilities = {
+    let mut backend = BackendCapabilities::PTRACE;
+    backend.supports_blocked_wait_signal_interruption = false;
+    backend.delivers_preemption_timer_events = false;
+    backend.runs_guest_code_between_injections = false;
+    backend
+};
 
 /// One mount row whose kernel-private root must be replaced before it becomes
 /// guest-visible.
@@ -167,58 +183,16 @@ pub struct Config {
     /// Detcore reads facts about the backend only from here, never from the
     /// backend's name, so a new backend is modelled correctly by reporting its
     /// capabilities. The host copies the running backend's answer into this
-    /// field before the run starts. The default describes a ptrace-hosted
-    /// guest, the backend Detcore's own tests use.
+    /// field before the run starts. The default,
+    /// [`DEFAULT_BACKEND_CAPABILITIES`], describes a ptrace-hosted guest, the
+    /// backend Detcore's own tests use, with the three host-set facts off.
     ///
     /// JSON that the guest can see is written by [`to_legacy_backend_json`],
     /// which carries this field as the separate keys used before it existed;
     /// [`from_legacy_backend_json`] reads them back.
     #[serde(default = "default_backend_capabilities")]
-    #[clap(skip = BackendCapabilities::PTRACE)]
+    #[clap(skip = DEFAULT_BACKEND_CAPABILITIES)]
     pub backend: BackendCapabilities,
-
-    /// The backend runs the guest as real host threads whose signal state the kernel
-    /// owns and reports in `/proc`, and resumes a Tool's restart errno through the
-    /// kernel's own signal-delivery and syscall-restart path. Blocking waits then
-    /// decide signal interruption from the guest's real mask and dispositions
-    /// (<https://github.com/rrnewton/hermit/issues/3146>). Off by default: only the
-    /// backends measured to honor that contract opt in.
-    ///
-    /// The host sets it from the backend's name, because
-    /// `reverie::BackendCapabilities` has no field for this fact yet. It has no
-    /// legacy key: [`to_legacy_backend_json`] leaves it out and
-    /// [`from_legacy_backend_json`] reads it back as false.
-    #[serde(default)]
-    #[clap(skip)]
-    pub backend_supports_blocked_wait_signal_interruption: bool,
-
-    /// The backend delivers the preemption timer `--max-timeslice` arms, so a
-    /// thread that never makes a syscall still ends its slice. Under chaos, a
-    /// `sched_yield` may then hand its turn to such a thread
-    /// (<https://github.com/rrnewton/hermit/issues/4068>); without delivery the
-    /// thread would never give it back. Off by default; the host sets it from
-    /// the backend's name, because `reverie::BackendCapabilities` has no field
-    /// for this fact yet. Like the field above it has no legacy key.
-    #[serde(default)]
-    #[clap(skip)]
-    pub backend_delivers_timer_events: bool,
-
-    /// Guest code can run while a Tool handler is between two of its injected
-    /// system calls, and reach Linux without Detcore: SaBRe and in-guest
-    /// LiteInst run an accepted native guest signal handler inside the Tool's
-    /// handler, and the loader passes that handler's system calls to Linux.
-    /// What a descriptor number names can then change between two injected
-    /// calls even with threads sequentialized, so Detcore makes no pair of
-    /// injected calls that needs it unchanged (the uptime a rendered procfs
-    /// file's first read carries on its placeholder). False where the backend
-    /// runs guest code only outside Tool handlers (ptrace, e9patch, DBT,
-    /// KVM). The host sets it from the backend's name, because
-    /// `reverie::BackendCapabilities` has no field for this fact yet. Like the
-    /// fields above it has no legacy key; it is false for DBT, the legacy
-    /// form's only reader.
-    #[serde(default)]
-    #[clap(skip)]
-    pub backend_runs_guest_code_between_injections: bool,
 
     /// The guest may start with a terminal: one of the launcher's standard
     /// descriptors is a terminal, the launcher has a controlling terminal that
@@ -229,7 +203,7 @@ pub struct Config {
     /// SIGTTIN and SIGTTOU for a background process group's reads and writes.
     /// The guest makes no traced call that arms them, so where blocked waits
     /// decide interruption from the kernel's signal state
-    /// ([`Config::backend_supports_blocked_wait_signal_interruption`]) the
+    /// (`BackendCapabilities::supports_blocked_wait_signal_interruption`) the
     /// scheduler records all eight as host-timed for every process before the
     /// guest's first instruction, and no gated wait ends for them
     /// (<https://github.com/rrnewton/hermit/issues/3146>).
@@ -1905,12 +1879,8 @@ impl Default for Config {
 /// computed from `config`. [`Config::record_host_inputs`], which the legacy
 /// form never had, is left out too, and reads back as false: this form serves
 /// only DBT, whose launcher collects no host inputs. So is
-/// [`Config::backend_supports_blocked_wait_signal_interruption`] and
-/// [`Config::backend_delivers_timer_events`] and
-/// [`Config::backend_runs_guest_code_between_injections`], which are false
-/// for DBT, and
-/// [`Config::guest_may_inherit_a_terminal`], which only
-/// that capability reads, and [`Config::in_guest_detlog_forward_policy`] and
+/// [`Config::guest_may_inherit_a_terminal`], which only DBT-false
+/// capability `supports_blocked_wait_signal_interruption` reads, and [`Config::in_guest_detlog_forward_policy`] and
 /// [`Config::in_guest_site_patching_off`], which are unset for DBT. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
 /// option has no effect. So are [`Config::futex_wake_yields`] and
@@ -2035,9 +2005,13 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// can express, which includes every backend's own constant except for
 /// capabilities added after the legacy form froze: those never enter it, as
 /// `record_host_inputs` does not, and read back as their default. There are
-/// three. `process_exits_complete_asynchronously` and
+/// six. `process_exits_complete_asynchronously` and
 /// `virtualizes_guest_sigalrm` are true only for in-guest LiteInst, which
 /// never travels through this DBT-only form.
+/// `supports_blocked_wait_signal_interruption`,
+/// `delivers_preemption_timer_events` and
+/// `runs_guest_code_between_injections` read back as false, the value DBT
+/// has and the value their earlier `Config` fields read back as.
 /// `supports_guest_memory_compare_exchange` is true for DBT, so a DBT
 /// configuration needs the versioned envelope of
 /// [`encode_backend_config_json`] to carry it.
@@ -2257,6 +2231,12 @@ impl LegacyBackendKeys {
         backend.supports_madv_dontneed = self.backend_supports_madvise || self.backend_is_kvm;
         backend.provides_process_signal_control = self.backend_is_kvm;
         backend.emulates_child_waits = self.backend_is_kvm;
+        // Added after the legacy form froze. Each was a `Config` field with no
+        // legacy key that read back as false, and each is false for DBT, the
+        // form's only reader, so a DBT configuration stays exact.
+        backend.supports_blocked_wait_signal_interruption = false;
+        backend.delivers_preemption_timer_events = false;
+        backend.runs_guest_code_between_injections = false;
         backend
     }
 }
@@ -2304,11 +2284,9 @@ mod legacy_backend_json {
     /// `record_host_inputs` has no legacy key and no legacy value: the legacy
     /// form serves only DBT, whose launcher collects no host inputs, so it is
     /// never written and always reads as false.
-    /// `backend_supports_blocked_wait_signal_interruption`,
-    /// `backend_delivers_timer_events` and
-    /// `backend_runs_guest_code_between_injections` are the same: they are
-    /// false for DBT, so they are never written and always read as false.
-    /// So is `guest_may_inherit_a_terminal`, which only that capability reads.
+    /// So is `guest_may_inherit_a_terminal`, which only the capability
+    /// `supports_blocked_wait_signal_interruption` reads; that is false for
+    /// DBT.
     /// `target_timeslice_syscalls_only` came after the legacy form froze; the
     /// legacy form never carried it, so it is never written and reads as false,
     /// the behaviour every legacy reader already has.
@@ -2325,12 +2303,9 @@ mod legacy_backend_json {
     /// written and reads as unknown.
     /// `cpu_profile` and `cpu_profile_host` came after it as well. DBT refuses
     /// the x86-64-v3 profile, so they are never written and read as v2.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 16] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 13] = [
         "backend",
         "record_host_inputs",
-        "backend_supports_blocked_wait_signal_interruption",
-        "backend_delivers_timer_events",
-        "backend_runs_guest_code_between_injections",
         "guest_may_inherit_a_terminal",
         "in_guest_detlog_forward_policy",
         "in_guest_site_patching_off",
@@ -2431,9 +2406,6 @@ mod legacy_backend_json {
     /// declaration order; at [`Config::backend`] this reads up to fifteen
     /// elements as the legacy backend keys, and neither the field it asks for
     /// there nor [`Config::record_host_inputs`],
-    /// [`Config::backend_supports_blocked_wait_signal_interruption`],
-    /// [`Config::backend_delivers_timer_events`],
-    /// [`Config::backend_runs_guest_code_between_injections`],
     /// [`Config::guest_may_inherit_a_terminal`],
     /// [`Config::in_guest_detlog_forward_policy`],
     /// [`Config::in_guest_site_patching_off`],
@@ -2472,9 +2444,6 @@ mod legacy_backend_json {
                 }
                 Some(
                     "record_host_inputs"
-                    | "backend_supports_blocked_wait_signal_interruption"
-                    | "backend_delivers_timer_events"
-                    | "backend_runs_guest_code_between_injections"
                     | "guest_may_inherit_a_terminal"
                     | "in_guest_site_patching_off"
                     | "target_timeslice_syscalls_only"
@@ -2748,9 +2717,6 @@ mod legacy_backend_json {
                 }
                 // No legacy key; see FIELDS_WITHOUT_A_LEGACY_KEY.
                 "record_host_inputs"
-                | "backend_supports_blocked_wait_signal_interruption"
-                | "backend_delivers_timer_events"
-                | "backend_runs_guest_code_between_injections"
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
@@ -2813,7 +2779,7 @@ mod tests {
     #[test]
     fn default_backend_capabilities_match_instrumented_backends() {
         let config = Config::default();
-        assert_eq!(config.backend, BackendCapabilities::PTRACE);
+        assert_eq!(config.backend, DEFAULT_BACKEND_CAPABILITIES);
         assert!(!config.backend.reports_physical_process_exits);
         assert!(config.backend.tracks_process_children);
         assert!(config.backend.runs_exit_robust_list);
@@ -2826,9 +2792,9 @@ mod tests {
             legacy_backend_keys(&config).contains(&("kvm_shared_dequeue_timers", false)),
             "the default configuration must not write a controlled-run legacy key"
         );
-        assert!(!config.backend_supports_blocked_wait_signal_interruption);
-        assert!(!config.backend_delivers_timer_events);
-        assert!(!config.backend_runs_guest_code_between_injections);
+        assert!(!config.backend.supports_blocked_wait_signal_interruption);
+        assert!(!config.backend.delivers_preemption_timer_events);
+        assert!(!config.backend.runs_guest_code_between_injections);
         assert!(!config.guest_may_inherit_a_terminal);
         assert!(config.in_guest_detlog_forward_policy.is_none());
         assert!(!config.in_guest_site_patching_off);
@@ -2841,7 +2807,7 @@ mod tests {
         assert!(fields.remove("backend").is_some());
         assert!(!fields.contains_key("shared_dequeue_timers"));
         let decoded: Config = serde_json::from_value(encoded).unwrap();
-        assert_eq!(decoded.backend, BackendCapabilities::PTRACE);
+        assert_eq!(decoded.backend, DEFAULT_BACKEND_CAPABILITIES);
     }
 
     /// `Config`'s own derived deserializer ignores a key it does not name, and
@@ -2895,6 +2861,9 @@ mod tests {
         backend.process_exits_complete_asynchronously = false;
         backend.virtualizes_guest_sigalrm = false;
         backend.supports_guest_memory_compare_exchange = false;
+        backend.supports_blocked_wait_signal_interruption = false;
+        backend.delivers_preemption_timer_events = false;
+        backend.runs_guest_code_between_injections = false;
         // The legacy discover_live_file_metadata bit couples four facts.
         backend.rediscovers_descriptors_after_exec = backend.tool_shares_guest_descriptor_table;
         backend.internal_pipe_turns_are_host_timed = backend.tool_shares_guest_descriptor_table;
@@ -2948,14 +2917,14 @@ mod tests {
     #[test]
     fn backend_config_json_preserves_every_backend_and_representable_bytes() {
         for (name, backend, needs_envelope) in [
-            ("PTRACE", BackendCapabilities::PTRACE, false),
-            ("E9PATCH", BackendCapabilities::E9PATCH, false),
+            ("PTRACE", BackendCapabilities::PTRACE, true),
+            ("E9PATCH", BackendCapabilities::E9PATCH, true),
             (
                 "LITEINST_IN_GUEST",
                 BackendCapabilities::LITEINST_IN_GUEST,
                 true,
             ),
-            ("SABRE", BackendCapabilities::SABRE, false),
+            ("SABRE", BackendCapabilities::SABRE, true),
             ("DBT", BackendCapabilities::DBT, true),
             ("KVM", BackendCapabilities::KVM, false),
         ] {
@@ -3189,13 +3158,16 @@ mod tests {
             assert!(absent.remove(key).is_some(), "{key}");
         }
         let decoded = from_legacy_backend_json(&serde_json::to_string(&absent).unwrap()).unwrap();
-        assert_eq!(decoded.backend, BackendCapabilities::PTRACE);
+        // The capabilities added after the legacy form froze read back as
+        // false (`legacy_expressible`), whatever ptrace reports.
+        let legacy_ptrace = legacy_expressible(BackendCapabilities::PTRACE);
+        assert_eq!(decoded.backend, legacy_ptrace);
         let unflipped =
             serde_json::to_string(&from_legacy_backend_json(&ptrace_json).unwrap()).unwrap();
         assert_eq!(serde_json::to_string(&decoded).unwrap(), unflipped);
 
         for (key, ptrace_value) in keys {
-            let mut expected = BackendCapabilities::PTRACE;
+            let mut expected = legacy_ptrace;
             match key {
                 "cpuid_virtualized_by_backend" => expected.virtualizes_cpuid = true,
                 "backend_supports_madvise" => {
@@ -3347,10 +3319,7 @@ mod tests {
 
     /// The legacy form's positions are `Config`'s fields in declaration order
     /// with the fifteen legacy keys where `backend` stands and no
-    /// `record_host_inputs`, `backend_supports_blocked_wait_signal_interruption`,
-    /// `backend_delivers_timer_events`,
-    /// `backend_runs_guest_code_between_injections`,
-    /// `guest_may_inherit_a_terminal`,
+    /// `record_host_inputs`, `guest_may_inherit_a_terminal`,
     /// `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
     /// `target_timeslice_syscalls_only`, `futex_wake_yields`, `replaying`,
     /// `scheduler_turn_cost` or
@@ -3371,9 +3340,6 @@ mod tests {
             match field.as_str() {
                 "backend" => expected.extend(names.map(str::to_owned)),
                 "record_host_inputs"
-                | "backend_supports_blocked_wait_signal_interruption"
-                | "backend_delivers_timer_events"
-                | "backend_runs_guest_code_between_injections"
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
@@ -3395,17 +3361,14 @@ mod tests {
             .collect();
         assert_eq!(keys, expected);
         // `backend` becomes fifteen keys; `record_host_inputs`,
-        // `backend_supports_blocked_wait_signal_interruption`,
-        // `backend_delivers_timer_events`,
-        // `backend_runs_guest_code_between_injections`,
         // `guest_may_inherit_a_terminal`,
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
         // `target_timeslice_syscalls_only`, `futex_wake_yields`,
         // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
         // `inherited_seccomp`, `cpu_profile` and `cpu_profile_host` none:
-        // fourteen more keys, and fifteen fewer.
+        // fourteen more keys, and twelve fewer.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 1);
+        assert_eq!(fields.len() + 2, keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -3468,43 +3431,44 @@ mod tests {
         );
     }
 
-    /// `backend_supports_blocked_wait_signal_interruption` never enters the
-    /// legacy form, whatever its value: the guest-visible string stays the
-    /// legacy bytes, and it reads back as false from both the object and the
-    /// array form.
+    /// The capabilities added after the legacy form froze that a legacy
+    /// configuration reads back as false
+    /// (`supports_blocked_wait_signal_interruption`,
+    /// `delivers_preemption_timer_events`,
+    /// `runs_guest_code_between_injections`) never enter it, whatever their
+    /// value: the guest-visible string stays the legacy bytes, and they read
+    /// back as false from both the object and the array form.
     #[test]
-    fn blocked_wait_signal_interruption_never_enters_the_legacy_form() {
+    fn post_freeze_capabilities_never_enter_the_legacy_form() {
         let off = Config {
             backend: BackendCapabilities::DBT,
             ..Config::default()
         };
-        let on = Config {
-            backend_supports_blocked_wait_signal_interruption: true,
-            backend_delivers_timer_events: false,
-            backend_runs_guest_code_between_injections: false,
-            ..off.clone()
-        };
+        let mut on = off.clone();
+        on.backend.supports_blocked_wait_signal_interruption = true;
+        on.backend.delivers_preemption_timer_events = true;
+        on.backend.runs_guest_code_between_injections = true;
         let json = to_legacy_backend_json(&on).unwrap();
         assert_eq!(json, to_legacy_backend_json(&off).unwrap());
-        assert!(
-            !json.contains("backend_supports_blocked_wait_signal_interruption"),
-            "{json}"
-        );
-        assert!(
-            !from_legacy_backend_json(&json)
-                .unwrap()
-                .backend_supports_blocked_wait_signal_interruption
-        );
+        for key in [
+            "supports_blocked_wait_signal_interruption",
+            "delivers_preemption_timer_events",
+            "runs_guest_code_between_injections",
+        ] {
+            assert!(!json.contains(key), "{json}");
+        }
         let values: Vec<serde_json::Value> = ordered_entries(&json)
             .into_iter()
             .map(|(_, value)| value)
             .collect();
         let array = serde_json::to_string(&values).unwrap();
-        assert!(
-            !from_legacy_backend_json(&array)
-                .unwrap()
-                .backend_supports_blocked_wait_signal_interruption
-        );
+        for decoded in [&json, &array] {
+            let backend = from_legacy_backend_json(decoded).unwrap().backend;
+            assert!(!backend.supports_blocked_wait_signal_interruption);
+            assert!(!backend.delivers_preemption_timer_events);
+            assert!(!backend.runs_guest_code_between_injections);
+            assert_eq!(backend, legacy_expressible(BackendCapabilities::DBT));
+        }
     }
 
     /// `guest_may_inherit_a_terminal` never enters the legacy form, whatever

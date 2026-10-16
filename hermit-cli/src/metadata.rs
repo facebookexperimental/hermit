@@ -230,7 +230,7 @@ impl RecordVersion {
 // take another branch and a different schedule, although no event shape
 // changed.
 // 0x128 -> 0x129: record and replay set
-// `backend_supports_blocked_wait_signal_interruption`, so the scheduler models
+// `supports_blocked_wait_signal_interruption`, so the scheduler models
 // signal targets as `hermit run` does on ptrace
 // (https://github.com/rrnewton/hermit/issues/3963). A thread that a committed
 // signal wakes out of a backgrounded call rejoins at the release barrier, a
@@ -919,9 +919,6 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         // SIGCHLD woke was not held at the release barrier: the scheduler could
         // pop the next timer, or report a terminal deadlock, before the thread's
         // continuation posted (https://github.com/rrnewton/hermit/issues/3963).
-        backend_supports_blocked_wait_signal_interruption: true,
-        backend_delivers_timer_events: false,
-        backend_runs_guest_code_between_injections: false,
         // A constant, unlike `hermit run`: replay rebuilds this configuration
         // and must decide which signals end a wait exactly as the recording did,
         // whatever terminal replay itself runs under. `false` keeps Linux's rule
@@ -998,7 +995,12 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         chaos_slowdown_max_factor: 10.0,
         chaos_epoch_length_ns: 0,
         fuzz_seed: None,
-    };
+    }
+    .with_backend(|backend| {
+        backend.supports_blocked_wait_signal_interruption = true;
+        backend.delivers_preemption_timer_events = false;
+        backend.runs_guest_code_between_injections = false;
+    });
     if let Err(reason) = record_timer_support() {
         disable_timeslice_without_a_timer(&mut config, &reason);
     }
@@ -1429,10 +1431,10 @@ mod tests {
         let run =
             crate::prepare_backend_config(crate::DetConfig::default(), crate::Backend::Ptrace);
         assert!(record.sequentialize_threads);
-        assert!(record.backend_supports_blocked_wait_signal_interruption);
+        assert!(record.backend.supports_blocked_wait_signal_interruption);
         assert_eq!(
-            record.backend_supports_blocked_wait_signal_interruption,
-            run.backend_supports_blocked_wait_signal_interruption
+            record.backend.supports_blocked_wait_signal_interruption,
+            run.backend.supports_blocked_wait_signal_interruption
         );
         assert!(!record.guest_may_inherit_a_terminal);
     }

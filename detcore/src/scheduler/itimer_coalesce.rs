@@ -436,13 +436,17 @@ mod tests {
     /// periodic 1 ms ITIMER_REAL first expires at 1 ms, and whose leader
     /// neither blocks nor ignores SIGALRM.
     fn one_process() -> (Scheduler, DetPid, DetTid) {
-        let mut scheduler = Scheduler::new(&Config {
-            sequentialize_threads: true,
-            backend_supports_blocked_wait_signal_interruption: true,
-            backend_delivers_timer_events: false,
-            backend_runs_guest_code_between_injections: false,
-            ..Config::default()
-        });
+        let mut scheduler = Scheduler::new(
+            &Config {
+                sequentialize_threads: true,
+                ..Config::default()
+            }
+            .with_backend(|backend| {
+                backend.supports_blocked_wait_signal_interruption = true;
+                backend.delivers_preemption_timer_events = false;
+                backend.runs_guest_code_between_injections = false;
+            }),
+        );
         assert!(scheduler.coalesces_alarms());
         scheduler.test_guest_sends_land = true;
         let leader = DetTid::from_raw(100);

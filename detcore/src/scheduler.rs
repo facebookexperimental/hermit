@@ -437,7 +437,7 @@ pub(crate) fn terminal_signals() -> u64 {
 /// otherwise. The guest makes no traced call that arms them, so no guest turn
 /// could record them (<https://github.com/rrnewton/hermit/issues/3146>).
 fn startup_host_timed_signals(cfg: &Config) -> u64 {
-    if cfg.backend_supports_blocked_wait_signal_interruption && cfg.guest_may_inherit_a_terminal {
+    if cfg.backend.supports_blocked_wait_signal_interruption && cfg.guest_may_inherit_a_terminal {
         terminal_signals()
     } else {
         0
@@ -1381,7 +1381,7 @@ pub struct Scheduler {
     /// sends, from the signal masks it reads from the kernel: set exactly when
     /// threads are serialized and the backend decides blocked-wait interruption
     /// from the kernel's signal state
-    /// (`backend_supports_blocked_wait_signal_interruption`). Under it the
+    /// (`supports_blocked_wait_signal_interruption`). Under it the
     /// scheduler records the mask of each thread it releases into a call
     /// outside the schedule (`BlockedPool::out_of_scheduler_masks`), wakes such
     /// a thread at a fixed point when its own signal reaches it
@@ -3685,7 +3685,7 @@ impl Scheduler {
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
             models_signal_targets: cfg.sequentialize_threads
-                && cfg.backend_supports_blocked_wait_signal_interruption,
+                && cfg.backend.supports_blocked_wait_signal_interruption,
             host_timed_signals: Default::default(),
             host_timed_signals_everywhere: startup_host_timed_signals(cfg),
             #[cfg(test)]
@@ -11981,7 +11981,7 @@ impl Scheduler {
                 // that mask. Its two readers, `kernel_sigchld_target` (through
                 // `thread_signal_mask`) and `arm_signaled_background`, run only
                 // under that flag, and the flag needs
-                // `backend_supports_blocked_wait_signal_interruption`, which a
+                // `supports_blocked_wait_signal_interruption`, which a
                 // backend sets only when its `DetTid`s are the host thread IDs
                 // that `/proc` names (`prepare_backend_config` in
                 // `hermit-cli/src/lib.rs`). On a backend whose IDs are
@@ -21263,13 +21263,17 @@ mod test {
     /// backend that decides blocked-wait interruption from the kernel's signal
     /// state (https://github.com/rrnewton/hermit/issues/3146).
     fn gated_scheduler() -> Scheduler {
-        let scheduler = Scheduler::new(&Config {
-            sequentialize_threads: true,
-            backend_supports_blocked_wait_signal_interruption: true,
-            backend_delivers_timer_events: false,
-            backend_runs_guest_code_between_injections: false,
-            ..Config::default()
-        });
+        let scheduler = Scheduler::new(
+            &Config {
+                sequentialize_threads: true,
+                ..Config::default()
+            }
+            .with_backend(|backend| {
+                backend.supports_blocked_wait_signal_interruption = true;
+                backend.delivers_preemption_timer_events = false;
+                backend.runs_guest_code_between_injections = false;
+            }),
+        );
         assert!(scheduler.models_signal_targets);
         scheduler
     }
@@ -21936,21 +21940,28 @@ mod test {
         .into_iter()
         .fold(0, |set, signal| set | kernel_signal_bit(signal));
         let usr1 = kernel_signal_bit(libc::SIGUSR1);
-        let gated = |guest_may_inherit_a_terminal| Config {
-            sequentialize_threads: true,
-            backend_supports_blocked_wait_signal_interruption: true,
-            backend_delivers_timer_events: false,
-            backend_runs_guest_code_between_injections: false,
-            guest_may_inherit_a_terminal,
-            ..Config::default()
+        let gated = |guest_may_inherit_a_terminal| {
+            Config {
+                sequentialize_threads: true,
+                guest_may_inherit_a_terminal,
+                ..Config::default()
+            }
+            .with_backend(|backend| {
+                backend.supports_blocked_wait_signal_interruption = true;
+                backend.delivers_preemption_timer_events = false;
+                backend.runs_guest_code_between_injections = false;
+            })
         };
         assert_eq!(startup_host_timed_signals(&gated(true)), terminal);
         assert_eq!(startup_host_timed_signals(&gated(false)), 0);
         assert_eq!(
-            startup_host_timed_signals(&Config {
-                guest_may_inherit_a_terminal: true,
-                ..Config::default()
-            }),
+            startup_host_timed_signals(
+                &Config {
+                    guest_may_inherit_a_terminal: true,
+                    ..Config::default()
+                }
+                .with_backend(|backend| backend.supports_blocked_wait_signal_interruption = false)
+            ),
             0,
             "a backend whose waits do not read the kernel's signal state records nothing"
         );
@@ -23883,7 +23894,7 @@ mod test {
     }
 
     /// Only a backend whose blocked waits are interrupted by the kernel's
-    /// signal state (`backend_supports_blocked_wait_signal_interruption`)
+    /// signal state (`supports_blocked_wait_signal_interruption`)
     /// arms an `rt_sigsuspend` waiter to await its report. On SaBRe, where a
     /// signal interrupts an external syscall through its own continuation
     /// RPC, the waiter stays in its pool, unarmed, with its request empty.
@@ -30836,10 +30847,13 @@ mod test {
             (LogicalTime::INDEFINITE, PAUSE_FYI),
             (deadline, NANOSLEEP_FYI),
         ] {
-            let mut scheduler = Scheduler::new(&Config {
-                sequentialize_threads: true,
-                ..Config::default()
-            });
+            let mut scheduler = Scheduler::new(
+                &Config {
+                    sequentialize_threads: true,
+                    ..Config::default()
+                }
+                .with_backend(|backend| backend.supports_blocked_wait_signal_interruption = false),
+            );
             assert!(!scheduler.models_signal_targets);
             let target = filed_sleep(&mut scheduler, deadline, fyi, false);
             assert_eq!(scheduler.signal_sleep(target), None, "{fyi}");

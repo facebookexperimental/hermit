@@ -3423,7 +3423,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // would not record alike.
                 if guest
                     .config()
-                    .backend_supports_blocked_wait_signal_interruption
+                    .backend
+                    .supports_blocked_wait_signal_interruption
                     && !self.cfg.recordreplay_modes
                     && open_can_acquire_controlling_terminal(call.flags())
                     && opened_controlling_terminal(guest.pid().as_raw(), fd, host_stat.as_ref())
@@ -7229,7 +7230,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if signals != 0
             && guest
                 .config()
-                .backend_supports_blocked_wait_signal_interruption
+                .backend
+                .supports_blocked_wait_signal_interruption
         {
             record_host_timed_signals(guest, HostTimedSignalScope::Container, signals).await;
         }
@@ -7488,7 +7490,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if signals != 0
             && guest
                 .config()
-                .backend_supports_blocked_wait_signal_interruption
+                .backend
+                .supports_blocked_wait_signal_interruption
         {
             record_host_timed_signals(guest, HostTimedSignalScope::Container, signals).await;
         }
@@ -9206,7 +9209,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                         )
                     } else if !guest
                         .config()
-                        .backend_supports_blocked_wait_signal_interruption
+                        .backend
+                        .supports_blocked_wait_signal_interruption
                     {
                         // Only on ptrace are the guest's thread ids the host's, so
                         // that its descriptors can be read through /proc/<tid>.

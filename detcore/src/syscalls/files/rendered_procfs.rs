@@ -130,7 +130,7 @@ fn carried_uptime_mtime(uptime_seconds: u64) -> Timespec {
 /// Whether nothing can change what a descriptor number names between two of
 /// Detcore's injected calls: threads are sequentialized, so Detcore holds the
 /// scheduler turn across both, and no guest code runs inside a Tool handler
-/// (`Config::backend_runs_guest_code_between_injections`: SaBRe's and
+/// (`BackendCapabilities::runs_guest_code_between_injections`: SaBRe's and
 /// in-guest LiteInst's accepted native signal handlers do).
 fn descriptor_stable_across_injections(sequentialized: bool, guest_code_between: bool) -> bool {
     sequentialized && !guest_code_between
@@ -1339,7 +1339,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> u64 {
         let stable = descriptor_stable_across_injections(
             guest.config().sequentialize_threads,
-            guest.config().backend_runs_guest_code_between_injections,
+            guest.config().backend.runs_guest_code_between_injections,
         );
         if !stable {
             return uptime_seconds;

@@ -2115,7 +2115,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<OwnProcessSend, Error> {
         if !guest
             .config()
-            .backend_supports_blocked_wait_signal_interruption
+            .backend
+            .supports_blocked_wait_signal_interruption
         {
             return Ok(OwnProcessSend::NotOwn);
         }
@@ -2375,7 +2376,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if signals != 0
             && guest
                 .config()
-                .backend_supports_blocked_wait_signal_interruption
+                .backend
+                .supports_blocked_wait_signal_interruption
         {
             record_host_timed_signals(guest, HostTimedSignalScope::Container, signals).await;
         }
@@ -3196,7 +3198,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // refused by name (`rt_sigqueueinfo_precheck`).
         if guest
             .config()
-            .backend_supports_blocked_wait_signal_interruption
+            .backend
+            .supports_blocked_wait_signal_interruption
         {
             match self.rt_sigqueueinfo_precheck(guest, &call) {
                 RtSigqueueinfoPrecheck::KernelFails => {
@@ -3355,7 +3358,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         signal: SigWrapper,
     ) {
         if !(self.cfg.sequentialize_threads
-            && self.cfg.backend_supports_blocked_wait_signal_interruption)
+            && self.cfg.backend.supports_blocked_wait_signal_interruption)
             || guest.thread_state().handler_restore_rt_reported == REAL_TIME_SIGNALS
         {
             return;
@@ -3502,7 +3505,8 @@ where
 {
     if !guest
         .config()
-        .backend_supports_blocked_wait_signal_interruption
+        .backend
+        .supports_blocked_wait_signal_interruption
     {
         return Ok(match check {
             SleepCheck::BeforePark => SleepSignal::None,
@@ -5530,11 +5534,13 @@ mod before_park_tests {
         for committed in [true, false] {
             let config = Config {
                 sequentialize_threads: true,
-                backend_supports_blocked_wait_signal_interruption: true,
-                backend_delivers_timer_events: false,
-                backend_runs_guest_code_between_injections: false,
                 ..Config::default()
-            };
+            }
+            .with_backend(|backend| {
+                backend.supports_blocked_wait_signal_interruption = true;
+                backend.delivers_preemption_timer_events = false;
+                backend.runs_guest_code_between_injections = false;
+            });
             let state = GlobalState::for_tests(&config);
             let mut guest = SleeperGuest {
                 state: &state,
@@ -5587,11 +5593,13 @@ mod before_park_tests {
         for (committed, host_timed) in [(true, 0), (false, 0), (true, chld)] {
             let config = Config {
                 sequentialize_threads: true,
-                backend_supports_blocked_wait_signal_interruption: true,
-                backend_delivers_timer_events: false,
-                backend_runs_guest_code_between_injections: false,
                 ..Config::default()
-            };
+            }
+            .with_backend(|backend| {
+                backend.supports_blocked_wait_signal_interruption = true;
+                backend.delivers_preemption_timer_events = false;
+                backend.runs_guest_code_between_injections = false;
+            });
             let global = GlobalState::for_tests(&config);
             let mut guest = SleeperGuest {
                 state: &global,
@@ -5655,11 +5663,13 @@ mod before_park_tests {
         ] {
             let config = Config {
                 sequentialize_threads: true,
-                backend_supports_blocked_wait_signal_interruption: true,
-                backend_delivers_timer_events: false,
-                backend_runs_guest_code_between_injections: false,
                 ..Config::default()
-            };
+            }
+            .with_backend(|backend| {
+                backend.supports_blocked_wait_signal_interruption = true;
+                backend.delivers_preemption_timer_events = false;
+                backend.runs_guest_code_between_injections = false;
+            });
             let global = GlobalState::for_tests(&config);
             let mut guest = SleeperGuest {
                 state: &global,
@@ -5740,11 +5750,13 @@ mod before_park_tests {
         for committed_wake in [0, chld] {
             let config = Config {
                 sequentialize_threads: true,
-                backend_supports_blocked_wait_signal_interruption: true,
-                backend_delivers_timer_events: false,
-                backend_runs_guest_code_between_injections: false,
                 ..Config::default()
-            };
+            }
+            .with_backend(|backend| {
+                backend.supports_blocked_wait_signal_interruption = true;
+                backend.delivers_preemption_timer_events = false;
+                backend.runs_guest_code_between_injections = false;
+            });
             let global = GlobalState::for_tests(&config);
             let mut guest = SleeperGuest {
                 state: &global,

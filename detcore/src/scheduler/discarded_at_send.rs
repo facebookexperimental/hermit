@@ -47,7 +47,7 @@ use crate::types::DetTid;
 /// thread IDs are host tasks. Every guest-side hook and `/proc` read of the
 /// record is gated on it, so another backend (KVM) behaves as before.
 pub(crate) fn records(cfg: &crate::config::Config) -> bool {
-    cfg.sequentialize_threads && cfg.backend_supports_blocked_wait_signal_interruption
+    cfg.sequentialize_threads && cfg.backend.supports_blocked_wait_signal_interruption
 }
 
 /// The standard signals this record tracks: 1 to 31.

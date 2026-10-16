@@ -91,7 +91,7 @@ fn seccomp_result(op: u32, flags: u32, has_args: bool) -> Result<i64, Errno> {
 /// exit reaches the scheduler in order (sequentialized threads) and the
 /// guest's tasks are host tasks it can signal (ptrace).
 fn emulates_parent_death_signal(config: &crate::config::Config) -> bool {
-    config.sequentialize_threads && config.backend_supports_blocked_wait_signal_interruption
+    config.sequentialize_threads && config.backend.supports_blocked_wait_signal_interruption
 }
 
 /// Whether parent-death signal `signal` is one Detcore sends itself: a
@@ -553,7 +553,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if (1..=64).contains(&signal)
                     && guest
                         .config()
-                        .backend_supports_blocked_wait_signal_interruption
+                        .backend
+                        .supports_blocked_wait_signal_interruption
                 {
                     record_host_timed_signals(
                         guest,

@@ -1424,7 +1424,7 @@ pub trait NonblockableSyscall: SyscallInfo {
 
     /// Return the errno for an interrupting signal that ends this wait after it began,
     /// on a backend that decides interruption from the kernel's signal state
-    /// (`backend_supports_blocked_wait_signal_interruption`). The kernel applies the
+    /// (`supports_blocked_wait_signal_interruption`). The kernel applies the
     /// guest's disposition to it on resume, so it must be the restart code Linux uses
     /// for this call: a handler then turns it into `EINTR` or a restart, and a signal
     /// with no handler restarts the call.
@@ -2158,7 +2158,8 @@ where
     let maybe_tup = maybe_timeout.map(|t| (t, call.timeout_return_val()));
     if guest
         .config()
-        .backend_supports_blocked_wait_signal_interruption
+        .backend
+        .supports_blocked_wait_signal_interruption
     {
         return retry_blocking_wait_with_kernel_signal_state(guest, call, rsrc, maybe_tup).await;
     }
@@ -2397,7 +2398,7 @@ where
 }
 
 /// Retry a blocking wait on a backend that decides signal interruption from the
-/// kernel's signal state (`backend_supports_blocked_wait_signal_interruption`).
+/// kernel's signal state (`supports_blocked_wait_signal_interruption`).
 ///
 /// A wait ends early only for a signal that would end it natively: one the guest
 /// does not block and that is caught, or whose default action terminates or stops
@@ -2617,7 +2618,8 @@ pub(crate) async fn publish_wait_mask<T, G>(
     let models_signal_targets = guest.config().sequentialize_threads
         && guest
             .config()
-            .backend_supports_blocked_wait_signal_interruption;
+            .backend
+            .supports_blocked_wait_signal_interruption;
     if mask == published.0 || !models_signal_targets {
         return;
     }
@@ -2947,7 +2949,7 @@ where
 }
 
 /// Signal handling for one blocking wait whose interruption is decided from the
-/// kernel's signal state (`backend_supports_blocked_wait_signal_interruption`).
+/// kernel's signal state (`supports_blocked_wait_signal_interruption`).
 ///
 /// A wait ends early only for a signal that would end it natively: one the guest
 /// does not block and that is caught, or whose default action terminates or stops
@@ -6013,7 +6015,8 @@ mod kernel_signal_wait_failures {
         guest.config.sequentialize_threads = gated_backend;
         guest
             .config
-            .backend_supports_blocked_wait_signal_interruption = gated_backend;
+            .backend
+            .supports_blocked_wait_signal_interruption = gated_backend;
         {
             let mut kernel = kernel.lock().unwrap();
             kernel.pending = kernel_sigset_bit(libc::SIGCHLD);

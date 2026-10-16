@@ -3114,7 +3114,9 @@ mod tests {
             assert!(backend.tracks_process_children);
             assert!(backend.runs_exit_robust_list);
             assert!(!backend.requires_thread_directed_process_signals);
-            let mut expected = reverie::BackendCapabilities::PTRACE;
+            // An unprepared configuration's capabilities: ptrace's, with the
+            // facts only a host sets for its backend left off.
+            let mut expected = Config::default().backend;
             expected.supports_parked_write_signal_interruption = false;
             assert_eq!(backend, expected);
             assert_ne!(backend, backend_capabilities());

@@ -1280,7 +1280,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // On a backend whose kernel reports the guest's signal state, a
         // `KernelSignalWait` below decides interruption against the temporary
         // mask instead (`with_wait_mask`), and the probes carry no mask.
-        let kernel_signal_wait = self.cfg.backend_supports_blocked_wait_signal_interruption;
+        let kernel_signal_wait = self.cfg.backend.supports_blocked_wait_signal_interruption;
         let probe_sigmask = sigmask.filter(|_| !kernel_signal_wait).map(|mask| {
             let sigset = stack.push(mask);
             stack
@@ -1683,7 +1683,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // wait had before (`KernelSignalWait::for_select`).
         let mut signals = self
             .cfg
-            .backend_supports_blocked_wait_signal_interruption
+            .backend
+            .supports_blocked_wait_signal_interruption
             .then(|| KernelSignalWait::for_select(guest));
         let mask_cell = signals.as_ref().map(|_| stack.reserve::<KernelSigset>());
         // This frame holds the scratch stack across every probe, so the
@@ -2163,7 +2164,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     None => Err(Errno::ENOSYS.into()),
                 };
             };
-            let result = if self.cfg.backend_supports_blocked_wait_signal_interruption {
+            let result = if self.cfg.backend.supports_blocked_wait_signal_interruption {
                 self.wait_on_masked_ppoll_probe(
                     guest,
                     probe,
@@ -2488,7 +2489,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if call.sigmask().is_some()
             && call.timeout() != 0
             && self.cfg.sequentialize_threads
-            && self.cfg.backend_supports_blocked_wait_signal_interruption
+            && self.cfg.backend.supports_blocked_wait_signal_interruption
         {
             return self.handle_internal_masked_epoll_pwait(guest, call).await;
         }
@@ -2771,7 +2772,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         } else if self.cfg.sequentialize_threads
             && !zero_timeout
-            && (args.arg4 == 0 || self.cfg.backend_supports_blocked_wait_signal_interruption)
+            && (args.arg4 == 0 || self.cfg.backend.supports_blocked_wait_signal_interruption)
         {
             // With threads sequentialized, a call that may wait polls, as
             // epoll_pwait does, rather than waiting in the kernel inside the
