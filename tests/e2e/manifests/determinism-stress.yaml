@@ -290,17 +290,11 @@ test:
         backends_enabled:
           - ptrace
           - kvm
-          - liteinst
-          - in-guest-trap
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
-        hermit_args:
-          liteinst:
-            - --max-timeslice=disabled
-          in-guest-trap:
-            - --max-timeslice=disabled
-        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
+          liteinst: "The in-guest runtime runs one thread of the guest and refuses thread creation (reverie 2d68a3bd, hermit d9d98c01); this guest creates threads with pthread_create, so its clone3 is refused and the run ends: in-guest-trap reports the refusal as missing LiteInst statistics, and liteinst as process 3 exiting without deregistering, because the fail-closed exit runs inside the guest process (hermit b3362616 validate, 2026-10-16)"
+          in-guest-trap: "The in-guest runtime runs one thread of the guest and refuses thread creation (reverie 2d68a3bd, hermit d9d98c01); this guest creates threads with pthread_create, so its clone3 is refused and the run ends: in-guest-trap reports the refusal as missing LiteInst statistics, and liteinst as process 3 exiting without deregistering, because the fail-closed exit runs inside the guest process (hermit b3362616 validate, 2026-10-16)"
       replay:
         ci: false
         backends_enabled: []
