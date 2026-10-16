@@ -31596,24 +31596,29 @@ fn cpu_profile_v3_library_run_with_unqualified_facts_is_refused() {
     assert_eq!(refusals, [expected, expected]);
 }
 
-/// A library caller may launch from a spawned thread with the 4 MiB stack the
-/// launch functions document (more than a debug build needs, about 2.2 MiB;
-/// https://github.com/rrnewton/hermit/issues/4389). Both launch families run
+/// A library caller may launch from a thread with little stack: on ptrace the
+/// session runs on the launch functions' own tracer thread, so a 256 KiB
+/// caller is enough, though the session needs about 2 MiB in a debug build
+/// (https://github.com/rrnewton/hermit/issues/4389). Both launch families run
 /// a guest to completion there.
 #[test]
-fn library_runs_return_on_a_four_mib_thread() {
+fn library_runs_return_on_a_256_kib_thread() {
+    // Built here: `DetConfig::default` parses an empty command line with clap,
+    // whose debug-build frame alone is about 516 KiB. The command is not
+    // `Send`, so it is built on the small thread.
+    let (run_config, output_config) = (hermit::DetConfig::default(), hermit::DetConfig::default());
     let (status, output) = std::thread::Builder::new()
-        .stack_size(4 << 20)
-        .spawn(|| {
+        .stack_size(256 << 10)
+        .spawn(move || {
             let status = hermit::run(
                 reverie::process::Command::new("/bin/true"),
-                hermit::DetConfig::default(),
+                run_config,
                 false,
                 &None,
             );
             let output = hermit::run_with_output(
                 reverie::process::Command::new("/bin/true"),
-                hermit::DetConfig::default(),
+                output_config,
                 false,
                 &None,
             );
@@ -34069,16 +34074,16 @@ fn an_unusable_verify_tmpdir_is_a_clean_error_naming_the_variable() {
     }
 }
 
-/// One `fifo_peer wake-*` run under `hermit run --strict`, with
-/// `--pipe-wake-latency` set to `latency` when given, and `extra` before the
-/// `--`.
 /// Held across each pipe-wake run. Under `cargo test` the tests are threads
 /// of one process, and two of them running the same mode in its one directory
 /// deleted each other's FIFO and `wake-shared` file mid-run. The directory
 /// stays per mode, not per test: the PMU rows' expected iteration depends on
 /// the guest's arguments, the directory among them.
-static PIPE_WAKE_RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static PIPE_WAKE_RUN: Mutex<()> = Mutex::new(());
 
+/// One `fifo_peer wake-*` run under `hermit run --strict`, with
+/// `--pipe-wake-latency` set to `latency` when given, and `extra` before the
+/// `--`.
 fn pipe_wake_run(mode: &str, latency: Option<&str>, extra: &[&str], guest_args: &[&str]) -> Output {
     let _run = PIPE_WAKE_RUN.lock().unwrap_or_else(|e| e.into_inner());
     let args = pipe_wake_args(mode, latency, extra, guest_args);

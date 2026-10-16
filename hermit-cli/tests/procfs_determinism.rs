@@ -2142,22 +2142,12 @@ fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
         max_timeslice: None,
         ..Default::default()
     };
-    // Launched from a 4 MiB thread, as the launch functions recommend: the
-    // test's default 2 MiB is too small in a debug build with third-party
-    // backends (https://github.com/rrnewton/hermit/issues/4389). The command
-    // is not `Send`, so it is built on that thread.
-    let output = std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(4 << 20)
-            .spawn_scoped(scope, || {
-                let mut command = ReverieCommand::new(&controller_program);
-                command.chroot(root.path()).current_dir("/");
-                hermit::run_with_output(command, config, false, &None)
-            })
-            .expect("spawn the launching thread")
-            .join()
-            .expect("the launching thread failed")
-    });
+    // Launched from the test's own thread: on ptrace the launch functions run
+    // the session on their tracer thread
+    // (https://github.com/rrnewton/hermit/issues/4389).
+    let mut command = ReverieCommand::new(&controller_program);
+    command.chroot(root.path()).current_dir("/");
+    let output = hermit::run_with_output(command, config, false, &None);
     umount(&proc_target).expect("unmount chroot procfs");
     let output = output.expect("run chroot guest");
     assert_eq!(

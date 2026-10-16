@@ -372,6 +372,7 @@ mod sabre_bootstrap;
 #[cfg(feature = "sabre")]
 mod sabre_ptrace;
 mod script;
+mod tracer_thread;
 
 #[cfg(feature = "sabre")]
 use std::ffi::OsStr;
@@ -460,6 +461,7 @@ pub use reverie::process::Stdio;
 pub use script::Shebang;
 use serde::Deserialize;
 use serde::Serialize;
+pub use tracer_thread::launch_on_calling_thread;
 
 fn read_iovecs<M: reverie::syscalls::MemoryAccess>(
     memory: &M,
@@ -3631,20 +3633,24 @@ async fn run_dbt(
 ///
 /// # Stack size
 ///
-/// This and the other `run*` launch functions run the tracer on the calling
-/// thread, which then needs more than 2 MiB of stack in a debug build with the
-/// `third-party-backends` feature: running `/bin/true` under a default
-/// configuration returned on a 2176 KiB thread and overflowed on 2112 KiB
-/// (<https://github.com/rrnewton/hermit/issues/4389>). A default-feature debug
-/// build needs just under 2 MiB (2048 KiB returned, 1792 KiB overflowed), so
-/// it fits a 2 MiB thread with little to spare. Most of it is Detcore's
-/// syscall handler, which at opt-level 0 keeps every syscall arm's
-/// temporaries in one stack frame. Rust's default for a spawned thread, and
-/// for a test, is 2 MiB, so launching from a thread spawned with 4 MiB
-/// (`std::thread::Builder::stack_size`) is recommended. The main thread
-/// usually has 8 MiB (the default `ulimit -s`), which is enough. Optimised
-/// builds need much less: in the `validate` profile a 512 KiB thread was
-/// enough.
+/// On the ptrace backend this and the other launch functions (`run*`,
+/// `record*`, `replay*`, [`HermitData::record`]) run the whole ptrace session
+/// on a tracer thread of their own, with an 8 MiB stack (the main thread's
+/// usual size, the default `ulimit -s`), so the calling thread needs no
+/// particular stack: a recording through the library returned on a 95 KiB
+/// caller thread. One tracer thread serves each calling thread for the
+/// caller's lifetime, so an operation kept at a [`HermitCleanupUnconfirmed`]
+/// checkpoint is resumed from the same caller. The session itself, in a debug
+/// build, needs about 2 MiB, mostly Detcore's syscall handler, which at
+/// opt-level 0 keeps every syscall arm's temporaries in one frame
+/// (<https://github.com/rrnewton/hermit/issues/4389>).
+///
+/// The other backends still run on the calling thread, which then needs that
+/// stack itself: launching from a thread spawned with 4 MiB
+/// (`std::thread::Builder::stack_size`) is recommended for them, and Rust's
+/// default 2 MiB for a spawned thread or a test is not enough in a debug build
+/// with the `third-party-backends` feature. Optimised builds need much less:
+/// in the `validate` profile a 512 KiB thread was enough.
 pub fn run(
     command: Command,
     config: DetConfig,
@@ -3662,7 +3668,7 @@ pub fn run(
 
 /// Run the given command using the selected instrumentation backend.
 ///
-/// A 4 MiB stack is recommended for the calling thread; see [`run`].
+/// On ptrace it needs no particular stack from the calling thread; see [`run`].
 pub fn run_with_backend(
     command: Command,
     config: DetConfig,
@@ -3682,7 +3688,7 @@ pub fn run_with_backend(
 
 /// [`run_with_backend`] with a hermit-enforced wall-clock bound on the guest.
 ///
-/// A 4 MiB stack is recommended for the calling thread; see [`run`].
+/// On ptrace it needs no particular stack from the calling thread; see [`run`].
 ///
 /// This library never installs a process alarm. Ordinary ptrace keeps the
 /// original runtime, operation, failed GlobalState and backing guards when a
@@ -3708,7 +3714,9 @@ pub fn run_with_backend_timeout(
 ) -> Result<ExitStatus, Error> {
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
-        return ptrace_completion::run(timeout, move |control| async move {
+        let command = tracer_thread::SendCommand::new(command);
+        return ptrace_completion::run_on_tracer_thread(timeout, move |control| async move {
+            let command = command.into_inner();
             let report = SkidOvershootReport::begin(true);
             let config = prepare_backend_config(config, backend);
             let result = dispatch_backend(
@@ -4158,7 +4166,7 @@ async fn dispatch_backend(
 
 /// Variant of `run` that also captures stdout/stderr.
 ///
-/// A 4 MiB stack is recommended for the calling thread; see [`run`].
+/// On ptrace it needs no particular stack from the calling thread; see [`run`].
 pub fn run_with_output(
     command: Command,
     config: DetConfig,
@@ -4176,7 +4184,7 @@ pub fn run_with_output(
 
 /// Variant of [`run_with_backend`] that also captures stdout/stderr.
 ///
-/// A 4 MiB stack is recommended for the calling thread; see [`run`].
+/// On ptrace it needs no particular stack from the calling thread; see [`run`].
 pub fn run_with_output_backend(
     command: Command,
     config: DetConfig,
@@ -4199,8 +4207,8 @@ pub fn run_with_output_backend(
 
 /// [`run_with_output_backend`] with a hermit-enforced wall-clock bound.
 ///
-/// See [`run_with_backend_timeout`]; the teardown semantics are identical. A
-/// 4 MiB stack is recommended for the calling thread; see [`run`].
+/// See [`run_with_backend_timeout`]; the teardown semantics are identical. On
+/// ptrace it needs no particular stack from the calling thread; see [`run`].
 pub fn run_with_output_backend_timeout(
     command: Command,
     config: DetConfig,
@@ -4211,7 +4219,9 @@ pub fn run_with_output_backend_timeout(
 ) -> Result<Output, Error> {
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
-        return ptrace_completion::run(timeout, move |control| async move {
+        let command = tracer_thread::SendCommand::new(command);
+        return ptrace_completion::run_on_tracer_thread(timeout, move |control| async move {
+            let command = command.into_inner();
             let report = SkidOvershootReport::begin(true);
             // Box before the retained operation captures the backend state;
             // constructing and polling it still happen after admission here.
@@ -4256,7 +4266,9 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
 ) -> Result<(Output, u64), Error> {
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
-        return ptrace_completion::run(timeout, move |control| async move {
+        let command = tracer_thread::SendCommand::new(command);
+        return ptrace_completion::run_on_tracer_thread(timeout, move |control| async move {
+            let command = command.into_inner();
             let report = SkidOvershootReport::begin(true);
             let result = Box::pin(dispatch_output_backend(
                 command,
@@ -4556,11 +4568,16 @@ impl HermitData {
     /// identities from the completed guest namespace. CLI container callers
     /// with producer-owned root provenance must use
     /// [`Self::record_with_mountinfo`].
+    ///
+    /// The ptrace session runs on a tracer thread, so the calling thread needs no
+    /// particular stack; see [`run`].
     pub fn record(&self, command: Command) -> Result<Recording, Error> {
         let store = Self {
             data_dir: self.data_dir.clone(),
         };
-        ptrace_completion::run(None, move |control| async move {
+        let command = tracer_thread::SendCommand::new(command);
+        ptrace_completion::run_on_tracer_thread(None, move |control| async move {
+            let command = command.into_inner();
             let data = store.create_recording_dir()?;
             let exit_status = record_to_async(
                 command,
@@ -4578,6 +4595,9 @@ impl HermitData {
     }
 
     /// Records with mountinfo provenance captured from the active container.
+    ///
+    /// The ptrace session runs on a tracer thread, so the calling thread needs no
+    /// particular stack; see [`run`].
     pub fn record_with_mountinfo(
         &self,
         command: Command,
@@ -4586,7 +4606,9 @@ impl HermitData {
         let store = Self {
             data_dir: self.data_dir.clone(),
         };
-        ptrace_completion::run(None, move |control| async move {
+        let command = tracer_thread::SendCommand::new(command);
+        ptrace_completion::run_on_tracer_thread(None, move |control| async move {
+            let command = command.into_inner();
             let data = store.create_recording_dir()?;
             let mount_ids = capture_mountinfo_identity_order()?;
             let exit_status = record_to_async(
@@ -4636,12 +4658,18 @@ impl HermitData {
     }
 
     /// Replays the given recording ID.
+    ///
+    /// The ptrace session runs on a tracer thread, so the calling thread needs no
+    /// particular stack; see [`run`].
     pub fn replay(&self, id: Id) -> Result<ExitStatus, Error> {
         let data = self.data_dir.join(id.to_string());
         replay_from(&data)
     }
 
     /// Replays the given recording ID with a gdbserver available to attach to.
+    ///
+    /// The ptrace session runs on a tracer thread, so the calling thread needs no
+    /// particular stack; see [`run`].
     pub fn replay_with_gdbserver(&self, id: Id, port: u16) -> Result<ExitStatus, Error> {
         let data = self.data_dir.join(id.to_string());
         replay_with_gdbserver(&data, port)
@@ -4793,9 +4821,14 @@ impl<'a> From<Option<&'a PathBuf>> for HermitData {
 /// Records to an existing directory. The caller must keep its backing resources
 /// alive through any [`HermitCleanupUnconfirmed`] recovery. [`HermitData::record`]
 /// owns its temporary recording directory inside the retained operation.
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
 pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
     let dir = dir.to_owned();
-    ptrace_completion::run(None, move |control| async move {
+    let command = tracer_thread::SendCommand::new(command);
+    ptrace_completion::run_on_tracer_thread(None, move |control| async move {
+        let command = command.into_inner();
         record_to_async(
             command,
             &dir,
@@ -4814,6 +4847,9 @@ pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
 /// obligation is the same as [`record_to`]. `local_networking` and
 /// `proc_level` are stored in the recording's `metadata.json`, and a replay
 /// uses that network and that `/proc` level.
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
 pub fn record_to_with_mountinfo(
     command: Command,
     dir: &Path,
@@ -4823,7 +4859,9 @@ pub fn record_to_with_mountinfo(
     cpu_profile: detcore_model::cpu_profile::CpuProfile,
 ) -> Result<ExitStatus, Error> {
     let dir = dir.to_owned();
-    ptrace_completion::run(None, move |control| async move {
+    let command = tracer_thread::SendCommand::new(command);
+    ptrace_completion::run_on_tracer_thread(None, move |control| async move {
+        let command = command.into_inner();
         let mount_ids = capture_mountinfo_identity_order()?;
         record_to_async(
             command,
@@ -4873,9 +4911,14 @@ async fn record_to_async(
 
 /// Records and captures output. Keep the directory's backing resources alive
 /// through any cleanup checkpoint, as for [`record_to`].
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
 pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error> {
     let dir = dir.to_owned();
-    ptrace_completion::run(None, move |control| async move {
+    let command = tracer_thread::SendCommand::new(command);
+    ptrace_completion::run_on_tracer_thread(None, move |control| async move {
+        let command = command.into_inner();
         record_with_output_async(
             command,
             &dir,
@@ -4892,6 +4935,9 @@ pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error>
 
 /// Records with captured output and exact mountinfo provenance.
 /// `local_networking` and `proc_level` are as for [`record_to_with_mountinfo`].
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
 pub fn record_with_output_with_mountinfo(
     command: Command,
     dir: &Path,
@@ -4901,7 +4947,9 @@ pub fn record_with_output_with_mountinfo(
     cpu_profile: detcore_model::cpu_profile::CpuProfile,
 ) -> Result<Output, Error> {
     let dir = dir.to_owned();
-    ptrace_completion::run(None, move |control| async move {
+    let command = tracer_thread::SendCommand::new(command);
+    ptrace_completion::run_on_tracer_thread(None, move |control| async move {
+        let command = command.into_inner();
         let mount_ids = capture_mountinfo_identity_order()?;
         record_with_output_async(
             command,
@@ -4954,16 +5002,25 @@ async fn record_with_output_async(
 
 /// Replays an existing recording. Materialization and chroot guards remain with
 /// the original runtime through any cleanup checkpoint.
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
 pub fn replay_from(dir: &Path) -> Result<ExitStatus, Error> {
     replay_plain(dir, None, &[])
 }
 
 /// Replays with a gdb server.
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
 pub fn replay_with_gdbserver(dir: &Path, port: u16) -> Result<ExitStatus, Error> {
     replay_plain(dir, Some(port), &[])
 }
 
 /// Replays with a gdb server and mounts inside the replay chroot.
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
 pub fn replay_with_gdbserver_and_mounts(
     dir: &Path,
     port: u16,
@@ -4975,7 +5032,7 @@ pub fn replay_with_gdbserver_and_mounts(
 fn replay_plain(dir: &Path, port: Option<u16>, mounts: &[Mount]) -> Result<ExitStatus, Error> {
     let dir = dir.to_owned();
     let mounts = mounts.to_vec();
-    ptrace_completion::run(None, move |control| async move {
+    ptrace_completion::run_on_tracer_thread(None, move |control| async move {
         let report = SkidOvershootReport::begin(true);
         let result = async {
             Replay::spawn(&dir, false, port, &mounts)
@@ -4989,15 +5046,21 @@ fn replay_plain(dir: &Path, port: Option<u16>, mounts: &[Mount]) -> Result<ExitS
 }
 
 /// Replays with captured output.
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
 pub fn replay_with_output(dir: &Path) -> Result<Output, Error> {
     replay_with_output_and_mounts(dir, &[])
 }
 
 /// Replays with captured output and mounts inside the replay chroot.
+///
+/// The ptrace session runs on a tracer thread, so the calling thread needs no
+/// particular stack; see [`run`].
 pub fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Output, Error> {
     let dir = dir.to_owned();
     let mounts = mounts.to_vec();
-    ptrace_completion::run(None, move |control| async move {
+    ptrace_completion::run_on_tracer_thread(None, move |control| async move {
         let report = SkidOvershootReport::begin(true);
         let result = async {
             Replay::spawn(&dir, true, None, &mounts)

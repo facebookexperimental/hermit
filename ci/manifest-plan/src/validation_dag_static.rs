@@ -1598,7 +1598,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And -2 from 9851b797: 1113.
     // And the five --pipe-wake-latency tests (run, bisect, analyze, metadata) (https://github.com/rrnewton/hermit/issues/4380): 1120, listed.
     // And +1 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 1121, listed.
-    ("test.hermit_unit", 1121),
+    // And tracer_thread::tests::one_tracer_thread_serves_its_caller and
+    // ptrace_completion::tests::a_tracer_thread_operation_resumes_from_its_caller
+    // (https://github.com/rrnewton/hermit/issues/4389): 1123, listed.
+    ("test.hermit_unit", 1123),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3337,7 +3340,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_fuse_directory_with_procfs_block_size_is_not_procfs and
     // dbt_a_procfs_directory_keeps_its_size
     // (https://github.com/rrnewton/hermit/issues/4162): 438.
-    // And library_runs_return_on_a_four_mib_thread
+    // And library_runs_return_on_a_256_kib_thread (renamed from its 4 MiB form)
     // (https://github.com/rrnewton/hermit/issues/4389): 439, listed.
     // And detcore_answers_its_procfs_links_on_every_backend (B3a-2 of
     // https://github.com/rrnewton/hermit/issues/4266): 440, by listing.
@@ -4305,7 +4308,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And -2 from 9851b797: 1113.
     // And the five --pipe-wake-latency tests (https://github.com/rrnewton/hermit/issues/4380): 1120, listed.
     // And +1 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 1121, listed.
-    ("test.hermit_unit_on_host", 1121),
+    // And the two tracer-thread tests: 1123.
+    ("test.hermit_unit_on_host", 1123),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

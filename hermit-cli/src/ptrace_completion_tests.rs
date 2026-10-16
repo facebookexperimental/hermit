@@ -166,6 +166,36 @@ fn original_runtime_guards_and_admission_survive_checkpoint() {
     );
 }
 
+/// An operation that a public launch function starts runs on the calling
+/// thread's tracer thread (https://github.com/rrnewton/hermit/issues/4389).
+/// Its checkpoint is resumed from the caller, on that same tracer thread, and
+/// refused from any other thread.
+#[test]
+fn a_tracer_thread_operation_resumes_from_its_caller() {
+    isolated("a_tracer_thread_operation_resumes_from_its_caller", || {
+        let caller = std::thread::current().id();
+        let on_tracer = move || {
+            std::thread::current().id() != caller
+                && std::thread::current().name() == Some("hermit-tracer")
+        };
+        let diagnostic = pending(run_on_tracer_thread(None, move |control| async move {
+            let started = on_tracer();
+            control.yield_checkpoint().await;
+            Ok(started && on_tracer())
+        }));
+        let other = diagnostic.clone();
+        std::thread::spawn(move || {
+            refusal(other.resume::<bool>(), |e| {
+                matches!(e, RecoveryRefusal::WrongIdentity)
+            })
+        })
+        .join()
+        .unwrap();
+        assert!(diagnostic.resume::<bool>().unwrap());
+        assert!(run_on_tracer_thread(None, move |_| async move { Ok(on_tracer()) }).unwrap());
+    });
+}
+
 #[test]
 fn nested_runtime_refuses_before_factory() {
     isolated("nested_runtime_refuses_before_factory", || {

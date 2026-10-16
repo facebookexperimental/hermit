@@ -240,8 +240,22 @@ impl HermitCleanupUnconfirmed {
     /// already-expired timeout is published; no normal guest completion is
     /// claimed from this recovery. Do not call resume expecting cancellation of
     /// an operation that has not yet established its owned termination handle.
-    pub fn resume<T: 'static>(&self) -> Result<T, Error> {
+    ///
+    /// An operation a public launch function started lives on the calling
+    /// thread's tracer thread (`crate::tracer_thread`); resuming it from that
+    /// caller continues it there.
+    pub fn resume<T: Send + 'static>(&self) -> Result<T, Error> {
         reject_nested_runtime()?;
+        let this = self.clone();
+        if let Some(resumed) =
+            crate::tracer_thread::execute_on(self.origin.thread, move || this.resume_here::<T>())
+        {
+            return resumed?;
+        }
+        self.resume_here()
+    }
+
+    fn resume_here<T: 'static>(&self) -> Result<T, Error> {
         self.origin.check()?;
         let entry = OWNERS
             .try_with(|owners| owners.borrow().get(&self.key).cloned())
@@ -487,6 +501,23 @@ fn reject_nested_runtime() -> Result<(), RecoveryRefusal> {
     } else {
         Ok(())
     }
+}
+
+/// [`run`] on the calling thread's tracer thread (`crate::tracer_thread`), with
+/// its explicit stack, so that a library launch needs no particular stack from
+/// its caller. A nested runtime on the calling thread is refused here, before
+/// anything moves to the tracer thread.
+pub(crate) fn run_on_tracer_thread<T, F, Make>(
+    timeout: Option<Duration>,
+    make: Make,
+) -> Result<T, Error>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, Error>> + 'static,
+    Make: FnOnce(Rc<Control>) -> F + Send + 'static,
+{
+    reject_nested_runtime()?;
+    crate::tracer_thread::execute(move || run(timeout, make))?
 }
 
 /// Installs the whole operation before its first poll. `make` must only construct

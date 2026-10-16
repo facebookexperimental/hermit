@@ -634,6 +634,10 @@ impl Subcommand {
 
 #[fbinit::main]
 fn main() {
+    // The CLI launches from its main thread or a container child's own stack,
+    // and a container child must not gain a thread that outlives its entry
+    // point (`hermit::launch_on_calling_thread`).
+    hermit::launch_on_calling_thread();
     if let Some(status) = cli_owned_lifecycle::maybe_run() {
         std::process::exit(status);
     }
