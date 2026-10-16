@@ -31,6 +31,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Duration;
 use std::time::Instant;
@@ -658,6 +660,7 @@ fn run() -> Result<bool, String> {
     let mut scope = "full".to_owned();
     let mut executor = "safehermit".to_owned();
     let mut expected = None;
+    let mut jobs = 1_usize;
     let mut list = false;
     let arguments: Vec<_> = std::env::args().skip(1).collect();
     let mut index = 0;
@@ -667,10 +670,13 @@ fn run() -> Result<bool, String> {
             println!("Usage: conformance.rs --hermit PATH --artifacts DIR [OPTIONS]");
             println!("Defaults to every required backend, root, path, and namespace policy.");
             println!(
-                "Options: --repository DIR --safehermit PATH --installation DIR --backends LIST --roots LIST --paths LIST --policies LIST --descriptor-obligations FILE --descriptor-obligations-sha256 HEX --assert-scope full|launch-migration --executor safehermit|local --expected LEDGER --list"
+                "Options: --repository DIR --safehermit PATH --installation DIR --backends LIST --roots LIST --paths LIST --policies LIST --descriptor-obligations FILE --descriptor-obligations-sha256 HEX --assert-scope full|launch-migration --executor safehermit|local --jobs N --expected LEDGER --list"
             );
             println!(
                 "--executor local runs each command as this process's own bounded child, for a runner such as the validation DAG that bounds the whole run itself."
+            );
+            println!(
+                "--jobs N collects up to N cells at once (default 1); cells that share a cohort's input fixture still run one at a time, and output keeps the selection order."
             );
             println!(
                 "--expected LEDGER passes when every cell and assertion that does not match is a ledger row, and every row still describes a failure."
@@ -729,6 +735,12 @@ fn run() -> Result<bool, String> {
             "--assert-scope" => scope = value.to_owned(),
             "--executor" => executor = value.to_owned(),
             "--expected" => expected = Some(PathBuf::from(value)),
+            "--jobs" => {
+                jobs =
+                    value.parse().ok().filter(|jobs| *jobs > 0).ok_or_else(|| {
+                        format!("--jobs must be a positive integer, got {value:?}")
+                    })?
+            }
             _ => return Err(format!("unknown option {name}")),
         }
         index += consumed;
@@ -840,7 +852,6 @@ fn run() -> Result<bool, String> {
         )?
     };
     let mut matches = true;
-    let mut collected = Vec::new();
     // A backend whose every required cell runs here: only for it can a
     // ledger row be found to describe nothing any more.
     let complete: BTreeSet<String> = driver::conformance::BACKENDS
@@ -852,33 +863,81 @@ fn run() -> Result<bool, String> {
         })
         .map(|backend| backend.to_string())
         .collect();
-    for cell in cells {
-        let result = prepared.collect(cell);
-        let accepted = if scope == "launch-migration" {
-            result.launch_migration_matches()
-        } else {
-            result.full_matches()
-        };
-        let failures = result
-            .assertions
-            .iter()
-            .filter(|row| row.verdict != driver::conformance::Verdict::Match)
-            .count();
-        println!(
-            "{} scope={} verdict={} full_required_failures={} report={}",
-            result.cell.name(),
-            scope,
-            if accepted {
-                "match"
-            } else {
-                "mismatch_or_no_result"
-            },
-            failures,
-            result.directory.join("assertions.json").display()
-        );
-        matches &= accepted;
-        collected.push(result);
-    }
+    // One worker collects every cell alone, in selection order. More workers
+    // share units: the cells of one cohort (one input fixture across
+    // backends) stay in one unit and run in order, so a cell's before and
+    // after input snapshots see only its own guest. Lines and `collected`
+    // keep the selection order whatever order the cells finish in.
+    let units: Vec<Vec<usize>> = if jobs == 1 {
+        (0..cells.len()).map(|index| vec![index]).collect()
+    } else {
+        let mut cohorts: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (index, cell) in cells.iter().enumerate() {
+            cohorts
+                .entry(driver::cohort_key(cell))
+                .or_default()
+                .push(index);
+        }
+        let mut units: Vec<_> = cohorts.into_values().collect();
+        units.sort_by_key(|unit| unit[0]);
+        units
+    };
+    let mut results: Vec<Option<driver::Collected>> = cells.iter().map(|_| None).collect();
+    let next = AtomicUsize::new(0);
+    let (sender, receiver) = mpsc::channel();
+    std::thread::scope(|workers| {
+        for _ in 0..jobs.min(units.len()) {
+            let sender = sender.clone();
+            let (units, next, cells, prepared) = (&units, &next, &cells, &prepared);
+            workers.spawn(move || {
+                while let Some(unit) = units.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    for &index in unit {
+                        if sender
+                            .send((index, prepared.collect(cells[index].clone())))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+        drop(sender);
+        let mut reported = 0;
+        for (index, result) in receiver {
+            results[index] = Some(result);
+            while let Some(Some(result)) = results.get(reported) {
+                let accepted = if scope == "launch-migration" {
+                    result.launch_migration_matches()
+                } else {
+                    result.full_matches()
+                };
+                let failures = result
+                    .assertions
+                    .iter()
+                    .filter(|row| row.verdict != driver::conformance::Verdict::Match)
+                    .count();
+                println!(
+                    "{} scope={} verdict={} full_required_failures={} report={}",
+                    result.cell.name(),
+                    scope,
+                    if accepted {
+                        "match"
+                    } else {
+                        "mismatch_or_no_result"
+                    },
+                    failures,
+                    result.directory.join("assertions.json").display()
+                );
+                matches &= accepted;
+                reported += 1;
+            }
+        }
+    });
+    let collected: Vec<_> = results
+        .into_iter()
+        .map(|result| result.ok_or("a cell's collection ended without a result"))
+        .collect::<Result<_, _>>()?;
     if let Some(ledger) = &ledger {
         let failures = check_ledger(ledger, &collected, &complete);
         let mut families: BTreeMap<&str, usize> = BTreeMap::new();

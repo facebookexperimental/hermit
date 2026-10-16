@@ -1259,6 +1259,9 @@ fn pinned_root_command(step: &Step) -> String {
         env_names.insert("DAGRUN_TEST_COUNTS_PATH");
     }
     env_names.extend(step.env.keys().map(String::as_str));
+    // A width channel that the root does not forward leaves the command at its
+    // own default however wide the step was admitted.
+    env_names.extend(step.jobs_env.as_deref().filter(|name| !name.is_empty()));
     let mut argv = vec![
         "./ci/hermetic/run-in-pinned-root.sh".to_string(),
         "--src".into(),
@@ -5500,6 +5503,24 @@ sys.exit(37)
                 "accepted {mutation}"
             );
         }
+    }
+
+    #[test]
+    fn pinned_root_wrapper_forwards_every_declared_width_channel() {
+        let steps = crate::validation_dag_static::config().steps;
+        let mut channels = BTreeSet::new();
+        for step in &steps {
+            let Some(name) = step.jobs_env.as_deref().filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            channels.insert(name.to_owned());
+            assert!(
+                pinned_root_command(step).contains(&format!(" --env {name} ")),
+                "{} declares width channel {name} but the pinned root does not forward it",
+                step.tag()
+            );
+        }
+        assert!(channels.contains("HERMIT_ISOLATION_JOBS"), "{channels:?}");
     }
 
     #[test]

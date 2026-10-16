@@ -767,7 +767,7 @@ fn ordinary_cohort(cell: &Cell) -> bool {
         )
 }
 
-fn cohort_key(cell: &Cell) -> String {
+pub fn cohort_key(cell: &Cell) -> String {
     format!("{}:{}:{}", cell.root, cell.path, policy_name(cell.policy))
 }
 
