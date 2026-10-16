@@ -326,6 +326,7 @@ pub fn verify_across_host_action_with(
         .args(global_args)
         .arg("run")
         .args(run_args)
+        .arg(detcore_model::config::CANONICAL_TEST_EPOCH_ARG)
         .args(["--verify", "--verify-strict", "--verify-json"])
         .arg(&report_path)
         .args([
@@ -418,7 +419,8 @@ pub fn verify_ended_in_run_1(
         .args(["--kill-after", "5s", "180s"])
         .arg(hermit)
         .arg("run")
-        .args(["--strict", "--verify", "--verify-strict", "--verify-json"])
+        .args(["--strict", detcore_model::config::CANONICAL_TEST_EPOCH_ARG])
+        .args(["--verify", "--verify-strict", "--verify-json"])
         .arg(&report_path)
         .args([
             "--base-env=minimal",

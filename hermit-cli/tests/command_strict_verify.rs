@@ -102,7 +102,13 @@ fn assert_l2_under_strict_verify_with(case: &StrictCommandCase, run_args: &[&str
             HERMIT_VERIFY_TIMEOUT,
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=info", "run", "--strict", "--verify"])
+        .args([
+            "--log=info",
+            "run",
+            "--strict",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            "--verify",
+        ])
         .args(run_args)
         .arg(format!("--env=HOME={}", home.path().display()))
         .arg(format!(

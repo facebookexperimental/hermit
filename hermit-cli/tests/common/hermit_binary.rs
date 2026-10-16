@@ -43,6 +43,7 @@ pub fn hermit_output(label: &str, command: &mut Command) -> Output {
 /// more attempts of its costliest run.
 #[allow(dead_code)]
 pub fn hermit_output_attempts(label: &str, max_attempts: u32, command: &mut Command) -> Output {
+    pin_canonical_epoch(command);
     skid_overshoot::retry_typed_skid_refusal(label, max_attempts, || {
         let output = command
             .output()
@@ -182,6 +183,21 @@ where
     Ok(args)
 }
 
+/// Give a Hermit command the canonical test epoch
+/// ([`detcore_model::config::CANONICAL_TEST_EPOCH`]) through `HERMIT_EPOCH`,
+/// so its runs do not depend on when they ran: `hermit run --strict` refuses
+/// an epoch drawn from the host clock. A command that sets or removes
+/// `HERMIT_EPOCH` itself, or a test process that inherited one (Buck gives
+/// every cell of a run one), keeps it.
+#[allow(dead_code)]
+pub fn pin_canonical_epoch(command: &mut Command) {
+    if std::env::var_os("HERMIT_EPOCH").is_none()
+        && !command.get_envs().any(|(key, _)| key == "HERMIT_EPOCH")
+    {
+        command.env("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH);
+    }
+}
+
 /// Insert the validate v3 guest arguments into a direct or timeout-wrapped
 /// Hermit command. Call this before configuring standard I/O, process-group or
 /// user/group identity, pre-exec callbacks, or clearing the environment. The
@@ -189,6 +205,7 @@ where
 /// arguments, current directory and explicit environment entries.
 #[allow(dead_code)]
 pub fn configure_guest_execution(command: &mut Command) {
+    pin_canonical_epoch(command);
     let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
     configure_guest_execution_for(command, requested.as_deref())
         .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));

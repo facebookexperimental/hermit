@@ -55,6 +55,9 @@ FAILED_LOG_TAIL_BYTES = 64 << 10
 # by itself.
 OWNED_PROCESS_EXIT_SECONDS = 10.0
 HERMIT_EXIT_SECONDS = 10.0
+# The demo's virtual-time epoch, as demos 05 and 06 pass theirs: `hermit run
+# --strict` refuses an epoch drawn from the host clock.
+EPOCH = "2026-01-01T00:00:00Z"
 
 
 def _write_command_image(path: Path, command: str) -> None:
@@ -1051,6 +1054,8 @@ class HermitGuestProgram:
             "run",
             *tmp_args,
             "--strict",
+            "--epoch",
+            EPOCH,
             "--no-rcb-time",
             "--target-timeslice", "100000",
             "--max-timeslice", "disabled",

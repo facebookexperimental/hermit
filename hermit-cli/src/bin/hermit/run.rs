@@ -1207,7 +1207,10 @@ pub struct RunOpts {
     /// Reverie's validation, because the virtual clock counts retired branches and cannot be exact;
     /// with `--max-timeslice=disabled` Detcore uses no branch count, so that run is not refused
     /// (Reverie still sets up, calibrates and incidentally reads the counters, but none of
-    /// those reads reaches the virtual clock, a preemption point or the guest).
+    /// those reads reaches the virtual clock, a preemption point or the guest). Every input must be
+    /// on the command line: a strict run without `--epoch` (or `HERMIT_EPOCH`, or a replayed
+    /// recording that supplies it), or with `--seed-from=SystemRandom`, is refused before the
+    /// guest starts rather than drawing that input from the host.
     #[clap(
         long,
         conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io", "strace_only"]
@@ -4409,6 +4412,91 @@ fn strict_flag_rejects_determinism_opt_outs() {
 }
 
 #[test]
+fn strict_refuses_an_epoch_or_seed_drawn_from_the_host() {
+    let parse = |arguments: &[&str]| {
+        let mut ro = RunOpts::parse_from(arguments);
+        if !arguments
+            .iter()
+            .any(|argument| argument.starts_with("--epoch"))
+        {
+            ro.capture_default_epoch(|| {
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000)
+            });
+        }
+        ro.validate_args_with_perf_support(true).unwrap();
+        ro.adopt_replayed_schedule_epoch().unwrap();
+        ro
+    };
+
+    let error = parse(&["fakehermit", "--strict", "fakeprog"])
+        .refuse_strict_with_host_drawn_inputs()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("--strict requires every input")
+            && error.contains("the virtual-time epoch, from the host clock")
+            && error.contains("--epoch=2026-09-21T14:13:20Z")
+            && error.contains("HERMIT_EPOCH"),
+        "{error}"
+    );
+
+    let error = parse(&[
+        "fakehermit",
+        "--strict",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--seed-from=SystemRandom",
+        "fakeprog",
+    ])
+    .refuse_strict_with_host_drawn_inputs()
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("the seed, from --seed-from=SystemRandom")
+            && error.contains("--seed=N")
+            && !error.contains("epoch"),
+        "{error}"
+    );
+
+    for arguments in [
+        &[
+            "fakehermit",
+            "--strict",
+            "--epoch=2026-01-01T00:00:00Z",
+            "fakeprog",
+        ][..],
+        &[
+            "fakehermit",
+            "--strict",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--seed-from=Args",
+            "fakeprog",
+        ],
+        // Without --strict the same draws are recorded instead.
+        &["fakehermit", "fakeprog"],
+        &["fakehermit", "--seed-from=SystemRandom", "fakeprog"],
+    ] {
+        parse(arguments)
+            .refuse_strict_with_host_drawn_inputs()
+            .unwrap_or_else(|error| panic!("{arguments:?}: {error:#}"));
+    }
+
+    // A replay supplies its recorded epoch, which is not drawn from the host.
+    let dir = tempfile::tempdir().unwrap();
+    let trace = dir.path().join("net.trace");
+    detcore_model::network_engine::NetworkEngine::new_record(
+        "2026-01-01T00:00:00Z".parse().unwrap(),
+    )
+    .finish()
+    .unwrap()
+    .write_framed(File::create(&trace).unwrap())
+    .unwrap();
+    let flag = format!("--replay-networking={}", trace.display());
+    parse(&["fakehermit", "--strict", &flag, "fakeprog"])
+        .refuse_strict_with_host_drawn_inputs()
+        .unwrap();
+}
+
+#[test]
 fn strict_rejects_strace_only() {
     // `--strace-only`'s own doc comment says it is shorthand for, among other
     // things, `--no-sequentialize-threads --no-deterministic-io` -- the exact
@@ -4859,6 +4947,7 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "--strict",
         "Require Hermit's deterministic defaults",
         "already fail closed in ordinary runs",
+        "replayed recording that supplies it",
         "--no-sequentialize-threads",
         "Disable deterministic sequential thread execution",
         "--no-deterministic-io",
@@ -6112,6 +6201,9 @@ impl RunOpts {
         // off, and still before stdin is read or anything is launched.
         self.refuse_happens_before_without_preemption()?;
         self.adopt_replayed_schedule_epoch()?;
+        // After the replayed epoch is adopted, which makes an omitted epoch
+        // explicit, and still before stdin is read or anything is launched.
+        self.refuse_strict_with_host_drawn_inputs()?;
         self.refuse_replay_under_another_pipe_wake_latency()?;
         // Once every implicit input it records is resolved, and before the
         // guest starts, so a run that fails or hangs still leaves it.
@@ -9044,6 +9136,52 @@ impl RunOpts {
             );
         }
         drawn
+    }
+
+    /// `--strict` promises that the arguments alone determine the run, so a
+    /// strict run that would draw an input from the host clock or the host's
+    /// randomness is refused before the guest starts: it could be reproduced
+    /// only from a recording, which is what `--strict` says the run does not
+    /// need. Each refusal names the option that supplies the input. An epoch
+    /// adopted from the recording a run replays is not drawn from the host and
+    /// is not refused.
+    ///
+    /// The preemption timer a host without a usable performance counter turns
+    /// off is also recorded as host-drawn, but is not refused here: every
+    /// strict run on such a host (the hosted CI runners among them) would stop,
+    /// and a run on one host draws the same value every time.
+    fn refuse_strict_with_host_drawn_inputs(&self) -> Result<(), Error> {
+        if !self.strict {
+            return Ok(());
+        }
+        let mut drawn = self.host_drawn_inputs();
+        drawn.remove(crate::manifest::MAX_TIMESLICE_KEY);
+        if drawn.is_empty() {
+            return Ok(());
+        }
+        let remedies = drawn
+            .keys()
+            .map(|key| match key.as_str() {
+                crate::run_config::EPOCH_KEY => {
+                    // The host sample this run took, to whole seconds, as an
+                    // example a user can paste.
+                    let example = self.det_opts.det_config.epoch.format("%Y-%m-%dT%H:%M:%SZ");
+                    format!(
+                        "the virtual-time epoch, from the host clock: pass --epoch (for example \
+                         --epoch={example}) or set HERMIT_EPOCH"
+                    )
+                }
+                crate::run_config::SEED_KEY => "the seed, from --seed-from=SystemRandom: pass \
+                     --seed=N, or --seed-from=Args"
+                    .to_owned(),
+                other => format!("{other}: pass it explicitly"),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!(
+            "--strict requires every input of the run on the command line, but this run would \
+             draw {remedies}"
+        )
     }
 
     /// Writes this run's manifest when the policy asks for one (see

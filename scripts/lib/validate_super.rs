@@ -17,6 +17,7 @@ use dagrun::model::Step;
 use dagrun::model::StepOutcome;
 use dagrun::model::StructuredTestResultsManifest;
 
+use crate::validate_plan::canonical_test_epoch::CANONICAL_TEST_EPOCH_ARG;
 use crate::validate_plan::node;
 use crate::validate_plan::shell_quote;
 
@@ -294,10 +295,10 @@ impl StressProbe {
         let dbg = shell_quote(debug_bin);
         match self {
             StressProbe::PtraceStrictVerify => format!(
-                "{bound}{rel} run --strict --verify -- /bin/echo hermit-super-{iteration} </dev/null"
+                "{bound}{rel} run --strict {CANONICAL_TEST_EPOCH_ARG} --verify -- /bin/echo hermit-super-{iteration} </dev/null"
             ),
             StressProbe::PtracePipeline => format!(
-                "{bound}{rel} run --strict --verify -- bash -c 'yes hermit | head -n 64 | sha256sum' </dev/null"
+                "{bound}{rel} run --strict {CANONICAL_TEST_EPOCH_ARG} --verify -- bash -c 'yes hermit | head -n 64 | sha256sum' </dev/null"
             ),
             StressProbe::PtraceRecordReplay => {
                 let dir = format!(
@@ -431,7 +432,7 @@ fn availability_nodes(debug_bin: &str, build_dep: &str, reps: i64) -> Vec<Step> 
                 "dbt_available",
                 "DBT backend availability (gates the DBT stress rows)",
                 format!(
-                    "{dbg} --log=info --backend dbt run --strict --verify -- \
+                    "{dbg} --log=info --backend dbt run --strict {CANONICAL_TEST_EPOCH_ARG} --verify -- \
                  /bin/echo hermit-dbt-probe </dev/null >/dev/null 2>&1"
                 ),
                 vec![build_dep.to_string()],
@@ -441,7 +442,8 @@ fn availability_nodes(debug_bin: &str, build_dep: &str, reps: i64) -> Vec<Step> 
             ),
             format!(
                 "Runs one real DBT run with the debug Hermit after {build_dep}: `hermit --log=info \
-             --backend dbt run --strict --verify -- /bin/echo hermit-dbt-probe`, the port of \
+             --backend dbt run --strict {CANONICAL_TEST_EPOCH_ARG} --verify -- /bin/echo \
+                 hermit-dbt-probe`, the port of \
                  validate.sh's dbt_backend_available. It is a node because the debug binary does not \
                  exist when the plan is built. Its only dependent is superstress.dbt_verify, {reps} \
                  repetitions of `hermit --backend dbt run --verify` of /bin/echo; when this probe \

@@ -1627,7 +1627,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And record_version_rejects_streams_from_before_cpuinfo_is_rendered
     // (https://github.com/rrnewton/hermit/issues/4213): 1134, executed.
     // Complete terminal-failure decoding and execution-completeness controls: +2.
-    ("test.hermit_unit", 1136),
+    // And run::strict_refuses_an_epoch_or_seed_drawn_from_the_host: 1137.
+    ("test.hermit_unit", 1137),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4462,7 +4463,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And https://github.com/rrnewton/hermit/issues/4262: the same +1 as test.hermit_unit, 1133.
     // And the rendered-cpuinfo record-version test: 1134, executed.
     // Complete terminal-failure decoding and execution-completeness controls: +2.
-    ("test.hermit_unit_on_host", 1136),
+    // And the strict host-drawn-input refusal test: 1137.
+    ("test.hermit_unit_on_host", 1137),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6796,7 +6798,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"build.e2e_artifact"########],
-        env: &[],
+        env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 30.0,
@@ -7932,7 +7934,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"build.e2e_artifact"########],
-        env: &[],
+        env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 120.0,
@@ -10205,7 +10207,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"qemu.hermit_release"########],
-        env: &[],
+        env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 0.0,
@@ -10263,7 +10265,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"envelope.build"########],
-        env: &[],
+        env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 0.0,
@@ -10292,7 +10294,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"envelope.build"########],
-        env: &[],
+        env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 0.0,
@@ -10321,7 +10323,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"envelope.build"########],
-        env: &[],
+        env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 0.0,
@@ -10350,7 +10352,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"envelope.true_l2"########],
-        env: &[],
+        env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 0.0,
@@ -10408,7 +10410,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"envelope.build"########],
-        env: &[],
+        env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 0.0,
@@ -10437,7 +10439,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"envelope.build"########],
-        env: &[],
+        env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 0.0,
@@ -10466,7 +10468,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"envelope.build"########],
-        env: &[],
+        env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 0.0,
@@ -10495,7 +10497,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"envelope.echo_l2"########],
-        env: &[],
+        env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 0.0,
@@ -10553,7 +10555,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"envelope.build"########],
-        env: &[],
+        env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 0.0,
@@ -10582,7 +10584,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"envelope.build"########],
-        env: &[],
+        env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 0.0,
@@ -10611,7 +10613,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"envelope.build"########],
-        env: &[],
+        env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 0.0,
@@ -10640,7 +10642,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"envelope.date_l2"########],
-        env: &[],
+        env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 0.0,

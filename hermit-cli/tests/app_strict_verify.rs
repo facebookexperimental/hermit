@@ -339,6 +339,7 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
             "--log=info",
             "run",
             "--strict",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
             "--verify",
             // The test does not assert CPUID or PMU behavior; these flags
             // keep the test portable to runners without those capabilities. They do not
@@ -538,6 +539,7 @@ print(hermit_bound_probe.VALUE + sum(range(1000)))
             "--log=info",
             "run",
             "--strict",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
             "--verify",
             "--verify-strict",
         ])
@@ -648,6 +650,7 @@ fn assert_l2_jvm_under_strict_verify(program: &Path, args: &[&str]) {
             "--log=info",
             "run",
             "--strict",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
             "--verify",
             // Relax only CPUID virtualization; keep RCB preemption on so the
             // JVM's internal threads make progress (see the doc comment).
@@ -919,6 +922,7 @@ fn run_once_under_strict(program: &Path, args: &[&str]) -> Output {
             "--log=off",
             "run",
             "--strict",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
         ]);
@@ -1189,6 +1193,7 @@ fn make_command_with_execution_root(
             "--log=off",
             "run",
             "--strict",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
         ]);

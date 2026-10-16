@@ -43,6 +43,8 @@ fn compression_tools_are_deterministic_under_strict_hermit() {
             }
             let output = Command::new(&runner)
                 .env("HERMIT_BIN", env!("CARGO_BIN_EXE_hermit"))
+                // The script's strict runs take their epoch from this.
+                .env("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)
                 .env("COMPRESSION_ARTIFACT_ROOT", &artifact_root)
                 .env("COMPRESSION_INPUT_LINES", "12000")
                 .output()

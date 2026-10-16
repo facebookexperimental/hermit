@@ -964,7 +964,13 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
     let mut stderr = tempfile::tempfile().expect("failed to create Hermit stderr capture");
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
-        .args(["--backend=ptrace", "run", "--strict", "--"])
+        .args([
+            "--backend=ptrace",
+            "run",
+            "--strict",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            "--",
+        ])
         .arg(&guest)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

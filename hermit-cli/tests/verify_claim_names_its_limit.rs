@@ -41,7 +41,13 @@ use std::process::Command;
 fn verify(with_io_buffers: bool) -> (String, serde_json::Value) {
     let json = tempfile::NamedTempFile::new().expect("temp file");
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args(["run", "--strict", "--verify", "--verify-strict"]);
+    command.args([
+        "run",
+        "--strict",
+        detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+        "--verify",
+        "--verify-strict",
+    ]);
     if !with_io_buffers {
         command.arg("--no-detlog-io-buffers");
     }

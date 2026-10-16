@@ -319,6 +319,7 @@ fn run_arguments(seed: u64, max_timeslice: u64) -> Vec<String> {
         "--log=info".into(),
         "run".into(),
         "--strict".into(),
+        detcore_model::config::CANONICAL_TEST_EPOCH_ARG.into(),
         "--chaos".into(),
         "--seed=0".into(),
         "--rng-seed=0".into(),
@@ -966,8 +967,15 @@ fn assert_network_manifest_reruns_offline(
         detcore::Digest::new(original_trace).to_string(),
         "{manifest}"
     );
+    // `--strict` refuses an epoch drawn from the host, so the recording's
+    // epoch is the one its arguments gave, kept with the other inputs.
+    assert!(
+        manifest["inputs"]["host_drawn"].get("epoch").is_none(),
+        "{manifest}"
+    );
     assert_eq!(
-        manifest["inputs"]["host_drawn"]["epoch"], "host-now",
+        manifest["inputs"]["run"]["epoch"],
+        detcore_model::config::CANONICAL_TEST_EPOCH,
         "{manifest}"
     );
     assert!(
@@ -1551,6 +1559,7 @@ fn curl_arguments(log: &Path, network_flag: String) -> Vec<String> {
         format!("--log-file={}", log.display()),
         "run".into(),
         "--strict".into(),
+        detcore_model::config::CANONICAL_TEST_EPOCH_ARG.into(),
         network_flag,
     ]
 }

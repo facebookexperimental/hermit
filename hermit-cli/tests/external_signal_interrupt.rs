@@ -570,12 +570,13 @@ fn run_cell_with_external_signals(
 /// write to while a cell runs, so the guest's dynamic loader stat'ed a
 /// directory whose size could change between `--verify`'s two runs, and the
 /// cell failed bitwise parity on a host input, not on Hermit.
-fn cell_run_args(backend: &str) -> [&str; 5] {
+fn cell_run_args(backend: &str) -> [&str; 6] {
     [
         "--backend",
         backend,
         "run",
         "--strict",
+        detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
         "--base-env=minimal",
     ]
 }
@@ -3250,11 +3251,11 @@ fn run_inherited_terminal_cell_attempt(
         .arg(hermit_binary::hermit_binary())
         .args(["--backend", "ptrace", "run"]);
     // `--strict` refuses `--no-namespace`, which shares the host's network.
-    command.arg(if namespace {
-        "--strict"
+    if namespace {
+        command.args(["--strict", detcore_model::config::CANONICAL_TEST_EPOCH_ARG]);
     } else {
-        "--no-namespace"
-    });
+        command.arg("--no-namespace");
+    }
     command
         .arg("--")
         .arg(&program)

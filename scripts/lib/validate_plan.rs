@@ -59,6 +59,12 @@ pub use hermit_manifest_plan::host_capability::probe_host_capability;
 use crate::validate_corpus;
 use crate::validate_corpus::CorpusPaths;
 
+/// The canonical test epoch the strict compatibility probes pass, from its one
+/// source: `hermit run --strict` refuses an epoch drawn from the host clock.
+#[allow(dead_code)]
+#[path = "../../detcore-model/src/canonical_test_epoch.rs"]
+pub mod canonical_test_epoch;
+
 /// The manifest audit is an executable consumer, so its producer is part of
 /// the always-on preflight spine rather than an incidental lane root.
 pub const MANIFEST_PLAN_PRODUCER_TAG: &str = "setup.manifest_plan";
@@ -126,6 +132,7 @@ impl CompatMode {
                     ));
                 }
                 v.push(s("--strict"));
+                v.push(s(canonical_test_epoch::CANONICAL_TEST_EPOCH_ARG));
                 v.push(s("--verify"));
                 v.push(s("--"));
                 v
@@ -604,7 +611,7 @@ pub fn compat_nodes(
         let wall = mode.timeout_for(&row.label);
         let description = match mode {
             CompatMode::E9patch => format!(
-                "One per-program probe of the e9patch-compat-only profile, generated from a row of ci/compat/{}. It runs `target/release/hermit --backend e9patch run --strict --verify -- <program>` with stdin from /dev/null. That is e9patch binary-rewriting preprocessing with the ptrace backend, not a backend of its own: Hermit rewrites the guest's main ELF with e9tool and e9patch, then runs the rewritten program on the ptrace backend under strict mode, twice, comparing the runs with the Stripped comparator of plain --verify, so no row establishes L2. The rows range from coreutils such as echo and cat to bash pipelines and tests/compat/real_compat_workload.sh workloads; whoami, groups, pinky, logname, tar and chown also bind the files-only nsswitch.conf over /etc/nsswitch.conf. The profile counts every failure as blocking, for example a rewritten binary that crashes or two runs whose output differs.",
+                "One per-program probe of the e9patch-compat-only profile, generated from a row of ci/compat/{}. It runs `target/release/hermit --backend e9patch run --strict --epoch=<canonical test epoch> --verify -- <program>` with stdin from /dev/null. That is e9patch binary-rewriting preprocessing with the ptrace backend, not a backend of its own: Hermit rewrites the guest's main ELF with e9tool and e9patch, then runs the rewritten program on the ptrace backend under strict mode, twice, comparing the runs with the Stripped comparator of plain --verify, so no row establishes L2. The rows range from coreutils such as echo and cat to bash pipelines and tests/compat/real_compat_workload.sh workloads; whoami, groups, pinky, logname, tar and chown also bind the files-only nsswitch.conf over /etc/nsswitch.conf. The profile counts every failure as blocking, for example a rewritten binary that crashes or two runs whose output differs.",
                 mode.corpus_name()
             ),
         };

@@ -23,6 +23,8 @@ BENCHMARK_DIR = ROOT / "benchmarks"
 WORK_DIR = ROOT / "target" / "hermit-targeted-benchmarks"
 DEFAULT_OUTPUT_DIR = BENCHMARK_DIR / "results" / "targeted"
 BACKEND_NAMES = ("native", "ptrace", "dbt", "kvm")
+# `hermit run --strict` refuses an epoch drawn from the host clock.
+EPOCH = "2026-01-01T00:00:00Z"
 
 
 class BenchmarkError(RuntimeError):
@@ -210,6 +212,8 @@ def backend_command(
         backend,
         "run",
         "--strict",
+        "--epoch",
+        EPOCH,
         "--",
         *benchmark.command,
     )

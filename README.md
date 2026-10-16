@@ -110,16 +110,17 @@ hermit run -- /bin/echo hello
 The `--` separator is recommended so arguments beginning with `-` are passed to
 the guest. The command above prints `hello` and exits with the guest's status.
 
-Hermit's current defaults are strict and deterministic. `--strict` is retained
-as an explicit compatibility spelling for those defaults; it does not enable a
-stronger mode:
+Hermit's current defaults are strict and deterministic. `--strict` asks for
+those defaults and also requires every input of the run on the command line: it
+refuses a run that would take its virtual-time epoch from the host clock, so
+pass `--epoch` (or set `HERMIT_EPOCH`):
 
 ```bash
-hermit run --strict -- /bin/echo hello
+hermit run --strict --epoch=2026-01-01T00:00:00Z -- /bin/echo hello
 ```
 
-For programs that read the clock, also fix `--epoch` to reproduce the starting
-time. Without it, each invocation captures the current host time. See the
+Without `--strict`, a run without `--epoch` captures the current host time as
+its epoch and records it, so it can be rerun. See the
 [date example](examples/README.md#examples).
 
 ### Execution Backends

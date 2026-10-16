@@ -101,7 +101,12 @@ pub(super) fn run_guest(
         .arg(hermit)
         .arg("--log=info")
         .arg(format!("--backend={backend}"))
-        .args(["run", "--strict", "--base-env=minimal"])
+        .args([
+            "run",
+            "--strict",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            "--base-env=minimal",
+        ])
         .args(run_args);
     if let Some(summary) = summary {
         command.arg(format!("--summary-json={}", summary.display()));

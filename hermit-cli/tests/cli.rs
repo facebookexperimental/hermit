@@ -358,12 +358,14 @@ fn append_hermit_args_with_execution_root_mode(
 }
 
 fn append_hermit_args(command: &mut Command, args: &[&str]) {
+    hermit_test::pin_canonical_epoch(command);
     let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
     append_hermit_args_with_execution_root(command, args, requested.as_deref())
         .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
 }
 
 fn append_hermit_args_using_outer_mount(command: &mut Command, args: &[&str]) {
+    hermit_test::pin_canonical_epoch(command);
     let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
     append_hermit_args_with_execution_root_mode(command, args, requested.as_deref(), false)
         .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
@@ -12583,6 +12585,7 @@ impl CappedRun<'_> {
         args.push("--");
         args.extend_from_slice(self.guest);
         let mut command = (self.build)(&args);
+        hermit_test::pin_canonical_epoch(&mut command);
         command.stdin(Stdio::null());
         // The guest inherits hermit's environment. Under a UTF-8 `LANG` every
         // program the guest runs opens the locale's files at startup, and the
@@ -35089,6 +35092,7 @@ fn run_directory_size_guest_on_tmpfs(
         .arg(mount_point)
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(hermit_args);
+    hermit_test::pin_canonical_epoch(&mut command);
     let (status, log) = run_with_deadline(command, directory, Duration::from_secs(120), false);
     let stdout = fs::read_to_string(directory.join("deadline-run.stdout"))
         .expect("failed to read the guest's stdout");
@@ -35406,6 +35410,7 @@ fn a_fuse_directory_with_procfs_block_size_is_not_procfs() {
                 mount_arg.as_str(),
                 control_arg.as_str(),
             ]);
+        hermit_test::pin_canonical_epoch(&mut command);
         let (status, log) =
             run_with_deadline(command, directory.path(), Duration::from_secs(60), false);
         let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))

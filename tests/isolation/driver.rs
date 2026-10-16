@@ -27,6 +27,9 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+// Every cell's epoch: `hermit run --strict` refuses one drawn from the host
+// clock, and the compared runs must share one.
+use detcore_model::config::CANONICAL_TEST_EPOCH;
 use detcore_model::logdiff_policy::CANON_ADDRESS_ORDINAL_V1;
 use detcore_model::logdiff_policy::STRIP_WALL_CLOCK_PREFIX_V1;
 use hermit_manifest_plan::canonical_verdict::ComparedLogScope;
@@ -2094,7 +2097,8 @@ impl Prepared {
                     command
                         .args(arguments)
                         .current_dir(&self.repository)
-                        .env("HERMIT_INSTALL_DIR", &self.installation);
+                        .env("HERMIT_INSTALL_DIR", &self.installation)
+                        .env("HERMIT_EPOCH", CANONICAL_TEST_EPOCH);
                     retain_command(&command, directory)?;
                     let captured = capture(
                         &mut command,
@@ -2145,6 +2149,7 @@ impl Prepared {
                         .current_dir(&self.repository)
                         .env("SAFEHERMIT_LOG_ROOT", self.artifacts.join("safehermit"))
                         .env("HERMIT_INSTALL_DIR", &self.installation)
+                        .env("HERMIT_EPOCH", CANONICAL_TEST_EPOCH)
                         .stdin(Stdio::null())
                         .stdout(
                             File::create(directory.join("stdout"))

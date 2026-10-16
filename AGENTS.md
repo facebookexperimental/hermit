@@ -232,6 +232,10 @@ presupposes the ones below it:
 | L3 | Memory determinism | Add `--detlog-heap --detlog-stack` to the L2 command |
 | L4 | Stress-hardened | L2/L3 repeated 20x with no divergence |
 
+`--strict` refuses a run whose epoch would come from the host clock, so every
+command above also passes `--epoch` or `HERMIT_EPOCH`. Tests and E2E cells use
+the canonical test epoch, `detcore_model::config::CANONICAL_TEST_EPOCH`.
+
 A claim that a run "passes" is meaningless without a level. Write, for example,
 "passes at L2 (ptrace backend)". When reporting a run, also state:
 

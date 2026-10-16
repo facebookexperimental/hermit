@@ -161,8 +161,10 @@ Both invocations should print the same bytes when the command, inputs, and
 Hermit configuration are unchanged.
 
 Hermit uses strict deterministic execution by default. The explicit
-`--strict` option remains for command-line compatibility but does not make the
-default stricter.
+`--strict` option also requires every input of the run on the command line: a
+run without `--epoch` (or `HERMIT_EPOCH`, or a replayed recording that supplies
+the epoch), or with `--seed-from=SystemRandom`, is refused before the guest
+starts instead of drawing that input from the host.
 
 ## Choosing A Mode
 

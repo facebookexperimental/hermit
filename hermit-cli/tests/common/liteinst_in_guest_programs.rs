@@ -254,8 +254,12 @@ fn liteinst_command_at_epoch(log_level: &str, epoch: Option<&str>) -> Command {
     command
         .arg(format!("--log={log_level}"))
         .args(["--backend", "liteinst", "run"]);
-    if let Some(epoch) = epoch {
-        command.arg(format!("--epoch={epoch}"));
+    match epoch {
+        Some(epoch) => {
+            command.arg(format!("--epoch={epoch}"));
+        }
+        // `--strict` refuses an epoch drawn from the host clock.
+        None => super::hermit_test::pin_canonical_epoch(&mut command),
     }
     command.args([
         "--max-timeslice=disabled",

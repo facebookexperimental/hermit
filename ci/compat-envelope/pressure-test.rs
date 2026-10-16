@@ -5826,10 +5826,10 @@ fn write_plan_after_scorecard_check(
     selection: &CellSelection,
 ) -> Result<(RunMetadata, DagConfig), String> {
     let root = checked_scorecard.root;
-    // One epoch for the whole series. Each cell is a separate harness process
-    // that would otherwise sample host time, so the ptrace and candidate runs
-    // compared by the parity post-pass would give their guests different
-    // clocks. An inherited HERMIT_EPOCH is kept verbatim.
+    // One epoch for the whole series, recorded with it, so the ptrace and
+    // candidate runs compared by the parity post-pass, each a separate harness
+    // process, give their guests one clock. An inherited HERMIT_EPOCH is kept
+    // verbatim; otherwise it is the canonical test epoch.
     let hermit_epoch = run_epoch_from_env()?;
     let timeout_policy = PressureTimeoutPolicy::from_env()?;
     // A sample's draw measures declared paths with this plan's own policy.
@@ -24913,11 +24913,7 @@ mod pressure_sample_tests {
             .clone()
             .expect("a planned series records its epoch");
         if env::var_os("HERMIT_EPOCH").is_none() {
-            // Sampled from host time, in RFC 3339.
-            assert!(
-                epoch.len() >= 20 && epoch.as_bytes()[4] == b'-' && epoch.contains('T'),
-                "{epoch}"
-            );
+            assert_eq!(epoch, hermit_manifest_plan::runner::CANONICAL_TEST_EPOCH);
         }
         let retained: RunMetadata =
             serde_json::from_slice(&fs::read(results.join("run.json")).unwrap()).unwrap();

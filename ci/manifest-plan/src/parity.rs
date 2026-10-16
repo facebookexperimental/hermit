@@ -2396,7 +2396,7 @@ fn bind_target(mount: &str) -> Option<&str> {
 ///
 /// The epoch is part of the view rather than something the runner rewrites
 /// per cell: one harness process gives every cell it runs the same
-/// `HERMIT_EPOCH`, and the pressure test samples one epoch per series and
+/// `HERMIT_EPOCH`, and the pressure test resolves one epoch per series and
 /// passes it to each harness process
 /// ([`crate::runner::run_epoch_from_env`]). Equal epochs are therefore the
 /// normal case, and operands whose epochs differ or are unrecorded are

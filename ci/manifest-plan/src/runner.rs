@@ -3451,26 +3451,31 @@ pub struct RunContext {
     pub isolated_workdir: Option<PathBuf>,
 }
 
-fn resolve_run_epoch(
-    explicit: Option<std::ffi::OsString>,
-    capture_now: impl FnOnce() -> SystemTime,
-) -> Result<String, String> {
+/// The epoch a cell gets when `HERMIT_EPOCH` is unset, re-exported for the
+/// scripts that build on this crate.
+pub use detcore_model::config::CANONICAL_TEST_EPOCH;
+
+/// The epoch every cell gives its guests: `HERMIT_EPOCH` verbatim, or the
+/// canonical test epoch. Never the host clock: a run whose epoch came from the
+/// host could be reproduced only from a recording, and `hermit run --strict`
+/// refuses it.
+fn resolve_run_epoch(explicit: Option<std::ffi::OsString>) -> Result<String, String> {
     match explicit {
         // Preserve the supported input exactly, including invalid values that
-        // the CLI must reject. Never replace an override with a new sample.
+        // the CLI must reject.
         Some(epoch) => epoch
             .into_string()
             .map_err(|_| "HERMIT_EPOCH must be valid Unicode".to_owned()),
-        None => Ok(detcore_model::config::epoch_from_host_time(capture_now()).to_rfc3339()),
+        None => Ok(CANONICAL_TEST_EPOCH.to_owned()),
     }
 }
 
 /// The `HERMIT_EPOCH` a harness process started now would give every guest:
-/// the environment's value verbatim, or one sampled from host time. A caller
+/// the environment's value verbatim, or the canonical test epoch. A caller
 /// that launches several harness processes whose logs are compared (the
-/// pressure test's parity post-pass) samples this once and passes it to each.
+/// pressure test's parity post-pass) resolves this once and passes it to each.
 pub fn run_epoch_from_env() -> Result<String, String> {
-    resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"), SystemTime::now)
+    resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"))
 }
 
 impl RunContext {
@@ -3612,7 +3617,7 @@ impl RunContext {
             exact_branch_counter,
             attempt: 1,
             run_index,
-            epoch: resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"), SystemTime::now)?,
+            epoch: resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"))?,
             source_sha,
             source_dirty,
             binary_build_sha,
@@ -12098,23 +12103,10 @@ esac
     }
 
     #[test]
-    fn comparison_epoch_is_captured_once_and_explicit_input_never_reads_clock() {
-        let calls = std::cell::Cell::new(0);
-        let epoch = resolve_run_epoch(None, || {
-            calls.set(calls.get() + 1);
-            UNIX_EPOCH + Duration::new(978_307_199, 123_456_789)
-        })
-        .unwrap();
-        assert_eq!(calls.get(), 1);
-        assert_eq!(epoch, "2000-12-31T23:59:59.123456789+00:00");
+    fn comparison_epoch_is_the_canonical_one_unless_given_explicitly() {
+        assert_eq!(resolve_run_epoch(None).unwrap(), CANONICAL_TEST_EPOCH);
         let explicit = "2026-01-01T00:00:00.987654321Z";
-        assert_eq!(
-            resolve_run_epoch(Some(explicit.into()), || {
-                panic!("an explicit environment epoch must not sample the clock")
-            })
-            .unwrap(),
-            explicit
-        );
+        assert_eq!(resolve_run_epoch(Some(explicit.into())).unwrap(), explicit);
     }
 
     #[test]
@@ -12128,10 +12120,8 @@ esac
                 .as_nanos(),
         ));
         let mut context = run_context(&root);
-        context.epoch = resolve_run_epoch(None, || {
-            UNIX_EPOCH + Duration::new(978_307_199, 123_456_789)
-        })
-        .unwrap();
+        context.epoch =
+            resolve_run_epoch(Some("2000-12-31T23:59:59.123456789+00:00".into())).unwrap();
         for outer_attempt in [1, 2] {
             let context = context.with_attempt(outer_attempt);
             for backend in ["sabre", "ptrace"] {
@@ -17575,7 +17565,7 @@ backends_disabled:
             host_capabilities: probe_host_capabilities(),
             attempt: 1,
             run_index: None,
-            epoch: resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"), SystemTime::now).unwrap(),
+            epoch: resolve_run_epoch(std::env::var_os("HERMIT_EPOCH")).unwrap(),
             source_sha: "0".repeat(40),
             source_dirty: false,
             binary_build_sha: probe_binary_build_sha(&hermit_bin),

@@ -1679,6 +1679,9 @@ impl std::error::Error for ParseTimesliceError {
 /// original unix epoch (time zero).
 pub static DEFAULT_EPOCH_STR: &str = "2026-01-01T00:00:00Z";
 
+pub use crate::canonical_test_epoch::CANONICAL_TEST_EPOCH;
+pub use crate::canonical_test_epoch::CANONICAL_TEST_EPOCH_ARG;
+
 /// Convert one invocation's captured host instant without losing subsecond
 /// precision. CLI and comparison orchestration share this input conversion;
 /// guest clock progression never reads the host clock through it.
