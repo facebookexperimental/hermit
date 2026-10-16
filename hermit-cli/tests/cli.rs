@@ -205,6 +205,7 @@ static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static TOOL_OUTPUT_PROTECTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "dbt")]
 static CLOCK_RLIMIT_PARITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "dbt")]
@@ -26862,6 +26863,46 @@ fn dbt_rdtsc_is_answered_by_detcore_as_under_ptrace() {
         reads,
         "ptrace:\n{ptrace}\ndbt:\n{dbt}"
     );
+}
+
+/// Detcore's syscall outputs respect page protection, as the kernel's own
+/// writes do (https://github.com/rrnewton/reverie/issues/1064, F1):
+/// - `rt_sigprocmask` makes Detcore push the filtered mask on the guest stack,
+///   so a guest that points RSP at an executable read-only page, or at the
+///   `ud2` on Reverie's private page that guards the untraced stub, gets
+///   EFAULT and the bytes stay as they were. Linux itself returns 0 there,
+///   because it uses no guest stack; the refusal is Reverie's.
+/// - `time(tloc)` with `tloc` four bytes before a read-only page fails with
+///   EFAULT and writes none of the eight bytes, as Linux's `put_user` does.
+///
+/// Before Reverie 4c20795a the pushed mask went through PTRACE_POKEDATA and
+/// overwrote both pages with zeros, and `time` wrote all eight bytes.
+#[test]
+fn tool_output_respects_page_protection_and_the_private_page() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&TOOL_OUTPUT_PROTECTION_GUEST, "tool_output_protection")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for (case, expected) in [
+        ("stack", "stack target=rx result=-14 unchanged=1\n"),
+        (
+            "private-stack",
+            "stack target=private result=-14 unchanged=1\n",
+        ),
+        ("scalar", "scalar result=-1 errno=14 unchanged=1\n"),
+    ] {
+        for strict in [true, false] {
+            let mut args = vec!["run"];
+            if strict {
+                args.push("--strict");
+            }
+            args.extend(["--base-env=minimal", "--", guest.as_str(), case]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{args:?}");
+        }
+    }
 }
 
 /// Under DBT each guest `cpuid` is answered by Detcore, as under ptrace, so

@@ -2749,6 +2749,12 @@
       "why": "tests/c/timerslack_proc_record_replay.c is owned by hermit-cli/tests/record_replay.rs: The Rust integration test compiles this guest and runs its strict record/replay contract, asserting that one timer-slack value composes across relative and absolute procfs reads/writes, prctl access, zero-length I/O, seek behavior, and replay. It remains a test-owned guest fixture because that phase-spanning contract is asserted by the dedicated record/replay test rather than a generic manifest cell."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/tool_output_protection.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/tool_output_protection.c is owned by hermit-cli/tests/cli.rs: tool_output_respects_page_protection_and_the_private_page runs it under ptrace, --strict and not, and requires that Detcore's syscall outputs respect page protection (https://github.com/rrnewton/reverie/issues/1064): an rt_sigprocmask whose pushed mask the guest aims at an executable read-only page or at the ud2 on Reverie's private page gets EFAULT with the bytes unchanged, and time(tloc) across a writable/read-only page boundary gets EFAULT with none of its eight bytes written. It stays a fixture because a generic manifest cannot compare guest memory before and after against a Hermit-specific expectation (the stack cases differ from native by design)."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/umask_mode.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
