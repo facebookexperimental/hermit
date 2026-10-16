@@ -1077,7 +1077,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And hermit-verify's interpolate_refuses_schedules_recorded_under_different_pipe_wake_latencies (https://github.com/rrnewton/hermit/issues/4380): 1590, listed.
     // And +5 from 87bb6972: 1595.
     // Measured by the 57abff0a validate: 1596 executed.
-    ("test.regular_crates", 1596),
+    // And parity_outcomes' a_cell_the_baseline_did_not_consider_is_new_not_a_regression:
+    // 1597, listed.
+    ("test.regular_crates", 1597),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4439,7 +4441,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +5 from 87bb6972: 1581.
     // And the local selection's +1 already counted for test.regular_crates
     // (1595 -> 1596), which the twin does not exclude: 1582.
-    ("test.regular_crates_on_host", 1582),
+    // And the same new-cell gate test: 1583, listed.
+    ("test.regular_crates_on_host", 1583),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),

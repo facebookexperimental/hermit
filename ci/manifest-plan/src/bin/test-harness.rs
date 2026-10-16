@@ -194,7 +194,7 @@ Exit status: 0 when the files match (--check) or were written (--write), 1 when
 const PARITY_HELP: &str = "\
 Usage: test-harness parity compare --artifacts <DIR> --cell <TEST@BACKEND> [OPTIONS]
        test-harness parity export --e2e-root <DIR> [--expected-scope <FILE>]
-       test-harness parity outcomes --e2e-root <DIR> [--backend <B>]... [--json] [--baseline <FILE>]
+       test-harness parity outcomes --e2e-root <DIR> [--backend <B>]... [--json] [--baseline <FILE>] [--repo-root <DIR>]
 
 Measure parity cells from the logs a finished `run` retained, as its own
 post-pass does, without running any guest. Each cell compares TEST's verify
@@ -249,14 +249,20 @@ not-run (full validation selects it, but the run has no row). The cells
 considered are every test and mode whose ptrace cell full validation selects,
 plus every test and mode with a row on any candidate. It runs no guest and
 writes nothing. With --baseline it exits 1 when a cell that matched ptrace in
-the baseline no longer does, and lists the cells that started matching.
+the baseline no longer does, and lists the cells that started matching and
+the new cells (tests or modes the baseline did not consider), which never
+matched and do not fail the gate.
 
 Outcomes options:
   --e2e-root <DIR>                 The run's e2e result root, holding <lane>/<node>/results.jsonl
   --backend <B>                    A candidate backend (dbt, in-guest-trap, kvm, liteinst,
                                    sabre); may repeat (default: all five)
-  --json                           Print the differences as JSONL, the baseline format
-  --baseline <FILE>                Gate against an earlier run's --json output";
+  --json                           Print the differences, then every considered test/mode,
+                                   as JSONL: the baseline format
+  --baseline <FILE>                Gate against an earlier run's --json output
+  --repo-root <DIR>                Read the manifests (tests/e2e/manifests) from DIR, which
+                                   should hold the run's own commit (default: the checkout
+                                   this test-harness was built in)";
 
 const FILTER_OPTIONS: &str = "  --lane <portable|privileged>
   --category <CATEGORY>
@@ -997,7 +1003,8 @@ fn main() -> ExitCode {
             ParityRequest::Compare(request) => request,
             ParityRequest::Export(request) => return parity_export(&request),
             ParityRequest::Outcomes(request) => {
-                let manifests = ManifestSet::load(&root(None)).unwrap_or_else(|error| fail(error));
+                let manifests = ManifestSet::load(&root(request.repo_root.as_deref()))
+                    .unwrap_or_else(|error| fail(error));
                 return parity_outcomes(&manifests, &request);
             }
         };
@@ -3919,6 +3926,7 @@ struct ParityExportRequest {
 
 struct ParityOutcomesRequest {
     e2e_root: PathBuf,
+    repo_root: Option<PathBuf>,
     backends: Vec<parity::ParityBackend>,
     json: bool,
     baseline: Option<PathBuf>,
@@ -3973,6 +3981,7 @@ fn parse_parity_export(mut values: impl Iterator<Item = String>) -> ParityExport
 
 fn parse_parity_outcomes(mut values: impl Iterator<Item = String>) -> ParityOutcomesRequest {
     let mut e2e_root = None;
+    let mut repo_root = None;
     let mut baseline = None;
     let mut backends = Vec::new();
     let mut json = false;
@@ -3980,6 +3989,7 @@ fn parse_parity_outcomes(mut values: impl Iterator<Item = String>) -> ParityOutc
         match flag.as_str() {
             "--e2e-root" => set_once(&mut e2e_root, &mut values, "--e2e-root"),
             "--baseline" => set_once(&mut baseline, &mut values, "--baseline"),
+            "--repo-root" => set_once(&mut repo_root, &mut values, "--repo-root"),
             "--backend" => {
                 let value = required_value(&mut values, "--backend");
                 let backend =
@@ -4002,6 +4012,7 @@ fn parse_parity_outcomes(mut values: impl Iterator<Item = String>) -> ParityOutc
         e2e_root: PathBuf::from(e2e_root.unwrap_or_else(|| {
             fail("parity outcomes requires --e2e-root <DIR>, the run's e2e result root")
         })),
+        repo_root: repo_root.map(PathBuf::from),
         backends,
         json,
         baseline: baseline.map(PathBuf::from),
@@ -4021,6 +4032,12 @@ fn parity_outcomes(manifests: &ManifestSet, request: &ParityOutcomesRequest) -> 
         for row in &report.differences {
             lines.push(serde_json::to_string(row).expect("a difference serializes"));
         }
+        for cell in &report.considered {
+            let line = parity_outcomes::ConsideredLine {
+                considered: cell.clone(),
+            };
+            lines.push(serde_json::to_string(&line).expect("a considered cell serializes"));
+        }
     } else {
         lines.push(format!(
             "parity outcomes against ptrace: {} result rows in {} results.jsonl files under {} \
@@ -4035,7 +4052,7 @@ fn parity_outcomes(manifests: &ManifestSet, request: &ParityOutcomesRequest) -> 
                 .cloned()
                 .collect::<Vec<_>>()
                 .join(", "),
-            report.cells,
+            report.considered.len(),
             report.reference_rows,
             report.undeclared_rows,
         ));
@@ -4054,7 +4071,7 @@ fn parity_outcomes(manifests: &ManifestSet, request: &ParityOutcomesRequest) -> 
             lines.push(format!(
                 "{backend}: {} of {} cells differ from ptrace ({})",
                 rows.len(),
-                report.cells,
+                report.considered.len(),
                 by_outcome
                     .iter()
                     .map(|(outcome, count)| format!("{outcome}: {count}"))
@@ -4097,11 +4114,19 @@ fn parity_outcomes(manifests: &ManifestSet, request: &ParityOutcomesRequest) -> 
             format!("{}@{}/{}", row.test, row.backend, row.mode)
         };
         let mut gate_lines = vec![format!(
-            "baseline {}: {} cell(s) stopped matching ptrace, {} started matching, {} changed outcome",
+            "baseline {}: {} cell(s) stopped matching ptrace, {} started matching, {} changed \
+             outcome, {} new cell(s) differ{}",
             path.display(),
             gate.regressions.len(),
             gate.newly_matching.len(),
-            gate.changed.len()
+            gate.changed.len(),
+            gate.new_cells.len(),
+            if baseline.considered.is_some() {
+                " (tests or modes the baseline did not consider)"
+            } else {
+                " (this baseline does not record the cells it considered, so new cells count as \
+                 stopped matching)"
+            }
         )];
         for row in &gate.regressions {
             gate_lines.push(format!(
@@ -4114,6 +4139,14 @@ fn parity_outcomes(manifests: &ManifestSet, request: &ParityOutcomesRequest) -> 
         for row in &gate.newly_matching {
             gate_lines.push(format!(
                 "  started matching {} (was ptrace={} candidate={})",
+                cell(row),
+                row.reference,
+                row.candidate
+            ));
+        }
+        for row in &gate.new_cells {
+            gate_lines.push(format!(
+                "  new cell {}: ptrace={} candidate={}",
                 cell(row),
                 row.reference,
                 row.candidate

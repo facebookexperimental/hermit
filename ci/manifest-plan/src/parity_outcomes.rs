@@ -19,9 +19,11 @@
 //!
 //! The cells considered are every (test, mode) whose ptrace cell full
 //! validation selects, plus every (test, mode) for which the run has a row on
-//! any candidate backend. A baseline is this command's own `--json` output;
-//! [`gate`] reports every cell that matched ptrace in the baseline and no
-//! longer does, which is the regression a step may not introduce.
+//! any candidate backend. A baseline is this command's own `--json` output:
+//! the differing cells, then every (test, mode) it considered. [`gate`]
+//! reports every cell that matched ptrace in the baseline and no longer does,
+//! which is the regression a step may not introduce, apart from the cells of
+//! tests and modes the baseline did not consider, which never matched.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -62,6 +64,21 @@ impl OutcomeDifference {
     }
 }
 
+/// One manifest test and mode, the unit a baseline records as considered.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellKey {
+    pub test: String,
+    pub mode: String,
+}
+
+/// The baseline line naming one considered cell.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsideredLine {
+    pub considered: CellKey,
+}
+
 /// Every difference of one run, with the counts that give it scale.
 #[derive(Debug)]
 pub struct OutcomeReport {
@@ -70,8 +87,8 @@ pub struct OutcomeReport {
     /// The distinct `hermit_sha` values of the rows: the commit (or commits)
     /// the run tested, which the manifests compared against should match.
     pub hermit_shas: BTreeSet<String>,
-    /// (test, mode) pairs considered.
-    pub cells: usize,
+    /// The (test, mode) pairs considered, in manifest order.
+    pub considered: Vec<CellKey>,
     /// Of those, the pairs with a ptrace row in this run.
     pub reference_rows: usize,
     /// Final rows naming a test and mode these manifests do not declare,
@@ -212,7 +229,7 @@ pub fn compare(
                 .map(|backend| (cell.id.test, cell.id.mode, backend))
         })
         .collect();
-    let mut cells = 0;
+    let mut considered = Vec::new();
     let mut reference_rows = 0;
     let mut differences = Vec::new();
     for (_, _, _, test) in manifests.all_tests() {
@@ -230,7 +247,10 @@ pub fn compare(
             {
                 continue;
             }
-            cells += 1;
+            considered.push(CellKey {
+                test: test.id.clone(),
+                mode: mode.clone(),
+            });
             let side = |backend: &str| -> Result<(String, Option<String>, bool), String> {
                 if let Some(outcome) = row(backend) {
                     return Ok((outcome.clone(), None, true));
@@ -275,7 +295,7 @@ pub fn compare(
         results_files,
         rows,
         hermit_shas,
-        cells,
+        considered,
         reference_rows,
         undeclared_rows,
         differences,
@@ -292,34 +312,63 @@ pub struct GateReport {
     /// Differs in both, with a different candidate or reference outcome:
     /// (baseline, now).
     pub changed: Vec<(OutcomeDifference, OutcomeDifference)>,
+    /// Differs now, in a test and mode the baseline did not consider (a test
+    /// or mode added since), so it never matched.
+    pub new_cells: Vec<OutcomeDifference>,
 }
 
-/// Parse a baseline: this command's `--json` output, one difference per line.
-pub fn parse_baseline(text: &str) -> Result<Vec<OutcomeDifference>, String> {
+/// A parsed baseline.
+#[derive(Debug, Default)]
+pub struct Baseline {
+    pub differences: Vec<OutcomeDifference>,
+    /// The cells it considered; `None` for a baseline written before it
+    /// recorded them, in which every new difference counts as a regression.
+    pub considered: Option<BTreeSet<CellKey>>,
+}
+
+/// Parse a baseline: this command's `--json` output, one difference or one
+/// considered cell per line.
+pub fn parse_baseline(text: &str) -> Result<Baseline, String> {
     let mut seen = BTreeSet::new();
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(index, line)| {
-            let row: OutcomeDifference = serde_json::from_str(line)
-                .map_err(|error| format!("baseline line {}: {error}", index + 1))?;
-            if !seen.insert((row.test.clone(), row.mode.clone(), row.backend.clone())) {
+    let mut baseline = Baseline::default();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(ConsideredLine { considered }) = serde_json::from_str(line) {
+            if !baseline
+                .considered
+                .get_or_insert_with(BTreeSet::new)
+                .insert(considered.clone())
+            {
                 return Err(format!(
-                    "baseline line {} repeats {}@{}/{}",
+                    "baseline line {} repeats considered {}/{}",
                     index + 1,
-                    row.test,
-                    row.backend,
-                    row.mode
+                    considered.test,
+                    considered.mode
                 ));
             }
-            Ok(row)
-        })
-        .collect()
+            continue;
+        }
+        let row: OutcomeDifference = serde_json::from_str(line)
+            .map_err(|error| format!("baseline line {}: {error}", index + 1))?;
+        if !seen.insert((row.test.clone(), row.mode.clone(), row.backend.clone())) {
+            return Err(format!(
+                "baseline line {} repeats {}@{}/{}",
+                index + 1,
+                row.test,
+                row.backend,
+                row.mode
+            ));
+        }
+        baseline.differences.push(row);
+    }
+    Ok(baseline)
 }
 
 /// Compare `now` with `baseline`, over the candidate backends `backends`.
 pub fn gate(
-    baseline: &[OutcomeDifference],
+    baseline: &Baseline,
     now: &[OutcomeDifference],
     backends: &[ParityBackend],
 ) -> GateReport {
@@ -329,6 +378,7 @@ pub fn gate(
             .any(|backend| backend.as_str() == row.backend)
     };
     let before: BTreeMap<_, _> = baseline
+        .differences
         .iter()
         .filter(in_scope)
         .map(|row| (row.key(), row))
@@ -341,7 +391,21 @@ pub fn gate(
     let mut report = GateReport::default();
     for (key, row) in &after {
         match before.get(key) {
-            None => report.regressions.push((*row).clone()),
+            None => {
+                let key = CellKey {
+                    test: row.test.clone(),
+                    mode: row.mode.clone(),
+                };
+                if baseline
+                    .considered
+                    .as_ref()
+                    .is_some_and(|considered| !considered.contains(&key))
+                {
+                    report.new_cells.push((*row).clone())
+                } else {
+                    report.regressions.push((*row).clone())
+                }
+            }
             Some(old) if old.candidate != row.candidate || old.reference != row.reference => {
                 report.changed.push(((*old).clone(), (*row).clone()))
             }
@@ -371,13 +435,23 @@ mod tests {
         }
     }
 
+    fn key(test: &str) -> CellKey {
+        CellKey {
+            test: test.into(),
+            mode: "verify".into(),
+        }
+    }
+
     #[test]
     fn gate_names_regressions_improvements_and_changes_within_scope() {
-        let baseline = [
-            difference("a", "kvm", "disabled"),
-            difference("b", "kvm", "disabled"),
-            difference("c", "dbt", "FAIL"),
-        ];
+        let baseline = Baseline {
+            differences: vec![
+                difference("a", "kvm", "disabled"),
+                difference("b", "kvm", "disabled"),
+                difference("c", "dbt", "FAIL"),
+            ],
+            considered: None,
+        };
         let now = [
             difference("a", "kvm", "FAIL"),
             difference("d", "kvm", "FAIL"),
@@ -393,6 +467,24 @@ mod tests {
                 difference("a", "kvm", "FAIL")
             )]
         );
+        assert!(report.new_cells.is_empty());
+    }
+
+    #[test]
+    fn a_cell_the_baseline_did_not_consider_is_new_not_a_regression() {
+        let baseline = Baseline {
+            differences: vec![difference("a", "kvm", "disabled")],
+            considered: Some(BTreeSet::from([key("a"), key("b")])),
+        };
+        let now = [
+            difference("a", "kvm", "disabled"),
+            difference("b", "kvm", "FAIL"),
+            difference("new", "kvm", "disabled"),
+        ];
+        let report = gate(&baseline, &now, &[ParityBackend::Kvm]);
+        assert_eq!(report.regressions, [difference("b", "kvm", "FAIL")]);
+        assert_eq!(report.new_cells, [difference("new", "kvm", "disabled")]);
+        assert!(report.newly_matching.is_empty() && report.changed.is_empty());
     }
 
     #[test]
@@ -400,9 +492,22 @@ mod tests {
         let mut row = difference("a", "kvm", "disabled");
         row.reason = Some("why".into());
         let line = serde_json::to_string(&row).unwrap();
-        assert_eq!(parse_baseline(&format!("{line}\n")).unwrap(), [row]);
+        let considered = serde_json::to_string(&ConsideredLine {
+            considered: key("a"),
+        })
+        .unwrap();
+        let old_format = parse_baseline(&format!("{line}\n")).unwrap();
+        assert_eq!(
+            (old_format.differences, old_format.considered),
+            (vec![row.clone()], None)
+        );
+        let baseline = parse_baseline(&format!("{line}\n{considered}\n")).unwrap();
+        assert_eq!(baseline.differences, [row]);
+        assert_eq!(baseline.considered, Some(BTreeSet::from([key("a")])));
         let error = parse_baseline(&format!("{line}\n{line}\n")).unwrap_err();
         assert!(error.contains("repeats a@kvm/verify"), "{error}");
+        let error = parse_baseline(&format!("{considered}\n{considered}\n")).unwrap_err();
+        assert!(error.contains("repeats considered a/verify"), "{error}");
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -546,6 +651,7 @@ mod tests {
         // a candidate without a row either is never a difference.
         assert!(report.differences.iter().all(|row| row.reference == "PASS"));
         assert_eq!((report.reference_rows, report.undeclared_rows), (3, 0));
+        assert!(report.considered.contains(&key(&disabled_on_kvm)));
         assert!(report.differences.iter().all(|row| row.backend == "kvm"));
         fs::remove_dir_all(&root).unwrap();
     }
