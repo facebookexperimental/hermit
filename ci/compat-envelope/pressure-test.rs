@@ -5428,6 +5428,12 @@ fn selected_cell_dependencies(
         }
         if !(mode == "naked" && backend == "native") {
             deps.push("build.e2e_artifact".into());
+        } else {
+            // The artifact's gate.manifest ancestry brings the rust-script
+            // build to every other cell. A native naked cell needs no
+            // artifact, and since 2026-10-16 setup.manifest_plan no longer
+            // waits for build.rust_scripts, so the cell names it.
+            deps.push("build.rust_scripts".into());
         }
         return deps;
     }
@@ -11033,6 +11039,12 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
             ));
         }
         let mut expected = BTreeSet::new();
+        // Nodes neither upstream nor downstream of the failed one may or may
+        // not have run when the failure stopped the run: since 2026-10-16
+        // setup.manifest_plan builds beside build.rust_scripts, so a failed
+        // rust-script build can find it already started. They are neither
+        // required nor refused; ancestors are required and consumers refused.
+        let mut independent = BTreeSet::new();
         if let Some(failed) = failed {
             let error = result
                 .err()
@@ -11048,6 +11060,27 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
                     pending.extend(original[&tag].deps.iter().cloned());
                 }
             }
+            let mut consumers = BTreeSet::from([failed.to_string()]);
+            loop {
+                let added: Vec<String> = original
+                    .values()
+                    .filter(|step| {
+                        !consumers.contains(&step.tag())
+                            && step.deps.iter().any(|dep| consumers.contains(dep))
+                    })
+                    .map(|step| step.tag())
+                    .collect();
+                if added.is_empty() {
+                    break;
+                }
+                consumers.extend(added);
+            }
+            independent.extend(
+                original
+                    .keys()
+                    .filter(|tag| !expected.contains(*tag) && !consumers.contains(*tag))
+                    .cloned(),
+            );
         } else {
             let execution = result?;
             if execution.outcomes.len() != REQUIRED_BUILD_TAGS.len()
@@ -11061,9 +11094,12 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
         let text = fs::read_to_string(&log)
             .map_err(|e| format!("cannot read prerequisite sentinels: {e}"))?;
         let actual: BTreeSet<String> = text.lines().map(str::to_string).collect();
-        if actual != expected || text.lines().count() != expected.len() {
+        if !actual.is_superset(&expected)
+            || !actual.is_subset(&expected.union(&independent).cloned().collect())
+            || text.lines().count() != actual.len()
+        {
             return Err(format!(
-                "prerequisite failure {failed:?} admitted a consumer or lost an ancestor: expected={expected:?} actual={actual:?}"
+                "prerequisite failure {failed:?} admitted a consumer or lost an ancestor: required={expected:?} allowed independent={independent:?} actual={actual:?}"
             ));
         }
         let journal = fs::read_to_string(
@@ -11082,7 +11118,7 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
             .filter(|row| row["event"] == "step_end")
             .collect();
         let ended: BTreeSet<_> = ends.iter().filter_map(|row| row["step"].as_str()).collect();
-        if ends.len() != expected.len() || ended != expected.iter().map(String::as_str).collect() {
+        if ends.len() != actual.len() || ended != actual.iter().map(String::as_str).collect() {
             return Err(format!(
                 "isolated prerequisite fixture {failed:?} lost its exact terminal evidence"
             ));
@@ -11113,14 +11149,19 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
         let expected_skipped: BTreeSet<_> = original
             .keys()
             .map(String::as_str)
-            .filter(|step| !expected.iter().any(|ended| ended == step))
+            .filter(|step| !actual.iter().any(|ended| ended == step))
             .collect();
         let accounted: BTreeSet<_> = ended.union(&skipped).copied().collect();
         if ends.len() + skips.len() != original.len()
             || skips.len() != expected_skipped.len()
             || skipped != expected_skipped
             || accounted != original.keys().map(String::as_str).collect()
-            || skips.iter().any(|row| row["reason"] != "dependency_failed")
+            || skips.iter().any(|row| {
+                row["reason"] != "dependency_failed"
+                    && !row["step"]
+                        .as_str()
+                        .is_some_and(|step| independent.contains(step))
+            })
         {
             return Err(format!(
                 "isolated prerequisite fixture {failed:?} lost its skip accounting"
@@ -15000,7 +15041,10 @@ fn self_test(root: &Path) -> Result<(), String> {
         || liteinst_batch != batch_expected
         || exact_repeated != batch_expected
         || selected_cell_dependencies(true, false, "naked", "native", None)
-            != ["setup.manifest_plan".to_string()]
+            != [
+                "setup.manifest_plan".to_string(),
+                "build.rust_scripts".to_string(),
+            ]
         || selected_cell_dependencies(true, false, "verify", "ptrace", None)
             != [
                 "setup.manifest_plan".to_string(),
@@ -16634,7 +16678,9 @@ fn self_test(root: &Path) -> Result<(), String> {
                 "pre.reverie_pin".to_string(),
             ]
         || buck_build_steps[0].deps != ["gate.manifest".to_string(), "pre.reverie_pin".to_string()]
-        || manifest_plan_steps[0].deps != ["build.rust_scripts".to_string()]
+        // Since 2026-10-16 the manifest-plan build waits only for the Reverie
+        // pin and runs beside build.rust_scripts.
+        || manifest_plan_steps[0].deps != ["pre.reverie_pin".to_string()]
         || !runtime_build_steps[0]
             .cmd
             .contains(DIRECT_EXACT_HERMIT_BUILD)
@@ -17235,8 +17281,8 @@ fn self_test(root: &Path) -> Result<(), String> {
             "pre.submodules" => BTreeSet::new(),
             "pre.reverie_pin" => BTreeSet::from(["pre.submodules"]),
             "build.rust_scripts" => BTreeSet::from(["pre.reverie_pin"]),
-            "setup.manifest_plan" => BTreeSet::from(["build.rust_scripts"]),
-            "gate.manifest" => BTreeSet::from(["setup.manifest_plan"]),
+            "setup.manifest_plan" => BTreeSet::from(["pre.reverie_pin"]),
+            "gate.manifest" => BTreeSet::from(["build.rust_scripts", "setup.manifest_plan"]),
             "setup.nextest" => {
                 BTreeSet::from(["build.rust_scripts", "gate.manifest", "pre.reverie_pin"])
             }
