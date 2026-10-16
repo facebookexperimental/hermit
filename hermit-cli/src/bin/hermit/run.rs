@@ -31,6 +31,9 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use clap::Parser;
+
+#[cfg(test)]
+mod preemption_tests;
 use colored::Colorize;
 use detcore_model::backend_engagement::BackendEngagement;
 use detcore_model::backend_engagement::BackendEngagementReport;
@@ -1190,6 +1193,16 @@ pub struct RunOpts {
     #[clap(skip)]
     config_capture: Option<crate::run_config::RunConfig>,
 
+    /// Clap provenance, captured before values are lowered to DetConfig.
+    /// Programmatic callers have an effective configuration and must not have
+    /// a positive maximum silently replaced merely because it equals a default.
+    #[clap(skip = true)]
+    max_timeslice_explicit: bool,
+
+    /// The backend mechanism selected a disabled default for this invocation.
+    #[clap(skip)]
+    max_timeslice_default_disabled: bool,
+
     /// Runtime-only: the seed `--seed-from` chose, which `--save-config`
     /// writes in its place.
     #[clap(skip)]
@@ -2259,11 +2272,16 @@ fn vmm_time_warning_silent_for_non_vmm_programs() {
 /// not accept `--backend`; see `cli.rs::run_rejects_subcommand_level_backend`.
 #[cfg(test)]
 fn run_opts_for(argv: &[&str]) -> RunOpts {
-    let args = crate::Args::try_parse_from(argv)
+    use clap::CommandFactory;
+    use clap::FromArgMatches;
+    let matches = crate::Args::command()
+        .try_get_matches_from(argv)
         .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
+    let args = crate::Args::from_arg_matches(&matches).unwrap();
     let crate::Subcommand::Run(mut run) = args.command else {
         panic!("{argv:?} is not a `run` command");
     };
+    run.capture_max_timeslice_source(matches.subcommand_matches("run").unwrap());
     run.backend = args.global.backend;
     *run
 }
@@ -2560,9 +2578,14 @@ fn backend_values_parse_and_round_trip() {
         // The backend is global, so it renders before the subcommand and is not
         // part of the `run` options' own rendering.
         assert_eq!(ro.global_backend_arg(), format!(" --backend={value}"));
+        let maximum = if hermit::backend_delivers_preemption_timer(expected) {
+            ""
+        } else {
+            " --max-timeslice=disabled"
+        };
         assert_eq!(
             format!("{}", ro),
-            " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+            format!("{maximum} --epoch=2026-01-01T00:00:00+00:00 -- fakeprog")
         );
     }
 }
@@ -3704,11 +3727,16 @@ fn skid_margin_override_rejects_non_ptrace_backed_backends() {
             "fakeprog",
         ]);
         let error = opts.validate_args_with_perf_support(true).unwrap_err();
+        let message = format!("{error:#}");
         assert!(
-            error
-                .to_string()
-                .contains("requires a ptrace-backed backend"),
-            "unexpected {backend} error: {error}"
+            message.contains(&format!(
+                "unsupported_preemption: --backend={backend} refuses --skid-margin"
+            )),
+            "unexpected {backend} error: {message}"
+        );
+        assert!(
+            message.contains("cannot deliver Detcore preemption timer events"),
+            "{message}"
         );
     }
 }
@@ -4034,7 +4062,9 @@ fn in_guest_refusal(backend_flag: &str, options: &[&str]) -> Result<(), anyhow::
     let mut argv = vec!["hermit", backend_flag, "run"];
     argv.extend_from_slice(options);
     argv.push("fakeprog");
-    run_opts_for(&argv).refuse_unqualified_liteinst_in_guest_options()
+    let mut run = run_opts_for(&argv);
+    run.resolve_preemption_settings()?;
+    run.refuse_unqualified_liteinst_in_guest_options()
 }
 
 /// in-guest-trap runs the in-guest LiteInst runtime, so it refuses exactly
@@ -4044,7 +4074,8 @@ fn in_guest_refusal(backend_flag: &str, options: &[&str]) -> Result<(), anyhow::
 fn in_guest_trap_refuses_the_options_liteinst_refuses() {
     #[cfg(feature = "liteinst")]
     {
-        let error = in_guest_refusal("--backend=in-guest-trap", &[]).unwrap_err();
+        let error = in_guest_refusal("--backend=in-guest-trap", &["--max-timeslice=200000000"])
+            .unwrap_err();
         assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
         assert!(
             error.to_string().contains("pass --max-timeslice=disabled"),
@@ -4066,7 +4097,7 @@ fn in_guest_trap_refuses_the_options_liteinst_refuses() {
             "{option}"
         );
         assert!(
-            trap.to_string().starts_with("--backend=in-guest-trap "),
+            trap.to_string().contains("--backend=in-guest-trap "),
             "{option}: {trap:#}"
         );
     }
@@ -4089,13 +4120,11 @@ fn in_guest_trap_refuses_the_options_liteinst_refuses() {
 
 #[test]
 fn liteinst_in_guest_refuses_options_it_cannot_honour() {
-    // The default maximum timeslice is on, and the in-guest Tool host cannot
-    // deliver its timer. Only a build with the feature gives this advice;
-    // `liteinst_without_the_feature_is_refused_for_the_feature` covers the
-    // build without it.
+    // An explicitly requested maximum cannot be supplied by this runtime.
+    // The inherited default now resolves to disabled from the timer capability.
     #[cfg(feature = "liteinst")]
     {
-        let error = liteinst_in_guest_refusal(&[]).unwrap_err();
+        let error = liteinst_in_guest_refusal(&["--max-timeslice=200000000"]).unwrap_err();
         assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
         assert!(
             error.to_string().contains("pass --max-timeslice=disabled"),
@@ -4105,7 +4134,7 @@ fn liteinst_in_guest_refuses_options_it_cannot_honour() {
     // The other refusals hold in every build.
     for (option, reason) in [
         ("--timeout=3", "--timeout has not been qualified"),
-        ("--skid-margin=500", "--skid-margin configures"),
+        ("--skid-margin=500", "refuses --skid-margin"),
         ("--gdbserver", "--gdbserver needs the ptrace tracer"),
     ] {
         let error = liteinst_in_guest_refusal(&["--max-timeslice=disabled", option]).unwrap_err();
@@ -5627,15 +5656,6 @@ impl RunOpts {
     /// Refuses options that in-guest LiteInst cannot honour yet, so a run never
     /// silently drops one of them.
     ///
-    /// These refusals are static facts about the backend, so they hold in
-    /// every build and come before the availability check: a command gets the
-    /// same verdict whether or not the build has the `liteinst` feature
-    /// (https://github.com/rrnewton/hermit/issues/3418). The maximum-timeslice
-    /// advice is the exception. The timeslice is on by default, so in a build
-    /// without the feature that advice would answer every run, and following
-    /// it would only reach the build-feature refusal one run later. Such a
-    /// build skips it, and `refuse_liteinst_without_the_feature` names the
-    /// missing feature instead.
     /// Admits `--cpu-profile x86-64-v3` on this host and binds the host facts
     /// the guest's leaf 0xD and xstate answers come from, or refuses the run
     /// by name (<https://github.com/rrnewton/hermit/issues/4243>). A v2 run is
@@ -5678,11 +5698,7 @@ impl RunOpts {
             return Ok(());
         }
         let config = &self.det_opts.det_config;
-        let reason = if cfg!(feature = "liteinst") && config.max_timeslice.is_some() {
-            "it cannot deliver Detcore's preemption timer yet (the in-guest Tool host refuses \
-             set_timer with ENOSYS), so the run would fail at its first timeslice; pass \
-             --max-timeslice=disabled"
-        } else if self.timeout.is_some() {
+        let reason = if self.timeout.is_some() {
             "--timeout has not been qualified for the in-guest runtime, whose run future does \
              not kill the guest when it is dropped"
         } else if self.skid_margin.is_some() {
@@ -5701,7 +5717,8 @@ impl RunOpts {
 
     /// In a build without the `liteinst` feature, refuses `--backend=liteinst`
     /// for the missing feature ("this build was compiled without the liteinst
-    /// backend"), in place of the in-guest maximum-timeslice advice above.
+    /// backend"). An explicit unsupported timer request is refused earlier;
+    /// an omitted maximum resolves to disabled and reaches this feature check.
     ///
     /// `main` calls it after every refusal that holds in every build: the
     /// in-guest option refusals, the `--max-log-bytes` refusal, the `--verify`
@@ -6054,6 +6071,7 @@ impl RunOpts {
             );
         }
         self.refuse_unapplied_config()?;
+        self.resolve_preemption_settings()?;
         if let Some(path) = &self.backend_engagement_json {
             clear_machine_record(path, "backend engagement")?;
         }
@@ -6113,6 +6131,23 @@ impl RunOpts {
         self.refuse_happens_before_without_preemption()?;
         self.adopt_replayed_schedule_epoch()?;
         self.refuse_replay_under_another_pipe_wake_latency()?;
+        if !self.namespace_only
+            && (self.verify_verbose
+                || global
+                    .log
+                    .is_some_and(|level| level >= tracing::metadata::LevelFilter::DEBUG))
+        {
+            global.write_controller_diagnostic(format_args!(
+                "hermit: {}",
+                detcore_model::summary::PreemptionSummary {
+                    max_timeslice_ns: self
+                        .det_opts
+                        .det_config
+                        .max_timeslice
+                        .map(|maximum| maximum.get()),
+                }
+            ))?;
+        }
         // Once every implicit input it records is resolved, and before the
         // guest starts, so a run that fails or hangs still leaves it.
         self.write_saved_config()?;
@@ -6378,9 +6413,8 @@ impl RunOpts {
     /// for it would print a `--max-timeslice` downgrade warning about a timer the
     /// run never uses.
     ///
-    /// In-guest LiteInst arms no ptrace PMU timer either. Reporting perf as
-    /// present for it keeps `--max-timeslice` from being downgraded with a
-    /// warning, so the in-guest refusal sees the timeslice and stops the run.
+    /// Timerless runtimes resolve omitted maximums to disabled and refuse
+    /// explicit timer requests before this host-counter probe.
     fn arms_reverie_ptrace_pmu_timer(&self) -> bool {
         !self.namespace_only && self.backend_arms_reverie_ptrace_pmu_timer()
     }
@@ -6408,6 +6442,7 @@ impl RunOpts {
         &mut self,
         timer: Result<(), TimerUnavailable>,
     ) -> Result<(), Error> {
+        self.resolve_preemption_settings()?;
         let backend = self.selected_backend();
         // LiteInst passes here so that the in-guest refusal, which names why
         // it cannot honour `--skid-margin`, is the one that stops the run.
@@ -8983,6 +9018,31 @@ impl RunOpts {
         self.config_capture = Some(config);
     }
 
+    /// Retain source identity independently of YAML capture, which may fail
+    /// for a non-UTF-8 argument and does not run for embedded OCI commands.
+    pub(crate) fn capture_max_timeslice_source(&mut self, matches: &clap::ArgMatches) {
+        self.max_timeslice_explicit =
+            matches.value_source("max_timeslice") != Some(clap::parser::ValueSource::DefaultValue);
+    }
+
+    fn resolve_preemption_settings(&mut self) -> Result<(), Error> {
+        // Namespace-only runs do not dispatch an instrumentation backend.
+        if self.namespace_only {
+            return Ok(());
+        }
+        let backend = self.selected_backend();
+        if !self.max_timeslice_explicit && !hermit::backend_delivers_preemption_timer(backend) {
+            self.det_opts.det_config.max_timeslice = None;
+            self.max_timeslice_default_disabled = true;
+        }
+        hermit::preemption_admission::refuse_unsupported_preemption(
+            &self.det_opts.det_config,
+            backend,
+            self.skid_margin.is_some(),
+        )
+        .map_err(|refusal| Error::new(PolicyRefusal).context(refusal))
+    }
+
     /// The run config `--save-config` writes: the captured options with the
     /// implicit inputs this run resolved written out, so that loading it
     /// reproduces the run rather than resolving them again.
@@ -9005,6 +9065,12 @@ impl RunOpts {
         if let Some(seed) = self.seed_from_resolved {
             config.run.remove(SEED_FROM_KEY);
             config.run.insert(SEED_KEY.to_owned(), seed.into());
+        }
+        if self.max_timeslice_default_disabled {
+            config.run.insert(
+                crate::manifest::MAX_TIMESLICE_KEY.to_owned(),
+                "disabled".into(),
+            );
         }
         Ok(config)
     }
