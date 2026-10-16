@@ -17487,11 +17487,28 @@ mod nextest_timeout_tests {
         }
         assert!(filters.iter().all(|filter| filter == &filters[0]));
         let cli = std::fs::read_to_string(root.join("hermit-cli/tests/cli.rs")).unwrap();
-        let mut names = cli
-            .lines()
-            .filter_map(|line| {
+        let excluded = "run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting";
+        let lines = cli.lines().collect::<Vec<_>>();
+        let mut names = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| {
                 let name = line.trim().strip_prefix("fn run_kvm_")?.split_once('(')?.0;
-                Some(format!("run_kvm_{name}"))
+                let name = format!("run_kvm_{name}");
+                let ignored = lines[..index]
+                    .iter()
+                    .rev()
+                    .take_while(|line| {
+                        let line = line.trim();
+                        line.is_empty() || line.starts_with("#[") || line.starts_with("///")
+                    })
+                    .any(|line| line.trim().starts_with("#[ignore"));
+                assert_eq!(
+                    ignored,
+                    name == excluded,
+                    "unexpected ignore state for {name}"
+                );
+                Some(name)
             })
             .collect::<Vec<_>>();
         // 57 at ac74963d, and the seventeen run_kvm_timerfd_virtual_* tests
@@ -17522,11 +17539,16 @@ mod nextest_timeout_tests {
         // run_kvm_cpuid_rows_match_ptrace (KVM keeps no CPUID profile): 86.
         // And run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills
         // (https://github.com/rrnewton/hermit/issues/4485): 87.
+        // The disabled-maximum acceptance case makes 88 declarations. The
+        // spinner is retained but ignored and excluded because its explicit
+        // maximum requests an unavailable timer: 87 selected CLI tests remain.
         assert_eq!(
             names.len(),
-            87,
+            88,
             "update the exact CI inventory with new KVM tests"
         );
+        names.retain(|name| name != excluded);
+        assert_eq!(names.len(), 87);
         let required_cases = [
             "run_kvm_self_sigkill_from_nonleader_is_group_fatal",
             "run_kvm_synchronous_root_segv_preserves_guest_exit",
@@ -17542,7 +17564,9 @@ mod nextest_timeout_tests {
             "run_kvm_notifies_a_child_exit_once_at_bitwise_parity",
             "run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity",
             "run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does",
-            "run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting",
+            "run_kvm_with_a_resolved_or_explicitly_disabled_maximum",
+            "run_kvm_a_procfs_directory_keeps_its_size",
+            "run_kvm_a_directory_descriptors_first_seeks",
             "run_kvm_flock_is_a_named_refusal_where_ptrace_excludes",
             "run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills",
             "run_kvm_cpuid_rows_match_ptrace",
@@ -17551,7 +17575,7 @@ mod nextest_timeout_tests {
             assert!(names.iter().any(|name| name == required));
         }
         names.push("kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution".into());
-        let cases = names
+        let mut cases = names
             .iter()
             .map(|name| {
                 (
@@ -17562,6 +17586,12 @@ mod nextest_timeout_tests {
                 )
             })
             .collect::<serde_json::Map<_, _>>();
+        cases.insert(
+            excluded.into(),
+            serde_json::json!({
+                "ignored": true, "filter-match": {"status": "mismatch"}
+            }),
+        );
         let inventory = serde_json::json!({"rust-suites": {"fixture": {"testcases": cases}}});
         let scratch = tempfile::tempdir().unwrap();
         let path = scratch.path().join("inventory.json");
@@ -17580,6 +17610,15 @@ mod nextest_timeout_tests {
             );
         };
         check(&inventory, 0);
+        // Neither an ignored match nor re-enabling the excluded spinner may
+        // silently join the exact active selection.
+        for ignored in [true, false] {
+            let mut included = inventory.clone();
+            included["rust-suites"]["fixture"]["testcases"][excluded] = serde_json::json!({
+                "ignored": ignored, "filter-match": {"status": "matches"}
+            });
+            check(&included, 1);
+        }
         for name in &names {
             let mut missing = inventory.clone();
             missing["rust-suites"]["fixture"]["testcases"]

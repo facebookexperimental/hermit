@@ -47,6 +47,7 @@ pub mod xstate_probe;
 /// own stderr writer reads the same flag.
 pub use detcore::nonwaiting_write;
 pub mod physical_exit_watch;
+pub mod preemption_admission;
 pub mod proc_mount;
 mod ptrace_completion;
 

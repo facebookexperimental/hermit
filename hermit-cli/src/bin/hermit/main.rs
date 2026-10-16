@@ -214,6 +214,13 @@ fn args_from_matches_with_clock(
     });
     let run_epoch_source = run_matches.and_then(|run| run.value_source("epoch"));
     let mut args = Args::from_arg_matches(matches)?;
+    if let Some(run_matches) = run_matches {
+        match &mut args.command {
+            Subcommand::Run(run) => run.capture_max_timeslice_source(run_matches),
+            Subcommand::Oci(oci) => oci.capture_max_timeslice_source(run_matches),
+            _ => unreachable!("only run subcommands carry a maximum timeslice"),
+        }
+    }
     // `--namespace-only` bypasses instrumentation, so an explicit backend would
     // be silently ignored. The backend is a global option, which clap's
     // per-subcommand `conflicts_with` cannot see, so refuse the pair here as the

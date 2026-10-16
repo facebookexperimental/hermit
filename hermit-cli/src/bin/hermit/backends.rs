@@ -1069,6 +1069,18 @@ impl DbtInvocation {
         if let Some(capture) = &stats {
             finish_single_run_dbt_stats(capture, summary, engagement_json)?;
         }
+        if summary {
+            // Report the supplied configuration separately from timer delivery.
+            // DBT's runtime still clears its maximum internally; this does not
+            // change that execution model or claim a preemption mechanism.
+            eprintln!(
+                "{}",
+                detcore_model::summary::PreemptionSummary {
+                    max_timeslice_ns: self.config.max_timeslice.map(|maximum| maximum.get()),
+                    timer_enabled: Some(false),
+                }
+            );
+        }
         Ok(fail_on_dbt_backend_failure(status, stats.as_ref()))
     }
 

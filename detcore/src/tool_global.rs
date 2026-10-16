@@ -47,6 +47,7 @@ use detcore_model::network_engine::NetworkRequest;
 use detcore_model::network_trace::NetworkTraceMode;
 use detcore_model::network_trace::NetworkTraceV2;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
+use detcore_model::summary::PreemptionSummary;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
 pub(crate) use exec_identity::reconnect_exec;
@@ -1762,6 +1763,16 @@ impl GlobalState {
             sched.generate_partial_run_summary_for_log(self.cfg.record_preemptions_to.as_ref())?
         };
         // Second, we fill in the rest based on global state.
+        // Record configuration and the runtime's timer mechanism, not whether
+        // a timer is currently armed or has delivered an event. This metadata
+        // stays separate from the INFO guest-behavior view.
+        summary.preemption = Some(PreemptionSummary {
+            max_timeslice_ns: self.cfg.max_timeslice.map(|maximum| maximum.get()),
+            timer_enabled: Some(
+                self.cfg.max_timeslice.is_some()
+                    && self.cfg.backend.delivers_preemption_timer_events,
+            ),
+        });
         //
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the
@@ -8509,6 +8520,56 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), recorded);
         assert_eq!(summary.to_string(), full);
         assert_eq!(serde_json::to_vec(&summary).unwrap(), json);
+    }
+
+    #[test]
+    fn run_summary_records_the_effective_shared_preemption_configuration() {
+        for (config, expected_maximum, expected_timer) in [
+            (Config::default(), Some(200_000_000), true),
+            (
+                Config {
+                    max_timeslice: None,
+                    ..Config::default()
+                },
+                None,
+                false,
+            ),
+            (
+                Config {
+                    max_timeslice: std::num::NonZeroU64::new(12_340),
+                    ..Config::default()
+                },
+                Some(12_340),
+                true,
+            ),
+            (
+                Config::default().with_backend(|backend| {
+                    backend.delivers_preemption_timer_events = false;
+                }),
+                Some(200_000_000),
+                false,
+            ),
+            (
+                Config {
+                    max_timeslice: None,
+                    ..Config::default()
+                }
+                .with_backend(|backend| {
+                    backend.delivers_preemption_timer_events = false;
+                }),
+                None,
+                false,
+            ),
+        ] {
+            let summary = GlobalState::for_tests(&config).into_run_summary().unwrap();
+            assert_eq!(
+                summary.preemption,
+                Some(super::PreemptionSummary {
+                    max_timeslice_ns: expected_maximum,
+                    timer_enabled: Some(expected_timer),
+                })
+            );
+        }
     }
 
     #[test]

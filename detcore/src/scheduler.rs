@@ -14413,6 +14413,8 @@ impl Scheduler {
                 per_thread_timeslice,
                 // The backend, not the scheduler, measures dispatch.
                 dispatch_stats: None,
+                // GlobalState records the effective run configuration.
+                preemption: None,
             },
             info_reprio_descrip,
         ))

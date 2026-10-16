@@ -104,6 +104,13 @@ fn require_store() -> Result<PodmanStore, Error> {
 }
 
 impl OciOpts {
+    /// Preserve the embedded run's explicit maximum separately from its default.
+    pub(crate) fn capture_max_timeslice_source(&mut self, matches: &clap::ArgMatches) {
+        if let OciSubcommand::Run(opts) = &mut self.command {
+            opts.run.capture_max_timeslice_source(matches);
+        }
+    }
+
     /// Whether this `hermit oci` subcommand starts a guest.
     pub(crate) fn starts_guest(&self) -> bool {
         matches!(self.command, OciSubcommand::Run(_))
@@ -349,6 +356,73 @@ mod tests {
                 assert!(!run.pull, "--pull must default off so run never downloads");
             }
             other => panic!("expected the run subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oci_run_forwards_maximum_source_to_timerless_config_validation() {
+        use clap::CommandFactory;
+
+        for (maximum, refuses) in [
+            (None, false),
+            (Some("--max-timeslice=disabled"), false),
+            (Some("--max-timeslice=200000000"), true),
+        ] {
+            let mut argv = vec![
+                "hermit",
+                "--backend=dbt",
+                "oci",
+                "run",
+                "example.invalid/image:tag",
+                "--epoch=2000-12-31T23:59:59Z",
+            ];
+            argv.extend(maximum);
+            argv.extend(["--", "/nonexistent-oci-preemption-guest"]);
+            let matches = crate::Args::command().try_get_matches_from(argv).unwrap();
+            let args = crate::args_from_matches_with_clock(&matches, || {
+                panic!("an explicit epoch must not sample the host clock")
+            })
+            .unwrap();
+            let crate::Subcommand::Oci(oci) = args.command else {
+                panic!("expected oci subcommand");
+            };
+            let OciSubcommand::Run(mut options) = oci.command else {
+                panic!("expected embedded run subcommand");
+            };
+            // Use the same global selection RunOpts::main installs, without
+            // resolving an OCI store or claiming this backend supports images.
+            options.run.set_backend(args.global.backend);
+            assert_eq!(options.run.global_backend_arg(), " --backend=dbt");
+            let result = options.run.validate_args();
+            if refuses {
+                let error = result.unwrap_err();
+                let message = format!("{error:#}");
+                assert!(
+                    error
+                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .is_some(),
+                    "{message}"
+                );
+                assert!(
+                    message
+                        .contains("unsupported_preemption: --backend=dbt refuses --max-timeslice"),
+                    "{message}"
+                );
+                assert_eq!(
+                    options.run.det_opts.det_config.max_timeslice.map(u64::from),
+                    Some(200_000_000)
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    options.run.det_opts.det_config.max_timeslice.map(u64::from),
+                    if maximum.is_none() {
+                        Some(200_000_000)
+                    } else {
+                        None
+                    }
+                );
+            }
         }
     }
 

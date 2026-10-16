@@ -73,6 +73,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
+use detcore_model::summary::PreemptionSummary;
 use hermit::Error;
 use hermit::Id;
 use serde::Deserialize;
@@ -388,6 +389,10 @@ pub(crate) struct Manifest {
     pub(crate) created: String,
     pub(crate) command: Command,
     pub(crate) inputs: Inputs,
+    /// Configured maximum and runtime timer capability, not measured delivery.
+    /// Absent for older documents and execution without instrumentation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) preemption: Option<PreemptionSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) exit: Option<Exit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -407,6 +412,7 @@ impl Manifest {
             created: rfc3339_utc(std::time::SystemTime::now()),
             command,
             inputs,
+            preemption: None,
             exit: None,
             artifacts: None,
         }
@@ -863,9 +869,39 @@ mod tests {
             code: Some(3),
             signal: None,
         });
+        assert_eq!(manifest.preemption, None);
+        assert!(
+            serde_json::to_value(&manifest)
+                .unwrap()
+                .get("preemption")
+                .is_none()
+        );
         write(&path, &manifest).unwrap();
         assert_eq!(read(&path).unwrap(), manifest);
         assert_eq!(read(path.parent().unwrap()).unwrap(), manifest);
+        for preemption in [
+            PreemptionSummary {
+                max_timeslice_ns: None,
+                timer_enabled: Some(false),
+            },
+            PreemptionSummary {
+                max_timeslice_ns: Some(200_000_000),
+                timer_enabled: Some(false),
+            },
+            PreemptionSummary {
+                max_timeslice_ns: Some(12_340),
+                timer_enabled: Some(true),
+            },
+            PreemptionSummary {
+                max_timeslice_ns: Some(200_000_000),
+                timer_enabled: None,
+            },
+        ] {
+            manifest.preemption = Some(preemption);
+            write(&path, &manifest).unwrap();
+            assert_eq!(read(&path).unwrap(), manifest);
+            assert_eq!(read(path.parent().unwrap()).unwrap(), manifest);
+        }
     }
 
     /// Only the oldest manifest-only recordings beyond the limit go; a
