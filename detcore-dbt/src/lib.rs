@@ -4391,6 +4391,10 @@ mod tests {
     // `flock` remains in this syscall-level register because the zero-argument
     // census represents a malformed operation, which intentionally reaches the
     // kernel for `EINVAL`. Dedicated argument tests prove blocking modes refuse.
+    // `getpid` and `gettid` became Determinized when the ordinary shared Tool
+    // began projecting completed own-ID results. The native client already
+    // answers copied-child queries without shared Tool projection. Record that
+    // pre-existing escape until its ownership moves.
     const ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES: &[&str] = &[
         "accept",
         "accept4",
@@ -4443,6 +4447,7 @@ mod tests {
         "getgid",
         "getitimer",
         "getpeername",
+        "getpid",
         "getpriority",
         "getrandom",
         "getresgid",
@@ -4451,6 +4456,7 @@ mod tests {
         "getrusage",
         "getsockname",
         "getsockopt",
+        "gettid",
         "gettimeofday",
         "getuid",
         "inotify_add_watch",
