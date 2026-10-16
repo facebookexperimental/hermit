@@ -381,17 +381,30 @@ if ! "$ROOT_DIR/ci/retry-on-compiler-crash.sh" cargo clippy --manifest-path "$wo
         'check with clippy' || exit $?
 fi
 cat "$output"
-if ! "$ROOT_DIR/ci/retry-on-compiler-crash.sh" cargo build --release --manifest-path "$workspace_manifest" --workspace \
-    --target-dir "$build_target" >"$output" 2>&1; then
-    report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
+
+# Once clippy has passed, the release build and the test-harness build run side
+# by side: Cargo locks each profile directory of the target separately, and the
+# release build writes release/ while the test harnesses go to debug/. Results
+# are still judged in the old order, release first.
+release_output=$packages/release.output
+"$ROOT_DIR/ci/retry-on-compiler-crash.sh" cargo build --release --manifest-path "$workspace_manifest" --workspace \
+    --target-dir "$build_target" >"$release_output" 2>&1 &
+release_pid=$!
+test_json=$packages/tests.jsonl
+test_output=$packages/test.output
+test_status=0
+"$ROOT_DIR/ci/retry-on-compiler-crash.sh" cargo test --no-run --message-format=json \
+    --manifest-path "$workspace_manifest" "${test_package_args[@]}" \
+    --target-dir "$build_target" >"$test_json" 2>"$test_output" || test_status=$?
+release_status=0
+wait "$release_pid" || release_status=$?
+if ((release_status != 0)); then
+    report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$release_output" \
         'build release executables for' || exit $?
 fi
-cat "$output"
+cat "$release_output"
 
-test_json=$packages/tests.jsonl
-if ! "$ROOT_DIR/ci/retry-on-compiler-crash.sh" cargo test --no-run --message-format=json \
-    --manifest-path "$workspace_manifest" "${test_package_args[@]}" \
-    --target-dir "$build_target" >"$test_json" 2>"$output"; then
+if ((test_status != 0)); then
     # Cargo writes rendered compiler errors to JSON stdout in this mode, while
     # stderr may contain only the final error count. Retain the actual cause
     # before the generated package directory is removed by ordinary cleanup.
@@ -399,10 +412,10 @@ if ! "$ROOT_DIR/ci/retry-on-compiler-crash.sh" cargo test --no-run --message-for
         | (.message.rendered // .message.message)' "$test_json" >&2; then
         printf 'prepare-rust-scripts: could not decode compiler diagnostics from %s\n' "$test_json" >&2
     fi
-    report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
+    report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$test_output" \
         'build test harnesses for' || exit $?
 fi
-cat "$output"
+cat "$test_output"
 
 for index in "${!entrypoints[@]}"; do
     source=${entrypoints[$index]}

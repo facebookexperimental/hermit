@@ -11156,9 +11156,11 @@ fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
     let committed = committed_rust_script_producer(root)?;
     if committed.timeout != RUST_SCRIPT_PRODUCER_WALL_SECONDS
         || committed.cpu_timeout != 7200
-        || committed.hint.rss_baseline_bytes != Some(4 * 1024 * 1024 * 1024)
-        || committed.hint.hard_mem_max_bytes != Some(6 * 1024 * 1024 * 1024)
-        || committed.hint.preferred_inner_jobs != Some(8)
+        // Width 16 and the 7/10-GiB memory pair since 2026-10-16, when the
+        // producer began overlapping its release build with the other phases.
+        || committed.hint.rss_baseline_bytes != Some(7 * 1024 * 1024 * 1024)
+        || committed.hint.hard_mem_max_bytes != Some(10 * 1024 * 1024 * 1024)
+        || committed.hint.preferred_inner_jobs != Some(16)
     {
         return Err(format!(
             "rust-script producer bracket lost its wall/CPU/baseline/hard-cap/width tuple: {committed:?}"
