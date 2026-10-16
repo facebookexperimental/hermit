@@ -1758,8 +1758,16 @@ fi
 # coordinator in the sealed bootstrap (reverie-inguest, reverie-liteinst and the
 # M1 catalog). git diff is empty for reverie-dbt/, so no DynamoRIO build input
 # moves and the budget carries; the reverie-dbt inventory is unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8ae79e16069d5db97847f5ee98dfa81652f60511 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 8ae79e16069d5db97847f5ee98dfa81652f60511 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# KVM CPUID SDK-BUDGET CARRY (2026-10-16): advance
+# 8ae79e16069d5db97847f5ee98dfa81652f60511 to 0f4d8852c99b3091f04ca6b5b354ff1aff120027.
+# c3082de7 changes only reverie-dbt/src/evidence.rs, a test that now restores
+# the subreaper setting and reaps the adopted orphan; no native source changes.
+# 0f4d8852 (KVM keeps no CPUID profile of its own) touches only reverie-kvm
+# and reverie-core. build.rs, vendor/dynamorio, the native client and the root
+# Cargo.toml are unchanged, so the SDK build inputs and their budget carry; no
+# reverie-dbt file is added or removed and the inventory stays 956.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0f4d8852c99b3091f04ca6b5b354ff1aff120027 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0f4d8852c99b3091f04ca6b5b354ff1aff120027 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

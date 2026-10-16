@@ -196,7 +196,6 @@ static OMITTED_PROCFS_NAMES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
-#[cfg(feature = "dbt")]
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "dbt")]
 static CLOCK_RLIMIT_PARITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -28690,6 +28689,45 @@ fn cpuinfo_matches_cpuid() {
 /// Detcore's CPUID table: reverie-kvm opens /proc/cpuinfo onto a fixed stub,
 /// which Detcore's procfs snapshot replaces on read. Before
 /// https://github.com/rrnewton/hermit/pull/4264 it read 15/27 MISMATCH here.
+/// Under KVM each guest `cpuid` is answered by Detcore, as under ptrace, so
+/// the two print the same CPUID rows and the same hle/rtm agreement with
+/// `/proc/cpuinfo`. The backend keeps no CPUID profile of its own (Reverie
+/// c996abb2); its former fixed table was what a non-subscribing Tool's guest
+/// read, while Detcore's answer already reached Hermit runs.
+#[test]
+fn run_kvm_cpuid_rows_match_ptrace() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping KVM CPUID rows: /dev/kvm is unavailable");
+        return;
+    }
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&CPUID_TABLE_DUMP_GUEST, "cpuid_table_dump")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let run = |backend: &str| {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest.as_str(),
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        stdout(&output)
+    };
+    let ptrace = run("ptrace");
+    assert!(
+        ptrace.contains("00000000.0: 0000000d 756e6547 6c65746e 49656e69\n"),
+        "{ptrace}"
+    );
+    assert!(!ptrace.contains("MISMATCH"), "{ptrace}");
+    assert_eq!(run("kvm"), ptrace);
+}
+
 #[test]
 fn run_kvm_cpuinfo_matches_cpuid() {
     if !Path::new("/dev/kvm").exists() {
