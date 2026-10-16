@@ -1432,21 +1432,60 @@ fn opens_the_link_itself(observed: &Path, flags: OFlag) -> bool {
 ///   [`crate::syscalls::namespace::names_through_caller_selector`]): `N` is
 ///   the file its opener reached, which another process or thread that
 ///   inherited or shares it would not reach by that path.
+///
+/// Where the link names the caller's own table and `N` has no recorded path
+/// at all, as for a descriptor received through `SCM_RIGHTS`, `identity` is
+/// recorded instead if given: the procfs directory that the kernel names for
+/// the opened descriptor (see `Detcore::procfs_directory_named_for`). Not
+/// where `N`'s recorded path is refused above, nor where the link names a
+/// table the caller is not proven to hold, whose `N` is not the one
+/// `recorded` describes.
 fn path_to_record_for_open(
     observed: &Path,
     flags: OFlag,
     opener: DescriptorLinkOpener,
     recorded: impl FnOnce(RawFd) -> Option<PathBuf>,
+    identity: Option<PathBuf>,
 ) -> PathBuf {
     use crate::syscalls::namespace::DescriptorTable;
     if opens_the_link_itself(observed, flags) {
         return observed.to_path_buf();
     }
-    crate::syscalls::namespace::own_descriptor_link(observed, opener.own)
-        .filter(|link| link.table == DescriptorTable::Thread || opener.holds_process_table)
-        .and_then(|link| recorded(link.fd))
-        .filter(|path| !crate::syscalls::namespace::names_through_caller_selector(path))
-        .unwrap_or_else(|| observed.to_path_buf())
+    let Some(link) = crate::syscalls::namespace::own_descriptor_link(observed, opener.own) else {
+        return observed.to_path_buf();
+    };
+    if !(link.table == DescriptorTable::Thread || opener.holds_process_table) {
+        return observed.to_path_buf();
+    }
+    match recorded(link.fd) {
+        Some(path) => {
+            (!crate::syscalls::namespace::names_through_caller_selector(&path)).then_some(path)
+        }
+        None => identity,
+    }
+    .unwrap_or_else(|| observed.to_path_buf())
+}
+
+/// Whether `link`, the kernel's name for a descriptor (its
+/// `/proc/thread-self/fd/N` link), names a procfs directory path Detcore
+/// may record for it: `/proc`, or a path below it that names no process or
+/// thread (`procfs::ids::named_ids`, and no numeric component at all),
+/// whose numbers are the kernel's and need not be the guest's, nor a
+/// selector procfs resolves per caller. Not a deleted directory
+/// (`" (deleted)"`), an anonymous object or a relative target, nor any other
+/// directory.
+fn procfs_directory_link(link: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = link.as_os_str().as_bytes();
+    link.starts_with("/proc")
+        && !bytes.ends_with(b" (deleted)")
+        && link.components().all(|component| match component {
+            std::path::Component::RootDir => true,
+            std::path::Component::Normal(name) => !name.as_bytes().iter().all(u8::is_ascii_digit),
+            _ => false,
+        })
+        && crate::procfs::ids::named_ids(link).is_empty()
+        && !crate::syscalls::namespace::names_through_caller_selector(link)
 }
 
 /// Whether a stat call's own arguments are ones Linux accepts before it looks
@@ -3699,35 +3738,70 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // also keeps the spelling wherever the link may reach
                 // another file). Not after a `chroot`, where `/proc` and
                 // `/dev/fd` need not be what they are outside it.
+                //
+                // The leader holds the table procfs reads for
+                // `/proc/self/fd`, and so does every thread that holds the
+                // same table: the process's, which the group shares
+                // (`process_files`). Not known only for a state restored
+                // from before that was kept, where only the leader is shown
+                // to hold it.
+                let opener = {
+                    let detpid = self.own_detpid(guest);
+                    let state = guest.thread_state();
+                    DescriptorLinkOpener {
+                        own: self.procfs_caller_ids(guest),
+                        holds_process_table: state.dettid == detpid || state.holds_process_files(),
+                    }
+                };
+                // Where `N`, in the caller's own table, has no recorded path
+                // at all (a descriptor received through SCM_RIGHTS, which
+                // Detcore does not track, or one discovered without one), a
+                // procfs directory is named as the kernel beneath the backend
+                // names the opened descriptor (`procfs_directory_named_for`,
+                // one injected `readlinkat`). Only where Detcore renders
+                // procfs files (not under record and replay, which does not
+                // record that call, nor after a `chroot`), and with
+                // sequentialized threads, so that no other guest thread can
+                // replace the descriptor before the link is read.
+                let unrecorded_link_identity = if self.renders_procfs(guest)
+                    && guest.config().sequentialize_threads
+                    && !opens_the_link_itself(&observed_path, call.flags())
+                    && host_stat.is_none_or(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFDIR)
+                    && link_source
+                        .as_ref()
+                        .is_none_or(|source| source.path.is_none())
+                    && crate::syscalls::namespace::own_descriptor_link(&observed_path, opener.own)
+                        .is_some_and(|link| {
+                            link.table == crate::syscalls::namespace::DescriptorTable::Thread
+                                || opener.holds_process_table
+                        }) {
+                    Self::procfs_directory_named_for(guest, fd).await
+                } else {
+                    None
+                };
                 let recorded_path = {
                     let state = guest.thread_state();
                     if state.changed_root.load(Ordering::SeqCst) {
                         observed_path.clone()
                     } else {
-                        let detpid = self.own_detpid(guest);
-                        // The leader holds the table procfs reads for
-                        // `/proc/self/fd`, and so does every thread that
-                        // holds the same table: the process's, which the
-                        // group shares (`process_files`). Not known only
-                        // for a state restored from before that was kept,
-                        // where only the leader is shown to hold it.
-                        let opener = DescriptorLinkOpener {
-                            own: self.procfs_caller_ids(guest),
-                            holds_process_table: state.dettid == detpid
-                                || state.holds_process_files(),
-                        };
                         // `N` as the lookup saw it, and only if `N` still holds
                         // the same open file description: a thread sharing
                         // the table may have replaced it while the open
                         // waited (`LinkSource`).
-                        path_to_record_for_open(&observed_path, call.flags(), opener, |target| {
-                            link_source.as_ref().and_then(|source| {
-                                source.path_if_unchanged(
-                                    target,
-                                    state.with_detfd(target, |detfd| detfd.open_file_id()).ok(),
-                                )
-                            })
-                        })
+                        path_to_record_for_open(
+                            &observed_path,
+                            call.flags(),
+                            opener,
+                            |target| {
+                                link_source.as_ref().and_then(|source| {
+                                    source.path_if_unchanged(
+                                        target,
+                                        state.with_detfd(target, |detfd| detfd.open_file_id()).ok(),
+                                    )
+                                })
+                            },
+                            unrecorded_link_identity,
+                        )
                     }
                 };
                 guest.thread_state().with_detfd(fd, |detfd| {
@@ -4263,6 +4337,54 @@ impl<T: RecordOrReplay> Detcore<T> {
             contents.resize(start + bytes_read, 0);
             read_guest_exact(&guest.memory(), scratch, &mut contents[start..])?;
         }
+    }
+
+    /// The procfs directory that the kernel beneath the backend names for
+    /// descriptor `fd`, which this guest thread just opened: its
+    /// `/proc/thread-self/fd/<fd>` link, read by a `readlinkat` injected in
+    /// the guest thread, which the host kernel answers under ptrace and DBT
+    /// and the KVM executor answers for its own `/proc`, if that names a
+    /// directory Detcore may record (`procfs_directory_link`). `None`
+    /// otherwise, and where the guest stack scratch cannot hold the call's
+    /// buffers, the call fails, or the link does not fit in 256 bytes: every
+    /// path accepted is far shorter, and a truncated one must not match.
+    async fn procfs_directory_named_for<G: Guest<Self>>(
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Option<PathBuf> {
+        const LINK_CAPACITY: usize = 40;
+        const TARGET_CAPACITY: usize = 256;
+        let mut stack = guest.stack().await;
+        let link = stack.push(rendered_procfs::c_string::<LINK_CAPACITY>(
+            format!("/proc/thread-self/fd/{fd}").as_bytes(),
+        ));
+        let target = stack.reserve::<[u8; TARGET_CAPACITY]>();
+        let stack_guard = stack.commit().ok()?;
+        let length = guest
+            .inject(
+                syscalls::Readlinkat::new()
+                    .with_dirfd(libc::AT_FDCWD)
+                    .with_path(PathPtr::from_ptr(link.as_raw() as *const libc::c_char))
+                    .with_buf(Some(target.cast::<libc::c_char>()))
+                    .with_buf_len(TARGET_CAPACITY),
+            )
+            .await;
+        let bytes = match length.map(|length| length as usize) {
+            Ok(length) if length < TARGET_CAPACITY => {
+                let mut bytes = vec![0; length];
+                guest
+                    .memory()
+                    .read_exact(target.cast::<u8>(), &mut bytes)
+                    .ok()
+                    .map(|()| bytes)
+            }
+            _ => None,
+        };
+        drop(stack_guard);
+        let named = PathBuf::from(
+            <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes?),
+        );
+        procfs_directory_link(&named).then_some(named)
     }
 
     /// What descriptor `fd` of the calling process names, as its
@@ -11842,7 +11964,7 @@ mod test {
             "/proc/3/fd/4",
             "/proc/3/task/3/fd/4",
         ] {
-            let recorded = path_to_record_for_open(Path::new(spelling), read, leader, table);
+            let recorded = path_to_record_for_open(Path::new(spelling), read, leader, table, None);
             assert_eq!(recorded, Path::new("/proc"), "{spelling}");
             // A dirfd-relative name below the new descriptor is then the
             // rendered file's own path (`Detcore::observed_path`).
@@ -11854,21 +11976,26 @@ mod test {
         }
         // An alias of an alias: the second open finds the first's recorded
         // path, already the target's.
-        let first = path_to_record_for_open(Path::new("/proc/self/fd/4"), read, leader, table);
-        let second = path_to_record_for_open(Path::new("/dev/fd/9"), read, leader, |fd| {
-            (fd == 9).then(|| first.clone())
-        });
+        let first =
+            path_to_record_for_open(Path::new("/proc/self/fd/4"), read, leader, table, None);
+        let second = path_to_record_for_open(
+            Path::new("/dev/fd/9"),
+            read,
+            leader,
+            |fd| (fd == 9).then(|| first.clone()),
+            None,
+        );
         assert_eq!(second, Path::new("/proc"));
         // O_NOFOLLOW opens the link itself (O_PATH) unless a trailing slash
         // or `/.` follows it.
         let nofollow = OFlag::O_PATH | OFlag::O_NOFOLLOW;
         assert_eq!(
-            path_to_record_for_open(Path::new("/proc/self/fd/4"), nofollow, leader, table),
+            path_to_record_for_open(Path::new("/proc/self/fd/4"), nofollow, leader, table, None),
             Path::new("/proc/self/fd/4")
         );
         for spelling in ["/proc/self/fd/4/", "/proc/self/fd/4/.", "/dev/fd/4/"] {
             assert_eq!(
-                path_to_record_for_open(Path::new(spelling), nofollow, leader, table),
+                path_to_record_for_open(Path::new(spelling), nofollow, leader, table, None),
                 Path::new("/proc"),
                 "{spelling}"
             );
@@ -11882,15 +12009,19 @@ mod test {
         };
         for spelling in ["/proc/self/fd/4", "/dev/fd/4", "/proc/3/fd/4"] {
             assert_eq!(
-                path_to_record_for_open(Path::new(spelling), read, split, |_| {
-                    panic!("{spelling} names the leader's table, not the caller's")
-                }),
+                path_to_record_for_open(
+                    Path::new(spelling),
+                    read,
+                    split,
+                    |_| { panic!("{spelling} names the leader's table, not the caller's") },
+                    None
+                ),
                 Path::new(spelling)
             );
         }
         for spelling in ["/proc/thread-self/fd/4", "/proc/3/task/5/fd/4"] {
             assert_eq!(
-                path_to_record_for_open(Path::new(spelling), read, split, table),
+                path_to_record_for_open(Path::new(spelling), read, split, table, None),
                 Path::new("/proc"),
                 "{spelling}"
             );
@@ -11907,20 +12038,24 @@ mod test {
             "/proc/7/fd/4",
         ] {
             assert_eq!(
-                path_to_record_for_open(Path::new(spelling), read, leader, table),
+                path_to_record_for_open(Path::new(spelling), read, leader, table, None),
                 Path::new(spelling)
             );
         }
         assert_eq!(
-            path_to_record_for_open(Path::new("/dev/fd/11"), read, leader, table),
+            path_to_record_for_open(Path::new("/dev/fd/11"), read, leader, table, None),
             Path::new("/proc/12")
         );
         // So does every open that names no descriptor link.
         for spelling in ["/proc/stat", "/proc/self/fd/4/stat", "/tmp/x"] {
             assert_eq!(
-                path_to_record_for_open(Path::new(spelling), read, leader, |_| {
-                    panic!("{spelling} names no descriptor")
-                }),
+                path_to_record_for_open(
+                    Path::new(spelling),
+                    read,
+                    leader,
+                    |_| { panic!("{spelling} names no descriptor") },
+                    None
+                ),
                 Path::new(spelling)
             );
         }
@@ -11939,21 +12074,158 @@ mod test {
         let unchanged = Some(fifo.open_file);
         let spelling = Path::new("/proc/self/fd/5");
         assert_eq!(
-            path_to_record_for_open(spelling, read, leader, |fd| fifo
-                .path_if_unchanged(fd, unchanged)),
+            path_to_record_for_open(
+                spelling,
+                read,
+                leader,
+                |fd| fifo.path_if_unchanged(fd, unchanged),
+                None
+            ),
             Path::new("/tmp/dir/fifo")
         );
         assert_eq!(
-            path_to_record_for_open(spelling, read, leader, |fd| fifo
-                .path_if_unchanged(fd, replaced)),
+            path_to_record_for_open(
+                spelling,
+                read,
+                leader,
+                |fd| fifo.path_if_unchanged(fd, replaced),
+                None
+            ),
             spelling
         );
         assert_eq!(
-            path_to_record_for_open(spelling, read, leader, |fd| fifo
-                .path_if_unchanged(fd, None)),
+            path_to_record_for_open(
+                spelling,
+                read,
+                leader,
+                |fd| fifo.path_if_unchanged(fd, None),
+                None
+            ),
             spelling
         );
         assert_eq!(fifo.path_if_unchanged(4, unchanged), None);
+    }
+
+    /// Where the descriptor a link names has no recorded path (one received
+    /// through `SCM_RIGHTS`, which Detcore does not track), an open through
+    /// the link records the procfs directory the kernel names for the opened
+    /// descriptor (`Detcore::procfs_directory_named_for`): `/proc`, below
+    /// which `stat` is `/proc/stat`. Without that name it keeps the
+    /// spelling, as before. A recorded path of `N` still comes first, and the
+    /// name is never taken for a link opened itself, a spelling that names no
+    /// descriptor link, or a link to a table the caller does not hold. Only
+    /// `/proc` and the pid-free paths below it are names the kernel's link
+    /// may give (`procfs_directory_link`).
+    #[test]
+    fn an_open_through_an_unrecorded_descriptors_link_records_its_identity() {
+        use std::path::Path;
+        use std::path::PathBuf;
+
+        use super::DescriptorLinkOpener;
+        use super::path_to_record_for_open;
+
+        let leader = DescriptorLinkOpener {
+            own: Some((3, 3)),
+            holds_process_table: true,
+        };
+        let read = OFlag::O_RDONLY | OFlag::O_DIRECTORY;
+        let proc = || Some(PathBuf::from("/proc"));
+        for spelling in [
+            "/proc/self/fd/10",
+            "/dev/fd/10",
+            "/proc/thread-self/fd/10",
+            "/proc/3/fd/10",
+            "/proc/3/task/3/fd/10",
+        ] {
+            let recorded =
+                path_to_record_for_open(Path::new(spelling), read, leader, |_| None, proc());
+            assert_eq!(recorded, Path::new("/proc"), "{spelling}");
+            assert_eq!(recorded.join("stat"), Path::new("/proc/stat"));
+            assert_eq!(
+                path_to_record_for_open(Path::new(spelling), read, leader, |_| None, None),
+                Path::new(spelling)
+            );
+        }
+        assert_eq!(
+            path_to_record_for_open(
+                Path::new("/proc/self/fd/4"),
+                read,
+                leader,
+                |fd| (fd == 4).then(|| PathBuf::from("/proc/12")),
+                proc(),
+            ),
+            Path::new("/proc/12")
+        );
+        let nofollow = OFlag::O_PATH | OFlag::O_NOFOLLOW;
+        assert_eq!(
+            path_to_record_for_open(
+                Path::new("/proc/self/fd/10"),
+                nofollow,
+                leader,
+                |_| None,
+                proc()
+            ),
+            Path::new("/proc/self/fd/10")
+        );
+        for spelling in ["/proc/self/fd/10/stat", "/tmp/x"] {
+            assert_eq!(
+                path_to_record_for_open(Path::new(spelling), read, leader, |_| None, proc()),
+                Path::new(spelling)
+            );
+        }
+        // A recorded path refused as per caller is not replaced by the name.
+        assert_eq!(
+            path_to_record_for_open(
+                Path::new("/proc/self/fd/8"),
+                read,
+                leader,
+                |_| Some(PathBuf::from("/proc/self")),
+                proc(),
+            ),
+            Path::new("/proc/self/fd/8")
+        );
+        // A thread with a table of its own: the process's links name the
+        // leader's table, whose N the caller's table does not describe, so
+        // they keep the spelling; its own thread links take the name.
+        let split = DescriptorLinkOpener {
+            own: Some((3, 5)),
+            holds_process_table: false,
+        };
+        for spelling in ["/proc/self/fd/10", "/dev/fd/10", "/proc/3/fd/10"] {
+            assert_eq!(
+                path_to_record_for_open(Path::new(spelling), read, split, |_| None, proc()),
+                Path::new(spelling)
+            );
+        }
+        for spelling in ["/proc/thread-self/fd/10", "/proc/3/task/5/fd/10"] {
+            assert_eq!(
+                path_to_record_for_open(Path::new(spelling), read, split, |_| None, proc()),
+                Path::new("/proc"),
+                "{spelling}"
+            );
+        }
+        use super::procfs_directory_link;
+        for accepted in ["/proc", "/proc/sys", "/proc/sys/kernel", "/proc/sys/net"] {
+            assert!(procfs_directory_link(Path::new(accepted)), "{accepted}");
+        }
+        for refused in [
+            "/tmp/dir",
+            "/procfs",
+            "/proc (deleted)",
+            "/proc/sys (deleted)",
+            "/proc/12",
+            "/proc/12/task/12",
+            "/proc/self",
+            "/proc/thread-self",
+            // A symbolic link to the caller's own /proc/self/net.
+            "/proc/net",
+            "/proc/sys/../12",
+            "proc",
+            "anon_inode:[eventfd]",
+            "/memfd:x (deleted)",
+        ] {
+            assert!(!procfs_directory_link(Path::new(refused)), "{refused}");
+        }
     }
 
     #[test]

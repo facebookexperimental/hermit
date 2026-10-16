@@ -2402,7 +2402,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from 955bbf36: 1918.
     // Numeric procfs stream ordering and ordinary-name regression tests: +2.
     // And +1 from a52129ba: 1921.
-    ("test.detcore_unit", 1921),
+    // And syscalls::files::test::an_open_through_an_unrecorded_descriptors_link_records_its_identity
+    // (https://github.com/rrnewton/hermit/issues/4213): 1922, listed.
+    ("test.detcore_unit", 1922),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4165,7 +4167,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from 955bbf36: 1918.
     // Numeric procfs stream ordering and ordinary-name regression tests: +2.
     // And +1 from a52129ba: 1921.
-    ("test.detcore_unit_on_host", 1921),
+    // And the 4213 unrecorded-descriptor link test: 1922.
+    ("test.detcore_unit_on_host", 1922),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

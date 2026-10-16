@@ -115,7 +115,9 @@
  *     either option, the order is skipped for each spelling.
  *   --alias-bytes requires a file opened relative to a /proc descriptor that
  *     was itself opened through a descriptor link to read the bytes /proc's
- *     own name reads at the same moment (check_directory_aliases), which
+ *     own name reads at the same moment (check_directory_aliases, and
+ *     check_received_directory_aliases for the link of a /proc descriptor
+ *     received through SCM_RIGHTS), which
  *     holds where Detcore renders the files; natively the host's files change
  *     between reads, so only their identity and form are checked. It also
  *     requires the blocked open of check_alias_source_replaced_during_a_
@@ -141,6 +143,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/sendfile.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
@@ -1502,6 +1505,88 @@ static void check_directory_aliases_in_a_thread(void) {
         "directory aliases in a thread");
 }
 
+/* A copy of `fd` received through SCM_RIGHTS on a socketpair, or -1. */
+static int received_copy(int fd) {
+  int sockets[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+    CHECK(0, "socketpair: %s", strerror(errno));
+    return -1;
+  }
+  char byte = 'r';
+  struct iovec iov = {.iov_base = &byte, .iov_len = 1};
+  union {
+    char bytes[CMSG_SPACE(sizeof(int))];
+    struct cmsghdr align;
+  } control;
+  memset(&control, 0, sizeof(control));
+  struct msghdr message = {.msg_iov = &iov,
+                           .msg_iovlen = 1,
+                           .msg_control = control.bytes,
+                           .msg_controllen = sizeof(control.bytes)};
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+  header->cmsg_level = SOL_SOCKET;
+  header->cmsg_type = SCM_RIGHTS;
+  header->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(header), &fd, sizeof(int));
+  int received = -1;
+  if (sendmsg(sockets[0], &message, 0) != 1) {
+    CHECK(0, "sendmsg(SCM_RIGHTS): %s", strerror(errno));
+  } else {
+    memset(&control, 0, sizeof(control));
+    message.msg_controllen = sizeof(control.bytes);
+    if (recvmsg(sockets[1], &message, MSG_CMSG_CLOEXEC) != 1) {
+      CHECK(0, "recvmsg(SCM_RIGHTS): %s", strerror(errno));
+    } else {
+      header = CMSG_FIRSTHDR(&message);
+      if (header != NULL && header->cmsg_level == SOL_SOCKET &&
+          header->cmsg_type == SCM_RIGHTS && header->cmsg_len == CMSG_LEN(sizeof(int))) {
+        memcpy(&received, CMSG_DATA(header), sizeof(int));
+      }
+      CHECK(received >= 0, "recvmsg delivered no descriptor");
+    }
+  }
+  close(sockets[0]);
+  close(sockets[1]);
+  return received;
+}
+
+/* check_directory_aliases for a /proc descriptor this process received
+ * through SCM_RIGHTS, which no open of this process named: each of its
+ * own descriptor links (/proc/self/fd/R, /dev/fd/R, /proc/thread-self/fd/R
+ * and /proc/<getpid()>/fd/R) opens /proc, and `name` below it is
+ * /proc/<name>, with the same identity and, under --alias-bytes, the same
+ * bytes. */
+static void check_received_directory_aliases(const char* name, enum kind kind) {
+  char canonical[128];
+  snprintf(canonical, sizeof(canonical), "/proc/%s", name);
+  struct stat by_path;
+  CHECK(stat(canonical, &by_path) == 0, "stat(%s): %s", canonical, strerror(errno));
+  int proc = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(proc >= 0, "open(/proc): %s", strerror(errno));
+  if (proc < 0) {
+    return;
+  }
+  int received = received_copy(proc);
+  close(proc);
+  if (received < 0) {
+    return;
+  }
+  const int directory_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+  char spellings[4][64];
+  snprintf(spellings[0], sizeof(spellings[0]), "/proc/self/fd/%d", received);
+  snprintf(spellings[1], sizeof(spellings[1]), "/dev/fd/%d", received);
+  snprintf(spellings[2], sizeof(spellings[2]), "/proc/thread-self/fd/%d", received);
+  snprintf(spellings[3], sizeof(spellings[3]), "/proc/%ld/fd/%d", (long)getpid(), received);
+  for (size_t i = 0; i < sizeof(spellings) / sizeof(spellings[0]); i++) {
+    int directory = check_directory_alias(spellings[i], directory_flags, name, canonical,
+                                          &by_path, kind);
+    if (directory >= 0) {
+      close(directory);
+    }
+  }
+  close(received);
+}
+
 /* The process's descriptor links (/proc/self/fd/N, /dev/fd/N) name the
  * thread-group leader's descriptor table, which a thread cloned without
  * CLONE_FILES does not share; /proc/thread-self/fd/N names the thread's
@@ -2323,6 +2408,8 @@ int main(int argc, char** argv) {
   check_directory_aliases("sys/kernel/pty/nr", COUNT);
   check_directory_aliases("sys/kernel/random/uuid", UUID);
   check_directory_aliases_in_a_thread();
+  check_received_directory_aliases("stat", STAT);
+  check_received_directory_aliases("uptime", UPTIME);
   check_aliases_in_a_clone_files_process();
   check_aliases_after_a_thread_exec();
   check_alias_source_replaced_during_a_blocked_open();
