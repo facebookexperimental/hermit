@@ -10134,13 +10134,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self.serve_next_batch(guest, call).await;
         }
         let mark = directory_snapshot_mark(guest).await;
-        if let Some((entries, inodes)) = self.modeled_directory_snapshot(guest, call).await? {
+        if let Some((entries, inodes, order)) = self.modeled_directory_snapshot(guest, call).await?
+        {
             let mut entries = Some(entries);
             guest.thread_state().with_detfd(call.fd, |detfd| {
                 detfd.install_directory_snapshot(
                     entries.take().unwrap_or_default(),
                     mark,
                     inodes.clone(),
+                    order,
                 )
             })?;
             return self.serve_next_batch(guest, call).await;
@@ -10157,6 +10159,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         entries.take().unwrap_or_default(),
                         mark,
                         inodes.clone(),
+                        DirectoryOrder::NameBytes,
                     )
                 })?;
                 self.serve_next_batch(guest, call).await
@@ -10218,11 +10221,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some((_, true)) => {
                 let mark = directory_snapshot_mark(guest).await;
                 let modeled = self.modeled_directory_snapshot(guest, call).await?;
-                let (snapshot, inodes) = match modeled {
-                    Some((entries, inodes)) => (Ok(Some(entries)), inodes),
+                let (snapshot, inodes, order) = match modeled {
+                    Some((entries, inodes, order)) => (Ok(Some(entries)), inodes, order),
                     None => {
                         let inodes = self.directory_inodes(guest, call.fd).await?;
-                        (self.snapshot_directory_privately(guest, call).await, inodes)
+                        (
+                            self.snapshot_directory_privately(guest, call).await,
+                            inodes,
+                            DirectoryOrder::NameBytes,
+                        )
                     }
                 };
                 match snapshot {
@@ -10233,6 +10240,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 entries.take().unwrap_or_default(),
                                 mark,
                                 inodes.clone(),
+                                order,
                             );
                             detfd.with_directory_stream(|stream| stream.kernel_target())
                         })??;
@@ -10375,7 +10383,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: GetdentsCall<'_>,
-    ) -> Result<Option<(Vec<DirEntry>, DirectoryInodes)>, Error> {
+    ) -> Result<Option<(Vec<DirEntry>, DirectoryInodes, DirectoryOrder)>, Error> {
         let fd = call.fd;
         use std::os::unix::ffi::OsStrExt;
 
@@ -10611,7 +10619,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             last.off = last.off.max(host_end);
         }
         let inodes = DirectoryInodes::new(stat.dev, Some(ProcfsDirectory::new(within)));
-        Ok(Some((entries, inodes)))
+        let order = match &directory {
+            ModeledDirectory::System(names) if names.is_empty() => DirectoryOrder::ProcfsIds,
+            ModeledDirectory::Tasks(_) => DirectoryOrder::ProcfsIds,
+            _ => DirectoryOrder::NameBytes,
+        };
+        Ok(Some((entries, inodes, order)))
     }
 
     /// The inode number a lookup of each of `paths` from the directory open as

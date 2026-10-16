@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::dirents::DirEntry;
+use crate::dirents::DirectoryOrder;
 use crate::dirents::DirectoryStream;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
@@ -1370,10 +1371,11 @@ impl DetFd {
         entries: Vec<DirEntry>,
         mark: SnapshotMark,
         inodes: DirectoryInodes,
+        order: DirectoryOrder,
     ) {
         self.with_description(|d| {
             let stream = d.directory.get_or_insert_with(DirectoryStream::default);
-            stream.install(entries);
+            stream.install(entries, order);
             stream.note_snapshot_mark(mark);
             stream.note_snapshot_inodes(inodes);
         });
@@ -1774,6 +1776,7 @@ mod tests {
                 threads_counted: 7,
             },
             DirectoryInodes::new(11, None),
+            DirectoryOrder::NameBytes,
         );
         alias
             .with_directory_stream(|stream| stream.advance(1))

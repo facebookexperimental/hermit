@@ -371,6 +371,42 @@ fn compare_dir_entries(a: &DirEntry, b: &DirEntry) -> std::cmp::Ordering {
         .then_with(|| a.name.cmp(&b.name))
 }
 
+/// How to order a snapshot. Only modeled procfs root and task directories
+/// contain the model's numeric process/thread identities.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DirectoryOrder {
+    NameBytes,
+    ProcfsIds,
+}
+
+impl DirectoryOrder {
+    fn compare(self, a: &DirEntry, b: &DirEntry) -> std::cmp::Ordering {
+        match self {
+            Self::NameBytes => compare_dir_entries(a, b),
+            Self::ProcfsIds => {
+                fn key(name: &[u8]) -> (u8, i32, &[u8]) {
+                    match name {
+                        b"." => (0, 0, name),
+                        b".." => (1, 0, name),
+                        _ => {
+                            let id = (name.first().is_some_and(|byte| *byte != b'0')
+                                && name.iter().all(u8::is_ascii_digit))
+                            .then(|| std::str::from_utf8(name).ok()?.parse::<i32>().ok())
+                            .flatten()
+                            .filter(|id| *id > 0);
+                            match id {
+                                Some(id) => (2, id, name),
+                                None => (3, 0, name),
+                            }
+                        }
+                    }
+                }
+                key(&a.name).cmp(&key(&b.name))
+            }
+        }
+    }
+}
+
 /// The guest-visible directory stream of one open file description.
 ///
 /// Linux returns entries in an order and with `d_off` cookies that depend on
@@ -441,14 +477,14 @@ impl DirectoryStream {
 
     /// Install the entries of a whole directory, read from the kernel in host
     /// order until the end, which is where the kernel position is left.
-    pub(crate) fn install(&mut self, entries: Vec<DirEntry>) {
+    pub(crate) fn install(&mut self, entries: Vec<DirEntry>, order: DirectoryOrder) {
         // An entry's host `d_off` is the host position after it, so reading
         // from the position after entry `i - 1` returns entries `i` onwards in
         // host order. For each stream position, start at the entry with the
         // lowest host index among those not yet returned.
         let host_offsets: Vec<i64> = entries.iter().map(|entry| entry.off).collect();
         let mut indexed: Vec<(usize, DirEntry)> = entries.into_iter().enumerate().collect();
-        indexed.sort_by(|(_, a), (_, b)| compare_dir_entries(a, b));
+        indexed.sort_by(|(_, a), (_, b)| order.compare(a, b));
         let end = host_offsets.last().copied().unwrap_or(0);
         let mut resume = vec![end; indexed.len() + 1];
         let mut earliest = usize::MAX;
@@ -1198,7 +1234,10 @@ mod test {
     fn stream_serves_whole_directory_in_order_across_small_buffers() {
         let mut stream = DirectoryStream::default();
         assert!(stream.needs_snapshot());
-        stream.install(["c", "a", "b"].into_iter().map(entry).collect());
+        stream.install(
+            ["c", "a", "b"].into_iter().map(entry).collect(),
+            DirectoryOrder::NameBytes,
+        );
         assert!(!stream.needs_snapshot());
 
         // Each one-letter dirent64 record is 24 bytes: two fit in 48.
@@ -1218,9 +1257,88 @@ mod test {
     }
 
     #[test]
+    fn modeled_procfs_ids_keep_numeric_order_and_host_resume_positions() {
+        // Visible ID order differs from host-cookie order and byte order.
+        let host = [
+            ("10", 11),
+            ("cmdline", 23),
+            ("..", 37),
+            ("3", 41),
+            ("self", 59),
+            ("1", 61),
+            (".", 73),
+            ("11", 89),
+        ];
+        let entries = || {
+            host.iter()
+                .map(|&(name, off)| DirEntry { off, ..entry(name) })
+                .collect()
+        };
+        let expected = [".", "..", "1", "3", "10", "11", "cmdline", "self"];
+        let resume = [0, 0, 0, 0, 0, 11, 11, 41, 89];
+        for format in [DirentFormat::Legacy, DirentFormat::Dirent64] {
+            let mut stream = DirectoryStream::default();
+            stream.install(entries(), DirectoryOrder::ProcfsIds);
+            for (position, name) in expected.iter().enumerate() {
+                assert_eq!(stream.position(), position as u64);
+                assert_eq!(stream.kernel_target(), resume[position]);
+                let batch = stream
+                    .next_batch(format, format.record_len(name.len()))
+                    .unwrap();
+                assert_eq!(names(&batch), [*name]);
+                stream.advance(batch.len());
+            }
+            assert_eq!(stream.kernel_target(), resume[expected.len()]);
+            assert!(stream.next_batch(format, 1024).unwrap().is_empty());
+            stream.seek(3);
+            assert_eq!(names(&stream.next_batch(format, 24).unwrap()), ["3"]);
+            assert_eq!(stream.kernel_target(), 0);
+
+            // A negative-count getdents can install a snapshot after a rewind
+            // and nonzero seek, before a normal read serves the same stream.
+            stream.seek(0);
+            assert!(stream.needs_snapshot());
+            stream.seek(4);
+            stream.install(entries(), DirectoryOrder::ProcfsIds);
+            assert_eq!(stream.position(), 4);
+            assert_eq!(names(&stream.next_batch(format, 48).unwrap()), ["10", "11"]);
+            assert_eq!(stream.kernel_target(), 0);
+        }
+    }
+
+    #[test]
+    fn ordinary_directory_numeric_names_keep_byte_order() {
+        let mut stream = DirectoryStream::default();
+        stream.install(
+            ["10", "cmdline", "..", "3", "self", "1", ".", "11"]
+                .into_iter()
+                .map(entry)
+                .collect(),
+            DirectoryOrder::NameBytes,
+        );
+        assert_eq!(
+            names(&stream.next_batch(DirentFormat::Dirent64, 1024).unwrap()),
+            [".", "..", "1", "10", "11", "3", "cmdline", "self"]
+        );
+        // Numeric and non-ID names must have separate categories: a numeric
+        // comparison with a lexical fallback between categories can cycle.
+        stream.install(
+            ["2", "10", "15x", "03", "0", "2147483648"]
+                .into_iter()
+                .map(entry)
+                .collect(),
+            DirectoryOrder::ProcfsIds,
+        );
+        assert_eq!(
+            names(&stream.next_batch(DirentFormat::Dirent64, 1024).unwrap()),
+            ["2", "10", "0", "03", "15x", "2147483648"]
+        );
+    }
+
+    #[test]
     fn stream_rejects_a_buffer_too_small_for_the_next_entry() {
         let mut stream = DirectoryStream::default();
-        stream.install(vec![entry("a")]);
+        stream.install(vec![entry("a")], DirectoryOrder::NameBytes);
         assert_eq!(
             stream.next_batch(DirentFormat::Dirent64, 23),
             Err(Errno::EINVAL)
@@ -1235,7 +1353,10 @@ mod test {
     #[test]
     fn stream_seek_positions_by_index_and_rewind_refreshes() {
         let mut stream = DirectoryStream::default();
-        stream.install(["a", "b", "c"].into_iter().map(entry).collect());
+        stream.install(
+            ["a", "b", "c"].into_iter().map(entry).collect(),
+            DirectoryOrder::NameBytes,
+        );
         stream.seek(2);
         assert!(!stream.needs_snapshot());
         assert_eq!(
@@ -1263,6 +1384,7 @@ mod test {
             host.iter()
                 .map(|&(name, off)| DirEntry { off, ..entry(name) })
                 .collect(),
+            DirectoryOrder::NameBytes,
         );
 
         // After each stream position, the host position that the kernel
