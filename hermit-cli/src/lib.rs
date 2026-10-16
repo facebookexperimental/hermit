@@ -3327,11 +3327,9 @@ mod dbt_detconfig_tests {
     fn dbt_detconfig_matches_806cf2fa_bytes() {
         for ((name, mut config), (golden_name, golden)) in cases().into_iter().zip(GOLDEN) {
             // Keep the historical capability value as well as its byte oracle.
-            // Current DBT descriptor and atomic-memory facts need the
-            // versioned transport below.
+            // Current DBT descriptor facts need the versioned transport below.
             config.backend.tool_shares_guest_descriptor_table = false;
             config.backend.rediscovers_descriptors_after_exec = false;
-            config.backend.supports_guest_memory_compare_exchange = false;
             // These three were `Config` fields, false unless the host set them
             // for the backend, until they became stated capabilities.
             config.backend.supports_blocked_wait_signal_interruption = false;
@@ -3376,10 +3374,7 @@ mod dbt_detconfig_tests {
         let encoded = dbt_detconfig_json(&config).unwrap();
         assert!(detcore::from_legacy_backend_json(&encoded).is_err());
         let decoded = detcore::decode_backend_config_json(&encoded).unwrap();
-        assert_eq!(
-            decoded.backend,
-            detcore::hermit_consumed_capabilities(reverie::BackendCapabilities::DBT)
-        );
+        assert_eq!(decoded.backend, reverie::BackendCapabilities::DBT);
         assert_eq!(decoded.backend, config.backend);
     }
 
@@ -3388,31 +3383,25 @@ mod dbt_detconfig_tests {
         // Exercise the real CLI encoder and the admitted standalone JSON
         // reader. In particular, descriptor discovery must not silently
         // opt into host-timed turns or loopback poller yielding.
-        for atomic in [false, true] {
-            for mask in 0_u8..16 {
-                let mut config = prepare_backend_config(default_config(), Backend::Dbt);
-                config.backend.supports_guest_memory_compare_exchange = atomic;
-                config.backend.tool_shares_guest_descriptor_table = mask & 1 != 0;
-                config.backend.rediscovers_descriptors_after_exec = mask & 2 != 0;
-                config.backend.internal_pipe_turns_are_host_timed = mask & 4 != 0;
-                config.backend.loopback_pollers_yield_to_peers = mask & 8 != 0;
-                let encoded = dbt_detconfig_json(&config).unwrap();
-                assert_eq!(
-                    detcore::from_legacy_backend_json(&encoded).is_ok(),
-                    !atomic && (mask == 0 || mask == 15),
-                    "only coupled facts without atomic memory fit the legacy form: mask {mask}, atomic {atomic}"
-                );
-                let decoded = detcore::decode_backend_config_json(&encoded).unwrap();
-                assert_eq!(
-                    decoded.backend, config.backend,
-                    "capability mask {mask}, atomic {atomic}"
-                );
-                assert_eq!(
-                    serde_json::to_string(&decoded).unwrap(),
-                    serde_json::to_string(&config).unwrap(),
-                    "configuration mask {mask}, atomic {atomic}"
-                );
-            }
+        for mask in 0_u8..16 {
+            let mut config = prepare_backend_config(default_config(), Backend::Dbt);
+            config.backend.tool_shares_guest_descriptor_table = mask & 1 != 0;
+            config.backend.rediscovers_descriptors_after_exec = mask & 2 != 0;
+            config.backend.internal_pipe_turns_are_host_timed = mask & 4 != 0;
+            config.backend.loopback_pollers_yield_to_peers = mask & 8 != 0;
+            let encoded = dbt_detconfig_json(&config).unwrap();
+            assert_eq!(
+                detcore::from_legacy_backend_json(&encoded).is_ok(),
+                mask == 0 || mask == 15,
+                "only coupled facts fit the legacy form: mask {mask}"
+            );
+            let decoded = detcore::decode_backend_config_json(&encoded).unwrap();
+            assert_eq!(decoded.backend, config.backend, "capability mask {mask}");
+            assert_eq!(
+                serde_json::to_string(&decoded).unwrap(),
+                serde_json::to_string(&config).unwrap(),
+                "configuration mask {mask}"
+            );
         }
     }
 
@@ -3420,8 +3409,6 @@ mod dbt_detconfig_tests {
     fn representable_descriptor_facts_keep_the_current_config_bytes() {
         for discover in [false, true] {
             let mut config = prepare_backend_config(rich_config(), Backend::Dbt);
-            // This newer capability cannot be represented by the old keys.
-            config.backend.supports_guest_memory_compare_exchange = false;
             config.backend.tool_shares_guest_descriptor_table = discover;
             config.backend.rediscovers_descriptors_after_exec = discover;
             config.backend.internal_pipe_turns_are_host_timed = discover;
@@ -3861,7 +3848,7 @@ pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
         // Tool host can do, so in-guest-trap has in-guest LiteInst's capabilities.
         Backend::Liteinst | Backend::InGuestTrap => reverie::BackendCapabilities::LITEINST_IN_GUEST,
         Backend::Sabre => reverie::BackendCapabilities::SABRE,
-        Backend::Dbt => detcore::hermit_consumed_capabilities(reverie::BackendCapabilities::DBT),
+        Backend::Dbt => reverie::BackendCapabilities::DBT,
     }
 }
 
@@ -6730,9 +6717,6 @@ mod tests {
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "provides_process_signal_control": kvm,
             "emulates_child_waits": kvm,
-            // Reverie reports it for DBT (ABI 8); Hermit withholds it until a
-            // Detcore consumer lands (`detcore::hermit_consumed_capabilities`).
-            "supports_guest_memory_compare_exchange": false,
             // Each was a Config field Hermit set from the backend's name
             // before it was a stated capability; the values are the ones that
             // name test gave.
@@ -6796,10 +6780,9 @@ mod tests {
         }
         #[cfg(feature = "dbt")]
         {
-            // Less the capabilities Detcore does not consume yet.
             assert_eq!(
                 super::backend_capabilities(Backend::Dbt),
-                detcore::hermit_consumed_capabilities(reverie_dbt::DbtRunner::capabilities())
+                reverie_dbt::DbtRunner::capabilities()
             );
             // The DBT runtime re-asserts the same value when it loads the
             // configuration this crate serializes for it.
@@ -6885,9 +6868,6 @@ mod tests {
         ] {
             config.backend.tool_shares_guest_descriptor_table = false;
             config.backend.rediscovers_descriptors_after_exec = false;
-            // The historical fifteen-key form predates native atomic memory.
-            // Preserve its exact bytes and its false capability on decoding.
-            config.backend.supports_guest_memory_compare_exchange = false;
             // Read back as false, as the `Config` fields they replace were.
             config.backend.supports_blocked_wait_signal_interruption = false;
             config.backend.delivers_preemption_timer_events = false;

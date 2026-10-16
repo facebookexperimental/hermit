@@ -1622,7 +1622,20 @@ fi
 # byte-identical; the tracked DBT inventory stays 956. SDK thresholds, width
 # and CMAKE/CMAKE_GENERATOR/SOURCE_DATE_EPOCH selections carry unchanged,
 # not remeasured. Fresh exact-pin runtime validation remains required.
-expected_pin=30a02a848a0e00afc4b6584fffe904208237094f
+# ARCHITECTURE A4/A10 SDK-BUDGET CARRY (2026-10-16): advance
+# 30a02a848a0e00afc4b6584fffe904208237094f to ea5f55877a1c3750af04cd80d1a0ccad243231ee.
+# Two commits change reverie-dbt: 2d0f66b3 reduces PrototypeTool to a
+# forwarding tool (src/lib.rs, +7/-993 lines, and README.md); ea5f5587 makes
+# the runtime's descriptors 197/198 not open to the guest and refuses a dup
+# onto them (native/client.c, so the DynamoRIO client rebuilds, plus its
+# identity-policy test and fixture). The rest of the interval is 89f4124c
+# (KVM LinuxProvider), c661348c (A4 step 2a: a reserved descriptor reads
+# EBADF on every in-process backend) and 9b299ebb (drops
+# supports_guest_memory_compare_exchange). build.rs, vendor/dynamorio and the
+# root Cargo.toml are unchanged, so the SDK build inputs and their budget
+# carry; the client rebuild is not an SDK rebuild. No file is added or
+# removed; the reverie-dbt inventory stays 956.
+expected_pin=ea5f55877a1c3750af04cd80d1a0ccad243231ee
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

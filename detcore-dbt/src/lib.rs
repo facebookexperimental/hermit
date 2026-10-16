@@ -86,8 +86,7 @@ const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | l
 /// native client's atomic guest-word compare-and-exchange to the callbacks,
 /// growing them from 48 to 56 bytes; the version-5 RDTSC entry is unchanged.
 /// This runtime accepts the version-8 layout but does not install the
-/// exchange yet, and Hermit reports DBT's
-/// `supports_guest_memory_compare_exchange` as false, so nothing calls it.
+/// exchange, and no capability advertises it, so nothing calls it.
 const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 8;
 const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 56;
 
@@ -394,7 +393,7 @@ fn default_dbt_config() -> Config {
 /// The coordinator frame retains that value; the stable [`DETCONFIG_ENV`]
 /// producer also encodes it for the existing standalone fallback.
 pub const fn backend_capabilities() -> reverie::BackendCapabilities {
-    detcore::hermit_consumed_capabilities(reverie_dbt::DbtRunner::capabilities())
+    reverie_dbt::DbtRunner::capabilities()
 }
 
 /// Builds the admitted standalone Detcore [`Config`] fallback.
@@ -3057,15 +3056,7 @@ mod tests {
 
     #[test]
     fn dbt_execution_model_reads_the_dbt_backend_capabilities() {
-        assert_eq!(
-            backend_capabilities(),
-            detcore::hermit_consumed_capabilities(reverie::BackendCapabilities::DBT)
-        );
-        // Reverie reports the ABI 8 exchange for DBT; this runtime withholds it.
-        let reverie_reports = std::hint::black_box(reverie::BackendCapabilities::DBT);
-        let hermit_reports = std::hint::black_box(backend_capabilities());
-        assert!(reverie_reports.supports_guest_memory_compare_exchange);
-        assert!(!hermit_reports.supports_guest_memory_compare_exchange);
+        assert_eq!(backend_capabilities(), reverie::BackendCapabilities::DBT);
         let (_, json) = hermit_run_dbt_detconfig();
         let (config, source) = dbt_config_from(Some(&json));
         assert!(matches!(source, ConfigSource::Cli));
@@ -3154,8 +3145,6 @@ mod tests {
         // whose typed capabilities would take precedence over their projection.
         sent.backend.tool_shares_guest_descriptor_table = false;
         sent.backend.rediscovers_descriptors_after_exec = false;
-        // The fifteen-key format predates the atomic guest-memory callback.
-        sent.backend.supports_guest_memory_compare_exchange = false;
         let json = detcore::to_legacy_backend_json(&sent).unwrap();
         let key = "\"backend_requires_thread_directed_process_signals\"";
         let edited = json.replacen(&format!("{key}:true"), &format!("{key}:false"), 1);

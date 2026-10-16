@@ -2012,9 +2012,6 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// `delivers_preemption_timer_events` and
 /// `runs_guest_code_between_injections` read back as false, the value DBT
 /// has and the value their earlier `Config` fields read back as.
-/// `supports_guest_memory_compare_exchange` is true for DBT, so a DBT
-/// configuration needs the versioned envelope of
-/// [`encode_backend_config_json`] to carry it.
 ///
 /// `kvm_shared_dequeue_timers` supplies no capability. It was read into a
 /// `Config` field that chose the controlled signal path, and that choice is
@@ -2860,7 +2857,6 @@ mod tests {
     fn legacy_expressible(mut backend: BackendCapabilities) -> BackendCapabilities {
         backend.process_exits_complete_asynchronously = false;
         backend.virtualizes_guest_sigalrm = false;
-        backend.supports_guest_memory_compare_exchange = false;
         backend.supports_blocked_wait_signal_interruption = false;
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
