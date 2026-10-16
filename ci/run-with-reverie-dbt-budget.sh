@@ -1724,7 +1724,12 @@ fi
 # -> 961. a59dc37f (drop virtualizes_cpuid) touches only reverie-core.
 # build.rs, vendor/dynamorio and the root Cargo.toml are unchanged, so the
 # SDK budget carries.
-expected_pin=a59dc37f56ddbada4390686cec95c00433d0f7e5
+# KVM PROC-STAT-COPY-DELETION SDK-BUDGET CARRY (2026-10-16): advance
+# a59dc37f56ddbada4390686cec95c00433d0f7e5 to 47190e9fc8662f38699cccb0444ec524ffbc2b60.
+# The one commit deletes reverie-kvm's copy of /proc/stat and changes only
+# reverie-kvm (6 files). No reverie-dbt file or recorded SDK input changes;
+# the reverie-dbt inventory stays 961 and the budget carries.
+expected_pin=47190e9fc8662f38699cccb0444ec524ffbc2b60
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

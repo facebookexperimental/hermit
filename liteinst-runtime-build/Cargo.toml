@@ -19,11 +19,11 @@ allocator-fixture = []
 native-exec = ["dep:detcore-model", "dep:reverie-inguest", "dep:goblin", "dep:sha2"]
 
 [build-dependencies]
-reverie-liteinst-artifact = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "a59dc37f56ddbada4390686cec95c00433d0f7e5", default-features = false }
+reverie-liteinst-artifact = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "47190e9fc8662f38699cccb0444ec524ffbc2b60", default-features = false }
 serde_json = "1.0.151"
 
 detcore-model = { version = "0.4.1", path = "../detcore-model", features = ["native-exec"], optional = true }
-reverie-inguest = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "a59dc37f56ddbada4390686cec95c00433d0f7e5", default-features = false, features = ["exec-native-injection"], optional = true }
+reverie-inguest = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "47190e9fc8662f38699cccb0444ec524ffbc2b60", default-features = false, features = ["exec-native-injection"], optional = true }
 goblin = { version = "0.10.7", optional = true }
 sha2 = { version = "0.10.9", optional = true }
 

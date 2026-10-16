@@ -1801,8 +1801,13 @@ fi
 # -> 961. a59dc37f (drop virtualizes_cpuid) touches only reverie-core.
 # build.rs, vendor/dynamorio and the root Cargo.toml are unchanged, so the
 # SDK budget carries.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a59dc37f56ddbada4390686cec95c00433d0f7e5 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a59dc37f56ddbada4390686cec95c00433d0f7e5 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# KVM PROC-STAT-COPY-DELETION SDK-BUDGET CARRY (2026-10-16): advance
+# a59dc37f56ddbada4390686cec95c00433d0f7e5 to 47190e9fc8662f38699cccb0444ec524ffbc2b60.
+# The one commit deletes reverie-kvm's copy of /proc/stat and changes only
+# reverie-kvm (6 files). No reverie-dbt file or recorded SDK input changes;
+# the reverie-dbt inventory stays 961 and the budget carries.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 47190e9fc8662f38699cccb0444ec524ffbc2b60 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 47190e9fc8662f38699cccb0444ec524ffbc2b60 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
