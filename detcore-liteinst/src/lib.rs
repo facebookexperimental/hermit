@@ -137,6 +137,36 @@ unsafe extern "C" fn detcore_liteinst_initialize_body() {
     // owns Rust allocations unconditionally; this guard does not choose
     // between Tool storage and the guest's malloc.
     let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
+    // Hermit sends the coordinator and its settings in the sealed bootstrap,
+    // so none of them is on the guest's initial stack or in
+    // /proc/self/environ (detcore::in_guest_launch). A launcher that sets the
+    // environment variables instead still works, below.
+    // SAFETY: this is the preload constructor the launcher started.
+    match unsafe { reverie_liteinst::take_preload_bootstrap() } {
+        Ok(Some(bootstrap)) => {
+            let launch = detcore::in_guest_launch::InGuestLaunch::decode(&bootstrap.tool_data)
+                .unwrap_or_else(|error| {
+                    fail(&format!("the launch bootstrap is unreadable: {error}"))
+                });
+            // SAFETY: as below.
+            unsafe {
+                initialize_detcore(InitializationInputs {
+                    coordinator_socket: bootstrap.coordinator.into_os_string(),
+                    forward_request: launch.forward_request.map(OsString::from),
+                    forward_policy: launch.forward_policy.map(OsString::from),
+                    coordinator_fingerprint: launch.coordinator_fingerprint.map(OsString::from),
+                    #[cfg(feature = "exec-private-init")]
+                    initial_image: None,
+                });
+            }
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => fail(&format!(
+            "the launch bootstrap is unreadable: {}",
+            describe_io_error(&error)
+        )),
+    }
     let Some(socket) = std::env::var_os(reverie_liteinst::COORDINATOR_ENV) else {
         fail("the coordinator socket environment variable is missing");
     };

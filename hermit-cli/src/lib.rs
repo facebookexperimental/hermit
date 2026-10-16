@@ -2037,19 +2037,6 @@ const LITEINST_DETLOG_FORWARD_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG";
 #[cfg(feature = "liteinst")]
 const LITEINST_DETLOG_FORWARD_POLICY_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG_POLICY";
 
-/// Tells the in-guest LiteInst runtime this build's
-/// [`detcore::config_wire_fingerprint`], which it compares with its own before
-/// it decodes the configuration the coordinator sends. A runtime built from
-/// another tree then fails naming both fingerprints and its own path, not with
-/// a bare decoding error (<https://github.com/rrnewton/hermit/issues/3986>).
-#[cfg(feature = "liteinst")]
-fn announce_liteinst_config_fingerprint(command: &mut Command) {
-    command.env(
-        detcore::LITEINST_CONFIG_FINGERPRINT_ENV,
-        detcore::config_wire_fingerprint(),
-    );
-}
-
 /// Where in-guest LiteInst and SaBRe runs in this process forward Detcore's
 /// DETLOG records; see [`forward_in_guest_detlogs_to`].
 static IN_GUEST_DETLOG_SINK: Mutex<Option<std::os::fd::OwnedFd>> = Mutex::new(None);
@@ -2066,37 +2053,57 @@ pub fn forward_in_guest_detlogs_to(socket: std::os::fd::OwnedFd) {
     *IN_GUEST_DETLOG_SINK.lock().unwrap() = Some(socket);
 }
 
-/// Hands the in-guest LiteInst runtime the socket chosen with
-/// [`forward_in_guest_detlogs_to`], when `policy` forwards any record: an
-/// inheritable duplicate whose number goes in the private opt-in variable, and
-/// the encoded policy, which the guest's Detcore applies to each record by its
-/// module as each in-process `detlog!` callsite asks tracing. The runtime
-/// moves the socket to a descriptor Reverie reserves and protects from the
-/// guest. The caller keeps the returned duplicate open until the guest has
-/// started.
+/// What Hermit tells the in-guest LiteInst runtime, which travels in the
+/// sealed preload bootstrap rather than the guest's environment
+/// ([`detcore::in_guest_launch`]), so none of it lands on the guest's initial
+/// stack or in `/proc/self/environ`:
+/// - this build's [`detcore::config_wire_fingerprint`], which the runtime
+///   compares with its own before it decodes the configuration the
+///   coordinator sends. A runtime built from another tree then fails naming
+///   both fingerprints and its own path, not with a bare decoding error
+///   (<https://github.com/rrnewton/hermit/issues/3986>);
+/// - when `policy` forwards any record, the socket chosen with
+///   [`forward_in_guest_detlogs_to`] (an inheritable duplicate, which the
+///   runtime moves to a descriptor Reverie reserves and protects from the
+///   guest) and the encoded policy, which the guest's Detcore applies to each
+///   record by its module as each in-process `detlog!` callsite asks tracing.
+///
+/// The caller keeps the returned duplicate open until the guest has started.
+/// Hermit's own variable names are removed from `command`, so a stale value
+/// cannot reach a runtime that falls back to the environment.
 #[cfg(feature = "liteinst")]
-fn request_liteinst_detlog_forwarding(
+fn in_guest_liteinst_launch(
     command: &mut Command,
     policy: &detcore::detlog::ForwardPolicy,
-) -> Result<Option<std::os::fd::OwnedFd>, Error> {
+) -> Result<
+    (
+        detcore::in_guest_launch::InGuestLaunch,
+        Option<std::os::fd::OwnedFd>,
+    ),
+    Error,
+> {
     command.env_remove(LITEINST_DETLOG_FORWARD_ENV);
     command.env_remove(LITEINST_DETLOG_FORWARD_POLICY_ENV);
+    command.env_remove(detcore::LITEINST_CONFIG_FINGERPRINT_ENV);
+    let mut launch = detcore::in_guest_launch::InGuestLaunch {
+        coordinator_fingerprint: Some(detcore::config_wire_fingerprint()),
+        ..Default::default()
+    };
     // Asking only whether INFO is on for `detcore`, and then forwarding
     // everything, kept records a target-scoped filter drops under ptrace
     // (info,detcore::random=warn) and could forward nothing where it keeps
     // some (warn,detcore::random=info).
     if !policy.forwards_any() {
-        return Ok(None);
+        return Ok((launch, None));
     }
     let Some(duplicate) = inheritable_in_guest_detlog_socket()? else {
-        return Ok(None);
+        return Ok((launch, None));
     };
-    command.env(
-        LITEINST_DETLOG_FORWARD_ENV,
-        detcore::detlog::tool_output_env_value(duplicate.as_raw_fd())?,
-    );
-    command.env(LITEINST_DETLOG_FORWARD_POLICY_ENV, policy.encode());
-    Ok(Some(duplicate))
+    launch.forward_request = Some(detcore::detlog::tool_output_env_value(
+        duplicate.as_raw_fd(),
+    )?);
+    launch.forward_policy = Some(policy.encode());
+    Ok((launch, Some(duplicate)))
 }
 
 /// An inheritable duplicate of the socket chosen with
@@ -4121,11 +4128,9 @@ async fn dispatch_backend(
             let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
             let mut command = command;
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
-            announce_liteinst_config_fingerprint(&mut command);
-            let _detlog_descriptor = request_liteinst_detlog_forwarding(
-                &mut command,
-                &in_guest_detlog_forward_policy(),
-            )?;
+            let (launch, _detlog_descriptor) =
+                in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
+            let tool_data = launch.encode();
             // Every Tool image must forward on that socket, by that policy;
             // see detcore::Config::in_guest_detlog_forward_policy.
             let mut config = config;
@@ -4141,9 +4146,9 @@ async fn dispatch_backend(
                     async {
                         if stats_request.is_enabled() {
                             let (exit_status, global_state, source) =
-                                reverie_liteinst::LiteinstBackend::run_with_preload_and_stats::<
+                                reverie_liteinst::LiteinstBackend::run_with_preload_data_and_stats::<
                                     Detcore,
-                                >(command, config, preload)
+                                >(command, config, preload, tool_data)
                                 .await?;
                             let dispatch_stats =
                                 backend_stats::report(backend, stats_request, &source);
@@ -4156,8 +4161,8 @@ async fn dispatch_backend(
                             ))
                         } else {
                             let (exit_status, global_state) =
-                                reverie_liteinst::LiteinstBackend::run_with_preload::<Detcore>(
-                                    command, config, preload,
+                                reverie_liteinst::LiteinstBackend::run_with_preload_data::<Detcore>(
+                                    command, config, preload, tool_data,
                                 )
                                 .await?;
                             Ok((exit_status, global_state, None, 0))
@@ -4438,11 +4443,9 @@ async fn dispatch_output_backend(
             command.stdin(output_backend_stdin()?);
             let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
-            announce_liteinst_config_fingerprint(&mut command);
-            let _detlog_descriptor = request_liteinst_detlog_forwarding(
-                &mut command,
-                &in_guest_detlog_forward_policy(),
-            )?;
+            let (launch, _detlog_descriptor) =
+                in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
+            let tool_data = launch.encode();
             // Every Tool image must forward on that socket, by that policy;
             // see detcore::Config::in_guest_detlog_forward_policy.
             let mut config = config;
@@ -4456,18 +4459,18 @@ async fn dispatch_output_backend(
                 reverie_liteinst::LiteinstBackend::with_connection_admission(exits.clone(), async {
                     if stats_request.is_enabled() {
                         let (output, global_state, source) =
-                            reverie_liteinst::LiteinstBackend::run_with_output_and_preload_and_stats::<
+                            reverie_liteinst::LiteinstBackend::run_with_output_and_preload_data_and_stats::<
                                 Detcore,
-                            >(command, config, preload)
+                            >(command, config, preload, tool_data)
                             .await?;
                         let dispatch_stats = backend_stats::report(backend, stats_request, &source);
                         let process_reports = source.snapshot().process_reports();
                         Ok::<_, reverie::Error>((output, global_state, dispatch_stats, process_reports))
                     } else {
                         let (output, global_state) =
-                            reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<Detcore>(
-                                command, config, preload,
-                            )
+                            reverie_liteinst::LiteinstBackend::run_with_output_and_preload_data::<
+                                Detcore,
+                            >(command, config, preload, tool_data)
                             .await?;
                         Ok((output, global_state, None, 0))
                     }
@@ -7964,66 +7967,72 @@ mod tests {
     }
 
     /// In-guest LiteInst gets the per-target policy it is given next to the
-    /// forwarding descriptor, and a policy that forwards nothing requests no
-    /// forwarding and clears both variables.
+    /// forwarding descriptor, and this build's fingerprint, in the launch
+    /// record, with none of Hermit's variables left on the command; a policy
+    /// that forwards nothing requests no forwarding.
     #[cfg(feature = "liteinst")]
     #[test]
-    fn liteinst_detlog_forwarding_hands_the_guest_its_per_target_policy() {
+    fn liteinst_launch_hands_the_guest_its_per_target_policy() {
         use std::os::fd::AsRawFd;
 
         use detcore::detlog::ForwardPolicy;
+        use detcore::in_guest_launch::InGuestLaunch;
         use reverie::process::Command;
 
         use super::LITEINST_DETLOG_FORWARD_ENV;
         use super::LITEINST_DETLOG_FORWARD_POLICY_ENV;
         use super::forward_in_guest_detlogs_to;
-        use super::request_liteinst_detlog_forwarding;
+        use super::in_guest_liteinst_launch;
 
         let (sink, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
         forward_in_guest_detlogs_to(sink.into());
-        let env = |command: &Command, key: &str| {
-            command
-                .get_envs()
-                .find(|(name, _)| *name == std::ffi::OsStr::new(key))
-                .map(|(_, value)| value.map(|value| value.to_str().unwrap().to_owned()))
+        let removed = |command: &Command| {
+            [
+                LITEINST_DETLOG_FORWARD_ENV,
+                LITEINST_DETLOG_FORWARD_POLICY_ENV,
+                detcore::LITEINST_CONFIG_FINGERPRINT_ENV,
+            ]
+            .into_iter()
+            .all(|key| {
+                command
+                    .get_envs()
+                    .any(|(name, value)| name == std::ffi::OsStr::new(key) && value.is_none())
+            })
         };
 
         let scoped = ForwardPolicy::decode("0,detcore::random=1").unwrap();
         let mut command = Command::new("/bin/true");
-        let duplicate = request_liteinst_detlog_forwarding(&mut command, &scoped)
-            .unwrap()
-            .expect("a policy that forwards a target requests forwarding");
-        let passed = env(&command, LITEINST_DETLOG_FORWARD_ENV)
-            .flatten()
-            .expect("the descriptor is passed");
+        let (launch, duplicate) = in_guest_liteinst_launch(&mut command, &scoped).unwrap();
+        let duplicate = duplicate.expect("a policy that forwards a target requests forwarding");
+        assert!(removed(&command));
+        let launch = InGuestLaunch::decode(&launch.encode()).unwrap();
+        let passed = launch.forward_request.expect("the descriptor is passed");
         assert_eq!(
             detcore::detlog::tool_output_env_target(&passed),
             Some(duplicate.as_raw_fd()),
             "{passed}"
         );
-        let sent = env(&command, LITEINST_DETLOG_FORWARD_POLICY_ENV)
-            .flatten()
-            .expect("the policy goes with the descriptor");
-        let sent = ForwardPolicy::decode(&sent).unwrap();
+        let sent =
+            ForwardPolicy::decode(&launch.forward_policy.expect("the policy goes too")).unwrap();
         assert_eq!(sent, scoped);
         assert!(sent.forwards("detcore::random"));
         assert!(!sent.forwards("detcore::tool_local"));
+        assert_eq!(
+            launch.coordinator_fingerprint,
+            Some(detcore::config_wire_fingerprint())
+        );
 
         let nothing = ForwardPolicy::decode("0").unwrap();
         let mut command = Command::new("/bin/true");
         command
             .env(LITEINST_DETLOG_FORWARD_ENV, "9")
-            .env(LITEINST_DETLOG_FORWARD_POLICY_ENV, "1");
-        assert!(
-            request_liteinst_detlog_forwarding(&mut command, &nothing)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(env(&command, LITEINST_DETLOG_FORWARD_ENV), Some(None));
-        assert_eq!(
-            env(&command, LITEINST_DETLOG_FORWARD_POLICY_ENV),
-            Some(None)
-        );
+            .env(LITEINST_DETLOG_FORWARD_POLICY_ENV, "1")
+            .env(detcore::LITEINST_CONFIG_FINGERPRINT_ENV, "0000000000000000");
+        let (launch, duplicate) = in_guest_liteinst_launch(&mut command, &nothing).unwrap();
+        assert!(duplicate.is_none());
+        assert!(removed(&command));
+        assert_eq!(launch.forward_request, None);
+        assert_eq!(launch.forward_policy, None);
     }
 
     /// The forwarding policy answers as a real in-process `detlog!` record

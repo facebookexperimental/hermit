@@ -1752,8 +1752,14 @@ fi
 # rebuilds. build.rs, vendor/dynamorio and the root Cargo.toml are unchanged,
 # so the SDK build inputs and their budget carry; the client rebuild is not an
 # SDK rebuild. No reverie-dbt file is added or removed; the inventory stays 956.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != da86dfbe50e6c53845f5f68439e9f32cb6d74f0f ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie da86dfbe50e6c53845f5f68439e9f32cb6d74f0f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# IN-GUEST BOOTSTRAP SDK-BUDGET CARRY (2026-10-16): advance
+# da86dfbe50e6c53845f5f68439e9f32cb6d74f0f to 8ae79e16069d5db97847f5ee98dfa81652f60511.
+# The interval is one commit, 8ae79e16, which sends the in-guest statistics
+# coordinator in the sealed bootstrap (reverie-inguest, reverie-liteinst and the
+# M1 catalog). git diff is empty for reverie-dbt/, so no DynamoRIO build input
+# moves and the budget carries; the reverie-dbt inventory is unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8ae79e16069d5db97847f5ee98dfa81652f60511 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 8ae79e16069d5db97847f5ee98dfa81652f60511 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

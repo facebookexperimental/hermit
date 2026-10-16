@@ -465,10 +465,7 @@ fn liteinst_in_guest_checks_and_hides_the_config_fingerprint() {
         ],
     );
     let shell = String::from_utf8_lossy(&shell.stdout);
-    assert!(
-        shell == "[] PYTHONDONTWRITEBYTECODE" || shell == "[unset] PYTHONDONTWRITEBYTECODE",
-        "{shell}"
-    );
+    assert_eq!(shell, "[unset] PYTHONDONTWRITEBYTECODE");
 
     let environ = run_liteinst_in_guest(
         Path::new("/usr/bin/head"),
@@ -479,9 +476,10 @@ fn liteinst_in_guest_checks_and_hides_the_config_fingerprint() {
         .split(|&byte| byte == 0)
         .filter(|entry| entry.starts_with(NAME.as_bytes()))
         .collect::<Vec<_>>();
-    assert_eq!(
-        entries,
-        [format!("{NAME}=").as_bytes()],
+    // Hermit sends the fingerprint in the sealed bootstrap, so the kernel
+    // never copied it onto the guest's initial stack.
+    assert!(
+        entries.is_empty(),
         "{:?}",
         String::from_utf8_lossy(&environ.stdout)
     );
@@ -2726,22 +2724,21 @@ fn run_constructor_mutation_guest(backend: &str, mode: &str) -> Output {
 /// one that removes it (which turns patching on); one that sets it to 1 while
 /// the library's interposed `getenv` sets it back to 0 during the runtime's
 /// installation, after the runtime read 1 (a check of the environment at the
-/// Tool's construction would see 0 and accept); and one that removes the
-/// statistics variable. The coordinator then refuses each run too (exit 122):
-/// for the sites the image's runtime patched, or because no process reported
-/// statistics. Controls: the constructor leaving everything alone runs under
-/// in-guest-trap; under liteinst, which patches by design, the restoring
-/// constructor reaches `main` and shows its `getenv` put the variable back
-/// to 0 during startup.
+/// Tool's construction would see 0 and accept). The coordinator then refuses
+/// each run too (exit 122), for the sites the image's runtime patched.
+/// A constructor that removes the statistics variable can no longer turn
+/// statistics off: Hermit's launcher names the statistics coordinator in the
+/// sealed bootstrap, not the environment, so that run collects statistics and
+/// reaches `main` like the control. Controls: the constructor leaving
+/// everything alone runs under in-guest-trap; under liteinst, which patches by
+/// design, the restoring constructor reaches `main` and shows its `getenv` put
+/// the variable back to 0 during startup.
 #[test]
 fn in_guest_trap_refuses_a_guest_library_that_turns_site_patching_back_on() {
     let _guard = hermit_run_guard();
     const PATCHING: &str = "detcore-liteinst: initialization failed: --backend=in-guest-trap runs \
          with syscall site patching off, but the in-guest runtime installed this process with \
          site patching on";
-    const NO_STATS: &str = "detcore-liteinst: initialization failed: --backend=in-guest-trap \
-         needs every process's syscall site statistics, but the in-guest runtime installed this \
-         process without collecting them";
     for (mode, image_refusal, run_refusal) in [
         ("set", PATCHING, "its guests' LiteInst statistics report "),
         ("unset", PATCHING, "its guests' LiteInst statistics report "),
@@ -2749,11 +2746,6 @@ fn in_guest_trap_refuses_a_guest_library_that_turns_site_patching_back_on() {
             "set-then-restore",
             PATCHING,
             "its guests' LiteInst statistics report ",
-        ),
-        (
-            "no-stats",
-            NO_STATS,
-            "no guest process reported LiteInst statistics",
         ),
     ] {
         let output = run_constructor_mutation_guest("in-guest-trap", mode);
@@ -2789,12 +2781,14 @@ fn in_guest_trap_refuses_a_guest_library_that_turns_site_patching_back_on() {
         );
     }
 
-    let control = run_constructor_mutation_guest("in-guest-trap", "none");
-    assert!(control.status.success(), "{control:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&control.stdout),
-        "main ran; constructor none; restored 0; REVERIE_LITEINST_SITE_PATCHING=0\n"
-    );
+    for mode in ["none", "no-stats"] {
+        let control = run_constructor_mutation_guest("in-guest-trap", mode);
+        assert!(control.status.success(), "{mode}: {control:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&control.stdout),
+            format!("main ran; constructor {mode}; restored 0; REVERIE_LITEINST_SITE_PATCHING=0\n")
+        );
+    }
     let restored = run_constructor_mutation_guest("liteinst", "set-then-restore");
     assert!(restored.status.success(), "{restored:?}");
     assert_eq!(

@@ -25111,21 +25111,25 @@ fn liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader() {
 #[cfg(feature = "liteinst")]
 fn liteinst_in_guest_refuses_a_guest_socket_at_the_forwarding_number() {
     const LIBRARY: &str = r#"
-#include <stdlib.h>
-#include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-extern char **environ;
-__attribute__((constructor)) static void replace_tool_output(void) {
-  for (char **entry = environ; *entry; entry++) {
-    if (strncmp(*entry, "HERMIT_LITEINST_FORWARD_DETLOG=", 31) == 0) {
-      int passed = atoi(*entry + 31);
-      int pair[2];
-      close(passed);
-      if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) _exit(3);
-      if (pair[0] != passed && dup2(pair[0], passed) != passed) _exit(4);
-    }
+// Hermit does not name the forwarding socket in the guest's environment, so
+// the library finds it as its one inherited SOCK_SEQPACKET descriptor.
+static int tool_output_fd(void) {
+  for (int fd = 3; fd < 1024; fd++) {
+    int type;
+    socklen_t length = sizeof type;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &length) == 0 && type == SOCK_SEQPACKET)
+      return fd;
   }
+  _exit(9);
+}
+__attribute__((constructor)) static void replace_tool_output(void) {
+  int passed = tool_output_fd();
+  int pair[2];
+  close(passed);
+  if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) _exit(3);
+  if (pair[0] != passed && dup2(pair[0], passed) != passed) _exit(4);
 }
 "#;
     let _lock = hermit_run_guard();

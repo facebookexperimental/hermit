@@ -1675,7 +1675,13 @@ fi
 # rebuilds. build.rs, vendor/dynamorio and the root Cargo.toml are unchanged,
 # so the SDK build inputs and their budget carry; the client rebuild is not an
 # SDK rebuild. No reverie-dbt file is added or removed; the inventory stays 956.
-expected_pin=da86dfbe50e6c53845f5f68439e9f32cb6d74f0f
+# IN-GUEST BOOTSTRAP SDK-BUDGET CARRY (2026-10-16): advance
+# da86dfbe50e6c53845f5f68439e9f32cb6d74f0f to 8ae79e16069d5db97847f5ee98dfa81652f60511.
+# The interval is one commit, 8ae79e16, which sends the in-guest statistics
+# coordinator in the sealed bootstrap (reverie-inguest, reverie-liteinst and the
+# M1 catalog). git diff is empty for reverie-dbt/, so no DynamoRIO build input
+# moves and the budget carries; the reverie-dbt inventory is unchanged.
+expected_pin=8ae79e16069d5db97847f5ee98dfa81652f60511
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

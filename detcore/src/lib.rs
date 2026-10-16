@@ -51,6 +51,7 @@ mod fatal_core;
 mod fd;
 mod fifo_peer;
 mod host_inputs;
+pub mod in_guest_launch;
 pub mod in_guest_site_patching;
 mod io_buffers;
 mod iovecs;
