@@ -2667,7 +2667,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And signal_determinism::dbt_refuses_a_thread_directed_sigkill_to_an_exited_thread
     // (Claude review of https://github.com/rrnewton/hermit/pull/4439, R1):
     // 60 + 263 + 232 = 555.
-    ("test.hermit_integration", 60),
+    // And container_init_deadline's
+    // container_init_exits_when_its_hermit_parent_died_before_it_armed:
+    // 61 + 263 + 252 = 576, listed.
+    ("test.hermit_integration", 61),
     ("test.hermit_integration_2", 263),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
@@ -4147,7 +4150,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And standalone's 12 running standalone targets: 567.
     // Less the ignored no_networking_network_bind_full: 566.
     // Ten DBT SIGKILL scenarios replace one aggregate test: 575.
-    ("test.hermit_integration_on_host", 575),
+    // And the container-init parent-died-before-arming test: 576, listed.
+    ("test.hermit_integration_on_host", 576),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

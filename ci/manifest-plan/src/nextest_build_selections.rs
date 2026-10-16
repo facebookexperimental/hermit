@@ -867,8 +867,10 @@ mod tests {
             } else {
                 executed(tag)
             };
-            // The ten DBT SIGKILL scenarios replace one aggregate test (+9).
-            assert_eq!(population, 575);
+            // The ten DBT SIGKILL scenarios replace one aggregate test (+9),
+            // and container_init_deadline gains the parent-died-before-arming
+            // test (+1).
+            assert_eq!(population, 576);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

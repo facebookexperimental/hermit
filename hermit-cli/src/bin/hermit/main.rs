@@ -657,6 +657,10 @@ fn main() {
     ) {
         std::process::exit(refuse_entry_descriptor_failure(error, &entry_argv));
     }
+    // Also before anything that can fork, and after the inherited descriptors
+    // are retired: every container init must inherit this process's pidfd to
+    // see whether its parent died before it armed its death signal.
+    container::open_parent_pidfd_for_container_inits();
     // ⚠️ BEFORE ANYTHING THAT CAN FORK. The stderr diagnostic deadline is a total
     // for the INVOCATION, and the origin every hermit process measures from is a
     // shared mapping that children inherit across fork. A mapping made after the

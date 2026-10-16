@@ -378,8 +378,8 @@ pub(crate) fn register_invocation_log_budget(budget: Option<LogBudget>) {
 /// store-buffering shape, in which both sides can miss each other.
 ///
 /// It closes only the part of the fork-to-`prctl` window that the cap opens. A
-/// parent killed for another reason inside that window still leaves the child
-/// unsupervised; see `arm_parent_death_signal`.
+/// parent that died for another reason inside that window is caught by
+/// `container::exit_if_parent_already_gone`; see `arm_parent_death_signal`.
 pub(crate) fn exit_if_log_cap_already_crossed() {
     if let Some(budget) = INVOCATION_LOG_BUDGET.get()
         && crossing_already_claimed(&budget.cells().admission)

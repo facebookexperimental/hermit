@@ -314,6 +314,64 @@ fn container_init_dies_with_the_hermit_process_that_forked_it() {
     );
 }
 
+/// The same outright kill, landed while the container init is still in
+/// container setup, before it has armed its parent-death signal. The kernel
+/// never sends that signal for a parent that died first, so the init has to
+/// see for itself that its parent is gone. The init is held before it arms, as
+/// in `container_init_honours_signals_sent_before_it_arms`, the outer `hermit`
+/// is killed inside that hold, and the whole run must still disappear well
+/// before the hold would have ended. The test above lands in this window only
+/// by chance under load (2 of 180 runs on 4 loaded CPUs on 2026-10-16, each
+/// leaving the init and its guest running); this one lands in it every time.
+#[test]
+fn container_init_exits_when_its_hermit_parent_died_before_it_armed() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut argv = vec![hermit_bin(), "run", "--"];
+    argv.extend_from_slice(SPINNER);
+
+    let spawned = Instant::now();
+    let (mut hermit, guard, init) = start_hung_run(&argv, &[(ARMING_STALL_ENV, "1")]);
+    let outer = hermit.id() as i32;
+    assert_ne!(
+        outer, init,
+        "the container init must be a distinct process from the hermit CLI"
+    );
+    let stalled = poll_until(STARTUP_BUDGET, || {
+        let comm = fs::read_to_string(format!("/proc/{init}/comm")).ok()?;
+        (comm.trim_end() == ARMING_STALL_COMM).then_some(())
+    });
+    assert!(
+        stalled.is_some(),
+        "container init {init} never showed the {ARMING_STALL_COMM:?} thread name, so it \
+         is not waiting before it arms and this test cannot place the parent's death in \
+         that window. The hermit under test ignores {ARMING_STALL_ENV}; is it older than \
+         this test?"
+    );
+
+    // SAFETY: `kill` takes a pid and a signal number and touches no caller
+    // memory. `outer` is our own child and has not been reaped yet.
+    assert_eq!(
+        unsafe { libc::kill(outer, libc::SIGKILL) },
+        0,
+        "failed to kill the outer hermit process: {}",
+        io::Error::last_os_error()
+    );
+    let status = hermit.wait().expect("failed to wait for hermit");
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+    assert_session_drains(
+        guard.0,
+        "container init whose hermit parent was killed before it armed its death signal",
+    );
+    let elapsed = spawned.elapsed();
+    assert!(
+        elapsed < ARMING_STALL,
+        "the run drained {elapsed:?} after spawn, which is not inside the {ARMING_STALL:?} \
+         hold, so this pass says nothing about the init noticing its parent was gone"
+    );
+}
+
 /// Isolates the stop-signal handlers: signal only the container init, leaving
 /// its `hermit` parent alive so the parent-death signal cannot be what ends the
 /// run. Each of these is discarded outright while the container init leaves the

@@ -3475,20 +3475,20 @@ pub(super) fn deterministic_container() -> Result<(Container, IdentityGuard), Er
 /// Reverie uses the same idiom for exec'd untraced members in
 /// `safeptrace/src/notifier.rs`.
 ///
-/// One residual gap: if the parent died between the fork and this call, no
-/// death signal will ever arrive. The part of that gap that `--max-log-bytes`
-/// itself opens is closed: a parent that crossed the cap set the shared
-/// crossing bit before it exited 123, and `arm_container_init_guards` checks
-/// that bit right after this call (`exit_if_log_cap_already_crossed`, which
-/// carries the ordering argument). A parent that dies for any other reason in
-/// the window (killed from outside, OOM, a crash) still leaves this process
-/// unsupervised. The usual `getppid()` guard for that race is unavailable here,
-/// because inside a new PID namespace the out-of-namespace parent is not mapped
-/// and `getppid()` reports 0 whether or not it is alive. Closing it completely
-/// would mean arming the signal inside `Container::run` before container
-/// setup, which is a Reverie-side change. The window is a few milliseconds of
-/// container setup, and the case this guards against is a supervisor deadline
-/// seconds or minutes later.
+/// If the parent died between the fork and this call, no death signal will
+/// ever arrive, so the callers check right after it whether the parent is
+/// already gone. A parent that crossed `--max-log-bytes` set the shared
+/// crossing bit before it exited 123 (`exit_if_log_cap_already_crossed`, which
+/// carries the ordering argument). A parent that died for any other reason in
+/// the window (killed from outside, OOM, a crash) is seen through the pidfd it
+/// opened for itself before it forked (`exit_if_parent_already_gone`). The
+/// usual `getppid()` guard is unavailable here, because inside a new PID
+/// namespace the out-of-namespace parent is not mapped and `getppid()` reports
+/// 0 whether or not it is alive. Under load that window, container setup
+/// between the clone and this call, was long enough for an outright SIGKILL of
+/// the hermit CLI to land in it: 2 of 180 runs of
+/// `container_init_dies_with_the_hermit_process_that_forked_it` on 4 loaded
+/// CPUs (2026-10-16), each leaving the init and its guest running.
 fn arm_parent_death_signal() -> Result<(), Error> {
     // SAFETY: `PR_SET_PDEATHSIG` only sets the calling thread's parent-death
     // signal attribute. It reads and writes no caller memory, and the remaining
@@ -3791,9 +3791,89 @@ pub(super) fn stall_container_init_before_arming_if_asked() {
         libc::prctl(libc::PR_GET_NAME, name.as_mut_ptr());
         libc::prctl(libc::PR_SET_NAME, c"unarmed-init".as_ptr());
     }
-    std::thread::sleep(CONTAINER_INIT_ARMING_STALL);
+    // The stall ends early if the parent exits, so a test can place the
+    // parent's death in this window without waiting out the whole stall.
+    wait_for_parent_exit(CONTAINER_INIT_ARMING_STALL);
     // SAFETY: as above; `name` is still NUL-terminated.
     unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) };
+}
+
+/// A pidfd for this hermit process, opened in `main` before anything can fork,
+/// with the device and inode it had then. Every container init this process
+/// forks inherits the descriptor (it is closed only at exec), so the init can
+/// tell whether the process that forked it is still alive: a pidfd becomes
+/// readable once its process has exited. `None` when the kernel has no
+/// `pidfd_open` (before Linux 5.3); the death signal is then all there is.
+static PARENT_PIDFD: OnceLock<Option<(OwnedFd, u64, u64)>> = OnceLock::new();
+
+/// Open [`PARENT_PIDFD`]. Called from `main` before anything can fork.
+pub(super) fn open_parent_pidfd_for_container_inits() {
+    PARENT_PIDFD.get_or_init(|| {
+        // SAFETY: `pidfd_open` takes a pid and flags and touches no caller
+        // memory. The descriptor it returns is close-on-exec.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: `fd` was just returned by `pidfd_open` and nothing else owns it.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+        let (dev, ino) = fd_identity(fd.as_raw_fd())?;
+        Some((fd, dev, ino))
+    });
+}
+
+/// The device and inode of `fd`, by `fstat`, which is async-signal-safe.
+fn fd_identity(fd: libc::c_int) -> Option<(u64, u64)> {
+    // SAFETY: an all-zero `stat` is a valid value for `fstat` to overwrite.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `stat` is a valid, writable `struct stat`.
+    (unsafe { libc::fstat(fd, &mut stat) } == 0).then_some((stat.st_dev, stat.st_ino))
+}
+
+/// The inherited [`PARENT_PIDFD`], if this process still holds that very file.
+fn inherited_parent_pidfd() -> Option<libc::c_int> {
+    let (fd, dev, ino) = PARENT_PIDFD.get()?.as_ref()?;
+    let fd = fd.as_raw_fd();
+    (fd_identity(fd) == Some((*dev, *ino))).then_some(fd)
+}
+
+/// Wait up to `timeout` for the process that forked this one to exit, and say
+/// whether it has. Without an inherited pidfd it cannot tell: it waits the
+/// whole `timeout` and says no. Async-signal-safe: `fstat`, `poll` and
+/// `nanosleep` only.
+fn wait_for_parent_exit(timeout: std::time::Duration) -> bool {
+    let Some(fd) = inherited_parent_pidfd() else {
+        let pause = libc::timespec {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_nsec: timeout.subsec_nanos() as libc::c_long,
+        };
+        // SAFETY: `pause` is a valid `timespec`; the remainder is not wanted.
+        unsafe { libc::nanosleep(&pause, std::ptr::null_mut()) };
+        return false;
+    };
+    let mut ready = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: one valid `pollfd`.
+    (unsafe { libc::poll(&mut ready, 1, millis) } == 1) && ready.revents & libc::POLLIN != 0
+}
+
+/// Exit now if the hermit process that forked this container init has already
+/// exited. Called right after `prctl(PR_SET_PDEATHSIG)`: a parent that died
+/// before that call will never deliver the signal, and nothing else would end
+/// this init or the guest it is about to start. The exit status is the
+/// `128 + SIGKILL` a shell reports for the death signal that never came; a
+/// namespace init cannot be killed by a signal it sends itself.
+///
+/// Async-signal-safe (`fstat`, `poll`, `_exit`), so it is sound in `pre_exec`.
+pub(super) fn exit_if_parent_already_gone() {
+    if wait_for_parent_exit(std::time::Duration::ZERO) {
+        // SAFETY: `_exit` has no preconditions and is async-signal-safe.
+        unsafe { libc::_exit(128 + libc::SIGKILL) }
+    }
 }
 
 /// See [`stall_container_init_before_arming_if_asked`].
@@ -3846,6 +3926,9 @@ pub(super) fn exits_init_after_publication() -> bool {
 /// sites now.
 pub(super) fn arm_container_init_guards() -> Result<(), SerializableError> {
     arm_parent_death_signal().map_err(SerializableError::from)?;
+    // A parent that died before the `prctl` above will never send its death
+    // signal; nothing would end this init, so end it here.
+    exit_if_parent_already_gone();
     // Right after the death signal and before anything can start a guest: a
     // parent that crossed --max-log-bytes and exited 123 before the `prctl`
     // above will never send it, so stop here instead.
@@ -3860,13 +3943,15 @@ pub(super) fn arm_container_init_guards() -> Result<(), SerializableError> {
 /// site in `run.rs` for why the stop handlers are not.
 ///
 /// It runs between fork and exec, so it must stay async-signal-safe: `prctl`,
-/// one atomic read-modify-write, `_exit` and the error value only.
+/// `poll` and `fstat` on the inherited pidfd, one atomic read-modify-write,
+/// `_exit` and the error value only.
 pub(super) fn arm_namespace_only_guest() -> Result<(), reverie::Errno> {
     // SAFETY: as in `arm_parent_death_signal`: it reads and writes no caller
     // memory.
     if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } == -1 {
         return Err(reverie::Errno::last());
     }
+    exit_if_parent_already_gone();
     // In this mode the parent is the only hermit process and holds the log
     // subscriber, so it is the likeliest crosser: see
     // `exit_if_log_cap_already_crossed`.
