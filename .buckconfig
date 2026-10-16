@@ -45,4 +45,9 @@ forkserver = false
 file_watcher = notify
 
 [project]
-ignore = .git, target, shim/third-party/rust/vendor
+# ignored/ holds generated validation output and is never a Buck input. The full
+# validation's pinned-root nodes write ignored/hermetic/split while
+# e2e.buck_cells runs its two concurrent `buck2 test` invocations; each such
+# write made the daemon hold the second invocation until the first finished
+# ("Waiting on Synchronizing buck2 internal state").
+ignore = .git, target, ignored, shim/third-party/rust/vendor
