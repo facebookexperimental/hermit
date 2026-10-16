@@ -19666,8 +19666,13 @@ fn hermit_dap_listen_without_an_adapter_names_the_build_command() {
     let work =
         tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("failed to create the work dir");
     let lonely = work.path().join("hermit");
-    fs::hard_link(env!("CARGO_BIN_EXE_hermit"), &lonely)
-        .or_else(|_| fs::copy(env!("CARGO_BIN_EXE_hermit"), &lonely).map(|_| ()))
+    // A copy, never a hard link: in the validation, CARGO_BIN_EXE_hermit is the
+    // prepared target/validate/hermit, which other nodes hash as a prepared
+    // input while this test runs. A link changes that inode's link count and
+    // ctime, and test.arbitrary_binaries in the full validation of 6ae2cba5
+    // refused its inputs for exactly that ("prepared input changed while
+    // hashing /src/target/validate/hermit: ... nlink 2 -> 3").
+    fs::copy(env!("CARGO_BIN_EXE_hermit"), &lonely)
         .expect("failed to put a hermit without hermit-dap beside it");
     // Its own port: the adapter is looked for once the run's gdbserver listens.
     let gdbserver_arg = format!("--gdbserver-port={}", unused_local_port());
