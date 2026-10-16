@@ -655,7 +655,16 @@ impl RecordVersion {
 // (https://github.com/rrnewton/hermit/issues/4262). An older recording's
 // guest saw si_code 0 and no si_value for such a signal, and a replay would
 // show it SI_TIMER.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x168);
+// 0x168 -> 0x169 (reserved as 0x169): /proc/cpuinfo is a procfs file Detcore
+// renders where it answers the guest's CPUID instruction from its own table
+// (CPUID virtualized and intercepted;
+// https://github.com/rrnewton/hermit/issues/4213), and there a /proc/cpuinfo
+// the kernel opened (under record and replay, after chroot) takes Detcore's
+// rendered-file path for readv, preadv, preadv2 and lseek, as /proc/stat did
+// at 0x163. A vectored read of it records a capture where an older binary
+// refused it with ENOSYS, so an older recording containing one would replay
+// out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x169);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -680,7 +689,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x168);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x168;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x169;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1676,6 +1685,21 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_replaced_read_descriptors_block_the_claim() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15b)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x169 refused a vectored read of a /proc/cpuinfo
+    /// the kernel opened (ENOSYS) where Detcore now captures it, as it renders
+    /// /proc/cpuinfo where CPUID is virtualized and intercepted
+    /// (https://github.com/rrnewton/hermit/issues/4213).
+    #[test]
+    fn record_version_rejects_streams_from_before_cpuinfo_is_rendered() {
+        for older in 0x163..=0x168 {
+            assert!(
+                !RECORD_VERSION.compatible_with(&RecordVersion(older)),
+                "{older:#x}"
+            );
+        }
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 

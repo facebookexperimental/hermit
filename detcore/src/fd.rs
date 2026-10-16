@@ -1030,20 +1030,23 @@ impl DetFd {
     /// The procfs path of a file Detcore opened with no kernel object behind
     /// it (`ProcfsFile::is_rendered`): this descriptor is a placeholder.
     pub(crate) fn procfs_rendered_path(&self) -> Option<&'static Path> {
-        self.with_description(|d| {
-            d.procfs
-                .as_ref()
-                .filter(|procfs| procfs.is_rendered())
-                .and_then(ProcfsFile::rendered_path)
-        })
+        self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::opened_path))
     }
 
     /// The procfs path of a file whose every byte Detcore renders
     /// (`ProcfsFile::rendered_path`), whether Detcore opened it as a
     /// placeholder or the kernel opened it: through a symbolic link or `..`,
-    /// after `chroot`, or under record and replay.
-    pub(crate) fn procfs_renderable_path(&self) -> Option<&'static Path> {
-        self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::rendered_path))
+    /// after `chroot`, or under record and replay. `files` are the files the
+    /// session renders (`Detcore::rendered_files`).
+    pub(crate) fn procfs_renderable_path(
+        &self,
+        files: crate::procfs::RenderedFiles,
+    ) -> Option<&'static Path> {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .and_then(|procfs| procfs.rendered_path(files))
+        })
     }
 
     /// Whether Linux reads this procfs file through `read_iter`

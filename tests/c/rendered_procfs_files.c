@@ -7,8 +7,10 @@
 
 /* Guest for hermit-cli/tests/cli.rs: the procfs files Detcore renders without
  * the backend opening them (https://github.com/rrnewton/hermit/issues/4213),
- * /proc/sys/kernel/random/uuid, /proc/sys/kernel/pty/nr, /proc/uptime and
- * /proc/stat. The first two are sysctl files and the others seq_files, which
+ * /proc/sys/kernel/random/uuid, /proc/sys/kernel/pty/nr, /proc/uptime,
+ * /proc/stat and /proc/cpuinfo (which Detcore renders where it answers the
+ * guest's CPUID instruction from its own table, as on every backend the cli
+ * test runs). The first two are sysctl files and the others seq_files, which
  * Linux seeks, maps and writes at a position differently (check_seeks,
  * check_descriptor_refusals).
  *
@@ -36,7 +38,16 @@
  *                              [--detcore-xattr-order] [--alias-bytes]
  *        rendered_procfs_files --inherited <fd> <duplicate> <ino> <offset> <kvm>
  *                              <stat-fd> <stat-head> <uptime-fd>
+ *                              <cpuinfo-fd> <cpuinfo-head> <alias-bytes>
  *        rendered_procfs_files --aliases-in-a-thread <alias-bytes>
+ *        rendered_procfs_files --forged-cpuinfo-placeholder
+ *        rendered_procfs_files --forged-cpuinfo-after-exec <fd>
+ *
+ * --forged-cpuinfo-placeholder, for a run that does not render
+ * /proc/cpuinfo (--no-virtualize-cpuid): a memfd the program names and seals
+ * as Detcore names and seals a /proc/cpuinfo placeholder is an ordinary memfd
+ * there, reopened through its descriptor link and after exec (the second
+ * form), where Detcore made no placeholder.
  *
  * The program must be started by its absolute path, which it execs again.
  * Every check an option skips, or leaves out by its absence, is named on
@@ -122,7 +133,11 @@
  *     between reads, so only their identity and form are checked. It also
  *     requires the blocked open of check_alias_source_replaced_during_a_
  *     blocked_open to have kept its FIFO, as Detcore's deterministic
- *     schedule ensures.
+ *     schedule ensures, and /proc/cpuinfo, Detcore's of one CPU, to read
+ *     whole in one read, which natively takes one read per seq_file buffer.
+ *     After exec, it requires /proc/cpuinfo read in part before exec and
+ *     standard input (a /proc/cpuinfo not read before exec) to read the bytes
+ *     of a whole read.
  * --inherited is the program after it execs itself.
  */
 
@@ -163,9 +178,14 @@
 #define READ_CAPACITY (1 << 20)
 static char contents_buffer[READ_CAPACITY];
 static char rest_buffer[READ_CAPACITY];
+static char third_buffer[READ_CAPACITY];
 
 /* How many bytes of /proc/stat the program reads before it execs itself. */
 #define STAT_HEAD 8
+
+/* How many bytes of /proc/cpuinfo the program reads before it execs itself:
+ * "processor\t", the start of its first line. */
+#define CPUINFO_HEAD 10
 
 static int failures;
 static int kvm_local_procfs;
@@ -389,6 +409,18 @@ static int is_stat(const char* text, size_t length) {
          numbers_line(text, length, &at, "softirq ", 11, 11) && at == length;
 }
 
+/* /proc/cpuinfo in show_cpuinfo's layout: a block of "name\t: value" lines
+ * per CPU, the first CPU's first line "processor\t: 0", each with a flags
+ * line, and each ended by an empty line. */
+static int is_cpuinfo(const char* text, size_t length) {
+  static const char first[] = "processor\t: 0\n";
+  if (length < sizeof(first) + 1 || memcmp(text, first, sizeof(first) - 1) != 0 ||
+      memcmp(text + length - 2, "\n\n", 2) != 0 || memchr(text, '\0', length) != NULL) {
+    return 0;
+  }
+  return memmem(text, length, "\nflags\t\t: ", 10) != NULL;
+}
+
 /* "<a>.<cc> <b>.<cc> <c>.<cc> <running>/<total> <last pid>\n", as
  * /proc/loadavg reads. */
 static int is_loadavg(const char* text, size_t length) {
@@ -426,7 +458,7 @@ static int is_loadavg(const char* text, size_t length) {
 }
 
 /* The kinds of file this program checks. */
-enum kind { COUNT, UUID, UPTIME, STAT, LOADAVG };
+enum kind { COUNT, UUID, UPTIME, STAT, LOADAVG, CPUINFO };
 
 static int has_contents(enum kind kind, const char* text, size_t length) {
   switch (kind) {
@@ -438,6 +470,8 @@ static int has_contents(enum kind kind, const char* text, size_t length) {
       return is_stat(text, length);
     case LOADAVG:
       return is_loadavg(text, length);
+    case CPUINFO:
+      return is_cpuinfo(text, length);
     default:
       return is_count(text, length);
   }
@@ -446,7 +480,7 @@ static int has_contents(enum kind kind, const char* text, size_t length) {
 /* Whether the kind of file is a seq_file (every procfs file outside
  * /proc/sys) rather than a sysctl file. */
 static int is_seq_file(enum kind kind) {
-  return kind == UPTIME || kind == STAT || kind == LOADAVG;
+  return kind == UPTIME || kind == STAT || kind == LOADAVG || kind == CPUINFO;
 }
 
 /* Prints `label`, then `text` with each newline but its last shown as \n, so
@@ -1028,6 +1062,22 @@ static void check_file(const char* path, enum kind kind) {
 
   char* contents = contents_buffer;
   ssize_t length = read(fd, contents, READ_CAPACITY);
+  if (kind == CPUINFO) {
+    /* show_cpuinfo emits a record per CPU, and seq_read returns only the
+     * records that fit its buffer, so natively a host of many CPUs takes
+     * several reads. Detcore's file, of one CPU, takes one, which the runs
+     * under Hermit (--alias-bytes) require. */
+    int reads = 1;
+    while (length > 0 && length < READ_CAPACITY) {
+      ssize_t more = read(fd, contents + length, READ_CAPACITY - length);
+      if (more <= 0) {
+        break;
+      }
+      length += more;
+      reads++;
+    }
+    CHECK(reads == 1 || !alias_bytes, "%s took %d reads", path, reads);
+  }
   CHECK(length > 0 && has_contents(kind, contents, length),
         "%s contents %.*s", path, (int)(length > 0 ? length : 0), contents);
   char* rest = rest_buffer;
@@ -2187,11 +2237,30 @@ static void print_contents(const char* path) {
   print_one_line(label, contents, length > 0 ? length : 0);
 }
 
+/* Reads `fd` to its end into `buffer`, as many reads as that takes (a
+ * seq_file returns only the records that fit its buffer): the bytes read, or
+ * -1 if a read failed. */
+static ssize_t read_to_end(int fd, char* buffer, size_t capacity) {
+  size_t length = 0;
+  while (length < capacity) {
+    ssize_t got = read(fd, buffer + length, capacity - length);
+    if (got < 0) {
+      return -1;
+    }
+    if (got == 0) {
+      break;
+    }
+    length += (size_t)got;
+  }
+  return (ssize_t)length;
+}
+
 /* After exec: the inherited descriptor and its duplicate are still the file,
  * one open file at its position. Prints what they read, which every backend
  * must agree on. */
 static int inherited(int fd, int duplicate, unsigned long long ino, long offset, int stat_fd,
-                     const char* stat_head, int uptime_fd) {
+                     const char* stat_head, int uptime_fd, int cpuinfo_fd,
+                     const char* cpuinfo_head) {
   /* Before this image reads them, /proc/stat and /proc/uptime, whose first
    * reads took their snapshots before exec, show the files' own times, and a
    * time set on them is refused. */
@@ -2277,19 +2346,125 @@ static int inherited(int fd, int duplicate, unsigned long long ino, long offset,
         "inherited /proc/stat read %zd: %.*s", stat_rest,
         (int)(stat_rest > 0 ? head_length + (size_t)stat_rest : 0), contents_buffer);
   print_one_line("stat after exec: ", contents_buffer + head_length, stat_rest > 0 ? stat_rest : 0);
+  /* /proc/cpuinfo, read in part before exec, continues at its position, and
+   * standard input, a /proc/cpuinfo opened onto descriptor 0 and not read
+   * before exec, reads the whole file. Detcore renders /proc/cpuinfo again in
+   * the new image rather than carrying it (ProcfsFile::snapshot_is_rerendered),
+   * and must know the descriptors this image rediscovers, the standard ones
+   * among them, as the file they are. Where Detcore renders it
+   * (--alias-bytes), both are the bytes of a whole read; natively the host's
+   * file changes between reads (its frequencies), so only their form is
+   * checked. */
+  CHECK(lseek(cpuinfo_fd, 0, SEEK_CUR) == CPUINFO_HEAD, "inherited /proc/cpuinfo position %ld",
+        (long)lseek(cpuinfo_fd, 0, SEEK_CUR));
+  size_t cpuinfo_head_length = strlen(cpuinfo_head);
+  memcpy(contents_buffer, cpuinfo_head, cpuinfo_head_length);
+  ssize_t cpuinfo_rest = read_to_end(cpuinfo_fd, contents_buffer + cpuinfo_head_length,
+                                     READ_CAPACITY - cpuinfo_head_length);
+  size_t across = cpuinfo_rest > 0 ? cpuinfo_head_length + (size_t)cpuinfo_rest : 0;
+  CHECK(cpuinfo_head_length == CPUINFO_HEAD && cpuinfo_rest > 0 &&
+            is_cpuinfo(contents_buffer, across),
+        "inherited /proc/cpuinfo read %zd", cpuinfo_rest);
+  ssize_t on_stdin = read_to_end(0, third_buffer, READ_CAPACITY);
+  CHECK(on_stdin > 0 && is_cpuinfo(third_buffer, (size_t)on_stdin),
+        "/proc/cpuinfo on standard input after exec read %zd: %.*s", on_stdin,
+        (int)(on_stdin > 0 ? (on_stdin < 64 ? on_stdin : 64) : 0), third_buffer);
+  int whole_fd = open("/proc/cpuinfo", O_RDONLY);
+  ssize_t cpuinfo_whole = whole_fd < 0 ? -1 : read_to_end(whole_fd, rest_buffer, READ_CAPACITY);
+  if (whole_fd >= 0) {
+    close(whole_fd);
+  }
+  CHECK(cpuinfo_whole > 0 && is_cpuinfo(rest_buffer, (size_t)cpuinfo_whole),
+        "/proc/cpuinfo whole read after exec %zd", cpuinfo_whole);
+  if (alias_bytes) {
+    CHECK((ssize_t)across == cpuinfo_whole && memcmp(contents_buffer, rest_buffer, across) == 0,
+          "/proc/cpuinfo read across exec (%zu bytes) is not the whole file (%zd)", across,
+          cpuinfo_whole);
+    CHECK(on_stdin == cpuinfo_whole && memcmp(third_buffer, rest_buffer, (size_t)on_stdin) == 0,
+          "/proc/cpuinfo on standard input after exec (%zd bytes) is not the whole file (%zd)",
+          on_stdin, cpuinfo_whole);
+  }
+  printf("cpuinfo across exec: %zu+%zd bytes\n", cpuinfo_head_length, cpuinfo_rest);
+  printf("cpuinfo on standard input after exec: %zd bytes\n", on_stdin);
   return failures == 0 ? 0 : 1;
+}
+
+/* The forged placeholder's checks: descriptor `fd` is the empty memfd it is,
+ * read and reopened through its descriptor link, which names the memfd. */
+static void check_forged_cpuinfo_placeholder(int fd, const char* when) {
+  static const char name[] = "/memfd:hermit-procfs:/proc/cpuinfo@";
+  char link[64];
+  snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+  char target[128] = {0};
+  ssize_t named = readlink(link, target, sizeof(target) - 1);
+  CHECK(named > 0 && strncmp(target, name, sizeof(name) - 1) == 0,
+        "forged placeholder link %s: %.*s", when, (int)(named > 0 ? named : 0), target);
+  int again = open(link, O_RDONLY | O_CLOEXEC);
+  CHECK(again >= 0, "reopen the forged placeholder %s: %s", when, strerror(errno));
+  struct stat by_fd;
+  CHECK(again >= 0 && fstat(again, &by_fd) == 0 && S_ISREG(by_fd.st_mode) &&
+            by_fd.st_size == 0 && by_fd.st_nlink == 0,
+        "forged placeholder's reopened identity %s", when);
+  char bytes[64];
+  CHECK(again >= 0 && read(again, bytes, sizeof(bytes)) == 0,
+        "the reopened forged placeholder reads bytes %s", when);
+  CHECK(read(fd, bytes, sizeof(bytes)) == 0, "the forged placeholder reads bytes %s", when);
+  CHECK(lseek(fd, 0, SEEK_END) == 0, "the forged placeholder's end %s", when);
+  if (again >= 0) {
+    close(again);
+  }
+}
+
+/* A memfd named and sealed as a /proc/cpuinfo placeholder, in a run that
+ * does not render /proc/cpuinfo: an ordinary memfd, before and after exec. */
+static int forged_cpuinfo_placeholder(void) {
+  int fd = memfd_create("hermit-procfs:/proc/cpuinfo@", MFD_ALLOW_SEALING);
+  CHECK(fd >= 0, "memfd_create: %s", strerror(errno));
+  if (fd < 0) {
+    return 1;
+  }
+  /* Sealed as Detcore seals a placeholder where the backend has seals; KVM
+   * has none (ENOSYS), and Detcore's placeholders there carry none either,
+   * so the name alone is the forgery. */
+  if (fcntl(fd, F_ADD_SEALS, F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) != 0) {
+    CHECK(errno == ENOSYS, "seal the forged placeholder: %s", strerror(errno));
+    allowed_for("the forged placeholder", "ENOSYS from F_ADD_SEALS", "no option",
+                "the backend has no memfd seals, as on KVM, where Detcore's placeholders "
+                "carry none either");
+  }
+  check_forged_cpuinfo_placeholder(fd, "before exec");
+  if (failures != 0) {
+    return 1;
+  }
+  fflush(stdout);
+  char fd_text[16];
+  snprintf(fd_text, sizeof(fd_text), "%d", fd);
+  char* const arguments[] = {(char*)program, "--forged-cpuinfo-after-exec", fd_text, NULL};
+  execv(program, arguments);
+  fprintf(stderr, "FAIL: exec: %s\n", strerror(errno));
+  return 1;
 }
 
 int main(int argc, char** argv) {
   program = argv[0];
+  if (argc == 2 && strcmp(argv[1], "--forged-cpuinfo-placeholder") == 0) {
+    return forged_cpuinfo_placeholder();
+  }
+  if (argc == 3 && strcmp(argv[1], "--forged-cpuinfo-after-exec") == 0) {
+    check_forged_cpuinfo_placeholder(atoi(argv[2]), "after exec");
+    printf("forged cpuinfo placeholder: %s\n",
+           failures == 0 ? "an ordinary memfd" : "not an ordinary memfd");
+    return failures == 0 ? 0 : 1;
+  }
   if (argc == 3 && strcmp(argv[1], "--aliases-in-a-thread") == 0) {
     alias_bytes = atoi(argv[2]);
     return aliases_from_a_new_thread();
   }
-  if (argc == 10 && strcmp(argv[1], "--inherited") == 0) {
+  if (argc == 13 && strcmp(argv[1], "--inherited") == 0) {
     kvm_local_procfs = atoi(argv[6]);
+    alias_bytes = atoi(argv[12]);
     return inherited(atoi(argv[2]), atoi(argv[3]), strtoull(argv[4], NULL, 10), atol(argv[5]),
-                     atoi(argv[7]), argv[8], atoi(argv[9]));
+                     atoi(argv[7]), argv[8], atoi(argv[9]), atoi(argv[10]), argv[11]);
   }
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--kvm-local-procfs") == 0) {
@@ -2354,6 +2529,7 @@ int main(int argc, char** argv) {
   print_contents("/proc/sys/kernel/random/uuid");
   print_contents("/proc/sys/kernel/pty/nr");
   print_contents("/proc/stat");
+  print_contents("/proc/cpuinfo");
   /* The start of /proc/stat, whose first read takes its snapshot, in the
    * same second as the read above; the rest is read after exec. */
   int stat_fd = open("/proc/stat", O_RDONLY);
@@ -2386,6 +2562,14 @@ int main(int argc, char** argv) {
     fprintf(stderr, "FAIL: cannot prepare the inherited /proc/uptime: %s\n", strerror(errno));
     return 1;
   }
+  /* The start of /proc/cpuinfo; the rest is read after exec. */
+  int cpuinfo_fd = open("/proc/cpuinfo", O_RDONLY);
+  char cpuinfo_head[CPUINFO_HEAD + 1] = {0};
+  if (cpuinfo_fd < 0 || read(cpuinfo_fd, cpuinfo_head, CPUINFO_HEAD) != CPUINFO_HEAD ||
+      memchr(cpuinfo_head, '\0', CPUINFO_HEAD) != NULL) {
+    fprintf(stderr, "FAIL: cannot prepare the inherited /proc/cpuinfo: %s\n", strerror(errno));
+    return 1;
+  }
   check_fork_shares_the_position();
   int fd = open("/proc/sys/kernel/random/uuid", O_RDONLY);
   int duplicate = dup(fd);
@@ -2402,7 +2586,9 @@ int main(int argc, char** argv) {
   check_file("/proc/sys/kernel/pty/nr", COUNT);
   check_file("/proc/uptime", UPTIME);
   check_file("/proc/stat", STAT);
+  check_file("/proc/cpuinfo", CPUINFO);
   check_directory_aliases("stat", STAT);
+  check_directory_aliases("cpuinfo", CPUINFO);
   check_directory_aliases("uptime", UPTIME);
   check_directory_aliases("loadavg", LOADAVG);
   check_directory_aliases("sys/kernel/pty/nr", COUNT);
@@ -2467,6 +2653,15 @@ int main(int argc, char** argv) {
   snprintf(fd_text, sizeof(fd_text), "%d", fd);
   snprintf(duplicate_text, sizeof(duplicate_text), "%d", duplicate);
   snprintf(ino_text, sizeof(ino_text), "%llu", (unsigned long long)by_fd.st_ino);
+  char cpuinfo_fd_text[16];
+  snprintf(cpuinfo_fd_text, sizeof(cpuinfo_fd_text), "%d", cpuinfo_fd);
+  /* A /proc/cpuinfo on standard input that nothing reads before exec: the
+   * new image first meets it as one of the descriptors it rediscovers. */
+  int on_stdin = open("/proc/cpuinfo", O_RDONLY);
+  if (on_stdin < 0 || (on_stdin != 0 && (dup2(on_stdin, 0) != 0 || close(on_stdin) != 0))) {
+    fprintf(stderr, "FAIL: cannot put /proc/cpuinfo on standard input: %s\n", strerror(errno));
+    return 1;
+  }
   char* const arguments[] = {(char*)program,
                              "--inherited",
                              fd_text,
@@ -2477,6 +2672,9 @@ int main(int argc, char** argv) {
                              stat_fd_text,
                              stat_head,
                              uptime_fd_text,
+                             cpuinfo_fd_text,
+                             cpuinfo_head,
+                             alias_bytes ? "1" : "0",
                              NULL};
   execv(program, arguments);
   fprintf(stderr, "FAIL: exec: %s\n", strerror(errno));

@@ -5726,7 +5726,9 @@ fn detcore_lists_procfs_from_its_model_on_every_backend() {
 }
 
 /// Detcore renders `/proc/sys/kernel/random/uuid`, `/proc/sys/kernel/pty/nr`,
-/// `/proc/uptime` and `/proc/stat` without the backend opening them
+/// `/proc/uptime`, `/proc/stat` and `/proc/cpuinfo` (where it answers the
+/// guest's CPUID instruction from its own table, as on every backend here)
+/// without the backend opening them
 /// (https://github.com/rrnewton/hermit/issues/4213), also where the guest
 /// reaches them relative to a `/proc` descriptor it opened through a
 /// descriptor link (`/proc/self/fd/N`, `/dev/fd/N`), as `/proc/loadavg` too.
@@ -5868,6 +5870,29 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
             assert_success(&output, &args);
             assert_eq!(stdout(&output), "chroot checks passed\n", "dbt chroot");
         }
+        // In a run that does not render /proc/cpuinfo, a memfd the guest names
+        // and seals as Detcore names and seals a /proc/cpuinfo placeholder is
+        // an ordinary memfd, reopened through its descriptor link and after
+        // exec: Detcore made no placeholder there, so the name is not trusted
+        // (Codex review of https://github.com/rrnewton/hermit/issues/4213).
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--no-virtualize-cpuid",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            "--forged-cpuinfo-placeholder",
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            "forged cpuinfo placeholder: an ordinary memfd\n",
+            "{backend}"
+        );
     }
     assert!(
         identities.len() > 1 || !cfg!(feature = "dbt"),
@@ -5882,24 +5907,26 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
     );
     let (_, first) = &identities[0];
     let lines = first.lines().collect::<Vec<_>>();
-    // The guest's lines, in order: each file's contents (/proc/stat's on one
-    // line, its newlines shown as \n), the start of /proc/stat read before
-    // exec, a read shared across fork and the whole file read from its
-    // start, the bytes of the UUID read before exec, each file's identity,
-    // and the bytes read after exec, the whole UUID, and the rest of
-    // /proc/stat.
+    // The guest's lines, in order: each file's contents (/proc/stat's and
+    // /proc/cpuinfo's on one line, their newlines shown as \n), the start of
+    // /proc/stat read before exec, a read shared across fork and the whole
+    // file read from its start, the bytes of the UUID read before exec, each
+    // file's identity, and the bytes read after exec, the whole UUID, the
+    // rest of /proc/stat, and the sizes of /proc/cpuinfo read across exec and
+    // on standard input.
     let line = |index: usize, prefix: &str| {
         lines
             .get(index)
             .and_then(|line| line.strip_prefix(prefix))
             .unwrap_or_else(|| panic!("line {index} is not {prefix:?}: {first}"))
     };
-    assert_eq!(lines.len(), 15, "{first}");
+    assert_eq!(lines.len(), 19, "{first}");
     for (index, path) in [
-        (8, "/proc/sys/kernel/random/uuid"),
-        (9, "/proc/sys/kernel/pty/nr"),
-        (10, "/proc/uptime"),
-        (11, "/proc/stat"),
+        (9, "/proc/sys/kernel/random/uuid"),
+        (10, "/proc/sys/kernel/pty/nr"),
+        (11, "/proc/uptime"),
+        (12, "/proc/stat"),
+        (13, "/proc/cpuinfo"),
     ] {
         let identity = line(index, &format!("{path} dev=0xf000ff ino="));
         let ino: u64 = identity
@@ -5952,19 +5979,49 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
         )
     };
     assert_eq!(stat, rendering(user), "{first}");
-    let forked = format!("{}{}", line(4, "fork child: "), line(5, "fork parent: "));
+    // /proc/cpuinfo describes the virtual CPU whose table answers the guest's
+    // CPUID instruction, one of it, never the host's: the same bytes on every
+    // backend (below), from no kernel file. (The guest prints its final
+    // newline as itself, which ends the line.)
+    let cpuinfo = line(3, "/proc/cpuinfo: ").replace("\\n", "\n");
+    assert!(
+        cpuinfo.starts_with(
+            "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 6\n\
+             model name\t: QEMU Virtual CPU version 2.5+\nstepping\t: 3\n\
+             cpu MHz\t\t: 1000.000\n"
+        ) && cpuinfo.ends_with("\npower management:\n")
+            && cpuinfo.matches("processor\t:").count() == 1,
+        "{first}"
+    );
+    // /proc/cpuinfo read in part before exec and in the rest after it, and a
+    // /proc/cpuinfo on standard input that nothing read before exec, read the
+    // whole file in the new image (the guest compares their bytes with a whole
+    // read): Detcore renders the table again there and knows the descriptors
+    // that image rediscovers. The line above dropped the file's last newline.
+    let cpuinfo_length = cpuinfo.len() + 1;
+    assert_eq!(
+        line(17, "cpuinfo across exec: "),
+        format!("10+{} bytes", cpuinfo_length - 10),
+        "{first}"
+    );
+    assert_eq!(
+        line(18, "cpuinfo on standard input after exec: "),
+        format!("{cpuinfo_length} bytes"),
+        "{first}"
+    );
+    let forked = format!("{}{}", line(5, "fork child: "), line(6, "fork parent: "));
     assert!(uuid_shape(&forked), "{first}");
-    assert_eq!(forked, line(6, "fork whole: "), "{first}");
-    let execed = format!("{}{}", line(7, "before exec: "), line(12, "after exec: "));
+    assert_eq!(forked, line(7, "fork whole: "), "{first}");
+    let execed = format!("{}{}", line(8, "before exec: "), line(14, "after exec: "));
     assert!(uuid_shape(&execed), "{first}");
-    assert_eq!(execed, line(13, "exec whole: "), "{first}");
+    assert_eq!(execed, line(15, "exec whole: "), "{first}");
     // /proc/stat read in part before exec and in the rest a second after it
     // continues from the snapshot its first read took, in the same second as
     // the read above: a new snapshot would show 100 more ticks.
     let stat_execed = format!(
         "{}{}",
-        line(3, "stat before exec: "),
-        line(14, "stat after exec: ")
+        line(4, "stat before exec: "),
+        line(16, "stat after exec: ")
     );
     assert_eq!(stat_execed, line(2, "/proc/stat: "), "{first}");
     for (backend, identity) in &identities {
@@ -29037,10 +29094,6 @@ fn cpuinfo_matches_cpuid() {
     assert_cpuinfo_matches_cpuid(&[]);
 }
 
-/// [`cpuinfo_matches_cpuid`] on the KVM backend, whose guests also get
-/// Detcore's CPUID table: reverie-kvm opens /proc/cpuinfo onto a fixed stub,
-/// which Detcore's procfs snapshot replaces on read. Before
-/// https://github.com/rrnewton/hermit/pull/4264 it read 15/27 MISMATCH here.
 /// Under KVM each guest `cpuid` is answered by Detcore, as under ptrace, so
 /// the two print the same CPUID rows and the same hle/rtm agreement with
 /// `/proc/cpuinfo`. The backend keeps no CPUID profile of its own (Reverie
@@ -29080,6 +29133,12 @@ fn run_kvm_cpuid_rows_match_ptrace() {
     assert_eq!(run("kvm"), ptrace);
 }
 
+/// [`cpuinfo_matches_cpuid`] on the KVM backend, whose guests also get
+/// Detcore's CPUID table: Detcore renders /proc/cpuinfo from that table
+/// itself, as on every backend where it answers the CPUID instruction, and the
+/// backend opens nothing (https://github.com/rrnewton/hermit/issues/4213).
+/// Before https://github.com/rrnewton/hermit/pull/4264 it read 15/27 MISMATCH
+/// here.
 #[test]
 fn run_kvm_cpuinfo_matches_cpuid() {
     if !Path::new("/dev/kvm").exists() {

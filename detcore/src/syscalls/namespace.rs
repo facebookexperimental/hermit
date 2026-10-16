@@ -652,7 +652,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     where
         G: Guest<Self>,
     {
-        if let Some(path) = crate::procfs::placeholder_link_path(raw_target)
+        if let Some(path) =
+            crate::procfs::placeholder_link_path(raw_target, self.rendered_files(guest))
             && self.placeholder_link_confirmed(guest, link).await
         {
             // Another process's link to a procfs file Detcore renders names
@@ -958,7 +959,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(length) => {
                 let mut target = vec![0; (length as usize).min(ANONYMOUS_PROC_FD_TARGET_CAPACITY)];
                 guest.memory().read_exact(scratch.cast(), &mut target)?;
-                crate::procfs::placeholder_link_path(&target)
+                crate::procfs::placeholder_link_path(&target, self.rendered_files(guest))
             }
             Err(_) => None,
         };
@@ -1730,18 +1731,23 @@ mod tests {
         let longest = format!("/memfd:{} (deleted)", "x".repeat(249));
         assert!(longest.len() < ANONYMOUS_PROC_FD_TARGET_CAPACITY);
         // Each rendered file's placeholder, with the snapshot it carries,
-        // fits a memfd name and is read back from its link. A fixed file's
-        // carries none (`ProcfsFile::snapshot_is_fixed`).
-        for path in crate::syscalls::rendered_procfs::rendered_paths() {
+        // fits a memfd name and is read back from its link in a session that
+        // renders it. A file whose snapshots are all the same carries none
+        // (`ProcfsFile::snapshot_is_rerendered`).
+        let all = crate::procfs::RenderedFiles::ALL;
+        for path in crate::syscalls::rendered_procfs::rendered_paths(all) {
             let path = std::path::Path::new(path.to_str().unwrap());
-            let snapshot = match crate::procfs::FixedProcfsFile::from_path(path.to_str().unwrap()) {
-                Some(_) => Vec::new(),
-                None => b"00000000-0000-4000-8000-000000000000\n".to_vec(),
+            let rerendered = crate::procfs::ProcfsFile::from_path(path)
+                .unwrap()
+                .snapshot_is_rerendered();
+            let snapshot = match rerendered {
+                true => Vec::new(),
+                false => b"00000000-0000-4000-8000-000000000000\n".to_vec(),
             };
             let name = crate::procfs::placeholder_name(path, &snapshot);
             assert!(name.len() <= 249, "{name}");
             let placeholder = format!("/memfd:{name} (deleted)");
-            assert!(crate::procfs::placeholder_link_path(placeholder.as_bytes()).is_some());
+            assert!(crate::procfs::placeholder_link_path(placeholder.as_bytes(), all).is_some());
         }
         assert_eq!(
             anonymous_proc_fd_identity(maximum.as_bytes()),

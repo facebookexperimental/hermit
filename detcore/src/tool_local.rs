@@ -107,6 +107,23 @@ pub struct FileMetadata {
     /// The next accept-wait operation number in this table.
     #[serde(skip)]
     next_accept_wait: u64,
+    /// Whether the session renders `/proc/cpuinfo`, so that a memfd named as
+    /// its placeholder may be one when this table rediscovers descriptors
+    /// without a guest at hand (an in-guest backend's image after `exec`):
+    /// the session's own answer (`Detcore::rendered_files`), taken at the
+    /// image's first guest callback (`decide_cpuinfo_placeholders`), and kept
+    /// by `fork_for` and `for_exec`. `None` until then, and when absent from
+    /// an older serialized table. Detcore makes no such placeholder in a
+    /// session that does not render the file, so there a memfd of that name
+    /// stays an ordinary memfd.
+    #[serde(default)]
+    cpuinfo_placeholders: Option<bool>,
+    /// Descriptors rediscovered before [`Self::cpuinfo_placeholders`] was
+    /// decided whose memfd is named as a `/proc/cpuinfo` placeholder: kept as
+    /// the ordinary descriptors they look like until the session's answer
+    /// says whether they are placeholders (`decide_cpuinfo_placeholders`).
+    #[serde(default)]
+    pending_cpuinfo_placeholders: Vec<RawFd>,
 }
 
 /// Deserializes a descriptor table with its aliases restored, so a table
@@ -729,7 +746,41 @@ impl FileMetadata {
             file_handles: HashMap::new(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
+            cpuinfo_placeholders: None,
+            pending_cpuinfo_placeholders: Vec::new(),
         }
+    }
+
+    /// Take the session's answer to whether it renders `/proc/cpuinfo`
+    /// (`rendered`: `Detcore::rendered_files(guest).cpuinfo`), at the first
+    /// guest callback of this image, before guest code runs. A descriptor
+    /// rediscovered before it whose memfd is named as a `/proc/cpuinfo`
+    /// placeholder becomes the placeholder it is where the session renders
+    /// the file, and stays an ordinary memfd where it does not. Later answers
+    /// of the same session are the same and change nothing.
+    pub(crate) fn decide_cpuinfo_placeholders(&mut self, rendered: bool) -> Result<(), Errno> {
+        if self.cpuinfo_placeholders.is_some() {
+            return Ok(());
+        }
+        self.cpuinfo_placeholders = Some(rendered);
+        let pending = std::mem::take(&mut self.pending_cpuinfo_placeholders);
+        if !rendered {
+            return Ok(());
+        }
+        for fd in pending {
+            if !self.file_handles.contains_key(&fd) {
+                continue;
+            }
+            let raw_stat =
+                stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).map_err(|_| Errno::last())?;
+            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if let Some((path, snapshot)) =
+                placeholder_behind(fd, crate::procfs::RenderedFiles::ALL)
+            {
+                self.adopt_placeholder(fd, &raw_stat, fd_flags, path, snapshot)?;
+            }
+        }
+        Ok(())
     }
 
     /// Register a blocking accept waiting on `listener` and return the
@@ -830,6 +881,8 @@ impl FileMetadata {
             file_handles: self.file_handles.clone(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
+            cpuinfo_placeholders: self.cpuinfo_placeholders,
+            pending_cpuinfo_placeholders: self.pending_cpuinfo_placeholders.clone(),
         }
     }
 
@@ -846,6 +899,8 @@ impl FileMetadata {
                 .collect(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
+            cpuinfo_placeholders: self.cpuinfo_placeholders,
+            pending_cpuinfo_placeholders: self.pending_cpuinfo_placeholders.clone(),
         }
     }
 
@@ -1236,42 +1291,28 @@ impl FileMetadata {
         let may_be_placeholder = raw_stat.st_mode & libc::S_IFMT == libc::S_IFREG
             && raw_stat.st_nlink == 0
             && raw_stat.st_size == 0;
-        if let Some((path, snapshot)) = may_be_placeholder.then(|| placeholder_behind(fd)).flatten()
+        // A `/proc/cpuinfo` placeholder only once the session's answer says
+        // it renders the file (`decide_cpuinfo_placeholders`); before that
+        // answer, one waits for it as the ordinary descriptor it looks like.
+        let decided = self.cpuinfo_placeholders;
+        let files = crate::procfs::RenderedFiles {
+            cpuinfo: decided == Some(true),
+        };
+        let found = may_be_placeholder
+            .then(|| placeholder_behind(fd, files))
+            .flatten();
+        if found.is_none()
+            && decided.is_none()
+            && may_be_placeholder
+            && placeholder_behind(fd, crate::procfs::RenderedFiles::ALL)
+                .is_some_and(|(path, _)| path == std::path::Path::new("/proc/cpuinfo"))
         {
-            crate::syscalls::rendered_procfs::register_placeholder(
-                raw_stat.st_dev,
-                raw_stat.st_ino,
-                path,
-            );
-            // Every open makes its own placeholder, so another descriptor on
-            // the same one is the same open file: one cursor, as before.
-            if let Some(alias) = self.rendered_alias(fd, raw_stat.st_dev, raw_stat.st_ino) {
-                let mut alias = alias.with_fd(fd);
-                alias.set_cloexec(fd_flags & libc::FD_CLOEXEC != 0);
-                self.add_detfd(alias);
+            self.pending_cpuinfo_placeholders.push(fd);
+        }
+        if let Some((path, snapshot)) = found {
+            if self.adopt_placeholder(fd, &raw_stat, fd_flags, path, snapshot)? {
                 return Ok(());
             }
-            // SAFETY: lseek only reads the descriptor's position.
-            let offset = unsafe {
-                crate::util::raw_syscall(
-                    libc::SYS_lseek,
-                    [fd as u64, 0, libc::SEEK_CUR as u64, 0, 0, 0],
-                )
-            };
-            let offset = usize::try_from(offset).unwrap_or(0);
-            let procfs = crate::procfs::ProcfsFile::from_path(path)
-                .expect("a rendered path is a procfs file")
-                .into_rendered();
-            let procfs = if snapshot.is_empty() {
-                procfs
-            } else {
-                procfs.with_rendered_snapshot(snapshot)
-            };
-            self.with_detfd(fd, |detfd| {
-                detfd.set_path(path);
-                detfd.set_procfs(procfs.clone());
-                detfd.set_procfs_offset(offset);
-            })?;
         }
         // A fixed procfs file the kernel opened (through a symbolic link),
         // which the old image read from Detcore's rendering: the file again,
@@ -1291,7 +1332,7 @@ impl FileMetadata {
             };
             let offset = usize::try_from(offset).unwrap_or(0);
             let path = procfs
-                .rendered_path()
+                .rendered_path(crate::procfs::RenderedFiles::WITHOUT_CPUINFO)
                 .expect("a fixed procfs file has a path");
             self.with_detfd(fd, |detfd| {
                 detfd.set_path(path);
@@ -1306,6 +1347,56 @@ impl FileMetadata {
             self.with_detfd(fd, |detfd| detfd.set_physically_nonblocking())?;
         }
         Ok(())
+    }
+
+    /// Make descriptor `fd`, already in this table, the placeholder for the
+    /// rendered file `path` that its memfd (`raw_stat`, descriptor flags
+    /// `fd_flags`) is, with the snapshot its name carries. Returns whether it
+    /// joined another descriptor's open file (an alias), whose state it then
+    /// shares.
+    fn adopt_placeholder(
+        &mut self,
+        fd: RawFd,
+        raw_stat: &libc::stat,
+        fd_flags: libc::c_int,
+        path: &'static std::path::Path,
+        snapshot: Vec<u8>,
+    ) -> Result<bool, Errno> {
+        crate::syscalls::rendered_procfs::register_placeholder(
+            raw_stat.st_dev,
+            raw_stat.st_ino,
+            path,
+        );
+        // Every open makes its own placeholder, so another descriptor on
+        // the same one is the same open file: one cursor, as before.
+        if let Some(alias) = self.rendered_alias(fd, raw_stat.st_dev, raw_stat.st_ino) {
+            let mut alias = alias.with_fd(fd);
+            alias.set_cloexec(fd_flags & libc::FD_CLOEXEC != 0);
+            self.add_detfd(alias);
+            return Ok(true);
+        }
+        // SAFETY: lseek only reads the descriptor's position.
+        let offset = unsafe {
+            crate::util::raw_syscall(
+                libc::SYS_lseek,
+                [fd as u64, 0, libc::SEEK_CUR as u64, 0, 0, 0],
+            )
+        };
+        let offset = usize::try_from(offset).unwrap_or(0);
+        let procfs = crate::procfs::ProcfsFile::from_path(path)
+            .expect("a rendered path is a procfs file")
+            .into_rendered();
+        let procfs = if snapshot.is_empty() {
+            procfs
+        } else {
+            procfs.with_rendered_snapshot(snapshot)
+        };
+        self.with_detfd(fd, |detfd| {
+            detfd.set_path(path);
+            detfd.set_procfs(procfs.clone());
+            detfd.set_procfs_offset(offset);
+        })?;
+        Ok(false)
     }
 
     /// Another descriptor of this process open on the placeholder `(dev,
@@ -2171,6 +2262,80 @@ mod file_metadata_tests {
                 before[index]
             );
         }
+    }
+
+    /// A memfd named and sealed as a `/proc/cpuinfo` placeholder, met by a
+    /// table that rediscovers descriptors before the session's answer (an
+    /// in-guest backend's image after `exec`), is a placeholder only once the
+    /// session says it renders the file. With CPUID virtualized but not
+    /// intercepted (SaBRe), `Detcore::rendered_files` says it does not, and
+    /// the memfd stays the ordinary memfd it is (Codex and
+    /// deterministic-scheduling review of
+    /// https://github.com/rrnewton/hermit/issues/4213).
+    #[test]
+    fn a_cpuinfo_placeholder_waits_for_the_sessions_answer() {
+        let owner = DetTid::from_raw(9);
+        let forged = || {
+            // SAFETY: the name is NUL-terminated; the result is checked.
+            let raw = unsafe {
+                libc::memfd_create(
+                    c"hermit-procfs:/proc/cpuinfo@".as_ptr(),
+                    libc::MFD_ALLOW_SEALING,
+                )
+            };
+            assert!(
+                raw >= 0,
+                "memfd_create: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: `raw` is a descriptor this test just made and owns.
+            let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+            let seals = crate::syscalls::rendered_procfs::PLACEHOLDER_SEALS;
+            assert_eq!(unsafe { libc::fcntl(raw, libc::F_ADD_SEALS, seals) }, 0);
+            fd
+        };
+        let ordinary = |metadata: &FileMetadata, fd: RawFd| {
+            metadata.file_handles[&fd].procfs_rendered_path().is_none()
+        };
+        // The session does not render /proc/cpuinfo (CPUID virtualized by
+        // the configuration, but the backend delivers no CPUID to Detcore).
+        let fd = forged();
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .discover_fd_from_current_process(owner, fd.as_raw_fd())
+            .unwrap();
+        assert!(ordinary(&metadata, fd.as_raw_fd()));
+        metadata.decide_cpuinfo_placeholders(false).unwrap();
+        assert!(ordinary(&metadata, fd.as_raw_fd()));
+        // Once decided, a later descriptor is not one either.
+        let later = forged();
+        metadata
+            .discover_fd_from_current_process(owner, later.as_raw_fd())
+            .unwrap();
+        assert!(ordinary(&metadata, later.as_raw_fd()));
+        // A later answer of the same session changes nothing.
+        metadata.decide_cpuinfo_placeholders(true).unwrap();
+        assert!(ordinary(&metadata, fd.as_raw_fd()));
+        // The session renders it: the waiting descriptor becomes the
+        // placeholder, and so is one met after the answer.
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .discover_fd_from_current_process(owner, fd.as_raw_fd())
+            .unwrap();
+        assert!(ordinary(&metadata, fd.as_raw_fd()));
+        metadata.decide_cpuinfo_placeholders(true).unwrap();
+        assert_eq!(
+            metadata.file_handles[&fd.as_raw_fd()].procfs_rendered_path(),
+            Some(std::path::Path::new("/proc/cpuinfo"))
+        );
+        let after = forged();
+        metadata
+            .discover_fd_from_current_process(owner, after.as_raw_fd())
+            .unwrap();
+        assert_eq!(
+            metadata.file_handles[&after.as_raw_fd()].procfs_rendered_path(),
+            Some(std::path::Path::new("/proc/cpuinfo"))
+        );
     }
 
     #[test]
@@ -7188,7 +7353,10 @@ fn fixed_procfs_behind(fd: RawFd) -> Option<crate::procfs::ProcfsFile> {
     crate::procfs::ProcfsFile::from_path(path).filter(crate::procfs::ProcfsFile::snapshot_is_fixed)
 }
 
-fn placeholder_behind(fd: RawFd) -> Option<(&'static std::path::Path, Vec<u8>)> {
+fn placeholder_behind(
+    fd: RawFd,
+    files: crate::procfs::RenderedFiles,
+) -> Option<(&'static std::path::Path, Vec<u8>)> {
     // SAFETY: F_GET_SEALS only reads the descriptor's seals.
     let seals = unsafe {
         crate::util::raw_syscall(
@@ -7218,7 +7386,7 @@ fn placeholder_behind(fd: RawFd) -> Option<(&'static std::path::Path, Vec<u8>)> 
         )
     };
     let length = usize::try_from(length).ok()?.min(target.len());
-    crate::procfs::placeholder_link(&target[..length])
+    crate::procfs::placeholder_link(&target[..length], files)
 }
 
 #[cfg(test)]

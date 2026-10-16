@@ -879,13 +879,18 @@ impl DirectoryInodes {
     }
 
     /// The inode number of the entry named `name` if it is a procfs file
-    /// Detcore renders, which names it by its path alone ([`rendered_inode`]).
-    pub(crate) fn rendered_entry_inode(&self, name: &[u8]) -> Option<u64> {
+    /// Detcore renders in this session (`files`), which names it by its path
+    /// alone ([`rendered_inode`]).
+    pub(crate) fn rendered_entry_inode(
+        &self,
+        name: &[u8],
+        files: crate::procfs::RenderedFiles,
+    ) -> Option<u64> {
         let within = self.procfs.as_ref()?.entry_path(name);
         let relative = within.strip_prefix("/").unwrap_or(&within);
         let path = Path::new("/proc").join(relative);
         crate::procfs::ProcfsFile::from_path(&path)?
-            .rendered_path()
+            .rendered_path(files)
             .map(rendered_inode)
     }
 

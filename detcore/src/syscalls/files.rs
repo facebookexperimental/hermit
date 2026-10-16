@@ -1300,19 +1300,21 @@ impl<'a> StatTarget<'a> {
 
 /// The rendered procfs file that a stat result describes, if it is one: by
 /// the name Detcore gave it, or by its kernel identity where Detcore names no
-/// procfs files.
+/// procfs files. `files` are the files the session renders
+/// (`Detcore::rendered_files`).
 fn rendered_entry(
     procfs: &ProcfsEntry,
     stat: &DetStat,
     cfg: &crate::config::Config,
+    files: crate::procfs::RenderedFiles,
 ) -> Option<&'static Path> {
     if cfg.recordreplay_modes {
         return None;
     }
     match procfs {
-        ProcfsEntry::At(within) => rendered_procfs::rendered_path_within(within),
+        ProcfsEntry::At(within) => rendered_procfs::rendered_path_within(within, files),
         ProcfsEntry::NotProcfs | ProcfsEntry::Unknown => {
-            rendered_procfs::rendered_path_of_raw(stat)
+            rendered_procfs::rendered_path_of_raw(stat, files)
         }
         ProcfsEntry::Unnamed => None,
     }
@@ -4674,7 +4676,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 None => {
                     let procfs =
                         Self::procfs_entry(guest, &stat, StatTarget::Descriptor(target_fd)).await;
-                    if let Some(path) = rendered_entry(&procfs, &stat, guest.config()) {
+                    let files = self.rendered_files(guest);
+                    if let Some(path) = rendered_entry(&procfs, &stat, guest.config(), files) {
                         DetInode::mint(procfs_inode::rendered_inode(path))
                     } else {
                         determinize_inode_observing_mtime(
@@ -4768,14 +4771,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         // exactly when CPUID is virtualized and the backend delivers the
         // instruction to Detcore (`handle_cpuid_event`), on ptrace and KVM
         // alike; without CPUID interception the guest sees the host's CPU,
-        // and so does this file. On KVM this replaces the fixed stub
-        // reverie-kvm opens /proc/cpuinfo onto.
-        let is_cpuinfo = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_is_cpuinfo())?;
-        let virtual_cpuinfo =
-            (is_cpuinfo && self.cfg.virtualize_cpuid && guest.has_cpuid_interception())
-                .then(|| self.virtual_cpuid().cpuinfo());
+        // and so does this file. There Detcore renders the file itself
+        // (`ProcfsFile::rendered_path`); this is for a /proc/cpuinfo the
+        // kernel opened: through a symbolic link, after `chroot`, or under
+        // record and replay.
+        // A placeholder (`procfs_rendered_path`), which exists only where the
+        // session renders the file, is rendered from the table: it holds no
+        // other bytes.
+        let (is_cpuinfo, placeholder) = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            (
+                detfd.procfs_is_cpuinfo(),
+                detfd.procfs_rendered_path().is_some(),
+            )
+        })?;
+        let virtual_cpuinfo = (is_cpuinfo && (placeholder || self.rendered_files(guest).cpuinfo))
+            .then(|| self.virtual_cpuid().cpuinfo());
         let needs_random_uuid = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_random_uuid())?;
@@ -5609,9 +5619,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // looked at; otherwise a sysctl file's `default_llseek` on a file of
         // size 0, whatever the snapshot holds, or a `seq_file`'s `seq_lseek`,
         // which seeks only from the start or the position.
+        let files = self.rendered_files(guest);
         let rendered = guest
             .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_renderable_path())?;
+            .with_detfd(call.fd(), |detfd| detfd.procfs_renderable_path(files))?;
         if let Some(rendered) = rendered {
             if status_flags & libc::O_PATH != 0 {
                 return Err(Errno::EBADF.into());
@@ -6505,10 +6516,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .readv_timer_slack(guest, call.fd(), iovecs, None, 0)
                 .await;
         }
-        if guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_renderable_path().is_some())?
-        {
+        let files = self.rendered_files(guest);
+        if guest.thread_state().with_detfd(call.fd(), |detfd| {
+            detfd.procfs_renderable_path(files).is_some()
+        })? {
             let address = call.iov().map_or(0, |address| address.as_raw());
             return self
                 .readv_rendered_procfs(guest, call.fd(), address, call.len(), None, 0)
@@ -6634,10 +6645,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .readv_timer_slack(guest, call.fd(), iovecs, Some(offset), 0)
                 .await;
         }
-        if guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_renderable_path().is_some())?
-        {
+        let files = self.rendered_files(guest);
+        if guest.thread_state().with_detfd(call.fd(), |detfd| {
+            detfd.procfs_renderable_path(files).is_some()
+        })? {
             let address = call.iov().map_or(0, |address| address.as_raw());
             return self
                 .readv_rendered_procfs(guest, call.fd(), address, call.iov_len(), Some(offset), 0)
@@ -6715,10 +6726,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .await
             };
         }
-        if guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_renderable_path().is_some())?
-        {
+        let files = self.rendered_files(guest);
+        if guest.thread_state().with_detfd(call.fd(), |detfd| {
+            detfd.procfs_renderable_path(files).is_some()
+        })? {
             let address = call.iov().map_or(0, |address| address.as_raw());
             let offset = (offset != -1).then_some(offset);
             return self
@@ -7332,7 +7343,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 {
                     stat.nlink = 1;
                 }
-                match rendered_entry(&procfs, &stat, &cfg) {
+                match rendered_entry(&procfs, &stat, &cfg, self.rendered_files(guest)) {
                     // A file Detcore renders, reached through a spelling the
                     // kernel resolved (a symbolic link): the number its path
                     // names, and the epoch.
@@ -10422,7 +10433,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let mut names = Vec::with_capacity(batch.len());
                 for (index, entry) in batch.iter().enumerate() {
                     let (host, path) = inodes.entry_inode(&entry.name, entry.ino);
-                    let d_ino = match self.rendered_listed_inode(&inodes, &entry.name, entry.ino) {
+                    let d_ino = match self.rendered_listed_inode(
+                        &inodes,
+                        &entry.name,
+                        entry.ino,
+                        self.rendered_files(guest),
+                    ) {
                         Some(inode) => DetInode::mint(inode),
                         None => determinize_listed_inode(guest, host, path, mark).await.0,
                     };
@@ -10681,6 +10697,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             })
             .collect();
         let host_cookie = |name: &[u8]| host_cookies.get(name).copied().unwrap_or(0);
+        let session_files = self.rendered_files(guest);
         let host_end = host.last().map_or(0, |entry| entry.off);
         // Looked up from the guest's own descriptor where it names the
         // kernel's directory, and by the guest's spelling on KVM, whose own
@@ -10715,7 +10732,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let rendered = crate::procfs::ProcfsFile::from_path(
                     &Path::new("/proc").join(entry.strip_prefix("/").unwrap_or(&entry)),
                 )
-                .is_some_and(|file| file.rendered_path().is_some());
+                .is_some_and(|file| file.rendered_path(session_files).is_some());
                 // On a backend's own /proc (KVM), what a lookup finds is the
                 // backend's, at a moment the host decides (a process's
                 // directory goes when its executor learns of the exit), so
@@ -10981,7 +10998,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut records = Vec::with_capacity(len);
         for entry in &entries {
             let (host, path) = inodes.entry_inode(&entry.name, entry.ino);
-            let d_ino = match self.rendered_listed_inode(&inodes, &entry.name, entry.ino) {
+            let d_ino = match self.rendered_listed_inode(
+                &inodes,
+                &entry.name,
+                entry.ino,
+                self.rendered_files(guest),
+            ) {
                 Some(inode) => DetInode::mint(inode),
                 None => determinize_named_inode(guest, host, path).await.0,
             };

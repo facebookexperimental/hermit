@@ -11,7 +11,10 @@
 //!
 //! For a file whose every byte comes from Detcore's own state
 //! (`ProcfsFile::rendered_path`), Detcore decides on every backend that it
-//! exists, what its metadata is and what it holds. The backend opens no
+//! exists, what its metadata is and what it holds. (`/proc/cpuinfo` is one
+//! only where Detcore answers the guest's CPUID instruction from its own
+//! table, `procfs::RenderedFiles`; elsewhere it describes the host's CPU
+//! and the kernel opens it.) The backend opens no
 //! procfs file. The guest's descriptor is a placeholder: a memfd named
 //! `PLACEHOLDER_NAME_PREFIX` and the file's path, reopened read-only with
 //! the guest's own flags, a kernel object every backend has. Reopened that
@@ -71,6 +74,7 @@ use super::StatTarget;
 use crate::fd::FdType;
 use crate::procfs::FixedProcfsFile;
 use crate::procfs::ProcfsFile;
+use crate::procfs::RenderedFiles;
 use crate::procfs::placeholder_link_path;
 use crate::procfs::placeholder_name;
 use crate::procfs_inode;
@@ -89,12 +93,12 @@ const XATTR_SIZE_MAX: usize = 65536;
 /// Linux's longest extended-attribute name.
 const XATTR_NAME_MAX: usize = 255;
 
-/// The rendered path a path within a procfs mount names, if it names one.
-/// Detcore names procfs files by their path within the mount
-/// (`ProcfsEntry::At`), as `/sys/kernel/random/uuid`.
-pub(crate) fn rendered_path_within(within: &Path) -> Option<&'static Path> {
+/// The rendered path a path within a procfs mount names, if it names one the
+/// session renders (`files`). Detcore names procfs files by their path within
+/// the mount (`ProcfsEntry::At`), as `/sys/kernel/random/uuid`.
+pub(crate) fn rendered_path_within(within: &Path, files: RenderedFiles) -> Option<&'static Path> {
     let relative = within.strip_prefix("/").unwrap_or(within);
-    ProcfsFile::from_path(&Path::new("/proc").join(relative))?.rendered_path()
+    ProcfsFile::from_path(&Path::new("/proc").join(relative))?.rendered_path(files)
 }
 
 /// The seals a placeholder carries where the backend supports seals: nothing
@@ -203,13 +207,19 @@ const DYNAMIC_PATHS: [&std::ffi::CStr; 4] = [
     c"/proc/stat",
 ];
 
-/// The paths of every procfs file Detcore renders.
-pub(crate) fn rendered_paths() -> impl Iterator<Item = &'static std::ffi::CStr> {
-    DYNAMIC_PATHS.into_iter().chain(
-        FixedProcfsFile::ALL
-            .into_iter()
-            .map(FixedProcfsFile::c_path),
-    )
+/// The paths of every procfs file a session renders (`files`):
+/// `/proc/cpuinfo` too where it renders that.
+pub(crate) fn rendered_paths(
+    files: RenderedFiles,
+) -> impl Iterator<Item = &'static std::ffi::CStr> {
+    DYNAMIC_PATHS
+        .into_iter()
+        .chain(files.cpuinfo.then_some(c"/proc/cpuinfo"))
+        .chain(
+            FixedProcfsFile::ALL
+                .into_iter()
+                .map(FixedProcfsFile::c_path),
+        )
 }
 
 /// The last component of a rendered file's path.
@@ -228,8 +238,10 @@ fn rendered_name(path: &std::ffi::CStr) -> &[u8] {
 /// permissions 0444 or 0644, as every rendered file is in the kernel's
 /// procfs, is checked, and an identity found not to be a rendered file is
 /// remembered (`NOT_RENDERED`): the checks of one procfs file cost their
-/// stats once per tool process.
-pub(crate) fn rendered_path_of_raw(stat: &DetStat) -> Option<&'static Path> {
+/// stats once per tool process. The search covers every file Detcore can
+/// render, so that what it remembers holds for any session; the answer is
+/// then the file only if this session renders it (`files`).
+pub(crate) fn rendered_path_of_raw(stat: &DetStat, files: RenderedFiles) -> Option<&'static Path> {
     let has = |field| stat.mask.contains(field);
     if (has(StatxMask::STATX_TYPE) && stat.mode & libc::S_IFMT != libc::S_IFREG)
         || (has(StatxMask::STATX_NLINK) && stat.nlink != 1)
@@ -245,7 +257,7 @@ pub(crate) fn rendered_path_of_raw(stat: &DetStat) -> Option<&'static Path> {
     {
         return None;
     }
-    let found = rendered_path_among(stat.dev, stat.inode, rendered_paths());
+    let found = rendered_path_among(stat.dev, stat.inode, rendered_paths(RenderedFiles::ALL));
     if found.is_none() && proc_device() == Some(stat.dev) {
         NOT_RENDERED
             .lock()
@@ -253,6 +265,8 @@ pub(crate) fn rendered_path_of_raw(stat: &DetStat) -> Option<&'static Path> {
             .insert(identity);
     }
     found
+        .and_then(ProcfsFile::from_path)
+        .and_then(|file| file.rendered_path(files))
 }
 
 /// The kernel procfs identities `(dev, ino)` this tool process found not to be
@@ -284,7 +298,7 @@ fn rendered_path_among(
         let stat = GuestProcfs::stat(path).ok()?;
         (stat.st_dev == dev && stat.st_ino == ino)
             .then(|| Path::new(OsStr::from_bytes(path.to_bytes())))
-            .and_then(|path| ProcfsFile::from_path(path)?.rendered_path())
+            .and_then(|path| ProcfsFile::from_path(path)?.rendered_path(RenderedFiles::ALL))
     })
 }
 
@@ -926,7 +940,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(None);
         }
         if let Some(procfs) = ProcfsFile::from_path(path) {
-            if procfs.rendered_path().is_none() {
+            if procfs.rendered_path(self.rendered_files(guest)).is_none() {
                 return Ok(None);
             }
             if names_a_directory(path) {
@@ -962,6 +976,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(None);
         }
+        // The descriptor is a placeholder, so the file it reopens is one
+        // Detcore opened as rendered: the target keeps that state, whatever
+        // the session renders by path.
         let target = guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.procfs_rendered_path())
@@ -969,7 +986,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .flatten()
             .and_then(ProcfsFile::from_path)
             .map(|procfs| RenderedTarget {
-                procfs,
+                procfs: procfs.into_rendered(),
                 via_link: true,
             });
         // The link reaches a file, which a trailing slash or `/.` refuses.
@@ -1052,7 +1069,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(length) => {
                 let mut bytes = vec![0; (length as usize).min(TARGET_CAPACITY)];
                 guest.memory().read_exact(target.cast::<u8>(), &mut bytes)?;
-                placeholder_link_path(&bytes)
+                placeholder_link_path(&bytes, self.rendered_files(guest))
             }
             Err(_) => None,
         };
@@ -1231,19 +1248,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Read before the placeholder exists, so that a failure leaves the
         // guest nothing open.
         let owner = GuestProcfs::sysctl_owner()?;
-        let path = target
-            .procfs
-            .rendered_path()
-            .expect("an opened rendered procfs file has a path");
         // The snapshot this open takes, which its placeholder's name carries,
-        // so that every backend has it after `exec`; a fixed file's is
-        // rendered again there. A file Linux renders when it is read takes
-        // none until its first read (`ProcfsFile::snapshot_at_first_read`).
+        // so that every backend has it after `exec`; a file whose every
+        // snapshot is the same is rendered again there
+        // (`ProcfsFile::snapshot_is_rerendered`). A file Linux renders when it
+        // is read takes none until its first read
+        // (`ProcfsFile::snapshot_at_first_read`).
         let procfs = target.procfs.into_rendered();
+        let path = procfs
+            .opened_path()
+            .expect("a file opened as rendered has a path");
         let snapshot =
             (!procfs.snapshot_at_first_read()).then(|| self.render_snapshot(guest, &procfs));
         let carried: &[u8] = match &snapshot {
-            Some(snapshot) if !procfs.snapshot_is_fixed() => snapshot,
+            Some(snapshot) if !procfs.snapshot_is_rerendered() => snapshot,
             _ => &[],
         };
         let fd = self
@@ -1270,8 +1288,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The snapshot of the rendered file `procfs` an open takes, from
     /// Detcore's state, as its first read used to: a UUID from the thread's
-    /// generator, Detcore's count of open ptys, or a fact of the machine
-    /// description.
+    /// generator, Detcore's count of open ptys, the virtual CPU's table
+    /// (`Detcore::virtual_cpuid`, which answers the guest's CPUID
+    /// instruction), or a fact of the machine description.
     fn render_snapshot<G: Guest<Self>>(&self, guest: &mut G, procfs: &ProcfsFile) -> Vec<u8> {
         use rand::RngExt as _;
         let mut file = procfs.clone();
@@ -1281,12 +1300,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         let virtual_pty_count = guest
             .thread_state()
             .count_open_files_at_paths(&[Path::new("/dev/ptmx"), Path::new("/dev/pts/ptmx")]);
+        let virtual_cpuinfo = file.is_cpuinfo().then(|| self.virtual_cpuid().cpuinfo());
         let template = file.rendering_template().to_vec();
         file.initialize(
             template,
             crate::procfs::ProcfsSnapshotContext {
                 random_uuid,
                 virtual_pty_count,
+                virtual_cpuinfo,
                 machine: crate::machine::MachineDescription::of(guest.config()),
                 ..Default::default()
             },
@@ -1523,6 +1544,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         inodes: &procfs_inode::DirectoryInodes,
         name: &[u8],
         host_ino: u64,
+        files: RenderedFiles,
     ) -> Option<u64> {
         if self.cfg.recordreplay_modes {
             return None;
@@ -1530,8 +1552,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // By kernel identity only for an entry named as a rendered file is,
         // which costs a stat for each rendered file of that name (at most
         // two: `version`), and only then.
-        inodes.rendered_entry_inode(name).or_else(|| {
-            let named = rendered_paths().filter(|path| rendered_name(path) == name);
+        inodes.rendered_entry_inode(name, files).or_else(|| {
+            let named = rendered_paths(files).filter(|path| rendered_name(path) == name);
             rendered_path_among(inodes.device(), host_ino, named).map(procfs_inode::rendered_inode)
         })
     }
@@ -1647,7 +1669,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 match self.rendered_procfs_at(guest, &observed).await? {
                     // A link's own metadata is not its target's: `lstat` of
                     // `/proc/self/fd/N` describes the link, which the kernel has.
-                    Some(target) if follow || !target.via_link => target.procfs.rendered_path(),
+                    Some(target) if follow || !target.via_link => {
+                        target.procfs.rendered_path(self.rendered_files(guest))
+                    }
                     Some(_) => None,
                     None if !guest.config().virtualize_metadata => {
                         self.placeholder_reached(guest, dirfd, Some(pointer), follow)
@@ -1698,10 +1722,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !target.via_link {
             return Err(Errno::EINVAL.into());
         }
+        // A link names a placeholder, which Detcore opened as rendered.
         let link = target
             .procfs
-            .rendered_path()
-            .expect("a rendered procfs file has a path");
+            .opened_path()
+            .expect("a descriptor link's target is opened as rendered");
         write_link(&mut guest.memory(), link, buffer, size).map(Some)
     }
 
@@ -1733,7 +1758,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest
             .memory()
             .read_exact(address.cast::<u8>(), &mut bytes)?;
-        match placeholder_link_path(&bytes) {
+        match placeholder_link_path(&bytes, self.rendered_files(guest)) {
             Some(path) if self.placeholder_link_confirmed(guest, link).await => {
                 let written = write_link(&mut guest.memory(), path, buffer, buffer_len)?;
                 crate::syscalls::namespace::restore_link_tail(
@@ -2385,8 +2410,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `import_xattr_name`), so a path error cannot hide them. Detcore
         // checks them first where it may answer: a spelling that could name
         // a rendered file. Any other path goes to the kernel untouched.
+        let session_files = self.rendered_files(guest);
         let xattr_arguments = if self.renders_procfs(guest)
-            && (by_descriptor || path_text.as_deref().is_some_and(could_name_rendered))
+            && (by_descriptor
+                || path_text
+                    .as_deref()
+                    .is_some_and(|text| could_name_rendered(text, session_files)))
         {
             checked_xattr_arguments(&guest.memory(), request, name)?
         } else {
@@ -2445,13 +2474,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             // The spellings Detcore resolves itself, which end in a rendered
             // file's name or a descriptor number.
-            let lexical = if could_name_rendered(&text) {
+            let files = self.rendered_files(guest);
+            let lexical = if could_name_rendered(&text, files) {
                 let observed = Self::observed_path(guest, dirfd, &text)?;
                 match self.rendered_procfs_at(guest, &observed).await? {
                     // A call that does not follow a descriptor link acts on
                     // the link itself, which the kernel has.
                     Some(target) if target.via_link && flags & nofollow() != 0 => return Ok(None),
-                    Some(target) => target.procfs.rendered_path(),
+                    Some(target) => target.procfs.rendered_path(files),
                     None => None,
                 }
             } else {
@@ -2578,12 +2608,12 @@ const fn nofollow() -> u64 {
 /// Whether `path` could be a spelling Detcore resolves to a rendered file
 /// itself: its last component is a rendered file's name or a descriptor
 /// number.
-fn could_name_rendered(path: &Path) -> bool {
+fn could_name_rendered(path: &Path, files: RenderedFiles) -> bool {
     let Some(std::path::Component::Normal(last)) = path.components().next_back() else {
         return false;
     };
     let last = last.as_bytes();
-    rendered_paths().any(|rendered| rendered_name(rendered) == last)
+    rendered_paths(files).any(|rendered| rendered_name(rendered) == last)
         || (!last.is_empty() && last.iter().all(u8::is_ascii_digit))
 }
 
@@ -2715,9 +2745,10 @@ mod tests {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        let paths: Vec<&Path> = rendered_paths()
+        let paths: Vec<&Path> = rendered_paths(RenderedFiles::ALL)
             .map(|path| Path::new(path.to_str().unwrap()))
             .collect();
+        assert!(paths.contains(&Path::new("/proc/cpuinfo")));
         let inodes: std::collections::BTreeSet<u64> = paths
             .iter()
             .map(|path| procfs_inode::rendered_inode(path))
@@ -2725,13 +2756,23 @@ mod tests {
         assert_eq!(inodes.len(), paths.len());
         for path in &paths {
             assert_eq!(
-                ProcfsFile::from_path(path).and_then(|file| file.rendered_path()),
+                ProcfsFile::from_path(path).and_then(|file| file.rendered_path(RenderedFiles::ALL)),
                 Some(*path)
             );
             // (That its placeholder's name, with its snapshot, fits a memfd
             // name is checked in `namespace`'s readlink scratch test.)
-            assert!(could_name_rendered(path), "{path:?}");
+            assert!(could_name_rendered(path, RenderedFiles::ALL), "{path:?}");
         }
+        // `/proc/cpuinfo` is rendered only in a session that renders it.
+        let without = RenderedFiles::WITHOUT_CPUINFO;
+        assert_eq!(rendered_paths(without).count() + 1, paths.len());
+        assert!(rendered_paths(without).all(|path| path != c"/proc/cpuinfo"));
+        assert!(!could_name_rendered(Path::new("/proc/cpuinfo"), without));
+        assert_eq!(rendered_path_within(Path::new("/cpuinfo"), without), None);
+        assert_eq!(
+            rendered_path_within(Path::new("/cpuinfo"), RenderedFiles::ALL),
+            Some(Path::new("/proc/cpuinfo"))
+        );
         let mode = |path: &str| rendered_stat(Path::new(path), epoch, (0, 0)).mode;
         assert_eq!(mode("/proc/version"), libc::S_IFREG | 0o444);
         assert_eq!(mode("/proc/sys/kernel/osrelease"), libc::S_IFREG | 0o444);
@@ -2749,25 +2790,42 @@ mod tests {
             DetStat::from(GuestProcfs::stat(&path).expect("stat the host's procfs"))
         };
         assert_eq!(
-            rendered_path_of_raw(&host("/proc/version")),
+            rendered_path_of_raw(&host("/proc/version"), RenderedFiles::ALL),
             Some(Path::new("/proc/version"))
         );
         assert_eq!(
-            rendered_path_of_raw(&host("/proc/sys/kernel/osrelease")),
+            rendered_path_of_raw(&host("/proc/sys/kernel/osrelease"), RenderedFiles::ALL),
             Some(Path::new("/proc/sys/kernel/osrelease"))
         );
         // A procfs file no rendered file is: not found, and then remembered.
         let status = host("/proc/self/status");
-        assert_eq!(rendered_path_of_raw(&status), None);
+        assert_eq!(rendered_path_of_raw(&status, RenderedFiles::ALL), None);
         assert!(
             NOT_RENDERED
                 .lock()
                 .unwrap()
                 .contains(&(status.dev, status.inode))
         );
-        assert_eq!(rendered_path_of_raw(&status), None);
+        assert_eq!(rendered_path_of_raw(&status, RenderedFiles::ALL), None);
+        // The host's /proc/cpuinfo is a rendered file only for a session that
+        // renders it, and what one session found is not remembered against
+        // another: each sees its own answer, in either order.
+        let cpuinfo = host("/proc/cpuinfo");
+        for _ in 0..2 {
+            assert_eq!(
+                rendered_path_of_raw(&cpuinfo, RenderedFiles::WITHOUT_CPUINFO),
+                None
+            );
+            assert_eq!(
+                rendered_path_of_raw(&cpuinfo, RenderedFiles::ALL),
+                Some(Path::new("/proc/cpuinfo"))
+            );
+        }
         // A directory is not even looked at.
-        assert_eq!(rendered_path_of_raw(&host("/proc/sys/kernel")), None);
+        assert_eq!(
+            rendered_path_of_raw(&host("/proc/sys/kernel"), RenderedFiles::ALL),
+            None
+        );
     }
 
     /// pty/nr is an integer sysctl: a read that copied part of it is followed
@@ -2794,30 +2852,49 @@ mod tests {
     fn placeholder_links_name_only_rendered_files() {
         assert_eq!(
             placeholder_link_path(
-                b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid@30 (deleted)"
+                b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid@30 (deleted)",
+                RenderedFiles::ALL
             ),
             Some(Path::new("/proc/sys/kernel/random/uuid"))
         );
         assert_eq!(
             crate::procfs::placeholder_link(
-                b"/memfd:hermit-procfs:/proc/sys/kernel/pty/nr@330a (deleted)"
+                b"/memfd:hermit-procfs:/proc/sys/kernel/pty/nr@330a (deleted)",
+                RenderedFiles::ALL
             ),
             Some((Path::new("/proc/sys/kernel/pty/nr"), b"3\n".to_vec()))
         );
         // The name a placeholder gets is the one its link is read back from.
         let name = placeholder_name(Path::new("/proc/sys/kernel/pty/nr"), b"12\n");
         assert_eq!(
-            crate::procfs::placeholder_link(format!("/memfd:{name} (deleted)").as_bytes()),
+            crate::procfs::placeholder_link(
+                format!("/memfd:{name} (deleted)").as_bytes(),
+                RenderedFiles::ALL
+            ),
             Some((Path::new("/proc/sys/kernel/pty/nr"), b"12\n".to_vec()))
         );
         // A file Linux renders at read: its placeholder carries no snapshot.
         assert_eq!(
-            crate::procfs::placeholder_link(b"/memfd:hermit-procfs:/proc/uptime@ (deleted)"),
+            crate::procfs::placeholder_link(
+                b"/memfd:hermit-procfs:/proc/uptime@ (deleted)",
+                RenderedFiles::ALL
+            ),
             Some((Path::new("/proc/uptime"), Vec::new()))
         );
         assert_eq!(
-            crate::procfs::placeholder_link(b"/memfd:hermit-procfs:/proc/stat@ (deleted)"),
+            crate::procfs::placeholder_link(
+                b"/memfd:hermit-procfs:/proc/stat@ (deleted)",
+                RenderedFiles::ALL
+            ),
             Some((Path::new("/proc/stat"), Vec::new()))
+        );
+        // A /proc/cpuinfo placeholder is one in a session that renders it.
+        assert_eq!(
+            crate::procfs::placeholder_link(
+                b"/memfd:hermit-procfs:/proc/cpuinfo@ (deleted)",
+                RenderedFiles::ALL
+            ),
+            Some((Path::new("/proc/cpuinfo"), Vec::new()))
         );
         for link in [
             b"/memfd:hermit-procfs:/proc/diskstats@30 (deleted)".as_slice(),
@@ -2828,22 +2905,32 @@ mod tests {
             b"/memfd: (deleted)",
             b"/proc/sys/kernel/random/uuid",
         ] {
-            assert_eq!(placeholder_link_path(link), None, "{link:?}");
+            assert_eq!(
+                placeholder_link_path(link, RenderedFiles::ALL),
+                None,
+                "{link:?}"
+            );
         }
         assert_eq!(
-            rendered_path_within(Path::new("/sys/kernel/random/uuid")),
+            rendered_path_within(Path::new("/sys/kernel/random/uuid"), RenderedFiles::ALL),
             Some(Path::new("/proc/sys/kernel/random/uuid"))
         );
         assert_eq!(
-            rendered_path_within(Path::new("/uptime")),
+            rendered_path_within(Path::new("/uptime"), RenderedFiles::ALL),
             Some(Path::new("/proc/uptime"))
         );
         assert_eq!(
-            rendered_path_within(Path::new("/stat")),
+            rendered_path_within(Path::new("/stat"), RenderedFiles::ALL),
             Some(Path::new("/proc/stat"))
         );
-        assert_eq!(rendered_path_within(Path::new("/diskstats")), None);
-        assert_eq!(rendered_path_within(Path::new("/self/stat")), None);
+        assert_eq!(
+            rendered_path_within(Path::new("/diskstats"), RenderedFiles::ALL),
+            None
+        );
+        assert_eq!(
+            rendered_path_within(Path::new("/self/stat"), RenderedFiles::ALL),
+            None
+        );
     }
 
     /// A placeholder carries the uptime of its file's first read in its

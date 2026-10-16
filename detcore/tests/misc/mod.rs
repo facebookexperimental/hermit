@@ -13,6 +13,7 @@
     reason = "`fbcode_build` is supplied by the internal Buck build"
 )]
 
+mod cpuinfo_sessions;
 mod inode_reuse;
 mod notification_fds;
 mod procfs_caller_buffer;

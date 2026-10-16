@@ -343,9 +343,9 @@ pub(crate) fn rendered_path_is_seq_file(path: &Path) -> bool {
 pub(crate) const PLACEHOLDER_NAME_PREFIX: &str = "hermit-procfs:";
 
 /// The procfs path a descriptor link names, if it names a placeholder for a
-/// procfs file Detcore renders.
-pub(crate) fn placeholder_link_path(link: &[u8]) -> Option<&'static Path> {
-    placeholder_link(link).map(|(path, _)| path)
+/// procfs file Detcore renders in this session (`files`).
+pub(crate) fn placeholder_link_path(link: &[u8], files: RenderedFiles) -> Option<&'static Path> {
+    placeholder_link(link, files).map(|(path, _)| path)
 }
 
 /// The most bytes a placeholder's link (`/memfd:<name> (deleted)`) takes.
@@ -355,8 +355,9 @@ pub(crate) const PLACEHOLDER_LINK_CAPACITY: usize = 288;
 /// snapshot `snapshot`: `PLACEHOLDER_NAME_PREFIX`, the path, `@`, and the
 /// snapshot in hexadecimal. The name carries the snapshot across `exec` to a
 /// backend that rediscovers its descriptors; the file itself stays empty. A
-/// fixed file's placeholder carries none (`ProcfsFile::snapshot_is_fixed`):
-/// the new image renders the same bytes, which for a table would not fit.
+/// placeholder for a file whose every snapshot is the same carries none
+/// (`ProcfsFile::snapshot_is_rerendered`): the new image renders the same
+/// bytes, which for a table would not fit.
 pub(crate) fn placeholder_name(path: &Path, snapshot: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut name = format!("{PLACEHOLDER_NAME_PREFIX}{}@", path.display());
@@ -366,8 +367,17 @@ pub(crate) fn placeholder_name(path: &Path, snapshot: &[u8]) -> String {
     name
 }
 
-/// The rendered file, and the snapshot, that a placeholder's link names.
-pub(crate) fn placeholder_link(link: &[u8]) -> Option<(&'static Path, Vec<u8>)> {
+/// The rendered file, and the snapshot, that a placeholder's link names, if
+/// it names a file Detcore renders in this session (`files`).
+///
+/// A name is only a claim: a guest can name a memfd anything. Detcore makes a
+/// placeholder only for a file it renders, so in a session that does not
+/// render `/proc/cpuinfo` (`RenderedFiles::cpuinfo`) a memfd named for it is
+/// not one, and stays the ordinary memfd it is.
+pub(crate) fn placeholder_link(
+    link: &[u8],
+    files: RenderedFiles,
+) -> Option<(&'static Path, Vec<u8>)> {
     let name = link
         .strip_prefix(b"/memfd:")?
         .strip_prefix(PLACEHOLDER_NAME_PREFIX.as_bytes())?
@@ -387,8 +397,45 @@ pub(crate) fn placeholder_link(link: &[u8]) -> Option<(&'static Path, Vec<u8>)> 
     let path = ProcfsFile::from_path(Path::new(
         <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path),
     ))?
-    .rendered_path()?;
+    .rendered_path(files)?;
     Some((path, snapshot))
+}
+
+/// Which of the files Detcore can render it renders in one session: all of
+/// them, and `/proc/cpuinfo` exactly where it answers the guest's CPUID
+/// instruction from its own table, which is where CPUID is virtualized and the
+/// backend delivers the instruction to Detcore
+/// (`Detcore::rendered_files`). Rendering the virtual CPU's table where the
+/// guest's instruction sees the host's CPU would make the two disagree
+/// (<https://github.com/rrnewton/hermit/issues/4161>), so there the kernel
+/// opens the file and Detcore reads it as before.
+///
+/// Not process-wide state: each lookup takes the session's answer from its
+/// own configuration and the guest's backend (one capability read, no
+/// injected call), and passes it to the tables that name rendered files by
+/// path or kernel identity. Two sessions in one process, one after the
+/// other or at once, so each see their own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RenderedFiles {
+    /// Whether Detcore renders `/proc/cpuinfo`.
+    pub(crate) cpuinfo: bool,
+}
+
+impl RenderedFiles {
+    /// Every file Detcore can render, `/proc/cpuinfo` too.
+    pub(crate) const ALL: Self = Self { cpuinfo: true };
+
+    /// The files Detcore renders in every session, without `/proc/cpuinfo`.
+    pub(crate) const WITHOUT_CPUINFO: Self = Self { cpuinfo: false };
+
+    /// The files a session renders whose configuration virtualizes CPUID
+    /// (`virtualize_cpuid`) and whose backend delivers the guest's CPUID
+    /// instruction to Detcore (`cpuid_interception`).
+    pub(crate) fn of(virtualize_cpuid: bool, cpuid_interception: bool) -> Self {
+        Self {
+            cpuinfo: virtualize_cpuid && cpuid_interception,
+        }
+    }
 }
 
 /// State for a procfs file whose volatile fields require normalization.
@@ -910,22 +957,41 @@ impl ProcfsFile {
     /// holds on every backend instead of the backend's `open`
     /// (<https://github.com/rrnewton/hermit/issues/4213>). `None` for the files
     /// whose bytes come from the kernel.
-    pub(crate) fn rendered_path(&self) -> Option<&'static Path> {
+    ///
+    /// `/proc/cpuinfo` is one only in a session that renders it (`files`),
+    /// and always once Detcore opened it so.
+    pub(crate) fn rendered_path(&self, files: RenderedFiles) -> Option<&'static Path> {
+        self.rendered_path_where(self.rendered || files.cpuinfo)
+    }
+
+    /// The path of this file if Detcore opened it without a kernel object
+    /// behind it ([`Self::is_rendered`]).
+    pub(crate) fn opened_path(&self) -> Option<&'static Path> {
+        self.rendered
+            .then(|| self.rendered_path_where(true))
+            .flatten()
+    }
+
+    /// [`Self::rendered_path`], where Detcore renders `/proc/cpuinfo` exactly
+    /// when `cpuinfo_rendered`.
+    fn rendered_path_where(&self, cpuinfo_rendered: bool) -> Option<&'static Path> {
         match self.kind {
             ProcfsKind::RandomUuid => Some(Path::new("/proc/sys/kernel/random/uuid")),
             ProcfsKind::PtyNr => Some(Path::new("/proc/sys/kernel/pty/nr")),
             ProcfsKind::Uptime => Some(Path::new("/proc/uptime")),
             ProcfsKind::SystemStat => Some(Path::new("/proc/stat")),
+            ProcfsKind::Cpuinfo if cpuinfo_rendered => Some(Path::new("/proc/cpuinfo")),
             ProcfsKind::Fixed(file) => Some(file.path()),
             _ => None,
         }
     }
 
     /// This file, opened by Detcore without a kernel object behind it. It
-    /// must be one [`Self::rendered_path`] names.
+    /// must be one Detcore can render ([`RenderedFiles::ALL`]); the caller
+    /// decided that this session renders it.
     pub(crate) fn into_rendered(self) -> Self {
         assert!(
-            self.rendered_path().is_some(),
+            self.rendered_path_where(true).is_some(),
             "{:?} is not rendered",
             self.kind
         );
@@ -988,6 +1054,20 @@ impl ProcfsFile {
         matches!(self.kind, ProcfsKind::Fixed(_))
     }
 
+    /// Whether every snapshot of this rendered file is the same, so that its
+    /// placeholder need not carry it across `exec`: the new image renders it
+    /// again (`placeholder_name`). A fixed file ([`Self::snapshot_is_fixed`]),
+    /// and `/proc/cpuinfo`, a function of the configuration alone
+    /// (`Detcore::virtual_cpuid`), whose table would not fit a memfd name.
+    ///
+    /// `/proc/cpuinfo` is not fixed in the other sense: where the kernel opens
+    /// it (through a symbolic link, after `chroot`, under record and replay, or
+    /// where Detcore does not render it), its bytes come from the kernel's
+    /// file unless CPUID is virtualized and intercepted.
+    pub(crate) fn snapshot_is_rerendered(&self) -> bool {
+        self.snapshot_is_fixed() || self.kind == ProcfsKind::Cpuinfo
+    }
+
     /// The kernel-shaped bytes a rendered file's snapshot starts from in place
     /// of a capture. Its sanitizer replaces every byte of them.
     pub(crate) fn rendering_template(&self) -> &'static [u8] {
@@ -997,7 +1077,7 @@ impl ProcfsFile {
             ProcfsKind::PtyNr => b"0\n",
             ProcfsKind::Uptime => b"0.00 0.00\n",
             ProcfsKind::SystemStat => SYSTEM_STAT_TEMPLATE,
-            ProcfsKind::Fixed(_) => b"",
+            ProcfsKind::Cpuinfo | ProcfsKind::Fixed(_) => b"",
             _ => unreachable!("{:?} has no rendered path", self.kind),
         }
     }
@@ -1228,6 +1308,11 @@ impl ProcfsFile {
                 virtual_boot_time_seconds.expect("system stat snapshot omitted its boot time"),
                 machine.cpus,
             ),
+            // Rendered only where CPUID is virtualized and intercepted, so a
+            // rendered snapshot always has the virtual CPU's table; the
+            // kernel's file, which the template stands in for, was never read.
+            ProcfsKind::Cpuinfo if self.rendered => virtual_cpuinfo
+                .expect("Detcore renders /proc/cpuinfo only from the virtual CPUID table"),
             ProcfsKind::Cpuinfo => virtual_cpuinfo.unwrap_or_else(|| sanitize_cpuinfo(&contents)),
             ProcfsKind::Diskstats => sanitize_diskstats(&contents),
             ProcfsKind::ProcessIo => sanitize_process_io(&contents),
@@ -5876,6 +5961,95 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
         assert_eq!(read(Some(virtual_cpuinfo.clone())), virtual_cpuinfo);
         // When the guest's CPUID is the host's, so is the file, normalized.
         assert_eq!(read(None), sanitize_cpuinfo(host));
+    }
+
+    /// Detcore renders `/proc/cpuinfo` only where it answers the guest's CPUID
+    /// instruction from its own table; rendered, every byte is that table's,
+    /// from no kernel file, and its placeholder carries none of it across
+    /// `exec`, where the new image renders the same bytes again
+    /// (<https://github.com/rrnewton/hermit/issues/4213>).
+    #[test]
+    fn rendered_cpuinfo_is_the_virtual_cpu_table_alone() {
+        let file = ProcfsFile::from_path(Path::new("/proc/cpuinfo")).unwrap();
+        // Where the guest sees the host's CPU, the kernel opens the file
+        // (https://github.com/rrnewton/hermit/issues/4161).
+        assert_eq!(file.rendered_path(RenderedFiles::WITHOUT_CPUINFO), None);
+        assert_eq!(
+            file.rendered_path(RenderedFiles::ALL),
+            Some(Path::new("/proc/cpuinfo"))
+        );
+        assert_eq!(RenderedFiles::of(true, true), RenderedFiles::ALL);
+        for (virtualize, intercepted) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(
+                RenderedFiles::of(virtualize, intercepted),
+                RenderedFiles::WITHOUT_CPUINFO
+            );
+        }
+        assert_eq!(file.opened_path(), None);
+        // Not a fixed file, which a kernel-opened alias would read as one.
+        assert!(!file.snapshot_is_fixed());
+        assert!(file.snapshot_is_rerendered());
+
+        let mut file = file.into_rendered();
+        // Opened so, it stays rendered whatever the session renders.
+        assert_eq!(
+            file.rendered_path(RenderedFiles::WITHOUT_CPUINFO),
+            Some(Path::new("/proc/cpuinfo"))
+        );
+        assert_eq!(file.opened_path(), Some(Path::new("/proc/cpuinfo")));
+        assert!(rendered_path_is_seq_file(file.opened_path().unwrap()));
+        assert!(file.has_read_iter());
+        assert!(!file.faults_on_a_short_copy());
+        let template = file.rendering_template().to_vec();
+        assert!(template.is_empty());
+        let virtual_cpuinfo = crate::cpuid::InterceptedCpuid::new().cpuinfo();
+        file.initialize(
+            template,
+            ProcfsSnapshotContext {
+                virtual_cpuinfo: Some(virtual_cpuinfo.clone()),
+                ..ProcfsSnapshotContext::default()
+            },
+        );
+        assert_eq!(file.rendered_snapshot(), Some(virtual_cpuinfo.as_slice()));
+        assert_eq!(file.take(usize::MAX), Some(virtual_cpuinfo));
+    }
+
+    /// A memfd named as a /proc/cpuinfo placeholder is one only in a session
+    /// that renders the file: elsewhere Detcore made none, so a guest's memfd
+    /// of that name (https://github.com/rrnewton/hermit/issues/4213, Codex
+    /// review) stays the ordinary memfd it is. The other rendered files are
+    /// placeholders in every session.
+    #[test]
+    fn a_cpuinfo_placeholder_name_counts_only_where_the_session_renders_it() {
+        let cpuinfo = b"/memfd:hermit-procfs:/proc/cpuinfo@ (deleted)";
+        assert_eq!(
+            placeholder_link(cpuinfo, RenderedFiles::ALL),
+            Some((Path::new("/proc/cpuinfo"), Vec::new()))
+        );
+        assert_eq!(
+            placeholder_link(cpuinfo, RenderedFiles::WITHOUT_CPUINFO),
+            None
+        );
+        let stat = b"/memfd:hermit-procfs:/proc/stat@ (deleted)";
+        for files in [RenderedFiles::ALL, RenderedFiles::WITHOUT_CPUINFO] {
+            assert_eq!(
+                placeholder_link_path(stat, files),
+                Some(Path::new("/proc/stat"))
+            );
+        }
+    }
+
+    /// A rendered `/proc/cpuinfo` has no kernel file to fall back to: a
+    /// snapshot without the virtual CPU's table is a broken invariant, not
+    /// the host's file normalized from an empty template.
+    #[test]
+    #[should_panic(expected = "only from the virtual CPUID table")]
+    fn rendered_cpuinfo_refuses_a_snapshot_without_the_table() {
+        let mut file = ProcfsFile::from_path(Path::new("/proc/cpuinfo"))
+            .unwrap()
+            .into_rendered();
+        let template = file.rendering_template().to_vec();
+        file.initialize(template, ProcfsSnapshotContext::default());
     }
 
     #[test]

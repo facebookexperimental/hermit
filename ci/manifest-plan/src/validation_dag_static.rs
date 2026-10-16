@@ -1622,7 +1622,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And record_version_rejects_streams_from_before_descriptor_links_record_their_target
     // (https://github.com/rrnewton/hermit/issues/4213): 1132, listed.
     // And https://github.com/rrnewton/hermit/issues/4262: record_version_rejects_streams_from_before_posix_timer_records_carry_si_timer: 1133.
-    ("test.hermit_unit", 1133),
+    // And record_version_rejects_streams_from_before_cpuinfo_is_rendered
+    // (https://github.com/rrnewton/hermit/issues/4213): 1134, executed.
+    ("test.hermit_unit", 1134),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2404,7 +2406,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from a52129ba: 1921.
     // And syscalls::files::test::an_open_through_an_unrecorded_descriptors_link_records_its_identity
     // (https://github.com/rrnewton/hermit/issues/4213): 1922, listed.
-    ("test.detcore_unit", 1922),
+    // And procfs::tests::rendered_cpuinfo_is_the_virtual_cpu_table_alone,
+    // procfs::tests::rendered_cpuinfo_refuses_a_snapshot_without_the_table and
+    // procfs::tests::a_cpuinfo_placeholder_name_counts_only_where_the_session_renders_it and
+    // file_metadata_tests::a_cpuinfo_placeholder_waits_for_the_sessions_answer
+    // (https://github.com/rrnewton/hermit/issues/4213): 1926, executed.
+    ("test.detcore_unit", 1926),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2489,7 +2496,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4012) retain all 129: 134.
     // tight_stack_openat's record-mode open
     // (https://github.com/rrnewton/hermit/issues/4266): 135.
-    ("test.detcore_misc", 135),
+    // And cpuinfo_sessions::sequential_runs_each_render_cpuinfo_by_their_own_configuration
+    // and cpuinfo_sessions::concurrent_runs_each_render_cpuinfo_by_their_own_configuration
+    // (https://github.com/rrnewton/hermit/issues/4213): 137.
+    ("test.detcore_misc", 137),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -3925,7 +3935,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same eleven child-subreaper guest tests: 129.
     // And the same five raw-clone process tests: 134.
     // And the same record-mode tight-stack open: 135.
-    ("test.detcore_misc_on_host", 135),
+    // And the two 4213 cpuinfo-session tests: 137.
+    ("test.detcore_misc_on_host", 137),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -4170,7 +4181,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Numeric procfs stream ordering and ordinary-name regression tests: +2.
     // And +1 from a52129ba: 1921.
     // And the 4213 unrecorded-descriptor link test: 1922.
-    ("test.detcore_unit_on_host", 1922),
+    // And the four 4213 rendered-cpuinfo tests: 1926, executed.
+    ("test.detcore_unit_on_host", 1926),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4443,7 +4455,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 4362 step-0b record-version test: 1131.
     // And the descriptor-link record-version test: 1132, listed.
     // And https://github.com/rrnewton/hermit/issues/4262: the same +1 as test.hermit_unit, 1133.
-    ("test.hermit_unit_on_host", 1133),
+    // And the rendered-cpuinfo record-version test: 1134, executed.
+    ("test.hermit_unit_on_host", 1134),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

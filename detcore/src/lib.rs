@@ -486,6 +486,39 @@ impl<T: RecordOrReplay> Detcore<T> {
         cpuid::InterceptedCpuid::for_config(&self.cfg)
     }
 
+    /// The procfs files this session renders (`procfs::RenderedFiles`):
+    /// `/proc/cpuinfo` among them where the guest's CPUID instruction is
+    /// answered from [`Self::virtual_cpuid`], which is where CPUID is
+    /// virtualized and the backend delivers the instruction to Detcore.
+    ///
+    /// Recomputed at each lookup from this run's configuration and the
+    /// guest's backend: one capability read, no injected call, and no state
+    /// shared with another session in the process. The answer is the same at
+    /// every lookup of a run: Reverie arms CPUID interception before the
+    /// guest's first callback (ptrace in its post-spawn preinit, before
+    /// `handle_thread_start`, and again at each `exec`; KVM from the Tool's
+    /// subscription before the first entry; DBT always intercepts), and a new
+    /// task takes its parent's.
+    pub(crate) fn rendered_files<G: Guest<Self>>(&self, guest: &G) -> procfs::RenderedFiles {
+        procfs::RenderedFiles::of(self.cfg.virtualize_cpuid, guest.has_cpuid_interception())
+    }
+
+    /// Give this image's descriptor table the session's answer to whether it
+    /// renders `/proc/cpuinfo` ([`Self::rendered_files`]), at the image's
+    /// first guest callback and before guest code runs, so that a placeholder
+    /// the table rediscovered without a guest at hand (an in-guest backend's
+    /// image after `exec`) is trusted exactly where the session renders the
+    /// file (`FileMetadata::decide_cpuinfo_placeholders`).
+    fn decide_cpuinfo_placeholders<G: Guest<Self>>(&self, guest: &G) -> Result<(), Errno> {
+        let rendered = self.rendered_files(guest).cpuinfo;
+        guest
+            .thread_state()
+            .file_metadata
+            .lock()
+            .unwrap()
+            .decide_cpuinfo_placeholders(rendered)
+    }
+
     /// Signal phase 1, step I4 (design section 4, "The commit"): when the
     /// caller's process holds a SIGALRM entry that is due for it, run the
     /// signal pipeline ptrace runs at a signal-delivery stop (step 2), take
@@ -2816,6 +2849,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
         guest.thread_state_mut().thread_start_entered = true;
+        self.decide_cpuinfo_placeholders(guest)?;
         let new_dettid = DetTid::from_raw(guest.tid().into()); // TODO(T78538674): virtualize pid/tid:
         assert_eq!(new_dettid, guest.thread_state().dettid);
         let detpid = select_thread_start_detpid(guest.thread_state().detpid, guest.pid());
@@ -2896,6 +2930,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     }
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        // The new image's table may hold placeholders it rediscovered before
+        // this, the image's first guest callback.
+        self.decide_cpuinfo_placeholders(guest)?;
         // A nonleader exec preserves the survivor's state and PMU counter, but
         // Linux changes its TID. Bind that state before any image callback RPC.
         match tool_global::reconnect_exec(guest).await {
