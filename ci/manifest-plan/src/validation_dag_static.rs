@@ -1072,7 +1072,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And replay_modes' trace_replay_split_just_spin, the internal
     // just_spin_trace_replay_split target: 1570.
     // And +13 from a3a9c83a: 1583.
-    ("test.regular_crates", 1583),
+    // And hermit-verify chaos-stress's three classification unit tests and
+    // its three runs against a scripted Hermit (tests/cli.rs): 1589.
+    ("test.regular_crates", 1589),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4397,7 +4399,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same replay_modes parser test: 1555.
     // And the same trace_replay_split_just_spin: 1556.
     // And +13 from a3a9c83a: 1569.
-    ("test.regular_crates_on_host", 1569),
+    // And the same six chaos-stress tests, which need no PMU: 1575.
+    ("test.regular_crates_on_host", 1575),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),
