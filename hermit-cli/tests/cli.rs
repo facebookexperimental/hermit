@@ -4114,8 +4114,14 @@ const PROCFS_BACKENDS: [&str; 7] = [
 /// deliver the preemption timer yet.
 const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
     (
-        "detcore_fixes_the_virtual_kernel_files_on_every_backend",
-        "liteinst, in-guest-trap",
+        "detcore_fixes_the_virtual_kernel_files_on_liteinst",
+        "liteinst",
+        "a /proc descriptor kept across execve loses its position \
+         (https://github.com/rrnewton/hermit/issues/4450)",
+    ),
+    (
+        "detcore_fixes_the_virtual_kernel_files_on_in_guest_trap",
+        "in-guest-trap",
         "a /proc descriptor kept across execve loses its position \
          (https://github.com/rrnewton/hermit/issues/4450)",
     ),
@@ -4549,16 +4555,30 @@ const VIRTUAL_KERNEL_FILES: [&str; 36] = [
 /// (https://github.com/rrnewton/hermit/issues/4266). Before, the host-process
 /// backends passed the kernel's files through and kept each table's host
 /// shape, and KVM made up its own files or refused them. Linux's own
-/// invariants are checked natively first. Every backend that runs Detcore is
-/// compared (`procfs_backends`), but one not available here, named as not
-/// compared, and one `PROCFS_NOT_YET` lists, named with its issue.
+/// invariants are checked natively first.
+///
+/// Every backend that runs Detcore is checked, one test each, and each
+/// one's output is compared with ptrace's whole, inode numbers included
+/// (`procfs_backends`): a backend not available here is named as not
+/// compared, and one `PROCFS_NOT_YET` lists is named with its issue. One test
+/// per backend gives each backend's L2 runs their own CPU budget: the one
+/// test of all seven crossed validate's 22 CPU-second cap per test (exit 124
+/// at 38-40 s on main c506cd58 and d9d98c01), DBT's two verified runs alone
+/// taking 20-23 s of wall time.
 // Carried verbatim from reverie-kvm's removed regression test of its own copies of
 // these files, which Detcore's renderings replace (https://github.com/rrnewton/hermit/issues/4213):
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-224): regression coverage for the /proc/vmstat
 // and /proc/sys/kernel/osrelease synthetic surfaces.
-#[test]
-fn detcore_fixes_the_virtual_kernel_files_on_every_backend() {
+fn detcore_fixes_the_virtual_kernel_files_on(test: &str, backend: &'static str) {
+    // The backend itself, and ptrace, the reference it is compared with.
+    let compared = procfs_backends(test)
+        .into_iter()
+        .filter(|candidate| *candidate == "ptrace" || *candidate == backend)
+        .collect::<Vec<_>>();
+    if !compared.contains(&backend) {
+        return;
+    }
     let guest = virtual_kernel_files_guest();
     let native = Command::new(guest)
         .arg("--host")
@@ -4638,7 +4658,7 @@ fn detcore_fixes_the_virtual_kernel_files_on_every_backend() {
     );
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mut outputs = Vec::new();
-    for backend in procfs_backends("detcore_fixes_the_virtual_kernel_files_on_every_backend") {
+    for backend in compared {
         let report = directory.path().join(format!("{backend}.json"));
         let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
         let mut args = vec![
@@ -4688,11 +4708,11 @@ fn detcore_fixes_the_virtual_kernel_files_on_every_backend() {
         outputs.push((backend, text));
     }
     assert!(
-        outputs.len() > 1 || !cfg!(feature = "dbt"),
-        "only ptrace was compared"
+        backend == "ptrace" || outputs.len() == 2,
+        "{test}: {backend} was not compared with ptrace"
     );
     eprintln!(
-        "detcore_fixes_the_virtual_kernel_files_on_every_backend compared {:?}",
+        "{test} compared {:?}",
         outputs
             .iter()
             .map(|(backend, _)| *backend)
@@ -4705,6 +4725,62 @@ fn detcore_fixes_the_virtual_kernel_files_on_every_backend() {
             outputs[0].0
         );
     }
+}
+
+#[test]
+fn detcore_fixes_the_virtual_kernel_files_on_ptrace() {
+    detcore_fixes_the_virtual_kernel_files_on(
+        "detcore_fixes_the_virtual_kernel_files_on_ptrace",
+        "ptrace",
+    );
+}
+
+#[test]
+fn detcore_fixes_the_virtual_kernel_files_on_dbt() {
+    detcore_fixes_the_virtual_kernel_files_on(
+        "detcore_fixes_the_virtual_kernel_files_on_dbt",
+        "dbt",
+    );
+}
+
+#[test]
+fn detcore_fixes_the_virtual_kernel_files_on_kvm() {
+    detcore_fixes_the_virtual_kernel_files_on(
+        "detcore_fixes_the_virtual_kernel_files_on_kvm",
+        "kvm",
+    );
+}
+
+#[test]
+fn detcore_fixes_the_virtual_kernel_files_on_sabre() {
+    detcore_fixes_the_virtual_kernel_files_on(
+        "detcore_fixes_the_virtual_kernel_files_on_sabre",
+        "sabre",
+    );
+}
+
+#[test]
+fn detcore_fixes_the_virtual_kernel_files_on_liteinst() {
+    detcore_fixes_the_virtual_kernel_files_on(
+        "detcore_fixes_the_virtual_kernel_files_on_liteinst",
+        "liteinst",
+    );
+}
+
+#[test]
+fn detcore_fixes_the_virtual_kernel_files_on_in_guest_trap() {
+    detcore_fixes_the_virtual_kernel_files_on(
+        "detcore_fixes_the_virtual_kernel_files_on_in_guest_trap",
+        "in-guest-trap",
+    );
+}
+
+#[test]
+fn detcore_fixes_the_virtual_kernel_files_on_e9patch() {
+    detcore_fixes_the_virtual_kernel_files_on(
+        "detcore_fixes_the_virtual_kernel_files_on_e9patch",
+        "e9patch",
+    );
 }
 
 /// Whether the host kernel's release is at least `major.minor`.
