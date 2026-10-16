@@ -4698,19 +4698,29 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         // keep 1.5 times its largest observed wall. 7200 = 9600 minus the 2400
         // seconds quick.build's wall bound fell (3600 to 1200) to leave a
         // preparation reserve (https://github.com/rrnewton/hermit/issues/3906).
-        if profile.label == "quick" && critical_path_wall_seconds(&selected)? != 7200 {
+        // 6900 = 7200 minus setup.manifest_plan's 300-second wall, which since
+        // 2026-10-16 runs beside the 1200-second rust-script producer instead
+        // of after it.
+        if profile.label == "quick" && critical_path_wall_seconds(&selected)? != 6900 {
             return Err(format!(
-                "quick selected critical path differs from 7200 seconds with image-owned Nextest, the measured rust-script wall bound, the 300-second setup.manifest_plan wall and the 1200-second quick.build wall: {}",
+                "quick selected critical path differs from 6900 seconds with image-owned Nextest, the measured rust-script wall bound, setup.manifest_plan beside it and the 1200-second quick.build wall: {}",
                 critical_path_wall_seconds(&selected)?
             ));
         }
         // 4920 = 4500 plus the 120 seconds setup.manifest_plan's wall cap grew
         // (180 to 300) in https://github.com/rrnewton/hermit/issues/3381, plus
         // the 300 seconds the rust-script producer's wall bound grew (900 to
-        // 1200).
-        if profile.label == "privileged" && critical_path_wall_seconds(&selected)? != 4920 {
+        // 1200). 4740 since 2026-10-16, when setup.manifest_plan's 300 seconds
+        // left the path by running beside the rust-script producer. The longest
+        // path is then the pinned-root one, 180 seconds shorter: pre.submodules,
+        // pre.reverie_pin, setup.pinned_root_fetch (600),
+        // build.rust_scripts_in_pinned_root (1200),
+        // setup.manifest_plan_in_pinned_root (300),
+        // privileged-build.manifest_guests_in_pinned_root (120), then
+        // privileged-only-e2e.manifest_applications and its scorecard.
+        if profile.label == "privileged" && critical_path_wall_seconds(&selected)? != 4740 {
             return Err(format!(
-                "local privileged selected critical path differs from 4920 seconds with the measured rust-script wall bound and the 300-second setup.manifest_plan wall: {}",
+                "local privileged selected critical path differs from 4740 seconds with the measured rust-script wall bound and setup.manifest_plan beside it: {}",
                 critical_path_wall_seconds(&selected)?
             ));
         }
@@ -7621,6 +7631,41 @@ sys.exit(37)
             assert_eq!(before_structured, after_structured, "{}", step.tag());
         }
         assert_structured_result_producers(&reattached).unwrap();
+    }
+
+    #[test]
+    fn host_manifest_plan_build_does_not_wait_for_the_rust_script_tools() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let full = select_steps_by_labels(&committed, &["full".to_string()]).unwrap();
+        let deps = |tag: &str| {
+            full.steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .unwrap()
+                .deps
+                .clone()
+        };
+        // The Cargo build starts beside build.rust_scripts, directly and
+        // transitively, and keeps the rust-script environment, so a script
+        // added to it fails at once instead of running unprepared.
+        assert_eq!(deps("setup.manifest_plan"), ["pre.reverie_pin"]);
+        assert_eq!(deps("pre.reverie_pin"), ["pre.submodules"]);
+        let setup = full
+            .steps
+            .iter()
+            .find(|step| step.tag() == "setup.manifest_plan")
+            .unwrap();
+        assert!(
+            setup
+                .cmd
+                .contains("export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1;")
+        );
+        // gate.manifest, which runs the binaries and the rust-script tools,
+        // waits for both, and every product node waits for gate.manifest.
+        assert_eq!(
+            deps("gate.manifest"),
+            ["build.rust_scripts", "setup.manifest_plan"]
+        );
     }
 
     #[test]

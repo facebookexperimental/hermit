@@ -2080,8 +2080,9 @@ fn resolve_portable_selectors(portable: &dagrun::DagConfig, nodes: Vec<String>) 
 // 4200 = 3780 plus the 120 seconds setup.manifest_plan's wall cap grew (180 to
 // 300) in https://github.com/rrnewton/hermit/issues/3381, plus the 300 seconds
 // build.rust_scripts' wall cap grew (900 to 1200) to keep 1.5 times its
-// largest observed wall.
-const PORTABLE_PREFLIGHT_CRITICAL_PATH_SECONDS: u64 = 4200;
+// largest observed wall. 3900 = 4200 minus setup.manifest_plan's 300 seconds,
+// which since 2026-10-16 runs beside build.rust_scripts instead of after it.
+const PORTABLE_PREFLIGHT_CRITICAL_PATH_SECONDS: u64 = 3900;
 const PORTABLE_PREFLIGHT_OVERHEAD_SECONDS: u64 = 420;
 const PORTABLE_CHECKS_CRITICAL_PATH_SECONDS: u64 = 2400;
 const PORTABLE_CHECKS_OVERHEAD_SECONDS: u64 = 600;
@@ -8848,7 +8849,7 @@ sys.exit(1 if failed else 0)
             .unwrap_err();
         assert!(
             error.contains(
-                "portable preflight job 600s must cover its 4200s constructed DAG critical path plus at least 420s"
+                "portable preflight job 600s must cover its 3900s constructed DAG critical path plus at least 420s"
             ),
             "{error}"
         );

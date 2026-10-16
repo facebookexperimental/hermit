@@ -86,7 +86,7 @@
       "group": "setup",
       "job": "manifest_plan",
       "desc": "Build the manifest-plan binaries the metadata validation runs",
-      "description": "Builds the hermit-manifest-plan binaries (test-harness, generate-validation-dag, generate-test-footprints and the other manifest tools) in the dev profile. On the host, gate.manifest runs them; the generated twin setup.manifest_plan_in_pinned_root builds the same binaries for the E2E bucket and manifest-guest nodes, which run inside the pinned root. Neither copy can stand in for the other: test-harness resolves the repository from its compile-time CARGO_MANIFEST_DIR, which is the checkout path on the host and /src inside the pinned root. Width 8 since 2026-09-30: at the former one-core cap it took 101 s wall for 100 CPU-s at d44bbbb79acd, while a cold build at 8 cores took 26 s wall, 102 CPU-s and a 2.53-GiB peak, hence the 3-GiB baseline and 4-GiB cap. The 300-second wall cap (https://github.com/rrnewton/hermit/issues/3381) was set after a 187-second timeout of the pinned-root twin under load at one core.",
+      "description": "Builds the hermit-manifest-plan binaries (test-harness, generate-validation-dag, generate-test-footprints and the other manifest tools) in the dev profile. On the host, gate.manifest runs them; the generated twin setup.manifest_plan_in_pinned_root builds the same binaries for the E2E bucket and manifest-guest nodes, which run inside the pinned root. Neither copy can stand in for the other: test-harness resolves the repository from its compile-time CARGO_MANIFEST_DIR, which is the checkout path on the host and /src inside the pinned root. Width 8 since 2026-09-30: at the former one-core cap it took 101 s wall for 100 CPU-s at d44bbbb79acd, while a cold build at 8 cores took 26 s wall, 102 CPU-s and a 2.53-GiB peak, hence the 3-GiB baseline and 4-GiB cap. The 300-second wall cap (https://github.com/rrnewton/hermit/issues/3381) was set after a 187-second timeout of the pinned-root twin under load at one core. Nothing in it runs a rust-script: hermit-manifest-plan has no build script, nor does its one path dependency, detcore-model. So since 2026-10-16 it waits only for the pinned Reverie (pre.reverie_pin) and compiles beside build.rust_scripts, which builds in target/ci/rust-script-build rather than target/debug; gate.manifest, the first node that runs both these binaries and the rust-script tools, waits for both. It keeps the rust-script environment, with HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1, so a rust-script added here later fails at once instead of compiling or running unprepared. Until then it waited for build.rust_scripts: in the full validation of hermit 32e1c019 it started 238 s into the run, when build.rust_scripts ended, and took 38 s, and every product node waits on gate.manifest after it.",
       "labels": [
         "full",
         "hosted-portable",
@@ -95,7 +95,7 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build -p hermit-manifest-plan --bins",
       "result_manifests": [],
       "deps": [
-        "build.rust_scripts"
+        "pre.reverie_pin"
       ],
       "env": {},
       "networkonly": false,
@@ -129,6 +129,7 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness validate",
       "result_manifests": [],
       "deps": [
+        "build.rust_scripts",
         "setup.manifest_plan"
       ],
       "env": {
@@ -23137,7 +23138,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1599",
+        "NEXTEST_EXPECTED_EXECUTED": "1600",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -46973,7 +46974,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1585",
+        "NEXTEST_EXPECTED_EXECUTED": "1586",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -64914,7 +64915,7 @@
       "group": "setup",
       "job": "manifest_plan_in_pinned_root",
       "desc": "Build the manifest-plan binaries the metadata validation runs",
-      "description": "Builds the hermit-manifest-plan binaries (test-harness, generate-validation-dag, generate-test-footprints and the other manifest tools) in the dev profile. On the host, gate.manifest runs them; the generated twin setup.manifest_plan_in_pinned_root builds the same binaries for the E2E bucket and manifest-guest nodes, which run inside the pinned root. Neither copy can stand in for the other: test-harness resolves the repository from its compile-time CARGO_MANIFEST_DIR, which is the checkout path on the host and /src inside the pinned root. Width 8 since 2026-09-30: at the former one-core cap it took 101 s wall for 100 CPU-s at d44bbbb79acd, while a cold build at 8 cores took 26 s wall, 102 CPU-s and a 2.53-GiB peak, hence the 3-GiB baseline and 4-GiB cap. The 300-second wall cap (https://github.com/rrnewton/hermit/issues/3381) was set after a 187-second timeout of the pinned-root twin under load at one core.",
+      "description": "Builds the hermit-manifest-plan binaries (test-harness, generate-validation-dag, generate-test-footprints and the other manifest tools) in the dev profile. On the host, gate.manifest runs them; the generated twin setup.manifest_plan_in_pinned_root builds the same binaries for the E2E bucket and manifest-guest nodes, which run inside the pinned root. Neither copy can stand in for the other: test-harness resolves the repository from its compile-time CARGO_MANIFEST_DIR, which is the checkout path on the host and /src inside the pinned root. Width 8 since 2026-09-30: at the former one-core cap it took 101 s wall for 100 CPU-s at d44bbbb79acd, while a cold build at 8 cores took 26 s wall, 102 CPU-s and a 2.53-GiB peak, hence the 3-GiB baseline and 4-GiB cap. The 300-second wall cap (https://github.com/rrnewton/hermit/issues/3381) was set after a 187-second timeout of the pinned-root twin under load at one core. Nothing in it runs a rust-script: hermit-manifest-plan has no build script, nor does its one path dependency, detcore-model. So since 2026-10-16 it waits only for the pinned Reverie (pre.reverie_pin) and compiles beside build.rust_scripts, which builds in target/ci/rust-script-build rather than target/debug; gate.manifest, the first node that runs both these binaries and the rust-script tools, waits for both. It keeps the rust-script environment, with HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1, so a rust-script added here later fails at once instead of compiling or running unprepared. Until then it waited for build.rust_scripts: in the full validation of hermit 32e1c019 it started 238 s into the run, when build.rust_scripts ended, and took 38 s, and every product node waits on gate.manifest after it.",
       "labels": [
         "full",
         "portable"
@@ -65285,7 +65286,7 @@
       "group": "quick-super-setup",
       "job": "manifest_plan",
       "desc": "Build the manifest-plan binaries the metadata validation runs",
-      "description": "Builds the hermit-manifest-plan binaries (test-harness, generate-validation-dag, generate-test-footprints and the other manifest tools) in the dev profile. On the host, gate.manifest runs them; the generated twin setup.manifest_plan_in_pinned_root builds the same binaries for the E2E bucket and manifest-guest nodes, which run inside the pinned root. Neither copy can stand in for the other: test-harness resolves the repository from its compile-time CARGO_MANIFEST_DIR, which is the checkout path on the host and /src inside the pinned root. Width 8 since 2026-09-30: at the former one-core cap it took 101 s wall for 100 CPU-s at d44bbbb79acd, while a cold build at 8 cores took 26 s wall, 102 CPU-s and a 2.53-GiB peak, hence the 3-GiB baseline and 4-GiB cap. The 300-second wall cap (https://github.com/rrnewton/hermit/issues/3381) was set after a 187-second timeout of the pinned-root twin under load at one core.",
+      "description": "Builds the hermit-manifest-plan binaries (test-harness, generate-validation-dag, generate-test-footprints and the other manifest tools) in the dev profile. On the host, gate.manifest runs them; the generated twin setup.manifest_plan_in_pinned_root builds the same binaries for the E2E bucket and manifest-guest nodes, which run inside the pinned root. Neither copy can stand in for the other: test-harness resolves the repository from its compile-time CARGO_MANIFEST_DIR, which is the checkout path on the host and /src inside the pinned root. Width 8 since 2026-09-30: at the former one-core cap it took 101 s wall for 100 CPU-s at d44bbbb79acd, while a cold build at 8 cores took 26 s wall, 102 CPU-s and a 2.53-GiB peak, hence the 3-GiB baseline and 4-GiB cap. The 300-second wall cap (https://github.com/rrnewton/hermit/issues/3381) was set after a 187-second timeout of the pinned-root twin under load at one core. Nothing in it runs a rust-script: hermit-manifest-plan has no build script, nor does its one path dependency, detcore-model. So since 2026-10-16 it waits only for the pinned Reverie (pre.reverie_pin) and compiles beside build.rust_scripts, which builds in target/ci/rust-script-build rather than target/debug; gate.manifest, the first node that runs both these binaries and the rust-script tools, waits for both. It keeps the rust-script environment, with HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1, so a rust-script added here later fails at once instead of compiling or running unprepared. Until then it waited for build.rust_scripts: in the full validation of hermit 32e1c019 it started 238 s into the run, when build.rust_scripts ended, and took 38 s, and every product node waits on gate.manifest after it.",
       "labels": [
         "quick",
         "super"
@@ -65293,7 +65294,7 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build -p hermit-manifest-plan --bins",
       "result_manifests": [],
       "deps": [
-        "quick-super-build.rust_scripts"
+        "pre.reverie_pin"
       ],
       "env": {},
       "networkonly": false,
@@ -65326,6 +65327,7 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness validate",
       "result_manifests": [],
       "deps": [
+        "quick-super-build.rust_scripts",
         "quick-super-setup.manifest_plan"
       ],
       "env": {
@@ -65625,7 +65627,7 @@
       "group": "quick-super-setup",
       "job": "manifest_plan_in_pinned_root",
       "desc": "Build the manifest-plan binaries the metadata validation runs",
-      "description": "Builds the hermit-manifest-plan binaries (test-harness, generate-validation-dag, generate-test-footprints and the other manifest tools) in the dev profile. On the host, gate.manifest runs them; the generated twin setup.manifest_plan_in_pinned_root builds the same binaries for the E2E bucket and manifest-guest nodes, which run inside the pinned root. Neither copy can stand in for the other: test-harness resolves the repository from its compile-time CARGO_MANIFEST_DIR, which is the checkout path on the host and /src inside the pinned root. Width 8 since 2026-09-30: at the former one-core cap it took 101 s wall for 100 CPU-s at d44bbbb79acd, while a cold build at 8 cores took 26 s wall, 102 CPU-s and a 2.53-GiB peak, hence the 3-GiB baseline and 4-GiB cap. The 300-second wall cap (https://github.com/rrnewton/hermit/issues/3381) was set after a 187-second timeout of the pinned-root twin under load at one core.",
+      "description": "Builds the hermit-manifest-plan binaries (test-harness, generate-validation-dag, generate-test-footprints and the other manifest tools) in the dev profile. On the host, gate.manifest runs them; the generated twin setup.manifest_plan_in_pinned_root builds the same binaries for the E2E bucket and manifest-guest nodes, which run inside the pinned root. Neither copy can stand in for the other: test-harness resolves the repository from its compile-time CARGO_MANIFEST_DIR, which is the checkout path on the host and /src inside the pinned root. Width 8 since 2026-09-30: at the former one-core cap it took 101 s wall for 100 CPU-s at d44bbbb79acd, while a cold build at 8 cores took 26 s wall, 102 CPU-s and a 2.53-GiB peak, hence the 3-GiB baseline and 4-GiB cap. The 300-second wall cap (https://github.com/rrnewton/hermit/issues/3381) was set after a 187-second timeout of the pinned-root twin under load at one core. Nothing in it runs a rust-script: hermit-manifest-plan has no build script, nor does its one path dependency, detcore-model. So since 2026-10-16 it waits only for the pinned Reverie (pre.reverie_pin) and compiles beside build.rust_scripts, which builds in target/ci/rust-script-build rather than target/debug; gate.manifest, the first node that runs both these binaries and the rust-script tools, waits for both. It keeps the rust-script environment, with HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1, so a rust-script added here later fails at once instead of compiling or running unprepared. Until then it waited for build.rust_scripts: in the full validation of hermit 32e1c019 it started 238 s into the run, when build.rust_scripts ended, and took 38 s, and every product node waits on gate.manifest after it.",
       "labels": [
         "quick",
         "super"

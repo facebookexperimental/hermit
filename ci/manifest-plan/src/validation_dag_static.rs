@@ -1083,7 +1083,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1598, listed.
     // And detcore-dbt's copied_child_refuses_group_and_session_getters_in_strict_mode:
     // 1599, listed.
-    ("test.regular_crates", 1599),
+    // And validation_dag's host_manifest_plan_build_does_not_wait_for_the_rust_script_tools:
+    // 1600 (hermit-manifest-plan lists 789 tests, 788 at 32e1c019).
+    ("test.regular_crates", 1600),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4539,7 +4541,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same new-cell gate test: 1583, listed.
     // And the same concurrent-listing test: 1584, listed.
     // And the same copied-child group-getter test: 1585.
-    ("test.regular_crates_on_host", 1585),
+    // And the same manifest-plan dependency test: 1586.
+    ("test.regular_crates_on_host", 1586),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),
@@ -5047,7 +5050,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"setup"########,
         job: r########"manifest_plan"########,
         desc: r########"Build the manifest-plan binaries the metadata validation runs"########,
-        description: r########"Builds the hermit-manifest-plan binaries (test-harness, generate-validation-dag, generate-test-footprints and the other manifest tools) in the dev profile. On the host, gate.manifest runs them; the generated twin setup.manifest_plan_in_pinned_root builds the same binaries for the E2E bucket and manifest-guest nodes, which run inside the pinned root. Neither copy can stand in for the other: test-harness resolves the repository from its compile-time CARGO_MANIFEST_DIR, which is the checkout path on the host and /src inside the pinned root. Width 8 since 2026-09-30: at the former one-core cap it took 101 s wall for 100 CPU-s at d44bbbb79acd, while a cold build at 8 cores took 26 s wall, 102 CPU-s and a 2.53-GiB peak, hence the 3-GiB baseline and 4-GiB cap. The 300-second wall cap (https://github.com/rrnewton/hermit/issues/3381) was set after a 187-second timeout of the pinned-root twin under load at one core."########,
+        description: r########"Builds the hermit-manifest-plan binaries (test-harness, generate-validation-dag, generate-test-footprints and the other manifest tools) in the dev profile. On the host, gate.manifest runs them; the generated twin setup.manifest_plan_in_pinned_root builds the same binaries for the E2E bucket and manifest-guest nodes, which run inside the pinned root. Neither copy can stand in for the other: test-harness resolves the repository from its compile-time CARGO_MANIFEST_DIR, which is the checkout path on the host and /src inside the pinned root. Width 8 since 2026-09-30: at the former one-core cap it took 101 s wall for 100 CPU-s at d44bbbb79acd, while a cold build at 8 cores took 26 s wall, 102 CPU-s and a 2.53-GiB peak, hence the 3-GiB baseline and 4-GiB cap. The 300-second wall cap (https://github.com/rrnewton/hermit/issues/3381) was set after a 187-second timeout of the pinned-root twin under load at one core. Nothing in it runs a rust-script: hermit-manifest-plan has no build script, nor does its one path dependency, detcore-model. So since 2026-10-16 it waits only for the pinned Reverie (pre.reverie_pin) and compiles beside build.rust_scripts, which builds in target/ci/rust-script-build rather than target/debug; gate.manifest, the first node that runs both these binaries and the rust-script tools, waits for both. It keeps the rust-script environment, with HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1, so a rust-script added here later fails at once instead of compiling or running unprepared. Until then it waited for build.rust_scripts: in the full validation of hermit 32e1c019 it started 238 s into the run, when build.rust_scripts ended, and took 38 s, and every product node waits on gate.manifest after it."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
@@ -5059,7 +5062,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"build.rust_scripts"########],
+        deps: &[r########"pre.reverie_pin"########],
         env: &[],
         hint: HintSpec {
             resources: &[],
@@ -5094,7 +5097,10 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"setup.manifest_plan"########],
+        deps: &[
+            r########"build.rust_scripts"########,
+            r########"setup.manifest_plan"########,
+        ],
         env: &[(
             r########"HERMIT_VALIDATE_AUDIT_JOBS"########,
             r########"1"########,

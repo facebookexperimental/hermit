@@ -60,10 +60,13 @@ runnable DAG.
 The local privileged selection contains 19 nodes (20 until the one-build change
 of 2026-09-30 retired the unconsumed host copy of
 `privileged-only-build.privileged_tests`, which compiled Hermit on the host)
-with a 4920-second critical
+with a 4740-second critical
 path (4500 until setup.manifest_plan's wall cap went from 180 to 300 seconds in
 https://github.com/rrnewton/hermit/issues/3381, then 4620 until the Rust-script
-producer's wall cap went from 900 to 1200 seconds). The separately labelled hosted privileged smoke preserves its historical
+producer's wall cap went from 900 to 1200 seconds, then 4920 until
+setup.manifest_plan stopped waiting for the Rust-script producer on 2026-10-16;
+the longest path is now the pinned-root one through
+build.rust_scripts_in_pinned_root and setup.manifest_plan_in_pinned_root). The separately labelled hosted privileged smoke preserves its historical
 12-node population and has a 2400-second critical path (2100 before the
 Rust-script producer's wall cap went from 900 to 1200 seconds), so the manual
 workflow uses an audited 2460-second launcher bound. The stale hosted file omitted CPU
@@ -133,7 +136,10 @@ seconds, 1.5 times its largest observed wall of 644.5 seconds rounded up to
 the next 300-second bucket. It is 7200 seconds since quick.build's wall cap
 went from 3600 to 1200 seconds, so a 4200-second ci-hub run keeps a
 preparation reserve under the quick label
-(https://github.com/rrnewton/hermit/issues/3906).
+(https://github.com/rrnewton/hermit/issues/3906), and 6900 seconds since
+setup.manifest_plan's 300 seconds run beside the Rust-script producer
+(2026-10-16): it builds the manifest tools in target/debug and runs no
+rust-script, so only gate.manifest waits for both.
 These sums are scheduling bounds, not measured preparation or execution times.
 The pressure runner's batch preparation similarly retains the Nextest setup
 prerequisite: ten nodes including LiteInst, or nine without it. This adds 600

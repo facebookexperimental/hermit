@@ -4934,14 +4934,16 @@ cleared-caps refusal names {} starved step(s)",
                 "{RUST_SCRIPT_COMMAND_PREFIX}{}",
                 validate_plan::MANIFEST_PLAN_BUILD_COMMAND
             )
-            || manifest_producer.deps != [RUST_SCRIPT_PRODUCER_TAG.to_string()]
+            // It builds beside the rust-script producer (no rust-script runs in
+            // `cargo build -p hermit-manifest-plan`), after the Reverie pin.
+            || manifest_producer.deps != [PIN_GATE_TAG.to_string()]
             || manifest_producer
                 .deps
                 .iter()
                 .any(|dependency| dependency == "gate.manifest")
         {
             return Err(format!(
-                "full-plan bracket: committed manifest-plan producer is not directly after the rust-script producer: cmd={} deps={:?}",
+                "full-plan bracket: committed manifest-plan producer does not wait for exactly the Reverie pin: cmd={} deps={:?}",
                 manifest_producer.cmd, manifest_producer.deps
             ));
         }
@@ -4951,9 +4953,16 @@ cleared-caps refusal names {} starved step(s)",
                 manifest_audit.cmd
             ));
         }
-        if manifest_audit.deps != [validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string()] {
+        // The audit runs both the manifest-plan binaries and the rust-script
+        // tools, so it waits for both producers, which build side by side.
+        if manifest_audit.deps
+            != [
+                RUST_SCRIPT_PRODUCER_TAG.to_string(),
+                validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string(),
+            ]
+        {
             return Err(format!(
-                "full-plan bracket: manifest audit can run without its binary producer: deps={:?}",
+                "full-plan bracket: manifest audit can run without its binary or rust-script producer: deps={:?}",
                 manifest_audit.deps
             ));
         }
@@ -11120,11 +11129,24 @@ fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
         .iter()
         .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
         .ok_or("rust-script preflight bracket lost the manifest producer")?;
+    let manifest_audit = preflight
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == "gate.manifest")
+        .ok_or("rust-script preflight bracket lost the manifest audit")?;
+    // Both compilations follow pin verification side by side, and the audit,
+    // which runs both, follows both.
     if producer.deps != [PIN_GATE_TAG.to_string()]
-        || manifest_plan.deps != [RUST_SCRIPT_PRODUCER_TAG.to_string()]
+        || manifest_plan.deps != [PIN_GATE_TAG.to_string()]
+        || manifest_audit.deps
+            != [
+                RUST_SCRIPT_PRODUCER_TAG.to_string(),
+                validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string(),
+            ]
     {
         return Err(format!(
-            "rust-script preflight bracket did not place compilation between pin verification and manifest compilation: producer={producer:?} manifest={manifest_plan:?}"
+            "rust-script preflight bracket did not place both compilations between pin verification and the manifest audit: producer={producer:?} manifest={manifest_plan:?} audit={manifest_audit:?}"
         ));
     }
     let committed = committed_rust_script_producer(root)?;
@@ -12436,7 +12458,7 @@ fn retain_focused_manifest_producers(cfg: &DagConfig, tags: &mut BTreeSet<String
         )
     };
     loop {
-        let additions = cfg
+        let mut additions = cfg
             .steps
             .iter()
             .filter(|step| tags.contains(&step.tag()))
@@ -12444,6 +12466,21 @@ fn retain_focused_manifest_producers(cfg: &DagConfig, tags: &mut BTreeSet<String
             .filter(|dependency| required_producer(dependency) && !tags.contains(*dependency))
             .cloned()
             .collect::<Vec<_>>();
+        // The host manifest-plan build no longer waits for the rust-script
+        // producer, but every node that waits for it also runs rust-scripts
+        // (gate.manifest, the E2E buckets), so a focused run keeps the two
+        // producers together, as the dependency once did.
+        for tag in tags.iter() {
+            if let Some(prefix) = tag.strip_suffix(validate_plan::MANIFEST_PLAN_PRODUCER_TAG) {
+                let scripts = format!("{prefix}{RUST_SCRIPT_PRODUCER_TAG}");
+                if (prefix.is_empty() || prefix == "quick-super-")
+                    && available.contains(&scripts)
+                    && !tags.contains(&scripts)
+                {
+                    additions.push(scripts);
+                }
+            }
+        }
         if additions.is_empty() {
             break;
         }

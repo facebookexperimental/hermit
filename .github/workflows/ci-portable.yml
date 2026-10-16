@@ -279,12 +279,14 @@ jobs:
     # proof-of-inert `skip` (e.g. docs-only) drops it.
     if: needs.select.outputs.decision != 'skip'
     runs-on: ubuntu-latest
-    # The five selected preflight_nodes form a 4200s committed critical path
+    # The five selected preflight_nodes form a 3900s committed critical path
     # (3780s until setup.manifest_plan's wall cap went from 180 to 300 in
     # https://github.com/rrnewton/hermit/issues/3381, then 3900s until
-    # build.rust_scripts' wall cap went from 900 to 1200).
-    # Keep 420s outside that bound for checkout, packages, tool install,
-    # artifact transfer, and runner teardown; test-harness audits both numbers.
+    # build.rust_scripts' wall cap went from 900 to 1200, then 4200s until
+    # setup.manifest_plan stopped waiting for build.rust_scripts on 2026-10-16).
+    # Keep at least 420s outside that bound for checkout, packages, tool
+    # install, artifact transfer, and runner teardown; test-harness audits both
+    # numbers. The 77 minutes were sized for the 4200s path and still cover it.
     timeout-minutes: 77
     steps:
       - uses: actions/checkout@v4
