@@ -20390,6 +20390,54 @@ fn terminal_environmental_observation(attempts: &[NodeAttempt], tag: &str) -> Op
     ))
 }
 
+/// Where ci/retry-on-compiler-crash.sh records each rerun it made, one file per
+/// rerun, under the run's VALIDATE_RUN_STATE.
+const COMPILER_CRASH_RETRIES_DIR: &str = "compiler-crash-retries";
+
+/// The records of every compiler-crash rerun this run made, oldest first: what
+/// crashed, the crash lines of the first run, and whether the one rerun passed.
+fn compiler_crash_retry_records(run_state: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(run_state.join(COMPILER_CRASH_RETRIES_DIR)) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "txt"))
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .map(|path| match std::fs::read_to_string(path) {
+            Ok(text) => text.trim_end().to_string(),
+            Err(error) => format!(
+                "retry-on-compiler-crash: record {} is unreadable: {error}",
+                path.display()
+            ),
+        })
+        .collect()
+}
+
+/// Print every compiler-crash rerun of the run (ci/retry-on-compiler-crash.sh),
+/// passed or failed, so a node that passed only on its one rerun is never
+/// silent: the rerun is an INFRA RETRY, and its record keeps the original
+/// crash text.
+fn print_compiler_crash_retries(run_state: &Path) {
+    let records = compiler_crash_retry_records(run_state);
+    if records.is_empty() {
+        return;
+    }
+    println!(
+        "\n⚠️  INFRA RETRY (compiler crash) — {} rerun(s): the compiler itself crashed, and the \
+         command ran once more; a node that passed did so only on that rerun:",
+        records.len()
+    );
+    for record in records {
+        for line in record.lines() {
+            println!("   {line}");
+        }
+    }
+}
+
 fn print_retry_ledger(attempts: &[NodeAttempt]) {
     let mut retried: BTreeMap<&str, Vec<&NodeAttempt>> = BTreeMap::new();
     for attempt in attempts {
@@ -28051,6 +28099,9 @@ fn run(
         );
     }
     print_retry_ledger(&attempts);
+    if let Some(run_state) = std::env::var_os("VALIDATE_RUN_STATE") {
+        print_compiler_crash_retries(Path::new(&run_state));
+    }
 
     // ---- the single cleanup / evidence-commit point (validate.sh:1812) -------
     //
@@ -34701,5 +34752,36 @@ mod frozen_run_tests {
         // The reason must stay outside the consumer's qualification-safe set,
         // which today is exactly {"empty-manifest-bucket"}.
         assert_ne!(FROZEN_RUN_WITHHELD_REASON, "empty-manifest-bucket");
+    }
+}
+
+#[cfg(test)]
+mod compiler_crash_retry_tests {
+    use super::*;
+
+    #[test]
+    fn every_recorded_rerun_is_listed_oldest_first_with_its_crash_text() {
+        let state = tempfile::tempdir().unwrap();
+        assert!(compiler_crash_retry_records(state.path()).is_empty());
+        let dir = state.path().join(COMPILER_CRASH_RETRIES_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("20261016T171500-2.txt"),
+            "retry-on-compiler-crash: INFRA RETRY 1 of 1: the compiler crashed (exit 101) in: cargo build -p b\n\
+             error: rustc interrupted by SIGSEGV, printing backtrace\n\
+             retry-on-compiler-crash: INFRA RETRY FAILED: the rerun exited 101 too\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("20261016T171400-1.txt"),
+            "retry-on-compiler-crash: INFRA RETRY: passed on its one rerun after a compiler crash\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ignored.tmp"), "not a record").unwrap();
+        let records = compiler_crash_retry_records(state.path());
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert!(records[0].contains("passed on its one rerun"), "{records:?}");
+        assert!(records[1].contains("interrupted by SIGSEGV"), "{records:?}");
+        assert!(records[1].contains("INFRA RETRY FAILED"), "{records:?}");
     }
 }

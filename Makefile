@@ -398,6 +398,7 @@ lint-check-guest-preload-gate:
 
 lint-check-reverie-dbt-budget:
 	./ci/run-with-reverie-dbt-budget-test.sh
+	./ci/retry-on-compiler-crash.sh --self-test
 
 # The unit tests carried by rust-script entrypoints are their own CI node,
 # check.script_unit_tests, so they run beside lint-checks instead of inside its

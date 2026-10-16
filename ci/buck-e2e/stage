@@ -177,19 +177,21 @@ hermit_target_dir=$target_dir/stage-hermit
 # that build then fails with "No such file or directory" at its temporary directory
 # under the replaced one. Reproducible staging always starts with neither present.
 mkdir -p "$hermit_target_dir"
-setsid -w cargo build --manifest-path "$root/Cargo.toml" --locked --release -p hermit-manifest-plan --bins \
+# Every cargo build here reruns once if the compiler itself crashed (ci/retry-on-compiler-crash.sh).
+retry=$root/ci/retry-on-compiler-crash.sh
+setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --release -p hermit-manifest-plan --bins \
     --target-dir "$target_dir" >"$tmp/release-build.log" 2>&1 &
 release_build=$!
-setsid -w cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit --bin hermit \
+setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit --bin hermit \
     --features hermit/third-party-backends --target-dir "$hermit_target_dir" >"$tmp/hermit-build.log" 2>&1 &
 hermit_build=$!
-cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p detcore-dbt -p detcore-dbt-cdylib --target-dir "$target_dir"
+"$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p detcore-dbt -p detcore-dbt-cdylib --target-dir "$target_dir"
 # hermit-install's build script stages install_pkg/ next to the profile directories and
 # links libdetcore_sabre.so and libdetcore_liteinst.so into it. The links resolve only
 # when this invocation also builds both cdylibs; publish-hermit-e2e-artifact.sh requires
 # every one of them. Its hermit link, to ../validate/hermit, resolves once the hermit
 # build is copied there below.
-cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-install -p detcore-sabre \
+"$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-install -p detcore-sabre \
     -p detcore-liteinst --target-dir "$target_dir"
 finish_build() { # finish_build WHAT PID-VARIABLE LOG
     local status=0

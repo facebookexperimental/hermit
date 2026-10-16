@@ -1781,4 +1781,7 @@ source "$ROOT_DIR/ci/configure-build-jobs.sh" reverie-dbt-budget-child
 
 echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:75c3067d4692cd8aa168d6791e718f21e6535e672b957291142070a0edc27234}" >&2
 
-exec "$@"
+# A cargo build, check, clippy, doc, rustc or test command reruns once if the
+# compiler itself crashed; every other command is exec'd unchanged
+# (ci/retry-on-compiler-crash.sh).
+exec "$ROOT_DIR/ci/retry-on-compiler-crash.sh" "$@"

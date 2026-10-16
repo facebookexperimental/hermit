@@ -51,6 +51,7 @@ from pathlib import Path
 
 
 STAGE = Path(__file__).resolve().parent / "buck-e2e" / "stage"
+RETRY = Path(__file__).resolve().parent / "retry-on-compiler-crash.sh"
 TOOLS = ("patchelf", "readelf", "strip", "cmake")
 LIBS = ("libunwind.so.8", "libunwind-x86_64.so.8")
 # Commands stage runs on its way to the check and just after it.
@@ -282,6 +283,9 @@ class StageCargoOverlapTest(unittest.TestCase):
         self.stage = tree / "ci" / "buck-e2e" / "stage"
         self.stage.parent.mkdir(parents=True)
         shutil.copy2(STAGE, self.stage)
+        # stage runs each cargo build through this wrapper; a clean or plainly
+        # failing fake cargo passes through it unchanged.
+        shutil.copy2(RETRY, tree / "ci" / "retry-on-compiler-crash.sh")
         (tree / ".gitignore").write_text("ci/buck-e2e/staged/\n")
         git = ["git", "-C", str(tree), "-c", "user.email=t@example.invalid", "-c", "user.name=t",
                "-c", "commit.gpgsign=false"]
@@ -290,7 +294,7 @@ class StageCargoOverlapTest(unittest.TestCase):
         subprocess.run(git + ["commit", "-qm", "fixture"], check=True)
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
-        for name in HOST_COMMANDS + ("mktemp", "setsid", "sleep"):
+        for name in HOST_COMMANDS + ("mktemp", "setsid", "sleep", "tee", "grep"):
             real = shutil.which(name)
             self.assertIsNotNone(real, name)
             (self.bin / name).symlink_to(real)

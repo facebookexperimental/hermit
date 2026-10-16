@@ -374,14 +374,14 @@ done
 # The outer flock still makes this the only writer to the persistent target and
 # published directories.
 output=$packages/workspace.output
-if ! cargo clippy --manifest-path "$workspace_manifest" --workspace \
+if ! "$ROOT_DIR/ci/retry-on-compiler-crash.sh" cargo clippy --manifest-path "$workspace_manifest" --workspace \
     --target-dir "$build_target" \
     -- -D warnings "${CLIPPY_WAIVERS[@]}" >"$output" 2>&1; then
     report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
         'check with clippy' || exit $?
 fi
 cat "$output"
-if ! cargo build --release --manifest-path "$workspace_manifest" --workspace \
+if ! "$ROOT_DIR/ci/retry-on-compiler-crash.sh" cargo build --release --manifest-path "$workspace_manifest" --workspace \
     --target-dir "$build_target" >"$output" 2>&1; then
     report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
         'build release executables for' || exit $?
@@ -389,7 +389,7 @@ fi
 cat "$output"
 
 test_json=$packages/tests.jsonl
-if ! cargo test --no-run --message-format=json \
+if ! "$ROOT_DIR/ci/retry-on-compiler-crash.sh" cargo test --no-run --message-format=json \
     --manifest-path "$workspace_manifest" "${test_package_args[@]}" \
     --target-dir "$build_target" >"$test_json" 2>"$output"; then
     # Cargo writes rendered compiler errors to JSON stdout in this mode, while
