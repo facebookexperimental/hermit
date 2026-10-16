@@ -274,6 +274,181 @@ fn a_forked_child_cannot_resume_its_parents_operation() {
     });
 }
 
+/// Enters a user namespace, plus `extra` namespaces, mapping the caller to
+/// root there as `unshare -Ur` does, so the test keeps capabilities across
+/// exec. For `isolated_with_child_setup`: it runs between fork and exec, while
+/// the child has one thread, which a new user namespace needs, and uses only
+/// raw calls on stack buffers. A PID namespace has to wait for the test body:
+/// once a process unshares one, it can no longer start threads, and libtest
+/// starts the test's.
+fn enter_root_mapped_user_namespace(extra: libc::c_int) -> std::io::Result<()> {
+    fn write_proc(path: &std::ffi::CStr, data: &[u8]) -> std::io::Result<()> {
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let written = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+        unsafe { libc::close(fd) };
+        if written == data.len() as isize {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    // "0 <id> 1": map `id` outside to root inside.
+    fn map_line(buf: &mut [u8; 32], mut id: u32) -> usize {
+        let mut digits = [0u8; 10];
+        let mut count = 0;
+        loop {
+            digits[count] = b'0' + (id % 10) as u8;
+            count += 1;
+            id /= 10;
+            if id == 0 {
+                break;
+            }
+        }
+        buf[..2].copy_from_slice(b"0 ");
+        for i in 0..count {
+            buf[2 + i] = digits[count - 1 - i];
+        }
+        buf[2 + count..4 + count].copy_from_slice(b" 1");
+        4 + count
+    }
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER | extra) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    write_proc(c"/proc/self/setgroups", b"deny")?;
+    let mut line = [0u8; 32];
+    let len = map_line(&mut line, uid);
+    write_proc(c"/proc/self/uid_map", &line[..len])?;
+    let len = map_line(&mut line, gid);
+    write_proc(c"/proc/self/gid_map", &line[..len])
+}
+
+fn enter_user_namespace() -> std::io::Result<()> {
+    enter_root_mapped_user_namespace(0)
+}
+
+fn enter_user_and_mount_namespaces() -> std::io::Result<()> {
+    enter_root_mapped_user_namespace(libc::CLONE_NEWNS)
+}
+
+/// A child in a new PID namespace can have its parent's PID: a container init
+/// that unshares a PID namespace and forks makes another PID 1. Its stale
+/// tracer handle is still recognised, by the namespace: the child's resume of
+/// the parent's operation is refused, and its launch reaches admission on a
+/// tracer thread of its own instead of waiting on the parent's (Claude
+/// re-check of the tracer thread).
+#[test]
+fn a_child_with_its_parents_pid_in_a_new_pid_namespace_has_its_own_tracer() {
+    isolated_with_child_setup(
+        "a_child_with_its_parents_pid_in_a_new_pid_namespace_has_its_own_tracer",
+        &[],
+        enter_user_namespace,
+        || {
+            // A PID namespace for this process's children, then a fork into it
+            // to become its PID 1.
+            assert_eq!(
+                unsafe { libc::unshare(libc::CLONE_NEWPID) },
+                0,
+                "unshare: {}",
+                std::io::Error::last_os_error()
+            );
+            let init = in_forked_child(|| {
+                // PID 1, with a tracer thread and a retained operation.
+                if std::process::id() != 1 {
+                    return false;
+                }
+                let diagnostic = pending(run_on_tracer_thread(None, |control| async move {
+                    control.yield_checkpoint().await;
+                    Ok(7u32)
+                }));
+                // A process can pick its children's PID namespace once, so one
+                // child, another PID 1, makes both probes.
+                if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
+                    return false;
+                }
+                let other = diagnostic.clone();
+                let child = in_forked_child(move || {
+                    std::process::id() == 1
+                        // Its resume is refused by identity, not sent to the
+                        // parent's tracer thread.
+                        && other
+                            .resume::<u32>()
+                            .unwrap_err()
+                            .downcast::<RecoveryRefusal>()
+                            .is_ok_and(|e| matches!(e, RecoveryRefusal::WrongIdentity))
+                        // Its launch reaches admission on a tracer thread of
+                        // its own, which refuses it while the copied operation
+                        // is retained, as before the tracer thread; on the
+                        // parent's missing thread it would never return.
+                        && run_on_tracer_thread(None, |_| async { Ok(8u32) })
+                            .unwrap_err()
+                            .downcast::<RecoveryRefusal>()
+                            .is_ok_and(|e| matches!(e, RecoveryRefusal::AdmissionClosed))
+                });
+                child == Some(0) && diagnostic.resume::<u32>().is_ok_and(|value| value == 7)
+            });
+            assert_eq!(init, Some(0));
+        },
+    );
+}
+
+/// Without a readable PID namespace (here a tmpfs over `/proc`), a process
+/// cannot tell its own tracer handle from an inherited one, so launches run on
+/// the calling thread, as before the tracer thread, and refuse there
+/// (`Identity`). A PID 1 forked into a new PID namespace by such a process,
+/// with the same PID, refuses at once too instead of waiting on a tracer thread
+/// it does not have (Claude review of
+/// https://github.com/rrnewton/hermit/issues/4389 follow-up).
+#[test]
+fn without_a_readable_pid_namespace_launches_stay_on_the_caller() {
+    isolated_with_child_setup(
+        "without_a_readable_pid_namespace_launches_stay_on_the_caller",
+        &[],
+        enter_user_and_mount_namespaces,
+        || {
+            assert_eq!(
+                unsafe {
+                    libc::mount(
+                        c"tmpfs".as_ptr(),
+                        c"/proc".as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                    )
+                },
+                0,
+                "mount tmpfs over /proc: {}",
+                std::io::Error::last_os_error()
+            );
+            let refused_identity = || {
+                run_on_tracer_thread(None, |_| async { Ok(1u32) })
+                    .unwrap_err()
+                    .downcast::<RecoveryRefusal>()
+                    .is_ok_and(|e| matches!(e, RecoveryRefusal::Identity(_)))
+            };
+            assert_eq!(
+                unsafe { libc::unshare(libc::CLONE_NEWPID) },
+                0,
+                "unshare: {}",
+                std::io::Error::last_os_error()
+            );
+            let init = in_forked_child(move || {
+                if std::process::id() != 1 || !refused_identity() {
+                    return false;
+                }
+                if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
+                    return false;
+                }
+                in_forked_child(move || std::process::id() == 1 && refused_identity()) == Some(0)
+            });
+            assert_eq!(init, Some(0));
+        },
+    );
+}
+
 #[test]
 fn nested_runtime_refuses_before_factory() {
     isolated("nested_runtime_refuses_before_factory", || {

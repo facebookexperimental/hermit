@@ -1610,7 +1610,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // recorder::fs::tests::mapping_permissions_follow_the_read_and_write_bits and
     // recorder::fs::tests::only_kcmp_answers_decide_whether_descriptions_are_shared
     // (https://github.com/rrnewton/hermit/issues/4416): 1128.
-    ("test.hermit_unit", 1128),
+    // And the tracer thread's PID-namespace tests
+    // (a_child_with_its_parents_pid_in_a_new_pid_namespace_has_its_own_tracer,
+    // without_a_readable_pid_namespace_launches_stay_on_the_caller): 1130.
+    ("test.hermit_unit", 1130),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4353,7 +4356,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // recorder::fs::tests::mapping_permissions_follow_the_read_and_write_bits and
     // recorder::fs::tests::only_kcmp_answers_decide_whether_descriptions_are_shared
     // (https://github.com/rrnewton/hermit/issues/4416): 1128.
-    ("test.hermit_unit_on_host", 1128),
+    // And the tracer thread's PID-namespace tests
+    // (a_child_with_its_parents_pid_in_a_new_pid_namespace_has_its_own_tracer,
+    // without_a_readable_pid_namespace_launches_stay_on_the_caller): 1130.
+    ("test.hermit_unit_on_host", 1130),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

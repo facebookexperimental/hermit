@@ -58,7 +58,14 @@ pub fn launch_on_calling_thread() {
 }
 
 fn in_place() -> bool {
-    ON_TRACER.get() || ON_CALLER.load(Ordering::Relaxed)
+    ON_TRACER.get()
+        || ON_CALLER.load(Ordering::Relaxed)
+        // Without a readable PID namespace (`/proc` hidden or not mounted), a
+        // process cannot tell its tracer handle from one a forked child
+        // inherited, so it keeps no handle: the launch runs on the calling
+        // thread, as it did before the tracer thread, and refuses there
+        // (`Identity`) for the same reason.
+        || ProcessIdentity::current().namespace.is_none()
 }
 
 struct TracerThread {
@@ -67,7 +74,28 @@ struct TracerThread {
     // The process the tracer thread runs in. A child forked from the caller
     // inherits this handle but not the thread, so a handle from another
     // process is stale there.
+    process: ProcessIdentity,
+}
+
+/// A process's number together with its PID namespace, which the number alone
+/// does not name: a container init that forks into a new PID namespace makes
+/// a child that is PID 1 as well.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProcessIdentity {
     pid: u32,
+    namespace: Option<(u64, u64)>,
+}
+
+impl ProcessIdentity {
+    fn current() -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            pid: std::process::id(),
+            namespace: std::fs::metadata("/proc/self/ns/pid")
+                .ok()
+                .map(|meta| (meta.dev(), meta.ino())),
+        }
+    }
 }
 
 thread_local! {
@@ -91,18 +119,19 @@ fn spawn() -> std::io::Result<TracerThread> {
     Ok(TracerThread {
         jobs,
         id: handle.thread().id(),
-        pid: std::process::id(),
+        process: ProcessIdentity::current(),
     })
 }
 
 /// The calling thread's tracer thread in this process, if it has one. A
-/// handle inherited across `fork` names a thread the child does not have: it
-/// is forgotten (dropping it could take a lock another thread of the parent
-/// held at the fork) and the caller gets a fresh tracer thread.
+/// handle inherited across `fork` names a thread the child does not have,
+/// even when the child has the same PID in a new PID namespace: it is
+/// forgotten (dropping it could take a lock another thread of the parent held
+/// at the fork) and the caller gets a fresh tracer thread.
 fn current(tracer: &mut Option<TracerThread>) -> Option<&TracerThread> {
     if tracer
         .as_ref()
-        .is_some_and(|tracer| tracer.pid != std::process::id())
+        .is_some_and(|tracer| tracer.process != ProcessIdentity::current())
     {
         std::mem::forget(tracer.take());
     }
