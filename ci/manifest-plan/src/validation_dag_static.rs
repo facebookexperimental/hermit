@@ -1619,7 +1619,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b): 1131.
     // And record_version_rejects_streams_from_before_descriptor_links_record_their_target
     // (https://github.com/rrnewton/hermit/issues/4213): 1132, listed.
-    ("test.hermit_unit", 1132),
+    // And https://github.com/rrnewton/hermit/issues/4262: record_version_rejects_streams_from_before_posix_timer_records_carry_si_timer: 1133.
+    ("test.hermit_unit", 1133),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2389,9 +2390,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // syscalls::files::test::an_open_through_a_descriptor_link_records_the_targets_path and
     // process_files_tests::every_thread_knows_the_table_its_process_holds
     // (https://github.com/rrnewton/hermit/issues/4213): 1855, listed.
-    // Main dbbbdc86 lists 1857 (nextest list on the node selection; two tests
-    // landed without this pin moving): 1857.
-    ("test.detcore_unit", 1857),
+    // And https://github.com/rrnewton/hermit/issues/4262: new scheduler::signal_lists, discarded_at_send and
+    // posix_timer_coalesce(_tests) tests, less the 7 scheduler::test tests of the exec
+    // timer-copy maps the PR deletes: +57, 1912, listed.
+    // And the two Detcore unit tests main counted in 90dec733: 1914, listed.
+    ("test.detcore_unit", 1914),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2879,7 +2882,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4416): 217.
     // And record_replay_keeps_the_order_of_a_cleartid_join_wake_beside_an_admission
     // (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b): 218.
-    ("test.record_replay", 218),
+    // And https://github.com/rrnewton/hermit/issues/4262: record_exec_discards_posix_timer_copies_as_on_linux and
+    // record_replay_posix_timer_rows_replay_but_diverge_from_linux: 220.
+    ("test.record_replay", 220),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -3421,7 +3426,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // dbt_rlimit_and_clock_answers_match_ptrace and
     // dbt_refuses_a_vfork_childs_clock_read_by_name: 476, listed.
     // And a_guest_that_left_the_process_group_does_not_outlive_the_run (B3a-4c): 477.
-    ("test.cli", 477),
+    // And https://github.com/rrnewton/hermit/issues/4262: the four posix_timer_entries_* and posix_timer_signal_rows_*
+    // tests and posix_timer_rows_verify_under_random_and_chaos_schedules, less
+    // an_exec_with_an_unprovable_timer_copy_pending_is_refused_by_name (folded into
+    // exec_discards_a_posix_timers_pending_signal_at_bitwise_parity); the 4164
+    // refusal test is renamed a_sigev_thread_id_expiration_beside_a_pending_copy_is_delivered_as_on_linux: +4, 481.
+    ("test.cli", 481),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3831,7 +3841,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 699c6948: 410.
     // And the two A8 step 2 DBT clock/limit tests: 412, listed.
     // And the B3a-4c containment test: 413.
-    ("test.cli_on_host", 413),
+    // And https://github.com/rrnewton/hermit/issues/4262: the same +4 as test.cli, 417.
+    ("test.cli_on_host", 417),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4115,9 +4126,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 699c6948: 1849.
     // And the two 4362 step-0b clear-TID admission tests: 1851.
     // And the four 4213 descriptor-link tests: 1855.
-    // Main dbbbdc86 lists 1857 (nextest list on the node selection; two tests
-    // landed without this pin moving): 1857.
-    ("test.detcore_unit_on_host", 1857),
+    // And https://github.com/rrnewton/hermit/issues/4262: the same +57 as test.detcore_unit, 1912.
+    // And the two Detcore unit tests main counted in 90dec733: 1914, listed.
+    ("test.detcore_unit_on_host", 1914),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4389,7 +4400,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // without_a_readable_pid_namespace_launches_stay_on_the_caller): 1130.
     // And the 4362 step-0b record-version test: 1131.
     // And the descriptor-link record-version test: 1132, listed.
-    ("test.hermit_unit_on_host", 1132),
+    // And https://github.com/rrnewton/hermit/issues/4262: the same +1 as test.hermit_unit, 1133.
+    ("test.hermit_unit_on_host", 1133),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
