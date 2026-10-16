@@ -26652,7 +26652,11 @@ fn a_wait_after_a_sigkill_to_an_exited_leader_is_a_deadlock() {
         stdout,
         "tgkill of the exited leader: 0 errno 0; waiting for the child\n"
     );
-    assert_eq!(status.and_then(|status| status.code()), Some(125), "{log}");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{log}"
+    );
     assert!(
         log.contains("Deadlock detected")
             && log.contains("thread(s) waiting for a child that cannot exit"),
