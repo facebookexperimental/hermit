@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 3000,
-      "applicable": 1925,
-      "selectable": 1674,
+      "applicable": 1923,
+      "selectable": 1672,
       "population": 2930,
-      "population_candidate_selected": 1674,
+      "population_candidate_selected": 1672,
       "population_candidate_not_selected": 240,
-      "population_candidate_disabled": 1016
+      "population_candidate_disabled": 1018
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 600,
-        "applicable": 560,
-        "selectable": 554,
+        "applicable": 558,
+        "selectable": 552,
         "population": 586,
-        "population_candidate_selected": 554,
+        "population_candidate_selected": 552,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 29
+        "population_candidate_disabled": 31
       },
       "liteinst": {
         "cells": 600,
@@ -342,7 +342,7 @@
     {"test_id":"c-programs/file-io-roundtrip","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/flock-lifecycle","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/flock-lifecycle","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/flock-lifecycle","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/flock-lifecycle","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM refuses every flock lock operation by name (ENOSYS with the typed refusal UnsupportedOperation::Flock): it cannot keep a host lock's lifetime equal to the guest description's. This cell passed only because KVM flock used to be a silent no-op (https://github.com/rrnewton/reverie/issues/1069)"},
     {"test_id":"c-programs/flock-lifecycle","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/flock-lifecycle","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/fork-exec-pipeline","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately"},
@@ -1850,9 +1850,9 @@
     {"test_id":"compat/flex","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/flex","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Did not pass 10 of 10 verify runs on liteinst with the maximum timeslice disabled in the first local survey of 2026-10-08, which ran without the compat fixtures; the second survey did not run this sabre-compat-only row (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/flex","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
-    {"test_id":"compat/flock","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on kvm, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
+    {"test_id":"compat/flock","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
     {"test_id":"compat/flock","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its first verify run on in-guest-trap failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
-    {"test_id":"compat/flock","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"compat/flock","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM refuses every flock lock operation by name (ENOSYS with the typed refusal UnsupportedOperation::Flock): it cannot keep a host lock's lifetime equal to the guest description's. This cell passed only because KVM flock used to be a silent no-op (https://github.com/rrnewton/reverie/issues/1069)"},
     {"test_id":"compat/flock","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/flock","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
     {"test_id":"compat/fmt","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on kvm, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},

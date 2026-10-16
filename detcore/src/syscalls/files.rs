@@ -3815,12 +3815,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     syscalls::Fcntl::new().with_fd(fd).with_cmd(F_GETFD),
                 ))
                 .await?;
-            error!(
+            report_flock_refusal(&format!(
                 "[dtid {dettid}] blocking flock(fd={fd}, operation={operation:#x}) refused: \
                  this open file description existed before Detcore observed its lock state, \
-                 so a nonblocking probe could destroy a lock that cannot be restored. Use \
-                 LOCK_NB, or run without --strict to receive ENOLCK."
-            );
+                 so a nonblocking probe could destroy a lock that cannot be restored. \
+                 {FLOCK_REFUSAL_ADVICE}"
+            ));
             return self
                 .refuse_unserviceable_operation(guest, Sysno::flock, Errno::ENOLCK)
                 .await;
@@ -3836,6 +3836,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         let result = self
             .record_or_replay(guest, call.with_operation(probe_operation))
             .await;
+        // A backend that cannot apply flock faithfully refuses it with a typed
+        // refusal and no lock effect (the KVM backend refuses every lock
+        // operation: https://github.com/rrnewton/reverie/issues/1069). Ask
+        // before anything else is injected, since the next injection replaces
+        // the backend's record. The refusal is reported as a refusal, never
+        // handed to the guest as the backend's raw ENOSYS.
+        let refusal = if result.is_err() {
+            guest.take_unsupported_refusal()
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            let message = format!(
+                "[dtid {dettid}] flock(fd={fd}, operation={operation:#x}) refused by the backend: {}. \
+                 No lock was taken or released.",
+                refusal.diagnostic
+            );
+            report_flock_refusal(&message);
+            if !self.cfg.panic_on_unsupported_syscalls {
+                crate::tool_global::report_unsupported_syscall(guest, Sysno::flock).await;
+            }
+            return self
+                .refuse_unserviceable_operation(guest, Sysno::flock, Errno::ENOLCK)
+                .await;
+        }
 
         match result {
             Ok(value) => {
@@ -3899,12 +3924,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // that exists, refuse loudly. Returning success would recreate
                 // the mutual-exclusion bug this handler was written to fix, and
                 // blocking in the kernel would deadlock the container.
-                error!(
+                report_flock_refusal(&format!(
                     "[dtid {dettid}] blocking flock(fd={fd}, operation={operation:#x}) is \
                      contended, and Detcore cannot yet park a thread on a file lock \
                      deterministically. Refusing rather than granting a lock another guest \
-                     holds. Use LOCK_NB, or run without --strict to receive ENOLCK."
-                );
+                     holds. {FLOCK_REFUSAL_ADVICE}"
+                ));
                 self.refuse_unserviceable_operation(guest, Sysno::flock, Errno::ENOLCK)
                     .await
             }
@@ -13462,4 +13487,22 @@ mod untraced_code_tests {
             );
         }
     }
+}
+
+/// Closing advice of every flock refusal. It names no backend: LOCK_NB is the
+/// form Detcore can serve wherever the backend supports flock, and ENOLCK
+/// reaches the guest only when the run opted in to unsupported syscalls.
+const FLOCK_REFUSAL_ADVICE: &str = "LOCK_NB is the supported form where the backend \
+     supports flock at all; ENOLCK is returned instead only under \
+     --allow-unsupported-syscalls.";
+
+/// Report a flock refusal in every disposition, fail-closed (the run ends)
+/// and opted in (the guest gets ENOLCK): through tracing, and directly on
+/// stderr so that neither --log=off nor --log-file hides the reason.
+fn report_flock_refusal(message: &str) {
+    error!("{message}");
+    let _ = std::io::Write::write_fmt(
+        &mut crate::util::RetryingStderr,
+        format_args!("hermit: {message}\n"),
+    );
 }

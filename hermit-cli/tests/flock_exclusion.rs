@@ -283,9 +283,11 @@ fn contended_blocking_upgrade_is_fail_closed_under_strict() {
     );
     assert!(
         run.stderr.contains("blocking flock(fd=")
-            && run
-                .stderr
-                .contains("Refusing rather than granting a lock another guest holds"),
+            && run.stderr.contains(
+                "Refusing rather than granting a lock another guest holds. LOCK_NB is the \
+                 supported form where the backend supports flock at all; ENOLCK is returned \
+                 instead only under --allow-unsupported-syscalls."
+            ),
         "the strict run did not report the specific flock refusal\n{}",
         run.combined()
     );
@@ -316,8 +318,12 @@ fn blocking_upgrade_on_received_fd_preserves_unknown_lock_state() {
         );
     }
     assert!(
-        run.stderr
-            .contains("existed before Detcore observed its lock state"),
+        run.stderr.contains(
+            "existed before Detcore observed its lock state, so a nonblocking probe could \
+             destroy a lock that cannot be restored. LOCK_NB is the supported form where the \
+             backend supports flock at all; ENOLCK is returned instead only under \
+             --allow-unsupported-syscalls."
+        ),
         "the run did not take the unknown-state refusal path\n{}",
         run.combined()
     );

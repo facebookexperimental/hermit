@@ -1465,7 +1465,7 @@ corpus:
           column, comm, cp, cpio-roundtrip, cpp, crc32, cscope, csplit, curl,
           curl-localhost, cut, date, dc, dd, df, df-direct, diff, diff3,
           dirname, dos2unix, du, echo, egrep, elfedit, env, envsubst, expand,
-          expr, factor, fallocate, fgrep, file, find, findmnt, flex, flock,
+          expr, factor, fallocate, fgrep, file, find, findmnt, flex,
           fmt, fold, free, "g++", gcc, gcov, getconf, getopt, git, gprof, grep,
           groups, gzip, gzip-roundtrip, head, hexdump, hostname, iconv, id,
           install, ionice, iostat, ip, join, jq, ld, ln, logger, logname, ls,
@@ -1498,6 +1498,12 @@ corpus:
         xargs: >-
           Exceeded the default 22-second CPU budget in 10 of 10 KVM verify
           runs on 2026-10-13
+        flock: >-
+          KVM refuses every flock lock operation by name (ENOSYS with the
+          typed refusal UnsupportedOperation::Flock): it cannot keep a host
+          lock's lifetime equal to the guest description's. This cell passed
+          only because KVM flock used to be a silent no-op
+          (https://github.com/rrnewton/reverie/issues/1069)
   # Cells measured red on 2026-10-01 (release Hermit at 03bbb8358, through
   # this bucket): each stays enabled with ci: false and its failure class's
   # issue, so the SaBRe run type does not require it.

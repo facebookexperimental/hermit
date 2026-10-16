@@ -17405,7 +17405,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "85");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "86");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -17451,10 +17451,12 @@ mod nextest_timeout_tests {
         // run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity, the
         // raw-exit half split out of
         // run_kvm_notifies_a_child_exit_once_at_bitwise_parity
-        // (https://github.com/rrnewton/hermit/issues/4360): 84.
+        // (https://github.com/rrnewton/hermit/issues/4360): 84. And
+        // run_kvm_flock_is_a_named_refusal_where_ptrace_excludes
+        // (https://github.com/rrnewton/reverie/issues/1069): 85.
         assert_eq!(
             names.len(),
-            84,
+            85,
             "update the exact CI inventory with new KVM tests"
         );
         let required_cases = [
@@ -17473,6 +17475,7 @@ mod nextest_timeout_tests {
             "run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity",
             "run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does",
             "run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting",
+            "run_kvm_flock_is_a_named_refusal_where_ptrace_excludes",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -18533,7 +18536,9 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity, split out of
         // run_kvm_notifies_a_child_exit_once_at_bitwise_parity
         // (https://github.com/rrnewton/hermit/issues/4360): 84 declarations, 85 selected.
-        ("privileged-only-test.cli_kvm", 85usize),
+        // run_kvm_flock_is_a_named_refusal_where_ptrace_excludes
+        // (https://github.com/rrnewton/reverie/issues/1069): 85 declarations, 86 selected.
+        ("privileged-only-test.cli_kvm", 86usize),
     ] {
         let step = privileged
             .steps

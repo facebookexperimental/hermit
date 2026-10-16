@@ -207,6 +207,7 @@ static SIGSUSPEND_AFTER_WNOHANG_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_SHARED_MASK_REWRITE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_SHARED_STACK_MASK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_ONCE_PER_CHILD_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FLOCK_EXCLUSION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE3_SET_TID_REUSE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARENT_DEATH_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_PIDFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -2200,6 +2201,34 @@ fn sigchld_once_per_child_exit_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "sigchld-once-per-child-exit guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// tests/c/flock_exclusion.c, compiled as hermit-cli/tests/flock_exclusion.rs
+/// compiles it.
+fn flock_exclusion_guest() -> &'static Path {
+    FLOCK_EXCLUSION_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("flock-exclusion");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the flock-exclusion guest directory");
+        let guest = build_root.join("flock_exclusion");
+        let output = Command::new("cc")
+            .args(["-O1", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/flock_exclusion.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the flock-exclusion guest");
+        assert!(
+            output.status.success(),
+            "flock-exclusion guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -10806,6 +10835,144 @@ fn kvm_child_exit_is_notified_once_at_bitwise_parity(mode: &str) {
             );
         }
     }
+}
+
+/// tests/c/flock_exclusion.c's `exclusion` scenario: on ptrace a held LOCK_EX
+/// excludes a second open file description and a second, forked process, at
+/// bitwise parity; on KVM the first lock is refused by name. KVM's flock used to
+/// check its arguments and return 0 without taking a lock, so both contenders
+/// "acquired" it and the guest printed `FAIL: a second open file description
+/// acquired a held LOCK_EX`. KVM cannot keep a host lock's lifetime equal to the
+/// guest description's (per-thread descriptor copies, copied mappings, in-flight
+/// SCM_RIGHTS), so it now refuses every lock operation with the typed refusal
+/// `UnsupportedOperation::Flock` (https://github.com/rrnewton/reverie/issues/1069).
+/// Detcore reports that refusal; under --strict the run ends as a policy
+/// refusal naming it, not with an errno the guest could mistake for contention.
+#[test]
+fn run_kvm_flock_is_a_named_refusal_where_ptrace_excludes() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM flock refusal case: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = flock_exclusion_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("verify.json");
+    let report_arg = report.to_str().expect("report path should be UTF-8");
+    let args = [
+        "--backend=ptrace",
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report_arg,
+        "--",
+        guest,
+        "exclusion",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("strict verification wrote no verdict"))
+            .expect("strict verification verdict is valid JSON");
+    assert_eq!(verdict["bitwise_parity"], true, "ptrace: {verdict}");
+    for side in ["left", "right"] {
+        assert!(
+            verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+            "ptrace: no INFO messages compared: {verdict}"
+        );
+    }
+    assert_eq!(
+        stdout(&output),
+        "flock-first-holder-acquired\nflock-second-open-excluded\n\
+         flock-second-process-excluded\nflock-released-and-reacquired\nflock-exclusion-ok\n",
+        "ptrace"
+    );
+    assert!(
+        !stderr(&output).contains("refused by the backend"),
+        "ptrace must not report a backend flock refusal\nstderr:\n{}",
+        stderr(&output)
+    );
+
+    // The refusal is named on stderr whatever the log level or destination:
+    // default logging, --log=off, and --log-file (which takes the tracing
+    // copy, leaving only the required diagnostic on stderr). The last case
+    // takes the first lock in a forked child (a shell runs the guest), which
+    // must end the run at the same point.
+    let log_file = directory.path().join("hermit.log");
+    let log_file_arg = format!("--log-file={}", log_file.display());
+    let child_command = format!("{guest} holder; echo shell-continued");
+    let cases: [(&str, Vec<&str>); 4] = [
+        ("default logging", vec![guest, "exclusion"]),
+        ("--log=off", vec![guest, "exclusion"]),
+        ("--log-file", vec![guest, "exclusion"]),
+        (
+            "forked child",
+            vec!["/bin/sh", "-c", child_command.as_str()],
+        ),
+    ];
+    for (case, command) in cases {
+        let mut args = Vec::new();
+        match case {
+            "--log=off" => args.push("--log=off"),
+            "--log-file" => args.extend(["--log=error", log_file_arg.as_str()]),
+            _ => {}
+        }
+        args.extend([
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+        ]);
+        args.extend(command);
+        let output = hermit(&args);
+        let stdout = stdout(&output);
+        let stderr = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{case}: KVM flock must end the strict run as a policy refusal\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+                && stderr.contains("refused by the backend: KVM flock is unsupported"),
+            "{case}: the KVM run did not name the flock refusal on stderr\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("acquired") && !stdout.contains("shell-continued"),
+            "{case}: the KVM guest went on past a lock the backend refused\nstdout:\n{stdout}"
+        );
+    }
+
+    // Opted in with --allow-unsupported-syscalls, the guest receives ENOLCK
+    // (37) and runs on, and the refusal is still named on stderr with
+    // logging off.
+    let args = [
+        "--log=off",
+        "--backend=kvm",
+        "run",
+        "--allow-unsupported-syscalls",
+        "--base-env=minimal",
+        "--",
+        guest,
+        "exclusion",
+    ];
+    let output = hermit(&args);
+    let stdout = stdout(&output);
+    let stderr = stderr(&output);
+    assert!(
+        stdout.contains("FAIL: LOCK_EX on an unlocked file was refused (errno=37)"),
+        "opt-in: the KVM guest did not receive ENOLCK\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("refused by the backend: KVM flock is unsupported"),
+        "opt-in: the KVM run did not name the flock refusal on stderr\nstderr:\n{stderr}"
+    );
 }
 
 /// tests/c/signal_then_sibling_exit.c on KVM: a worker signals the main thread

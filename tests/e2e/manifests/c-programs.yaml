@@ -13863,11 +13863,16 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - kvm
           - dbt
           - liteinst
           - in-guest-trap
-        backends_disabled: {}
+        backends_disabled:
+          kvm: >-
+            KVM refuses every flock lock operation by name (ENOSYS with the
+            typed refusal UnsupportedOperation::Flock): it cannot keep a host
+            lock's lifetime equal to the guest description's. This cell passed
+            only because KVM flock used to be a silent no-op
+            (https://github.com/rrnewton/reverie/issues/1069)
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
