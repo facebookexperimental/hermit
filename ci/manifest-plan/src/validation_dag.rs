@@ -518,6 +518,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.inherited_terminal_read",
     "test.isolation_matrix_ptrace_runtime",
     "test.isolation_matrix_dbt_in_guest",
+    "test.syscall_conformance_ptrace",
     "test.isolated_detcore_workdir",
     "test.sabre_examples",
     "test.hermit_modes",
@@ -544,6 +545,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.pmu_integration_cases_2",
     "privileged-test.cli_kvm",
     "privileged-test.isolation_matrix_kvm",
+    "privileged-test.syscall_conformance_kvm",
     "privileged-only-cpuid.faulting",
     "privileged-only-pmu.preemption",
     "privileged-only-test.pmu_buck_chaos_cases",
@@ -656,9 +658,12 @@ const PROFILES: [Profile; 11] = [
         // The backend isolation matrix adds three full-only nodes
         // (test.isolation_matrix_ptrace_runtime, test.isolation_matrix_dbt_in_guest
         // and privileged-test.isolation_matrix_kvm): 98/99 before.
+        // The syscall conformance check adds two full-only nodes
+        // (test.syscall_conformance_ptrace and
+        // privileged-test.syscall_conformance_kvm): 101/102 before.
         label: "full",
-        direct_steps: 101,
-        selected_steps: 102,
+        direct_steps: 103,
+        selected_steps: 104,
     },
     Profile {
         label: "portable",
@@ -4239,9 +4244,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // 441 with the backend isolation matrix: test.isolation_matrix_ptrace_runtime,
     // test.isolation_matrix_dbt_in_guest and privileged-test.isolation_matrix_kvm
     // (438 + 3; https://github.com/rrnewton/hermit/issues/4009).
-    if cfg.steps.len() != 441 {
+    // 443 with the syscall conformance check: test.syscall_conformance_ptrace
+    // and privileged-test.syscall_conformance_kvm (441 + 2).
+    if cfg.steps.len() != 443 {
         return Err(format!(
-            "superset has {} steps, expected 441",
+            "superset has {} steps, expected 443",
             cfg.steps.len()
         ));
     }
@@ -6759,8 +6766,8 @@ sys.exit(37)
         // https://github.com/rrnewton/hermit/issues/4243), and 96 since
         // test.pmu_integration_cases runs as two shards (99 full nodes),
         // and 99 with the three backend isolation matrix nodes (102 full
-        // nodes).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 99);
+        // nodes), and 101 with the two syscall conformance nodes (104).
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 101);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps

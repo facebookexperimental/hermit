@@ -1,0 +1,12 @@
+# One program per line: name<TAB>absolute program<TAB>arguments (tab-separated).
+# Each runs natively twice and on every backend, under the pass-through recorder.
+true	/bin/true
+echo	/bin/echo	hello
+cat-hostname	/bin/cat	/etc/hostname
+ls-root	/bin/ls	-la	/
+stat-root	/usr/bin/stat	/
+uname	/bin/uname	-a
+sh-builtin	/bin/sh	-c	echo a; exit 3
+sh-fork	/bin/sh	-c	/bin/true; /bin/echo b
+head-zero	/usr/bin/head	-c	100	/dev/zero
+false	/bin/false

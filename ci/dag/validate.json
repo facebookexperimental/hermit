@@ -24164,6 +24164,44 @@
     },
     {
       "group": "test",
+      "job": "syscall_conformance_ptrace",
+      "desc": "Syscall results under a pass-through Reverie tool on ptrace and the other non-KVM backends, against native Linux",
+      "description": "Runs every program of tests/syscall-conformance/corpus.tsv natively twice and on ptrace, e9patch, SaBRe, DBT, LiteInst and in-guest-trap (the last five refuse by name today: their runtimes load only Detcore) under one pass-through Reverie tool, the syscall-conformance recorder (hermit-cli/src/bin/syscall-conformance.rs), which injects every syscall unchanged and records its result; the native runs are observed with plain ptrace syscall stops, no Reverie. A backend only intercepts and injects (step 0 of the backend-agnostic architecture work, https://github.com/rrnewton/hermit/issues/4485), so the node compares each backend's record with the native one, call by call (exit code, threads, each call's errno or, for byte counts, offsets and descriptor numbers, its exact value; calls the vDSO answers are left out). Every verdict other than match (a mismatch, with its first difference; a refusal by name, where the recorder cannot run on the backend; an unstable native baseline; no result) must be a row of tests/syscall-conformance/expected-mismatches.tsv linking its issue, and a row that no longer describes a backend it names fails the node until it is deleted. Artifacts (each run's record and stderr) are kept in target/ci/syscall-conformance/ptrace.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; rm -rf target/ci/syscall-conformance/ptrace && mkdir -p target/ci/syscall-conformance && ./tests/syscall-conformance/compare.rs --recorder target/validate/syscall-conformance --backends ptrace,e9patch,sabre,dbt,liteinst,in-guest-trap --corpus tests/syscall-conformance/corpus.tsv --expected tests/syscall-conformance/expected-mismatches.tsv --artifacts target/ci/syscall-conformance/ptrace'",
+      "result_manifests": [],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 900,
+      "cpu_timeout": 3600,
+      "jobs_flag": "",
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 30.0,
+        "rss_baseline_bytes": 1073741824,
+        "hard_mem_max_bytes": 8589934592,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": 1,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "test.syscall_conformance_ptrace"
+    },
+    {
+      "group": "test",
       "job": "arbitrary_binaries",
       "desc": "Portable arbitrary-binary cases",
       "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 255152128 bytes; the larger 1936408576-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
@@ -25983,6 +26021,45 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "privileged-test.isolation_matrix_kvm"
+    },
+    {
+      "group": "privileged-test",
+      "job": "syscall_conformance_kvm",
+      "desc": "Syscall results under a pass-through Reverie tool on KVM, against native Linux",
+      "description": "Runs every program of tests/syscall-conformance/corpus.tsv natively twice and on KVM, after requiring /dev/kvm, under one pass-through Reverie tool, the syscall-conformance recorder (hermit-cli/src/bin/syscall-conformance.rs), which injects every syscall unchanged and records its result; the native runs are observed with plain ptrace syscall stops, no Reverie. A backend only intercepts and injects (step 0 of the backend-agnostic architecture work, https://github.com/rrnewton/hermit/issues/4485), so the node compares each backend's record with the native one, call by call (exit code, threads, each call's errno or, for byte counts, offsets and descriptor numbers, its exact value; calls the vDSO answers are left out). Every verdict other than match (a mismatch, with its first difference; a refusal by name, where the recorder cannot run on the backend; an unstable native baseline; no result) must be a row of tests/syscall-conformance/expected-mismatches.tsv linking its issue, and a row that no longer describes a backend it names fails the node until it is deleted. Artifacts are kept in target/ci/syscall-conformance/kvm.",
+      "labels": [
+        "full",
+        "kvm"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf '\\''%s: /dev/kvm is required\\n'\\'' privileged-test.syscall_conformance_kvm >&2; exit 2; fi; exec 9>&-; rm -rf target/ci/syscall-conformance/kvm && mkdir -p target/ci/syscall-conformance && ./tests/syscall-conformance/compare.rs --recorder target/validate/syscall-conformance --backends kvm --corpus tests/syscall-conformance/corpus.tsv --expected tests/syscall-conformance/expected-mismatches.tsv --artifacts target/ci/syscall-conformance/kvm'",
+      "result_manifests": [],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 600,
+      "cpu_timeout": 3600,
+      "jobs_flag": "",
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 30.0,
+        "rss_baseline_bytes": 1073741824,
+        "hard_mem_max_bytes": 8589934592,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": 1,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "privileged-test.syscall_conformance_kvm"
     },
     {
       "group": "full-scorecard",

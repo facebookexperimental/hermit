@@ -4627,6 +4627,24 @@
       "why": "tests/stress/scheduling_fairness.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `scheduling_fairness` is built from `tests/stress/scheduling_fairness.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
+      "disposition": "special-driver",
+      "path": "tests/syscall-conformance/compare.rs",
+      "runner": "ci/dag/validate.json test.syscall_conformance_ptrace and privileged-test.syscall_conformance_kvm",
+      "why": "This driver runs each corpus program natively twice and on each named backend under the pass-through syscall-conformance recorder (hermit-cli/src/bin/syscall-conformance.rs), compares every backend's syscall results with the native ones call by call, and holds the differences to tests/syscall-conformance/expected-mismatches.tsv: an unexpected difference or a stale row fails the node."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/syscall-conformance/corpus.tsv",
+      "runner": "tests/syscall-conformance/compare.rs --corpus",
+      "why": "The programs the syscall conformance check runs, one per line with its absolute path and arguments; each must give the same record in two native runs."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/syscall-conformance/expected-mismatches.tsv",
+      "runner": "tests/syscall-conformance/compare.rs --expected",
+      "why": "The syscall conformance check's expected-difference ledger: each row names a program (or any), a backend, a verdict, the first difference and the GitHub issue that tracks it. compare.rs fails on any difference no row expects and on any row that no longer describes one."
+    },
+    {
       "disposition": "buck-fixture",
       "path": "tests/util/BUCK",
       "runner": "Meta Buck test targets",

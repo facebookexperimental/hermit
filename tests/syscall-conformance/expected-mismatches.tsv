@@ -1,0 +1,10 @@
+# cell<TAB>backend<TAB>verdict<TAB>signature<TAB>issue (full URL); * for any cell or signature.
+# Measured in the pinned root (validate's environment); a row names a program's first difference only.
+# Until their own issues are filed, the rows link the audit's tracking issue; each row's signature names its defect.
+*	kvm	mismatch	newfstatat=ENOENT -> newfstatat=ok	https://github.com/rrnewton/hermit/issues/4485
+sh-fork	ptrace	mismatch	rt_sigreturn=ok -> rt_sigaction=ok	https://github.com/rrnewton/hermit/issues/4485
+*	e9patch	refused	*	https://github.com/rrnewton/hermit/issues/4485
+*	sabre	refused	*	https://github.com/rrnewton/hermit/issues/4485
+*	dbt	refused	*	https://github.com/rrnewton/hermit/issues/4485
+*	liteinst	refused	*	https://github.com/rrnewton/hermit/issues/4485
+*	in-guest-trap	refused	*	https://github.com/rrnewton/hermit/issues/4485

@@ -6973,11 +6973,16 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
     // line per cell and the ledger summary at every verbosity and publishes
     // no structured test counts. Their result is the ledger's verdict, which
     // the node's exit status carries; a count of cells would not say more.
+    // Audited 2026-10-15 likewise: test.syscall_conformance_ptrace runs
+    // tests/syscall-conformance/compare.rs --expected, which prints one
+    // verdict line per program and backend and the ledger summary, and
+    // publishes no structured test counts.
     let expected_non_nextest = BTreeSet::from([
         "test.applications_e2e".to_string(),
         "test.envelope_levels".to_string(),
         "test.isolation_matrix_dbt_in_guest".to_string(),
         "test.isolation_matrix_ptrace_runtime".to_string(),
+        "test.syscall_conformance_ptrace".to_string(),
     ]);
     if non_nextest_test_nodes != expected_non_nextest {
         return Err(format!(
