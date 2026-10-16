@@ -4620,7 +4620,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same copied-child group-getter test: 1585.
     // And the same manifest-plan dependency test: 1586.
     // And the same rustc-stack forwarding test: 1587.
-    ("test.regular_crates_on_host", 1587),
+    // And the same copied-child scheduler-policy test: 1588.
+    ("test.regular_crates_on_host", 1588),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),
