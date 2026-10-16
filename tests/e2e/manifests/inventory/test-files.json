@@ -229,6 +229,12 @@
       "why": "tests/c/close_range_releases_port.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test runs this close_range port-release probe on ptrace and on in-guest LiteInst and requires the same output from both; it remains a guest fixture because a generic manifest cannot express a cross-backend output equality."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/copied_scheduler_query.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/copied_scheduler_query.c is owned by hermit-cli/tests/cli.rs: the CLI test dbt_refuses_a_vfork_childs_scheduler_policy_query_by_name runs it on DBT and requires a strict copied (vfork) child's native scheduler-policy query to stop with the named refusal. It stays a fixture because a generic manifest cannot assert the refusal's exit status and stderr."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/copy_file_range_refusal.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
