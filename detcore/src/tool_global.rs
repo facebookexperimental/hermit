@@ -75,6 +75,7 @@ use tracing::trace;
 use tracing::warn;
 
 use crate::config::Config;
+#[cfg(test)]
 use crate::consts::ROOT_DETPID;
 use crate::fd::SharedOpenFileError;
 use crate::ivar::Ivar;
@@ -3812,7 +3813,6 @@ impl GlobalState {
             if flags.is_none()
                 && parent_dettid == child_dettid
                 && parent_detpid == child_dettid
-                && child_dettid == ROOT_DETPID
                 && let Some(input) = self.inherited_input.lock().unwrap().as_mut()
                 && input.root.is_none()
             {
@@ -9219,8 +9219,17 @@ mod tests {
 
     #[tokio::test]
     async fn inherited_input_belongs_only_to_the_registered_root_initial_image() {
+        check_inherited_input_root_ownership(super::ROOT_DETPID, DetTid::from_raw(4)).await;
+    }
+
+    #[tokio::test]
+    async fn inherited_input_uses_registered_root_identity_instead_of_pid_three() {
+        // A descendant with the old numeric root ID must not acquire the lease.
+        check_inherited_input_root_ownership(DetTid::from_raw(37), DetTid::from_raw(3)).await;
+    }
+
+    async fn check_inherited_input_root_ownership(root: DetTid, child: DetTid) {
         use super::ChildRegistration;
-        use super::ROOT_DETPID;
 
         let config = Config {
             sequentialize_threads: false,
@@ -9230,11 +9239,17 @@ mod tests {
         let mut state = GlobalState::initialize(&config, false);
         let pipe = reverie::InheritedInput::pipe(0).unwrap();
         state.install_inherited_input(pipe.lease().unwrap());
-        let root = ROOT_DETPID;
-        let child = DetTid::from_raw(root.as_raw() + 1);
+        let worker = DetTid::from_raw(root.as_raw() + 2);
         let root_mm = MmId::initial(root);
-        for (parent, task, flags) in [(root, root, None), (root, child, Some(CloneFlags::empty()))]
-        {
+        for (parent, task, flags) in [
+            (root, root, None),
+            (root, child, Some(CloneFlags::empty())),
+            (
+                root,
+                worker,
+                Some(CloneFlags::CLONE_VM | CloneFlags::CLONE_SIGHAND | CloneFlags::CLONE_THREAD),
+            ),
+        ] {
             assert!(matches!(
                 state
                     .recv_create_child_thread(
@@ -9261,23 +9276,29 @@ mod tests {
             Some((root, root_mm))
         );
 
-        // A real descendant may complete first, but cannot consume this seed.
-        let response = state
-            .receive_rpc(
-                Tid::from_raw(child.as_raw()),
-                (
-                    DetTime::new(&config),
-                    MmId::initial(child),
-                    GlobalRequest::MarkPastFirstExecve(child, None),
-                ),
-            )
-            .await
-            .1;
-        let GlobalResponse::MarkPastFirstExecve(child_state) = response else {
-            panic!("{response:?}")
-        };
-        assert!(child_state.initial_input.is_none());
-        assert!(state.inherited_input.lock().unwrap().is_some());
+        // Neither a descendant nor a sibling sharing the root's exact MmId
+        // may consume the seed before the root's own completion.
+        for (task, detpid, mm) in [
+            (child, child, MmId::initial(child)),
+            (worker, root, root_mm),
+        ] {
+            let response = state
+                .receive_rpc(
+                    Tid::from_raw(task.as_raw()),
+                    (
+                        DetTime::new(&config),
+                        mm,
+                        GlobalRequest::MarkPastFirstExecve(detpid, None),
+                    ),
+                )
+                .await
+                .1;
+            let GlobalResponse::MarkPastFirstExecve(non_root_state) = response else {
+                panic!("{response:?}")
+            };
+            assert!(non_root_state.initial_input.is_none());
+            assert!(state.inherited_input.lock().unwrap().is_some());
+        }
 
         // Nor can a later root image, even with the correct descriptor slot.
         let response = state
@@ -9346,6 +9367,48 @@ mod tests {
             .await
             .1;
         assert_eq!(response, GlobalResponse::ThreadExited);
+    }
+
+    #[tokio::test]
+    async fn failed_root_registration_does_not_bind_inherited_input() {
+        for raw_root in [3, 37] {
+            let config = Config {
+                sequentialize_threads: false,
+                ..Config::default()
+            }
+            .with_backend(|backend| backend.tool_shares_guest_descriptor_table = true);
+            let mut state = GlobalState::initialize(&config, false);
+            let pipe = reverie::InheritedInput::pipe(0).unwrap();
+            state.install_inherited_input(pipe.lease().unwrap());
+            let root = DetTid::from_raw(raw_root);
+            let root_mm = MmId::initial(root);
+            let response = state
+                .recv_create_child_thread(
+                    Tid::from_raw(raw_root),
+                    root_mm,
+                    super::ChildRegistration {
+                        parent_dettid: root,
+                        parent_detpid: root,
+                        child_dettid: root,
+                        child_tid_addr: 0,
+                        flags: None,
+                        exit_signal: libc::SIGCHLD,
+                        // The real physical-registration boundary rejects
+                        // nonpositive IDs before opening any kernel pidfd.
+                        physical_ids: Some((-1, -1)),
+                        maybe_priority: Some(DEFAULT_PRIORITY),
+                        parent_is_kernel_blocked: false,
+                    },
+                )
+                .await;
+            assert!(matches!(response, SchedulerRpcResult::ThreadExited));
+            let input = state.inherited_input.lock().unwrap();
+            let input = input
+                .as_ref()
+                .expect("failed registration consumed the lease");
+            assert!(input.root.is_none(), "failed registration bound the root");
+            assert_eq!(input.lease.identity(), pipe.identity());
+        }
     }
 
     fn cancellation_test_state() -> (Config, GlobalState, DetTid, DetPid) {
