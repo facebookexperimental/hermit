@@ -1113,3 +1113,66 @@ fn a_non_leader_exec_carries_its_replay_records_to_the_leaders_tid() {
         "{refusal}"
     );
 }
+
+/// A send of a signal whose list's front the kernel already dequeued for a
+/// delivery stop, before that stop's hooks ran (its turn was still to come),
+/// is queued by Linux: it joins the list the early pop emptied, and the
+/// stop's check expects the identified queue to hold it (cargo's jobserver
+/// helper shutdown, the regression of
+/// https://github.com/rrnewton/hermit/pull/4491).
+#[test]
+fn a_send_after_an_in_flight_dequeue_joins_the_emptied_list() {
+    let mut f = family();
+    let pr = private(&f);
+    let bit = kernel_signal_bit(USR1);
+    f.guest_send(pr, ordinary_siginfo(USR1, -6, 100, 1000));
+    f.queues(bit, 0);
+    assert_eq!(
+        f.sched
+            .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(10))),
+        DeliveryAnswer::AsIs
+    );
+    // The kernel dequeued the front; another tgkill lands before the hooks.
+    f.queues(0, 0);
+    f.guest_send(pr, ordinary_siginfo(USR1, -6, 100, 1000));
+    assert!(matches!(f.entries(pr).as_slice(), [Entry::Plain { .. }]));
+    // The hooks read the new copy in the private queue: no refusal.
+    f.queues(bit, 0);
+    f.sched.discarded_signal_control(
+        f.leader,
+        DiscardedSignalControl::Consumed {
+            signal: USR1,
+            how: Consumption::KeptResume { blocked: false },
+            thread_holds: true,
+            process_holds: false,
+        },
+    );
+    assert!(
+        matches!(f.entries(pr).as_slice(), [Entry::Plain { .. }]),
+        "the send is the list's front"
+    );
+    assert!(f.sent().is_empty(), "nothing is promoted or re-sent");
+}
+
+/// The same send while a timer entry waits behind the in-flight front: Linux,
+/// whose pending bit stays set, drops it, but the kernel queued it, which no
+/// list can hold, so the run is refused by name.
+#[test]
+#[should_panic(expected = "the front had an entry behind it")]
+fn a_send_after_an_in_flight_dequeue_with_an_entry_behind_is_refused() {
+    let mut f = family();
+    let pr = private(&f);
+    let bit = kernel_signal_bit(USR1);
+    f.guest_send(pr, ordinary_siginfo(USR1, -6, 100, 1000));
+    f.queues(bit, 0);
+    f.arm(0, SignalTarget::Thread(f.leader), 10, 0);
+    f.pop(10);
+    assert!(matches!(
+        f.entries(pr).as_slice(),
+        [Entry::Plain { .. }, Entry::Timer(_)]
+    ));
+    f.sched
+        .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(20)));
+    f.queues(0, 0);
+    f.guest_send(pr, ordinary_siginfo(USR1, -6, 100, 1000));
+}

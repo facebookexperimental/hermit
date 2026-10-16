@@ -1171,6 +1171,9 @@ impl Scheduler {
         };
         match record {
             Some(siginfo) => {
+                if !token.discarded {
+                    self.pop_in_flight_front(token.queue, token.signal, token.present);
+                }
                 let process = match token.queue {
                     QueueId::Thread(thread) => {
                         self.thread_tree.process_of(thread).unwrap_or(thread)

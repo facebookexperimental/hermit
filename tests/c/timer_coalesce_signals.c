@@ -22,8 +22,10 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <spawn.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -970,6 +972,42 @@ static void cx_stale_middle(void) {
   cx_print_read("stale_middle first", fd);
   cx_print_read("stale_middle second", fd);
 }
+/* A thread spinning in user code catches SIGUSR1 while another thread
+ * tgkills it again and again, as cargo's jobserver interrupts its helper: a
+ * send can land after the kernel dequeued the previous copy for a delivery
+ * and before that delivery's handler ran, and Linux queues it. A model that
+ * dropped it refused the run (the regression of
+ * https://github.com/rrnewton/hermit/pull/4491). */
+static atomic_int rs_stop, rs_handled, rs_ready, rs_tid;
+static void rs_handler(int s) {
+  (void)s;
+  atomic_fetch_add(&rs_handled, 1);
+}
+static void *rs_spinner(void *a) {
+  (void)a;
+  atomic_store(&rs_tid, gettid_());
+  atomic_store(&rs_ready, 1);
+  volatile unsigned long spins = 0;
+  while (!atomic_load(&rs_stop)) spins++;
+  return NULL;
+}
+static void resend_while_delivering(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = rs_handler;
+  sigaction(SIGUSR1, &sa, NULL);
+  pthread_t t;
+  pthread_create(&t, NULL, rs_spinner, NULL);
+  while (!atomic_load(&rs_ready)) sched_yield();
+  for (int i = 0; i < 300; i++) {
+    syscall(SYS_tgkill, getpid(), atomic_load(&rs_tid), SIGUSR1);
+    sched_yield();
+  }
+  while (atomic_load(&rs_handled) == 0) sched_yield();
+  atomic_store(&rs_stop, 1);
+  pthread_join(t, NULL);
+  printf("resend_while_delivering handled_at_least_once=%d\n", atomic_load(&rs_handled) > 0);
+}
 /* The Codex re-review's P2: [Plain, 80 stale entries, valid B] read by one
  * signalfd read with room for 4. Linux skips every stale entry inside the
  * dequeue, so the read returns the Plain and B. */
@@ -1108,6 +1146,7 @@ int main(int argc, char **argv) {
   else if (!strcmp(m, "delivery_turn")) delivery_turn();
   else if (!strcmp(m, "stale_middle")) cx_stale_middle();
   else if (!strcmp(m, "many_stale")) cx_many_stale();
+  else if (!strcmp(m, "resend_while_delivering")) resend_while_delivering();
   else if (!strcmp(m, "bad_old_disarm")) cx_bad_old_disarm();
   else if (!strcmp(m, "bad_old_overrun")) cx_bad_old_overrun();
   else if (!strcmp(m, "setsig_periodic")) cx_setsig_periodic();

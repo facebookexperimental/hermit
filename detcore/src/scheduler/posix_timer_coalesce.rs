@@ -44,6 +44,7 @@ use super::kernel_signal_bit;
 use super::signal_lists::Entry;
 use super::signal_lists::FrontClass;
 use super::signal_lists::KernelSiginfo;
+use super::signal_lists::Popped;
 use super::signal_lists::TimerAppend;
 use super::signal_lists::TimerEntry;
 use super::signal_lists::timer_siginfo;
@@ -120,6 +121,10 @@ pub(crate) struct PendingDequeue {
     /// for (`DeliveryAnswer::TimerEntry`), with its timer's state as the stop
     /// found it.
     awaiting_info: Option<CapturedEntry>,
+    /// The front this dequeue took, popped before the stop's hooks ran
+    /// because a send found the kernel's queue already without it
+    /// (`Scheduler::pop_in_flight_front`).
+    early: Option<Popped>,
 }
 
 /// A timer entry as a delivery stop dequeued it: its `si_value` and, for a
@@ -848,6 +853,7 @@ impl Scheduler {
                 delivery: true,
                 reconcile,
                 awaiting_info,
+                early: None,
             },
         );
         answer
@@ -936,10 +942,13 @@ impl Scheduler {
         };
         if let Some((thread_pending, shared_pending)) = after {
             let bit = kernel_signal_bit(signal);
+            // A take dequeues in the caller's own turn: no send can follow
+            // the kernel's dequeue before this check.
             self.check_taken_queues(
                 thread,
                 queue,
                 signal,
+                false,
                 thread_pending & bit != 0,
                 shared_pending & bit != 0,
             );
@@ -984,6 +993,7 @@ impl Scheduler {
                 delivery: false,
                 reconcile,
                 awaiting_info: None,
+                early: None,
             },
             thread,
         );
@@ -1061,6 +1071,7 @@ impl Scheduler {
                 delivery: false,
                 reconcile,
                 awaiting_info: None,
+                early: None,
             },
             thread,
         );
@@ -1135,7 +1146,21 @@ impl Scheduler {
             let at = self.committed_time;
             pending.reconcile = Some((captured.entry.timer, at, captured_overrun(&captured, at)));
         }
-        self.check_taken_queues(thread, pending.queue, signal, thread_holds, process_holds);
+        // After an early pop, a send's copy is the identified queue's new
+        // front, physically there (`pop_in_flight_front`).
+        let identified_expected = pending.early.is_some()
+            && self
+                .discarded_at_send
+                .lists
+                .is_listed(pending.queue, signal);
+        self.check_taken_queues(
+            thread,
+            pending.queue,
+            signal,
+            identified_expected,
+            thread_holds,
+            process_holds,
+        );
         Some(pending)
     }
 
@@ -1150,6 +1175,7 @@ impl Scheduler {
         thread: DetTid,
         queue: QueueId,
         signal: i32,
+        identified_expected: bool,
         thread_holds: bool,
         process_holds: bool,
     ) {
@@ -1162,32 +1188,73 @@ impl Scheduler {
         };
         let other_expected = self.discarded_at_send.lists.is_listed(other, signal)
             || self.discarded_at_send.is_discarded(other, signal);
-        if identified_holds || other_holds != other_expected {
+        if identified_holds != identified_expected || other_holds != other_expected {
             refuse(format_args!(
-                "hermit: thread {thread} took signal {signal} from {queue:?}, and afterwards that queue {} the signal and {other:?} {} it, where the model of its pending entries expects {}: a producer the schedule does not see, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)",
+                "hermit: thread {thread} took signal {signal} from {queue:?}, and afterwards that queue {} the signal and {other:?} {} it, where the model of its pending entries expects it {} in {queue:?} and {} in {other:?}: a producer the schedule does not see, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)",
                 if identified_holds {
                     "still held"
                 } else {
                     "no longer held"
                 },
                 if other_holds { "held" } else { "did not hold" },
-                if other_expected {
-                    "it held there"
+                if identified_expected {
+                    "held"
                 } else {
-                    "it absent there"
+                    "absent"
                 },
+                if other_expected { "held" } else { "absent" },
             ));
+        }
+    }
+
+    /// A kept send of `signal` into `queue` found the kernel's queue without
+    /// the signal (`present` false) while its list still has a front: the
+    /// kernel dequeued that front at a delivery stop whose hooks have not run
+    /// yet (a `PendingDequeue` for it). Linux queues this send, so the front
+    /// is popped now, kept in the pending dequeue for the stop to finish, and
+    /// the send joins the empty list (A1).
+    ///
+    /// Without this, a thread that `tgkill`s a signal again while another
+    /// thread's delivery of it waits for its turn left the new copy out of
+    /// the model, and the stop refused the run (cargo's jobserver helper
+    /// shutdown; the regression of
+    /// https://github.com/rrnewton/hermit/pull/4491). An entry behind the
+    /// in-flight front means Linux, whose bit stays set, drops this send
+    /// while the kernel kept it: no list can say that, so it is refused.
+    pub(crate) fn pop_in_flight_front(&mut self, queue: QueueId, signal: i32, present: bool) {
+        if present || !self.discarded_at_send.lists.is_listed(queue, signal) {
+            return;
+        }
+        let Some((&thread, _)) = self.pending_timer_dequeues.iter().find(|(_, pending)| {
+            pending.queue == queue && pending.signal == signal && pending.early.is_none()
+        }) else {
+            return;
+        };
+        let Some(popped) = self.discarded_at_send.lists.pop(queue, signal) else {
+            return;
+        };
+        if popped.next.is_some() {
+            refuse(format_args!(
+                "hermit: a send of signal {signal} found {queue:?} without it while thread {thread}'s delivery of its front waited for its turn, and the front had an entry behind it: Linux drops that send, but the kernel queued it, which the model of pending entries cannot hold, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)"
+            ));
+        }
+        debug!(
+            "[dtid {}] signal {} in {:?}: the front a delivery took is popped early; a send joins the list.",
+            thread, signal, queue
+        );
+        if let Some(pending) = self.pending_timer_dequeues.get_mut(&thread) {
+            pending.early = Some(popped);
         }
     }
 
     /// Pop `pending`'s front, reconcile its timer, and promote the next entry
     /// with `receiver` the thread that took it.
     pub(crate) fn pop_and_promote(&mut self, pending: PendingDequeue, receiver: DetTid) {
-        let Some(popped) = self
-            .discarded_at_send
-            .lists
-            .pop(pending.queue, pending.signal)
-        else {
+        let Some(popped) = pending.early.or_else(|| {
+            self.discarded_at_send
+                .lists
+                .pop(pending.queue, pending.signal)
+        }) else {
             return;
         };
         if let (Entry::Timer(entry), Some((timer, at, overrun))) = (popped.entry, pending.reconcile)

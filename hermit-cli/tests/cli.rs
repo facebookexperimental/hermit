@@ -33365,6 +33365,10 @@ fn posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity() {
             "stale_middle first bytes=256 errno=0 code0=0 val0=0 code1=-2 val1=222\nstale_middle second bytes=-1 errno=11\n",
         ),
         (
+            "resend_while_delivering",
+            "resend_while_delivering handled_at_least_once=1\n",
+        ),
+        (
             "many_stale",
             "many_stale first bytes=256 errno=0 code0=0 val0=0 code1=-2 val1=222\nmany_stale second bytes=-1 errno=11\n",
         ),
