@@ -4437,7 +4437,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same six chaos-stress tests, which need no PMU: 1575.
     // And the same interpolate refusal test (https://github.com/rrnewton/hermit/issues/4380): 1576, listed.
     // And +5 from 87bb6972: 1581.
-    ("test.regular_crates_on_host", 1581),
+    // And the local selection's +1 already counted for test.regular_crates
+    // (1595 -> 1596), which the twin does not exclude: 1582.
+    ("test.regular_crates_on_host", 1582),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),
