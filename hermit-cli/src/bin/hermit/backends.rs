@@ -1614,9 +1614,9 @@ impl DbtExecution {
     }
 
     fn new_runtime() -> Result<tokio::runtime::Runtime, Error> {
-        // RPCs can wait on the scheduler, so both need independent workers.
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+        // RPC and scheduler waits yield asynchronously. The launcher moves
+        // blocking child waits and I/O to spawn_blocking after guest creation.
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| Error::msg(format!("failed to start the DBT coordinator: {error}")))
@@ -1656,6 +1656,10 @@ impl DbtExecution {
                     // The detached stdin reader may stay blocked after the
                     // guest exits.
                     super::container::exit_init_after_publication();
+                    // This physical-run path does not initialize tracing. Use
+                    // its common namespace baseline exactly once, before any
+                    // coordinator task starts, just as the tracing paths do.
+                    super::tracing::align_tracing_pid_baseline(hermit::Backend::Dbt);
                     let config = super::run::complete_container_config(config.clone(), identity)?;
                     let _config_dir = config_dir
                         .as_deref()

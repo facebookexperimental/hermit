@@ -1051,7 +1051,7 @@ pub fn init_sync_file_tracing<W: Write + Send + 'static>(
 /// signal and interval-timer state, and it exits before any backend starts.
 /// Outside a PID-namespace init (notably `--no-namespace`) this is a deliberate
 /// no-op; Hermit must not create a process merely to alter the host namespace.
-fn align_tracing_pid_baseline(backend: Backend) {
+pub(super) fn align_tracing_pid_baseline(backend: Backend) {
     // KVM supplies the deterministic root identity explicitly rather than
     // deriving it from a Linux task in this namespace. Allocating PID 2 for
     // that backend is both unnecessary and harmful: it makes the setitimer
