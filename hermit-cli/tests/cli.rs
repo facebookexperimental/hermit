@@ -32013,6 +32013,13 @@ fn posix_timer_entries_are_delivered_as_on_linux_at_bitwise_parity() {
             "forged_timer",
             "forged_timer on_worker=1\nforged deliveries=1\n  0 sig=10 code=-1 own_pid=0 value=0x1122334455667788\n",
         ),
+        // Created and never armed: creation alone makes the pair a timer pair
+        // (the Codex review of https://github.com/rrnewton/hermit/pull/4491,
+        // P2-4; native 5 runs, 2026-10-16).
+        (
+            "forged_timer_unarmed",
+            "forged_timer_unarmed on_worker=1\nforged deliveries=1\n  0 sig=10 code=-1 own_pid=0 value=0x1122334455667788\n",
+        ),
         (
             "forged_timer_tgkill",
             "forged_timer_tgkill on_worker=1\nforged deliveries=1\n  0 sig=10 code=-6 own_pid=1 value=0\n",
@@ -32210,6 +32217,27 @@ fn posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity() {
         (
             "delivery_turn",
             "delivery_turn deliveries_positive=1 all_si_timer=1 accounting_ok=1\n",
+        ),
+        // The Codex review of https://github.com/rrnewton/hermit/pull/4491
+        // (native 5 runs each, 2026-10-16): a stale entry between two returned
+        // records (P2-1); an EFAULT copying old_value after the set took effect
+        // (P2-2, a disarm and an overrun reset); F_SETSIG ending observability
+        // with a periodic entry queued (P2-3).
+        (
+            "stale_middle",
+            "stale_middle first bytes=256 errno=0 code0=0 val0=0 code1=-2 val1=222\nstale_middle second bytes=-1 errno=11\n",
+        ),
+        (
+            "bad_old_disarm",
+            "bad_old_disarm settime=-1 errno=14 take=-1 errno=11 code=0 value=0\n",
+        ),
+        (
+            "bad_old_overrun",
+            "bad_old_overrun taken=1 before_positive=1 settime=-1 errno=14 after=0\n",
+        ),
+        (
+            "setsig_periodic",
+            "setsig_periodic setsig=0 errno=0 first=10 errno=0 second=10 errno=0\n",
         ),
         (
             "armed_promoted",

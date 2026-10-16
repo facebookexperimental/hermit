@@ -932,6 +932,10 @@ pub enum DiscardedSignalControl {
         mask: u64,
         nodefer: bool,
     },
+    /// The calling thread's process created a POSIX timer notifying `signal`:
+    /// the pair has a timer history from now on, armed or not (N10-2; the
+    /// Codex review of <https://github.com/rrnewton/hermit/pull/4491>, P2-4).
+    TimerCreated { signal: i32 },
     /// The signals whose list in the calling thread's private queue, and in
     /// its process's shared queue, holds an entry behind its front or a stale
     /// timer entry (`signal_lists`), as `Bits`: a dequeue of one sends the
@@ -1510,6 +1514,12 @@ impl Scheduler {
                         .insert((process, signal), (mask, nodefer));
                 } else {
                     self.handler_masks.remove(&(process, signal));
+                }
+                DiscardedSignalAnswer::Recorded
+            }
+            DiscardedSignalControl::TimerCreated { signal } => {
+                if (1..32).contains(&signal) {
+                    self.discarded_at_send.note_timer_history(process, signal);
                 }
                 DiscardedSignalAnswer::Recorded
             }

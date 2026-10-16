@@ -1029,6 +1029,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest
             .memory()
             .write_value(timerid_ptr, &(id as libc::c_int))?;
+        // The process has a POSIX timer on this signal from its creation, armed
+        // or not, which decides how a kept send standing on another sender's
+        // record is classified (https://github.com/rrnewton/hermit/issues/4262).
+        if crate::scheduler::discarded_at_send::records(guest.config())
+            && let Some(signo) = signo
+            && (1..32).contains(&signo)
+        {
+            crate::tool_global::discarded_signal(
+                guest,
+                crate::scheduler::discarded_at_send::DiscardedSignalControl::TimerCreated {
+                    signal: signo,
+                },
+            )
+            .await;
+        }
         detlog!(
             "[dtid {}] timer_create(clockid={:?}) => deterministic timer id {}, signal {:?}, thread {:?}",
             guest.thread_state().dettid,
@@ -1076,17 +1091,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 timers.value(id).unwrap_or(0),
             )
         };
-        let (old_remaining_ns, old_interval_ns) = old.ok_or(Errno::EINVAL)?;
+        let (mut old_remaining_ns, old_interval_ns) = old.ok_or(Errno::EINVAL)?;
         let signal_number = signal_number.ok_or(Errno::EINVAL)?;
-
-        if let Some(old_ptr) = call.old_value() {
-            let old_spec = libc::itimerspec {
-                it_interval: ns_to_timespec(old_interval_ns),
-                it_value: ns_to_timespec(old_remaining_ns),
-            };
-            guest.memory().write_value(old_ptr, &old_spec)?;
+        // The old value is the timer's remaining time as `timer_gettime`
+        // reads it now, from the scheduler where it keeps the timer's phase
+        // (4262 design §5).
+        if let Some((Some(remaining), _)) = posix_timer_readout(guest, id, now).await {
+            old_remaining_ns = remaining.as_nanos();
         }
 
+        // Linux changes the timer, its generation and its overrun before it
+        // copies the old value out (`do_timer_settime`), and an EFAULT there
+        // undoes none of it, so the scheduler is told first (the Codex review
+        // of https://github.com/rrnewton/hermit/pull/4491, P2-2).
         if let Some(signo) = signal_number {
             if self.posix_timer_expiry_is_registered(signo) {
                 register_posix_timer(
@@ -1110,6 +1127,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     signo,
                 );
             }
+        }
+
+        if let Some(old_ptr) = call.old_value() {
+            let old_spec = libc::itimerspec {
+                it_interval: ns_to_timespec(old_interval_ns),
+                it_value: ns_to_timespec(old_remaining_ns),
+            };
+            guest.memory().write_value(old_ptr, &old_spec)?;
         }
 
         detlog!(

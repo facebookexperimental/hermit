@@ -888,6 +888,10 @@ impl Scheduler {
         at: LogicalTime,
         after: Option<(u64, u64)>,
     ) -> TakeOutcome {
+        // The take is in the caller's turn, granted at the committed time;
+        // the caller's own clock may not have caught up with it yet (a sleep
+        // it just woke from), and the overrun must not trail it.
+        let at = at.max(self.committed_time);
         let process = self.sigchld_process(thread);
         let listed = if self.coalesces_alarms() && (1..32).contains(&signal) {
             self.identify_listed_queue(thread, process, signal)
@@ -974,6 +978,7 @@ impl Scheduler {
         shared_pending: u64,
         at: LogicalTime,
     ) -> bool {
+        let at = at.max(self.committed_time);
         let process = self.sigchld_process(thread);
         let (private, shared) = (QueueId::Thread(thread), QueueId::Process(process));
         let mut taken = Vec::new();

@@ -619,11 +619,16 @@ static void *forged_worker(void *a) {
   worker_futex = syscall(SYS_futex, &futex_word, 128 /* FUTEX_WAIT_PRIVATE */, 0, &ts, 0, 0);
   return 0;
 }
+/* timer: 0 none, 1 created and armed then disarmed, 2 created and never
+ * armed (the Codex review of https://github.com/rrnewton/hermit/pull/4491,
+ * P2-4: creation alone makes the pair a timer pair). */
 static void forged(int timer, int use_tgkill) {
   if (timer) {
     timer_t t = mk(SIGUSR1, 0, 0);
-    arm(t, 3600 * 1000000L, 3600 * 1000000L);
-    arm(t, 0, 0);
+    if (timer == 1) {
+      arm(t, 3600 * 1000000L, 3600 * 1000000L);
+      arm(t, 0, 0);
+    }
   }
   install(SIGUSR1, 1);
   mask(SIG_BLOCK, SIGUSR1);
@@ -654,7 +659,7 @@ static void forged(int timer, int use_tgkill) {
     if (syscall(SYS_rt_tgsigqueueinfo, getpid(), wtid, SIGUSR1, &si)) perror("queue");
   }
   pthread_join(th, 0);
-  printf("forged_%s%s on_worker=%d\n", timer ? "timer" : "notimer", use_tgkill ? "_tgkill" : "",
+  printf("forged_%s%s on_worker=%d\n", timer == 2 ? "timer_unarmed" : timer ? "timer" : "notimer", use_tgkill ? "_tgkill" : "",
          htid == wtid);
   print_handled("forged");
 }
@@ -720,6 +725,7 @@ int main(int argc, char **argv) {
   else if (!strcmp(m, "gettime")) gettime();
   else if (!strcmp(m, "forged_timer")) forged(1, 0);
   else if (!strcmp(m, "forged_notimer")) forged(0, 0);
+  else if (!strcmp(m, "forged_timer_unarmed")) forged(2, 0);
   else if (!strcmp(m, "forged_timer_tgkill")) forged(1, 1);
   else if (!strcmp(m, "forged_exec_timer")) forged_exec(argv[0], 1);
   else if (!strcmp(m, "forged_exec_notimer")) forged_exec(argv[0], 0);

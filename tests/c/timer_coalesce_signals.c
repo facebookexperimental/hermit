@@ -920,6 +920,128 @@ static void forged_shared(void) {
   pthread_join(th, 0);
 }
 
+/* The Codex review of https://github.com/rrnewton/hermit/pull/4491. */
+static int cx_timer(int value) {
+  struct sigevent ev;
+  memset(&ev, 0, sizeof ev);
+  ev.sigev_notify = SIGEV_SIGNAL;
+  ev.sigev_signo = SIGUSR1;
+  ev.sigev_value.sival_int = value;
+  int id = -1;
+  if (syscall(SYS_timer_create, CLOCK_MONOTONIC, &ev, &id)) exit(3);
+  return id;
+}
+static void cx_arm(int id, long ns, long period) {
+  struct itimerspec t = {{period / 1000000000, period % 1000000000}, {ns / 1000000000, ns % 1000000000}};
+  if (syscall(SYS_timer_settime, id, 0, &t, NULL)) exit(3);
+}
+static void cx_sleep_ms(long ms) {
+  struct timespec ts = {ms / 1000, (ms % 1000) * 1000000};
+  while (nanosleep(&ts, &ts)) if (errno != EINTR) exit(3);
+}
+static void cx_print_read(const char *name, int fd) {
+  struct signalfd_siginfo rec[4];
+  memset(rec, 0, sizeof rec);
+  errno = 0;
+  ssize_t got = read(fd, rec, sizeof rec);
+  int e = errno;
+  printf("%s bytes=%zd errno=%d", name, got, got < 0 ? e : 0);
+  for (ssize_t i = 0; i < got / (ssize_t)sizeof(rec[0]); i++)
+    printf(" code%zd=%d val%zd=%u", i, rec[i].ssi_code, i, rec[i].ssi_int);
+  putchar('\n');
+}
+/* P2-1: [Plain, stale A, valid B] read by one signalfd read. */
+static void cx_stale_middle(void) {
+  mask(SIG_BLOCK, SIGUSR1);
+  kill(getpid(), SIGUSR1);
+  int a = cx_timer(111), b = cx_timer(222);
+  cx_arm(a, 1000000, 0);
+  cx_sleep_ms(3);
+  cx_arm(b, 1000000, 0);
+  cx_sleep_ms(3);
+  cx_arm(a, 0, 0);
+  sigset_t s;
+  sigemptyset(&s);
+  sigaddset(&s, SIGUSR1);
+  int fd = signalfd(-1, &s, SFD_NONBLOCK);
+  cx_print_read("stale_middle first", fd);
+  cx_print_read("stale_middle second", fd);
+}
+/* P2-2: a disarm whose old_value copy faults still disarms. */
+static void cx_bad_old_disarm(void) {
+  mask(SIG_BLOCK, SIGUSR1);
+  int a = cx_timer(333);
+  cx_arm(a, 1000000, 0);
+  cx_sleep_ms(3);
+  struct itimerspec zero;
+  memset(&zero, 0, sizeof zero);
+  errno = 0;
+  long change = syscall(SYS_timer_settime, a, 0, &zero, (void *)(uintptr_t)1);
+  int ce = errno;
+  sigset_t s;
+  sigemptyset(&s);
+  sigaddset(&s, SIGUSR1);
+  struct timespec z = {0, 0};
+  siginfo_t si;
+  memset(&si, 0, sizeof si);
+  errno = 0;
+  long got = syscall(SYS_rt_sigtimedwait, &s, &si, &z, 8);
+  int ge = errno;
+  printf("bad_old_disarm settime=%ld errno=%d take=%ld errno=%d code=%d value=%d\n", change, ce, got,
+         ge, si.si_code, si.si_value.sival_int);
+}
+/* P2-2: a set whose old_value copy faults still resets the overrun. */
+static void cx_bad_old_overrun(void) {
+  mask(SIG_BLOCK, SIGUSR1);
+  int a = cx_timer(444);
+  cx_arm(a, 1000000, 1000000);
+  cx_sleep_ms(8);
+  sigset_t s;
+  sigemptyset(&s);
+  sigaddset(&s, SIGUSR1);
+  struct timespec z = {0, 0};
+  siginfo_t si;
+  memset(&si, 0, sizeof si);
+  long got = syscall(SYS_rt_sigtimedwait, &s, &si, &z, 8);
+  long before = syscall(SYS_timer_getoverrun, a);
+  struct itimerspec far = {{0, 0}, {3600, 0}};
+  errno = 0;
+  long change = syscall(SYS_timer_settime, a, 0, &far, (void *)(uintptr_t)1);
+  int ce = errno;
+  long after = syscall(SYS_timer_getoverrun, a);
+  printf("bad_old_overrun taken=%d before_positive=%d settime=%ld errno=%d after=%ld\n",
+         got == SIGUSR1, before > 0, change, ce, after);
+}
+/* P2-3: F_SETSIG makes the pair unobservable with a periodic entry queued;
+ * the timer keeps expiring. */
+static void cx_setsig_periodic(void) {
+  mask(SIG_BLOCK, SIGUSR1);
+  int p[2];
+  if (pipe(p)) exit(3);
+  int a = cx_timer(555);
+  cx_arm(a, 1000000, 10000000);
+  cx_sleep_ms(3);
+  errno = 0;
+  int change = fcntl(p[0], F_SETSIG, SIGUSR1);
+  int ce = errno;
+  sigset_t s;
+  sigemptyset(&s);
+  sigaddset(&s, SIGUSR1);
+  struct timespec z = {0, 0};
+  siginfo_t si;
+  memset(&si, 0, sizeof si);
+  errno = 0;
+  long first = syscall(SYS_rt_sigtimedwait, &s, &si, &z, 8);
+  int fe = errno;
+  cx_sleep_ms(25);
+  memset(&si, 0, sizeof si);
+  errno = 0;
+  long second = syscall(SYS_rt_sigtimedwait, &s, &si, &z, 8);
+  int se = errno;
+  printf("setsig_periodic setsig=%d errno=%d first=%ld errno=%d second=%ld errno=%d\n", change, ce,
+         first, fe, second, se);
+}
+
 int main(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr, "usage: %s <mode>\n", argv[0]);
@@ -957,6 +1079,10 @@ int main(int argc, char **argv) {
   else if (!strcmp(m, "d1_transition")) d1_transition(0);
   else if (!strcmp(m, "d1_transition_queued")) d1_transition(1);
   else if (!strcmp(m, "delivery_turn")) delivery_turn();
+  else if (!strcmp(m, "stale_middle")) cx_stale_middle();
+  else if (!strcmp(m, "bad_old_disarm")) cx_bad_old_disarm();
+  else if (!strcmp(m, "bad_old_overrun")) cx_bad_old_overrun();
+  else if (!strcmp(m, "setsig_periodic")) cx_setsig_periodic();
   else {
     fprintf(stderr, "unknown mode %s\n", m);
     return 2;
