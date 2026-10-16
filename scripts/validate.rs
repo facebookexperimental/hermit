@@ -10784,6 +10784,9 @@ fn require_committed_scheduler_input(plan: &Plan) -> Result<(), String> {
 }
 
 const RUST_SCRIPT_PRODUCER_TAG: &str = "build.rust_scripts";
+const RUST_MIN_STACK_ENV: &str = "RUST_MIN_STACK";
+/// The stack size every cargo and rustc of a validation run gets (16 MiB).
+const VALIDATION_RUST_MIN_STACK: &str = "16777216";
 const DAGRUN_PREPARE_BODY: &str = "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun";
 const RUST_SCRIPT_PRODUCER_BODY: &str =
     "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun && ./ci/prepare-rust-scripts.sh";
@@ -27073,6 +27076,18 @@ fn run(
         );
     }
     std::env::set_var("VALIDATE_RUN_STATE", &tmp);
+    // Every cargo and rustc the DAG starts inherits this: host nodes directly,
+    // pinned-root nodes through `--env RUST_MIN_STACK`
+    // (validation_dag::PINNED_ROOT_FORWARDED_ENV). rustc takes it for its main
+    // thread and for the threads LLVM's passes run on, which otherwise get
+    // Rust's 2-MiB default; the retained full-validation logs hold 7 "rustc
+    // interrupted by SIGSEGV" crashes, 3 of them in LLVM passes on those
+    // threads, across build.rust_scripts (validate.rs, dagrun),
+    // build.workspace_compile_in_pinned_root and test.strict_compat. 16 MiB is
+    // the size rustc's own message names. A caller's own value wins.
+    if std::env::var_os(RUST_MIN_STACK_ENV).is_none() {
+        std::env::set_var(RUST_MIN_STACK_ENV, VALIDATION_RUST_MIN_STACK);
+    }
     if let Some(proof) = admitted_context.as_ref() {
         let result = if nesting.nested || verified_scope_reexec {
             proof.check_witness(&root, &tmp)

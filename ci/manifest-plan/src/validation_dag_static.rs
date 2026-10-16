@@ -1085,7 +1085,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1599, listed.
     // And validation_dag's host_manifest_plan_build_does_not_wait_for_the_rust_script_tools:
     // 1600 (hermit-manifest-plan lists 789 tests, 788 at 32e1c019).
-    ("test.regular_crates", 1600),
+    // And validation_dag's every_committed_pinned_root_node_forwards_the_rustc_stack_size:
+    // 1601 (hermit-manifest-plan lists 790 tests).
+    ("test.regular_crates", 1601),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4582,7 +4584,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same concurrent-listing test: 1584, listed.
     // And the same copied-child group-getter test: 1585.
     // And the same manifest-plan dependency test: 1586.
-    ("test.regular_crates_on_host", 1586),
+    // And the same rustc-stack forwarding test: 1587.
+    ("test.regular_crates_on_host", 1587),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),

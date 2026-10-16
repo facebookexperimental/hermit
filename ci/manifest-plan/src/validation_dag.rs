@@ -577,6 +577,8 @@ const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     "L4_REPS",
     "NEXTEST_TEST_THREADS",
     "PR_NUMBER",
+    // validate.rs sets it to 16 MiB for every cargo and rustc of a run.
+    "RUST_MIN_STACK",
     "SUPER_REPETITIONS",
     "THIRD_PARTY_BUILD_JOBS",
     "VALIDATE_VERBOSITY",
@@ -5543,6 +5545,26 @@ sys.exit(37)
             );
         }
         assert!(channels.contains("HERMIT_ISOLATION_JOBS"), "{channels:?}");
+    }
+
+    #[test]
+    fn every_committed_pinned_root_node_forwards_the_rustc_stack_size() {
+        // validate.rs sets RUST_MIN_STACK for every cargo and rustc of a run;
+        // a pinned-root node sees it only if its wrapper forwards it.
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let pinned: Vec<_> = committed
+            .steps
+            .iter()
+            .filter(|step| step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh "))
+            .collect();
+        assert!(pinned.len() > 50, "{}", pinned.len());
+        for step in pinned {
+            assert!(
+                step.cmd.contains(" --env RUST_MIN_STACK "),
+                "{} does not forward RUST_MIN_STACK",
+                step.tag()
+            );
+        }
     }
 
     #[test]
