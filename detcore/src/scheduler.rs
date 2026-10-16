@@ -8119,11 +8119,14 @@ impl Scheduler {
     }
 
     /// Snapshot eligibility is local to the exact outstanding sleep request.
+    /// Only a backend that keeps the guest's SIGALRM virtual
+    /// (`virtualizes_guest_sigalrm`) has such a sleep; this reads that fact
+    /// rather than comparing the whole capability set with one backend's.
     fn in_guest_sleep_sigalrm(
         &self,
         thread: DetTid,
     ) -> Option<(crate::resources::InGuestSleepSigalrm, LogicalTime)> {
-        if self.backend != BackendCapabilities::LITEINST_IN_GUEST
+        if !self.backend.virtualizes_guest_sigalrm
             || self.registered_process(thread) != Some(thread)
             || self.thread_tree.my_thread_group(&thread) != [thread]
         {
@@ -8206,7 +8209,7 @@ impl Scheduler {
         mm: Option<MmId>,
         original: &Resources,
     ) -> bool {
-        self.backend == BackendCapabilities::LITEINST_IN_GUEST
+        self.backend.virtualizes_guest_sigalrm
             && thread == process
             && original.tid == thread
             && original
@@ -30580,6 +30583,32 @@ mod test {
             disposition: crate::resources::SigalrmSleepDisposition::Default,
             blocked: false,
         }
+    }
+
+    /// An in-guest SIGALRM sleep is recognized from the backend's
+    /// `virtualizes_guest_sigalrm` fact, not from its whole capability set
+    /// being in-guest LiteInst's: any backend that keeps SIGALRM virtual has
+    /// such sleeps, and one that does not, has none (audit step A9 of
+    /// https://github.com/rrnewton/hermit/issues/4485).
+    #[test]
+    fn an_in_guest_sigalrm_sleep_follows_the_virtual_sigalrm_capability() {
+        let (mut scheduler, target, original) = in_guest_alarm_sleep(
+            LogicalTime::INDEFINITE,
+            PAUSE_FYI,
+            default_sleep_alarm_snapshot(),
+            false,
+        );
+        let mm = scheduler.exec_incarnations.get(&target).copied();
+        assert!(scheduler.in_guest_sleep_sigalrm(target).is_some());
+        let mut virtual_ptrace = BackendCapabilities::PTRACE;
+        virtual_ptrace.virtualizes_guest_sigalrm = true;
+        scheduler.backend = virtual_ptrace;
+        assert!(scheduler.in_guest_sleep_sigalrm(target).is_some());
+        let mut physical_liteinst = BackendCapabilities::LITEINST_IN_GUEST;
+        physical_liteinst.virtualizes_guest_sigalrm = false;
+        scheduler.backend = physical_liteinst;
+        assert!(scheduler.in_guest_sleep_sigalrm(target).is_none());
+        assert!(!scheduler.in_guest_fatal_alarm_response_matches(target, target, mm, &original));
     }
 
     /// Drive the real pop, diversion and typed grant boundaries directly,
