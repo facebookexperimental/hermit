@@ -22531,6 +22531,13 @@
           "category": "system-utils",
           "test": "system-utils/procfs-sanitized-paths",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/procfs-sanitized-paths",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -39490,6 +39497,13 @@
           "test": "system-utils/proc-uptime",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/procfs-sanitized-paths",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -64178,6 +64192,13 @@
           "test": "system-utils/proc-uptime",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/procfs-sanitized-paths",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",

@@ -1682,8 +1682,16 @@ fi
 # the M1 source-catalog qualification. No reverie-dbt source, build.rs, vendor SDK input
 # or native recipe changes; the reverie-dbt inventory stays 956 and the budget
 # carries.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 42d75dd6fdb656a174331244bea298d92e0e7b02 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 42d75dd6fdb656a174331244bea298d92e0e7b02 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# DBT FIXED-VMCODE-BASE SDK-BUDGET CARRY (2026-10-16): advance
+# 42d75dd6fdb656a174331244bea298d92e0e7b02 to b88d6af03a3976b17519582ef991969ae0760b48.
+# The interval is one commit that changes the reverie-dbt tree: launcher.rs
+# alone passes DynamoRIO -vm_max_offset 0x0 at run time (a fixed base for its
+# code region; https://github.com/rrnewton/hermit/issues/4478). No build.rs,
+# vendor SDK input, native source or recipe changes, so no DynamoRIO build input
+# moves and the budget carries; no test is added or removed, so the reverie-dbt
+# inventory stays 956.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b88d6af03a3976b17519582ef991969ae0760b48 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie b88d6af03a3976b17519582ef991969ae0760b48 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

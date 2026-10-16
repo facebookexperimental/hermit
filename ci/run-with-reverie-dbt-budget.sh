@@ -1605,7 +1605,15 @@ fi
 # the M1 source-catalog qualification. No reverie-dbt source, build.rs, vendor SDK input
 # or native recipe changes; the reverie-dbt inventory stays 956 and the budget
 # carries.
-expected_pin=42d75dd6fdb656a174331244bea298d92e0e7b02
+# DBT FIXED-VMCODE-BASE SDK-BUDGET CARRY (2026-10-16): advance
+# 42d75dd6fdb656a174331244bea298d92e0e7b02 to b88d6af03a3976b17519582ef991969ae0760b48.
+# The interval is one commit that changes the reverie-dbt tree: launcher.rs
+# alone passes DynamoRIO -vm_max_offset 0x0 at run time (a fixed base for its
+# code region; https://github.com/rrnewton/hermit/issues/4478). No build.rs,
+# vendor SDK input, native source or recipe changes, so no DynamoRIO build input
+# moves and the budget carries; no test is added or removed, so the reverie-dbt
+# inventory stays 956.
+expected_pin=b88d6af03a3976b17519582ef991969ae0760b48
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

@@ -1377,13 +1377,14 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
         compare_io_buffers: true
         rcb_time: false
         rcb_time_disabled_reason: The guest intentionally parses sanitizer outputs whose non-sanitized fields may vary; RCB-derived virtual time would turn legitimate data-dependent assertion work into unrelated INFO timestamp divergence.
         backends_enabled:
           - ptrace
+          - dbt
         backends_disabled:
-          dbt: Not deterministic on DBT, as the two verify runs read different bytes from /proc/self/smaps (https://github.com/rrnewton/hermit/issues/4478)
           kvm: KVM's own /proc refuses /proc/self/smaps with EACCES, so the guest fails (https://github.com/rrnewton/hermit/issues/4479, https://github.com/rrnewton/hermit/issues/4282)
           sabre: Under SaBRe this guest's verify matches, but the harness refuses the run because SaBRe used fallback or native sites for bash and the utilities it runs (https://github.com/rrnewton/hermit/issues/4477)
           liteinst: Under in-guest LiteInst, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)
