@@ -1766,7 +1766,14 @@ fi
 # existing terminal stats record before root termination. Match native client
 # and tests to this source; identical tested artifacts may be reused. All seven
 # SDK inputs, inventory 961, calibrated budget, job width and limits are unchanged.
-expected_pin=e9f043de2fa512630f749751d8f36a4306ebd0a2
+# CARRY TO 1e36924571bda44acd381e35a0d7c6f6f3a4894c (2026-10-16): from
+# e9f043de2fa512630f749751d8f36a4306ebd0a2. The interval is one commit, 1e369245, which makes reverie-ptrace's
+# timer reach precise targets with PTRACE_SINGLEBLOCK under a decoded bound
+# (reverie-ptrace and safeptrace only). git diff is empty under reverie-dbt/
+# (tree 17688ad5a2f6 at both pins), and the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml are unchanged. All seven SDK inputs, inventory 961,
+# calibrated budget, job width and limits are unchanged.
+expected_pin=1e36924571bda44acd381e35a0d7c6f6f3a4894c
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
