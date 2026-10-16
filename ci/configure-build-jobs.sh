@@ -1766,8 +1766,18 @@ fi
 # and reverie-core. build.rs, vendor/dynamorio, the native client and the root
 # Cargo.toml are unchanged, so the SDK build inputs and their budget carry; no
 # reverie-dbt file is added or removed and the inventory stays 956.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0f4d8852c99b3091f04ca6b5b354ff1aff120027 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0f4d8852c99b3091f04ca6b5b354ff1aff120027 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# A7 RAW-IDENTITY SDK-BUDGET CARRY (2026-10-16): advance
+# 0f4d8852c99b3091f04ca6b5b354ff1aff120027 to 2a62681f03c45f6f402679e3e5a7322eea4209c8.
+# The six published A7 commits remove synthetic native identity allocation and
+# projection and order collector/input setup before guest execution. The native
+# client changes, so a client rebuild is required. The subsequent shared Signal
+# refusal variant/KVM use and ptrace signal-boundary test remain included.
+# All seven SDK recipe Git inputs are unchanged across this full interval;
+# the DynamoRIO SDK budget and every limit therefore carry unchanged.
+# Three A7 fixtures increase the tracked DBT inventory from 956 to 959.
+# This source carry is not a fresh runtime measurement or a whole-backend claim.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 2a62681f03c45f6f402679e3e5a7322eea4209c8 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 2a62681f03c45f6f402679e3e5a7322eea4209c8 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
