@@ -8063,6 +8063,165 @@ fn run_kvm_self_sigkill_from_nonleader_is_group_fatal() {
     );
 }
 
+/// Check the complete numeric transcript against task relationships. Kernel
+/// task IDs need not be dense: runtime helpers may consume intervening IDs.
+/// This does not normalize the logs or replace strict repeat comparison.
+fn assert_pid_lifecycle_transcript(output: &str) {
+    let lines = output.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 13, "{output}");
+    let identity = |line: usize, prefix: &str| {
+        lines[line]
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("missing lifecycle identity")
+            .parse::<i32>()
+            .expect("lifecycle identity is a positive Linux PID")
+    };
+    let child = identity(2, "child pid=");
+    let grandchild = identity(1, "grandchild pid=");
+    let exec = identity(5, "exec-child pid=");
+    let waitid = identity(8, "waitid-child pid=");
+    let vfork = identity(10, "root vfork=");
+    let vfork_exec = identity(11, "vfork-exec-child pid=");
+    let births = [3, child, grandchild, exec, waitid, vfork, vfork_exec];
+    assert!(
+        births.windows(2).all(|pair| pair[0] < pair[1]),
+        "fresh-namespace child IDs must be positive, distinct and in birth order: {births:?}"
+    );
+    assert_eq!(
+        output,
+        format!(
+            concat!(
+                "root pid=3 ppid=1 tid=3\n",
+                "grandchild pid={grandchild} ppid={child} tid={grandchild}\n",
+                "child pid={child} ppid=3 tid={child}\n",
+                "child grandchild={grandchild} waited={grandchild} exit=5\n",
+                "root child={child} waited={child} exit=6\n",
+                "exec-child pid={exec} ppid=3 tid={exec}\n",
+                "exec-proc stat={exec}/3 status={exec}/3 tracer=1\n",
+                "root exec={exec} waited={exec} exit=8\n",
+                "waitid-child pid={waitid} ppid=3 tid={waitid}\n",
+                "root waitid={waitid} reported={waitid} exit=9\n",
+                "root vfork={vfork} waited={vfork} exit=0 pid=3 tid=3 ",
+                "child={vfork}/3/{vfork} written=1\n",
+                "vfork-exec-child pid={vfork_exec} ppid=3 tid={vfork_exec}\n",
+                "root vfork-exec={vfork_exec} waited={vfork_exec} exit=10 pid=3 tid=3\n",
+            ),
+            child = child,
+            grandchild = grandchild,
+            exec = exec,
+            waitid = waitid,
+            vfork = vfork,
+            vfork_exec = vfork_exec,
+        ),
+    );
+}
+
+fn assert_pid_lifecycle_oracle_rejects_broken_relationships() {
+    // Deliberately non-dense example data tests the oracle, not kernel behavior.
+    let valid = concat!(
+        "root pid=3 ppid=1 tid=3\n",
+        "grandchild pid=7 ppid=4 tid=7\n",
+        "child pid=4 ppid=3 tid=4\n",
+        "child grandchild=7 waited=7 exit=5\n",
+        "root child=4 waited=4 exit=6\n",
+        "exec-child pid=9 ppid=3 tid=9\n",
+        "exec-proc stat=9/3 status=9/3 tracer=1\n",
+        "root exec=9 waited=9 exit=8\n",
+        "waitid-child pid=12 ppid=3 tid=12\n",
+        "root waitid=12 reported=12 exit=9\n",
+        "root vfork=15 waited=15 exit=0 pid=3 tid=3 child=15/3/15 written=1\n",
+        "vfork-exec-child pid=20 ppid=3 tid=20\n",
+        "root vfork-exec=20 waited=20 exit=10 pid=3 tid=3\n",
+    );
+    assert_pid_lifecycle_transcript(valid);
+    for (original, broken) in [
+        ("root pid=3 ppid=1 tid=3", "root pid=5 ppid=1 tid=5"),
+        ("child=15/3/15 written=1", "child=16/3/16 written=1"),
+        ("waitid=12 reported=12", "waitid=12 reported=11"),
+        ("reported=12 exit=9", "reported=12 exit=8"),
+        ("stat=9/3 status=9/3", "stat=10/3 status=9/3"),
+        (
+            "grandchild pid=7 ppid=4 tid=7\nchild pid=4 ppid=3 tid=4\n",
+            "child pid=4 ppid=3 tid=4\ngrandchild pid=7 ppid=4 tid=7\n",
+        ),
+    ] {
+        assert!(valid.contains(original));
+        let changed = valid.replacen(original, broken, 1);
+        assert!(
+            std::panic::catch_unwind(|| assert_pid_lifecycle_transcript(&changed)).is_err(),
+            "accepted broken identity relationship: {changed}"
+        );
+    }
+    // Change every exec identity consistently, so transcript equality alone
+    // cannot catch the alias or reversed birth order.
+    let with_exec = |pid| {
+        valid
+            .replace(
+                "exec-child pid=9 ppid=3 tid=9",
+                &format!("exec-child pid={pid} ppid=3 tid={pid}"),
+            )
+            .replace(
+                "exec-proc stat=9/3 status=9/3",
+                &format!("exec-proc stat={pid}/3 status={pid}/3"),
+            )
+            .replace(
+                "root exec=9 waited=9",
+                &format!("root exec={pid} waited={pid}"),
+            )
+    };
+    assert_pid_lifecycle_transcript(&with_exec(10));
+    for pid in [7, 6] {
+        let changed = with_exec(pid);
+        assert!(
+            std::panic::catch_unwind(|| assert_pid_lifecycle_transcript(&changed)).is_err(),
+            "accepted a consistent child alias or reversed birth order: {changed}"
+        );
+    }
+}
+
+fn assert_backend_pid_lifecycle_at_l2(backend: &str) {
+    assert_pid_lifecycle_oracle_rejects_broken_relationships();
+    let program = dbt_pid_guest()
+        .to_str()
+        .expect("DBT PID guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let args = [
+        "--log",
+        "info",
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        verdict.to_str().expect("verification path is UTF-8"),
+        "--",
+        program,
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_pid_lifecycle_transcript(&stdout(&output));
+    let report = read_terminal_dbt_verdict(&verdict);
+    assert_eq!(report["verdict"], "matched", "{report}");
+    assert_eq!(report["verified"], true, "{report}");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+    let compared = &report["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "{report}"
+    );
+    assert!(
+        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
+        "{backend} determinism confirmation missing:\n{}",
+        stderr(&output),
+    );
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-723): Review DBT PID virtualization L2 coverage.
 #[test]
@@ -8070,44 +8229,12 @@ fn run_dbt_virtualizes_process_identities() {
     if dbt_unavailable("run_dbt_virtualizes_process_identities") {
         return;
     }
-    let program = dbt_pid_guest()
-        .to_str()
-        .expect("DBT PID guest path should be UTF-8");
-    let args = [
-        "--backend",
-        "dbt",
-        "run",
-        "--strict",
-        "--verify",
-        "--",
-        program,
-    ];
-    let output = hermit(&args);
+    assert_backend_pid_lifecycle_at_l2("dbt");
+}
 
-    assert_success(&output, &args);
-    assert_eq!(
-        stdout(&output),
-        concat!(
-            "root pid=3 ppid=1 tid=3\n",
-            "grandchild pid=5 ppid=4 tid=5\n",
-            "child pid=4 ppid=3 tid=4\n",
-            "child grandchild=5 waited=5 exit=5\n",
-            "root child=4 waited=4 exit=6\n",
-            "exec-child pid=6 ppid=3 tid=6\n",
-            "exec-proc stat=6/3 status=6/3 tracer=1\n",
-            "root exec=6 waited=6 exit=8\n",
-            "waitid-child pid=7 ppid=3 tid=7\n",
-            "root waitid=7 reported=7 exit=9\n",
-            "root vfork=8 waited=8 exit=0 pid=3 tid=3\n",
-            "vfork-exec-child pid=9 ppid=3 tid=9\n",
-            "root vfork-exec=9 waited=9 exit=10 pid=3 tid=3\n",
-        )
-    );
-    assert!(
-        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBT determinism confirmation missing:\n{}",
-        stderr(&output),
-    );
+#[test]
+fn run_ptrace_preserves_process_identity_relationships() {
+    assert_backend_pid_lifecycle_at_l2("ptrace");
 }
 
 /// DBT numbers a guest's syscalls as ptrace does, counting the execve that

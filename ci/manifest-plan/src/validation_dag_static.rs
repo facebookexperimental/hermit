@@ -3444,7 +3444,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // node's skips, 5 of them ignored).
     // And clock_ids_are_validated_as_linux_validates_them (Detcore's clock
     // ids answer EINVAL as Linux's do): 485, listed.
-    ("test.cli", 485),
+    // Plus the complete ptrace PID-relationship control: 486 (listing pending).
+    ("test.cli", 486),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3859,7 +3860,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And https://github.com/rrnewton/hermit/issues/4262: the same +4 as test.cli, 417.
     // And the same +3 as test.cli (none is excluded here): 420.
     // And clock_ids_are_validated_as_linux_validates_them: 421, listed.
-    ("test.cli_on_host", 421),
+    // Plus the complete ptrace PID-relationship control: 422 (listing pending).
+    ("test.cli_on_host", 422),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
