@@ -1712,8 +1712,22 @@ fi
 # root Cargo.toml are unchanged, so the SDK build inputs and their budget
 # carry; the client rebuild is not an SDK rebuild. No file is added or
 # removed; the reverie-dbt inventory stays 956.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ea5f55877a1c3750af04cd80d1a0ccad243231ee ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ea5f55877a1c3750af04cd80d1a0ccad243231ee (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# A8 STEP 1 CPUID SDK-BUDGET CARRY (2026-10-16): advance
+# ea5f55877a1c3750af04cd80d1a0ccad243231ee to d76232d15bd7a99d3947e49fca26f34cc0c324d3.
+# 2b55657f refuses KVM flock by name and d8ce0a85 moves the Linux provider
+# interface into reverie-linux-provider; neither touches a reverie-dbt file.
+# e6ad44e0 moves DBT's CPUID answer into the runtime (native/runtime ABI 9):
+# native/client.c loses its CPUID tables and calls reverie_dbt_runtime_cpuid,
+# so the DynamoRIO client rebuilds; src/lib.rs, README.md,
+# scripts/test-cpuid.sh and tests/cpuid_probe.c change with it. build.rs and
+# vendor/dynamorio are unchanged (the root Cargo.toml only gains the
+# reverie-linux-provider member), so the SDK build inputs and their budget
+# carry; the client rebuild is not an SDK rebuild.
+# d76232d1 refreshes the M1 source catalog for the new member and changes
+# only scripts/m1_artifact.rs.
+# No file is added or removed; the reverie-dbt inventory stays 956.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d76232d15bd7a99d3947e49fca26f34cc0c324d3 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d76232d15bd7a99d3947e49fca26f34cc0c324d3 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

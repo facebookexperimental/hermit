@@ -100,7 +100,10 @@ pub fn check_request(request: &AdmissionRequest<'_>) -> Result<(), AdmissionRefu
                 "the KVM backend switches XCR0 between the guest's and the host's on every VM \
                  exit, a transition the startup qualification does not cover"
             }
-            "dbt" => "the DBT client's CPUID table has no x86-64-v3 rows",
+            "dbt" => {
+                "Detcore answers DBT's CPUID, but the DBT runtime's configuration carries no \
+                 CPU profile, so it answers only the x86-64-v2 table"
+            }
             "sabre" | "liteinst" | "in-guest-trap" => {
                 "this backend does not trap CPUID, so the guest would see the host's"
             }
@@ -514,7 +517,7 @@ mod tests {
         assert!(
             check_request(&request("dbt"))
                 .unwrap_err()
-                .contains("no x86-64-v3 rows")
+                .contains("carries no CPU profile")
         );
         let mut r = request("ptrace");
         r.virtualize_cpuid = false;

@@ -194,6 +194,8 @@ static OMITTED_PROCFS_NAMES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
+#[cfg(feature = "dbt")]
+static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_RT_SIGNAL_PENDING_OBSERVED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -24521,6 +24523,87 @@ fn dbt_rdtsc_is_answered_by_detcore_as_under_ptrace() {
     );
 }
 
+/// Under DBT each guest `cpuid` is answered by Detcore, as under ptrace, so
+/// the two print the same CPUID rows (every basic leaf for subleaves 0 to 2 and
+/// every extended leaf), and DBT's `/proc/cpuinfo` lists HLE and RTM exactly
+/// when CPUID does. Before, the DBT client answered from its own copy of the
+/// table: leaf 7 EBX was 0x001807a9 (HLE and RTM cleared) where ptrace's is
+/// 0x00180fb9, and DBT's `/proc/cpuinfo` was the host's.
+#[test]
+#[cfg(feature = "dbt")]
+fn dbt_cpuid_rows_match_ptrace() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&CPUID_TABLE_DUMP_GUEST, "cpuid_table_dump")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let run = |backend: &str| {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest.as_str(),
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        stdout(&output)
+    };
+    let ptrace = run("ptrace");
+    assert!(
+        ptrace.contains("00000007.0: 00000000 00180fb9 00000000 00000000\n"),
+        "{ptrace}"
+    );
+    assert!(!ptrace.contains("MISMATCH"), "{ptrace}");
+    assert_eq!(run("dbt"), ptrace);
+}
+
+/// [`cpuinfo_matches_cpuid`] on the DBT backend, whose `/proc/cpuinfo` Detcore
+/// now renders from the table it answers DBT's CPUID from. Before, DBT's guest
+/// did not report CPUID interception, so Detcore left the host's
+/// `/proc/cpuinfo` in place: on an AMD host it read AuthenticAMD while CPUID
+/// read GenuineIntel.
+#[test]
+#[cfg(feature = "dbt")]
+fn run_dbt_cpuinfo_matches_cpuid() {
+    assert_cpuinfo_matches_cpuid(&["--backend=dbt"]);
+}
+
+/// DBT refuses `--cpu-profile x86-64-v3` by name: Detcore answers its CPUID,
+/// but the DBT runtime's configuration carries no CPU profile, so a v3 run
+/// would see the v2 table.
+#[test]
+#[cfg(feature = "dbt")]
+fn dbt_refuses_cpu_profile_v3_by_name() {
+    let _lock = hermit_run_guard();
+    let args = [
+        "--backend",
+        "dbt",
+        "run",
+        "--cpu-profile",
+        "x86-64-v3",
+        "--",
+        "/bin/true",
+    ];
+    let output = hermit(&args);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains(
+            "--cpu-profile x86-64-v3 refused: --backend=dbt: Detcore answers DBT's CPUID, but \
+             the DBT runtime's configuration carries no CPU profile"
+        ),
+        "{}",
+        stderr(&output)
+    );
+}
+
 /// The coordinator writes the records the in-guest Tool forwards into the log
 /// as it handles the guest's requests, so backend parity's own comparison
 /// (`hermit log-diff --record-envelope cross-backend-detcore-v1`) of the
@@ -31502,7 +31585,7 @@ fn cpu_profile_v3_refuses_backends_and_flags_it_cannot_qualify() {
     let guest = cpuid_profile_v3_guest().to_str().unwrap().to_owned();
     let cases: [(&[&str], &[&str], &str); 5] = [
         (&["--backend=kvm"], &[], "--backend=kvm"),
-        (&["--backend=dbt"], &[], "no x86-64-v3 rows"),
+        (&["--backend=dbt"], &[], "carries no CPU profile"),
         (&[], &["--gdbserver"], "--gdbserver"),
         (&[], &["--no-virtualize-cpuid"], "does not virtualize CPUID"),
         (

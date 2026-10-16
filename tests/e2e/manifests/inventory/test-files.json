@@ -254,6 +254,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/cpuid_table_dump.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/cpuid_table_dump.c is owned by hermit-cli/tests/cli.rs: dbt_cpuid_rows_match_ptrace runs it under ptrace and under DBT and requires byte-identical stdout, every CPUID row (each basic leaf for subleaves 0 to 2 and each extended leaf) plus whether /proc/cpuinfo lists hle and rtm exactly when CPUID leaf 7 does, because Detcore answers DBT's CPUID as it answers ptrace's (A8 step 1; before, DBT's client cleared HLE/RTM from its own table and its /proc/cpuinfo was the host's). It stays a fixture because a generic manifest cannot compare two backends' outputs with each other."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/cpuinfo_matches_cpuid.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/cpuinfo_matches_cpuid.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test cpuinfo_matches_cpuid compiles this guest, which compares /proc/cpuinfo's vendor, family, model, stepping, model name and 22 feature flags with what the CPUID instruction reports and prints only whether each matches, and requires every line to match at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4161: /proc/cpuinfo showed the host CPU while CPUID showed the virtual one); it remains a guest fixture because a generic manifest cannot assert this exact output."

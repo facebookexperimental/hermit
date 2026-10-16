@@ -86,8 +86,10 @@ const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | l
 /// native client's atomic guest-word compare-and-exchange to the callbacks,
 /// growing them from 48 to 56 bytes; the version-5 RDTSC entry is unchanged.
 /// This runtime accepts the version-8 layout but does not install the
-/// exchange, and no capability advertises it, so nothing calls it.
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 8;
+/// exchange, and no capability advertises it, so nothing calls it. Version 9
+/// adds `reverie_dbt_runtime_cpuid`: the native client keeps no CPUID table and
+/// asks this runtime, which answers from Detcore.
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 9;
 const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 56;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2407,6 +2409,94 @@ pub unsafe extern "C" fn reverie_dbt_runtime_rdtsc(
     }
 }
 
+/// Answers one guest `cpuid` for `leaf` and `subleaf` through the real Detcore
+/// Tool (ABI version 9), so a DBT guest's CPUID comes from Detcore's machine
+/// description, the table `/proc/cpuinfo` is rendered from, and is charged and
+/// logged ("inbound cpuid") as under ptrace. The native client keeps no CPUID
+/// table of its own.
+///
+/// Returns 1 with `registers` written as EAX, EBX, ECX and EDX, or a negative
+/// value when the thread cannot be served; the client then ends the run.
+///
+/// # Safety
+///
+/// `scratch` must name this thread's initialized storage, the callbacks must be
+/// valid for this event, and `registers` must be writable.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_cpuid(
+    context: *mut c_void,
+    scratch: *mut c_void,
+    tid: i32,
+    pid: i32,
+    branches: u64,
+    leaf: u32,
+    subleaf: u32,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+    emit: unsafe extern "C" fn(*const u8, usize),
+    registers: *mut [u32; 4],
+) -> i32 {
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    let runtime = current_runtime();
+    let Some((det_tid, det_pid)) =
+        runtime
+            .abi
+            .runtime_identity(scratch.virtual_tid, scratch.virtual_pid, tid, pid)
+    else {
+        return -1;
+    };
+    let _ofd_scope = ofd_channel::Scope::enter(context as usize, invoke_syscall, det_tid);
+    TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
+    let host_pid = Pid::from_raw(pid);
+    let det_tid = Pid::from_raw(det_tid.into());
+    let tool = runtime
+        .tool
+        .get_or_init(|| Detcore::new(det_pid, &runtime.config));
+    let thread = match unsafe {
+        start_thread_runtime(
+            scratch,
+            &runtime,
+            tool,
+            context,
+            tid,
+            det_tid,
+            det_pid,
+            host_pid,
+            branches,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+            emit,
+            false,
+        )
+    } {
+        Ok(thread) => unsafe { &mut *thread },
+        Err(_) => return -1,
+    };
+    let mut guest = DbtGuest::new(
+        context as usize,
+        thread.tid,
+        host_pid,
+        None,
+        branches,
+        &mut thread.state,
+        &runtime.global,
+        &runtime.config,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+    );
+    match run_ready(tool.handle_cpuid_event(&mut guest, leaf, subleaf)) {
+        Ok(result) => {
+            unsafe { registers.write([result.eax, result.ebx, result.ecx, result.edx]) };
+            1
+        }
+        Err(_) => -1,
+    }
+}
+
 /// Reports one caught signal to Detcore's `Tool::handle_signal_event` (ABI
 /// version 7) from the native client's owned signal continuation, before the
 /// application handler runs.
@@ -3186,7 +3276,7 @@ mod tests {
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 8);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 9);
         assert_eq!(IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE, 56);
         // The native client's dbt_signal_event_t (ABI version 7).
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
