@@ -17467,7 +17467,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "87");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "88");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -17517,9 +17517,11 @@ mod nextest_timeout_tests {
         // run_kvm_flock_is_a_named_refusal_where_ptrace_excludes
         // (https://github.com/rrnewton/reverie/issues/1069): 85. And
         // run_kvm_cpuid_rows_match_ptrace (KVM keeps no CPUID profile): 86.
+        // And run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills
+        // (https://github.com/rrnewton/hermit/issues/4485): 87.
         assert_eq!(
             names.len(),
-            86,
+            87,
             "update the exact CI inventory with new KVM tests"
         );
         let required_cases = [
@@ -17539,6 +17541,7 @@ mod nextest_timeout_tests {
             "run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does",
             "run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting",
             "run_kvm_flock_is_a_named_refusal_where_ptrace_excludes",
+            "run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills",
             "run_kvm_cpuid_rows_match_ptrace",
         ];
         for required in required_cases {
@@ -18604,7 +18607,9 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // (https://github.com/rrnewton/reverie/issues/1069): 85 declarations, 86 selected.
         // run_kvm_cpuid_rows_match_ptrace (KVM keeps no CPUID profile): 86
         // declarations, 87 selected.
-        ("privileged-only-test.cli_kvm", 87usize),
+        // run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills
+        // (https://github.com/rrnewton/hermit/issues/4485): 87 declarations, 88 selected.
+        ("privileged-only-test.cli_kvm", 88usize),
     ] {
         let step = privileged
             .steps

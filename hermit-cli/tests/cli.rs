@@ -961,6 +961,33 @@ fn poll_timeout_vs_spinner_guest() -> &'static Path {
 }
 
 static SIGKILL_CROSS_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static KILL_CHILD_AND_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+fn kill_child_and_wait_guest() -> &'static Path {
+    KILL_CHILD_AND_WAIT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("kill-child-and-wait");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create kill-child-and-wait guest directory");
+        let guest = build_root.join("kill_child_and_wait");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/kill_child_and_wait.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile kill-child-and-wait guest");
+        assert!(
+            output.status.success(),
+            "kill-child-and-wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
 
 fn sigkill_cross_process_guest() -> &'static Path {
     SIGKILL_CROSS_PROCESS_GUEST.get_or_init(|| {
@@ -11402,6 +11429,79 @@ fn run_kvm_flock_is_a_named_refusal_where_ptrace_excludes() {
         stderr.contains("refused by the backend: KVM flock is unsupported"),
         "opt-in: the KVM run did not name the flock refusal on stderr\nstderr:\n{stderr}"
     );
+}
+
+/// tests/c/kill_child_and_wait.c: a parent kills its own pausing child with
+/// SIGKILL and waits for it. On ptrace the kill succeeds and the wait reports
+/// the child killed by signal 9. KVM cannot deliver a signal to another
+/// process; it used to answer the kill with a bare ENOSYS, after which the
+/// parent waited forever and the run ended in "Deadlock detected" (exit 125).
+/// The backend now records the typed refusal UnsupportedOperation::Signal and
+/// Detcore stops the run as a policy refusal naming it
+/// (https://github.com/rrnewton/hermit/issues/4485).
+#[test]
+fn run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM kill refusal case: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = kill_child_and_wait_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let args = [
+        "--backend=ptrace",
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "kill=0 errno=-\nwaited=child signaled=1 sig=9\n",
+        "ptrace"
+    );
+    assert!(
+        !stderr(&output).contains("refused by the backend"),
+        "ptrace must not report a backend signal refusal\nstderr:\n{}",
+        stderr(&output)
+    );
+
+    for log in [None, Some("--log=off")] {
+        let mut args = Vec::new();
+        args.extend(log);
+        args.extend([
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest,
+        ]);
+        let output = hermit(&args);
+        let stdout = stdout(&output);
+        let stderr = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{log:?}: the KVM kill must end the run as a policy refusal, not a deadlock\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+                && stderr.contains(
+                    "kill refused by the backend: KVM signal delivery refused: KVM cannot \
+                     deliver a signal to another process"
+                ),
+            "{log:?}: the KVM run did not name the signal refusal on stderr\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("kill=") && !stderr.contains("Deadlock detected"),
+            "{log:?}: the KVM guest went on past the refused kill\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
 }
 
 /// tests/c/signal_then_sibling_exit.c on KVM: a worker signals the main thread

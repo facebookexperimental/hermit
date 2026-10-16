@@ -1885,6 +1885,49 @@ impl<T: RecordOrReplay> Detcore<T> {
         true
     }
 
+    /// A backend that cannot deliver a guest's signal (the KVM backend, to
+    /// another process for example) refuses it with ENOSYS and the typed
+    /// refusal `UnsupportedOperation::Signal`. Report that refusal by name and
+    /// route it through the unsupported-operation policy, instead of handing
+    /// the guest the backend's bare ENOSYS, which left a waiting parent
+    /// deadlocked. The name goes to tracing and directly to stderr in both
+    /// dispositions, so neither --log=off nor --log-file hides it. Callers pass
+    /// the handler's result right after the injection that may have been
+    /// refused: the next injection replaces the backend's record. Every other
+    /// result passes through unchanged. No backend is named here; a backend
+    /// that records no refusal is unaffected.
+    pub(crate) async fn report_backend_signal_refusal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        result: Result<i64, Error>,
+    ) -> Result<i64, Error> {
+        if !matches!(result, Err(Error::Errno(Errno::ENOSYS))) {
+            return result;
+        }
+        let Some(refusal) = guest
+            .take_unsupported_refusal()
+            .filter(|refusal| refusal.operation == reverie::UnsupportedOperation::Signal)
+        else {
+            return result;
+        };
+        let message = format!(
+            "[dtid {}] {sysno} refused by the backend: {}. No signal was sent.",
+            guest.thread_state().dettid,
+            refusal.diagnostic
+        );
+        tracing::error!("{message}");
+        let _ = std::io::Write::write_fmt(
+            &mut crate::util::RetryingStderr,
+            format_args!("hermit: {message}\n"),
+        );
+        if !self.cfg.panic_on_unsupported_syscalls {
+            crate::tool_global::report_unsupported_syscall(guest, sysno).await;
+        }
+        self.refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+            .await
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     // TODO-HUMAN-REVIEW(PR-1058): Review process-pending signal preservation.

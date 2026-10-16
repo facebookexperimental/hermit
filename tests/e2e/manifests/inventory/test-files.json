@@ -950,6 +950,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/kill_child_and_wait.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/kill_child_and_wait.c is owned by hermit-cli/tests/cli.rs: run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills compiles this guest, in which a parent kills its own pausing child with SIGKILL and waits for it, and requires ptrace's kill=0 and a child signaled by 9, and on KVM the policy-refusal status naming the backend's signal refusal instead of a bare ENOSYS and a deadlock (https://github.com/rrnewton/hermit/issues/4485); it remains a guest fixture because a generic manifest cannot assert a refusal status."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/kill_multithreaded_process.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/kill_multithreaded_process.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_process_directed_signal_to_several_threads_is_refused_by_name compiles this guest, which sends kill and rt_sigqueueinfo to its own process with one thread and then with two, and requires delivery with one thread, the policy-refusal status naming the call under a fail-closed run, and ENOSYS with --allow-unsupported-syscalls (https://github.com/rrnewton/hermit/issues/4034); it remains a guest fixture because a generic manifest cannot assert this exact output or refusal status."

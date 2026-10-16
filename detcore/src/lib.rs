@@ -4226,6 +4226,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Kill(s) => {
                     let result = self.handle_kill(guest, s).await;
+                    let result = self
+                        .report_backend_signal_refusal(guest, Sysno::kill, result)
+                        .await;
                     if s.sig() == libc::SIGALRM && result.is_ok() {
                         let target = if guest.thread_state().nested_pid_namespace {
                             Some(GuestSigalrmTarget::Unclassified)
@@ -4250,14 +4253,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Tgkill(s) => self.handle_tgkill(guest, s).await,
+                Syscall::Tgkill(s) => {
+                    let result = self.handle_tgkill(guest, s).await;
+                    self.report_backend_signal_refusal(guest, Sysno::tgkill, result)
+                        .await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#812)
-                Syscall::Tkill(s) => self.handle_tkill(guest, s).await,
+                Syscall::Tkill(s) => {
+                    let result = self.handle_tkill(guest, s).await;
+                    self.report_backend_signal_refusal(guest, Sysno::tkill, result)
+                        .await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#812)
                 Syscall::RtSigqueueinfo(s) => {
                     let result = self.handle_rt_sigqueueinfo(guest, s).await;
+                    let result = self
+                        .report_backend_signal_refusal(guest, Sysno::rt_sigqueueinfo, result)
+                        .await;
                     if s.sig() == libc::SIGALRM && result.is_ok() {
                         let target = if guest.thread_state().nested_pid_namespace {
                             GuestSigalrmTarget::Unclassified
@@ -4270,7 +4284,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#812)
-                Syscall::RtTgsigqueueinfo(s) => self.handle_rt_tgsigqueueinfo(guest, s).await,
+                Syscall::RtTgsigqueueinfo(s) => {
+                    let result = self.handle_rt_tgsigqueueinfo(guest, s).await;
+                    self.report_backend_signal_refusal(guest, Sysno::rt_tgsigqueueinfo, result)
+                        .await
+                }
 
                 Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
                 Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
