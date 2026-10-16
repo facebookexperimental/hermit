@@ -527,8 +527,21 @@ fn produce(root: &Path) -> Result<()> {
         pin == rv_head,
         "all manifests/locks must select initialized exact Reverie pin",
     )?;
-    let standalone = build_leaf(root, &bundle, &oracles, true, deadline)?;
-    let detcore = build_leaf(root, &bundle, &oracles, false, deadline)?;
+    // The two leaves share no output: each builds cold in its own target
+    // directory under its own bundle subdirectory, with its own runner and
+    // logs, against the same shared deadline. Built side by side, the shorter
+    // standalone build (about 40 s at width 8) hides under the Detcore one
+    // (about 95 s) instead of preceding it.
+    let (standalone, detcore) = std::thread::scope(|scope| {
+        let standalone = scope.spawn(|| build_leaf(root, &bundle, &oracles, true, deadline));
+        let detcore = build_leaf(root, &bundle, &oracles, false, deadline);
+        let standalone = standalone
+            .join()
+            .unwrap_or_else(|_| Err("the standalone leaf build panicked".into()));
+        (standalone, detcore)
+    });
+    let standalone = standalone?;
+    let detcore = detcore?;
     require_stack_exports(&standalone, false)?;
     require_stack_exports(&detcore, true)?;
     let guest = bundle.join("m1_allocator_guest");

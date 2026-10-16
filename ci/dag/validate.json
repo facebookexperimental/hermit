@@ -65139,7 +65139,7 @@
       "group": "build",
       "job": "liteinst_allocator_fixtures_in_pinned_root",
       "desc": "Qualify both real diagnostic preload leaves and separate frozen allocator/stack guests",
-      "description": "M1 diagnostic producer only: exact initialized Reverie Git pin, full locked nested package metadata, current Cargo artifact selection, constructor/local-shim/private call-path and portability qualification for the genuine standalone release leaf and Detcore validate leaf, plus the unchanged M1 C workload and a separate frozen M2 stack guest/receipt. Both builds require allocator-fixture solely for exports. Unique targets/bundle do not change normal resources or prepared test executables. Shared 900-second deadline, 64-MiB command stream caps and process-group cleanup supplement the outer DAG CPU/memory/cgroup backstop. Width 8, measured 2026-10-15 on the build host as a transient unit with CPUQuota equal to the width (dagrun's cpu.max shape), in two alternating pairs: 221 s at width 4 against 162 s at width 8, then 244 s against 194 s under host load 174; in the full validation of 238231ed width 4 took 283 s at 2.7 cores and set the end of the graph through test.liteinst_stacks. The two leaf builds are cold and sequential, so width 8 shortens the Detcore leaf most. Peak memory 3.0-3.2 GiB at width 8 (2.7-2.8 GiB at width 4) stays under the 4-GiB accounting and 8-GiB hard cap. No guest or test executes in this node.",
+      "description": "M1 diagnostic producer only: exact initialized Reverie Git pin, full locked nested package metadata, current Cargo artifact selection, constructor/local-shim/private call-path and portability qualification for the genuine standalone release leaf and Detcore validate leaf, plus the unchanged M1 C workload and a separate frozen M2 stack guest/receipt. Both builds require allocator-fixture solely for exports. Unique targets/bundle do not change normal resources or prepared test executables. Shared 900-second deadline, 64-MiB command stream caps and process-group cleanup supplement the outer DAG CPU/memory/cgroup backstop. Width 8, measured 2026-10-15 on the build host as a transient unit with CPUQuota equal to the width (dagrun's cpu.max shape), in two alternating pairs: 221 s at width 4 against 162 s at width 8, then 244 s against 194 s under host load 174; in the full validation of 238231ed width 4 took 283 s at 2.7 cores and set the end of the graph through test.liteinst_stacks. Width 16 since 2026-10-16, when the producer began building its two cold leaves side by side instead of one after the other (each in its own target directory and bundle subdirectory, under the one shared deadline): the standalone release leaf takes about 40 s and the Detcore validate leaf about 95 s at width 8, so side by side the shorter one hides under the longer. Measured as transient units at CPUQuota equal to the width, cold, two alternating rounds at host load 290-330: the sequential producer at width 8 took 180 and 215 s (12.3-14.6 CPU-minutes, peak 3.0-3.1 GiB); side by side it took 160 and 155 s at width 8 (peak 3.9 GiB) and 116 and 116 s at width 16 (11.8-12.1 CPU-minutes, peak 5.6-5.7 GiB), hence the 6-GiB accounting under the unchanged 8-GiB hard cap. In the full validation of 32e1c019 this node took 240 s and test.liteinst_stacks, after it, ended at +623 s, 11 s before the end of the graph. No guest or test executes in this node.",
       "labels": [
         "full",
         "portable"
@@ -65163,10 +65163,10 @@
       "hint": {
         "resources": {},
         "est_duration_s": 650.0,
-        "rss_baseline_bytes": 4294967296,
+        "rss_baseline_bytes": 6442450944,
         "hard_mem_max_bytes": 8589934592,
         "classification": "cpu-bound",
-        "preferred_inner_jobs": 8,
+        "preferred_inner_jobs": 16,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
