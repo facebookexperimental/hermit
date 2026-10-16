@@ -1729,7 +1729,14 @@ fi
 # The one commit deletes reverie-kvm's copy of /proc/stat and changes only
 # reverie-kvm (6 files). No reverie-dbt file or recorded SDK input changes;
 # the reverie-dbt inventory stays 961 and the budget carries.
-expected_pin=47190e9fc8662f38699cccb0444ec524ffbc2b60
+# REVERIE-LAYER E2E SDK-BUDGET CARRY (2026-10-16): advance
+# 47190e9fc8662f38699cccb0444ec524ffbc2b60 to 75575dc018555cc08531b2b2204045a6fc9cfbbb.
+# 98a8a5d2 and b56b90f9 give every reverie-examples tool one --backend runner
+# and touch no reverie-dbt file. 75575dc0 (DBT hosts the shared example tools
+# by name) changes reverie-dbt src/lib.rs and src/tools.rs and adds no file,
+# so the reverie-dbt inventory stays 961. build.rs, vendor/dynamorio, native/
+# and the root Cargo.toml are unchanged, so the SDK budget carries.
+expected_pin=75575dc018555cc08531b2b2204045a6fc9cfbbb
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

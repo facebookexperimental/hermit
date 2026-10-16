@@ -132,6 +132,9 @@ FETCH_MANIFESTS=(
     Cargo.toml
     liteinst-runtime-build/Cargo.toml
     agent-utils/rs/Cargo.toml
+    # The Reverie-layer cross-backend check builds reverie-examples from the
+    # pinned reverie/ checkout's own workspace (test.syscall_conformance_*).
+    reverie/Cargo.toml
 )
 [[ -f "$MAP" ]] || { echo "run-split-validate: missing $MAP" >&2; exit 2; }
 [[ -f "$EXPECTED_E2E_PLAN" ]] || {
