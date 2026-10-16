@@ -166,7 +166,7 @@ pub enum SyscallEvent {
     Accept(AcceptEvent),
     /// What a `sendfile` copied and where its input stopped, with its output
     /// side recorded as a write's is
-    /// (https://github.com/rrnewton/hermit/issues/4416).
+    /// (<https://github.com/rrnewton/hermit/issues/4416>).
     Sendfile(SendfileEvent),
 }
 
