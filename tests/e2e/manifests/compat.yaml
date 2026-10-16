@@ -1878,7 +1878,14 @@ corpus:
     - {label: "envsubst", argv: ["bash", "-c", "set -euo pipefail; output=$(HERMIT_NAME=Hermit HERMIT_VALUE=42 /usr/bin/envsubst \"\\$HERMIT_NAME=\\$HERMIT_VALUE\" <<<\"\\$HERMIT_NAME=\\$HERMIT_VALUE\"); test \"$output\" = Hermit=42; printf \"envsubst:%s\\n\" \"$output\""]}
     - {label: "col", argv: ["bash", "-c", "set -euo pipefail; output=$(printf \"A\\bB\\n\" | /usr/bin/col -b); test \"$output\" = B; printf \"col:overstrike=%s\\n\" \"$output\""]}
     - {label: "colrm", argv: ["bash", "-c", "set -euo pipefail; output=$(printf \"abcdef\\n\" | /usr/bin/colrm 3 5); test \"$output\" = abf; printf \"colrm:%s\\n\" \"$output\""]}
-    - {label: "crc32", argv: ["bash", "-c", "set -euo pipefail; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; printf \"Hermit\\n\" >\"$f\"; sum=$(/usr/bin/crc32 \"$f\"); test \"$sum\" = 146f43bb; printf \"crc32:%s\\n\" \"$sum\""]}
+    # crc32 (perl-Archive-Zip) treats 8 hex digits between non-hex characters
+    # anywhere in a file's path as its expected checksum and appends "BAD ..."
+    # when they differ. A default mktemp name ends in 10 random characters
+    # that Hermit derives from the guest epoch, which Buck validation sets
+    # from the commit's time, so some commits failed this row on every
+    # backend: f141091f drew /tmp/tmp.q68cD4F2fm. This template leaves 6
+    # random characters after a dot, which can never hold such a run.
+    - {label: "crc32", argv: ["bash", "-c", "set -euo pipefail; f=$(mktemp --tmpdir crc32-input.XXXXXX); trap 'rm -f \"$f\"' EXIT; printf \"Hermit\\n\" >\"$f\"; sum=$(/usr/bin/crc32 \"$f\"); test \"$sum\" = 146f43bb; printf \"crc32:%s\\n\" \"$sum\""]}
     - {label: "uuidgen", argv: ["bash", "-c", "set -euo pipefail; value=$(/usr/bin/uuidgen --random); [[ $value =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; printf \"uuidgen:%s\\n\" \"$value\""]}
     - {label: "shred", argv: ["bash", "-c", "set -euo pipefail; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; printf seed >\"$f\"; /usr/bin/shred -n 1 -z -s 4096 \"$f\"; test \"$(stat -c %s \"$f\")\" = 4096; /usr/bin/cmp -n 4096 \"$f\" /dev/zero; printf \"shred:4096-zeroed\\n\""]}
     - {label: "sync", argv: ["bash", "-c", "set -euo pipefail; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; printf \"sync-payload\\n\" >\"$f\"; /usr/bin/sync -f \"$f\"; test \"$(cat \"$f\")\" = sync-payload; printf \"sync:file-ok\\n\""]}
