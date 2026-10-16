@@ -27,8 +27,10 @@
 // kill(INT_MIN, SIGKILL), which Linux refuses with ESRCH. "exitedleader"
 // and "exitedleader_tkill" send SIGKILL with tgkill or tkill to a child's
 // leader that exited while a sibling runs on, which Linux leaves running
-// (https://github.com/rrnewton/hermit/issues/4445); "exitedleader_wait" then
-// waits for that child, which never exits. "zombie_term"
+// (https://github.com/rrnewton/hermit/issues/4445); "exitedleader_pidfd" and
+// "exitedleader_tgsigqueue" do the same with a thread-scoped
+// pidfd_send_signal and rt_tgsigqueueinfo; the "_wait" variants then wait
+// for that child, which never exits. "zombie_term"
 // SIGTERMs a zombie (0); "autoreap_term" and "nocldwait_term" SIGTERM a child
 // the kernel auto-reaped (ESRCH). "bgrecord" kills a victim blocked reading a
 // TCP socket, for the record-mode refusal. "sigtimedwait" blocks SIGCHLD,
@@ -508,14 +510,54 @@ static void *pause_forever(void *arg) {
   return NULL;
 }
 
-/* "exitedleader" ("exitedleader_tkill"): a child's leader starts a sibling
- * that pauses and calls SYS_exit; main sends SIGKILL to the exited leader
- * with tgkill (tkill). Linux keeps the leader a zombie, and the SIGKILL does
- * not end its group, so the child is still alive afterwards; main then kills
- * it with kill(2) (https://github.com/rrnewton/hermit/issues/4445). With
- * `then_wait` ("exitedleader_wait") main instead waits for the child, which
+/* How `exited_leader_mode` sends its SIGKILL to one thread. */
+enum thread_kill { BY_TGKILL, BY_TKILL, BY_PIDFD_THREAD, BY_TGSIGQUEUE };
+
+static const char *const thread_kill_names[] = {
+    "tgkill", "tkill", "pidfd thread send", "rt_tgsigqueueinfo"};
+
+/* Sends SIGKILL to thread `child` of process `child` by `how`. */
+static long kill_thread(pid_t child, enum thread_kill how) {
+  switch (how) {
+    case BY_TGKILL:
+      return syscall(SYS_tgkill, child, child, SIGKILL);
+    case BY_TKILL:
+      return syscall(SYS_tkill, child, SIGKILL);
+    case BY_PIDFD_THREAD: {
+      int pidfd = (int)syscall(SYS_pidfd_open, child, 0);
+      if (pidfd < 0) {
+        return -1;
+      }
+      long sent = syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, NULL, 1 /* PIDFD_SIGNAL_THREAD */);
+      int saved = errno;
+      close(pidfd);
+      errno = saved;
+      return sent;
+    }
+    case BY_TGSIGQUEUE: {
+      siginfo_t info;
+      memset(&info, 0, sizeof(info));
+      info.si_signo = SIGKILL;
+      info.si_code = SI_QUEUE;
+      info.si_pid = getpid();
+      info.si_uid = getuid();
+      return syscall(SYS_rt_tgsigqueueinfo, child, child, SIGKILL, &info);
+    }
+  }
+  return -1;
+}
+
+/* "exitedleader" ("exitedleader_tkill", "exitedleader_pidfd",
+ * "exitedleader_tgsigqueue"): a child's leader starts a sibling that pauses
+ * and calls SYS_exit; main sends SIGKILL to the exited leader with tgkill
+ * (tkill, a thread-scoped pidfd_send_signal, rt_tgsigqueueinfo). Linux keeps
+ * the leader a zombie, and the SIGKILL does not end its group, so the child
+ * is still alive afterwards; main then kills it with kill(2)
+ * (https://github.com/rrnewton/hermit/issues/4445). With `then_wait`
+ * ("exitedleader_wait", "exitedleader_pidfd_wait",
+ * "exitedleader_tgsigqueue_wait") main instead waits for the child, which
  * never exits: natively a hang. */
-static int exited_leader_mode(int use_tkill, int then_wait) {
+static int exited_leader_mode(enum thread_kill how, int then_wait) {
   int ready[2];
   if (pipe(ready) != 0) {
     return 1;
@@ -538,13 +580,13 @@ static int exited_leader_mode(int use_tkill, int then_wait) {
   }
   struct timespec tick = {0, 10 * 1000 * 1000};
   nanosleep(&tick, NULL); /* the leader exits */
-  long sent = use_tkill ? syscall(SYS_tkill, child, SIGKILL)
-                        : syscall(SYS_tgkill, child, child, SIGKILL);
+  long sent = kill_thread(child, how);
   int error = sent == 0 ? 0 : errno;
   nanosleep(&tick, NULL);
   int status = 0;
   if (then_wait) {
-    printf("tgkill of the exited leader: %ld errno %d; waiting for the child\n", sent, error);
+    printf("%s of the exited leader: %ld errno %d; waiting for the child\n",
+           thread_kill_names[how], sent, error);
     fflush(stdout);
     waitpid(child, &status, 0);
     printf("the child ended\n");
@@ -552,7 +594,7 @@ static int exited_leader_mode(int use_tkill, int then_wait) {
   }
   pid_t early = waitpid(child, &status, WNOHANG);
   printf("%s of the exited leader: %ld errno %d, alive afterwards: %d\n",
-         use_tkill ? "tkill" : "tgkill", sent, error, early == 0);
+         thread_kill_names[how], sent, error, early == 0);
   if (early == 0) {
     kill(child, SIGKILL);
     if (waitpid(child, &status, 0) != child) {
@@ -1057,13 +1099,25 @@ int main(int argc, char **argv) {
     return intmin_mode();
   }
   if (strcmp(mode, "exitedleader") == 0) {
-    return exited_leader_mode(0, 0);
+    return exited_leader_mode(BY_TGKILL, 0);
   }
   if (strcmp(mode, "exitedleader_tkill") == 0) {
-    return exited_leader_mode(1, 0);
+    return exited_leader_mode(BY_TKILL, 0);
+  }
+  if (strcmp(mode, "exitedleader_pidfd") == 0) {
+    return exited_leader_mode(BY_PIDFD_THREAD, 0);
+  }
+  if (strcmp(mode, "exitedleader_tgsigqueue") == 0) {
+    return exited_leader_mode(BY_TGSIGQUEUE, 0);
   }
   if (strcmp(mode, "exitedleader_wait") == 0) {
-    return exited_leader_mode(0, 1);
+    return exited_leader_mode(BY_TGKILL, 1);
+  }
+  if (strcmp(mode, "exitedleader_pidfd_wait") == 0) {
+    return exited_leader_mode(BY_PIDFD_THREAD, 1);
+  }
+  if (strcmp(mode, "exitedleader_tgsigqueue_wait") == 0) {
+    return exited_leader_mode(BY_TGSIGQUEUE, 1);
   }
   if (strcmp(mode, "zombie_term") == 0) {
     return exited_signal_mode(0);

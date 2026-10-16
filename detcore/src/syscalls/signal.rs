@@ -224,7 +224,7 @@ where
 /// every run (`Scheduler::names_a_retired_exited_leader`). A leader that left
 /// the scheduler at a host-timed deregistration, as on DBT, does not
 /// (https://github.com/rrnewton/hermit/issues/4445).
-async fn sigkill_names_an_exited_leader<G, T>(guest: &mut G, tid: DetTid) -> bool
+pub(crate) async fn sigkill_names_an_exited_leader<G, T>(guest: &mut G, tid: DetTid) -> bool
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -3022,6 +3022,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(0);
         }
+        // A SIGKILL to an exited leader changes nothing, as in `tgkill`
+        // (https://github.com/rrnewton/hermit/issues/4445).
+        let exited_leader = call.sig() == libc::SIGKILL
+            && guest.config().sequentialize_threads
+            && tid > 0
+            && sigkill_names_an_exited_leader(guest, DetTid::from_raw(tid)).await;
         let value = self
             .send_guest_signal(
                 guest,
@@ -3033,6 +3039,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 DetTid::from_raw(tid),
             )
             .await?;
+        if exited_leader {
+            return Ok(value);
+        }
         // Thread-directed like `tgkill`, so it carries the same wakeup
         // obligation. `sigqueue`/`pthread_sigqueue` reach a parked sibling
         // through here.

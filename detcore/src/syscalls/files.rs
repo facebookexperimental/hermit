@@ -9164,8 +9164,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             refuse_sigalrm(guest, control).await?;
         }
+        // A thread-scoped SIGKILL to a leader that exited while its group
+        // lives on changes nothing, as `tgkill`'s does
+        // (https://github.com/rrnewton/hermit/issues/4445).
+        let exited_leader = signal == libc::SIGKILL
+            && guest.config().sequentialize_threads
+            && thread_scope
+            && match named {
+                Some(thread) => {
+                    crate::syscalls::signal::sigkill_names_an_exited_leader(
+                        guest,
+                        DetTid::from_raw(thread.as_raw()),
+                    )
+                    .await
+                }
+                None => false,
+            };
         if signal == libc::SIGKILL
             && guest.config().sequentialize_threads
+            && !exited_leader
             && let (Some(process), Some(receiver)) = (process, receiver_id)
         {
             // A SIGKILL ends the whole process whichever thread it names, and
@@ -9207,6 +9224,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 _ => self.record_or_replay(guest, call).await?,
             };
+            if exited_leader {
+                return Ok(value);
+            }
             if let (Some(thread), Some(process)) = (named, process) {
                 let thread = DetTid::from_raw(thread.as_raw());
                 if signal == libc::SIGKILL {
