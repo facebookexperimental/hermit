@@ -1851,7 +1851,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, resources).await;
         }
 
-        let maybe_res = guest.inject(Syscall::from(clone_family)).await;
+        let call = Syscall::from(clone_family);
+        let sysno = call.number();
+        let maybe_res = guest.inject(call).await;
+        // Ask before anything else is injected: the next injection replaces
+        // the backend's record.
+        let refusal = if maybe_res.is_err() {
+            guest.take_unsupported_refusal()
+        } else {
+            None
+        };
 
         if is_vfork && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
@@ -1879,6 +1888,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         let ts = guest.thread_state_mut();
         ts.clone_flags = None; // Unset, now that it has been read by the child.
         ts.pending_vfork = None;
+
+        // A backend that cannot create the child says so with a typed refusal
+        // (an in-guest backend runs one thread of the guest). Answering the
+        // guest with the refusal's errno would be an error Linux never gives
+        // a valid clone, so the run is refused instead, as for an exec the
+        // backend cannot perform.
+        if let (Some(refusal), Err(errno)) = (refusal, &maybe_res) {
+            tracing::error!(
+                "[detcore, dtid {parent_dettid}] {}; no child was created",
+                refusal.diagnostic
+            );
+            if !self.cfg.panic_on_unsupported_syscalls {
+                crate::tool_global::report_unsupported_syscall(guest, sysno).await;
+            }
+            return self
+                .refuse_unserviceable_operation(guest, sysno, *errno)
+                .await;
+        }
 
         let res = maybe_res?;
 
@@ -5920,6 +5947,176 @@ mod tests {
             let mut aggregate = String::new();
             report.read_to_string(&mut aggregate).unwrap();
             assert_eq!(aggregate, if reported { "execveat\n" } else { "" });
+        }
+    }
+
+    /// A guest whose backend fails every clone with `errno`, recording a typed
+    /// refusal when `backend_refuses`, as an in-guest backend does for a
+    /// thread it cannot create.
+    struct FailedCloneGuest<'a> {
+        config: &'a Config,
+        global: &'a GlobalState,
+        thread: crate::ThreadState<()>,
+        sender: Tid,
+        errno: Errno,
+        backend_refuses: bool,
+        refusal: Option<reverie::UnsupportedRefusal>,
+        refusal_takes: usize,
+        injections: usize,
+        requests: Mutex<Vec<GlobalRequest>>,
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for FailedCloneGuest<'_> {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            self.requests.lock().unwrap().push(message.2.clone());
+            self.global.receive_rpc(self.sender, message).await
+        }
+        fn config(&self) -> &Config {
+            self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for FailedCloneGuest<'_> {
+        type Memory = reverie::syscalls::LocalMemory;
+        type Stack = FailedExecStack;
+
+        fn tid(&self) -> Tid {
+            self.sender
+        }
+        fn pid(&self) -> Tid {
+            self.sender
+        }
+        fn ppid(&self) -> Option<Tid> {
+            None
+        }
+        fn memory(&self) -> Self::Memory {
+            reverie::syscalls::LocalMemory::new()
+        }
+        fn thread_state(&self) -> &crate::ThreadState<()> {
+            &self.thread
+        }
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+            &mut self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("a failed clone must not read registers")
+        }
+        async fn stack(&mut self) -> Self::Stack {
+            panic!("a failed clone must not use a guest stack")
+        }
+        async fn daemonize(&mut self) {
+            panic!("a failed clone must not daemonize")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, call: S) -> Result<i64, Errno> {
+            assert_eq!(call.number(), syscalls::Sysno::clone);
+            self.injections += 1;
+            self.refusal = self.backend_refuses.then(|| {
+                reverie::UnsupportedRefusal::new(
+                    reverie::UnsupportedOperation::NativeExec,
+                    self.errno,
+                    "this backend cannot create a thread",
+                )
+            });
+            Err(self.errno)
+        }
+        fn take_unsupported_refusal(&mut self) -> Option<reverie::UnsupportedRefusal> {
+            self.refusal_takes += 1;
+            self.refusal.take()
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+            panic!("a failed clone must not retire a live guest")
+        }
+        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("a failed clone must not replace the timer")
+        }
+        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("a failed clone must not replace the timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("a failed clone must not sample the clock")
+        }
+    }
+
+    /// A clone the backend refuses with a typed refusal is refused by the
+    /// unsupported-operation policy, never answered with the refusal's errno in
+    /// a fail-closed run; a clone that merely fails keeps its errno.
+    #[tokio::test]
+    async fn backend_clone_refusal_follows_the_unsupported_operation_policy() {
+        let process = DetPid::from_raw(23);
+        for (errno, backend_refuses, fail_closed, refused, reported) in [
+            (Errno::EOPNOTSUPP, true, true, true, false),
+            (Errno::EOPNOTSUPP, true, false, false, true),
+            (Errno::EAGAIN, false, true, false, false),
+            (Errno::EOPNOTSUPP, false, true, false, false),
+        ] {
+            let mut report = tempfile::tempfile().unwrap();
+            let config = Config {
+                sequentialize_threads: false,
+                panic_on_unsupported_syscalls: fail_closed,
+                exit_on_unsupported_syscall: true,
+                shutdown_on_unsupported_syscall: false,
+                unsupported_syscall_report_fd: Some(report.as_raw_fd()),
+                ..Config::default()
+            };
+            let global = GlobalState::init_global_state(&config).await;
+            let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
+            let mut thread = crate::ThreadState::new(process, &config, ());
+            thread.detpid = Some(process);
+            let mut guest = FailedCloneGuest {
+                config: &config,
+                global: &global,
+                thread,
+                sender: Tid::from_raw(process.as_raw()),
+                errno,
+                backend_refuses,
+                refusal: None,
+                refusal_takes: 0,
+                injections: 0,
+                requests: Mutex::new(Vec::new()),
+            };
+            let flags = (libc::CLONE_VM
+                | libc::CLONE_FS
+                | libc::CLONE_FILES
+                | libc::CLONE_SIGHAND
+                | libc::CLONE_THREAD
+                | libc::CLONE_SYSVSEM) as u64;
+            let clone = syscalls::Clone::new()
+                .with_flags(nix::sched::CloneFlags::from_bits_truncate(flags as _));
+            let result = tool
+                .handle_clone_family(&mut guest, syscalls::family::CloneFamily::Clone(clone))
+                .await;
+            match result {
+                Err(Error::Tool(error)) if refused => assert_eq!(
+                    error
+                        .downcast_ref::<crate::UnsupportedSyscallError>()
+                        .unwrap()
+                        .0,
+                    syscalls::Sysno::clone
+                ),
+                Err(Error::Errno(actual)) if !refused => assert_eq!(actual, errno),
+                result => panic!("wrong failed-clone policy: {result:?}"),
+            }
+            assert_eq!(guest.injections, 1);
+            assert_eq!(guest.refusal_takes, 1, "the refusal must be asked for once");
+            assert_eq!(guest.refusal, None, "a reported refusal must be taken");
+            assert_eq!(guest.thread.clone_flags, None);
+            let requests = guest.requests.lock().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| matches!(request, GlobalRequest::ReportUnsupportedSyscall(name) if name == "clone"))
+                    .count(),
+                usize::from(reported)
+            );
+            report.rewind().unwrap();
+            let mut aggregate = String::new();
+            report.read_to_string(&mut aggregate).unwrap();
+            assert_eq!(aggregate, if reported { "clone\n" } else { "" });
         }
     }
 
