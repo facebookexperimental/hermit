@@ -25,6 +25,15 @@ cd "$ROOT_DIR"
 # 16 MiB is the size rustc names, 8 times the default. A caller's own value wins.
 export RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}"
 
+# The clippy pass and the test-harness build use the dev profile, where Cargo
+# keeps incremental-compilation state by default. This build starts cold in
+# every validation checkout, so that state is written and never read: in a
+# cold run at width 8 it was 1.8 of the build directory's 5.1 GB, and it raised
+# the build's memory peak from 4.7 GiB to 5.6-6.0 GiB, at or near the node's
+# 6-GiB hard cap, with no gain in wall time (two alternating pairs: 185 and
+# 233 s with it, 199 and 182 s without). A caller's own value wins.
+export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
+
 find_real_rust_script() {
     local candidate dir
     if [[ -n ${HERMIT_REAL_RUST_SCRIPT:-} ]]; then
