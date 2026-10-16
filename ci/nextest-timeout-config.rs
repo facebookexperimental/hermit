@@ -60,6 +60,18 @@ const DETCORE_CONSTRUCTOR_CPU_SECONDS: u64 = 33;
 // Use 33 conservatively after the concurrent CPU22 timeout at 22.799306s;
 // that censored failure has unknown completion cost. Wall and cleanup stay unchanged.
 const STANDALONE_ALLOCATOR_CPU_SECONDS: u64 = 33;
+const RENDERED_PROCFS_WRAPPER_NAME: &str = "hermit-rendered-procfs-cpu";
+// hermit::cli detcore_renders_its_procfs_files_on_every_backend runs a
+// --verify of one guest on every backend this build has, DBT's among them, plus
+// a DBT chroot run. Completed cgroup CPU seconds in the 13 full validations of
+// 2026-10-15/16 that ran it: 4.5 to 14.9 (12.8, 12.9 and 14.6 at 2f640c23,
+// 90dec733 and d7efd4cb), at 18-24 s wall. dbbbdc86's was stopped by the
+// 22-second cap at 23.6 (32.9 s wall), in a run where every DBT test cost more
+// (detcore_fixes_the_virtual_kernel_files_on_dbt 17.6 against 14.0-15.6).
+// ceil(1.5 * 23.6) = 36 covers that censored run with half again; the
+// completed-sample formula would give 23. At that run's 0.72 CPU per wall
+// second, 36 CPU seconds take 50 s, inside the unchanged 57-second wall.
+const RENDERED_PROCFS_CPU_SECONDS: u64 = 36;
 const CPU_TERMINATION_GRACE_SECONDS: u64 = 2;
 
 #[derive(Clone, Copy)]
@@ -81,7 +93,7 @@ impl MeasuredCpuAllowance {
     }
 }
 
-const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 3] = [
+const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 4] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
         binary: "hermit::liteinst_allocator",
@@ -99,6 +111,12 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 3] = [
         binary: "hermit::liteinst_allocator",
         test: "genuine_standalone_leaf_keeps_scope_free_work_private",
         cpu_seconds: STANDALONE_ALLOCATOR_CPU_SECONDS,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: RENDERED_PROCFS_WRAPPER_NAME,
+        binary: "hermit::cli",
+        test: "detcore_renders_its_procfs_files_on_every_backend",
+        cpu_seconds: RENDERED_PROCFS_CPU_SECONDS,
     },
 ];
 
@@ -1789,19 +1807,43 @@ mod tests {
         );
         let mut reversed = MEASURED_CPU_ALLOWANCES.to_vec();
         reversed.reverse();
-        for selected in [MEASURED_CPU_ALLOWANCES.as_slice(), reversed.as_slice()] {
-            assert!(
-                scaled_config_with_allowances(
-                    &short,
-                    1.0,
-                    Some((Path::new("/fixture/wrapper"), 1.0)),
-                    selected,
-                )
-                .unwrap_err()
-                .contains("33s")
-            );
+        // The largest selected allowance is named, in either order: since
+        // the rendered-procfs entry, 36 s.
+        for (selected, first) in [
+            (MEASURED_CPU_ALLOWANCES.as_slice(), "(36s)"),
+            (reversed.as_slice(), "(36s)"),
+        ] {
+            let error = scaled_config_with_allowances(
+                &short,
+                1.0,
+                Some((Path::new("/fixture/wrapper"), 1.0)),
+                selected,
+            )
+            .unwrap_err();
+            assert!(error.contains(first), "{error}");
         }
-        for allowance in &MEASURED_CPU_ALLOWANCES[1..] {
+        // The 36-second rendered-procfs allowance needs a wall above 38 s,
+        // and a CPU multiplier stretches it past a shortened wall.
+        let rendered = [MEASURED_CPU_ALLOWANCES[3]];
+        assert_eq!(rendered[0].cpu_seconds, 36);
+        let wrapper = Some((Path::new("/fixture/wrapper"), 1.0));
+        let error =
+            scaled_config_with_allowances(&short.replace("35s", "38s"), 1.0, wrapper, &rendered)
+                .unwrap_err();
+        assert!(error.contains("(36s)"), "{error}");
+        assert!(
+            scaled_config_with_allowances(&short.replace("35s", "39s"), 1.0, wrapper, &rendered)
+                .is_ok()
+        );
+        // 36 * 1.25 = 45 and 57 * 0.8 rounds to 46 <= 45 + 2; at the full
+        // 57-second wall, 47 is below it.
+        let stretched = Some((Path::new("/fixture/wrapper"), 1.25));
+        assert!(scaled_config_with_allowances(source, 0.8, stretched, &rendered).is_err());
+        assert!(scaled_config_with_allowances(source, 1.0, stretched, &rendered).is_ok());
+        for allowance in MEASURED_CPU_ALLOWANCES[1..]
+            .iter()
+            .filter(|allowance| allowance.cpu_seconds == 33)
+        {
             for source in [
                 short.clone(),
                 format!(
