@@ -4877,7 +4877,7 @@ impl Scheduler {
             .discarded_at_send
             .retire(discarded_at_send::QueueId::Thread(*dtid));
         self.note_private_entries_retired(retired);
-        self.pending_timer_dequeues.remove(dtid);
+        self.forget_pending_dequeue(*dtid);
         // Its private queue dies with it, and so does a raw-exit status its
         // grant never settled (a thread killed between its report and its
         // grant).

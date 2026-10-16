@@ -1176,3 +1176,62 @@ fn a_send_after_an_in_flight_dequeue_with_an_entry_behind_is_refused() {
     f.queues(0, 0);
     f.guest_send(pr, ordinary_siginfo(USR1, -6, 100, 1000));
 }
+
+/// A periodic timer's entry popped early for a delivery (a send took its
+/// place) whose thread then exits before the delivery finishes re-arms the
+/// timer, as an entry that dies with its thread does: it is not left waiting
+/// for a dequeue that will never be reported.
+#[test]
+fn an_early_popped_timer_entry_rearms_when_its_thread_exits() {
+    let mut f = family();
+    let pr = private(&f);
+    let bit = kernel_signal_bit(USR1);
+    f.arm(0, SignalTarget::Thread(f.leader), 10, 10);
+    f.pop(10);
+    f.queues(bit, 0);
+    assert!(matches!(f.entries(pr).as_slice(), [Entry::Timer(_)]));
+    assert_eq!(
+        f.sched
+            .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(15))),
+        DeliveryAnswer::TimerEntry
+    );
+    f.queues(0, 0);
+    f.guest_send(pr, ordinary_siginfo(USR1, -6, 100, 1000));
+    assert!(matches!(f.entries(pr).as_slice(), [Entry::Plain { .. }]));
+    assert!(
+        f.sched.blocked.timed_waiters.next_deadline().is_none(),
+        "the timer still waits for its entry's dequeue"
+    );
+    f.sched.forget_pending_dequeue(f.leader);
+    assert!(
+        f.sched.blocked.timed_waiters.next_deadline().is_some(),
+        "the timer re-armed"
+    );
+}
+
+/// A delivery resumed blocked requeues its copy, so Linux never consumed
+/// the front a send's early pop replaced: the merged record is refused by
+/// name rather than modelled wrongly.
+#[test]
+#[should_panic(expected = "was resumed blocked, which requeues it")]
+fn a_blocked_resume_after_an_early_pop_is_refused() {
+    let mut f = family();
+    let pr = private(&f);
+    let bit = kernel_signal_bit(USR1);
+    f.guest_send(pr, ordinary_siginfo(USR1, -6, 100, 1000));
+    f.queues(bit, 0);
+    f.sched
+        .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(10)));
+    f.queues(0, 0);
+    f.guest_send(pr, ordinary_siginfo(USR1, -6, 100, 1000));
+    f.queues(bit, 0);
+    f.sched.discarded_signal_control(
+        f.leader,
+        DiscardedSignalControl::Consumed {
+            signal: USR1,
+            how: Consumption::KeptResume { blocked: true },
+            thread_holds: true,
+            process_holds: false,
+        },
+    );
+}

@@ -1137,6 +1137,16 @@ impl Scheduler {
         process_holds: bool,
     ) -> Option<PendingDequeue> {
         let mut pending = self.pending_timer_dequeues.remove(&thread)?;
+        if pending.early.is_some() && how == (Consumption::KeptResume { blocked: true }) {
+            // The kernel requeued the copy, so Linux never consumed the front
+            // popped early, and the send that joined its list was one Linux
+            // drops; the requeue merged into that send's record, so the
+            // physical record is no longer the front's.
+            refuse(format_args!(
+                "hermit: thread {thread}'s delivery of signal {signal} was resumed blocked, which requeues it, after a send had taken the place of its front in {:?}: the model of pending entries cannot hold the merged record, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)",
+                pending.queue
+            ));
+        }
         if pending.signal != signal || how == (Consumption::KeptResume { blocked: true }) {
             return None;
         }
@@ -1244,6 +1254,19 @@ impl Scheduler {
         );
         if let Some(pending) = self.pending_timer_dequeues.get_mut(&thread) {
             pending.early = Some(popped);
+        }
+    }
+
+    /// Thread `thread` exited with a dequeue pending: a front popped early
+    /// for it (`pop_in_flight_front`) is retired as its thread's entries are,
+    /// so a periodic timer that waited for its dequeue re-arms.
+    pub(crate) fn forget_pending_dequeue(&mut self, thread: DetTid) {
+        if let Some(PendingDequeue {
+            early: Some(popped),
+            ..
+        }) = self.pending_timer_dequeues.remove(&thread)
+        {
+            self.note_private_entries_retired(vec![popped.entry]);
         }
     }
 
