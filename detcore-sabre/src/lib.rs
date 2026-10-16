@@ -146,13 +146,14 @@ fn remember_coordinator_socket(
     })
 }
 
-// The coordinator publishes its fingerprint in the environment of the image it
-// starts, and take_private_env erases it there. A forked child constructs the
-// plugin again from the parent's memory, where the variable is already gone, so
+// The coordinator publishes its fingerprint to the image it starts, as a
+// launch-specification setting, and take_private_env consumes it. A forked child
+// constructs the plugin again from the parent's memory, where it is already gone, so
 // without this memo the child took the "published no fingerprint" branch and
 // wrote that warning, with this build's fingerprint, to the guest's own fd 2.
 // Fork inherits this slot as it inherits RPC_SOCKET; execve starts a new image,
-// where reverie-sabre re-injects the REVERIE_SABRE_* variables.
+// where reverie-sabre passes the REVERIE_SABRE_* settings again in a launch
+// specification.
 static COORDINATOR_FINGERPRINT: OnceLock<Option<String>> = OnceLock::new();
 
 /// What the coordinator published to this process image (`None`: nothing),

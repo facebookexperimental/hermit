@@ -1029,10 +1029,10 @@ fn initial_arguments(pid: Pid, rows: &[Map], stack: usize) -> Result<Vec<Vec<u8>
         "initial argv is not on the owned writable stack"
     );
     let argc = word(&remote_bytes(pid, stack, 8)?, 0)?;
-    // run_sabre prepends the loader, plugin and delimiter to the existing
-    // supported guest argc (4096). IMAGE retains that original guest bound.
+    // run_sabre execs SaBRe with the guest's own argv (see
+    // reverie_sabre_stats::launch), within the supported guest argc (4096).
     ensure!(
-        (4..=4099).contains(&argc),
+        (1..=4096).contains(&argc),
         "unsupported initial loader argc"
     );
     let vector_size = (argc + 2) * 8;
@@ -1074,33 +1074,17 @@ fn initial_arguments(pid: Pid, rows: &[Map], stack: usize) -> Result<Vec<Vec<u8>
     Ok(arguments)
 }
 
-fn guest_arguments(initial: Vec<Vec<u8>>, script: Option<&[u8]>) -> Result<Vec<Vec<u8>>> {
-    // find_client_path_idx scans after argv[0], and stops at the first exact
-    // delimiter. Later literal "--" arguments belong to the client unchanged.
-    let delimiter = initial
-        .iter()
-        .skip(1)
-        .position(|value| value == b"--\0")
-        .map(|index| index + 1)
-        .ok_or_else(|| anyhow!("initial loader argv lacks delimiter"))?;
+/// The argv the guest's image must start with: SaBRe's own initial argv,
+/// unchanged. run_sabre execs SaBRe with the guest's argv, a script's already
+/// resolved to its interpreter as the kernel would, and passes the plugin and
+/// image in a launch specification, so the loader leaves argv as the kernel
+/// built it.
+fn guest_arguments(initial: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
     ensure!(
-        delimiter + 1 < initial.len(),
-        "initial loader argv lacks client"
-    );
-    let mut expected = Vec::new();
-    if let Some(script) = script {
-        for token in script_words(script)? {
-            let mut value = token.to_vec();
-            value.push(0);
-            expected.push(value);
-        }
-    }
-    expected.extend(initial.into_iter().skip(delimiter + 1));
-    ensure!(
-        !expected.is_empty() && expected.len() <= 4096,
+        !initial.is_empty() && initial.len() <= 4096,
         "unsupported bootstrap argc"
     );
-    Ok(expected)
+    Ok(initial)
 }
 
 fn authenticate_arguments(
@@ -1363,10 +1347,7 @@ impl Bootstrap {
         let rows = maps(root)?;
         let expected_arguments = if launch.initializes_random() {
             let registers = nix::sys::ptrace::getregs(root)?;
-            guest_arguments(
-                initial_arguments(root, &rows, registers.rsp as usize)?,
-                launch.script.as_ref().map(|script| script.bytes.as_slice()),
-            )?
+            guest_arguments(initial_arguments(root, &rows, registers.rsp as usize)?)?
         } else {
             // Static legacy TAKE has no IMAGE/argv proof. Preserve its
             // existing admission instead of imposing the dynamic argc bound.
@@ -2820,27 +2801,17 @@ mod tests {
         let registers = nix::sys::ptrace::getregs(pid).unwrap();
         let rows = maps(pid).unwrap();
         let captured = initial_arguments(pid, &rows, registers.rsp as usize).unwrap();
-        let direct = guest_arguments(captured.clone(), None).unwrap();
-        assert_eq!(direct[0], b"client\0");
-        assert_eq!(direct[1], b"--\0");
-        assert_eq!(&direct[2][..long.len()], long);
-        assert_eq!(direct[2].last(), Some(&0));
-        assert_eq!(&direct[3][..raw.len()], raw);
-        let script =
-            guest_arguments(captured, Some(b"#! /raw-\xff --option ignored\nbody")).unwrap();
-        assert_eq!(
-            &script[..2],
-            &[b"/raw-\xff\0".to_vec(), b"--option\0".to_vec()]
-        );
-        assert_eq!(&script[2..], direct);
-        expect_error(
-            guest_arguments(vec![b"loader\0".to_vec(), b"--\0".to_vec()], None),
-            "lacks client",
-        );
-        expect_error(
-            guest_arguments(vec![b"loader\0".to_vec(), b"client\0".to_vec()], None),
-            "lacks delimiter",
-        );
+        // The guest's argv is SaBRe's initial argv, kernel bytes and literal
+        // `--` arguments included, unchanged.
+        let direct = guest_arguments(captured.clone()).unwrap();
+        assert_eq!(direct, captured);
+        assert_eq!(direct[0], b"/bin/true\0");
+        assert_eq!(direct[1], b"plugin\0");
+        assert_eq!(direct[2], b"--\0");
+        assert_eq!(&direct[5][..long.len()], long);
+        assert_eq!(direct[5].last(), Some(&0));
+        assert_eq!(&direct[6][..raw.len()], raw);
+        expect_error(guest_arguments(Vec::new()), "unsupported bootstrap argc");
     }
 
     #[test]
@@ -3154,26 +3125,6 @@ mod tests {
             ),
         ] {
             assert_eq!(script_words(script).unwrap(), expected);
-            let arguments = guest_arguments(
-                vec![
-                    b"loader\0".to_vec(),
-                    b"plugin\0".to_vec(),
-                    b"--\0".to_vec(),
-                    b"script\0".to_vec(),
-                ],
-                Some(script),
-            )
-            .unwrap();
-            let mut expected_arguments: Vec<_> = expected
-                .iter()
-                .map(|word| {
-                    let mut value = word.to_vec();
-                    value.push(0);
-                    value
-                })
-                .collect();
-            expected_arguments.push(b"script\0".to_vec());
-            assert_eq!(arguments, expected_arguments);
         }
         expect_error(
             script_words(b"#!/interpreter\0bad --option\n"),

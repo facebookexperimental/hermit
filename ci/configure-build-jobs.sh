@@ -1726,8 +1726,16 @@ fi
 # d76232d1 refreshes the M1 source catalog for the new member and changes
 # only scripts/m1_artifact.rs.
 # No file is added or removed; the reverie-dbt inventory stays 956.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d76232d15bd7a99d3947e49fca26f34cc0c324d3 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d76232d15bd7a99d3947e49fca26f34cc0c324d3 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# SABRE LAUNCH SDK-BUDGET CARRY (2026-10-16): advance
+# d76232d15bd7a99d3947e49fca26f34cc0c324d3 to 875a66c95de435f3bc4b56ea9c6020c55efc36f3.
+# Three commits, none touching reverie-dbt/ (git diff is empty there):
+# 6c60f1c9 gives SaBRe clients their own argv and environment, 7ffc6b97
+# preserves signal metadata through in-guest deferral (reverie-liteinst and
+# reverie-inguest), and 875a66c9 moves KVM types into the new reverie-kvm-core
+# crate (the root Cargo.toml only adds that member). No DynamoRIO build input
+# moves, so the budget carries; the reverie-dbt inventory is unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 875a66c95de435f3bc4b56ea9c6020c55efc36f3 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 875a66c95de435f3bc4b56ea9c6020c55efc36f3 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

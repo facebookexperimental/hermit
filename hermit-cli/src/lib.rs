@@ -2390,26 +2390,65 @@ async fn run_sabre(
     .map_err(|error| anyhow!("failed to start SaBRe coordinator RPC: {error}"))?;
     let server_task = tokio::spawn(async move { server.serve().await });
 
-    command.prepend_args([
-        plugin.as_os_str(),
-        OsStr::new("--"),
-        launch_program.as_os_str(),
-    ]);
-    command.program(&sabre);
-    command.env(SABRE_RPC_SOCKET_ENV, &socket_path);
+    // SaBRe runs with the guest's own argv and environment, so the kernel
+    // builds the guest's initial stack, /proc/self/cmdline and
+    // /proc/self/environ from them, as for an exec of the guest itself. The
+    // plugin and image paths and the plugin's settings go in a sealed launch
+    // specification instead (reverie_sabre_stats::launch), which SaBRe's loader
+    // reads and closes before the guest starts. A script runs as its
+    // interpreter, with the argv the kernel would give it.
+    let mut first_bytes = vec![0u8; 256];
+    let read = std::fs::File::open(launch_program)
+        .and_then(|mut file| std::io::Read::read(&mut file, &mut first_bytes))
+        .map_err(|error| {
+            anyhow!(
+                "failed to read SaBRe guest executable {}: {error}",
+                launch_program.display()
+            )
+        })?;
+    first_bytes.truncate(read);
+    let arg0 = command.get_arg0().to_owned();
+    let client = match reverie_sabre_stats::launch::shebang(&first_bytes) {
+        Some((interpreter, argument)) => {
+            command.program(&sabre);
+            command.arg0(OsStr::from_bytes(&interpreter));
+            let mut words: Vec<&OsStr> = argument
+                .iter()
+                .map(|word| OsStr::from_bytes(word))
+                .collect();
+            words.push(launch_program.as_os_str());
+            command.prepend_args(words);
+            PathBuf::from(OsStr::from_bytes(&interpreter))
+        }
+        None => {
+            command.program(&sabre);
+            command.arg0(&arg0);
+            launch_program.to_path_buf()
+        }
+    };
+    let mut launch_settings: Vec<Vec<u8>> = Vec::new();
+    let mut setting = |name: &str, value: &OsStr| {
+        let mut entry = name.as_bytes().to_vec();
+        entry.push(b'=');
+        entry.extend_from_slice(value.as_bytes());
+        launch_settings.push(entry);
+    };
+    setting(SABRE_RPC_SOCKET_ENV, socket_path.as_os_str());
+    command.env_remove(SABRE_RPC_SOCKET_ENV);
     command.env_remove(sabre_bootstrap::ENVIRONMENT);
     if bootstrap_launch.initializes_random() {
-        command.env(sabre_bootstrap::ENVIRONMENT, "1");
+        setting(sabre_bootstrap::ENVIRONMENT, OsStr::new("1"));
     }
     // Publish the configuration and clock RPC fingerprint for this coordinator.
     // The plugin is a separate artifact in the same target directory, so it can
     // be stale without looking it. Its check before connecting names the mismatch
     // instead of failing to decode Config or a later DetTime request field.
     // See detcore_model::config_wire_fingerprint.
-    command.env(
+    setting(
         detcore::CONFIG_FINGERPRINT_ENV,
-        detcore::config_wire_fingerprint(),
+        OsStr::new(&detcore::config_wire_fingerprint()),
     );
+    command.env_remove(detcore::CONFIG_FINGERPRINT_ENV);
     command.env_remove(SABRE_PATH_EVIDENCE_ENV);
     command.env_remove(SABRE_DETLOG_FORWARD_ENV);
     // Per emitting module, as each in-process `detlog!` callsite asks tracing:
@@ -2420,16 +2459,19 @@ async fn run_sabre(
     // Kept open until the guest has started (it inherits its own copy).
     let mut _detlog_descriptor = None;
     if detlog_policy.forwards_any() {
-        command.env(SABRE_DETLOG_FORWARD_ENV, detlog_policy.encode());
+        setting(
+            SABRE_DETLOG_FORWARD_ENV,
+            OsStr::new(&detlog_policy.encode()),
+        );
         // With a socket (`hermit run --verify`), the plugin sends each record
         // on it from a descriptor reverie-sabre protects from the guest, and
         // the coordinator writes each thread's records into the log at that
         // thread's scheduler turns, as for in-guest LiteInst. Without one it
         // writes them to the guest's standard error.
         if let Some(socket) = inheritable_in_guest_detlog_socket()? {
-            command.env(
+            setting(
                 SABRE_TOOL_OUTPUT_ENV,
-                detcore::detlog::tool_output_env_value(socket.as_raw_fd())?,
+                OsStr::new(&detcore::detlog::tool_output_env_value(socket.as_raw_fd())?),
             );
             _detlog_descriptor = Some(socket);
         }
@@ -2438,16 +2480,28 @@ async fn run_sabre(
     command.env_remove("SABRE_PLUGIN");
     // Always collect: the statistics page is a descriptor the guest can see,
     // so creating it only when a summary or DEBUG log is requested would make
-    // those flags change the guest's view. The plugin takes the variable out
-    // of the guest environment, and the descriptor sits above the plugin's
-    // fixed RPC socket.
+    // those flags change the guest's view. Its number travels in the launch
+    // specification, and the descriptor sits above the plugin's fixed RPC
+    // socket.
     let stats = reverie_sabre_stats::SabreStats::create(reverie::BackendStatsRequest::ENABLED)
         .map_err(|error| anyhow!("failed to create the SaBRe statistics page: {error}"))?
         .expect("an enabled request creates the statistics page");
-    command.env(
+    setting(
         reverie_sabre_stats::BACKEND_STATS_ENV,
-        stats.raw_fd().to_string(),
+        OsStr::new(&stats.raw_fd().to_string()),
     );
+    command.env_remove(reverie_sabre_stats::BACKEND_STATS_ENV);
+    let launch_settings: Vec<&[u8]> = launch_settings.iter().map(Vec::as_slice).collect();
+    let launch_spec = reverie_sabre_stats::launch::spec_bytes(
+        plugin.as_os_str().as_bytes(),
+        client.as_os_str().as_bytes(),
+        &launch_settings,
+    )
+    .ok_or_else(|| anyhow!("the SaBRe launch specification is malformed or too large"))?;
+    // Kept open until the guest has started (it inherits its own copy, which
+    // SaBRe's loader closes).
+    let _launch_spec = reverie_sabre_stats::launch::spec_fd(&launch_spec)
+        .map_err(|error| anyhow!("failed to create the SaBRe launch specification: {error}"))?;
 
     // THE SOCKET PATH IS DELIBERATELY RANDOM AND MUST NOT BE COMPARED.
     //
