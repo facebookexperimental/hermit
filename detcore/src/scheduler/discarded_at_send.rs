@@ -946,35 +946,6 @@ pub enum DiscardedSignalControl {
     },
 }
 
-impl DiscardedSignalControl {
-    /// The control with a dequeue's time no earlier than `now`.
-    pub(crate) fn at_least(self, now: crate::types::LogicalTime) -> Self {
-        match self {
-            Self::Dequeue { signal, at } => Self::Dequeue {
-                signal,
-                at: at.max(now),
-            },
-            Self::Take { signal, at, after } => Self::Take {
-                signal,
-                at: at.max(now),
-                after,
-            },
-            Self::TakeFaulted {
-                set,
-                thread_pending,
-                shared_pending,
-                at,
-            } => Self::TakeFaulted {
-                set,
-                thread_pending,
-                shared_pending,
-                at: at.max(now),
-            },
-            other => other,
-        }
-    }
-}
-
 /// The answer to a [`DiscardedSignalControl`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiscardedSignalAnswer {
@@ -1492,7 +1463,19 @@ impl Scheduler {
                     .discarded_at_send
                     .unignore(process, signal, |producer| current.contains(producer));
                 for (queue, producer) in resend {
-                    self.send_unignored_expiry(dtid, process, queue, signal, producer, None);
+                    // The timer's own `SI_TIMER` record, which exec's flush
+                    // removes, as every physical timer record carries
+                    // (https://github.com/rrnewton/hermit/issues/4262).
+                    let entry = super::signal_lists::TimerEntry {
+                        process,
+                        timer: producer.timer,
+                        gen_at_send: producer.arm_gen,
+                        periodic_at_send: true,
+                    };
+                    let info = self
+                        .models_signal_targets
+                        .then(|| self.timer_signal_info(signal, &entry, 0));
+                    self.send_unignored_expiry(dtid, process, queue, signal, producer, info);
                 }
                 DiscardedSignalAnswer::Recorded
             }

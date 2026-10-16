@@ -715,3 +715,325 @@ fn a_copy_standing_for_an_unignored_entry_wakes_the_target() {
         "the copy-stands unignore wakes the sibling"
     );
 }
+
+/// An unignore whose copy stands for the entry, with the caller the only
+/// thread the signal can go to: the caller runs, and is not woken (a wake
+/// would assert it parked). Kills "the caller rule in `wake_for_entry`".
+#[test]
+fn a_copy_standing_for_an_unignored_entry_does_not_wake_its_caller() {
+    let mut f = family();
+    for thread in [f.leader, f.sibling] {
+        let state = f.sched.test_kernel_signal_states.get_mut(&thread).unwrap();
+        state.caught = 0;
+        state.ignored = kernel_signal_bit(USR1);
+    }
+    f.arm(0, SignalTarget::Process(f.leader), 10, 10);
+    f.pop(10);
+    f.sent();
+    // The sibling blocks USR1, so the leader, the caller, is the target.
+    f.sched
+        .test_kernel_signal_states
+        .get_mut(&f.sibling)
+        .unwrap()
+        .blocked = kernel_signal_bit(USR1);
+    queued_poller_for(&mut f.sched, f.leader);
+    f.sched
+        .discarded_signal_control(f.leader, DiscardedSignalControl::Unignored { signal: USR1 });
+    assert!(!f.woken(f.leader), "the running caller is not woken");
+}
+
+/// An unreported pass of a stale timer entry drops it, as Linux skips it
+/// inside the dequeue (§4.10).
+#[test]
+fn an_unreported_stale_entry_is_dropped() {
+    let mut f = family();
+    f.arm(0, SignalTarget::Process(f.leader), 10, 0);
+    f.pop(10);
+    f.arm(0, SignalTarget::Process(f.leader), 1_000, 0);
+    assert_eq!(
+        f.sched.timer_signal_dequeue(f.leader, USR1, None),
+        DeliveryAnswer::Suppress
+    );
+}
+
+/// Exec takes back a kept physical record whose only entry it removed: a
+/// timer entry standing, as a `Proxy`, on a discarded copy that is not
+/// `SI_TIMER` (D1 + exec). Behind a copy of the same signal in the
+/// survivor's own queue, that record cannot be taken alone: refused by name.
+#[test]
+fn exec_takes_back_a_kept_record_or_refuses_behind_a_private_copy() {
+    let mut f = family();
+    let sh = shared(&f);
+    f.discarded_send(sh, ordinary_siginfo(USR1, 0, 100, 1000));
+    f.arm(0, SignalTarget::Process(f.leader), 10, 0);
+    f.queues(0, kernel_signal_bit(USR1));
+    f.pop(10);
+    assert_eq!(
+        f.sched
+            .discarded_at_send
+            .lists
+            .front(sh, USR1)
+            .map(|front| front.1),
+        Some(FrontClass::Proxy)
+    );
+    let flush = f.sched.take_exec_timer_flush(f.leader, f.process).unwrap();
+    assert_eq!(flush.shared, kernel_signal_bit(USR1), "taken back");
+    assert_eq!(flush.own, 0);
+    assert!(f.entries(sh).is_empty());
+
+    let mut f = family();
+    let sh = shared(&f);
+    f.discarded_send(sh, ordinary_siginfo(USR1, 0, 100, 1000));
+    f.arm(0, SignalTarget::Process(f.leader), 10, 0);
+    f.queues(kernel_signal_bit(USR1), kernel_signal_bit(USR1));
+    f.pop(10);
+    let refusal = f
+        .sched
+        .take_exec_timer_flush(f.leader, f.process)
+        .unwrap_err();
+    assert!(
+        refusal.contains("behind another copy") && refusal.contains("own queue"),
+        "{refusal}"
+    );
+}
+
+/// Exec's kernel flush removes a discarded `SI_TIMER` copy, so its bit goes.
+#[test]
+fn exec_forgets_a_discarded_si_timer_copy_the_kernel_flushed() {
+    let mut f = family();
+    let pr = private(&f);
+    f.discarded_send(pr, forged_si_timer());
+    assert!(f.sched.discarded_at_send.discarded_is_si_timer(pr, USR1));
+    f.sched.take_exec_timer_flush(f.leader, f.process).unwrap();
+    assert!(!f.sched.discarded_at_send.is_discarded(pr, USR1));
+}
+
+/// Disclosure 11: the timer history survives exec on the path that deletes
+/// the process's timers (`exit_itimers`) as on the flush.
+#[test]
+fn the_timer_history_survives_the_exec_that_deletes_the_timers() {
+    let mut f = family();
+    f.arm(0, SignalTarget::Process(f.leader), 10, 0);
+    assert!(f.sched.discarded_at_send.has_timer_history(f.process, USR1));
+    f.sched.delete_exec_posix_timers(f.process);
+    f.sched.take_exec_timer_flush(f.leader, f.process).unwrap();
+    assert!(f.sched.discarded_at_send.has_timer_history(f.process, USR1));
+}
+
+/// A forked child starts without its parent's timer history (N10-2's
+/// condition), copies its parent's handler masks (P3-3), and its exit
+/// signal ends the parent's pair's observability at its creation (§3.4).
+#[test]
+fn a_forked_child_takes_handler_masks_but_no_timer_history() {
+    let mut f = family();
+    f.arm(0, SignalTarget::Process(f.leader), 1_000, 0);
+    f.sched.discarded_signal_control(
+        f.leader,
+        DiscardedSignalControl::Handler {
+            signal: USR1,
+            caught: true,
+            mask: kernel_signal_bit(libc::SIGUSR2),
+            nodefer: false,
+        },
+    );
+    let child = DetTid::from_raw(200);
+    f.sched
+        .thread_tree
+        .add_child_with_wait_metadata(f.leader, child, true, false, USR1);
+    register_known_thread_for(&mut f.sched, child);
+    f.sched.child_ends_timer_observability(child);
+    let child_process = DetPid::from_raw(200);
+    assert!(f.sched.discarded_at_send.has_timer_history(f.process, USR1));
+    assert!(
+        !f.sched
+            .discarded_at_send
+            .has_timer_history(child_process, USR1)
+    );
+    assert_eq!(
+        f.sched.handler_masks.get(&(child_process, USR1)),
+        Some(&(kernel_signal_bit(libc::SIGUSR2), false))
+    );
+    assert!(
+        f.sched.signal_unobservable.contains(&(f.process, USR1)),
+        "the child's exit signal ends the parent's USR1 pair"
+    );
+}
+
+/// Arming ITIMER_REAL ends the SIGALRM pair's observability at the arm.
+#[test]
+fn arming_itimer_real_ends_the_sigalrm_pair() {
+    let mut f = family();
+    let t = LogicalTime::from_nanos;
+    f.sched
+        .register_alarm(f.process, f.leader, t(0), t(1_000), t(0), Signal::SIGALRM);
+    assert!(
+        f.sched
+            .signal_unobservable
+            .contains(&(f.process, libc::SIGALRM))
+    );
+}
+
+/// The R2b-1 seam: a list holding only stale timer entries is reported as
+/// not deliverable (`discarded_bits`); a valid one is not.
+#[test]
+fn a_stale_only_list_is_not_deliverable_to_the_wake_rules() {
+    let mut f = family();
+    f.arm(0, SignalTarget::Process(f.leader), 10, 0);
+    f.pop(10);
+    assert_eq!(
+        f.sched.discarded_bits(f.leader).1 & kernel_signal_bit(USR1),
+        0
+    );
+    f.arm(0, SignalTarget::Process(f.leader), 1_000, 0);
+    assert_ne!(
+        f.sched.discarded_bits(f.leader).1 & kernel_signal_bit(USR1),
+        0
+    );
+}
+
+/// A transition with a single front standing as a `Proxy` is refused (D1 +
+/// transition): the fallback would deliver another sender's record.
+#[test]
+#[should_panic(expected = "stopped being observable")]
+fn a_transition_with_a_proxy_front_is_refused() {
+    let mut f = family();
+    let sh = shared(&f);
+    f.discarded_send(sh, ordinary_siginfo(USR1, 0, 100, 1000));
+    f.arm(0, SignalTarget::Process(f.leader), 10, 0);
+    f.pop(10);
+    f.sched.lose_timer_observability(f.process, USR1);
+}
+
+/// A transition while a current ignored expiry is parked is refused.
+#[test]
+#[should_panic(expected = "is parked")]
+fn a_transition_with_a_current_park_is_refused() {
+    let mut f = family();
+    for thread in [f.leader, f.sibling] {
+        let state = f.sched.test_kernel_signal_states.get_mut(&thread).unwrap();
+        state.caught = 0;
+        state.ignored = kernel_signal_bit(USR1);
+    }
+    f.arm(0, SignalTarget::Process(f.leader), 10, 10);
+    f.pop(10);
+    f.sched.lose_timer_observability(f.process, USR1);
+}
+
+/// P3-3: a promotion at a delivery stop is aimed with the mask the
+/// receiver's handler frame leaves it with: its handler blocks USR1, so the
+/// sibling takes the next entry.
+#[test]
+fn a_promotion_at_a_delivery_goes_where_the_handler_mask_allows() {
+    let mut f = family();
+    f.sched.discarded_signal_control(
+        f.leader,
+        DiscardedSignalControl::Handler {
+            signal: USR1,
+            caught: true,
+            mask: 0,
+            nodefer: false,
+        },
+    );
+    f.arm(0, SignalTarget::Process(f.leader), 10, 0);
+    f.pop(10);
+    f.queues(0, kernel_signal_bit(USR1));
+    f.arm(1, SignalTarget::Process(f.leader), 11, 0);
+    f.pop(11);
+    f.sent();
+    f.queues(0, 0);
+    f.stop(20, false, false);
+    let sent = f.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, f.sibling, "the leader's handler blocks USR1");
+}
+
+/// The queue comes from the model, private first: a private discarded copy
+/// with no list beside a shared timer list is what a stop takes, so the
+/// shared entry stays (rev 7 G, "queue chosen from physical reads").
+#[test]
+fn a_private_discarded_copy_is_taken_before_a_shared_timer_entry() {
+    let mut f = family();
+    let (pr, sh) = (private(&f), shared(&f));
+    f.discarded_send(pr, ordinary_siginfo(USR1, libc::SI_TKILL, 100, 1000));
+    f.arm(0, SignalTarget::Process(f.leader), 10, 0);
+    f.pop(10);
+    f.queues(kernel_signal_bit(USR1), kernel_signal_bit(USR1));
+    assert_eq!(f.stop(20, false, true), DeliveryAnswer::AsIs);
+    assert_eq!(f.entries(sh).len(), 1, "the shared timer entry stays");
+}
+
+/// A wake with no physical send records the signal as left in the shared
+/// queue when every thread blocks it, as a send would
+/// (`note_signal_left_in_shared_queue`).
+#[test]
+fn a_wake_with_every_thread_blocking_keeps_the_shared_queue_record() {
+    let mut f = family();
+    f.arm(0, SignalTarget::Process(f.sibling), 10, 0);
+    f.pop(10);
+    f.arm(0, SignalTarget::Process(f.sibling), 1_000, 0);
+    queued_poller_for(&mut f.sched, f.sibling);
+    for thread in [f.leader, f.sibling] {
+        f.sched
+            .test_kernel_signal_states
+            .get_mut(&thread)
+            .unwrap()
+            .blocked = kernel_signal_bit(USR1);
+    }
+    f.arm(1, SignalTarget::Process(f.sibling), 15, 0);
+    f.pop(15);
+    assert_ne!(
+        f.sched
+            .shared_queue_scheduler_signals
+            .get(&f.process)
+            .copied()
+            .unwrap_or(0)
+            & kernel_signal_bit(USR1),
+        0
+    );
+}
+
+/// Exec re-sends a shared `Proxy` `Plain` with `kill` (no thread), and the
+/// survivor, running its exec, is not woken by its own re-send (P2-3).
+#[test]
+fn exec_resends_a_shared_proxy_plain_with_kill_and_wakes_no_one() {
+    let mut f = family();
+    let sh = shared(&f);
+    f.sched
+        .discarded_at_send
+        .note_timer_history(f.process, USR1);
+    f.discarded_send(sh, forged_si_timer());
+    f.guest_send(sh, queued());
+    f.sent();
+    f.sched.test_send_wakes.clear();
+    f.sched.take_exec_timer_flush(f.leader, f.process).unwrap();
+    assert_eq!(f.sent(), vec![(f.leader, USR1, None, None)], "one kill");
+    assert!(
+        f.sched.test_send_wakes.is_empty(),
+        "the exec caller is not woken"
+    );
+    let (_, class, physical_si_timer) = f.sched.discarded_at_send.lists.front(sh, USR1).unwrap();
+    assert_eq!(class, FrontClass::Proxy);
+    assert!(
+        !physical_si_timer,
+        "I1: the physical record is now the re-send"
+    );
+}
+
+/// After a non-leader exec, the caller's private lists move to the leader's
+/// tid (`rekey_thread`), and exec re-sends there.
+#[test]
+fn exec_resends_to_the_survivors_tid_after_a_non_leader_exec() {
+    let mut f = family();
+    let worker = QueueId::Thread(f.sibling);
+    f.sched
+        .discarded_at_send
+        .note_timer_history(f.process, USR1);
+    f.discarded_send(worker, forged_si_timer());
+    f.guest_send(worker, queued());
+    f.sent();
+    f.sched.discarded_at_send.rekey_thread(f.sibling, f.leader);
+    f.sched.take_exec_timer_flush(f.leader, f.process).unwrap();
+    assert_eq!(f.sent(), vec![(f.leader, USR1, None, Some(f.process))]);
+    assert!(f.entries(worker).is_empty());
+    assert_eq!(f.entries(private(&f)).len(), 1);
+}

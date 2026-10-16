@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <spawn.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,6 +32,7 @@
 #include <sys/signalfd.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -571,9 +573,309 @@ static void sfd_notimer(int vectored) {
   print_records(vectored ? "sfd_notimer_readv" : "sfd_notimer_read", rec, got);
 }
 
+
+/* Review of https://github.com/rrnewton/hermit/pull/4491, P1-1: a periodic
+ * timer whose entry is queued when its process makes a call outside the
+ * schedule must keep expiring. Each mode takes later ticks with a bounded
+ * sigtimedwait and prints whether all arrived. */
+static int later_ticks(int want) {
+  sigset_t w;
+  set2(&w, SIGUSR1, 0);
+  struct timespec to = {0, 100 * 1000000L};
+  int got = 0;
+  for (int k = 0; k < want; k++) {
+    siginfo_t si;
+    if (sigtimedwait(&w, &si, &to) == SIGUSR1 && si.si_code == SI_TIMER) got++;
+  }
+  return got;
+}
+/* rt_sigsuspend with a periodic timer's single valid entry queued: the entry
+ * is delivered (the pair falls back), and the timer keeps expiring. */
+static void susp_periodic(void) {
+  install(SIGUSR1, 0);
+  mask(SIG_BLOCK, SIGUSR1);
+  timer_t t = mk(SIGUSR1, 3, 0);
+  arm(t, 1000, 1000);
+  sleep_us(1200);
+  sigset_t admit;
+  sigemptyset(&admit);
+  sigsuspend(&admit);
+  int first = n;
+  int later = later_ticks(5);
+  timer_delete(t);
+  printf("susp_periodic first=%d first_si_timer=%d later_5_of_5=%d\n", first,
+         first > 0 && rcode[0] == SI_TIMER, later == 5);
+}
+/* The tick loop of the review's sigwait_bg probe: USR1 blocked, a periodic
+ * 1 ms timer, 20 sigwaitinfo ticks, while a sibling enters sigsuspend. */
+static void tick_h2(int s) { (void)s; }
+static void *tick_sibling(void *a) {
+  (void)a;
+  sleep_us(3000);
+  sigset_t w;
+  sigfillset(&w);
+  sigdelset(&w, SIGUSR2);
+  sigsuspend(&w);
+  return NULL;
+}
+static void sigwait_bg(void) {
+  struct sigaction sb;
+  memset(&sb, 0, sizeof sb);
+  sb.sa_handler = tick_h2;
+  sigaction(SIGUSR2, &sb, NULL);
+  mask(SIG_BLOCK, SIGUSR1);
+  mask(SIG_BLOCK, SIGUSR2);
+  pthread_t th;
+  pthread_create(&th, NULL, tick_sibling, NULL);
+  timer_t t = mk(SIGUSR1, 7, 0);
+  arm(t, 1000, 1000);
+  for (volatile long i = 0; i < 20000000L; i++) {
+  }
+  sigset_t one;
+  set2(&one, SIGUSR1, 0);
+  long ticks = 0;
+  for (int k = 0; k < 20; k++) {
+    siginfo_t si;
+    if (sigwaitinfo(&one, &si) == SIGUSR1) ticks += 1 + si.si_overrun;
+  }
+  timer_delete(t);
+  pthread_kill(th, SIGUSR2);
+  pthread_join(th, NULL);
+  printf("sigwait_bg took 20 ticks, expiries>=20: %d\n", ticks >= 20);
+}
+/* posix_spawn (a vfork-style call outside the schedule) while a periodic
+ * timer's entry is queued: the ticks continue after it. */
+extern char **environ;
+static void spawn_tick(void) {
+  mask(SIG_BLOCK, SIGUSR1);
+  timer_t t = mk(SIGUSR1, 4, 0);
+  arm(t, 1000, 1000);
+  sleep_us(1200);
+  pid_t pid;
+  char *argv[] = {(char *)"/bin/true", NULL};
+  int r = posix_spawn(&pid, "/bin/true", NULL, NULL, argv, environ);
+  int status = -1;
+  if (r == 0) waitpid(pid, &status, 0);
+  int later = later_ticks(5);
+  timer_delete(t);
+  printf("spawn_tick spawn=%d status=%d later_5_of_5=%d\n", r, status, later == 5);
+}
+
+/* Review P2-1: a stale timer entry among more pending signals than a
+ * signalfd read has room for; Linux skips it inside the dequeue and fills the
+ * slot with the next signal ("behind": a valid second entry behind it). */
+static void sfd_stale_room(int behind) {
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGHUP);
+  sigaddset(&set, SIGUSR1);
+  sigaddset(&set, SIGUSR2);
+  sigprocmask(SIG_BLOCK, &set, NULL);
+  timer_t a = mk(SIGUSR1, 1, 0);
+  arm(a, 1000, 0);
+  sleep_us(20000);
+  if (behind) {
+    timer_t b = mk(SIGUSR1, 2, 0);
+    arm(b, 1000, 0);
+    sleep_us(20000);
+  }
+  arm(a, 100000000, 0);
+  kill(getpid(), SIGHUP);
+  kill(getpid(), SIGUSR2);
+  int fd = signalfd(-1, &set, SFD_NONBLOCK);
+  struct signalfd_siginfo rec[2];
+  memset(rec, 0, sizeof rec);
+  ssize_t got = read(fd, rec, sizeof rec);
+  const char *label = behind ? "sfd_stale_behind" : "sfd_stale_single";
+  print_records(label, rec, got);
+  for (int k = 0; k < 3; k++) {
+    struct signalfd_siginfo r;
+    if (read(fd, &r, sizeof r) <= 0) {
+      printf("%s then=EAGAIN\n", label);
+      break;
+    }
+    print_records(label, &r, sizeof r);
+  }
+}
+
+/* Rev 6 §9: strict verify with a polling sibling in an observable process. A
+ * sibling polls an empty internal pipe without blocking while the main
+ * thread takes a tgkill and a SIGEV_THREAD_ID timer entry of USR1, then a
+ * timer blocked for 5 periods. */
+static volatile int poll_stop;
+static void *poller(void *a) {
+  int fd = (int)(intptr_t)a;
+  char c;
+  while (!poll_stop) {
+    if (read(fd, &c, 1) < 0 && errno != EAGAIN) break;
+    sched_yield();
+  }
+  return NULL;
+}
+static void poll_sibling(void) {
+  int p[2];
+  if (pipe2(p, O_NONBLOCK)) perror("pipe2");
+  sigset_t block;
+  set2(&block, SIGUSR1, 0);
+  pthread_sigmask(SIG_BLOCK, &block, NULL);
+  pthread_t th;
+  pthread_create(&th, NULL, poller, (void *)(intptr_t)p[0]);
+  install(SIGUSR1, 0);
+  /* Thread-directed: a process-directed kill by a thread that blocks the
+   * signal, in a process with two live threads, is refused by
+   * https://github.com/rrnewton/hermit/issues/4034's rule. */
+  syscall(SYS_tgkill, getpid(), gettid_(), SIGUSR1);
+  timer_t t = mk(SIGUSR1, VALUE, gettid_());
+  arm(t, 1000, 0);
+  sleep_us(2000);
+  mask(SIG_UNBLOCK, SIGUSR1);
+  mask(SIG_BLOCK, SIGUSR1);
+  int before = n;
+  timer_t b = mk(SIGUSR1, 5, gettid_());
+  long armed = now_ns();
+  arm(b, 1000, 1000);
+  sleep_us(5200);
+  long woke = now_ns();
+  mask(SIG_UNBLOCK, SIGUSR1);
+  long after = now_ns();
+  mask(SIG_BLOCK, SIGUSR1);
+  timer_delete(b);
+  poll_stop = 1;
+  pthread_join(th, NULL);
+  /* The polling sibling's turns may advance the main thread's clock between
+   * its wake and its unblock; the overrun must be the one its own clock
+   * reads imply: the grid points from the wake to just after the unblock. */
+  int ov = n > before ? rov[before] : -1;
+  long lo = (woke - armed) / 1000000L - 1, hi = (after - armed) / 1000000L - 1;
+  n = before;
+  print_handled("poll_sibling");
+  printf("poll_sibling blocked_entry_si_timer=%d overrun_matches_clock=%d\n",
+         rcode[before] == SI_TIMER && rtid[before] == 1, ov >= lo && ov <= hi);
+}
+
+/* Rev 6 §9: a SIGCHLD timer while a child is unreaped (the pair takes the
+ * fallback): blocked for 5 periods, then unblocked. */
+static void sigchld_timer(void) {
+  install(SIGCHLD, 0);
+  mask(SIG_BLOCK, SIGCHLD);
+  pid_t child = fork();
+  if (child == 0) {
+    sleep_us(2000000);
+    _exit(0);
+  }
+  timer_t t = mk(SIGCHLD, VALUE, 0);
+  arm(t, 1000, 1000);
+  sleep_us(5200);
+  mask(SIG_UNBLOCK, SIGCHLD);
+  mask(SIG_BLOCK, SIGCHLD);
+  timer_delete(t);
+  int timer_deliveries = 0, overruns = 0;
+  for (int i = 0; i < n && i < MAXREC; i++) {
+    if (rcode[i] == SI_TIMER) {
+      timer_deliveries++;
+      overruns += rov[i];
+    }
+  }
+  printf("sigchld_timer timer_deliveries=%d overruns=%d\n", timer_deliveries, overruns);
+  mask(SIG_BLOCK, SIGCHLD);
+  kill(child, SIGKILL);
+  waitpid(child, NULL, 0);
+}
+
+/* Rev 6 §9 "D1 + single-entry transition": the D1 construction, whose
+ * worker timer entry stands on the discarded copy, then a call outside the
+ * schedule (rt_sigsuspend in the main thread): begun before the expiry, or
+ * ("queued") while the entry is queued. */
+static void d1_transition(int queued) {
+  install(SIGUSR1, 1);
+  install(SIGUSR2, 0);
+  pthread_t th;
+  pthread_create(&th, 0, parked_worker, (void *)(intptr_t)300);
+  mask(SIG_BLOCK, SIGUSR1);
+  mask(SIG_BLOCK, SIGUSR2);
+  while (!wtid) sleep_us(1000);
+  sleep_us(50000);
+  siginfo_t si;
+  memset(&si, 0, sizeof si);
+  si.si_signo = SIGUSR1;
+  si.si_code = SI_QUEUE;
+  si.si_value.sival_int = 5;
+  if (syscall(SYS_rt_tgsigqueueinfo, getpid(), wtid, SIGUSR1, &si)) perror("discarded");
+  install(SIGUSR1, 0);
+  sigset_t block;
+  set2(&block, SIGUSR1, 0);
+  timer_t t = mk(SIGUSR1, VALUE, wtid);
+  arm(t, 1000, 0);
+  if (queued) sleep_us(2000);
+  timer_t w = mk(SIGUSR2, 9, 0);
+  arm(w, 5000, 0);
+  sigset_t admit;
+  sigfillset(&admit);
+  sigdelset(&admit, SIGUSR2);
+  sigsuspend(&admit);
+  pthread_join(th, 0);
+  printf("%s deliveries=%d\n", queued ? "d1_transition_queued" : "d1_transition", n);
+}
+
+/* Review P2-2: the delivery stop and the delivery's turn apart in virtual
+ * time. Two siblings spin (USR1 blocked) while a 1 ms timer's handler runs on
+ * the main thread, so each delivery's turn may wait behind theirs. For each
+ * delivery, the expiries it accounts for (1 + si_overrun, summed) must not
+ * exceed the grid points up to the handler's own clock read, nor trail them
+ * by more than the one that may expire between the dequeue and that read. */
+static volatile int spin_stop;
+static void *spinner(void *a) {
+  (void)a;
+  sigset_t block;
+  set2(&block, SIGUSR1, 0);
+  pthread_sigmask(SIG_BLOCK, &block, NULL);
+  while (!spin_stop) {
+  }
+  return NULL;
+}
+static volatile long dt_at[MAXREC];
+static void turn_handler(int s, siginfo_t *si, void *u) {
+  long t = now_ns();
+  if (n < MAXREC) dt_at[n] = t;
+  handler(s, si, u);
+}
+static void delivery_turn(void) {
+  pthread_t a, b;
+  pthread_create(&a, NULL, spinner, NULL);
+  pthread_create(&b, NULL, spinner, NULL);
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = turn_handler;
+  sa.sa_flags = SA_SIGINFO;
+  sigaction(SIGUSR1, &sa, NULL);
+  timer_t t = mk(SIGUSR1, VALUE, 0);
+  long start = now_ns();
+  arm(t, 1000, 1000);
+  long armed = now_ns();
+  for (volatile long i = 0; i < 30000000L; i++) {
+  }
+  mask(SIG_BLOCK, SIGUSR1);
+  timer_delete(t);
+  spin_stop = 1;
+  pthread_join(a, NULL);
+  pthread_join(b, NULL);
+  int got = n < MAXREC ? n : MAXREC;
+  long sum = 0;
+  int ok = got > 0 && got == n;
+  for (int i = 0; i < got; i++) {
+    sum += 1 + rov[i];
+    long lo = (dt_at[i] - armed) / 1000000L, hi = (dt_at[i] - start) / 1000000L;
+    if (sum > hi || sum + 1 < lo) ok = 0;
+    fprintf(stderr, "delivery_turn %d sum=%ld lo=%ld hi=%ld\n", i, sum, lo, hi);
+  }
+  printf("delivery_turn deliveries_positive=%d all_si_timer=%d accounting_ok=%d\n", n > 0,
+         got > 0 && rcode[0] == SI_TIMER, ok);
+}
+
+static char *self_path;
+
 /* N9-5: a worker with a tgkill USR1 pending in its own queue execs; the
  * kept copy survives with the leader's tid and is delivered after exec. */
-static char *self_path;
 static void *exec_worker(void *a) {
   (void)a;
   wtid = gettid_();
@@ -633,6 +935,7 @@ int main(int argc, char **argv) {
   else if (!strcmp(m, "ppoll_stale_valid")) ppoll_past_stale(0);
   else if (!strcmp(m, "ppoll_both_stale")) ppoll_past_stale(1);
   else if (!strcmp(m, "armed_promoted")) armed_promoted();
+  else if (!strcmp(m, "susp_periodic")) susp_periodic();
   else if (!strncmp(m, "susp_", 5)) susp(m + 5);
   else if (!strcmp(m, "rt2_fault")) rt2_fault(0);
   else if (!strcmp(m, "rt2_fault_sfd")) rt2_fault(1);
@@ -645,6 +948,15 @@ int main(int argc, char **argv) {
   else if (!strcmp(m, "nonleader_exec")) nonleader_exec();
   else if (!strcmp(m, "nonleader_exec_child")) nonleader_exec_child();
   else if (!strcmp(m, "forged_shared")) forged_shared();
+  else if (!strcmp(m, "sigwait_bg")) sigwait_bg();
+  else if (!strcmp(m, "spawn_tick")) spawn_tick();
+  else if (!strcmp(m, "sfd_stale_single")) sfd_stale_room(0);
+  else if (!strcmp(m, "sfd_stale_behind")) sfd_stale_room(1);
+  else if (!strcmp(m, "poll_sibling")) poll_sibling();
+  else if (!strcmp(m, "sigchld_timer")) sigchld_timer();
+  else if (!strcmp(m, "d1_transition")) d1_transition(0);
+  else if (!strcmp(m, "d1_transition_queued")) d1_transition(1);
+  else if (!strcmp(m, "delivery_turn")) delivery_turn();
   else {
     fprintf(stderr, "unknown mode %s\n", m);
     return 2;

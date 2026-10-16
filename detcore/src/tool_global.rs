@@ -2124,16 +2124,11 @@ impl GlobalState {
         // carries no logical time and its answer carries none back. It records
         // a send in the sender's own turn, or a consumption at a signal stop.
         if let GlobalRequest::DiscardedSignal(control) = request {
-            // A dequeue's time is the caller's, which its hooks may not yet
-            // have caught up with the global clock it holds in its turn (a
-            // sleep it just woke from), as the ITIMER_REAL reconcile reads
-            // (`ReconcileAlarm`).
-            let now = self.global_time.lock().unwrap().as_nanos();
             let answer = self
                 .sched
                 .lock()
                 .unwrap()
-                .discarded_signal_control(dtid, control.at_least(now));
+                .discarded_signal_control(dtid, control);
             return (None, R::DiscardedSignal(answer));
         }
         if let GlobalRequest::SignalDequeued {

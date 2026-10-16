@@ -3123,6 +3123,99 @@ fn record_sigev_thread_id_timers() {
     }
 }
 
+/// The POSIX timer coalescing rows of
+/// https://github.com/rrnewton/hermit/issues/4262 under record and replay (the
+/// Claude review of https://github.com/rrnewton/hermit/pull/4491, P2-4: the
+/// legacy-identity and preemption-replay rows). Record and replay keep the
+/// legacy recurrence (design §6, `coalesces_alarms`): every expiry is sent at
+/// its pop, so a send merges into a pending copy and no overrun is counted,
+/// and only the physical record is new, `SI_TIMER` with the timer's id and
+/// value, which exec's own flush removes. Each replay matches its recording at
+/// bitwise parity (`record start --verify --verify-strict`); the recordings
+/// differ from Linux in the ways the legacy path does, named here with
+/// Linux's output (native, 5 identical runs each, 2026-10-15) beside Hermit's
+/// (2 identical recordings each, 2026-10-16):
+/// - T2 `blocked`: two deliveries with overrun 0, where Linux has one with
+///   overrun 4.
+/// - T7 `merged_handler`: the `kill` and the timer merge into one delivery.
+/// - `unignore_current`: the parked expiry re-sent at the unignore and the
+///   next pop, each the timer's record with overrun 0, where Linux delivers
+///   one with overrun 9.
+/// - T1 `storm`: its expiries are popped at preemption points the replay must
+///   reproduce, and every delivery is the timer's `SI_TIMER` record. The
+///   count follows the run's length, so only the record kind and the replay
+///   are checked.
+#[test]
+fn record_replay_posix_timer_rows_replay_but_diverge_from_linux() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    for (source, mode, linux, hermit) in [
+        (
+            "timer_coalesce_signals",
+            "storm",
+            "storm deliveries_positive=1 all_si_timer=1 recurrence_ok=1\n",
+            "storm deliveries_positive=1 all_si_timer=1 recurrence_ok=",
+        ),
+        (
+            "timer_coalesce",
+            "blocked",
+            "blocked waiting_remaining_within_interval=1 getoverrun_before=0 getoverrun_after=4\n\
+             blocked deliveries=1\n  \
+             0 sig=10 SI_TIMER timer=0 overrun=4 value=0x1122334455667788\n",
+            "blocked waiting_remaining_within_interval=1 getoverrun_before=0 getoverrun_after=0\n\
+             blocked deliveries=2\n  \
+             0 sig=10 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n  \
+             1 sig=10 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
+        ),
+        (
+            "timer_coalesce",
+            "merged_handler",
+            "merged_handler deliveries=2\n  \
+             0 sig=10 code=0 own_pid=1 value=0\n  \
+             1 sig=10 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
+            "merged_handler deliveries=1\n  0 sig=10 code=0 own_pid=1 value=0\n",
+        ),
+        (
+            "timer_coalesce",
+            "unignore_current",
+            "unignore_current deliveries=1\n  \
+             0 sig=10 SI_TIMER timer=0 overrun=9 value=0x1122334455667788\n",
+            "unignore_current deliveries=2\n  \
+             0 sig=10 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n  \
+             1 sig=10 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
+        ),
+    ] {
+        let guest = build.path().join(source);
+        if !guest.exists() {
+            let output = Command::new("cc")
+                .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+                .arg(repository.join(format!("tests/c/{source}.c")))
+                .arg("-o")
+                .arg(&guest)
+                .output()
+                .expect("failed to compile the timer guest");
+            assert!(
+                output.status.success(),
+                "{source} compilation failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let output = canonical_record_replay_command(
+            &format!("{source}, {mode}"),
+            &guest,
+            &[OsStr::new(mode)],
+        );
+        assert!(
+            output.contains(hermit) && !output.contains(linux),
+            "{mode}: the known divergence {hermit:?} changed (Linux prints {linux:?}):\n{output}"
+        );
+    }
+}
+
 /// Every mode of `tests/c/timer_exec_flush.c` under record and replay
 /// (https://github.com/rrnewton/hermit/issues/4262): a POSIX timer's copy is
 /// sent as an `SI_TIMER` record, which exec's own flush removes, so each

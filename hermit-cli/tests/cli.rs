@@ -32158,10 +32158,59 @@ fn posix_timer_entries_hermit_refuses_or_diverges_on_are_named() {
 ///   (N8-7).
 /// - N9-5 `nonleader_exec`: a worker's kept private copy survives its exec
 ///   and is delivered with its own siginfo.
+///
+/// From the Claude review of https://github.com/rrnewton/hermit/pull/4491
+/// (5 native runs each, identical, 2026-10-16):
+/// - P1-1: a periodic timer whose entry is queued when its process makes a
+///   call outside the schedule keeps expiring: `susp_periodic`
+///   (rt_sigsuspend takes the entry, then 5 more ticks arrive), `sigwait_bg`
+///   (the review's 20-tick sigwaitinfo loop with a sibling in sigsuspend,
+///   which hit the 60 s timeout at 712437b9) and `spawn_tick` (posix_spawn).
+/// - P2-1: `sfd_stale_single` and `sfd_stale_behind`: a stale timer entry
+///   among more pending signals than a signalfd read has room for is skipped
+///   and its slot filled (Linux: 256 bytes; 712437b9 returned 128).
+/// - Rev 6 §9's polling-sibling row, `poll_sibling`: a sibling polls an empty
+///   internal pipe while the main thread takes a tgkill and a timer entry,
+///   then a timer blocked for 5 periods, whose overrun must be the one the
+///   main thread's own clock reads imply.
+/// - `d1_transition` and `d1_transition_queued`: the D1 construction with an
+///   rt_sigsuspend outside the schedule, begun before the timer's expiry or
+///   after it.
+/// - `delivery_turn`: a 1 ms timer's handler on the main thread while two
+///   siblings spin, so a delivery's turn may wait behind theirs; the expiries
+///   each delivery accounts for must not exceed the grid points up to the
+///   handler's own clock read.
 #[test]
 fn posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity() {
     let guest = timer_coalesce_signals_guest().to_str().unwrap().to_owned();
     let cases = [
+        (
+            "susp_periodic",
+            "susp_periodic first=1 first_si_timer=1 later_5_of_5=1\n",
+        ),
+        ("sigwait_bg", "sigwait_bg took 20 ticks, expiries>=20: 1\n"),
+        ("spawn_tick", "spawn_tick spawn=0 status=0 later_5_of_5=1\n"),
+        (
+            "sfd_stale_single",
+            "sfd_stale_single records=2\n  0 sig=1 code=0 own_pid=1 ptr=0\n  1 sig=12 code=0 own_pid=1 ptr=0\nsfd_stale_single then=EAGAIN\n",
+        ),
+        (
+            "sfd_stale_behind",
+            "sfd_stale_behind records=2\n  0 sig=1 code=0 own_pid=1 ptr=0\n  1 sig=10 SI_TIMER timer=1 overrun=0 ptr=0x2\nsfd_stale_behind records=1\n  0 sig=12 code=0 own_pid=1 ptr=0\nsfd_stale_behind then=EAGAIN\n",
+        ),
+        (
+            "poll_sibling",
+            "poll_sibling deliveries=2\n  0 sig=10 code=-6 own_pid=1 value=0\n  1 sig=10 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\npoll_sibling blocked_entry_si_timer=1 overrun_matches_clock=1\n",
+        ),
+        ("d1_transition", "d1_transition deliveries=2\n"),
+        (
+            "d1_transition_queued",
+            "d1_transition_queued deliveries=2\n",
+        ),
+        (
+            "delivery_turn",
+            "delivery_turn deliveries_positive=1 all_si_timer=1 accounting_ok=1\n",
+        ),
         (
             "armed_promoted",
             "armed_promoted deliveries=2 first_on_main=1 second_on_sibling=1\narmed_promoted deliveries=2\n  0 sig=10 SI_TIMER timer=0 overrun=0 value=0x1\n  1 sig=10 SI_TIMER timer=1 overrun=0 value=0x1122334455667788\n",
@@ -32296,6 +32345,10 @@ fn posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity() {
 /// - `d2`: a copy Linux discarded while ignored, still queued for a parked
 ///   worker, is delivered to a handler installed later: the late-handler
 ///   residual of https://github.com/rrnewton/hermit/issues/4293, as on main.
+/// - `sigchld_timer` (rev 6 §9): a SIGCHLD timer while a child is unreaped
+///   takes the fallback, whose expiries merge into the pending copy, so the
+///   timer blocked for 5 periods reports overrun 0 where Linux reports 4
+///   (disclosure 2).
 #[test]
 fn posix_timer_signal_rows_hermit_refuses_or_diverges_on_are_named() {
     let guest = timer_coalesce_signals_guest().to_str().unwrap().to_owned();
@@ -32351,6 +32404,11 @@ fn posix_timer_signal_rows_hermit_refuses_or_diverges_on_are_named() {
             "fallback_pipe deliveries=1\n  0 sig=13 code=0 own_pid=1 value=0\n",
             "fallback_pipe deliveries=2\n  0 sig=13 code=0 own_pid=1 value=0\n  1 sig=13 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
         ),
+        (
+            "sigchld_timer",
+            "sigchld_timer timer_deliveries=1 overruns=0\n",
+            "sigchld_timer timer_deliveries=1 overruns=4\n",
+        ),
     ];
     for (mode, hermit, linux) in divergences {
         assert_ne!(hermit, linux, "{mode} is listed as a divergence");
@@ -32377,6 +32435,140 @@ fn posix_timer_signal_rows_hermit_refuses_or_diverges_on_are_named() {
             "{mode}:\nstdout:\n{stdout}\nstderr:\n{log}"
         );
         assert_eq!(stdout, hermit, "{mode}: stderr:\n{log}");
+    }
+}
+
+/// Rev 6 §9's Verify block for https://github.com/rrnewton/hermit/issues/4262
+/// (the Claude review of https://github.com/rrnewton/hermit/pull/4491, P2-4):
+/// the design's rows strict-verified under the random scheduler and under
+/// chaos, not only the default one. T1 `storm`, T2 `blocked`, T4 `parked`,
+/// T5 `flush`, T6 `stale_far_handler`, T7 `merged_handler` and
+/// `merged_sfd2`, T7b `order_shared`, D1 `d1`, the unignore rows
+/// `unignore_current` and `unignore_high_first`, and the thread-timer rows
+/// `coalesce_self` and `raise_rearm` must each print Linux's output (the same
+/// native measurements as their default-scheduler tests) at bitwise parity
+/// with `--sched-heuristic=random --sched-seed=1` and with
+/// `--chaos --sched-seed=1`.
+#[test]
+fn posix_timer_rows_verify_under_random_and_chaos_schedules() {
+    enum Guest {
+        Coalesce,
+        Signals,
+        ThreadId,
+    }
+    let rows = [
+        (
+            Guest::Coalesce,
+            "blocked",
+            "blocked waiting_remaining_within_interval=1 getoverrun_before=0 getoverrun_after=4\nblocked deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=4 value=0x1122334455667788\n",
+        ),
+        (
+            Guest::Coalesce,
+            "parked",
+            "parked at_install=1\nparked deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=2 value=0x1122334455667788\n",
+        ),
+        (
+            Guest::Coalesce,
+            "flush",
+            "flush deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=2 value=0x1122334455667788\n",
+        ),
+        (
+            Guest::Coalesce,
+            "stale_far_handler",
+            "stale_far_handler pending=1\nstale_far_handler deliveries=0\n",
+        ),
+        (
+            Guest::Coalesce,
+            "merged_handler",
+            "merged_handler deliveries=2\n  0 sig=10 code=0 own_pid=1 value=0\n  1 sig=10 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
+        ),
+        (
+            Guest::Coalesce,
+            "merged_sfd2",
+            "merged_sfd2 records=2\n  0 sig=10 code=0 own_pid=1 ptr=0\n  1 sig=10 SI_TIMER timer=0 overrun=0 int=0x55667788 ptr=0x1122334455667788\n",
+        ),
+        (
+            Guest::Coalesce,
+            "order_shared",
+            "order_shared records=3\n  0 sig=10 SI_TIMER timer=0 overrun=0 int=0x1 ptr=0x1\n  1 sig=10 SI_TIMER timer=1 overrun=0 int=0x2 ptr=0x2\n  2 sig=12 code=0 own_pid=1 ptr=0\n",
+        ),
+        (
+            Guest::Coalesce,
+            "unignore_current",
+            "unignore_current deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=9 value=0x1122334455667788\n",
+        ),
+        (
+            Guest::Coalesce,
+            "unignore_high_first",
+            "unignore_high_first deliveries=2\n  0 sig=10 SI_TIMER timer=0 overrun=0 value=0\n  1 sig=10 SI_TIMER timer=1 overrun=0 value=0x1\n",
+        ),
+        (
+            Guest::Signals,
+            "d1",
+            "d1 deliveries=1 on_worker=1 raw_is_the_timers_record=1\nd1 deliveries=1\n  0 sig=10 SI_TIMER timer=0 overrun=0 value=0x1122334455667788\n",
+        ),
+        (
+            Guest::Signals,
+            "storm",
+            "storm deliveries_positive=1 all_si_timer=1 recurrence_ok=1\n",
+        ),
+        (Guest::ThreadId, "coalesce_self", "coalesce_self hits=2\n"),
+        (
+            Guest::ThreadId,
+            "raise_rearm",
+            "raise_rearm first=1 hits=3\n",
+        ),
+    ];
+    for schedule in [
+        ["--sched-heuristic=random", "--sched-seed=1"],
+        ["--chaos", "--sched-seed=1"],
+    ] {
+        for (guest, mode, expected) in &rows {
+            let guest = match guest {
+                Guest::Coalesce => timer_coalesce_guest(),
+                Guest::Signals => timer_coalesce_signals_guest(),
+                Guest::ThreadId => timer_sigev_thread_id_guest(),
+            };
+            let guest = guest.to_str().unwrap().to_owned();
+            let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+            let verdict = directory.path().join("verify.json");
+            let (status, log) = run_with_deadline(
+                hermit_command(&[
+                    "--log=info",
+                    "run",
+                    "--strict",
+                    schedule[0],
+                    schedule[1],
+                    "--verify",
+                    "--verify-strict",
+                    "--verify-json",
+                    verdict.to_str().unwrap(),
+                    "--timeout",
+                    "60",
+                    "--",
+                    guest.as_str(),
+                    mode,
+                ]),
+                directory.path(),
+                Duration::from_secs(180),
+                false,
+            );
+            let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+                .expect("failed to read the guest's stdout");
+            assert_eq!(
+                status.and_then(|status| status.code()),
+                Some(0),
+                "{mode} {schedule:?}:\nstdout:\n{stdout}\nstderr:\n{log}"
+            );
+            assert_eq!(&stdout, expected, "{mode} {schedule:?}: stderr:\n{log}");
+            let report: serde_json::Value =
+                serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+                    .expect("the verdict must be JSON");
+            assert_eq!(
+                report["bitwise_parity"], true,
+                "{mode} {schedule:?}: {report}"
+            );
+        }
     }
 }
 
