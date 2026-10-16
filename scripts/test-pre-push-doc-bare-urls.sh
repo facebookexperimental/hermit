@@ -54,6 +54,7 @@ chmod +x "$repo/scripts/check-default-build-warnings.sh"
 cat > "$repo/scripts/check-doc-bare-urls.rs" <<'STUB'
 #!/usr/bin/env bash
 touch "$(dirname "$0")/../doc-check-ran"
+printf '%s' "${XDG_CACHE_HOME:-}" > "$(dirname "$0")/../doc-check-cache"
 status=$(cat "$(dirname "$0")/../doc-check-status")
 case $status in
     1) echo 'src/bin/x.rs:1: bare URL https://example.com/a in a doc comment' >&2
@@ -115,6 +116,10 @@ run_hook compile "$push"
 run_hook 0 "$push"
 [[ $hook_status -eq 0 ]] || fail "a clean tree with a passing build must push; got: $out"
 [[ -e $repo/doc-check-ran ]] || fail "the bare-URL checker did not run"
+# The checker gets a rust-script cache of its own: in the shared one it waited
+# out every other script's compile, past the 300 s timeout under load.
+[[ $(cat "$repo/doc-check-cache") == "${XDG_CACHE_HOME:-$HOME/.cache}/hermit-pre-push" ]] ||
+    fail "the bare-URL checker must run with its own rust-script cache; got: $(cat "$repo/doc-check-cache")"
 [[ -e $repo/build-check-ran ]] || fail "the build check did not run after a clean bare-URL check"
 
 # ---- a branch deletion pushes no code and runs neither checker.

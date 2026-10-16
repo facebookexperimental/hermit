@@ -67,7 +67,16 @@ doc_urls="$root/scripts/check-doc-bare-urls.rs"
 if [[ -x "$doc_urls" ]]; then
     doc_urls_status=0
     doc_urls_log=$(mktemp)
-    (cd "$root" && timeout 300 "$doc_urls") >"$doc_urls_log" 2>&1 || doc_urls_status=$?
+    # rust-script builds every script into ONE Cargo target directory under
+    # $XDG_CACHE_HOME/rust-script and runs `cargo build` on each run (the
+    # checker's shebang passes --force), so the check waited out the whole of
+    # any other script's compile in that shared cache. Measured 2026-10-15 on
+    # the host recorded in docs/TESTING_ENVIRONMENTS.md: 0.56 s alone, 55.6 s
+    # beside a cold scripts/validate.rs compile; a push under load hit the
+    # 300 s timeout. A cache of its own leaves the check waiting only for
+    # another push's check, at the cost of one 4-5 s compile per new version.
+    doc_urls_cache="${XDG_CACHE_HOME:-$HOME/.cache}/hermit-pre-push"
+    (cd "$root" && XDG_CACHE_HOME="$doc_urls_cache" timeout 300 "$doc_urls") >"$doc_urls_log" 2>&1 || doc_urls_status=$?
     cat "$doc_urls_log" >&2
     # Exit 1 alone does not mean findings: rust-script also exits 1 when the
     # checker fails to compile. Only the checker's own verdict line does.
