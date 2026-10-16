@@ -57,15 +57,20 @@ pub fn launch_on_calling_thread() {
     ON_CALLER.store(true, Ordering::Relaxed);
 }
 
-fn in_place() -> bool {
-    ON_TRACER.get()
-        || ON_CALLER.load(Ordering::Relaxed)
-        // Without a readable PID namespace (`/proc` hidden or not mounted), a
-        // process cannot tell its tracer handle from one a forked child
-        // inherited, so it keeps no handle: the launch runs on the calling
-        // thread, as it did before the tracer thread, and refuses there
-        // (`Identity`) for the same reason.
-        || ProcessIdentity::current().namespace.is_none()
+/// The calling process's identity, read once for a whole call, or `None`
+/// when the launch runs on the calling thread instead: on a tracer thread,
+/// after [`launch_on_calling_thread`], or without a readable PID namespace.
+/// In the last case (`/proc` hidden or not mounted) a process cannot tell its
+/// tracer handle from one a forked child inherited, so it keeps no handle,
+/// and the launch refuses on the calling thread (`Identity`), as it did before
+/// the tracer thread. One read per call, so that `/proc` vanishing between
+/// two reads cannot make a call both keep and discard its handle.
+fn tracer_identity() -> Option<ProcessIdentity> {
+    if ON_TRACER.get() || ON_CALLER.load(Ordering::Relaxed) {
+        return None;
+    }
+    let identity = ProcessIdentity::current();
+    identity.namespace.is_some().then_some(identity)
 }
 
 struct TracerThread {
@@ -105,7 +110,7 @@ thread_local! {
     static ON_TRACER: Cell<bool> = const { Cell::new(false) };
 }
 
-fn spawn() -> std::io::Result<TracerThread> {
+fn spawn(process: ProcessIdentity) -> std::io::Result<TracerThread> {
     let (jobs, receive) = mpsc::channel::<Job>();
     let handle = std::thread::Builder::new()
         .name("hermit-tracer".to_owned())
@@ -119,7 +124,7 @@ fn spawn() -> std::io::Result<TracerThread> {
     Ok(TracerThread {
         jobs,
         id: handle.thread().id(),
-        process: ProcessIdentity::current(),
+        process,
     })
 }
 
@@ -128,25 +133,35 @@ fn spawn() -> std::io::Result<TracerThread> {
 /// even when the child has the same PID in a new PID namespace: it is
 /// forgotten (dropping it could take a lock another thread of the parent held
 /// at the fork) and the caller gets a fresh tracer thread.
-fn current(tracer: &mut Option<TracerThread>) -> Option<&TracerThread> {
+fn current(tracer: &mut Option<TracerThread>, process: ProcessIdentity) -> Option<&TracerThread> {
     if tracer
         .as_ref()
-        .is_some_and(|tracer| tracer.process != ProcessIdentity::current())
+        .is_some_and(|tracer| tracer.process != process)
     {
         std::mem::forget(tracer.take());
     }
     tracer.as_ref()
 }
 
-/// Runs `job` on the calling thread's tracer thread and returns its result.
-/// A panic in `job` resumes in the caller. Called on a tracer thread, or after
-/// [`launch_on_calling_thread`], it runs `job` on the calling thread.
+/// Runs `job` on the calling thread's tracer thread, started on first use,
+/// and returns its result. A panic in `job` resumes in the caller. It runs
+/// `job` on the calling thread instead when [`tracer_identity`] says so (on a
+/// tracer thread, after [`launch_on_calling_thread`], or without a readable
+/// PID namespace) and during the calling thread's teardown.
 pub(crate) fn execute<R: Send + 'static>(
     job: impl FnOnce() -> R + Send + 'static,
 ) -> std::io::Result<R> {
-    if in_place() {
-        return Ok(job());
+    match tracer_identity() {
+        Some(identity) => execute_with(identity, job),
+        None => Ok(job()),
     }
+}
+
+/// [`execute`] for a caller that already read its identity.
+fn execute_with<R: Send + 'static>(
+    identity: ProcessIdentity,
+    job: impl FnOnce() -> R + Send + 'static,
+) -> std::io::Result<R> {
     if TRACER.try_with(|_| ()).is_err() {
         // During the calling thread's teardown its storage is gone: run in
         // place, where the launch refuses as it always did
@@ -159,8 +174,8 @@ pub(crate) fn execute<R: Send + 'static>(
     });
     let sent = TRACER.try_with(|tracer| {
         let mut tracer = tracer.borrow_mut();
-        if current(&mut tracer).is_none() {
-            *tracer = Some(spawn()?);
+        if current(&mut tracer, identity).is_none() {
+            *tracer = Some(spawn(identity)?);
         }
         tracer
             .as_ref()
@@ -185,16 +200,14 @@ pub(crate) fn execute_on<R: Send + 'static>(
     owner: ThreadId,
     job: impl FnOnce() -> R + Send + 'static,
 ) -> Option<std::io::Result<R>> {
-    if in_place() {
-        return None;
-    }
+    let identity = tracer_identity()?;
     // A tracer thread of another process (a handle a forked child inherited)
     // owns nothing here: the caller's identity check refuses instead.
     let mine = TRACER
-        .try_with(|tracer| current(&mut tracer.borrow_mut()).map(|tracer| tracer.id))
+        .try_with(|tracer| current(&mut tracer.borrow_mut(), identity).map(|tracer| tracer.id))
         .ok()
         .flatten();
-    (mine == Some(owner)).then(|| execute(job))
+    (mine == Some(owner)).then(|| execute_with(identity, job))
 }
 
 /// A [`reverie::process::Command`] on its way to the tracer thread.
