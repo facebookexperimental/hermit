@@ -42434,6 +42434,22 @@
       ],
       "test": "system-utils/proc-uptime",
       "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "system-utils/ps-proc-table",
+      "timeout_seconds": 57
     }
   ],
   "schema": 1

@@ -83,6 +83,7 @@ use crate::tool_local::finish_partial_record_or_replay_write;
 use crate::types::*;
 
 pub(crate) mod procfs_levels;
+pub(crate) mod procfs_numbers;
 pub(crate) mod rendered_procfs;
 
 /// A conversion from SOCK_* flags to O_* flags which makes unsafe (but checked during testing) assumptions.
@@ -1440,6 +1441,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Re-resolve the numeric proc path on every operation. Linux gives a
         // recycled TID a different proc inode, while the original open file
         // description remains bound to the exited task's inode.
+        // The kernel's number for the guest's (DBT; `procfs_numbers`): one
+        // `/proc` does not list has no file to bind.
+        let Some(target) = Self::kernel_procfs_number(guest, target).await else {
+            return Ok(None);
+        };
         let path = format!("/proc/{target}/timerslack_ns");
         let path_bytes = path.as_bytes();
         let mut path_buffer = [0_u8; 64];
@@ -2522,6 +2528,45 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// <https://github.com/rrnewton/hermit/pull/3849>, P3-2). Otherwise it is
     /// a transient private page, unmapped before the guest resumes.
     pub(crate) async fn inject_statat<G: Guest<Self>>(
+        guest: &mut G,
+        dirfd: RawFd,
+        path: syscalls::PathPtr<'_>,
+        inputs: [Option<syscalls::PathPtr<'_>>; 2],
+        flags: AtFlags,
+    ) -> Result<libc::stat, Errno> {
+        // A `/proc` path naming a process or thread by the guest's number
+        // is looked up by the kernel's (DBT), as the guest's own call is
+        // (`procfs_numbers`).
+        let probe = Syscall::Newfstatat(
+            syscalls::Newfstatat::new()
+                .with_dirfd(dirfd)
+                .with_path(Some(path))
+                .with_flags(flags),
+        );
+        let Some(translated) = Self::procfs_translated_call(guest, &probe).await? else {
+            return Self::inject_statat_as_spelled(guest, dirfd, path, inputs, flags).await;
+        };
+        // The one path is staged at the start of the transient page.
+        let respelled = PathPtr::from_ptr(translated.page.as_raw() as *const libc::c_char);
+        let looked_up = match respelled {
+            Some(respelled) => {
+                Self::inject_statat_as_spelled(
+                    guest,
+                    dirfd,
+                    respelled,
+                    [Some(respelled), None],
+                    flags,
+                )
+                .await
+            }
+            None => Err(Errno::ENOMEM),
+        };
+        Self::finish_translated_call(guest, translated).await;
+        looked_up
+    }
+
+    /// [`Self::inject_statat`] of `path` as it is spelled.
+    async fn inject_statat_as_spelled<G: Guest<Self>>(
         guest: &mut G,
         dirfd: RawFd,
         path: syscalls::PathPtr<'_>,
@@ -4205,6 +4250,32 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             raw_contents
         };
+        // Another process's `stat` or `status`, where the kernel numbers
+        // processes otherwise than Detcore (DBT), is renumbered to the
+        // guest's numbers (slice B3a-4 of
+        // https://github.com/rrnewton/hermit/issues/4266).
+        let held = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            detfd.procfs_kernel_numbers_held(&contents)
+        })?;
+        // The init's files (`/proc/1/...`, Hermit's own process and threads)
+        // keep the numbers the kernel gives them, as their paths do. Which
+        // process's file it is, the kernel's name for the descriptor says
+        // where the tool shares the guest's descriptors (DBT), whatever path
+        // reached it.
+        let path = if guest.config().backend.tool_shares_guest_descriptor_table {
+            std::fs::read_link(format!("/proc/thread-self/fd/{}", call.fd())).ok()
+        } else {
+            guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.path())?
+        };
+        let init = path.is_some_and(|path| crate::procfs::ids::names_init(&path));
+        let held = if init { Vec::new() } else { held };
+        if let Some(numbers) = Self::guest_procfs_numbers(guest, &held).await {
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                detfd.set_procfs_guest_numbers(numbers.clone())
+            })?;
+        }
         let virtual_uptime_seconds = self.calculate_procfs_uptime(guest).await?;
         // A file Detcore renders at its first read: at the uptime an earlier
         // read of the same open file took its snapshot at, which a process
@@ -6971,7 +7042,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ),
                 None => target,
             };
-            guest.inject(Syscall::from(call)).await?;
+            Self::inject_translated(guest, Syscall::from(call)).await?;
             let statptr = call.stat().ok_or(Errno::EFAULT)?;
             let inode_override = target
                 .descriptor()
@@ -7050,7 +7121,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ),
                 None => target,
             };
-            guest.inject(call).await?;
+            Self::inject_translated(guest, Syscall::from(call)).await?;
             let statptr = call.statx().ok_or(Errno::EFAULT)?;
             let inode_override = target
                 .descriptor()
@@ -10030,13 +10101,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         if status_flags & libc::O_PATH != 0 {
             return Ok(None);
         }
+        // Where numbers are translated (DBT), the kernel's name for the
+        // descriptor says which directory it is, whatever spelling opened it
+        // (`/proc/self/fd/N` of a descriptor of `/proc`).
+        let kernel_named = || {
+            std::fs::read_link(format!("/proc/thread-self/fd/{fd}"))
+                .is_ok_and(|kernel| listing::classify(&kernel, 0, 0).is_some())
+        };
         if spelled
             .as_deref()
             .and_then(|spelled| listing::classify(spelled, 0, 0))
             .is_none()
+            && !(Self::translates_procfs_numbers(guest)
+                && guest.config().backend.tool_shares_guest_descriptor_table
+                && kernel_named())
         {
             return Ok(None);
         }
+        let state = guest.thread_state();
         let tid = state.dettid.as_raw();
         let names_tasks =
             procfs_inode::guest_tids_name_host_tasks(&self.cfg.backend, state.physical_tid);
@@ -10055,6 +10137,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let backend_procfs =
             procfs_inode::is_backend_procfs_device(&self.cfg.backend, stat.dev, stat.blksize);
+        // Where the kernel numbers processes otherwise than Detcore (DBT),
+        // the directory is the one the guest's spelling names, which reached
+        // the kernel's directory of the same process (`procfs_numbers`).
+        let translates = Self::translates_procfs_numbers(guest)
+            && rendered_procfs::proc_device() == Some(stat.dev);
         let path = if names_tasks && rendered_procfs::proc_device() == Some(stat.dev) {
             match Self::procfs_entry(guest, &stat, StatTarget::Descriptor(fd)).await {
                 ProcfsEntry::At(within) => {
@@ -10063,6 +10150,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ProcfsEntry::NotProcfs | ProcfsEntry::Unnamed | ProcfsEntry::Unknown => {
                     return Ok(None);
                 }
+            }
+        } else if translates {
+            match Self::guest_procfs_spelling(guest, fd).await {
+                Some(path) => path,
+                None => return Ok(None),
             }
         } else if backend_procfs && let Some(spelled) = spelled {
             spelled
@@ -10121,16 +10213,48 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             host
         };
-        let host_cookies: std::collections::HashMap<&[u8], i64> = host
+        // A process or thread number the kernel lists is the kernel's (DBT):
+        // its cookie is the cookie of the guest's number for it.
+        let host_numbers = if translates {
+            let held = host
+                .iter()
+                .filter(|entry| {
+                    crate::procfs::ids::names_an_id(&path, std::ffi::OsStr::from_bytes(&entry.name))
+                })
+                .filter_map(|entry| std::str::from_utf8(&entry.name).ok()?.parse::<i32>().ok())
+                .collect::<Vec<_>>();
+            Self::guest_procfs_numbers(guest, &held)
+                .await
+                .unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        // A kernel number that is no guest's has no cookie to give: its name
+        // may be another guest number's.
+        let host_cookies: std::collections::HashMap<Vec<u8>, i64> = host
             .iter()
-            .map(|entry| (entry.name.as_slice(), entry.off))
+            .filter_map(|entry| {
+                if !translates
+                    || !crate::procfs::ids::names_an_id(
+                        &path,
+                        std::ffi::OsStr::from_bytes(&entry.name),
+                    )
+                {
+                    return Some((entry.name.clone(), entry.off));
+                }
+                let kernel = std::str::from_utf8(&entry.name).ok()?.parse::<i32>().ok()?;
+                let guest = host_numbers.get(&kernel)?;
+                Some((guest.to_string().into_bytes(), entry.off))
+            })
             .collect();
         let host_cookie = |name: &[u8]| host_cookies.get(name).copied().unwrap_or(0);
         let host_end = host.last().map_or(0, |entry| entry.off);
         // Looked up from the guest's own descriptor where it names the
         // kernel's directory, and by the guest's spelling on KVM, whose own
-        // /proc looks up only absolute paths.
-        let (lookup_dir, spellings): (RawFd, Vec<PathBuf>) = if backend_procfs {
+        // /proc looks up only absolute paths, and on DBT, whose lookup
+        // translates the guest's numbers to the kernel's as the guest's own
+        // lookup of each would be (`inject_statat`, `procfs_numbers`).
+        let (lookup_dir, spellings): (RawFd, Vec<PathBuf>) = if backend_procfs || translates {
             let spellings = names
                 .iter()
                 .map(|(name, _)| path.join(std::ffi::OsStr::from_bytes(name)))

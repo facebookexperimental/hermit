@@ -19,6 +19,8 @@
 //! checked to be procfs, which creates nothing, so such a call cannot
 //! succeed or change anything.
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::os::fd::RawFd;
@@ -62,7 +64,7 @@ const SUN_PATH_MAX: usize = 108;
 
 /// What a call names that a lookup may find, by argument position.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Lookups {
+pub(super) enum Lookups {
     /// Paths: each the position of its directory descriptor (`None` for
     /// `AT_FDCWD`) and of its path pointer.
     Paths(Vec<(Option<usize>, usize)>),
@@ -87,7 +89,7 @@ enum Lookups {
 /// newer than the pinned `syscalls` crate (`setxattrat` and its siblings,
 /// `file_getattr`, `open_tree_attr`) are unknown to Detcore and refused as
 /// such.
-fn looked_up(sysno: Sysno) -> Option<Lookups> {
+pub(super) fn looked_up(sysno: Sysno) -> Option<Lookups> {
     let paths = match sysno {
         Sysno::open
         | Sysno::creat
@@ -303,7 +305,7 @@ struct Replacement {
 
 /// A transient anonymous page of at least `length` bytes in the guest, or
 /// `None` if the guest's address space has no room.
-async fn map_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(super) async fn map_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
     guest: &mut G,
     length: usize,
 ) -> Option<AddrMut<'static, u8>> {
@@ -325,7 +327,7 @@ async fn map_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
 
 /// Unmap a page from [`map_transient`]: a mapping left behind would be
 /// visible to the guest.
-async fn unmap_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(super) async fn unmap_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
     guest: &mut G,
     page: AddrMut<'_, u8>,
     length: usize,
@@ -343,7 +345,7 @@ async fn unmap_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
 }
 
 /// Raw syscall arguments from six values.
-fn raw_args(values: [usize; 6]) -> syscalls::SyscallArgs {
+pub(super) fn raw_args(values: [usize; 6]) -> syscalls::SyscallArgs {
     syscalls::SyscallArgs::new(
         values[0], values[1], values[2], values[3], values[4], values[5],
     )
@@ -387,6 +389,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut values = [
             args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
         ];
+        let numbers = self.parent_numbers(guest, &lookups, &values).await;
         // Whether a refusal for permission can only be the KVM executor's.
         let mut confined = true;
         let replacements = match lookups {
@@ -396,9 +399,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let decision = match PathPtr::from_ptr(values[path] as *const libc::c_char)
                         .and_then(|address| address.read(&guest.memory()).ok())
                     {
-                        Some(spelling) => {
-                            self.decide(guest, dirfd.map(|p| values[p] as i32), &spelling, &root)
-                        }
+                        Some(spelling) => self.decide(
+                            guest,
+                            dirfd.map(|p| values[p] as i32),
+                            &spelling,
+                            &root,
+                            numbers.as_ref(),
+                        ),
                         None => Decision::default(),
                     };
                     confined &= decision.decided;
@@ -426,6 +433,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     length_value,
                     send,
                     &root,
+                    numbers.as_ref(),
                 ) else {
                     return Ok(None);
                 };
@@ -457,7 +465,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let length = u32::from_ne_bytes(header[8..12].try_into().expect("4 bytes"));
                 let bytes = (name != 0)
                     .then(|| {
-                        self.substituted_socket_address(guest, name, length as usize, true, &root)
+                        self.substituted_socket_address(
+                            guest,
+                            name,
+                            length as usize,
+                            true,
+                            &root,
+                            numbers.as_ref(),
+                        )
                     })
                     .flatten();
                 let Some(bytes) = bytes else {
@@ -492,6 +507,70 @@ impl<T: RecordOrReplay> Detcore<T> {
             .map(Some)
     }
 
+    /// The kernel's number for each guest process or thread number in the
+    /// paths `lookups` names, as [`Self::decide`] places them (DBT;
+    /// `procfs_numbers`): the tool looks at an omitted name's directory by
+    /// them ([`Self::parent_in_tool_view`]). `None` where numbers are not
+    /// translated.
+    async fn parent_numbers<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        lookups: &Lookups,
+        values: &[usize; 6],
+    ) -> Option<BTreeMap<i32, Option<i32>>> {
+        if !Self::translates_procfs_numbers(guest) {
+            return None;
+        }
+        let mut spellings = Vec::new();
+        match lookups {
+            Lookups::Paths(operands) => {
+                for (dirfd, path) in operands {
+                    if let Some(spelling) = PathPtr::from_ptr(values[*path] as *const libc::c_char)
+                        .and_then(|address| address.read(&guest.memory()).ok())
+                    {
+                        let dirfd =
+                            dirfd.map_or(libc::AT_FDCWD, |position| values[position] as i32);
+                        spellings.push((dirfd, spelling));
+                    }
+                }
+            }
+            Lookups::SocketAddress {
+                address, length, ..
+            } => {
+                spellings.extend(
+                    socket_address_path(guest, values[*address], values[*length] as u32 as usize)
+                        .map(|path| (libc::AT_FDCWD, path)),
+                );
+            }
+            Lookups::MessageAddress => {
+                // `msg_name` and `msg_namelen` begin `struct msghdr`.
+                let mut header = [0u8; 12];
+                if let Some(start) = Addr::<u8>::from_raw(values[1])
+                    && guest.memory().read_exact(start, &mut header).is_ok()
+                {
+                    let name = u64::from_ne_bytes(header[..8].try_into().expect("8 bytes"));
+                    let length = u32::from_ne_bytes(header[8..12].try_into().expect("4 bytes"));
+                    spellings.extend(
+                        socket_address_path(guest, name as usize, length as usize)
+                            .map(|path| (libc::AT_FDCWD, path)),
+                    );
+                }
+            }
+        }
+        let named = spellings
+            .iter()
+            .filter_map(|(dirfd, spelling)| Self::observed_path(guest, *dirfd, spelling).ok())
+            .flat_map(|path| crate::procfs::ids::named_ids(&path))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if named.is_empty() {
+            return Some(BTreeMap::new());
+        }
+        let kernel = crate::tool_global::procfs_ids(guest, true, named.clone()).await;
+        Some(named.into_iter().zip(kernel).collect())
+    }
+
     /// What Detcore decides about `spelling`, relative to `dirfd` (`None`
     /// for the working directory). It decides nothing for an empty or
     /// overlong spelling, one it cannot place (a working directory outside
@@ -505,6 +584,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         dirfd: Option<i32>,
         spelling: &Path,
         root: &Option<PathBuf>,
+        numbers: Option<&BTreeMap<i32, Option<i32>>>,
     ) -> Decision {
         let bytes = spelling.as_os_str().as_bytes();
         if bytes.is_empty() || bytes.len() >= PATH_MAX {
@@ -537,7 +617,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let decided = procfs_name(named).is_some_and(|name| name != ProcfsName::Undecided);
         let substituted = absent_prefix(named, self.cfg.proc_level).and_then(|prefix| {
             let parent = prefix.parent()?;
-            let checked = self.parent_in_tool_view(guest, &to_tool(parent), root);
+            let checked = self.parent_in_tool_view(guest, &to_tool(parent), root, numbers);
             let on_procfs = std::fs::metadata(&checked)
                 .ok()
                 .is_some_and(|metadata| Some(metadata.dev()) == rendered_procfs::proc_device());
@@ -591,6 +671,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &G,
         parent: &Path,
         root: &Option<PathBuf>,
+        numbers: Option<&BTreeMap<i32, Option<i32>>>,
     ) -> PathBuf {
         let proc_root = match root {
             None => PathBuf::from("/proc"),
@@ -606,8 +687,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         let first = first.as_os_str().as_bytes();
         let is_process =
             first == b"self" || first == b"thread-self" || first.iter().all(u8::is_ascii_digit);
-        if !is_process || self.cfg.backend.tool_shares_guest_descriptor_table {
+        if !is_process {
             return parent.to_path_buf();
+        }
+        // The tool on the guest's own thread (DBT) sees the guest's /proc,
+        // by the kernel's numbers where they differ (`procfs_numbers`).
+        if self.cfg.backend.tool_shares_guest_descriptor_table {
+            return numbers
+                .and_then(|numbers| {
+                    crate::procfs::ids::translate(parent, |id| numbers.get(&id).copied().flatten())
+                })
+                .unwrap_or_else(|| parent.to_path_buf());
         }
         if !crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend) {
             return proc_root;
@@ -638,6 +728,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         length: usize,
         send: bool,
         root: &Option<PathBuf>,
+        numbers: Option<&BTreeMap<i32, Option<i32>>>,
     ) -> Option<Vec<u8>> {
         if length > std::mem::size_of::<libc::sockaddr_un>()
             || (send && self.cfg.recordreplay_modes)
@@ -650,7 +741,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .read_exact(Addr::<u8>::from_raw(address as usize)?, &mut bytes)
             .ok()?;
         let path = PathBuf::from(OsStr::from_bytes(unix_address_path(&bytes)?));
-        let substituted = self.decide(guest, None, &path, root).substituted?;
+        let substituted = self.decide(guest, None, &path, root, numbers).substituted?;
         unix_address(&substituted)
     }
 
@@ -947,7 +1038,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_dirfd(call.dirfd())
             .with_path(call.path())
             .with_flags(o_path);
-        match guest.inject(probe).await {
+        // With the guest's numbers translated, as its own open is (DBT).
+        match Self::inject_translated(guest, Syscall::from(probe)).await {
             Ok(fd) => {
                 let fd = fd as RawFd;
                 let refused = self.opened_procfs_name_outside_level(guest, fd, None).await;
@@ -981,14 +1073,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut contents = path.to_vec();
         contents.push(0);
         let direct = if guest.memory().write_exact(page, &contents).is_ok() {
-            guest
-                .inject(
+            Self::inject_translated(
+                guest,
+                Syscall::from(
                     syscalls::Openat::new()
                         .with_dirfd(libc::AT_FDCWD)
                         .with_path(PathPtr::from_ptr(page.as_raw() as *const libc::c_char))
                         .with_flags(o_path),
-                )
-                .await
+                ),
+            )
+            .await
         } else {
             Err(syscalls::Errno::EFAULT)
         };
@@ -1003,6 +1097,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(error) => matches!(error, syscalls::Errno::EACCES | syscalls::Errno::EPERM),
         }
     }
+}
+
+/// The path of the `AF_UNIX` address of `length` bytes at `address` in the
+/// guest's memory, if it is one with a path.
+fn socket_address_path<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &G,
+    address: usize,
+    length: usize,
+) -> Option<PathBuf> {
+    if length > std::mem::size_of::<libc::sockaddr_un>() {
+        return None;
+    }
+    let mut bytes = vec![0; length];
+    guest
+        .memory()
+        .read_exact(Addr::<u8>::from_raw(address)?, &mut bytes)
+        .ok()?;
+    Some(PathBuf::from(OsStr::from_bytes(unix_address_path(&bytes)?)))
 }
 
 #[cfg(test)]

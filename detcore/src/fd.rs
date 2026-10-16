@@ -1198,6 +1198,26 @@ impl DetFd {
         self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::needs_boot_time))
     }
 
+    /// The kernel process numbers a process's `stat` or `status` named by
+    /// number holds in `contents` (`ProcfsFile::kernel_numbers_held`).
+    pub(crate) fn procfs_kernel_numbers_held(&self, contents: &[u8]) -> Vec<i32> {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .map_or_else(Vec::new, |file| file.kernel_numbers_held(contents))
+        })
+    }
+
+    /// The guest's numbers for the kernel's numbers in the snapshot about to
+    /// be taken (`ProcfsFile::set_guest_numbers`).
+    pub(crate) fn set_procfs_guest_numbers(&self, numbers: std::collections::BTreeMap<i32, i32>) {
+        self.with_description(|d| {
+            if let Some(file) = d.procfs.as_mut() {
+                file.set_guest_numbers(numbers);
+            }
+        })
+    }
+
     /// Initialize the deterministic snapshot shared by all aliases.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity parameters.
     // TODO-HUMAN-REVIEW(PR-955): Review deterministic UUID snapshot input.

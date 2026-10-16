@@ -1129,6 +1129,13 @@ pub struct Scheduler {
     /// from removing a replacement image's descriptor.
     physical_thread_pidfds: BTreeMap<DetTid, (MmId, i32, i32, OwnedFd)>,
 
+    /// The kernel's process and thread ids of each thread that registered
+    /// them (`register_physical_thread`), kept after the thread exits, so a
+    /// zombie's `/proc` directory is still found by its guest number
+    /// (`procfs_ids`). Only what `/proc` lists is translated, so a reaped
+    /// process's entry, kept until its number is taken again, names nothing.
+    procfs_kernel_ids: BTreeMap<DetTid, (i32, i32)>,
+
     /// Whole-process observations, one per process, each bound to the
     /// registration that armed it. The Arc identity distinguishes reused PIDs
     /// even when CLONE_VM shares MmId. Nothing arms one yet: the authenticated
@@ -3597,6 +3604,7 @@ impl Scheduler {
             turn: 0,
             next_turns: Default::default(),
             physical_thread_pidfds: Default::default(),
+            procfs_kernel_ids: Default::default(),
             process_exit_watches: Default::default(),
             bg_action_pool: Default::default(),
             committed_time: Default::default(),
@@ -3807,6 +3815,8 @@ impl Scheduler {
         let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) };
         self.physical_thread_pidfds
             .insert(dettid, (mm, physical_pid, physical_tid, pidfd));
+        self.procfs_kernel_ids
+            .insert(dettid, (physical_pid, physical_tid));
         Ok(())
     }
 
@@ -8383,6 +8393,66 @@ impl Scheduler {
             _ => Vec::new(),
         };
         crate::procfs::listing::ListingFacts { processes, threads }
+    }
+
+    /// The kernel's number for each of `ids`, a guest process or thread
+    /// number as `/proc` spells it (`to_kernel`), or the guest's for each
+    /// kernel number (`!to_kernel`), where the backend's host threads
+    /// registered their kernel ids (`register_physical_thread`; DBT, whose
+    /// kernel numbers the container's processes otherwise than Detcore).
+    /// `None` for a number of no process or live thread `/proc` lists
+    /// (`procfs_listing`). Pid 1, the namespace's init, is Hermit's own
+    /// process in both numberings unless a guest holds it. Where the
+    /// numberings agree (no kernel ids registered, or each thread's is its
+    /// own number), every number is its own.
+    pub fn procfs_ids(&self, to_kernel: bool, ids: &[i32]) -> Vec<Option<i32>> {
+        // Where every registered thread's kernel tid is its own number (an
+        // in-guest native exec), or none registered, the numberings agree:
+        // every number is its own.
+        if self
+            .procfs_kernel_ids
+            .iter()
+            .all(|(tid, (_, thread))| tid.as_raw() == *thread)
+        {
+            return ids.iter().map(|id| Some(*id)).collect();
+        }
+        let processes = self.procfs_listing(None).processes;
+        // A process's leader while the process is listed (zombies too), and
+        // any other thread while it lives.
+        let listed = |tid: DetTid| {
+            processes.binary_search(&tid.as_raw()).is_ok()
+                || (self.next_turns.contains_key(&tid)
+                    && self
+                        .thread_tree
+                        .thread_to_leader
+                        .get(&tid)
+                        .is_some_and(|leader| processes.binary_search(&leader.as_raw()).is_ok()))
+        };
+        let holds_one = |tid: DetTid| self.procfs_kernel_ids.contains_key(&tid);
+        ids.iter()
+            .map(|&id| {
+                if to_kernel {
+                    let tid = DetTid::from_raw(id);
+                    match self.procfs_kernel_ids.get(&tid) {
+                        Some((process, thread)) if listed(tid) => {
+                            Some(if processes.binary_search(&id).is_ok() {
+                                *process
+                            } else {
+                                *thread
+                            })
+                        }
+                        _ if id == 1 && !holds_one(tid) => Some(1),
+                        _ => None,
+                    }
+                } else {
+                    self.procfs_kernel_ids
+                        .iter()
+                        .find(|(tid, (_, thread))| *thread == id && listed(**tid))
+                        .map(|(tid, _)| tid.as_raw())
+                        .or_else(|| (id == 1 && !holds_one(DetTid::from_raw(1))).then_some(1))
+                }
+            })
+            .collect()
     }
 
     /// Return scheduler-owned lifecycle state for an exact child-process wait.
@@ -15085,6 +15155,53 @@ mod test {
     fn exit_process(scheduler: &mut Scheduler, pid: DetPid) {
         scheduler.thread_tree.granted_exits.insert(pid);
         scheduler.logically_kill_thread(&pid, &pid, MmId::initial(pid));
+    }
+
+    /// Where the backend registers the kernel's ids (DBT), the guest's and
+    /// the kernel's numbers translate both ways for what `/proc` lists, a
+    /// zombie included, and for nothing else (`procfs_ids`, slice B3a-4 of
+    /// https://github.com/rrnewton/hermit/issues/4266).
+    #[test]
+    fn procfs_numbers_translate_for_what_proc_lists() {
+        let mut scheduler = process_chain();
+        let [_, inner, middle, orphan] = [1, 2, 3, 4].map(DetPid::from_raw);
+        let thread = DetTid::from_raw(5);
+        scheduler.thread_tree.add_child(inner, thread, false);
+        register_known_thread(&mut scheduler, thread);
+        for (tid, kernel) in [(2, (12, 12)), (3, (13, 13)), (4, (14, 14)), (5, (12, 15))] {
+            scheduler
+                .procfs_kernel_ids
+                .insert(DetTid::from_raw(tid), kernel);
+        }
+        // A process's number is its kernel pid; another thread's, its tid.
+        // The root, pid 1 here with no registration, is 1 in both.
+        assert_eq!(
+            scheduler.procfs_ids(true, &[1, 2, 3, 5, 9]),
+            [Some(1), Some(12), Some(13), Some(15), None]
+        );
+        assert_eq!(
+            scheduler.procfs_ids(false, &[1, 12, 13, 15, 99]),
+            [Some(1), Some(2), Some(3), Some(5), None]
+        );
+        // A zombie is translated until it is reaped.
+        exit_process(&mut scheduler, orphan);
+        assert_eq!(scheduler.procfs_ids(true, &[4]), [Some(14)]);
+        assert_eq!(scheduler.procfs_ids(false, &[14]), [Some(4)]);
+        assert!(scheduler.consume_child_wait(middle, orphan));
+        assert_eq!(scheduler.procfs_ids(true, &[4]), [None]);
+        assert_eq!(scheduler.procfs_ids(false, &[14]), [None]);
+        // Where no kernel ids are registered (ptrace), or each is its
+        // thread's own number (an in-guest native exec), every number is its
+        // own.
+        let mut agreeing = process_chain();
+        assert_eq!(
+            agreeing.procfs_ids(true, &[2, 3, 9]),
+            [Some(2), Some(3), Some(9)]
+        );
+        agreeing
+            .procfs_kernel_ids
+            .insert(DetTid::from_raw(2), (2, 2));
+        assert_eq!(agreeing.procfs_ids(false, &[2, 9]), [Some(2), Some(9)]);
     }
 
     /// `/proc` lists every process from its creation until it is reaped,

@@ -568,11 +568,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         S: Into<Syscall>,
     {
         preserve_record_or_replay_error(
-            self.record_or_replay
-                .handle_syscall_event(&mut guest.into_guest(), syscall.into())
+            self.translated_record_or_replay(guest, syscall.into())
                 .await,
         )?
         .map_err(Error::from)
+    }
+
+    /// The record-or-replay tool's handling of `syscall`, with a `/proc`
+    /// path that names a process or thread by the guest's number reaching
+    /// the kernel's directory for it (DBT; see
+    /// `syscalls::files::procfs_numbers`).
+    async fn translated_record_or_replay<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        let translated = Self::procfs_translated_call(guest, &syscall).await?;
+        let result = self
+            .record_or_replay
+            .handle_syscall_event(
+                &mut guest.into_guest(),
+                translated
+                    .as_ref()
+                    .map_or(syscall, |translated| translated.call),
+            )
+            .await;
+        if let Some(translated) = translated {
+            Self::finish_translated_call(guest, translated).await;
+        }
+        result
     }
 
     /// Helper function for delegating the injection of a syscall to the
@@ -600,8 +624,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         G: Guest<Self>,
         S: Into<Syscall>,
     {
-        self.record_or_replay
-            .handle_syscall_event(&mut guest.into_guest(), syscall.into())
+        self.translated_record_or_replay(guest, syscall.into())
             .await
             // TODO: Get rid of this and make this whole function use the Error type.
             .map_err(|err| err.into_errno().unwrap())

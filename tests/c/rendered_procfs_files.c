@@ -27,7 +27,8 @@
  * file with the identity the guest sees, which must be the same on every
  * backend, and exits 0 only if every check passed.
  *
- * usage: rendered_procfs_files [--no-foreign-fd-links] [--noreplace-overlap-eperm]
+ * usage: rendered_procfs_files [--no-foreign-fd-links] [--no-foreign-fd-access]
+ *                              [--noreplace-overlap-eperm]
  *                              [--kvm-local-procfs]
  *                              [--no-maps-or-chroot] [--chroot-only]
  *                              [--require-chroot] [--xattr-arguments-first]
@@ -41,8 +42,11 @@
  * close when Detcore renders the per-process files too (a later step of the
  * issue above):
  *   --no-foreign-fd-links skips another process's /proc/<pid>/fd/N and a
- *     thread's /proc/self/task/<tid>/fd/N. Under DBT the IDs Detcore gives
- *     the guest do not name the container's /proc entries.
+ *     thread's /proc/self/task/<tid>/fd/N.
+ *   --no-foreign-fd-access skips only the `access` check of another
+ *     process's link: under DBT it reaches the placeholder's memfd, which
+ *     Detcore there, in one guest process, does not know as that process's
+ *     placeholder.
  *   --kvm-local-procfs also skips the /proc/self/fd listing and the mode of
  *     a descriptor link, a /proc directory listing, and a symbolic link to
  *     the file, which the KVM backend's own procfs refuses or answers
@@ -113,6 +117,7 @@ static char rest_buffer[READ_CAPACITY];
 static int failures;
 static int kvm_local_procfs;
 static int no_foreign_fd_links;
+static int no_foreign_fd_access;
 static int noreplace_overlap_eperm;
 /* The checks assume none of the capabilities that bypass the refusals they
  * expect; with --no-bypass-capabilities the guest checks that first. */
@@ -1054,7 +1059,7 @@ static void check_file(const char* path, enum kind kind) {
       /* Without a rendered descriptor of its own. */
       close(fd);
       errno = 0;
-      int ok = access(other_link, W_OK) == -1 && errno == EACCES;
+      int ok = no_foreign_fd_access || (access(other_link, W_OK) == -1 && errno == EACCES);
       ok = ok && link_names(other_link, path);
       int other = open(other_link, O_RDONLY);
       struct stat by_other;
@@ -1308,6 +1313,8 @@ int main(int argc, char** argv) {
       noreplace_overlap_eperm = 1;
     } else if (strcmp(argv[i], "--no-foreign-fd-links") == 0) {
       no_foreign_fd_links = 1;
+    } else if (strcmp(argv[i], "--no-foreign-fd-access") == 0) {
+      no_foreign_fd_access = 1;
     } else if (strcmp(argv[i], "--no-maps-or-chroot") == 0) {
       no_maps_or_chroot = 1;
     } else if (strcmp(argv[i], "--chroot-only") == 0) {

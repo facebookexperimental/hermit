@@ -23,16 +23,12 @@
  * - an `O_PATH` descriptor lists nothing (EBADF);
  * - the legacy getdents, as the first read of the root, lists it.
  *
- * usage: procfs_listings [--host] [--no-process-directories] [--kernel-numbering]
- *                        [--no-autoreap] [--recorded]
+ * usage: procfs_listings [--host] [--no-process-directories] [--no-autoreap]
+ *                        [--recorded]
  *   --host: natively, check the same relations and print nothing.
  *   --no-process-directories: check only the root, whose process entries
  *   cannot be looked up either (a backend whose own /proc cannot open a
  *   process's directory yet, KVM).
- *   --kernel-numbering: skip the checks that compare listed numbers with the
- *   caller's pid, tids and children (a backend whose kernel numbers
- *   processes otherwise than the guest sees them, DBT, until /proc/<pid> is
- *   translated).
  *   --no-autoreap: skip the automatically reaped child (a backend that does
  *   not reap them, DBT: https://github.com/rrnewton/hermit/issues/4413).
  *   --recorded: Hermit records and replays the run, where listings are the
@@ -61,7 +57,6 @@
 static int failures;
 static int host;
 static int process_directories = 1;
-static int guest_numbering = 1;
 static int autoreap = 1;
 static int recorded;
 
@@ -203,16 +198,14 @@ int main(int argc, char** argv) {
       host = 1;
     } else if (strcmp(argv[i], "--no-process-directories") == 0) {
       process_directories = 0;
-    } else if (strcmp(argv[i], "--kernel-numbering") == 0) {
-      guest_numbering = 0;
     } else if (strcmp(argv[i], "--no-autoreap") == 0) {
       autoreap = 0;
     } else if (strcmp(argv[i], "--recorded") == 0) {
       recorded = 1;
     } else {
       fprintf(stderr,
-          "usage: %s [--host] [--no-process-directories] [--kernel-numbering] "
-          "[--no-autoreap] [--recorded]\n",
+          "usage: %s [--host] [--no-process-directories] [--no-autoreap] "
+          "[--recorded]\n",
           argv[0]);
       return 2;
     }
@@ -236,12 +229,10 @@ int main(int argc, char** argv) {
   char name[24];
   list("/proc", &root);
   CHECK(has(&root, "self") && has(&root, "thread-self"), "/proc lists no self or thread-self");
-  if (guest_numbering) {
-    snprintf(name, sizeof name, "%ld", pid);
-    CHECK(has(&root, name), "/proc does not list the caller, %ld", pid);
-    snprintf(name, sizeof name, "%d", child);
-    CHECK(has(&root, name), "/proc does not list the live child, %d", child);
-  }
+  snprintf(name, sizeof name, "%ld", pid);
+  CHECK(has(&root, name), "/proc does not list the caller, %ld", pid);
+  snprintf(name, sizeof name, "%d", child);
+  CHECK(has(&root, name), "/proc does not list the live child, %d", child);
   inodes_agree("/proc", &root, 0);
   /* The legacy getdents lists the root too, as the first read of it. */
   {
@@ -267,16 +258,14 @@ int main(int argc, char** argv) {
   long tid = thread_tid;
   list("/proc", &again);
   snprintf(name, sizeof name, "%ld", tid);
-  CHECK(!guest_numbering || !has(&again, name),
+  CHECK(!has(&again, name),
       "/proc lists the thread %ld, which leads no process", tid);
   if (process_directories) {
     list("/proc/self/task", &tasks);
-    if (guest_numbering) {
-      snprintf(name, sizeof name, "%ld", pid);
-      CHECK(has(&tasks, name), "/proc/self/task does not list the main thread");
-      snprintf(name, sizeof name, "%ld", tid);
-      CHECK(has(&tasks, name), "/proc/self/task does not list the thread %ld", tid);
-    }
+    snprintf(name, sizeof name, "%ld", pid);
+    CHECK(has(&tasks, name), "/proc/self/task does not list the main thread");
+    snprintf(name, sizeof name, "%ld", tid);
+    CHECK(has(&tasks, name), "/proc/self/task does not list the thread %ld", tid);
     CHECK(tasks.count == 4, "/proc/self/task lists %d entries, not ., .. and two threads",
         tasks.count);
     inodes_agree("/proc/self/task", &tasks, 1);
@@ -331,7 +320,7 @@ int main(int argc, char** argv) {
         own |= atol(d->d_name) == getpid();
         off += d->d_reclen;
       }
-      _exit(listed == 3 && (!guest_numbering || (opener && !own)) ? 0 : 1);
+      _exit(listed == 3 && opener && !own ? 0 : 1);
     }
     int reader_status = 0;
     CHECK(waitpid(reader, &reader_status, 0) == reader, "waitpid: %s", strerror(errno));
@@ -352,12 +341,12 @@ int main(int argc, char** argv) {
   CHECK(read(child_done[0], &c, 1) == 0, "read child_done: %s", strerror(errno));
   list("/proc", &again);
   snprintf(name, sizeof name, "%d", child);
-  CHECK(!guest_numbering || has(&again, name), "/proc does not list the zombie child %d",
+  CHECK(has(&again, name), "/proc does not list the zombie child %d",
       child);
   CHECK(waitpid(child, NULL, 0) == child, "waitpid: %s", strerror(errno));
   list("/proc", &again);
   snprintf(name, sizeof name, "%d", child);
-  CHECK(!guest_numbering || !has(&again, name),
+  CHECK(!has(&again, name),
       "/proc still lists the child %d reaped with no status", child);
   pid_t second = fork();
   if (second == 0) {
@@ -367,7 +356,7 @@ int main(int argc, char** argv) {
   CHECK(waitpid(second, &status, 0) == second, "waitpid: %s", strerror(errno));
   list("/proc", &again);
   snprintf(name, sizeof name, "%d", second);
-  CHECK(!guest_numbering || !has(&again, name),
+  CHECK(!has(&again, name),
       "/proc still lists the child %d reaped with its status", second);
   /* A child of a parent that ignores SIGCHLD is reaped at its exit: once
    * wait finds no child left, it is gone. */
@@ -383,7 +372,7 @@ int main(int argc, char** argv) {
     signal(SIGCHLD, SIG_DFL);
     list("/proc", &again);
     snprintf(name, sizeof name, "%d", ignored);
-    CHECK(!guest_numbering || !has(&again, name),
+    CHECK(!has(&again, name),
         "/proc still lists the child %d reaped automatically", ignored);
   }
   if (!host) {

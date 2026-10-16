@@ -3245,6 +3245,11 @@ impl GlobalState {
             GlobalRequest::ProcfsListing(process) => {
                 R::ProcfsListing(self.lock_rpc_scheduler(false).await.procfs_listing(process))
             }
+            GlobalRequest::ProcfsIds(to_kernel, ids) => R::ProcfsIds(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .procfs_ids(to_kernel, &ids),
+            ),
             GlobalRequest::LocalPid(caller, task) => R::LocalPid(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -5277,6 +5282,10 @@ pub enum GlobalRequest {
     /// while its group lives on (`names_a_retired_exited_leader`). Appended
     /// last, for the same reason as the controls above.
     NamesARetiredExitedLeader(DetTid),
+    /// The kernel's numbers for guest process or thread numbers (`true`), or
+    /// the guest's for kernel numbers (`false`), as `/proc` spells them
+    /// (`Scheduler::procfs_ids`). Appended last, for the same reason.
+    ProcfsIds(bool, Vec<i32>),
 }
 
 /// Responses from the global object
@@ -5443,6 +5452,8 @@ pub enum GlobalResponse {
     CompleteNativeExec(Result<(), native_exec::ExecControlError>),
     /// Appended last, for the same reason.
     NamesARetiredExitedLeader(bool),
+    /// Appended last, for the same reason.
+    ProcfsIds(Vec<Option<i32>>),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -7592,6 +7603,21 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ProcfsListing(process)).await;
     match response.1 {
         GlobalResponse::ProcfsListing(facts) => facts,
+        _ => unreachable!(),
+    }
+}
+
+/// The kernel's number for each guest process or thread number in `ids`
+/// (`to_kernel`), or the guest's for each kernel number, as `/proc` spells
+/// them (`Scheduler::procfs_ids`).
+pub async fn procfs_ids<G, T>(guest: &mut G, to_kernel: bool, ids: Vec<i32>) -> Vec<Option<i32>>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::ProcfsIds(to_kernel, ids)).await;
+    match response.1 {
+        GlobalResponse::ProcfsIds(ids) => ids,
         _ => unreachable!(),
     }
 }

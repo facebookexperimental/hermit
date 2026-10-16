@@ -9,22 +9,22 @@
   "counts": {
     "all": {
       "cells": 2995,
-      "applicable": 1931,
-      "selectable": 1680,
+      "applicable": 1932,
+      "selectable": 1681,
       "population": 2925,
-      "population_candidate_selected": 1680,
+      "population_candidate_selected": 1681,
       "population_candidate_not_selected": 240,
-      "population_candidate_disabled": 1005
+      "population_candidate_disabled": 1004
     },
     "by_backend": {
       "dbt": {
         "cells": 599,
-        "applicable": 255,
-        "selectable": 251,
+        "applicable": 256,
+        "selectable": 252,
         "population": 585,
-        "population_candidate_selected": 251,
+        "population_candidate_selected": 252,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 331
+        "population_candidate_disabled": 330
       },
       "in-guest-trap": {
         "cells": 599,
@@ -2990,7 +2990,7 @@
     {"test_id":"system-utils/procfs-sanitized-paths","backend":"kvm","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM's own /proc refuses /proc/self/smaps with EACCES, so the guest fails (https://github.com/rrnewton/hermit/issues/4479, https://github.com/rrnewton/hermit/issues/4282)"},
     {"test_id":"system-utils/procfs-sanitized-paths","backend":"liteinst","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Under in-guest LiteInst, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)"},
     {"test_id":"system-utils/procfs-sanitized-paths","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Under SaBRe this guest's verify matches, but the harness refuses the run because SaBRe used fallback or native sites for bash and the utilities it runs (https://github.com/rrnewton/hermit/issues/4477)"},
-    {"test_id":"system-utils/ps-proc-table","backend":"dbt","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: ps exits 1 on DBT, whose guest pids are not the container's /proc/<pid> names (https://github.com/rrnewton/hermit/issues/4478)"},
+    {"test_id":"system-utils/ps-proc-table","backend":"dbt","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/ps-proc-table","backend":"in-guest-trap","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Under in-guest-trap, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)"},
     {"test_id":"system-utils/ps-proc-table","backend":"kvm","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: ps exits 1 with no output on KVM, whose own /proc cannot open a process's directory (https://github.com/rrnewton/hermit/issues/4479, https://github.com/rrnewton/hermit/issues/4282)"},
     {"test_id":"system-utils/ps-proc-table","backend":"liteinst","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Under in-guest LiteInst, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)"},

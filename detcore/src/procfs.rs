@@ -29,6 +29,7 @@ use crate::machine::MachineDescription;
 use crate::syscalls::VIRTUAL_CPUSET_BYTES;
 
 mod fixed;
+pub(crate) mod ids;
 pub(crate) mod levels;
 pub(crate) mod listing;
 
@@ -403,6 +404,11 @@ pub(crate) struct ProcfsFile {
     /// [`ProcfsFile::rendered_path`]).
     #[serde(default)]
     rendered: bool,
+    /// The guest's number for each kernel process or thread number a
+    /// process's `stat` or `status` holds, where the kernel numbers processes
+    /// otherwise than Detcore (DBT; [`ProcfsFile::kernel_numbers_held`]).
+    #[serde(default)]
+    guest_numbers: Option<BTreeMap<i32, i32>>,
     contents: Option<Vec<u8>>,
     offset: usize,
 }
@@ -893,6 +899,7 @@ impl ProcfsFile {
             bound_thread_identity: None,
             timer_slack_identity: None,
             rendered: false,
+            guest_numbers: None,
             contents: None,
             offset: 0,
         })
@@ -1017,6 +1024,58 @@ impl ProcfsFile {
 
     pub(crate) fn needs_snapshot(&self) -> bool {
         !matches!(self.kind, ProcfsKind::TimerSlack(_)) && self.contents.is_none()
+    }
+
+    /// The kernel process and thread numbers in `contents`, a process's
+    /// `stat` or `status` named by number, where they name processes: the
+    /// pid, parent, process group, session and terminal group of `stat`, and
+    /// the `Tgid`, `Pid`, `PPid`, `NStgid` and `NSpid` of `status`. Empty for
+    /// any other file. Where the kernel numbers processes otherwise than
+    /// Detcore (DBT), the caller learns the guest's numbers for them
+    /// ([`ProcfsFile::set_guest_numbers`]) before the snapshot is taken.
+    pub(crate) fn kernel_numbers_held(&self, contents: &[u8]) -> Vec<i32> {
+        let positive = |text: &str| text.parse::<i32>().ok().filter(|id| *id > 0);
+        match self.kind {
+            ProcfsKind::ProcessStat => {
+                let Ok(text) = std::str::from_utf8(contents) else {
+                    return Vec::new();
+                };
+                let (Some(comm_start), Some(comm_end)) = (text.find(" ("), text.rfind(") ")) else {
+                    return Vec::new();
+                };
+                let fields = text[comm_end + 2..].split_whitespace().collect::<Vec<_>>();
+                std::iter::once(&text[..comm_start])
+                    .chain(
+                        [1, 2, 3, 5]
+                            .into_iter()
+                            .filter_map(|index| fields.get(index).copied()),
+                    )
+                    .filter_map(positive)
+                    .collect()
+            }
+            ProcfsKind::ProcessStatus => String::from_utf8_lossy(contents)
+                .lines()
+                .filter_map(|line| {
+                    let (label, value) = line.split_once(':')?;
+                    STATUS_NUMBER_LABELS.contains(&label).then(|| {
+                        value
+                            .split_whitespace()
+                            .filter_map(positive)
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .flatten()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Renumber the kernel's process numbers in this file's snapshot with
+    /// `numbers`, the guest's number for each (see
+    /// [`ProcfsFile::kernel_numbers_held`]); a number with none is shown as
+    /// 0, as Linux shows a number from outside the reader's PID namespace.
+    pub(crate) fn set_guest_numbers(&mut self, numbers: BTreeMap<i32, i32>) {
+        self.guest_numbers = Some(numbers);
     }
 
     /// Returns true when the procfs inode binds to the thread that opened it.
@@ -1145,9 +1204,21 @@ impl ProcfsFile {
                     .expect("thread-self status was not bound when opened");
                 sanitize_status(&contents, Some((tgid, tid, ppid)))
             }
-            ProcfsKind::ProcessStat => sanitize_stat(&contents, None),
+            ProcfsKind::ProcessStat => {
+                let sanitized = sanitize_stat(&contents, None);
+                match &self.guest_numbers {
+                    Some(numbers) => renumber_stat(&sanitized, numbers),
+                    None => sanitized,
+                }
+            }
             ProcfsKind::Statm => sanitize_statm(&contents),
-            ProcfsKind::ProcessStatus => sanitize_status(&contents, None),
+            ProcfsKind::ProcessStatus => {
+                let sanitized = sanitize_status(&contents, None);
+                match &self.guest_numbers {
+                    Some(numbers) => renumber_status(&sanitized, numbers),
+                    None => sanitized,
+                }
+            }
             ProcfsKind::TimerSlack(_) => {
                 unreachable!("timer-slack procfs content is generated from ThreadState")
             }
@@ -1692,6 +1763,75 @@ fn sanitize_stat(contents: &[u8], virtual_identity: Option<(i32, i32)>) -> Vec<u
         fields[*field - 3] = "0".to_owned();
     }
     format!("{pid}{comm} {}\n", fields.join(" ")).into_bytes()
+}
+
+/// The `status` lines whose values are process or thread numbers that
+/// [`renumber_status`] renumbers.
+const STATUS_NUMBER_LABELS: &[&str] = &["Tgid", "Pid", "PPid", "NStgid", "NSpid"];
+
+/// The guest's number for the kernel number `text`, where it is a positive
+/// number: from `numbers`, or 0 where it has none. Anything else (`-1`, `0`)
+/// is kept.
+fn renumbered(text: &str, numbers: &BTreeMap<i32, i32>) -> String {
+    match text.parse::<i32>() {
+        Ok(id) if id > 0 => numbers.get(&id).copied().unwrap_or(0).to_string(),
+        _ => text.to_owned(),
+    }
+}
+
+/// A process's sanitized `stat` with its pid, parent, process group, session
+/// and terminal group renumbered from the kernel's numbers to the guest's.
+fn renumber_stat(contents: &[u8], numbers: &BTreeMap<i32, i32>) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let (Some(comm_start), Some(comm_end)) = (text.find(" ("), text.rfind(") ")) else {
+        return contents.to_vec();
+    };
+    let mut fields = text[comm_end + 2..]
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    // `fields` starts with proc stat field 3 (state): 4 is the parent, 5 the
+    // process group, 6 the session, 8 the terminal's process group.
+    for index in [1, 2, 3, 5] {
+        if let Some(field) = fields.get_mut(index) {
+            *field = renumbered(field, numbers);
+        }
+    }
+    format!(
+        "{}{} {}\n",
+        renumbered(&text[..comm_start], numbers),
+        &text[comm_start..=comm_end],
+        fields.join(" ")
+    )
+    .into_bytes()
+}
+
+/// A process's sanitized `status` with the numbers in its
+/// [`STATUS_NUMBER_LABELS`] lines renumbered from the kernel's to the
+/// guest's.
+fn renumber_status(contents: &[u8], numbers: &BTreeMap<i32, i32>) -> Vec<u8> {
+    let mut renumbered_lines = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let text = String::from_utf8_lossy(line);
+        let body = text.strip_suffix('\n').unwrap_or(&text);
+        match body.split_once(':') {
+            Some((label, value)) if STATUS_NUMBER_LABELS.contains(&label) => {
+                let values = value
+                    .split_whitespace()
+                    .map(|value| renumbered(value, numbers))
+                    .collect::<Vec<_>>()
+                    .join("\t");
+                renumbered_lines.extend_from_slice(format!("{label}:\t{values}").as_bytes());
+                if line.ends_with(b"\n") {
+                    renumbered_lines.push(b'\n');
+                }
+            }
+            _ => renumbered_lines.extend_from_slice(line),
+        }
+    }
+    renumbered_lines
 }
 
 fn sanitize_statm(contents: &[u8]) -> Vec<u8> {
@@ -5526,6 +5666,42 @@ Rss:                   4 kB\n" as &[u8];
             sanitize_numeric_scalar(b"not-a-number\n"),
             b"not-a-number\n"
         );
+    }
+
+    /// Another process's `stat` and `status`, where the kernel numbers
+    /// processes otherwise than Detcore (DBT), show the guest's numbers for
+    /// the process, its parent, group and session, and 0 for one outside the
+    /// guest's numbering, as Linux shows a number from outside the reader's
+    /// PID namespace (slice B3a-4 of
+    /// https://github.com/rrnewton/hermit/issues/4266).
+    #[test]
+    fn process_files_are_renumbered_to_the_guests_numbers() {
+        let file = ProcfsFile::from_path(Path::new("/proc/3/stat")).unwrap();
+        let stat = format!("4 (bash) S 1 4 4 0 -1 {}\n", vec!["0"; 44].join(" "));
+        assert_eq!(file.kernel_numbers_held(stat.as_bytes()), [4, 1, 4, 4]);
+        let numbers = BTreeMap::from([(4, 3), (1, 1)]);
+        let renumbered = String::from_utf8(renumber_stat(stat.as_bytes(), &numbers)).unwrap();
+        assert!(
+            renumbered.starts_with("3 (bash) S 1 3 3 0 -1 "),
+            "{renumbered}"
+        );
+        let outside = BTreeMap::from([(4, 3)]);
+        let renumbered = String::from_utf8(renumber_stat(stat.as_bytes(), &outside)).unwrap();
+        assert!(
+            renumbered.starts_with("3 (bash) S 0 3 3 0 -1 "),
+            "{renumbered}"
+        );
+
+        let file = ProcfsFile::from_path(Path::new("/proc/3/status")).unwrap();
+        let status = "Name:\tbash\nTgid:\t4\nPid:\t4\nPPid:\t1\nNSpid:\t4\nUid:\t0\t0\t0\t0\n";
+        assert_eq!(file.kernel_numbers_held(status.as_bytes()), [4, 4, 1, 4]);
+        assert_eq!(
+            String::from_utf8(renumber_status(status.as_bytes(), &numbers)).unwrap(),
+            "Name:\tbash\nTgid:\t3\nPid:\t3\nPPid:\t1\nNSpid:\t3\nUid:\t0\t0\t0\t0\n"
+        );
+        // Not a process's file: nothing held.
+        let file = ProcfsFile::from_path(Path::new("/proc/self/stat")).unwrap();
+        assert!(file.kernel_numbers_held(stat.as_bytes()).is_empty());
     }
 
     #[test]

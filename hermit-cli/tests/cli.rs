@@ -5162,12 +5162,12 @@ fn detcore_answers_its_procfs_links_on_every_backend() {
 /// shown by role (before this, KVM's root listed nothing); KVM's own /proc
 /// cannot open a process's directory yet, so its run checks the root only,
 /// named as not checked (slice B3a-4). DBT, whose kernel numbers processes
-/// otherwise than its guest, keeps the kernel's listing until `/proc/<pid>`
-/// is translated (slice B3a-4): its run reaches bitwise parity with the
-/// checks of listed numbers skipped, and without the automatically reaped
-/// child, which DBT does not reap
-/// (https://github.com/rrnewton/hermit/issues/4413), both named as not
-/// checked. A ptrace run at
+/// otherwise than its guest, lists and looks up the guest's numbers too,
+/// translated to the kernel's (slice B3a-4; before it, DBT listed the
+/// kernel's numbers): its run prints the same listings, without the
+/// automatically reaped child, which DBT does not reap
+/// (https://github.com/rrnewton/hermit/issues/4413), named as not checked.
+/// A ptrace run at
 /// `--proc=standard` covers that level's process and thread directories.
 /// Record and replay on ptrace, where Detcore leaves listings to the
 /// kernel unfiltered by the level, keep the other relations and match (the
@@ -5209,7 +5209,7 @@ fn detcore_lists_procfs_from_its_model_on_every_backend() {
         ];
         match backend {
             "kvm" => args.push("--no-process-directories"),
-            "dbt" => args.extend(["--kernel-numbering", "--no-autoreap"]),
+            "dbt" => args.push("--no-autoreap"),
             _ => {}
         }
         let output = hermit(&args);
@@ -5243,24 +5243,10 @@ fn detcore_lists_procfs_from_its_model_on_every_backend() {
             );
         } else if *backend == "dbt" {
             eprintln!(
-                "{test}: dbt: NOT CHECKED: listed numbers against the guest's pids and tids, \
-                 and the root and `task` listings (DBT keeps the kernel's listing until \
-                 /proc/<pid> is translated); an automatically reaped child \
+                "{test}: dbt: NOT CHECKED: an automatically reaped child \
                  (https://github.com/rrnewton/hermit/issues/4413)"
             );
-            // A process's and a thread's directories hold no numbers.
-            let directories = |output: &str| {
-                output
-                    .lines()
-                    .filter(|line| line.starts_with("process:") || line.starts_with("thread:"))
-                    .map(|line| format!("{line}\n"))
-                    .collect::<String>()
-            };
-            assert_eq!(
-                directories(output),
-                directories(first),
-                "{backend}'s process and thread directories differ from {first_backend}'s"
-            );
+            assert_eq!(output, first, "{backend} differs from {first_backend}");
         } else if *backend == "kvm" {
             eprintln!(
                 "{test}: kvm: NOT CHECKED: a process's directory, a thread's and `task`, and \
@@ -5386,16 +5372,16 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
         // answers every other /proc path until it is removed
         // (https://github.com/rrnewton/hermit/issues/4282).
         match backend {
-            // DBT's virtual PIDs are not the container's procfs names
-            // (getpid() 3 where /proc/self is 4), and Detcore takes a
-            // /proc/<pid> spelling by the virtual PID, so another process's
-            // descriptor link can name the caller's own descriptor. Detcore's
-            // own per-process /proc removes this (slice B3 of
-            // https://github.com/rrnewton/hermit/issues/4266).
+            // Another process's descriptor link reaches its file on DBT too
+            // (slice B3a-4 of https://github.com/rrnewton/hermit/issues/4266
+            // translates the pid; before, DBT skipped every foreign link
+            // check), but `access` of it reaches the placeholder's memfd,
+            // which Detcore there, in one guest process, does not know as
+            // another process's placeholder.
             // DBT answers MAP_FIXED_NOREPLACE over a mapping with EPERM
             // (https://github.com/rrnewton/hermit/issues/4429).
             "dbt" => args.extend([
-                "--no-foreign-fd-links",
+                "--no-foreign-fd-access",
                 "--no-maps-or-chroot",
                 "--noreplace-overlap-eperm",
             ]),
