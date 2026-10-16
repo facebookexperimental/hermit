@@ -600,8 +600,6 @@ pub(crate) fn native_cdylib_from_cargo_messages(
 #[cfg(all(feature = "native-exec", not(test)))]
 pub(crate) mod native {
     use std::env;
-    use std::fs::OpenOptions;
-    use std::io::Write;
     use std::time::Duration;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
@@ -668,12 +666,34 @@ pub(crate) mod native {
         )
         .into()
     }
-    fn compiled_file(name: &str, identity: &qualifier::FileIdentity) -> String {
-        format!(
-            "{name}: CompiledFile {{ bytes: include_bytes!({:?}), digest: {:?} }},",
-            text(&identity.path),
-            hex_array(&identity.sha256)
-        )
+    fn publish_file(
+        name: &str,
+        identity: &qualifier::FileIdentity,
+        destination: &Path,
+        stage_root: &Path,
+    ) {
+        identity.verify().unwrap();
+        let temporary = destination.join(name);
+        super::super::copy_into_protected_stage(&identity.path, &temporary).unwrap();
+        let copied = qualifier::FileIdentity::read(&temporary).unwrap();
+        assert_eq!(copied.sha256, identity.sha256, "native bundle copy differs");
+        identity.verify().unwrap();
+        let published = stage_root.join(name);
+        fs::rename(&temporary, &published).unwrap();
+        assert_eq!(
+            qualifier::FileIdentity::read(&published).unwrap().sha256,
+            identity.sha256,
+            "published native bundle copy differs"
+        );
+    }
+    fn publish_digest(name: &str, digest: &[u8; 32], destination: &Path, stage_root: &Path) {
+        let temporary = destination.join(name);
+        qualifier::write_new(&temporary, digest).unwrap();
+        assert_eq!(fs::read(&temporary).unwrap().as_slice(), digest);
+        let published = stage_root.join(name);
+        fs::rename(&temporary, &published).unwrap();
+        qualifier::real_file(&published).unwrap();
+        assert_eq!(fs::read(&published).unwrap().as_slice(), digest);
     }
     pub(crate) fn build() {
         println!("cargo:rerun-if-env-changed=HERMIT_NATIVE_EXEC_STAGE");
@@ -956,23 +976,38 @@ pub(crate) mod native {
             .expect("native runtime lacks qualified fixed gate evidence")
             .verify_bootstrap_page_digest(&gate_digest)
             .unwrap_or_else(|e| panic!("native bootstrap/runtime gate pages differ: {e}"));
-        let source = format!(
-            "const NATIVE_BUNDLE: CompiledBundle = CompiledBundle {{ source_digest: {:?}, {} {} {} gate_digest: {:?} }};\n",
-            source_digest,
-            compiled_file("bootstrap", &bootstrap_identity),
-            compiled_file("runner", &runner_identity),
-            compiled_file("runtime", &runtime_identity),
-            gate_digest
+        // Publish only data, after all existing source/entry/gate qualifications.
+        // Each temporary is create-new inside this invocation's unique directory.
+        for (name, identity) in [
+            ("bootstrap", &bootstrap_identity),
+            ("runner", &runner_identity),
+            ("runtime", &runtime_identity),
+        ] {
+            publish_file(
+                &format!("native_exec_{name}.bin"),
+                identity,
+                &destination,
+                &stage_root,
+            );
+            publish_digest(
+                &format!("native_exec_{name}.sha256"),
+                &hex_array(&identity.sha256),
+                &destination,
+                &stage_root,
+            );
+        }
+        publish_digest(
+            "native_exec_source.sha256",
+            &source_digest,
+            &destination,
+            &stage_root,
         );
-        let temporary = destination.join("native_exec_bundle.rs");
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .unwrap();
-        output.write_all(source.as_bytes()).unwrap();
-        output.sync_all().unwrap();
-        fs::rename(&temporary, stage_root.join("native_exec_bundle.rs")).unwrap();
+        publish_digest(
+            "native_exec_gate.sha256",
+            &gate_digest,
+            &destination,
+            &stage_root,
+        );
         // Cargo rerun triggers are dependency hints, not source authority.
         // The host build script must watch the actual resolved native checkout
         // as well as its local source dirs after this nested producer returns.

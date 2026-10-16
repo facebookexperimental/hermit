@@ -53,11 +53,11 @@ pub(super) const RUNTIME_PATH: &[u8] = b"/run/hermit/native/libdetcore_liteinst.
 const RUNTIME_DIRECTORY: &[u8] = b"/run/hermit/native";
 const INITIALIZER: &str = "detcore_liteinst_exec_initialize";
 
-// The producer-generated Rust source is compiled into this host, not read from
-// a runtime sidecar or supplied by an exec request. Generating it must follow
-// successful real compilation and constructor/native-role qualification. The
-// retained source digest is independently computed by the same compiled source
-// helper on both sides; equality alone is not proof of a kernel exec.
+// Qualified producer bytes and fixed-size identities are compiled into this
+// host as data, never Rust source, a runtime sidecar or an exec-request choice.
+// Publishing them follows real compilation and constructor/native-role
+// qualification. The retained source digest is independently computed by the
+// same compiled source helper on both sides; equality alone is not proof of exec.
 struct CompiledFile {
     bytes: &'static [u8],
     digest: [u8; 32],
@@ -69,7 +69,22 @@ struct CompiledBundle {
     runtime: CompiledFile,
     gate_digest: [u8; 32],
 }
-include!(concat!(env!("OUT_DIR"), "/native_exec_bundle.rs"));
+const NATIVE_BUNDLE: CompiledBundle = CompiledBundle {
+    source_digest: *include_bytes!(concat!(env!("OUT_DIR"), "/native_exec_source.sha256")),
+    bootstrap: CompiledFile {
+        bytes: include_bytes!(concat!(env!("OUT_DIR"), "/native_exec_bootstrap.bin")),
+        digest: *include_bytes!(concat!(env!("OUT_DIR"), "/native_exec_bootstrap.sha256")),
+    },
+    runner: CompiledFile {
+        bytes: include_bytes!(concat!(env!("OUT_DIR"), "/native_exec_runner.bin")),
+        digest: *include_bytes!(concat!(env!("OUT_DIR"), "/native_exec_runner.sha256")),
+    },
+    runtime: CompiledFile {
+        bytes: include_bytes!(concat!(env!("OUT_DIR"), "/native_exec_runtime.bin")),
+        digest: *include_bytes!(concat!(env!("OUT_DIR"), "/native_exec_runtime.sha256")),
+    },
+    gate_digest: *include_bytes!(concat!(env!("OUT_DIR"), "/native_exec_gate.sha256")),
+};
 
 struct HeldArtifact {
     file: File,

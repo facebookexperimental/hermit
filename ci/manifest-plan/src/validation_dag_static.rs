@@ -1586,6 +1586,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And backend_guest_code_between_injections_is_explicit (https://github.com/rrnewton/hermit/issues/4213): 1099.
     // And +18 from a3a9c83a: 1117.
     // Listed at bef97db4 with this node's own selection: 1115.
+    // And -2 from 9851b797: 1113.
     ("test.hermit_unit", 1115),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
@@ -4247,6 +4248,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And backend_guest_code_between_injections_is_explicit (https://github.com/rrnewton/hermit/issues/4213): 1099.
     // And +18 from a3a9c83a: 1117.
     // Listed at bef97db4 with this node's own selection: 1115.
+    // And -2 from 9851b797: 1113.
     ("test.hermit_unit_on_host", 1115),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.

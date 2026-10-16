@@ -250,15 +250,24 @@ pub fn emit_native_exec_bundle(pin: &str) {
         .status()
         .expect("invoke real native standalone producer");
     assert!(status.success(), "real native producer failed: {status}");
-    let generated = out.join("native_exec_bundle.rs");
-    assert!(
-        generated.is_file()
-            && !std::fs::symlink_metadata(&generated)
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-        "native producer did not generate the compiled bundle"
-    );
+    for (name, digest) in [
+        ("native_exec_source.sha256", true),
+        ("native_exec_bootstrap.bin", false),
+        ("native_exec_bootstrap.sha256", true),
+        ("native_exec_runner.bin", false),
+        ("native_exec_runner.sha256", true),
+        ("native_exec_runtime.bin", false),
+        ("native_exec_runtime.sha256", true),
+        ("native_exec_gate.sha256", true),
+    ] {
+        let generated = out.join(name);
+        let metadata =
+            std::fs::symlink_metadata(&generated).expect("native producer bundle data absent");
+        assert!(
+            metadata.file_type().is_file() && (!digest || metadata.len() == 32),
+            "native producer bundle data has an invalid shape: {name}"
+        );
+    }
     let hints = out.join("native_exec_rerun_paths.txt");
     assert!(
         std::fs::metadata(&hints)

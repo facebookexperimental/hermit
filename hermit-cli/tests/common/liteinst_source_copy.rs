@@ -18,7 +18,7 @@ use crate::artifact::VerifiedCompiledSources;
 
 const CHILD_ROOT: &str = "HERMIT_SOURCE_COPY_TEST_CHILD";
 const TEST_NAME: &str = "source_copy::gitless_standalone_compiler_sources";
-const SOURCE_FILES: [&str; 7] = [
+const SOURCE_FILES: [&str; 9] = [
     "liteinst-runtime-build/Cargo.toml",
     "liteinst-runtime-build/Cargo.lock",
     "liteinst-runtime-build/runtime/Cargo.toml",
@@ -27,6 +27,10 @@ const SOURCE_FILES: [&str; 7] = [
     "liteinst-runtime-build/artifact.rs",
     // Cargo still requires the build-only library's declared target to exist.
     "liteinst-runtime-build/src/lib.rs",
+    // Cargo metadata validates optional local dependencies even with native-exec
+    // disabled. Retain the real manifest and declared target, not a stub crate.
+    "detcore-model/Cargo.toml",
+    "detcore-model/src/lib.rs",
 ];
 
 fn io<T>(result: std::io::Result<T>) -> Result<T> {

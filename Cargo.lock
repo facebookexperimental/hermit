@@ -538,6 +538,7 @@ dependencies = [
  "reverie-rpc-transport",
  "serde",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]

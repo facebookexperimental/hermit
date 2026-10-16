@@ -38,3 +38,7 @@ reverie-rpc-transport = { version = "0.4.1", git = "https://github.com/rrnewton/
 bincode = { version = "2", features = ["serde"], optional = true }
 serde = { version = "1.0.219", features = ["derive"], optional = true }
 sha2 = { version = "0.10.6", optional = true }
+
+[dev-dependencies]
+# Native consumer controls are also type-checked by all-target Clippy.
+tempfile = "3.27.0"

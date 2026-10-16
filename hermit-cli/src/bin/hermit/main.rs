@@ -998,13 +998,15 @@ mod exec_initial {
         panic!("completion fixture must not restore an image")
     }
 }
-#[cfg(all(test, feature = "native-exec"))]
+#[cfg(test)]
+#[cfg(feature = "native-exec")]
 #[path = "../../../../detcore-liteinst/src/exec_native/consumer.rs"]
 mod native_exec_consumer;
 
 // Exercise the actual guest provider without enabling the preload's unit
 // harness. These socket/descriptor controls do not manufacture native admission.
-#[cfg(all(test, feature = "native-exec"))]
+#[cfg(test)]
+#[cfg(feature = "native-exec")]
 #[path = "../../../../detcore-liteinst/src/exec_native/provider.rs"]
 mod native_exec_guest_provider;
 #[cfg(all(test, feature = "native-exec"))]

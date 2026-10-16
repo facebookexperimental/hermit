@@ -6931,7 +6931,11 @@ fn native_exec_checks_its_declared_inputs_without_an_ordinary_preload() {
             .stdin(Stdio::null())
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(125), "{output:?}");
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_INTERNAL_FAILURE_EXIT),
+            "{output:?}"
+        );
         assert!(output.stdout.is_empty(), "{output:?}");
         let error = stderr(&output);
         if native {
