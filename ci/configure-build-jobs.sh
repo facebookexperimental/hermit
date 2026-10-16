@@ -1776,8 +1776,14 @@ fi
 # the DynamoRIO SDK budget and every limit therefore carry unchanged.
 # Three A7 fixtures increase the tracked DBT inventory from 956 to 959.
 # This source carry is not a fresh runtime measurement or a whole-backend claim.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 2a62681f03c45f6f402679e3e5a7322eea4209c8 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 2a62681f03c45f6f402679e3e5a7322eea4209c8 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# B3A-4C TYPED PROCESS-GROUP REFUSAL SDK-BUDGET CARRY (2026-10-16): advance
+# 2a62681f03c45f6f402679e3e5a7322eea4209c8 to cdf6e9d689e6dcbeafe1b1ed0ea8529a2d455414.
+# One commit, cdf6e9d6, touching only reverie/src/unsupported.rs (a new
+# UnsupportedOperation variant) and reverie-kvm/src/executor.rs; git diff is
+# empty under reverie-dbt/. No DynamoRIO build input moves, so the budget
+# carries; the reverie-dbt inventory is unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != cdf6e9d689e6dcbeafe1b1ed0ea8529a2d455414 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie cdf6e9d689e6dcbeafe1b1ed0ea8529a2d455414 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

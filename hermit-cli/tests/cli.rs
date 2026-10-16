@@ -4451,9 +4451,10 @@ const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
         "process_groups_and_sessions_answer_as_linux_on_every_backend (reaped)",
         "dbt, sabre",
         "a child of a process that ignores SIGCHLD is not reaped at its exit: waitpid(child) \
-         returns the child where Linux, ptrace, KVM and the in-guest backends return ECHILD; \
-         the group and session answers already match (measured 2026-10-16 at 2f640c23; \
-         slice B3a-4c of https://github.com/rrnewton/hermit/issues/4266)",
+         returns the child where Linux, ptrace, KVM and the in-guest backends return ECHILD \
+         (DBT https://github.com/rrnewton/hermit/issues/4413, SaBRe \
+         https://github.com/rrnewton/hermit/issues/4449); the group and session answers \
+         already match (measured 2026-10-16 at 2f640c23)",
     ),
     (
         "process_groups_and_sessions_answer_as_linux_on_every_backend",

@@ -1699,7 +1699,13 @@ fi
 # the DynamoRIO SDK budget and every limit therefore carry unchanged.
 # Three A7 fixtures increase the tracked DBT inventory from 956 to 959.
 # This source carry is not a fresh runtime measurement or a whole-backend claim.
-expected_pin=2a62681f03c45f6f402679e3e5a7322eea4209c8
+# B3A-4C TYPED PROCESS-GROUP REFUSAL SDK-BUDGET CARRY (2026-10-16): advance
+# 2a62681f03c45f6f402679e3e5a7322eea4209c8 to cdf6e9d689e6dcbeafe1b1ed0ea8529a2d455414.
+# One commit, cdf6e9d6, touching only reverie/src/unsupported.rs (a new
+# UnsupportedOperation variant) and reverie-kvm/src/executor.rs; git diff is
+# empty under reverie-dbt/. No DynamoRIO build input moves, so the budget
+# carries; the reverie-dbt inventory is unchanged.
+expected_pin=cdf6e9d689e6dcbeafe1b1ed0ea8529a2d455414
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

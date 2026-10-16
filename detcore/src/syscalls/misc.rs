@@ -894,17 +894,34 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Give the backend a `setsid` or `setpgid` the model accepted, so that a
-    /// kernel that keeps process groups stays in step with the model. ENOSYS
-    /// means the backend keeps none, and the model's answer stands. Any other
-    /// failure means the backend's process groups disagree with the model's:
-    /// refused by name rather than answered with the backend's errno.
+    /// kernel that keeps process groups stays in step with the model. A
+    /// backend that keeps none says so with a typed refusal
+    /// (`UnsupportedOperation::ProcessGroups`), and the model's answer stands.
+    /// Any other failure, whatever its errno, means the backend's process
+    /// groups disagree with the model's: refused by name rather than answered
+    /// with the backend's errno. An errno alone never stands for a refusal: a
+    /// kernel ENOSYS for another reason would otherwise read as success.
     async fn mirror_group_change<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: reverie::syscalls::Syscall,
     ) -> Result<(), Error> {
-        match guest.inject(call).await {
-            Ok(_) | Err(Errno::ENOSYS) => Ok(()),
+        let result = guest.inject(call).await;
+        // Ask before anything else is injected: the next injection replaces
+        // the backend's record.
+        let refusal = result
+            .is_err()
+            .then(|| guest.take_unsupported_refusal())
+            .flatten();
+        match result {
+            Ok(_) => Ok(()),
+            Err(_)
+                if refusal.is_some_and(|refusal| {
+                    refusal.operation == reverie::UnsupportedOperation::ProcessGroups
+                }) =>
+            {
+                Ok(())
+            }
             Err(errno) => {
                 let sysno = reverie::syscalls::SyscallInfo::number(&call);
                 tracing::error!(
@@ -1176,6 +1193,192 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod group_mirror {
+        use std::sync::Mutex;
+
+        use reverie::GlobalRPC;
+        use reverie::GlobalTool;
+        use reverie::Tid;
+        use reverie::Tool;
+        use reverie::syscalls::Addr;
+        use reverie::syscalls::AddrMut;
+        use reverie::syscalls::SyscallInfo;
+
+        use super::*;
+        use crate::config::Config;
+        use crate::tool_global::GlobalState;
+
+        /// A guest whose backend answers the mirrored `setsid` with `answer`,
+        /// recording `refusal` as its typed refusal when the answer fails.
+        struct MirrorGuest<'a> {
+            config: &'a Config,
+            global: &'a GlobalState,
+            thread: crate::ThreadState<()>,
+            sender: Tid,
+            answer: Result<i64, Errno>,
+            refusal: Option<reverie::UnsupportedOperation>,
+            recorded: Option<reverie::UnsupportedRefusal>,
+            injections: Mutex<usize>,
+        }
+
+        struct NoStack;
+        struct NoStackGuard;
+        impl Drop for NoStackGuard {
+            fn drop(&mut self) {}
+        }
+        impl reverie::Stack for NoStack {
+            type StackGuard = NoStackGuard;
+            fn size(&self) -> usize {
+                panic!("a mirror must not use the guest stack")
+            }
+            fn capacity(&self) -> usize {
+                panic!("a mirror must not use the guest stack")
+            }
+            fn push<'stack, T>(&mut self, _: T) -> Addr<'stack, T> {
+                panic!("a mirror must not use the guest stack")
+            }
+            fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+                panic!("a mirror must not use the guest stack")
+            }
+            fn commit(self) -> Result<Self::StackGuard, Errno> {
+                panic!("a mirror must not use the guest stack")
+            }
+        }
+
+        #[reverie::tool]
+        impl GlobalRPC<GlobalState> for MirrorGuest<'_> {
+            async fn send_rpc(
+                &self,
+                message: <GlobalState as GlobalTool>::Request,
+            ) -> <GlobalState as GlobalTool>::Response {
+                self.global.receive_rpc(self.sender, message).await
+            }
+            fn config(&self) -> &Config {
+                self.config
+            }
+        }
+
+        #[reverie::tool]
+        impl Guest<Detcore> for MirrorGuest<'_> {
+            type Memory = reverie::syscalls::LocalMemory;
+            type Stack = NoStack;
+
+            fn tid(&self) -> Tid {
+                self.sender
+            }
+            fn pid(&self) -> Tid {
+                self.sender
+            }
+            fn ppid(&self) -> Option<Tid> {
+                None
+            }
+            fn memory(&self) -> Self::Memory {
+                reverie::syscalls::LocalMemory::new()
+            }
+            fn thread_state(&self) -> &crate::ThreadState<()> {
+                &self.thread
+            }
+            fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+                &mut self.thread
+            }
+            async fn regs(&mut self) -> libc::user_regs_struct {
+                panic!("a mirror must not read registers")
+            }
+            async fn stack(&mut self) -> Self::Stack {
+                panic!("a mirror must not use a guest stack")
+            }
+            async fn daemonize(&mut self) {
+                panic!("a mirror must not daemonize")
+            }
+            async fn inject<S: SyscallInfo>(&mut self, call: S) -> Result<i64, Errno> {
+                assert_eq!(call.number(), Sysno::setsid);
+                *self.injections.lock().unwrap() += 1;
+                if let Err(errno) = self.answer {
+                    self.recorded = self.refusal.map(|operation| {
+                        reverie::UnsupportedRefusal::new(operation, errno, "test backend")
+                    });
+                }
+                self.answer
+            }
+            fn take_unsupported_refusal(&mut self) -> Option<reverie::UnsupportedRefusal> {
+                self.recorded.take()
+            }
+            async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+                panic!("a mirror must not retire the guest")
+            }
+            fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+                panic!("a mirror must not set a timer")
+            }
+            fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+                panic!("a mirror must not set a timer")
+            }
+            fn read_clock(&mut self) -> Result<u64, Error> {
+                panic!("a mirror must not read the clock")
+            }
+        }
+
+        /// The negative control for the mirror of a group change the model
+        /// accepted: the backend's success, or its typed statement that it
+        /// keeps no process groups, lets the model's answer stand; any other
+        /// failure, a bare ENOSYS (as a guest's seccomp filter could give)
+        /// or an errno the model did not predict, refuses the run by name in
+        /// a fail-closed run, never passing the errno on.
+        #[tokio::test]
+        async fn a_failed_mirror_stands_only_with_the_typed_process_group_refusal() {
+            use reverie::UnsupportedOperation::Flock;
+            use reverie::UnsupportedOperation::ProcessGroups;
+            let process = DetPid::from_raw(23);
+            for (answer, refusal, accepted) in [
+                (Ok(23), None, true),
+                (Err(Errno::ENOSYS), Some(ProcessGroups), true),
+                (Err(Errno::ENOSYS), None, false),
+                (Err(Errno::EPERM), None, false),
+                (Err(Errno::ENOSYS), Some(Flock), false),
+            ] {
+                let config = Config {
+                    panic_on_unsupported_syscalls: true,
+                    exit_on_unsupported_syscall: true,
+                    shutdown_on_unsupported_syscall: false,
+                    ..Config::default()
+                };
+                let global = GlobalState::init_global_state(&config).await;
+                let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
+                let mut thread = crate::ThreadState::new(process, &config, ());
+                thread.detpid = Some(process);
+                let mut guest = MirrorGuest {
+                    config: &config,
+                    global: &global,
+                    thread,
+                    sender: Tid::from_raw(process.as_raw()),
+                    answer,
+                    refusal,
+                    recorded: None,
+                    injections: Mutex::new(0),
+                };
+                let result = tool
+                    .mirror_group_change(
+                        &mut guest,
+                        reverie::syscalls::Syscall::Setsid(reverie::syscalls::Setsid::new()),
+                    )
+                    .await;
+                match result {
+                    Ok(()) if accepted => {}
+                    Err(Error::Tool(error)) if !accepted => assert_eq!(
+                        error
+                            .downcast_ref::<crate::UnsupportedSyscallError>()
+                            .unwrap()
+                            .0,
+                        Sysno::setsid,
+                        "{answer:?} {refusal:?}"
+                    ),
+                    result => panic!("wrong mirror policy for {answer:?} {refusal:?}: {result:?}"),
+                }
+                assert_eq!(*guest.injections.lock().unwrap(), 1);
+                assert_eq!(guest.recorded, None, "a reported refusal must be taken");
+            }
+        }
+    }
 
     struct ScatterMemory {
         bytes: Vec<u8>,

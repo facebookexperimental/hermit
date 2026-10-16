@@ -2401,7 +2401,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (Claude review of https://github.com/rrnewton/hermit/pull/4424, N6): 1916, listed.
     // And +2 from 955bbf36: 1918.
     // Numeric procfs stream ordering and ordinary-name regression tests: +2.
-    ("test.detcore_unit", 1920),
+    // And +1 from a52129ba: 1921.
+    ("test.detcore_unit", 1921),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4163,7 +4164,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same polling-wait test: 1916.
     // And +2 from 955bbf36: 1918.
     // Numeric procfs stream ordering and ordinary-name regression tests: +2.
-    ("test.detcore_unit_on_host", 1920),
+    // And +1 from a52129ba: 1921.
+    ("test.detcore_unit_on_host", 1921),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
