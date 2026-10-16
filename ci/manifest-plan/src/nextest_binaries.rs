@@ -1048,6 +1048,77 @@ fn cargo_output(root: &Path, args: &[String], destination: &Path) -> Result<(), 
     Ok(())
 }
 
+/// Runs each `program` (Cargo) command of `listings` (arguments, output file), which
+/// must compile nothing, such as `nextest list` given both metadata files, up
+/// to [`preparation_build_jobs`] at a time and without
+/// ci/run-with-reverie-dbt-budget.sh. That wrapper binds the Reverie DBT build
+/// budget to its pin with a pin check of about 0.8 s a call, and a command
+/// that builds nothing has no budget to bind; `run` already starts its
+/// `nextest` this way. Twenty such listings ran one at a time through it in
+/// build.workspace_in_pinned_root, about 16 s of pin checks on the critical
+/// path of every validation. The first failure is returned once every started
+/// listing has finished.
+fn listing_outputs(
+    root: &Path,
+    program: &std::ffi::OsStr,
+    listings: &[(Vec<String>, PathBuf)],
+) -> Result<(), PreparationError> {
+    let jobs = preparation_build_jobs()
+        .parse::<usize>()
+        .unwrap_or(1)
+        .max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failures = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.min(listings.len()) {
+            scope.spawn(|| {
+                while let Some((args, destination)) =
+                    listings.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                {
+                    if let Err(error) = listing_output(root, program, args, destination) {
+                        failures
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(error);
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    match failures
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .into_iter()
+        .next()
+    {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn listing_output(
+    root: &Path,
+    program: &std::ffi::OsStr,
+    args: &[String],
+    destination: &Path,
+) -> Result<(), PreparationError> {
+    let output = fs::File::create(destination).map_err(|e| e.to_string())?;
+    let status = Command::new(program)
+        .args(args)
+        .current_dir(root)
+        .stdout(output)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err(PreparationError {
+            message: format!("Cargo listing failed ({status}): {args:?}"),
+            status: u8::try_from(exit_code(status)).unwrap_or(1),
+        });
+    }
+    Ok(())
+}
+
 fn check_identity(expected: &FileIdentity, executable: bool) -> Result<(), String> {
     let actual = file_identity(&expected.path, executable)?;
     if &actual != expected {
@@ -1867,6 +1938,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     // Hash only after every Cargo selection has completed. Shared paths may be
     // rebuilt by another selection; every published record names the final files.
     let mut recorded_selections = BTreeMap::new();
+    let mut listings = Vec::new();
     for (key, build_args) in selections {
         let path = generation.join(format!("{key}.json"));
         let (binaries, runtime_files) = metadata_binaries(&read_json(&path)?, &cargo, &target)?;
@@ -1882,9 +1954,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             "json",
         ]
         .map(String::from);
-        // Nextest itself must accept every complete metadata pair after the
-        // final build; this enumerates tests and never invokes the compiler.
-        cargo_output(&root, &args, &generation.join(format!("{key}.tests.json")))?;
+        listings.push((args.to_vec(), generation.join(format!("{key}.tests.json"))));
         recorded_selections.insert(
             key,
             SelectionRecord {
@@ -1895,6 +1965,9 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             },
         );
     }
+    // Nextest itself must accept every complete metadata pair after the final
+    // build; this enumerates tests and never invokes the compiler.
+    listing_outputs(&root, "cargo".as_ref(), &listings)?;
     let guests = if needs_guests {
         guest_executables(
             &fs::read_to_string(&guest_path).map_err(|e| e.to_string())?,
@@ -2155,6 +2228,64 @@ mod tests {
             .iter()
             .map(|text| (selection_key(&args(text)), args(text)))
             .collect()
+    }
+
+    #[test]
+    fn listings_run_concurrently_without_the_budget_wrapper_and_report_a_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-prepared-listings-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        // A stand-in for Cargo: it records how many listings overlap, prints
+        // its arguments as the listing, and fails on request.
+        let program = root.join("cargo");
+        fs::write(
+            &program,
+            "#!/bin/sh\n\
+             mkdir \"$PWD/running.$$\"\n\
+             sleep 0.3\n\
+             ls -d \"$PWD\"/running.* | wc -l >> \"$PWD/overlap\"\n\
+             rmdir \"$PWD/running.$$\"\n\
+             echo \"$@\"\n\
+             [ \"$1\" != fail ]\n",
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let listings: Vec<_> = (0..4)
+            .map(|index| {
+                (
+                    args(&format!("nextest list {index}")),
+                    root.join(format!("{index}.json")),
+                )
+            })
+            .collect();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("CARGO_BUILD_JOBS", "4") };
+        listing_outputs(&root, program.as_os_str(), &listings).unwrap();
+        for index in 0..4 {
+            assert_eq!(
+                fs::read_to_string(root.join(format!("{index}.json"))).unwrap(),
+                format!("nextest list {index}\n")
+            );
+        }
+        let overlap = fs::read_to_string(root.join("overlap")).unwrap();
+        assert!(
+            overlap
+                .lines()
+                .any(|line| line.trim().parse::<u32>().unwrap() > 1),
+            "the listings never overlapped: {overlap:?}"
+        );
+        let failing = vec![(args("fail now"), root.join("fail.json"))];
+        let error = listing_outputs(&root, program.as_os_str(), &failing).unwrap_err();
+        assert!(
+            error.message.contains("Cargo listing failed"),
+            "{}",
+            error.message
+        );
+        assert_eq!(error.status, 1);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
