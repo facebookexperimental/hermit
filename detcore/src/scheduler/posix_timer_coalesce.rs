@@ -808,7 +808,9 @@ impl Scheduler {
         signal: i32,
         at: Option<LogicalTime>,
     ) -> DeliveryAnswer {
-        self.pending_timer_dequeues.remove(&thread);
+        if let Some(unfinished) = self.pending_timer_dequeues.remove(&thread) {
+            self.retire_unfinished_dequeue(unfinished);
+        }
         if !self.coalesces_alarms() || !(1..32).contains(&signal) {
             return DeliveryAnswer::AsIs;
         }
@@ -1148,6 +1150,7 @@ impl Scheduler {
             ));
         }
         if pending.signal != signal || how == (Consumption::KeptResume { blocked: true }) {
+            self.retire_unfinished_dequeue(pending);
             return None;
         }
         // A delivery that never asked for its siginfo (it ended the thread
@@ -1157,12 +1160,19 @@ impl Scheduler {
             pending.reconcile = Some((captured.entry.timer, at, captured_overrun(&captured, at)));
         }
         // After an early pop, a send's copy is the identified queue's new
-        // front, physically there (`pop_in_flight_front`).
+        // front, physically there (`pop_in_flight_front`), unless another
+        // thread's delivery stop has since dequeued it and waits for its own
+        // turn (this pending dequeue is already removed, so any left for the
+        // same queue and signal is another's).
         let identified_expected = pending.early.is_some()
             && self
                 .discarded_at_send
                 .lists
-                .is_listed(pending.queue, signal);
+                .is_listed(pending.queue, signal)
+            && !self
+                .pending_timer_dequeues
+                .values()
+                .any(|other| other.queue == pending.queue && other.signal == signal);
         self.check_taken_queues(
             thread,
             pending.queue,
@@ -1178,8 +1188,8 @@ impl Scheduler {
     /// its queues read after it, before any promotion (rev 9 A''): the
     /// identified queue no longer holds the signal, and the other one holds
     /// it exactly when its list or its discarded bit says so. A
-    /// contradiction is a producer the schedule does not see, and refuses by
-    /// name.
+    /// contradiction is a producer or a consumer the schedule does not see,
+    /// and refuses by name.
     fn check_taken_queues(
         &self,
         thread: DetTid,
@@ -1200,7 +1210,7 @@ impl Scheduler {
             || self.discarded_at_send.is_discarded(other, signal);
         if identified_holds != identified_expected || other_holds != other_expected {
             refuse(format_args!(
-                "hermit: thread {thread} took signal {signal} from {queue:?}, and afterwards that queue {} the signal and {other:?} {} it, where the model of its pending entries expects it {} in {queue:?} and {} in {other:?}: a producer the schedule does not see, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)",
+                "hermit: thread {thread} took signal {signal} from {queue:?}, and afterwards that queue {} the signal and {other:?} {} it, where the model of its pending entries expects it {} in {queue:?} and {} in {other:?}: a {} the schedule does not see, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)",
                 if identified_holds {
                     "still held"
                 } else {
@@ -1213,6 +1223,13 @@ impl Scheduler {
                     "absent"
                 },
                 if other_expected { "held" } else { "absent" },
+                // A copy the model lacks came from a producer it did not see;
+                // a copy it expected that is gone, from a consumer.
+                if (identified_holds && !identified_expected) || (other_holds && !other_expected) {
+                    "producer"
+                } else {
+                    "consumer"
+                },
             ));
         }
     }
@@ -1231,6 +1248,15 @@ impl Scheduler {
     /// https://github.com/rrnewton/hermit/pull/4491). An entry behind the
     /// in-flight front means Linux, whose bit stays set, drops this send
     /// while the kernel kept it: no list can say that, so it is refused.
+    ///
+    /// The joining send's `standing` (`note_send_listed`) is read from the
+    /// discarded bit, which still describes the in-flight copy until the
+    /// stop finishes: after an early pop of a `Proxy` front standing on a
+    /// discarded copy, the send joins as `Proxy` with that record's
+    /// `SI_TIMER` flag. A later delivery rewrites it from its stored bytes,
+    /// and an exec re-send merges into the kept copy, so the record the guest
+    /// sees is the send's own (the Claude review of the in-flight-dequeue
+    /// fix, F6).
     pub(crate) fn pop_in_flight_front(&mut self, queue: QueueId, signal: i32, present: bool) {
         if present || !self.discarded_at_send.lists.is_listed(queue, signal) {
             return;
@@ -1261,11 +1287,21 @@ impl Scheduler {
     /// for it (`pop_in_flight_front`) is retired as its thread's entries are,
     /// so a periodic timer that waited for its dequeue re-arms.
     pub(crate) fn forget_pending_dequeue(&mut self, thread: DetTid) {
-        if let Some(PendingDequeue {
-            early: Some(popped),
-            ..
-        }) = self.pending_timer_dequeues.remove(&thread)
-        {
+        if let Some(unfinished) = self.pending_timer_dequeues.remove(&thread) {
+            self.retire_unfinished_dequeue(unfinished);
+        }
+    }
+
+    /// A pending dequeue dropped without finishing (its thread exited, a new
+    /// stop replaced it, or its finish did not match it): a front it holds
+    /// after an early pop (`pop_in_flight_front`) no longer has an owner, so
+    /// it is retired as a dead thread's entries are, and a periodic timer
+    /// that waited for its dequeue re-arms instead of stopping (the Claude
+    /// and Codex reviews of the in-flight-dequeue fix, F5 and P2). Before an
+    /// early pop the front is still in its list, where a later dequeue or the
+    /// queue's retirement reconciles it.
+    fn retire_unfinished_dequeue(&mut self, unfinished: PendingDequeue) {
+        if let Some(popped) = unfinished.early {
             self.note_private_entries_retired(vec![popped.entry]);
         }
     }

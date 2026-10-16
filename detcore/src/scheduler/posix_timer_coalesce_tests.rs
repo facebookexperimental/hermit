@@ -1235,3 +1235,98 @@ fn a_blocked_resume_after_an_early_pop_is_refused() {
         },
     );
 }
+
+/// With no delivery stop in flight, a send that finds the kernel's queue
+/// without the signal while its list has a front does not pop that front: a
+/// queue emptied behind the model's back is a consumer the schedule did not
+/// see, and the 4262 checks must still find it. The send is an A1 drop and
+/// the old front, with its own sender, stays (the Claude review of the
+/// in-flight-dequeue fix, F2).
+#[test]
+fn no_early_pop_without_an_in_flight_dequeue() {
+    let mut f = family();
+    let pr = private(&f);
+    let first = ordinary_siginfo(USR1, -6, 100, 1000);
+    f.guest_send(pr, first);
+    // An unseen consumer empties the kernel's queue; no stop reported it.
+    f.queues(0, 0);
+    f.guest_send(pr, ordinary_siginfo(USR1, -6, 200, 1000));
+    assert!(
+        matches!(f.entries(pr).as_slice(), [Entry::Plain { siginfo, .. }] if *siginfo == first),
+        "the old front stays: {:?}",
+        f.entries(pr)
+    );
+}
+
+/// After an early pop on the shared queue, another thread's delivery stop
+/// takes the send's copy before the first delivery's turn: every step is a
+/// valid Linux history (copy 1 to the leader, copy 2 to the sibling), so
+/// neither delivery refuses, whichever turn comes first (the Claude review of
+/// the in-flight-dequeue fix, F3).
+#[test]
+fn a_second_delivery_of_the_joined_copy_is_no_unseen_consumer() {
+    for sibling_first in [false, true] {
+        let mut f = family();
+        let sh = shared(&f);
+        let bit = kernel_signal_bit(USR1);
+        f.guest_send(sh, ordinary_siginfo(USR1, 0, 100, 1000));
+        f.queues(0, bit);
+        assert_eq!(
+            f.sched
+                .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(10))),
+            DeliveryAnswer::AsIs
+        );
+        f.queues(0, 0);
+        f.guest_send(sh, ordinary_siginfo(USR1, 0, 100, 1000));
+        f.queues(0, bit);
+        assert_eq!(
+            f.sched
+                .timer_signal_dequeue(f.sibling, USR1, Some(LogicalTime::from_nanos(20))),
+            DeliveryAnswer::AsIs
+        );
+        f.queues(0, 0);
+        let order = if sibling_first {
+            [f.sibling, f.leader]
+        } else {
+            [f.leader, f.sibling]
+        };
+        for thread in order {
+            f.sched.discarded_signal_control(
+                thread,
+                DiscardedSignalControl::Consumed {
+                    signal: USR1,
+                    how: Consumption::KeptResume { blocked: false },
+                    thread_holds: false,
+                    process_holds: false,
+                },
+            );
+        }
+        assert!(f.entries(sh).is_empty(), "sibling_first={sibling_first}");
+    }
+}
+
+/// An early-popped periodic timer entry whose delivery is replaced by a new
+/// stop of the same thread (the old dequeue never finished) re-arms its
+/// timer, as at the thread's exit (the Claude review of the in-flight-dequeue
+/// fix, F5).
+#[test]
+fn an_early_popped_timer_entry_rearms_when_a_new_stop_replaces_its_dequeue() {
+    let mut f = family();
+    let pr = private(&f);
+    let bit = kernel_signal_bit(USR1);
+    f.arm(0, SignalTarget::Thread(f.leader), 10, 10);
+    f.pop(10);
+    f.queues(bit, 0);
+    f.sched
+        .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(15)));
+    f.queues(0, 0);
+    f.guest_send(pr, ordinary_siginfo(USR1, -6, 100, 1000));
+    assert!(f.sched.blocked.timed_waiters.next_deadline().is_none());
+    f.queues(bit, 0);
+    f.sched
+        .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(25)));
+    assert!(
+        f.sched.blocked.timed_waiters.next_deadline().is_some(),
+        "the timer re-armed"
+    );
+}
