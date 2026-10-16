@@ -1904,7 +1904,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 crate::tool_global::report_unsupported_syscall(guest, sysno).await;
             }
             return self
-                .refuse_unserviceable_operation(guest, sysno, *errno)
+                .refuse_unserviceable_operation_because(guest, sysno, *errno, refusal.diagnostic)
                 .await;
         }
 
@@ -3341,7 +3341,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 crate::tool_global::report_unsupported_syscall(guest, call.number()).await;
             }
             return self
-                .refuse_unserviceable_operation(guest, call.number(), errno)
+                .refuse_unserviceable_operation_because(
+                    guest,
+                    call.number(),
+                    errno,
+                    refusal.diagnostic,
+                )
                 .await;
         }
 

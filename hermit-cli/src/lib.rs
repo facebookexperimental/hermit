@@ -1219,6 +1219,24 @@ fn in_guest_stats_request(
     }
 }
 
+/// Reports a refusal the fail-closed policy decided inside the guest as
+/// Hermit's own refusal. The in-guest Detcore that refuses tells the
+/// coordinator why (`GlobalState::policy_refusal`) and exits with
+/// `HERMIT_POLICY_REFUSAL_EXIT`, which ends only the guest process. Without
+/// this the run ended with that as the guest's exit status and no reason, or
+/// with whatever postcondition the early exit then tripped (an unregistered
+/// exit, or in-guest-trap's missing statistics). Checked before those.
+#[cfg(feature = "liteinst")]
+fn refuse_in_guest_policy(backend: Backend, refusal: Option<String>) -> Result<(), Error> {
+    match refusal {
+        Some(reason) => Err(Error::new(LiteinstInGuestRefusal::for_backend(
+            backend,
+            format!("{reason}; --backend=ptrace runs this program"),
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Why a finished `in-guest-trap` run did not show that it ran with syscall
 /// site patching off, from its dispatch record and the number of guest
 /// processes that reported LiteInst statistics: a site the runtime patched or
@@ -4174,6 +4192,7 @@ async fn dispatch_backend(
             let patched =
                 in_guest_trap_patching_evidence(backend, dispatch_stats.as_ref(), process_reports);
             let settled = settle_in_guest_exits(&exits, &global_state).await;
+            let policy_refusal = global_state.policy_refusal();
             if settled.is_err() || liteinst_requires_forced_shutdown(exit_status) {
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
@@ -4185,6 +4204,7 @@ async fn dispatch_backend(
                     dispatch_stats,
                 )
                 .await;
+            refuse_in_guest_policy(backend, policy_refusal)?;
             settled?;
             refuse_in_guest_trap_patching(backend, patched)?;
             return Ok(exit_status);
@@ -4480,6 +4500,7 @@ async fn dispatch_output_backend(
             let patched =
                 in_guest_trap_patching_evidence(backend, dispatch_stats.as_ref(), process_reports);
             let settled = settle_in_guest_exits(&exits, &global_state).await;
+            let policy_refusal = global_state.policy_refusal();
             let output = Output {
                 status: output.status.into(),
                 stdout: output.stdout,
@@ -4497,6 +4518,7 @@ async fn dispatch_output_backend(
                     dispatch_stats,
                 )
                 .await;
+            refuse_in_guest_policy(backend, policy_refusal)?;
             settled?;
             refuse_in_guest_trap_patching(backend, patched)?;
             return Ok(Output {

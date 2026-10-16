@@ -2606,8 +2606,9 @@ fn in_guest_trap_verifies_a_program_with_no_site_patched() {
 }
 
 /// Hermit, not the caller, decides site patching under `--backend=in-guest-trap`:
-/// the guest sees `REVERIE_LITEINST_SITE_PATCHING=0` though nobody set it, a
-/// caller value of `0` is accepted, and any other value is refused before the
+/// its selection (off) travels in the sealed bootstrap, so the guest does not
+/// see `REVERIE_LITEINST_SITE_PATCHING` at all, even when the caller passed
+/// `0`, which is accepted. Any other caller value is refused before the
 /// guest starts (exit 122) with a message that names the value and the two
 /// ways out.
 #[test]
@@ -2644,7 +2645,11 @@ fn in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on() {
             output.status,
             String::from_utf8_lossy(&output.stderr),
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "0\n", "{env:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "unset\n",
+            "{env:?}"
+        );
     }
     let refused = run(Some("1"));
     let stderr = String::from_utf8_lossy(&refused.stderr);
@@ -2713,80 +2718,110 @@ fn run_constructor_mutation_guest(backend: &str, mode: &str) -> Output {
     )
 }
 
-/// A shared library's constructor runs before the in-guest runtime's and can
-/// change the runtime's settings, which the runtime reads from the
-/// environment while it installs. Under `--backend=in-guest-trap` each Tool
-/// image compares the settings the runtime actually captured
-/// (`reverie_liteinst::site_patching_enabled` and `guest_stats_enabled`) with
-/// the host's request, which arrives over the coordinator connection, and
-/// refuses to run the program when they differ. Refused before `main`, each
-/// with its message: a constructor that sets REVERIE_LITEINST_SITE_PATCHING=1;
-/// one that removes it (which turns patching on); one that sets it to 1 while
-/// the library's interposed `getenv` sets it back to 0 during the runtime's
-/// installation, after the runtime read 1 (a check of the environment at the
-/// Tool's construction would see 0 and accept). The coordinator then refuses
-/// each run too (exit 122), for the sites the image's runtime patched.
-/// A constructor that removes the statistics variable can no longer turn
-/// statistics off: Hermit's launcher names the statistics coordinator in the
-/// sealed bootstrap, not the environment, so that run collects statistics and
-/// reaches `main` like the control. Controls: the constructor leaving
-/// everything alone runs under in-guest-trap; under liteinst, which patches by
-/// design, the restoring constructor reaches `main` and shows its `getenv` put
-/// the variable back to 0 during startup.
+/// An exec and a thread creation, which the in-guest runtime cannot perform,
+/// end the run as Hermit's named policy refusal (exit 122) on both in-guest
+/// backends, naming the call and the backend's reason. Before, the exec failed
+/// in the guest with EOPNOTSUPP, which Linux never returns for a valid exec,
+/// and the run went on to the guest's own exit status; and the refused thread
+/// ended the run with no reason (liteinst) or as missing LiteInst statistics
+/// (in-guest-trap), because the fail-closed exit runs inside the guest
+/// process. The shell runs `/bin/true` in a forked child, which execs it.
 #[test]
-fn in_guest_trap_refuses_a_guest_library_that_turns_site_patching_back_on() {
+fn liteinst_in_guest_refuses_exec_and_thread_creation_by_name() {
     let _guard = hermit_run_guard();
-    const PATCHING: &str = "detcore-liteinst: initialization failed: --backend=in-guest-trap runs \
-         with syscall site patching off, but the in-guest runtime installed this process with \
-         site patching on";
-    for (mode, image_refusal, run_refusal) in [
-        ("set", PATCHING, "its guests' LiteInst statistics report "),
-        ("unset", PATCHING, "its guests' LiteInst statistics report "),
+    let cases: [(&str, &[&str], &str, &str); 2] = [
         (
-            "set-then-restore",
-            PATCHING,
-            "its guests' LiteInst statistics report ",
+            "/bin/sh",
+            &["-c", "/bin/true; echo after"],
+            "refuses this run: execve",
+            "the in-guest backend cannot replace the process image",
         ),
+        (
+            "/usr/bin/python3",
+            &[
+                "-I",
+                "-B",
+                "-c",
+                "import threading; t = threading.Thread(target=print); t.start(); t.join()",
+            ],
+            "refuses this run: clone",
+            "the in-guest backend cannot create a thread or a vfork child",
+        ),
+    ];
+    for backend in ["liteinst", "in-guest-trap"] {
+        for (program, args, refusal, reason) in cases {
+            let output = super::hermit_test::hermit_output(
+                "hermit run",
+                Command::new(hermit_binary())
+                    .args(["--log=error", "--backend", backend, "run"])
+                    .args(["--max-timeslice=disabled", "--strict", "--base-env=minimal"])
+                    .arg("--")
+                    .arg(program)
+                    .args(args)
+                    .env_remove("REVERIE_LITEINST_SITE_PATCHING")
+                    .stdin(Stdio::null()),
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+                "{backend} {program}: {stderr}"
+            );
+            assert!(
+                stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+                "{backend} {program}: {stderr}"
+            );
+            assert!(
+                stderr.contains(&format!("--backend={backend} (")) && stderr.contains(refusal),
+                "{backend} {program}: {stderr}"
+            );
+            assert!(stderr.contains(reason), "{backend} {program}: {stderr}");
+            assert!(
+                !stderr.contains("exited without deregistering")
+                    && !stderr.contains("no guest process reported LiteInst statistics"),
+                "{backend} {program}: {stderr}"
+            );
+        }
+    }
+}
+
+/// A shared library's constructor runs before the in-guest runtime's and can
+/// change the environment the runtime used to read its settings from. Under
+/// `--backend=in-guest-trap` Hermit's site-patching selection (off) and the
+/// statistics coordinator now travel in the sealed bootstrap, which the
+/// runtime prefers and guest code cannot change. So no constructor turns
+/// patching back on or statistics off: one that sets
+/// REVERIE_LITEINST_SITE_PATCHING=1, one that removes it, one that sets it to
+/// 1 while the library's interposed `getenv` sets it back to 0 (the runtime
+/// no longer asks `getenv`, so nothing is restored), and one that removes the
+/// statistics variable each reach `main`. The run passes in-guest-trap's
+/// postcondition, which refuses any patched syscall site, so patching stayed
+/// off. Each image's own check (`in_guest_site_patching`) still refuses a
+/// runtime that captured patching on. Before, the guest saw the variable, and
+/// these constructors could flip it, which Hermit refused only afterwards.
+/// Controls: under liteinst, which takes the selection from the environment
+/// because Hermit sets none, the restoring constructor still shows its
+/// `getenv` put the variable back to 0 during startup, and the setting
+/// constructor's 1 is honored.
+#[test]
+fn in_guest_trap_keeps_site_patching_off_whatever_a_guest_library_does() {
+    let _guard = hermit_run_guard();
+    for (mode, restored, seen) in [
+        ("none", 0, "(unset)"),
+        ("no-stats", 0, "(unset)"),
+        ("set", 0, "1"),
+        ("unset", 0, "(unset)"),
+        ("set-then-restore", 0, "1"),
     ] {
         let output = run_constructor_mutation_guest("in-guest-trap", mode);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // The image refuses from its constructor (exit 127, as every in-guest
-        // initialization refusal does), and the coordinator's postcondition
-        // refuses the run as well: the typed in-guest refusal, exit 122.
+        assert!(output.status.success(), "{mode}: {output:?}");
         assert_eq!(
-            output.status.code(),
-            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
-            "{mode}: {output:?}"
-        );
-        assert!(
-            !stdout.contains("main ran"),
-            "{mode}: the program ran: {stdout}"
-        );
-        assert!(stderr.contains(image_refusal), "{mode}: {stderr}");
-        assert!(
-            stderr.contains("run this program with --backend=liteinst"),
-            "{mode}: {stderr}"
-        );
-        assert!(
-            stderr.contains(&format!(
-                "--backend=in-guest-trap (in-guest LiteInst, site patching off) refuses this \
-                 run: {run_refusal}"
-            )),
-            "{mode}: {stderr}"
-        );
-        assert!(
-            stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
-            "{mode}: {stderr}"
-        );
-    }
-
-    for mode in ["none", "no-stats"] {
-        let control = run_constructor_mutation_guest("in-guest-trap", mode);
-        assert!(control.status.success(), "{mode}: {control:?}");
-        assert_eq!(
-            String::from_utf8_lossy(&control.stdout),
-            format!("main ran; constructor {mode}; restored 0; REVERIE_LITEINST_SITE_PATCHING=0\n")
+            String::from_utf8_lossy(&output.stdout),
+            format!(
+                "main ran; constructor {mode}; restored {restored}; \
+                 REVERIE_LITEINST_SITE_PATCHING={seen}\n"
+            ),
+            "{mode}"
         );
     }
     let restored = run_constructor_mutation_guest("liteinst", "set-then-restore");

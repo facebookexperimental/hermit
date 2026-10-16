@@ -1705,7 +1705,16 @@ fi
 # UnsupportedOperation variant) and reverie-kvm/src/executor.rs; git diff is
 # empty under reverie-dbt/. No DynamoRIO build input moves, so the budget
 # carries; the reverie-dbt inventory is unchanged.
-expected_pin=cdf6e9d689e6dcbeafe1b1ed0ea8529a2d455414
+# IN-GUEST EXEC REFUSAL AND SITE-PATCHING SDK-BUDGET CARRY (2026-10-16):
+# advance cdf6e9d689e6dcbeafe1b1ed0ea8529a2d455414 to caa1deb31e6fddd14d3ed764d2f1759f0feab3d0.
+# Four commits: devbig030's reverie-ptrace 30f7925d and 4c20795a (Tool output
+# writes and the Tool stack commit), then 2f10ec67 (in-guest exec refused with
+# a typed refusal) and caa1deb3 (the site-patching selection in the sealed
+# bootstrap), touching reverie-ptrace, reverie-core, reverie-inguest,
+# reverie-liteinst and the M1 catalog. git diff is empty for reverie-dbt/, so
+# no DynamoRIO build input moves and the budget carries; the reverie-dbt
+# inventory is unchanged.
+expected_pin=caa1deb31e6fddd14d3ed764d2f1759f0feab3d0
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 3000,
-      "applicable": 1923,
-      "selectable": 1672,
+      "applicable": 1919,
+      "selectable": 1668,
       "population": 2930,
-      "population_candidate_selected": 1672,
+      "population_candidate_selected": 1668,
       "population_candidate_not_selected": 240,
-      "population_candidate_disabled": 1018
+      "population_candidate_disabled": 1022
     },
     "by_backend": {
       "dbt": {
@@ -28,12 +28,12 @@
       },
       "in-guest-trap": {
         "cells": 600,
-        "applicable": 314,
-        "selectable": 313,
+        "applicable": 312,
+        "selectable": 311,
         "population": 586,
-        "population_candidate_selected": 313,
+        "population_candidate_selected": 311,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 273
+        "population_candidate_disabled": 275
       },
       "kvm": {
         "cells": 600,
@@ -46,12 +46,12 @@
       },
       "liteinst": {
         "cells": 600,
-        "applicable": 315,
-        "selectable": 314,
+        "applicable": 313,
+        "selectable": 312,
         "population": 586,
-        "population_candidate_selected": 314,
+        "population_candidate_selected": 312,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 272
+        "population_candidate_disabled": 274
       },
       "sabre": {
         "cells": 600,
@@ -226,9 +226,9 @@
     {"test_id":"c-programs/dbt-mmap-exec","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/dbt-mmap-exec","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/dbt-pid-virtualization","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
-    {"test_id":"c-programs/dbt-pid-virtualization","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/dbt-pid-virtualization","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest execs a child after vfork, so its run is refused. It passed before only because that exec failed with EOPNOTSUPP in both verify runs and the exec'd image never ran."},
     {"test_id":"c-programs/dbt-pid-virtualization","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/dbt-pid-virtualization","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/dbt-pid-virtualization","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest execs a child after vfork, so its run is refused. It passed before only because that exec failed with EOPNOTSUPP in both verify runs and the exec'd image never ran."},
     {"test_id":"c-programs/dbt-pid-virtualization","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"},
     {"test_id":"c-programs/dbt-prlimit-self","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
     {"test_id":"c-programs/dbt-prlimit-self","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -1511,9 +1511,9 @@
     {"test_id":"c-programs/vectored-io","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/vectored-io","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/vforkexec","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/vforkexec","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/vforkexec","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest execs a child after vfork, so its run is refused. It passed before only because that exec failed with EOPNOTSUPP in both verify runs and the exec'd image never ran."},
     {"test_id":"c-programs/vforkexec","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/vforkexec","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/vforkexec","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest execs a child after vfork, so its run is refused. It passed before only because that exec failed with EOPNOTSUPP in both verify runs and the exec'd image never ran."},
     {"test_id":"c-programs/vforkexec","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"},
     {"test_id":"c-programs/vmsplice-enosys","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/vmsplice-enosys","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

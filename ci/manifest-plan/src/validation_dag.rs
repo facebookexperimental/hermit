@@ -254,7 +254,7 @@ pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm", "liteinst", "in-
 pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_backend_stats_report_the_guests_own_dispatch_paths",
     "liteinst_in_guest_programs::in_guest_trap_dispatch_record_reports_no_patched_sites",
-    "liteinst_in_guest_programs::in_guest_trap_refuses_a_guest_library_that_turns_site_patching_back_on",
+    "liteinst_in_guest_programs::in_guest_trap_keeps_site_patching_off_whatever_a_guest_library_does",
     "liteinst_in_guest_programs::in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on",
     "liteinst_in_guest_programs::in_guest_trap_sigalrm_scalar_identity_matches_ptrace",
     "liteinst_in_guest_programs::in_guest_trap_verifies_a_program_with_no_site_patched",
@@ -285,6 +285,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_python_random_example",
     "liteinst_in_guest_programs::liteinst_in_guest_reads_a_plain_file_on_a_fuse_filesystem",
     "liteinst_in_guest_programs::liteinst_in_guest_refuses_a_guest_that_opens_dev_fuse",
+    "liteinst_in_guest_programs::liteinst_in_guest_refuses_exec_and_thread_creation_by_name",
     "liteinst_in_guest_programs::liteinst_in_guest_round2_arithmetic_and_predicate_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_round2_encoding_and_comparison_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_round2_representation_and_path_utilities",

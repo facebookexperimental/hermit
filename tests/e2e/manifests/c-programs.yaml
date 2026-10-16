@@ -1107,23 +1107,15 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: true
-          in-guest-trap: true
           kvm: true
         backends_enabled:
           - ptrace
           - kvm
-          - liteinst
-          - in-guest-trap
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-        hermit_args:
-          liteinst:
-            - --max-timeslice=disabled
-          in-guest-trap:
-            - --max-timeslice=disabled
-        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
+          liteinst: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest execs a child after vfork, so its run is refused. It passed before only because that exec failed with EOPNOTSUPP in both verify runs and the exec'd image never ran."
+          in-guest-trap: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest execs a child after vfork, so its run is refused. It passed before only because that exec failed with EOPNOTSUPP in both verify runs and the exec'd image never ran."
       naked:
         ci: false
         backends_enabled: []
@@ -12391,16 +12383,10 @@ test:
           - ptrace
           - kvm
           - dbt
-          - liteinst
-          - in-guest-trap
         backends_disabled:
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-        hermit_args:
-          liteinst:
-            - --max-timeslice=disabled
-          in-guest-trap:
-            - --max-timeslice=disabled
-        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
+          liteinst: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest execs a child after vfork, so its run is refused. It passed before only because that exec failed with EOPNOTSUPP in both verify runs and the exec'd image never ran."
+          in-guest-trap: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest execs a child after vfork, so its run is refused. It passed before only because that exec failed with EOPNOTSUPP in both verify runs and the exec'd image never ran."
       naked:
         ci: false
         backends_enabled: []

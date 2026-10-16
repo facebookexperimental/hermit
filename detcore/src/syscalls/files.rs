@@ -4083,7 +4083,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 crate::tool_global::report_unsupported_syscall(guest, Sysno::flock).await;
             }
             return self
-                .refuse_unserviceable_operation(guest, Sysno::flock, Errno::ENOLCK)
+                .refuse_unserviceable_operation_because(
+                    guest,
+                    Sysno::flock,
+                    Errno::ENOLCK,
+                    refusal.diagnostic,
+                )
                 .await;
         }
 

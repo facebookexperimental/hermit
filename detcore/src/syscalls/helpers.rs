@@ -94,6 +94,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.cfg.panic_on_unsupported_syscalls,
             sysno,
             fallback,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::refuse_unserviceable_operation`], with the backend's own
+    /// description of why it cannot perform the operation, which a
+    /// fail-closed refusal reports as its reason.
+    pub(crate) async fn refuse_unserviceable_operation_because<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
+        fallback: Errno,
+        reason: &str,
+    ) -> Result<i64, Error> {
+        refuse_unserviceable_operation_with(
+            guest,
+            self.cfg.panic_on_unsupported_syscalls,
+            sysno,
+            fallback,
+            Some(reason),
         )
         .await
     }
@@ -2890,6 +2911,7 @@ pub(crate) async fn refuse_unserviceable_operation_with<T, G>(
     panic_on_unsupported_syscalls: bool,
     sysno: Sysno,
     fallback: Errno,
+    reason: Option<&str>,
 ) -> Result<i64, Error>
 where
     T: RecordOrReplay,
@@ -2900,7 +2922,17 @@ where
     }
     if guest.config().shutdown_on_unsupported_syscall {
         // Fail-closed policy: the operation is unserviceable and the config
-        // forbids passing it through.
+        // forbids passing it through. Say why first: on an in-guest backend
+        // the exit below ends only the guest process, and the launcher learns
+        // the reason from the coordinator.
+        let reason = match reason {
+            Some(reason) => format!("{sysno}: {reason}"),
+            None => format!(
+                "{sysno} cannot be serviced on this backend (with \
+                 --allow-unsupported-syscalls the guest would see {fallback})"
+            ),
+        };
+        crate::tool_global::report_policy_refusal(guest, reason).await;
         crate::tool_global::unrecoverable_shutdown(
             guest,
             detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
@@ -2960,6 +2992,7 @@ where
         panic_on_unsupported_syscalls,
         sysno,
         Errno::ERESTARTNOINTR,
+        None,
     )
     .await
 }

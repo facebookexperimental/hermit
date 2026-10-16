@@ -1069,6 +1069,10 @@ pub struct GlobalState {
     // Unsupported syscall names observed across every process in this run.
     unsupported_syscalls: Mutex<BTreeSet<String>>,
 
+    // Why the fail-closed policy ended the run, from the Tool image that
+    // refused (`GlobalRequest::PolicyRefusal`); the first report is kept.
+    policy_refusal: Mutex<Option<String>>,
+
     // The host identity of each file the guest opened in this run, in the
     // order the opens were reported, when `Config::record_host_inputs` is set
     // (see `detcore_model::host_input`). Written to `Config::host_input_log`
@@ -1343,6 +1347,7 @@ impl GlobalState {
             next_port: AtomicU16::new(range[0]),
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
+            policy_refusal: Mutex::new(None),
             host_inputs: Mutex::new(Vec::new()),
             host_mutations: Mutex::new(BTreeSet::new()),
             shared_open_files: process_exit_cleanup.shared_open_files,
@@ -1572,6 +1577,12 @@ impl GlobalState {
         if released != 0 {
             trace!("released {released} final physical process-exit barrier(s)");
         }
+    }
+
+    /// Why the fail-closed policy ended the run, when a Tool image reported
+    /// it before exiting (`GlobalRequest::PolicyRefusal`).
+    pub fn policy_refusal(&self) -> Option<String> {
+        self.policy_refusal.lock().unwrap().clone()
     }
 
     /// Unrecoverable fatal erorr. Bring things to a close cleanly, but as quickly as
@@ -2195,7 +2206,9 @@ impl GlobalState {
         let answered_for_sigkill_victim = consuming_cleanup
             || matches!(
                 &request,
-                GlobalRequest::ParkedProtocolFailure(_) | GlobalRequest::UnrecoverableShutdown
+                GlobalRequest::ParkedProtocolFailure(_)
+                    | GlobalRequest::UnrecoverableShutdown
+                    | GlobalRequest::PolicyRefusal(_)
             );
 
         let (exec_reconnect, is_exec_caller_after_local_mm_swap) = {
@@ -2441,6 +2454,10 @@ impl GlobalState {
             }
             GlobalRequest::ReleaseAllResources => {
                 R::ReleaseAllResources(self.recv_release_all_resources(from).await)
+            }
+            GlobalRequest::PolicyRefusal(reason) => {
+                self.policy_refusal.lock().unwrap().get_or_insert(reason);
+                R::PolicyRefusal(())
             }
             // TODO-HUMAN-REVIEW(PR-643): Review run-wide unsupported-syscall aggregation.
             GlobalRequest::ReportUnsupportedSyscall(name) => {
@@ -4901,6 +4918,12 @@ pub enum GlobalRequest {
     /// Add a syscall to the run-wide unsupported-use summary.
     ReportUnsupportedSyscall(String),
 
+    /// The fail-closed policy is ending the run, for this reason. Sent just
+    /// before the Tool image exits with `HERMIT_POLICY_REFUSAL_EXIT`, which on
+    /// an in-guest backend ends only the guest process: the launcher reads the
+    /// reason here to report the refusal (`GlobalState::policy_refusal`).
+    PolicyRefusal(String),
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
     /// Save the caller, address-space identity, and logically blocking descriptors before exec.
@@ -5359,6 +5382,7 @@ pub enum GlobalResponse {
     ReleaseAllResources(()),
     // TODO-HUMAN-REVIEW(PR-643): Review this new Detcore global RPC response.
     ReportUnsupportedSyscall(()),
+    PolicyRefusal(()),
     PrepareExec(()),
     CancelExec(()),
     ReconnectExec(bool),
@@ -5747,6 +5771,23 @@ where
     )
     .await;
     assert_eq!(response, GlobalResponse::ReportUnsupportedSyscall(()));
+}
+
+/// Tells the coordinator why the fail-closed policy is ending the run, before
+/// this Tool image exits (`GlobalRequest::PolicyRefusal`).
+pub(crate) async fn report_policy_refusal<G, T>(guest: &mut G, reason: String)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = send_and_update_time(guest, GlobalRequest::PolicyRefusal(reason)).await;
+    assert!(
+        matches!(
+            response,
+            GlobalResponse::PolicyRefusal(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to PolicyRefusal: {response:?}"
+    );
 }
 
 /// Mirrors a successful `set_tid_address(2)` into scheduler-owned exit state.
