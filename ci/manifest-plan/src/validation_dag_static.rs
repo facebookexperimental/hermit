@@ -1087,7 +1087,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1600 (hermit-manifest-plan lists 789 tests, 788 at 32e1c019).
     // And validation_dag's every_committed_pinned_root_node_forwards_the_rustc_stack_size:
     // 1601 (hermit-manifest-plan lists 790 tests).
-    ("test.regular_crates", 1601),
+    // And detcore-dbt's copied_child_refuses_scheduler_policy_queries_only_in_strict_mode:
+    // 1602, listed.
+    ("test.regular_crates", 1602),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
