@@ -277,6 +277,12 @@ impl Replayer {
             .map(|next| (next.dettid, self.resolve_time_to_run(next)))
     }
 
+    /// Whether the recorded schedule still has an event to replay. Past its
+    /// end the run goes on unguided (`ReplayAction::Continue`).
+    pub(super) fn has_events_left(&self) -> bool {
+        self.cursor.peek().is_some()
+    }
+
     fn next_replay_matches(&self, observed: &SchedEvent) -> bool {
         if let Some(expected) = self.cursor.peek() {
             !is_hard_desync(observed, expected)

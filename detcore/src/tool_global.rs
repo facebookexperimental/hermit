@@ -3783,13 +3783,13 @@ impl GlobalState {
                 let old_prio = sched.priorities.insert(child_dettid, initial_priority);
                 assert!(old_prio.is_none());
             } else {
-                // In replay mode, the context switch point will already have initialized the priority.
-                // UNLESS this is the root thread, in which case we need to fill it in:
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    sched.priorities.entry(child_dettid)
-                {
-                    assert_eq!(parent_detpid, ROOT_DETPID);
-                    entry.insert(initial_priority);
+                // In replay mode the schedule decides the thread's priority
+                // (`Scheduler::replay_registration_priority`).
+                if sched.replay_registration_priority(child_dettid, initial_priority) {
+                    warn!(
+                        "[detcore, dtid {}] registered before the replayed schedule switched to it, created by process {}; it takes its starting priority {}",
+                        child_dettid, parent_detpid, initial_priority
+                    );
                 }
             }
 

@@ -3016,7 +3016,7 @@ shell_replay_case!(
     Mode::Chaos
 );
 shell_replay_case!(
-    #[ignore = "https://github.com/rrnewton/hermit/issues/4472: the schedule replay panics in Detcore when a non-root process spawns"]
+    #[ignore = "replay diverges at a scheduler-turn time advance after a preemption lands at a different branch count; https://github.com/rrnewton/hermit/issues/4399 (its panic was https://github.com/rrnewton/hermit/issues/4472)"]
     trace_replay_shell_par_work,
     "par_work.sh",
     Mode::TraceReplay

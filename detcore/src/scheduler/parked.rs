@@ -720,7 +720,7 @@ impl Scheduler {
                 // pool at all.
                 self.blocked.sigchld_deferred.remove(&deferred);
                 self.blocked.sigchld_ready.insert(deferred);
-                self.run_queue.push_eager_io_repoll(deferred);
+                self.readmit_ready_thread(deferred);
                 if let SignalTimerId::ChildExit { child, .. } = id {
                     self.child_exit_sigchld.stand_in(parent, child);
                 }

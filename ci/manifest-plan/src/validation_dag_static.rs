@@ -1065,6 +1065,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the per-test CPU budget: 1545, listed.
     // And replay_modes' internal tests/shell targets: 26 cases for the six
     // scripts, one ignored for https://github.com/rrnewton/hermit/issues/4472
+    // (now for https://github.com/rrnewton/hermit/issues/4399)
     // and two for the per-test CPU budget: 1568, listed.
     // And replay_modes' a_refused_run_is_found_only_when_it_is_the_one_failure,
     // the parser of the skid retry for hermit-verify's runs: 1569.
@@ -2331,7 +2332,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (Claude re-check of https://github.com/rrnewton/hermit/pull/4439, N2): 1721, listed.
     // And a_placeholder_carries_the_uptime_of_the_first_read (https://github.com/rrnewton/hermit/issues/4213): 1722.
     // And +69 from a3a9c83a: 1791.
-    ("test.detcore_unit", 1791),
+    // And scheduler::test::a_readmission_keeps_its_replay_priority_until_the_schedule_runs_out
+    // and the_last_replayed_event_releases_the_replay_priorities and
+    // a_thread_registering_after_the_replay_ran_out_takes_the_default_priority
+    // (https://github.com/rrnewton/hermit/issues/4472): 1794, listed.
+    ("test.detcore_unit", 1794),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3324,7 +3329,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_parent_death_signal_reaches_the_child_when_its_parent_thread_leaves
     // (https://github.com/rrnewton/hermit/issues/4440): 445, listed.
     // And +2 from 7a4a7b54: 447.
-    ("test.cli", 447),
+    // And a_desynced_schedule_replay_admits_a_non_root_process_child
+    // (https://github.com/rrnewton/hermit/issues/4472): 448, listed.
+    ("test.cli", 448),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3714,7 +3721,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 4440 parent-death signal test
     // (https://github.com/rrnewton/hermit/issues/4440): 381, listed.
     // And +2 from 7a4a7b54: 383.
-    ("test.cli_on_host", 383),
+    // And the 4472 schedule-replay test
+    // (https://github.com/rrnewton/hermit/issues/4472): 384, listed.
+    ("test.cli_on_host", 384),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3981,7 +3990,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two 4411 tests and the 4439 reused-thread-id test: 1721.
     // And a_placeholder_carries_the_uptime_of_the_first_read (https://github.com/rrnewton/hermit/issues/4213): 1722.
     // And +69 from a3a9c83a: 1791.
-    ("test.detcore_unit_on_host", 1791),
+    // And the three 4472 replay-priority tests: 1794.
+    ("test.detcore_unit_on_host", 1794),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

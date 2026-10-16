@@ -14767,6 +14767,63 @@ fn happens_before_posthook_anchor_with_replay_schedule_is_refused() {
     }
 }
 
+/// A `--replay-schedule-from` run that has left its recorded schedule (a hard
+/// desync) is no longer guided by it, and a thread a process other than the
+/// root then creates has had no context switch to give it a priority. It
+/// takes its starting priority, as the root's children do, instead of failing
+/// Detcore's assertion that only the root's children can (Hermit exited 125
+/// with "left: DetPid(5) right: DetPid(3)",
+/// https://github.com/rrnewton/hermit/issues/4472). The schedule is recorded
+/// from a shell that forks nothing, and replayed under one whose subshell
+/// forks twice.
+#[test]
+fn a_desynced_schedule_replay_admits_a_non_root_process_child() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let record = format!("--record-preemptions-to={}", schedule.display());
+    let recorded = hermit(&[
+        "run",
+        "--strict",
+        &record,
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo done",
+    ]);
+    assert!(recorded.status.success(), "{}", stderr(&recorded));
+
+    let replay = format!("--replay-schedule-from={}", schedule.display());
+    let script = "( /bin/true; /bin/true ); echo done";
+    let replayed = hermit(&[
+        "--log=info",
+        "run",
+        "--strict",
+        &replay,
+        "--",
+        "/bin/sh",
+        "-c",
+        script,
+    ]);
+    let log = stderr(&replayed);
+    assert!(
+        replayed.status.success(),
+        "exit {:?}:\n{log}",
+        replayed.status.code()
+    );
+    assert_eq!(stdout(&replayed), "done\n");
+    // The replay did leave its recording, and the subshell's child did
+    // register without a priority: otherwise this is not the case.
+    assert!(log.contains("in a desynced state"), "{log}");
+    let marker = "registered before the replayed schedule switched to it, created by process ";
+    assert!(
+        log.lines()
+            .filter_map(|line| line.split_once(marker))
+            .any(|(_, rest)| !rest.starts_with("3;")),
+        "no thread of a process other than the root registered unguided:\n{log}"
+    );
+}
+
 /// A gate on a vfork child before its exec can never open: while the child
 /// runs, no other thread can (https://github.com/rrnewton/hermit/issues/3930).
 /// The child of `posix_spawn` calls dup2 before execve; a spec holding it there

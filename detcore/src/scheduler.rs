@@ -1810,6 +1810,10 @@ pub struct Scheduler {
     /// An instance of replayer that is responsible for replaying events in case --replay-preemptions-from is specified
     pub replayer: Option<Replayer>,
 
+    /// Whether the replayed schedule's priorities were dropped when its
+    /// recording ran out (`release_replay_priorities_if_exhausted`).
+    replay_priorities_released: bool,
+
     /// Count record_event calls which determines the event number if we're recording a schedule
     /// event trace.
     pub recorded_event_count: u64,
@@ -3560,6 +3564,7 @@ impl Scheduler {
                 None
             },
             replayer,
+            replay_priorities_released: false,
             recorded_event_count: 0,
             stacktrace_events,
             stop_after_turn: cfg.stop_after_turn,
@@ -4405,6 +4410,7 @@ impl Scheduler {
         }) {
             let print_stack = self.try_pop_stacktrace_event(ix, observed);
             debug!("Next ReplayAction = {:?}", action);
+            self.release_replay_priorities_if_exhausted();
 
             match action {
                 replayer::ReplayAction::Continue(timeslice_remaining) => {
@@ -7057,7 +7063,7 @@ impl Scheduler {
                 external.is_some() ^ sigsuspend.is_some(),
                 "ready thread must belong to exactly one blocking pool"
             );
-            self.run_queue.push_eager_io_repoll(dtid);
+            self.readmit_ready_thread(dtid);
         }
         Ok(())
     }
@@ -7083,7 +7089,7 @@ impl Scheduler {
         for dtid in ready {
             info!("[step2] Re-admit deferred SIGCHLD for dtid {:?}", dtid);
             self.blocked.sigchld_ready.insert(dtid);
-            self.run_queue.push_eager_io_repoll(dtid);
+            self.readmit_ready_thread(dtid);
         }
     }
 
@@ -10450,7 +10456,7 @@ impl Scheduler {
                         external.is_some() ^ sigsuspend.is_some(),
                         "ready thread must belong to exactly one blocking pool"
                     );
-                    scheduler.run_queue.push_eager_io_repoll(*ready_dtid);
+                    scheduler.readmit_ready_thread(*ready_dtid);
                 }
             };
 
@@ -13183,6 +13189,79 @@ impl Scheduler {
         self.run_queue.push_back(dettid, priority)
     }
 
+    /// Under `--replay-schedule-from`, give a thread registering now its
+    /// priority. A context switch to it that came before its registration
+    /// has already set one. Otherwise it takes its `starting` priority:
+    /// foreground for the root, deferred for any other thread, of whichever
+    /// process, until the replayed schedule switches to it
+    /// (https://github.com/rrnewton/hermit/issues/4472). Past the end of the
+    /// recording (`release_replay_priorities_if_exhausted`) every thread has
+    /// the default priority, so a new one does too: at the deferred priority
+    /// it could wait for ever behind a parent that never blocks. Returns
+    /// whether a thread other than the root took its starting priority
+    /// unguided, a sign that the replay has left its recording.
+    pub(crate) fn replay_registration_priority(
+        &mut self,
+        dettid: DetTid,
+        starting: Priority,
+    ) -> bool {
+        if self.replay_priorities_released {
+            self.priorities.insert(dettid, DEFAULT_PRIORITY);
+            return false;
+        }
+        match self.priorities.entry(dettid) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(starting);
+                dettid != crate::consts::ROOT_DETPID
+            }
+            std::collections::btree_map::Entry::Occupied(_) => false,
+        }
+    }
+
+    /// Once the replayed schedule has no events left, give every thread the
+    /// default priority, once. Nothing guides the run past that point, and a
+    /// thread the schedule left at the deferred priority would otherwise wait
+    /// for ever behind a foreground thread that never blocks, a thread the
+    /// schedule readmitted at the deferred priority included
+    /// (https://github.com/rrnewton/hermit/issues/4472). The point is the
+    /// consumption of the last recorded event, a scheduled event of a running
+    /// thread, so it is the same in every run.
+    fn release_replay_priorities_if_exhausted(&mut self) {
+        if self.replay_priorities_released
+            || self.replayer.as_ref().is_none_or(Replayer::has_events_left)
+        {
+            return;
+        }
+        self.replay_priorities_released = true;
+        info!("[sched] the replayed schedule ran out; every thread takes the default priority");
+        let threads: Vec<DetTid> = self.priorities.keys().copied().collect();
+        for dettid in threads {
+            self.requeue_with_new_priority(dettid, DEFAULT_PRIORITY);
+        }
+    }
+
+    /// Readmit a thread whose blocking call finished, or whose deferred
+    /// signal is due, ahead of all other work (`push_eager_io_repoll`).
+    /// While `--replay-schedule-from` still has recorded events, the replayed
+    /// schedule decides who runs next, through the priorities its context
+    /// switches set, so the thread goes back at its own priority instead: an
+    /// eager readmission outranked the thread the schedule had just switched
+    /// to (https://github.com/rrnewton/hermit/issues/4472). Past the end of
+    /// the recording nothing guides the run, and a thread left at the
+    /// deferred priority could wait behind a foreground one for ever, so
+    /// readmission is eager again.
+    fn readmit_ready_thread(&mut self, dettid: DetTid) {
+        if self
+            .replayer
+            .as_ref()
+            .is_some_and(Replayer::has_events_left)
+        {
+            self.runqueue_push_back(dettid);
+        } else {
+            self.run_queue.push_eager_io_repoll(dettid);
+        }
+    }
+
     /// Push a thread to the front of its persistent priority band.
     ///
     /// This is reserved for protocol handoffs where the queued thread must run
@@ -15698,6 +15777,103 @@ mod test {
             child_tid_addr: 0,
             reconnect_priority: Some(DEFAULT_PRIORITY),
         })
+    }
+
+    /// A readmitted thread keeps the priority the replayed schedule gave it
+    /// while the schedule has events left, and is readmitted eagerly once it
+    /// has run out (https://github.com/rrnewton/hermit/issues/4472).
+    #[test]
+    fn a_readmission_keeps_its_replay_priority_until_the_schedule_runs_out() {
+        let mut sched = Scheduler::new(&Config::default());
+        let foreground = DetTid::from_raw(3);
+        let readmitted = DetTid::from_raw(5);
+        let event = SchedEvent::syscall(foreground, Sysno::getpid, SyscallPhase::Prehook);
+        sched.replayer = Some(Replayer::new(vec![event.clone()]));
+        sched
+            .priorities
+            .insert(foreground, REPLAY_FOREGROUND_PRIORITY);
+        sched
+            .priorities
+            .insert(readmitted, REPLAY_DEFERRED_PRIORITY);
+
+        sched.readmit_ready_thread(readmitted);
+        assert_eq!(
+            sched.run_queue.queued_priority(readmitted),
+            Some(REPLAY_DEFERRED_PRIORITY)
+        );
+
+        assert!(sched.run_queue.remove_tid(readmitted));
+        let _ = sched.replayer.as_mut().unwrap().observe_event(&event);
+        sched.readmit_ready_thread(readmitted);
+        let eager = sched.run_queue.queued_priority(readmitted).unwrap();
+        assert!(eager < REPLAY_FOREGROUND_PRIORITY, "{eager}");
+
+        // Outside a schedule replay, readmission is always eager.
+        sched.replayer = None;
+        assert!(sched.run_queue.remove_tid(readmitted));
+        sched.readmit_ready_thread(readmitted);
+        assert_eq!(sched.run_queue.queued_priority(readmitted), Some(eager));
+    }
+
+    /// A thread queued at the deferred replay priority when the recording
+    /// runs out does not stay behind the foreground thread: consuming the
+    /// last recorded event gives every thread the default priority
+    /// (https://github.com/rrnewton/hermit/issues/4472).
+    #[test]
+    fn the_last_replayed_event_releases_the_replay_priorities() {
+        let mut sched = Scheduler::new(&Config::default());
+        let foreground = DetTid::from_raw(3);
+        let deferred = DetTid::from_raw(5);
+        let first = SchedEvent::syscall(foreground, Sysno::getpid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(10_000));
+        let last = SchedEvent::syscall(foreground, Sysno::getppid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(20_000));
+        sched.replayer = Some(Replayer::new(vec![first.clone(), last.clone()]));
+        sched
+            .priorities
+            .insert(foreground, REPLAY_FOREGROUND_PRIORITY);
+        sched.priorities.insert(deferred, REPLAY_DEFERRED_PRIORITY);
+        sched.readmit_ready_thread(deferred);
+
+        let _ = sched.consume_schedevent(&first);
+        assert_eq!(
+            sched.run_queue.queued_priority(deferred),
+            Some(REPLAY_DEFERRED_PRIORITY)
+        );
+
+        let _ = sched.consume_schedevent(&last);
+        assert_eq!(
+            sched.run_queue.queued_priority(deferred),
+            Some(DEFAULT_PRIORITY)
+        );
+        assert_eq!(sched.priorities.get(&foreground), Some(&DEFAULT_PRIORITY));
+    }
+
+    /// A thread registering after the replayed schedule ran out takes the
+    /// default priority like every other thread, not the deferred one; one
+    /// registering earlier with no context switch to it takes its starting
+    /// priority (https://github.com/rrnewton/hermit/issues/4472).
+    #[test]
+    fn a_thread_registering_after_the_replay_ran_out_takes_the_default_priority() {
+        let mut sched = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(3);
+        let early = DetTid::from_raw(5);
+        let late = DetTid::from_raw(7);
+        let last = SchedEvent::syscall(parent, Sysno::getpid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(10_000));
+        sched.replayer = Some(Replayer::new(vec![last.clone()]));
+        sched.priorities.insert(parent, REPLAY_FOREGROUND_PRIORITY);
+
+        assert!(sched.replay_registration_priority(early, REPLAY_DEFERRED_PRIORITY));
+        assert_eq!(
+            sched.priorities.get(&early),
+            Some(&REPLAY_DEFERRED_PRIORITY)
+        );
+
+        let _ = sched.consume_schedevent(&last);
+        assert!(!sched.replay_registration_priority(late, REPLAY_DEFERRED_PRIORITY));
+        assert_eq!(sched.priorities.get(&late), Some(&DEFAULT_PRIORITY));
+        assert_eq!(sched.priorities.get(&early), Some(&DEFAULT_PRIORITY));
     }
 
     fn exec_replay(
