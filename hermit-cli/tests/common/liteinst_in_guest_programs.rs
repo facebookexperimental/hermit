@@ -1049,46 +1049,103 @@ fn liteinst_in_guest_an_undeliverable_sigalrm_is_a_loss_and_stops_the_guest() {
     assert!(!stderr.contains("Determinism verified"), "{stderr}");
 }
 
-/// Signal phase 1, step I4: with handlers admitted, an alarm expiry that is
-/// due at a syscall's completion runs the guest's SIGALRM handler. `alarm(1)`
-/// then `pause()`: the handler runs once, sees SIGALRM with si_code SI_KERNEL
-/// (128, what Linux reports for an alarm) and SIGALRM blocked inside it, pause
-/// returns EINTR and the mask is restored. A one-shot ITIMER_REAL that expires
-/// while SIGALRM is blocked runs nothing until sigprocmask unblocks it, and has
-/// run once when that call returns. The run is verified deterministic.
+/// Characterizes syscall-completion delivery and real SA_SIGINFO return masks
+/// against native Linux on LiteInst fallback, ptrace, and in-guest-trap. Each
+/// backend must pass strict typed verification with preemption disabled. The
+/// return modes distinguish the saved mask, sa_mask activation, an optional
+/// uc_sigmask edit, and the mask observed after returning through the restorer.
 #[test]
 fn liteinst_in_guest_sigalrm_handler_runs_at_syscall_completion() {
+    use detcore::Digest;
+    use hermit::canonical_verdict::VerificationReport;
+
+    use super::kvm_cancellation::bounded_command_with_timeout;
+    use super::kvm_cancellation::bounded_read;
+
     let _guard = hermit_run_guard();
-    let build_root = process_build_root("liteinst-sigalrm-delivery");
-    fs::create_dir_all(&build_root).expect("failed to create the SIGALRM guest directory");
-    let guest = build_root.join("sigalrm_delivery");
-    let compiled = Command::new("cc")
-        .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
-        .arg(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/liteinst_sigalrm_delivery.c"),
-        )
-        .arg("-o")
-        .arg(&guest)
-        .output()
-        .expect("failed to compile the SIGALRM guest");
-    assert!(compiled.status.success(), "{compiled:?}");
-    let output = super::hermit_test::hermit_output(
-        "hermit run",
-        liteinst_command("info")
-            .arg("--verify")
-            .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
-            .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
-            .arg("--")
-            .arg(&guest)
-            .stdin(Stdio::null()),
-    );
-    let output = assert_liteinst_in_guest_output(output);
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "install=0 errno=0\n\
+    let guest = sigalrm_fixture("liteinst_sigalrm_delivery");
+    let completion = b"install=0 errno=0\n\
          pause=-1 errno=4 runs=1 signal=14 code=128 blocked_inside=1 blocked_after=0\n\
-         unblock: before=0 after=1 blocked_after=0\n"
+         unblock: before=0 after=1 blocked_after=0\n";
+    let unchanged = b"install=0 errno=0 before_alrm=0 before_usr1=0\n\
+         pause=-1 errno=4 runs=1 signal=14 code=128\n\
+         saved_alrm=0 saved_usr1=0 active_alrm=1 active_usr1=1\n\
+         return_alrm=0 return_usr1=0\n\
+         after_alrm=0 after_usr1=0\n";
+    let edited = b"install=0 errno=0 before_alrm=0 before_usr1=0\n\
+         pause=-1 errno=4 runs=1 signal=14 code=128\n\
+         saved_alrm=0 saved_usr1=0 active_alrm=1 active_usr1=1\n\
+         return_alrm=0 return_usr1=1\n\
+         after_alrm=0 after_usr1=1\n";
+    let mut failures = Vec::new();
+    for (mode, expected) in [
+        ("completion", completion.as_slice()),
+        ("return-unchanged", unchanged.as_slice()),
+        ("return-edit-usr1", edited.as_slice()),
+    ] {
+        let directory = process_build_root(&format!("sigalrm-native-{mode}"));
+        let mut native = Command::new(&guest);
+        native.arg(mode).stdin(Stdio::null());
+        let status = bounded_command_with_timeout(&mut native, &directory, Duration::from_secs(57));
+        let stdout = bounded_read(&directory.join("stdout"), 1024 * 1024);
+        let stderr = bounded_read(&directory.join("stderr"), 16 * 1024 * 1024);
+        assert_eq!(status.code(), Some(0), "native/{mode}: {stderr:?}");
+        assert_eq!(stdout, expected, "native/{mode}");
+        let expected_stderr = if mode == "completion" {
+            vec![b'.'; 200]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(stderr, expected_stderr, "native/{mode}");
+        for backend in ["liteinst", "ptrace", "in-guest-trap"] {
+            let result = std::panic::catch_unwind(|| {
+                let verified = strict_sigalrm_fixture_run(&guest, backend, Some("1"), "0", mode);
+                let retained = process_build_root(&format!("sigalrm-fixture-{backend}-{mode}"));
+                if backend == "liteinst" {
+                    let stderr = bounded_read(&retained.join("stderr"), 16 * 1024 * 1024);
+                    assert_in_guest_selected(&String::from_utf8_lossy(&stderr));
+                }
+                let report = VerificationReport::from_current_json_slice(&bounded_read(
+                    &retained.join("verify.json"),
+                    16 * 1024 * 1024,
+                ))
+                .expect("complete current SIGALRM verification report");
+                let outputs = report.compared_outputs.expect("compared guest outputs");
+                for operand in [&outputs.left, &outputs.right] {
+                    assert_eq!(operand.exit_code, status.code(), "{backend}/{mode}");
+                    assert!(operand.signal.is_none(), "{backend}/{mode}");
+                    assert_eq!(
+                        operand.stdout_bytes,
+                        stdout.len() as u64,
+                        "{backend}/{mode}"
+                    );
+                    assert_eq!(
+                        operand.stdout_sha256,
+                        Digest::new(&stdout).to_string(),
+                        "{backend}/{mode}"
+                    );
+                    assert_eq!(
+                        operand.stderr_bytes,
+                        stderr.len() as u64,
+                        "{backend}/{mode}"
+                    );
+                    assert_eq!(
+                        operand.stderr_sha256,
+                        Digest::new(&stderr).to_string(),
+                        "{backend}/{mode}"
+                    );
+                }
+                assert_eq!(verified, expected, "{backend}/{mode}");
+                assert_eq!(verified, stdout, "{backend}/{mode} versus native");
+            });
+            if result.is_err() {
+                failures.push(format!("{backend}/{mode}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "signal characterization failed: {failures:?}"
     );
 }
 
@@ -3630,4 +3687,87 @@ fn liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno() {
             assert_in_guest_selected(&String::from_utf8_lossy(&output.stderr));
         }
     }
+}
+
+/// Full Linux siginfo survives both standard-signal coalescing orders.
+#[test]
+fn sigalrm_first_pending_metadata_matches_native_linux() {
+    use detcore::Digest;
+    use hermit::canonical_verdict::VerificationReport;
+
+    use super::kvm_cancellation::bounded_command_with_timeout;
+    use super::kvm_cancellation::bounded_read;
+
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("sigalrm_first_copy");
+    let mut failures = Vec::new();
+    for (mode, expired, code, errno, value) in [
+        ("guest-first", 1, -1, 73, 0x13579bdf),
+        ("timer-first", 1, 128, 0, 0),
+        ("guest-only", 0, -1, 73, 0x13579bdf),
+        ("self-si-user", 0, 0, 73, 0x13579bdf),
+    ] {
+        // Attempt all four mandatory modes, retain every panic as failure,
+        // and fail the body if any mode fails; catch_unwind is not a skip.
+        let result = std::panic::catch_unwind(|| {
+            let expected = format!(
+                "mode={mode} hits=1 pending_before=1 pending_after=0 expired={expired} \
+                 signo=14 code={code} errno={errno} value={value} pid_ok=1 uid_ok=1 raw128=1\n"
+            );
+            let directory = process_build_root(&format!("sigalrm-first-copy-native-{mode}"));
+            let mut native = Command::new(&guest);
+            native.arg(mode).stdin(Stdio::null());
+            let status =
+                bounded_command_with_timeout(&mut native, &directory, Duration::from_secs(57));
+            let stdout = bounded_read(&directory.join("stdout"), 1024 * 1024);
+            let stderr = bounded_read(&directory.join("stderr"), 16 * 1024 * 1024);
+            assert_eq!(status.code(), Some(0), "native/{mode}: {stderr:?}");
+            assert_eq!(stdout, expected.as_bytes(), "native/{mode}");
+            assert!(stderr.is_empty(), "native/{mode}: {stderr:?}");
+
+            // Existing helper keeps strict, verify-strict, nonempty INFO,
+            // exact guest outputs, current typed schema, and the 57s cap.
+            let verified = strict_sigalrm_fixture_run(&guest, "ptrace", Some("1"), "0", mode);
+            let retained = process_build_root(&format!("sigalrm-fixture-ptrace-{mode}"));
+            let report = VerificationReport::from_current_json_slice(&bounded_read(
+                &retained.join("verify.json"),
+                16 * 1024 * 1024,
+            ))
+            .expect("complete current first-copy verification report");
+            // The helper already requires these; spell them out to prevent
+            // accidental reuse of a looser output-only helper at integration.
+            report
+                .require_canonical_match()
+                .expect("nonempty canonical INFO match");
+            report
+                .require_exact_output_match()
+                .expect("exact guest output match");
+            let outputs = report.compared_outputs.expect("compared guest outputs");
+            for operand in [&outputs.left, &outputs.right] {
+                assert_eq!(operand.exit_code, status.code(), "ptrace/{mode}");
+                assert!(operand.signal.is_none(), "ptrace/{mode}");
+                assert_eq!(operand.stdout_bytes, stdout.len() as u64, "ptrace/{mode}");
+                assert_eq!(
+                    operand.stdout_sha256,
+                    Digest::new(&stdout).to_string(),
+                    "ptrace/{mode}"
+                );
+                assert_eq!(operand.stderr_bytes, 0, "ptrace/{mode}");
+                assert_eq!(
+                    operand.stderr_sha256,
+                    Digest::new(&stderr).to_string(),
+                    "ptrace/{mode}"
+                );
+            }
+            assert_eq!(verified, expected.as_bytes(), "ptrace/{mode}");
+            assert_eq!(verified, stdout, "ptrace/{mode} versus native");
+        });
+        if result.is_err() {
+            failures.push(mode);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "first-copy metadata modes failed: {failures:?}"
+    );
 }

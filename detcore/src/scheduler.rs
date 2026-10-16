@@ -7400,6 +7400,18 @@ impl Scheduler {
         }
     }
 
+    /// Publish the actual ITIMER_REAL expiry through the common signal path.
+    fn fire_itimer_real_copy(&mut self, process: DetPid, thread: DetTid, signal: Signal) -> bool {
+        debug_assert_eq!(signal, Signal::SIGALRM);
+        self.fire_process_alarm(
+            process,
+            thread,
+            signal,
+            None,
+            Some(discarded_at_send::SignalProducer::ItimerReal),
+        )
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     fn fire_alarm(&mut self, dpid: DetPid, dtid: DetTid, sig: Signal) {
@@ -7424,16 +7436,16 @@ impl Scheduler {
     /// keep the shared-queue record (`note_signal_left_in_shared_queue`): a
     /// `SIGEV_SIGNAL` timer that once copied this body without it left a
     /// later `sigsuspend` unarmed behind a spinner (the Claude re-check of
-    /// https://github.com/rrnewton/hermit/pull/4351, N1). `producer` names a
-    /// periodic POSIX timer whose discarded expiry is parked
-    /// (`DiscardedAtSend::unignore`).
+    /// https://github.com/rrnewton/hermit/pull/4351, N1). `producer` names
+    /// the actual ITIMER_REAL expiry, or a periodic POSIX timer whose
+    /// discarded expiry is parked (`DiscardedAtSend::unignore`).
     fn fire_process_alarm(
         &mut self,
         dpid: DetPid,
         dtid: DetTid,
         sig: Signal,
         info: Option<[u8; 128]>,
-        producer: Option<discarded_at_send::TimerProducer>,
+        producer: Option<discarded_at_send::SignalProducer>,
     ) -> bool {
         // A guest-handled SIGALRM goes to the process's ledger, not the kernel.
         if self.divert_sigalrm(dpid, sig) {
@@ -7749,8 +7761,8 @@ impl Scheduler {
 
     /// Send `sig` to `target` of `dpid`, classified against `named`, the task
     /// Linux names (`discarded_when_sent_to`), never inferred from `target`,
-    /// which may be a thread Hermit chose. `producer`: the periodic POSIX timer
-    /// sending it.
+    /// which may be a thread Hermit chose. `producer` identifies an actual
+    /// ITIMER_REAL expiry or the periodic POSIX timer sending it.
     fn fire_alarm_at(
         &mut self,
         dpid: DetPid,
@@ -7758,7 +7770,7 @@ impl Scheduler {
         sig: Signal,
         info: Option<[u8; 128]>,
         named: DetTid,
-        producer: Option<discarded_at_send::TimerProducer>,
+        producer: Option<discarded_at_send::SignalProducer>,
     ) -> bool {
         let Some(target) = target else {
             info!(
@@ -7843,7 +7855,13 @@ impl Scheduler {
         sig: Signal,
         producer: Option<discarded_at_send::TimerProducer>,
     ) -> bool {
-        self.fire_process_alarm(process, tid, sig, None, producer)
+        self.fire_process_alarm(
+            process,
+            tid,
+            sig,
+            None,
+            producer.map(discarded_at_send::SignalProducer::Posix),
+        )
     }
 
     /// Whether every consumption of a shared-queue copy of the signal `bit`
@@ -8095,7 +8113,14 @@ impl Scheduler {
             self.unproven_thread_timer_copies.insert((thread, signo));
         }
         let producer = self.posix_timer_producer(id);
-        self.send_guest_signal(thread, sig, Some(process), None, thread, producer);
+        self.send_guest_signal(
+            thread,
+            sig,
+            Some(process),
+            None,
+            thread,
+            producer.map(discarded_at_send::SignalProducer::Posix),
+        );
     }
 
     /// Whether timer `id`'s expiration can be sent to `thread` as signal
@@ -8904,8 +8929,8 @@ impl Scheduler {
     ///
     /// The send is classified against `named`, the task Linux names
     /// (`discarded_when_sent_to`), and recorded once it succeeds
-    /// (`discard_note_send`), with `producer`, the periodic POSIX timer sending
-    /// it. A discarded send commits no wake (`wake_signaled_guest_as`).
+    /// (`discard_note_send`), with the actual timer source `producer`. A
+    /// discarded send commits no wake (`wake_signaled_guest_as`).
     fn send_guest_signal(
         &mut self,
         dettid: DetTid,
@@ -8913,7 +8938,7 @@ impl Scheduler {
         thread_of: Option<DetPid>,
         info: Option<[u8; 128]>,
         named: DetTid,
-        producer: Option<discarded_at_send::TimerProducer>,
+        producer: Option<discarded_at_send::SignalProducer>,
     ) {
         debug!(
             "[dtid {}] deliver signal {} physically to guest thread.",
@@ -9004,7 +9029,15 @@ impl Scheduler {
         if result.is_ok()
             && let Some(token) = token
         {
-            self.discard_note_send(token, producer);
+            match producer {
+                Some(discarded_at_send::SignalProducer::ItimerReal) => {
+                    self.discard_note_itimer_real(token);
+                }
+                Some(discarded_at_send::SignalProducer::Posix(timer)) => {
+                    self.discard_note_send(token, Some(timer));
+                }
+                None => self.discard_note_send(token, None),
+            }
         }
         match result {
             Ok(()) if thread_of.is_none() => {

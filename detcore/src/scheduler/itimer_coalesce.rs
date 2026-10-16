@@ -93,9 +93,10 @@ impl Scheduler {
         self.models_signal_targets && !self.recordreplay_modes && !self.signal_control_installed()
     }
 
-    /// Whether the scheduler can see a dequeue of `process`'s shared-queue
-    /// SIGALRM at a committed point. Sticky once false.
-    pub(super) fn alarm_observable(&mut self, process: DetPid) -> bool {
+    /// Whether the current process state permits identifying a shared-queue
+    /// SIGALRM dequeue. A metadata query must not commit a recurrence-policy
+    /// change during a transient state, such as an exited leader before exec.
+    pub(super) fn alarm_observable_now(&self, process: DetPid) -> bool {
         if !self.coalesces_alarms() {
             return false;
         }
@@ -114,10 +115,19 @@ impl Scheduler {
             .into_iter()
             .filter_map(|child| self.thread_tree.notification_signal(child))
             .any(|signal| signal == libc::SIGALRM);
-        let observable = !self.background_call_processes.contains(&process)
+        !self.background_call_processes.contains(&process)
             && !host_timed
             && !foreign_exit
-            && threads.contains(&leader);
+            && threads.contains(&leader)
+    }
+
+    /// The recurrence owner commits loss of observability at its existing
+    /// timer boundaries. Once committed, it remains sticky.
+    pub(super) fn alarm_observable(&mut self, process: DetPid) -> bool {
+        if !self.coalesces_alarms() || self.alarm_unobservable.contains(&process) {
+            return false;
+        }
+        let observable = self.alarm_observable_now(process);
         if !observable {
             debug!(
                 "[dpid {}] ITIMER_REAL dequeues are not observable from here on; expiries forward at the pop.",
@@ -165,7 +175,7 @@ impl Scheduler {
             .signal_timer_period(SignalTimerId::Alarm(process))
             .is_some();
         if !periodic || !self.coalesces_alarms() {
-            self.fire_alarm(process, tid, signal);
+            self.fire_itimer_real_copy(process, tid, signal);
             return;
         }
         let now = self.committed_time;
@@ -180,7 +190,7 @@ impl Scheduler {
             return;
         }
         if !self.alarm_observable(process) {
-            self.fire_alarm(process, tid, signal);
+            self.fire_itimer_real_copy(process, tid, signal);
             self.blocked
                 .timed_waiters
                 .alarm_after_fire(process, deadline, None, now);
@@ -198,7 +208,7 @@ impl Scheduler {
             }
             Some(false) => {
                 self.guest_send_landed = None;
-                let sent = self.fire_alarm_with(process, tid, signal, None);
+                let sent = self.fire_itimer_real_copy(process, tid, signal);
                 let landed = sent && self.guest_send_landed != Some(false);
                 let copy = landed.then_some(true);
                 self.blocked
@@ -207,7 +217,7 @@ impl Scheduler {
             }
             None => {
                 self.alarm_unobservable.insert(process);
-                self.fire_alarm(process, tid, signal);
+                self.fire_itimer_real_copy(process, tid, signal);
                 self.blocked
                     .timed_waiters
                     .alarm_after_fire(process, deadline, None, now);
@@ -231,7 +241,7 @@ impl Scheduler {
                 Some(true) => {}
                 Some(false) => {
                     self.guest_send_landed = None;
-                    let sent = self.fire_alarm_with(process, tid, signal, None);
+                    let sent = self.fire_itimer_real_copy(process, tid, signal);
                     if sent && self.guest_send_landed != Some(false) {
                         self.blocked.timed_waiters.alarm_set_copy(process, true);
                     } else {
@@ -242,7 +252,7 @@ impl Scheduler {
                     if observable {
                         self.alarm_unobservable.insert(process);
                     }
-                    self.fire_alarm(process, tid, signal);
+                    self.fire_itimer_real_copy(process, tid, signal);
                     self.blocked.timed_waiters.alarm_rearm_after(process, t);
                 }
             }
@@ -621,6 +631,34 @@ mod tests {
         assert!(scheduler.alarm_unobservable.contains(&process));
         // Sticky even if the record could shrink.
         assert!(!scheduler.alarm_observable(process));
+    }
+
+    /// Inspecting ordinary reported-signal metadata while the leader is
+    /// absent must not latch a timer recurrence decision. Exec can later
+    /// reconnect the leader before any periodic timer has needed that decision.
+    #[test]
+    fn reported_metadata_during_a_leader_gap_does_not_change_recurrence() {
+        use super::super::discarded_at_send::DiscardedSignalAnswer;
+        use super::super::discarded_at_send::DiscardedSignalControl;
+
+        let (mut scheduler, process, leader) = one_process();
+        let worker = DetTid::from_raw(101);
+        scheduler.thread_tree.add_child(leader, worker, false);
+        register_known_thread_for(&mut scheduler, worker);
+        scheduler.next_turns.remove(&leader);
+        assert!(!scheduler.alarm_observable_now(process));
+        assert_eq!(
+            scheduler.discarded_signal_control(worker, DiscardedSignalControl::ClaimItimerReal),
+            DiscardedSignalAnswer::ItimerReal(false)
+        );
+        assert!(!scheduler.alarm_unobservable.contains(&process));
+        register_known_thread_for(&mut scheduler, leader);
+        assert!(scheduler.alarm_observable(process));
+        pop_at(&mut scheduler, 1_000_000);
+        assert_eq!(
+            phase(&scheduler, process),
+            Some(AlarmPhase::Inactive { copy: true })
+        );
     }
 
     /// Record and replay keep the legacy recurrence and return values.

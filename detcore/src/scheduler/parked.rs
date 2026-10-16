@@ -997,9 +997,7 @@ impl Scheduler {
             .control
             .clone()
             .ok_or(ProtocolFailure::Identity)?;
-        let mut siginfo = [0; 128];
-        siginfo[..4].copy_from_slice(&libc::SIGALRM.to_ne_bytes());
-        siginfo[8..12].copy_from_slice(&libc::SI_KERNEL.to_ne_bytes());
+        let siginfo = super::discarded_at_send::itimer_real_siginfo();
         let event = SignalEvent::new(
             libc::SIGALRM,
             siginfo,

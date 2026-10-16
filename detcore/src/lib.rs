@@ -523,9 +523,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return false;
         }
-        let mut info = [0_u8; reverie::SIGNAL_INFO_SIZE];
-        info[0..4].copy_from_slice(&libc::SIGALRM.to_ne_bytes());
-        info[8..12].copy_from_slice(&libc::SI_KERNEL.to_ne_bytes());
+        let info = scheduler::discarded_at_send::itimer_real_siginfo();
         let target = reverie::SignalTarget::Process { pid: guest.pid() };
         let delivered = match reverie::SignalEvent::new(libc::SIGALRM, info, target) {
             Ok(event) if before_syscall => guest
@@ -984,6 +982,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             // other tool reports for this, and it keeps 122 meaning one thing.
             unrecoverable_shutdown(guest, detcore_model::HERMIT_SIGINT_DEATH_EXIT).await
         } else {
+            if signal.signal() == Some(Signal::SIGALRM) {
+                self.normalize_reported_itimer_real(guest).await;
+            }
             if signal.signal() == Some(Signal::SIGCHLD)
                 && self.cfg.backend.reports_child_exit_publication
                 && !self.child_exit_sigchld_delivers(guest).await
@@ -1206,6 +1207,44 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest.set_timer_precise(schedule)
         };
         armed.expect("Failed to set timer");
+    }
+
+    /// Install Linux timer metadata only for the exact first kept expiry
+    /// claimed before this callback advances logical time.
+    async fn normalize_reported_itimer_real<G: Guest<Self>>(&self, guest: &mut G) {
+        use scheduler::discarded_at_send::DiscardedSignalAnswer;
+        use scheduler::discarded_at_send::DiscardedSignalControl;
+        if !scheduler::discarded_at_send::records(&self.cfg) {
+            return;
+        }
+        let Some(info) = guest.signal_info() else {
+            return;
+        };
+        if info == scheduler::discarded_at_send::itimer_real_siginfo() {
+            // A claimed copy may have requeued after a blocked resume. Its
+            // canonical payload is already installed; do not claim a newer
+            // publication that arrived while this copy was in flight.
+            return;
+        }
+        if tool_global::discarded_signal(guest, DiscardedSignalControl::ClaimItimerReal).await
+            != DiscardedSignalAnswer::ItimerReal(true)
+        {
+            return;
+        }
+        if let Err(errno) =
+            guest.set_signal_info(scheduler::discarded_at_send::itimer_real_siginfo())
+        {
+            tool_global::report_determinism_loss(
+                guest,
+                format!("ITIMER_REAL_SIGINFO_UNAVAILABLE: owned timer delivery cannot install Linux siginfo: {errno}"),
+            ).await;
+            match guest
+                .tail_inject(
+                    reverie::syscalls::ExitGroup::new()
+                        .with_status(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+                )
+                .await {}
+        }
     }
 
     /// Whether a `SIGCHLD` that stopped this thread is delivered, on a backend
@@ -2371,6 +2410,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         rpc: &R,
         unreported: reverie::UnreportedSignal,
     ) -> bool {
+        if unreported.signal() == Signal::SIGALRM
+            && scheduler::discarded_at_send::records(&self.cfg)
+        {
+            let tid = DetTid::from_raw(unreported.tid().as_raw());
+            rpc.send_rpc((
+                DetTime::default(),
+                MmId::initial(tid),
+                tool_global::GlobalRequest::DiscardedSignal(
+                    scheduler::discarded_at_send::DiscardedSignalControl::UnreportedAlarm,
+                ),
+            ))
+            .await;
+        }
         let kept = async {
             // The test-only claim fault drops the claimed copy here too, where a
             // relative `nanosleep`'s restart code makes the backend pass it on

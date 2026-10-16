@@ -25,11 +25,24 @@
 //! consumption the schedule sees clears it (`consume`, `take`, `flush`). A
 //! check subtracts the bits from the pending sets it reads (`discarded`).
 //!
+//! The same record retains the first kept ITIMER_REAL origin for reported
+//! handler delivery. A claim retires the exact copy before callback accounting;
+//! a later expiry cannot supply the earlier delivery's metadata. The shared
+//! canonical payload also serves deferred and parked in-guest delivery.
+//!
+//! Residual `ITIMER_REAL_UNOBSERVED_SIGINFO`: synchronous signal reads,
+//! unreported delivery, record/replay and processes outside `alarm_observable`
+//! retain their prior metadata behavior. Once an unreported SIGALRM can requeue
+//! privately after its hook, this record stops attributing handler metadata for
+//! that process. Unknown provenance is never promoted to timer ownership.
+//! These restrictions affect this metadata correction, not timer recurrence.
+//!
 //! Real-time signals are not tracked
 //! (<https://github.com/rrnewton/hermit/issues/4319>). Every bit above
 //! signal 31 is ignored.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -88,6 +101,22 @@ pub struct TimerProducer {
     pub arm_gen: u64,
 }
 
+/// The causal source of a scheduler publication. Only ITIMER_REAL may select
+/// Linux's SI_KERNEL timer payload; POSIX timer metadata is a separate source.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SignalProducer {
+    ItimerReal,
+    Posix(TimerProducer),
+}
+
+/// Linux's cleared siginfo for it_real_fn's SEND_SIG_PRIV SIGALRM.
+pub(crate) fn itimer_real_siginfo() -> [u8; reverie::SIGNAL_INFO_SIZE] {
+    let mut info = [0; reverie::SIGNAL_INFO_SIZE];
+    info[..4].copy_from_slice(&libc::SIGALRM.to_ne_bytes());
+    info[8..12].copy_from_slice(&libc::SI_KERNEL.to_ne_bytes());
+    info
+}
+
 /// What a sender read of a queue before its send (`DiscardedAtSend::pre_send`):
 /// whether the queue held a copy of the signal, and the queue's clear
 /// generation for that signal.
@@ -111,11 +140,28 @@ pub enum Consumption {
     Dropped,
 }
 
+/// The first kept SIGALRM copy in one existing pending queue.
+/// Unknown includes a physical first copy that no recorded send identified.
+/// This is payload provenance, not another signal queue or timer policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlarmOrigin {
+    ItimerReal,
+    Other,
+    Unknown,
+}
+
 /// The record (see the module documentation).
 #[derive(Debug, Default)]
 pub(crate) struct DiscardedAtSend {
     /// For each queue, the bits of its pending copies Linux discarded.
     bits: BTreeMap<QueueId, u64>,
+    /// Origin of the first kept SIGALRM, in this same pending-copy record.
+    /// Absence is Unknown, never proof that the physical queue is empty.
+    alarm_first: BTreeMap<QueueId, AlarmOrigin>,
+    /// An unreported resume can queue a private copy after the consumption
+    /// hook. Its origin is not an observed send, so this process no longer
+    /// attributes handler metadata. Separate from timer recurrence policy.
+    alarm_unreported: BTreeSet<DetPid>,
     /// For each queue, the bits of its pending copies a recorded send kept
     /// (`note_send`). A take decides from these and `bits` alone which queue
     /// its copy came from (`take_from`), so record and replay, where a
@@ -184,11 +230,83 @@ impl DiscardedAtSend {
         pre: PreSend,
         producer: Option<TimerProducer>,
     ) {
+        self.note_send_with_alarm_origin(
+            queue,
+            signal,
+            discarded,
+            pre,
+            producer,
+            AlarmOrigin::Other,
+        );
+    }
+
+    /// The actual ITIMER_REAL send succeeded. No guest/POSIX-timer sender
+    /// may call this tag: those keep using note_send (Other).
+    pub(crate) fn note_itimer_real_send(&mut self, queue: QueueId, discarded: bool, pre: PreSend) {
+        self.note_send_with_alarm_origin(
+            queue,
+            libc::SIGALRM,
+            discarded,
+            pre,
+            None,
+            AlarmOrigin::ItimerReal,
+        );
+    }
+
+    /// Query before any prehook can publish another signal. Unknown never
+    /// permits synthesizing timer siginfo.
+    pub(crate) fn alarm_origin(&self, queue: QueueId) -> AlarmOrigin {
+        self.alarm_first
+            .get(&queue)
+            .copied()
+            .unwrap_or(AlarmOrigin::Unknown)
+    }
+
+    /// Whether an existing recorded send left a kept or discarded copy.
+    /// False is NOT proof that the physical queue is empty.
+    pub(crate) fn has_recorded_copy(&self, queue: QueueId, signal: i32) -> bool {
+        let bit = kernel_signal_bit(signal) & STANDARD_SIGNALS;
+        self.kept.get(&queue).is_some_and(|kept| kept & bit != 0)
+            || self.is_discarded(queue, signal)
+    }
+
+    /// The caller has proved the exact queue of this already-dequeued copy,
+    /// and that it is not an already-canonical SI_KERNEL requeue. Claim the
+    /// timer BEFORE pre_handler_hook or another send. Never guess a shared
+    /// source while an unknown physical private copy may win. A false claim
+    /// leaves Other/Unknown/discarded copies for existing consumers to handle.
+    pub(crate) fn claim_itimer_real(&mut self, source: QueueId) -> bool {
+        if self.alarm_origin(source) != AlarmOrigin::ItimerReal {
+            return false;
+        }
+        self.retire_copy(source, libc::SIGALRM);
+        true
+    }
+
+    fn note_send_with_alarm_origin(
+        &mut self,
+        queue: QueueId,
+        signal: i32,
+        discarded: bool,
+        pre: PreSend,
+        producer: Option<TimerProducer>,
+        origin: AlarmOrigin,
+    ) {
         let bit = kernel_signal_bit(signal) & STANDARD_SIGNALS;
         if bit == 0 {
             return;
         }
         if !discarded {
+            if signal == libc::SIGALRM {
+                let same_generation = self.generation(queue, signal) == pre.generation;
+                let preserves_first =
+                    pre.present && same_generation && !self.is_discarded(queue, signal);
+                if !preserves_first {
+                    self.alarm_first.insert(queue, origin);
+                }
+                // If a physical copy was present but no send identified it,
+                // preserves_first leaves the absent entry Unknown.
+            }
             self.clear_bit(queue, signal);
             *self.kept.entry(queue).or_default() |= bit;
             return;
@@ -196,6 +314,9 @@ impl DiscardedAtSend {
         let emptied = !pre.present || self.generation(queue, signal) != pre.generation;
         if emptied {
             *self.bits.entry(queue).or_default() |= bit;
+            if signal == libc::SIGALRM {
+                self.alarm_first.remove(&queue);
+            }
         }
         if let Some(producer) = producer {
             self.parked.insert(
@@ -268,6 +389,16 @@ impl DiscardedAtSend {
         } else {
             shared
         };
+        if signal == libc::SIGALRM
+            && source == private
+            && !self.kept.get(&private).is_some_and(|kept| kept & bit != 0)
+            && !self.is_discarded(private, signal)
+        {
+            // The old bool answer cannot distinguish an unrecorded private
+            // copy from a kept shared one. Preserve that answer; never leave
+            // positive shared provenance after a possibly shared take.
+            self.alarm_first.remove(&shared);
+        }
         self.take(source, signal)
     }
 
@@ -290,6 +421,14 @@ impl DiscardedAtSend {
         shared_pending: u64,
     ) -> bool {
         let (private, shared) = (QueueId::Thread(thread), QueueId::Process(process));
+        let alarm = kernel_signal_bit(libc::SIGALRM);
+        if set & alarm != 0 {
+            for (queue, pending) in [(private, thread_pending), (shared, shared_pending)] {
+                if pending & alarm == 0 && self.alarm_first.contains_key(&queue) {
+                    self.retire_copy(queue, libc::SIGALRM);
+                }
+            }
+        }
         let emptied = |queue, pending: u64| self.discarded(queue) & set & !pending;
         let candidates = [
             (private, emptied(private, thread_pending)),
@@ -340,6 +479,11 @@ impl DiscardedAtSend {
                 // The copy now stands for a kept expiry.
                 self.clear_bit(parked.queue, signal);
                 *self.kept.entry(parked.queue).or_default() |= kernel_signal_bit(signal);
+                if signal == libc::SIGALRM {
+                    // This existing parked producer is a POSIX timer, not
+                    // ITIMER_REAL. Its now-kept copy must never gain that tag.
+                    self.alarm_first.insert(parked.queue, AlarmOrigin::Other);
+                }
             } else if !resend.iter().any(|(queue, _)| *queue == parked.queue) {
                 resend.push((parked.queue, producer));
             }
@@ -369,6 +513,9 @@ impl DiscardedAtSend {
         }
         let (old, new) = (QueueId::Thread(from), QueueId::Thread(to));
         self.retire(new);
+        if let Some(origin) = self.alarm_first.remove(&old) {
+            self.alarm_first.insert(new, origin);
+        }
         if let Some(bits) = self.bits.remove(&old) {
             self.bits.insert(new, bits);
         }
@@ -393,6 +540,10 @@ impl DiscardedAtSend {
 
     /// Forget `queue`: its thread or process is gone.
     pub(crate) fn retire(&mut self, queue: QueueId) {
+        if let QueueId::Process(process) = queue {
+            self.alarm_unreported.remove(&process);
+        }
+        self.alarm_first.remove(&queue);
         self.bits.remove(&queue);
         self.kept.remove(&queue);
         self.clear_generation
@@ -411,6 +562,9 @@ impl DiscardedAtSend {
 
     /// `signal` left `queue`: clear its bit and move its generation.
     fn retire_copy(&mut self, queue: QueueId, signal: i32) {
+        if signal == libc::SIGALRM {
+            self.alarm_first.remove(&queue);
+        }
         self.clear_bit(queue, signal);
         if let Some(kept) = self.kept.get_mut(&queue) {
             *kept &= !kernel_signal_bit(signal);
@@ -479,6 +633,13 @@ pub enum DiscardedSignalControl {
     /// The discarded bits of the calling thread's private queue and of its
     /// process's shared queue.
     Bits,
+    /// Before any logical-time accounting, claim the reported SIGALRM's
+    /// positively identified ITIMER_REAL copy. Already canonical SI_KERNEL
+    /// requeues must not claim a newer pending copy.
+    ClaimItimerReal,
+    /// This process used an unreported SIGALRM resume, whose later private
+    /// requeue is outside the pending-origin observation contract.
+    UnreportedAlarm,
 }
 
 /// The answer to a [`DiscardedSignalControl`].
@@ -488,6 +649,7 @@ pub enum DiscardedSignalAnswer {
     Token(DiscardToken),
     Discarded(bool),
     Bits { thread: u64, process: u64 },
+    ItimerReal(bool),
 }
 
 /// A sender's classification of one send, with what it read before the
@@ -675,6 +837,47 @@ impl Scheduler {
         self.discard_job_control_flush(token.queue, token.signal);
     }
 
+    /// Record the successful physical publication of an actual ITIMER_REAL
+    /// expiry in the existing pending-copy owner.
+    pub(crate) fn discard_note_itimer_real(&mut self, token: DiscardToken) {
+        debug_assert_eq!(token.signal, libc::SIGALRM);
+        self.discarded_at_send.note_itimer_real_send(
+            token.queue,
+            token.discarded,
+            PreSend {
+                present: token.present,
+                generation: token.generation,
+            },
+        );
+    }
+
+    /// A reported delivery in the observable timer domain. All consumers and
+    /// sends are ordered there, and an unreported requeue permanently removes
+    /// this proof. Linux selects the private queue before the shared queue.
+    fn claim_reported_itimer_real(&mut self, thread: DetTid, process: DetPid) -> bool {
+        if !self.alarm_observable_now(process)
+            || self.discarded_at_send.alarm_unreported.contains(&process)
+        {
+            return false;
+        }
+        let private = QueueId::Thread(thread);
+        let shared = QueueId::Process(process);
+        let source = if self
+            .discarded_at_send
+            .has_recorded_copy(private, libc::SIGALRM)
+        {
+            private
+        } else if self
+            .discarded_at_send
+            .has_recorded_copy(shared, libc::SIGALRM)
+        {
+            shared
+        } else {
+            return false;
+        };
+        self.discarded_at_send.claim_itimer_real(source)
+    }
+
     /// The job-control flush of `prepare_signal` for a send of `signal` into
     /// `queue`'s process.
     fn discard_job_control_flush(&mut self, queue: QueueId, signal: i32) {
@@ -719,6 +922,13 @@ impl Scheduler {
     ) -> DiscardedSignalAnswer {
         let process = self.thread_tree.process_of(dtid).unwrap_or(dtid);
         match control {
+            DiscardedSignalControl::ClaimItimerReal => {
+                DiscardedSignalAnswer::ItimerReal(self.claim_reported_itimer_real(dtid, process))
+            }
+            DiscardedSignalControl::UnreportedAlarm => {
+                self.discarded_at_send.alarm_unreported.insert(process);
+                DiscardedSignalAnswer::Recorded
+            }
             DiscardedSignalControl::PreSend {
                 named,
                 queue,
@@ -1200,5 +1410,319 @@ mod tests {
         send(&mut record, QueueId::Process(P), true, false);
         assert!(record.unignore(P, USR1, |_| true).is_empty());
         assert!(record.is_discarded(QueueId::Process(P), USR1));
+    }
+}
+
+#[cfg(test)]
+mod alarm_origin_tests {
+    use super::*;
+
+    const T: DetTid = DetTid::from_raw(10);
+    const U: DetTid = DetTid::from_raw(11);
+    const P: DetPid = DetPid::from_raw(10);
+    const ALRM: i32 = libc::SIGALRM;
+    const TIMER: AlarmOrigin = AlarmOrigin::ItimerReal;
+    const OTHER: AlarmOrigin = AlarmOrigin::Other;
+    const UNKNOWN: AlarmOrigin = AlarmOrigin::Unknown;
+
+    fn send(
+        r: &mut DiscardedAtSend,
+        q: QueueId,
+        origin: AlarmOrigin,
+        discarded: bool,
+        present: bool,
+    ) {
+        let pre = r.pre_send(q, ALRM, present);
+        match origin {
+            AlarmOrigin::ItimerReal => r.note_itimer_real_send(q, discarded, pre),
+            AlarmOrigin::Other => r.note_send(q, ALRM, discarded, pre, None),
+            AlarmOrigin::Unknown => panic!("Unknown is not an authenticated send tag"),
+        }
+    }
+
+    #[test]
+    fn every_two_send_order_preserves_the_first_kept_origin() {
+        for q in [QueueId::Thread(T), QueueId::Process(P)] {
+            for first in [TIMER, OTHER] {
+                for second in [TIMER, OTHER] {
+                    let mut r = DiscardedAtSend::default();
+                    send(&mut r, q, first, false, false);
+                    send(&mut r, q, second, false, true);
+                    assert_eq!(r.alarm_origin(q), first);
+                    assert!(!r.is_discarded(q, ALRM));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_discarded_later_send_does_not_replace_either_kept_origin() {
+        for first in [TIMER, OTHER] {
+            for later in [TIMER, OTHER] {
+                let q = QueueId::Process(P);
+                let mut r = DiscardedAtSend::default();
+                send(&mut r, q, first, false, false);
+                send(&mut r, q, later, true, true);
+                assert_eq!(r.alarm_origin(q), first);
+                assert!(!r.is_discarded(q, ALRM));
+            }
+        }
+    }
+
+    #[test]
+    fn either_kept_origin_replaces_a_known_discarded_artifact() {
+        for first in [TIMER, OTHER] {
+            for kept in [TIMER, OTHER] {
+                let q = QueueId::Process(P);
+                let mut r = DiscardedAtSend::default();
+                send(&mut r, q, first, true, false);
+                assert_eq!(r.alarm_origin(q), UNKNOWN);
+                assert!(r.is_discarded(q, ALRM));
+                send(&mut r, q, kept, false, true);
+                assert_eq!(r.alarm_origin(q), kept);
+                assert!(!r.is_discarded(q, ALRM));
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_physical_first_copy_stays_unknown_for_every_later_send() {
+        for later in [TIMER, OTHER] {
+            for discarded in [false, true] {
+                let q = QueueId::Process(P);
+                let mut r = DiscardedAtSend::default();
+                send(&mut r, q, later, discarded, true);
+                assert_eq!(r.alarm_origin(q), UNKNOWN);
+                assert!(!r.is_discarded(q, ALRM));
+                send(&mut r, q, TIMER, false, true);
+                assert_eq!(r.alarm_origin(q), UNKNOWN);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_claim_retires_before_a_prehook_can_publish_the_next_copy() {
+        let q = QueueId::Process(P);
+        let mut r = DiscardedAtSend::default();
+        send(&mut r, q, TIMER, false, false);
+        let before = r.pre_send(q, ALRM, true).generation;
+        assert!(r.claim_itimer_real(q));
+        assert_eq!(r.alarm_origin(q), UNKNOWN);
+        assert_eq!(r.pre_send(q, ALRM, false).generation, before + 1);
+        // Models a later prehook send, not the same already-dequeued copy.
+        send(&mut r, q, OTHER, false, false);
+        let generation = r.pre_send(q, ALRM, true).generation;
+        assert!(!r.claim_itimer_real(q));
+        assert_eq!(r.alarm_origin(q), OTHER);
+        assert!(r.has_recorded_copy(q, ALRM));
+        assert_eq!(r.pre_send(q, ALRM, true).generation, generation);
+        r.take(q, ALRM);
+        assert!(!r.claim_itimer_real(q));
+    }
+
+    #[test]
+    fn explicit_private_first_claim_preserves_the_shared_timer() {
+        let private = QueueId::Thread(T);
+        let shared = QueueId::Process(P);
+        let mut r = DiscardedAtSend::default();
+        send(&mut r, private, OTHER, false, false);
+        send(&mut r, shared, TIMER, false, false);
+        let generation = r.pre_send(private, ALRM, true).generation;
+        assert!(!r.claim_itimer_real(private));
+        assert_eq!(r.alarm_origin(private), OTHER);
+        assert_eq!(r.pre_send(private, ALRM, true).generation, generation);
+        // Existing ordinary-copy path consumes the selected private copy.
+        r.take(private, ALRM);
+        assert_eq!(r.alarm_origin(shared), TIMER);
+        assert!(r.claim_itimer_real(shared));
+    }
+
+    #[test]
+    fn a_generic_ambiguous_take_cannot_leave_positive_shared_provenance() {
+        let shared = QueueId::Process(P);
+        let mut r = DiscardedAtSend::default();
+        send(&mut r, shared, TIMER, false, false);
+        // Old bool interface cannot exclude an unknown physical private copy.
+        assert!(!r.take_from(T, P, ALRM));
+        assert_eq!(r.alarm_origin(shared), UNKNOWN);
+    }
+
+    #[test]
+    fn an_explicit_take_clears_only_its_selected_origin() {
+        let private = QueueId::Thread(T);
+        let shared = QueueId::Process(P);
+        let mut r = DiscardedAtSend::default();
+        send(&mut r, private, OTHER, false, false);
+        send(&mut r, shared, TIMER, false, false);
+        assert!(!r.take(private, ALRM));
+        assert_eq!(r.alarm_origin(private), UNKNOWN);
+        assert_eq!(r.alarm_origin(shared), TIMER);
+        assert!(!r.take(shared, ALRM));
+        assert_eq!(r.alarm_origin(shared), UNKNOWN);
+    }
+
+    #[test]
+    fn faulted_takes_clear_emptied_alarm_origins_but_keep_pending_ones() {
+        let private = QueueId::Thread(T);
+        let shared = QueueId::Process(P);
+        let alarm = kernel_signal_bit(ALRM);
+        let mut r = DiscardedAtSend::default();
+        send(&mut r, private, OTHER, false, false);
+        send(&mut r, shared, TIMER, false, false);
+        assert!(!r.take_faulted(T, P, alarm, 0, alarm));
+        assert_eq!(r.alarm_origin(private), UNKNOWN);
+        assert_eq!(r.alarm_origin(shared), TIMER);
+        assert!(!r.take_faulted(T, P, alarm, 0, 0));
+        assert_eq!(r.alarm_origin(shared), UNKNOWN);
+    }
+
+    #[test]
+    fn blocked_resume_keeps_origins_and_an_emptied_consumption_clears_them() {
+        let private = QueueId::Thread(T);
+        let shared = QueueId::Process(P);
+        let mut r = DiscardedAtSend::default();
+        send(&mut r, private, OTHER, false, false);
+        send(&mut r, shared, TIMER, false, false);
+        r.consume(
+            T,
+            P,
+            ALRM,
+            Consumption::KeptResume { blocked: true },
+            false,
+            false,
+        );
+        assert_eq!(r.alarm_origin(private), OTHER);
+        assert_eq!(r.alarm_origin(shared), TIMER);
+        r.consume(T, P, ALRM, Consumption::Dropped, false, true);
+        assert_eq!(r.alarm_origin(private), UNKNOWN);
+        assert_eq!(r.alarm_origin(shared), TIMER);
+        r.consume(
+            T,
+            P,
+            ALRM,
+            Consumption::KeptResume { blocked: false },
+            false,
+            false,
+        );
+        assert_eq!(r.alarm_origin(shared), UNKNOWN);
+    }
+
+    #[test]
+    fn flush_retire_and_rekey_follow_existing_queue_lifetimes() {
+        let private = QueueId::Thread(T);
+        let moved = QueueId::Thread(U);
+        let shared = QueueId::Process(P);
+        let mut r = DiscardedAtSend::default();
+        send(&mut r, private, OTHER, false, false);
+        send(&mut r, moved, TIMER, false, false);
+        send(&mut r, shared, TIMER, false, false);
+        r.rekey_thread(U, T);
+        assert_eq!(r.alarm_origin(private), TIMER);
+        assert_eq!(r.alarm_origin(moved), UNKNOWN);
+        assert_eq!(r.alarm_origin(shared), TIMER);
+        r.rekey_thread(T, T);
+        assert_eq!(r.alarm_origin(private), TIMER);
+        r.flush([private], ALRM);
+        assert_eq!(r.alarm_origin(private), UNKNOWN);
+        assert_eq!(r.alarm_origin(shared), TIMER);
+        r.retire(shared);
+        assert_eq!(r.alarm_origin(shared), UNKNOWN);
+    }
+
+    #[test]
+    fn unrelated_signals_do_not_clear_or_forge_alarm_origin() {
+        let q = QueueId::Thread(T);
+        let mut r = DiscardedAtSend::default();
+        send(&mut r, q, TIMER, false, false);
+        let pre = r.pre_send(q, libc::SIGUSR1, false);
+        r.note_send(q, libc::SIGUSR1, false, pre, None);
+        r.take(q, libc::SIGUSR1);
+        r.flush([q], 34);
+        assert_eq!(r.alarm_origin(q), TIMER);
+    }
+
+    #[test]
+    fn a_known_empty_queue_or_generation_change_allows_a_new_first_origin() {
+        let q = QueueId::Process(P);
+        let mut r = DiscardedAtSend::default();
+        send(&mut r, q, TIMER, false, false);
+        // Physical pre-send emptiness supersedes an old stale origin.
+        send(&mut r, q, OTHER, false, false);
+        assert_eq!(r.alarm_origin(q), OTHER);
+        let pre = r.pre_send(q, ALRM, true);
+        r.take(q, ALRM);
+        r.note_itimer_real_send(q, false, pre);
+        assert_eq!(r.alarm_origin(q), TIMER);
+    }
+
+    #[test]
+    fn false_claims_preserve_discarded_unknown_and_other_signal_records() {
+        let q = QueueId::Process(P);
+        let mut r = DiscardedAtSend::default();
+        send(&mut r, q, OTHER, true, false);
+        let generation = r.pre_send(q, ALRM, true).generation;
+        assert!(!r.claim_itimer_real(q));
+        assert!(r.is_discarded(q, ALRM));
+        assert!(r.has_recorded_copy(q, ALRM));
+        assert_eq!(r.pre_send(q, ALRM, true).generation, generation);
+        r.take(q, ALRM);
+        send(&mut r, q, TIMER, false, true); // Physical first is unknown.
+        assert_eq!(r.alarm_origin(q), UNKNOWN);
+        assert!(!r.claim_itimer_real(q));
+        assert!(r.has_recorded_copy(q, ALRM));
+        assert!(!r.has_recorded_copy(q, 34));
+        assert!(!r.has_recorded_copy(QueueId::Thread(T), ALRM));
+    }
+
+    #[test]
+    fn a_posix_timer_unignored_as_sigalrm_is_other_not_itimer_real() {
+        let q = QueueId::Process(P);
+        let mut r = DiscardedAtSend::default();
+        let producer = TimerProducer {
+            process: P,
+            timer: 7,
+            arm_gen: 2,
+        };
+        let pre = r.pre_send(q, ALRM, false);
+        r.note_send(q, ALRM, true, pre, Some(producer));
+        assert_eq!(r.alarm_origin(q), UNKNOWN);
+        assert!(r.unignore(P, ALRM, |p| *p == producer).is_empty());
+        assert_eq!(r.alarm_origin(q), OTHER);
+        send(&mut r, q, TIMER, false, true);
+        assert_eq!(r.alarm_origin(q), OTHER);
+    }
+}
+
+#[cfg(test)]
+mod reported_alarm_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_itimer_info_zeros_every_non_header_byte() {
+        let info = itimer_real_siginfo();
+        assert_eq!(
+            i32::from_ne_bytes(info[..4].try_into().unwrap()),
+            libc::SIGALRM
+        );
+        assert_eq!(
+            i32::from_ne_bytes(info[8..12].try_into().unwrap()),
+            libc::SI_KERNEL
+        );
+        assert!(info[4..8].iter().chain(&info[12..]).all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn unreported_origin_loss_survives_thread_exec_rekey_until_process_retirement() {
+        let process = DetPid::from_raw(100);
+        let thread = DetTid::from_raw(101);
+        let leader = DetTid::from_raw(100);
+        let mut record = DiscardedAtSend::default();
+        record.alarm_unreported.insert(process);
+        record.rekey_thread(thread, leader);
+        assert!(record.alarm_unreported.contains(&process));
+        record.retire(QueueId::Thread(leader));
+        assert!(record.alarm_unreported.contains(&process));
+        record.retire(QueueId::Process(process));
+        assert!(!record.alarm_unreported.contains(&process));
     }
 }

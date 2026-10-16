@@ -2357,7 +2357,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +7 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 1827, listed.
     // And +1 from c0e13d24: 1828.
     // And +2 from 3717a6b7: 1830.
-    ("test.detcore_unit", 1830),
+    // And +18 ITIMER_REAL metadata/coalescing controls: 1848, listed.
+    ("test.detcore_unit", 1848),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3363,7 +3364,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +3 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 463, listed.
     // And +6: detcore_fixes_the_virtual_kernel_files_on_every_backend became
     // one test per backend (seven), each within the 22 CPU-second cap: 469.
-    ("test.cli", 469),
+    // And +1 strict/native first-pending SIGALRM metadata control: 470, listed.
+    ("test.cli", 470),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3765,7 +3767,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from ae5ca666: 396.
     // And +3 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 399, listed.
     // And +6: the virtual-kernel-files test became one test per backend: 405.
-    ("test.cli_on_host", 405),
+    // And +1 strict/native first-pending SIGALRM metadata control: 406, listed.
+    ("test.cli_on_host", 406),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4040,7 +4043,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +7 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 1827, listed.
     // And +1 from c0e13d24: 1828.
     // And +2 from 3717a6b7: 1830.
-    ("test.detcore_unit_on_host", 1830),
+    // And +18 ITIMER_REAL metadata/coalescing controls: 1848, listed.
+    ("test.detcore_unit_on_host", 1848),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
