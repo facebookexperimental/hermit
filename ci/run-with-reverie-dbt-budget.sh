@@ -1707,7 +1707,7 @@ fi
 # carries; the reverie-dbt inventory is unchanged.
 # IN-GUEST EXEC REFUSAL AND SITE-PATCHING SDK-BUDGET CARRY (2026-10-16):
 # advance cdf6e9d689e6dcbeafe1b1ed0ea8529a2d455414 to caa1deb31e6fddd14d3ed764d2f1759f0feab3d0.
-# Four commits: devbig030's reverie-ptrace 30f7925d and 4c20795a (Tool output
+# Four commits: the reverie-ptrace commits 30f7925d and 4c20795a (Tool output
 # writes and the Tool stack commit), then 2f10ec67 (in-guest exec refused with
 # a typed refusal) and caa1deb3 (the site-patching selection in the sealed
 # bootstrap), touching reverie-ptrace, reverie-core, reverie-inguest,
