@@ -1048,7 +1048,9 @@ fn assert_network_manifest_reruns_offline(
     assert_guest_invariants(&replayed.stdout, "replay-last-network-recording");
     let stderr = String::from_utf8_lossy(&replayed.stderr);
     assert!(
-        stderr.contains(&format!("recording {id} is of kind network")),
+        stderr.contains(&format!(
+            " WARN hermit::controller: recording {id} (network) replays by rerunning its program"
+        )),
         "{stderr}"
     );
     assert_eq!(

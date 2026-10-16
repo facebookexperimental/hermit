@@ -1121,6 +1121,54 @@ pub fn stderr_subscriber(level: Option<LevelFilter>, budget: Option<LogBudget>) 
         .finish()
 }
 
+/// Where [`emit_before_tracing`] writes: the run's `--log-file`, or stderr.
+pub(crate) enum EarlyLog {
+    File(CappedWriter<BoundedWriter<File>>),
+    Stderr(Option<LogBudget>),
+}
+
+/// Stderr for a run under `--max-log-bytes`: each event is written once,
+/// without waiting, and dropped when stderr cannot take it at once (see
+/// [`write_stderr_diagnostic`]).
+struct NonWaitingStderr;
+
+impl Write for NonWaitingStderr {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        write_without_waiting(libc::STDERR_FILENO, buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Emit tracing events from `emit` in a process that has not installed its
+/// global subscriber yet (the outer `hermit` process, which installs one only
+/// inside the container). They go through a scoped, synchronous subscriber
+/// with the run's level and format, to the run's own destination, so they
+/// read and filter exactly like the run's later events. Neither subscriber
+/// starts a thread, and the scope ends before the global one is installed.
+pub(crate) fn emit_before_tracing(level: Option<LevelFilter>, log: EarlyLog, emit: impl FnOnce()) {
+    let level = level.unwrap_or(DEFAULT_TRACE_LEVEL);
+    match log {
+        EarlyLog::File(writer) => {
+            tracing::subscriber::with_default(sync_file_subscriber(level, writer), emit)
+        }
+        EarlyLog::Stderr(_) if hermit::nonwaiting_write::diagnostics_must_not_wait() => {
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(env_filter(level))
+                .with_writer(|| NonWaitingStderr)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, emit)
+        }
+        EarlyLog::Stderr(budget) => {
+            tracing::subscriber::with_default(stderr_subscriber(Some(level), budget), emit)
+        }
+    }
+}
+
 /// Initializes tracing to `stderr`.
 ///
 /// NOTE: Writes to stderr are unbuffered, so this may be slow.

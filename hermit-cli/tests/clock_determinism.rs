@@ -144,20 +144,11 @@ fn assert_success(output: &Output, label: &str) {
     );
 }
 
-/// The `(epoch, source)` pair of the run's `virtual-time epoch=` notice.
-fn reported_epoch(output: &Output) -> (String, String) {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let line = stderr
-        .lines()
-        .find_map(|line| line.strip_prefix("hermit: virtual-time epoch="))
-        .unwrap_or_else(|| panic!("no virtual-time epoch notice in stderr:\n{stderr}"));
-    let (epoch, rest) = line
-        .split_once(" source=")
-        .expect("notice names its source");
-    let (source, _) = rest
-        .split_once(';')
-        .expect("notice ends its source with ';'");
-    (epoch.to_owned(), source.to_owned())
+/// Whether the run warned that it drew its epoch from the host clock. Hermit
+/// reports nothing of an explicit epoch or one adopted from a recording.
+fn warns_of_a_host_clock_epoch(output: &Output) -> bool {
+    String::from_utf8_lossy(&output.stderr)
+        .contains(" WARN hermit::controller: this run drew its epoch from the host")
 }
 
 /// The probe's clock trajectory: all eight samples and the completion marker.
@@ -256,9 +247,8 @@ fn default_virtual_epoch_tracks_invocation_start_and_is_reported() {
         "default virtual epoch {observed} was not captured near host now [{before}, {after}]"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("virtual-time epoch="), "{stderr}");
-    assert!(stderr.contains("source=host-now"), "{stderr}");
-    assert!(stderr.contains("reproduce with --epoch="), "{stderr}");
+    assert!(warns_of_a_host_clock_epoch(&output), "{stderr}");
+    assert!(stderr.contains("; rerun it with: "), "{stderr}");
 }
 
 #[test]
@@ -277,11 +267,7 @@ fn explicit_virtual_epoch_reproduces_identical_observed_time() {
     );
     for output in [first, second] {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("source=explicit"), "{stderr}");
-        assert!(
-            stderr.contains("2000-12-31T23:59:59.123456789+00:00"),
-            "{stderr}"
-        );
+        assert!(!stderr.contains("hermit::controller"), "{stderr}");
     }
 }
 
@@ -336,18 +322,13 @@ fn replay_with_an_omitted_epoch_starts_from_the_recorded_epoch() {
         );
         assert_success(&recorded, "recording");
         assert_full_trajectory(&recorded);
-        assert_eq!(
-            reported_epoch(&recorded),
-            (REPEATABLE_EPOCH_RFC3339.to_owned(), "explicit".to_owned())
-        );
+        assert!(!warns_of_a_host_clock_epoch(&recorded));
 
         let replayed = run_replay_epoch_guest(&[format!("{flag}={}", schedule.display())], None);
         assert_success(&replayed, flag);
-        assert_eq!(
-            reported_epoch(&replayed),
-            (REPEATABLE_EPOCH_RFC3339.to_owned(), "recording".to_owned()),
-            "{flag}"
-        );
+        // Adopted from the recording, not drawn from the host clock; the
+        // identical clock samples below show which epoch it was.
+        assert!(!warns_of_a_host_clock_epoch(&replayed), "{flag}");
         assert_eq!(
             String::from_utf8_lossy(&replayed.stdout),
             String::from_utf8_lossy(&recorded.stdout),
@@ -368,18 +349,14 @@ fn replay_of_a_host_clock_recording_reuses_its_epoch() {
         None,
     );
     assert_success(&recorded, "recording");
-    let (recorded_epoch, source) = reported_epoch(&recorded);
-    assert_eq!(source, "host-now");
+    assert!(warns_of_a_host_clock_epoch(&recorded));
 
     let replayed = run_replay_epoch_guest(
         &[format!("--replay-preemptions-from={}", schedule.display())],
         None,
     );
     assert_success(&replayed, "replay");
-    assert_eq!(
-        reported_epoch(&replayed),
-        (recorded_epoch, "recording".to_owned())
-    );
+    assert!(!warns_of_a_host_clock_epoch(&replayed));
     assert_full_trajectory(&replayed);
     assert_eq!(replayed.stdout, recorded.stdout);
 }
@@ -447,10 +424,7 @@ fn replay_refuses_an_explicit_epoch_that_contradicts_the_recording() {
 
     let agreeing = run_replay_epoch_guest(&[format!("--epoch={REPEATABLE_EPOCH}"), replay], None);
     assert_success(&agreeing, "replay with the recorded epoch");
-    assert_eq!(
-        reported_epoch(&agreeing),
-        (REPEATABLE_EPOCH_RFC3339.to_owned(), "explicit".to_owned())
-    );
+    assert!(!warns_of_a_host_clock_epoch(&agreeing));
     assert_eq!(agreeing.stdout, recorded.stdout);
 }
 

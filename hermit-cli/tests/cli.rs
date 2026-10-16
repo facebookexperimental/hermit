@@ -371,6 +371,18 @@ fn append_hermit_args_using_outer_mount(command: &mut Command, args: &[&str]) {
         .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
 }
 
+/// `path` as Hermit's warnings print it, with the home directory as `~`.
+fn home_relative(path: &Path) -> String {
+    match std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 fn hermit_command(args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     append_hermit_args(&mut command, args);
@@ -9806,13 +9818,12 @@ fn run_kvm_preserves_closed_standard_input() {
     assert!(native.status.success(), "native {mode} control: {native:?}");
     assert_eq!(stdout(&native), expected);
     assert_eq!(stderr(&native), "");
-    // A run that samples its epoch from the host reports it on stderr, so pin
-    // the epoch and require exactly that one diagnostic line and nothing else.
+    // A run that draws its epoch from the host warns about it on stderr, so
+    // pin the epoch and require an empty stderr: an explicit epoch is not
+    // reported.
     let epoch = "2026-01-01T00:00:00.123456789+00:00";
     let epoch_arg = format!("--epoch={epoch}");
-    let expected_stderr = format!(
-        "hermit: virtual-time epoch={epoch} source=explicit; reproduce with --epoch={epoch}\n"
-    );
+    let expected_stderr = "";
     for backend in ["ptrace", "kvm"] {
         let args = [
             "--backend",
@@ -10960,14 +10971,17 @@ fn a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest() {
     assert_eq!(manifest["exit"]["code"], 3);
     let recording = written[0].parent().unwrap();
     let id = manifest["id"].as_str().unwrap().to_owned();
-    // With --log-file, Hermit's diagnostics go to the log.
+    // With --log-file, Hermit's warning goes to the log: one WARN record
+    // naming what was drawn, the data directory (with `~` for the home
+    // directory) and the replay command.
     let diagnostics = fs::read_to_string(&left_log).unwrap();
     assert!(
         diagnostics.contains(&format!(
-            "saved as recording {id} in {}; rerun it with: hermit replay {id}",
-            recording.display()
+            " WARN hermit::controller: this run drew settings from the host; its inputs are \
+             saved as a recording in {}/; rerun it with: hermit replay {id}\n",
+            home_relative(Path::new(&data))
         )),
-        "the diagnostic names the recording and its replay:\n{diagnostics}"
+        "the warning names the recording and its replay:\n{diagnostics}"
     );
 
     let rerun = run(
@@ -11048,12 +11062,15 @@ fn a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest() {
     );
     assert_eq!(replayed.status.code(), Some(3), "{}", stderr(&replayed));
     assert_eq!(stdout(&replayed), stdout(&original));
+    // On stderr even under --log-file, which the rerun opens afresh.
+    let replay_diagnostics = stderr(&replayed);
     assert!(
-        stderr(&replayed).contains(&format!(
-            "recording {id} is of kind inputs-only; rerunning it with: hermit run --from"
+        replay_diagnostics.contains(&format!(
+            " WARN hermit::controller: recording {id} (inputs-only) replays by rerunning its \
+             program: hermit run --from {}\n",
+            home_relative(&written[0])
         )),
-        "{}",
-        stderr(&replayed)
+        "{replay_diagnostics}"
     );
     let diff = hermit_test::hermit_output(
         "hermit run",
@@ -12216,9 +12233,9 @@ fn run_chaos_preemption_replay_reuses_the_recorded_epoch() {
         "{replay_stderr}"
     );
     assert_success(&replayed, &replay_args);
+    // The recorded epoch is not drawn from the host, so nothing warns.
     assert!(
-        replay_stderr
-            .contains("virtual-time epoch=2000-12-31T23:59:59.123456789+00:00 source=recording"),
+        !replay_stderr.contains("hermit::controller"),
         "{replay_stderr}"
     );
     assert_eq!(stdout(&replayed), stdout(&recorded));
@@ -12540,7 +12557,9 @@ struct CappedRun<'a> {
     timeout: bool,
     guest: &'a [&'a str],
     /// The exit code the run must reach within [`LOG_CAP_RUN_WAIT_BOUND`]. For
-    /// 123, the log file must also be non-empty.
+    /// 123 without `--verify`, the log file must also be non-empty. (A
+    /// `--verify` run's two runs log to files of their own; its `--log-file`
+    /// used to hold only the epoch notice Hermit no longer writes.)
     exit_code: i32,
     /// A diagnostic this configuration writes to stderr. When set, the same
     /// run is made first with stderr a pipe that is read, and its stderr must
@@ -12624,7 +12643,7 @@ impl CappedRun<'_> {
         let log = directory.path().join("hermit.log");
         let status = exit_status_with_full_unread_stderr(&mut self.command(&log, &configure));
         assert_eq!(status.code(), Some(self.exit_code), "{status:?}");
-        if self.exit_code == HERMIT_LOG_CAP_EXIT {
+        if self.exit_code == HERMIT_LOG_CAP_EXIT && !self.run_options.contains(&"--verify") {
             assert!(
                 fs::metadata(&log).unwrap().len() > 0,
                 "the run logged to the file"
@@ -15996,33 +16015,44 @@ fn max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe
     .assert_exits_promptly_with_full_unread_stderr(|_| {});
 }
 
-/// Without `--log-file`, hermit writes its virtual-time epoch line to stderr
-/// (`GlobalOpts::write_controller_diagnostic`) before the guest starts. The
+/// Without `--log-file`, a run whose epoch comes from the host warns about it
+/// on stderr (`GlobalOpts::report_event`) before the guest starts. The
 /// default log level writes nothing else there for `/bin/true`, so the run
-/// must end with the guest's exit status, 0.
+/// must end with the guest's exit status, 0. (`--manifest never`: the run
+/// leaves no recording behind.)
 #[test]
 fn max_log_bytes_without_a_log_file_exits_promptly_when_stderr_is_a_full_pipe() {
     let _lock = hermit_run_guard();
     let args = [
         "--max-log-bytes=64K",
         "run",
+        "--manifest",
+        "never",
         "--timeout",
         "120",
         "--",
         "/bin/true",
     ];
-    let (status, elapsed, stderr) = stderr_when_read(hermit_command(&args).stdin(Stdio::null()));
+    let drawing = || {
+        let mut command = hermit_command(&args);
+        command.env_remove("HERMIT_EPOCH").stdin(Stdio::null());
+        command
+    };
+    let (status, elapsed, stderr) = stderr_when_read(&mut drawing());
     assert!(
-        stderr.contains("hermit: virtual-time epoch="),
+        stderr.contains(
+            " WARN hermit::controller: this run drew its epoch from the host and saved no \
+             recording; rerun it with: --epoch="
+        ),
         "the premise does not hold: with stderr read, the run ({status:?} after {elapsed:?}) \
-         printed no epoch line; stderr:\n{stderr}"
+         printed no warning; stderr:\n{stderr}"
     );
     assert_eq!(
         status.and_then(|status| status.code()),
         Some(0),
         "with stderr read: {status:?} after {elapsed:?}; stderr:\n{stderr}"
     );
-    let status = exit_status_with_full_unread_stderr(hermit_command(&args).stdin(Stdio::null()));
+    let status = exit_status_with_full_unread_stderr(&mut drawing());
     assert_eq!(status.code(), Some(0), "{status:?}");
 }
 
@@ -17196,9 +17226,9 @@ fn log_file_under_tmp_lands_on_the_host() {
         "--log-file under /tmp produced an empty host file"
     );
     let diagnostics = std::fs::read_to_string(&log).unwrap();
-    assert!(diagnostics.contains(&format!(
-        "hermit: virtual-time epoch={epoch} source=explicit; reproduce with --epoch={epoch}\n"
-    )));
+    assert!(diagnostics.contains(" INFO "), "{diagnostics}");
+    // An explicit epoch is not reported.
+    assert!(!diagnostics.contains("hermit::controller"), "{diagnostics}");
     assert_eq!(output.stderr, b"guest-stderr-control\n");
 }
 
@@ -17339,13 +17369,12 @@ fn log_diff(args: &[&str]) -> Output {
 }
 
 /// The log files of two separate runs are comparable
-/// (<https://github.com/rrnewton/hermit/issues/3410>). The virtual-time epoch
-/// notice is the first thing a run writes to `--log-file`; as a bare line it
-/// made `hermit log-diff` refuse every such pair at "log line 0 has no
-/// ERROR/WARN/INFO/DEBUG/TRACE tag". It is now a DEBUG record: the file
-/// parses, and both the default DETLOG/COMMIT comparison and the canonical INFO
-/// comparison accept two runs at one epoch. (It is deliberately outside both
-/// selections; see `log_diff_does_not_count_the_epoch_notice_as_evidence`.)
+/// (<https://github.com/rrnewton/hermit/issues/3410>). A virtual-time epoch
+/// notice used to be the first thing a run wrote to `--log-file`; as a bare
+/// line it made `hermit log-diff` refuse every such pair at "log line 0 has no
+/// ERROR/WARN/INFO/DEBUG/TRACE tag". A run at an explicit epoch now writes no
+/// notice at all, and both the default DETLOG/COMMIT comparison and the
+/// canonical INFO comparison accept two runs at one epoch.
 #[test]
 fn log_diff_compares_the_log_files_of_two_separate_runs() {
     let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -17355,19 +17384,13 @@ fn log_diff_compares_the_log_files_of_two_separate_runs() {
         directory.path().join("a.log"),
         directory.path().join("b.log"),
     ];
-    let notice = format!(
-        " DEBUG hermit::controller: hermit: virtual-time epoch={epoch} source=explicit; \
-         reproduce with --epoch={epoch}\n"
-    );
-    let first_record = regex::Regex::new(&format!(
-        r"^\d{{4}}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z{}",
-        regex::escape(&notice)
-    ))
-    .unwrap();
+    let first_record =
+        regex::Regex::new(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z +[A-Z]+ ").unwrap();
     for log in &logs {
         log_true_run(log, "info", epoch);
         let contents = std::fs::read_to_string(log).unwrap();
         assert!(first_record.is_match(&contents), "{contents}");
+        assert!(!contents.contains("hermit::controller"), "{contents}");
     }
     let (a, b) = (logs[0].to_str().unwrap(), logs[1].to_str().unwrap());
     for options in [&[][..], &["--canonical-info"][..]] {
@@ -17379,14 +17402,12 @@ fn log_diff_compares_the_log_files_of_two_separate_runs() {
     }
 }
 
-/// The epoch notice is harness context, not guest or Detcore evidence, so it
-/// must never make a comparison non-vacuous. At the default log level a run's
-/// `--log-file` holds nothing but the notice; two such logs must still be
-/// refused as having no comparable messages in every mode, as they were before
-/// the notice was a parseable record
-/// (review of <https://github.com/rrnewton/hermit/pull/3427>).
+/// Two logs without guest or Detcore evidence are refused as having no
+/// comparable messages in every mode, never reported as a match (review of
+/// <https://github.com/rrnewton/hermit/pull/3427>). At the default log level
+/// a run at an explicit epoch writes nothing to its `--log-file`.
 #[test]
-fn log_diff_does_not_count_the_epoch_notice_as_evidence() {
+fn log_diff_refuses_two_logs_without_evidence() {
     let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let logs = [
@@ -17400,8 +17421,8 @@ fn log_diff_does_not_count_the_epoch_notice_as_evidence() {
             "run",
             "--base-env=minimal",
             // Without CPUID faulting Reverie logs one ERROR record per exec;
-            // not asking for CPUID interception keeps the notice the only
-            // record on every host.
+            // not asking for CPUID interception keeps the log empty on every
+            // host.
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
             "--epoch=2026-01-01T00:00:00Z",
@@ -17417,9 +17438,8 @@ fn log_diff_does_not_count_the_epoch_notice_as_evidence() {
         );
         assert_success(&output, &args);
         let contents = std::fs::read_to_string(log).unwrap();
-        // The premise: the notice is the log's only record.
-        assert_eq!(contents.lines().count(), 1, "{contents}");
-        assert!(contents.contains("hermit::controller: hermit: virtual-time epoch="));
+        // The premise: the log holds no record at all.
+        assert_eq!(contents, "", "{contents}");
     }
     let (a, b) = (logs[0].to_str().unwrap(), logs[1].to_str().unwrap());
     let report = directory.path().join("report.json");

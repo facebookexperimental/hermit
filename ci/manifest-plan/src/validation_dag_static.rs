@@ -1628,7 +1628,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4213): 1134, executed.
     // Complete terminal-failure decoding and execution-completeness controls: +2.
     // And run::strict_refuses_an_epoch_or_seed_drawn_from_the_host: 1137.
-    ("test.hermit_unit", 1137),
+    // And global_opts::tests::a_reported_event_is_a_tracing_record_in_the_log_file: 1138.
+    ("test.hermit_unit", 1138),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2919,7 +2920,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3418) retains all 88 prior
     // selected CLI identities.
     // log_diff_compares_the_log_files_of_two_separate_runs,
-    // log_diff_does_not_count_the_epoch_notice_as_evidence
+    // log_diff_refuses_two_logs_without_evidence (formerly
+    // log_diff_does_not_count_the_epoch_notice_as_evidence)
     // (https://github.com/rrnewton/hermit/issues/3410) and
     // relaxed_log_diff_canonicalizes_marked_host_addresses_on_request
     // (https://github.com/rrnewton/hermit/issues/3412) retain all 89 prior
@@ -4464,7 +4466,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the rendered-cpuinfo record-version test: 1134, executed.
     // Complete terminal-failure decoding and execution-completeness controls: +2.
     // And the strict host-drawn-input refusal test: 1137.
-    ("test.hermit_unit_on_host", 1137),
+    // And the reported-event log-file test: 1138.
+    ("test.hermit_unit_on_host", 1138),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

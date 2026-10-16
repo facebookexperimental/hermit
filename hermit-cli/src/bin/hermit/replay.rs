@@ -104,7 +104,7 @@ impl ReplayOpts {
             Target::Manifest(path) => {
                 let manifest = crate::manifest::read(&path)?;
                 if manifest.kind != Kind::FullSyscall {
-                    return Err(self.rerun(&path, &manifest, store.data_dir()));
+                    return Err(self.rerun(global, &path, &manifest, store.data_dir()));
                 }
                 // The directory named, as the replayer finds it: its parent
                 // and its name.
@@ -253,7 +253,13 @@ impl ReplayOpts {
     /// replay of a recording that is not a syscall recording, run in the
     /// data directory it came from. Returns only the error that kept it
     /// from doing so.
-    fn rerun(&self, path: &Path, manifest: &crate::manifest::Manifest, data_dir: &Path) -> Error {
+    fn rerun(
+        &self,
+        global: &GlobalOpts,
+        path: &Path,
+        manifest: &crate::manifest::Manifest,
+        data_dir: &Path,
+    ) -> Error {
         use std::os::unix::process::CommandExt;
 
         let id = &manifest.id;
@@ -278,10 +284,19 @@ impl ReplayOpts {
             Ok(exe) => exe,
             Err(error) => return Error::from(error).context("Failed to locate hermit"),
         };
-        eprintln!(
-            "hermit replay: recording {id} is of kind {kind}; rerunning it with: hermit run \
-             --from {}",
-            path.display()
+        // A WARN: the program runs again from its saved inputs, which is not a
+        // replay of its system calls. On stderr even under `--log-file`: the
+        // rerun opens that log afresh and would erase it.
+        super::tracing::emit_before_tracing(
+            global.log,
+            super::tracing::EarlyLog::Stderr(global.log_budget()),
+            || {
+                ::tracing::warn!(
+                    target: super::global_opts::CONTROLLER_TARGET,
+                    "recording {id} ({kind}) replays by rerunning its program: hermit run --from {}",
+                    super::run::home_relative(path)
+                )
+            },
         );
         let error = std::process::Command::new(&exe)
             .args(&self.global_argv)

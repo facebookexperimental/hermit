@@ -48,15 +48,17 @@ host's real `CPUID` results on every host, CPU model and features included, so
 program does. `--epoch` sets the instant at which the virtual
 clock starts (see [How it works](#how-it-works)).
 
-Every `hermit run` prints one line on standard error that names the clock's
-starting instant, for example:
+A `hermit run` without `--epoch` takes the clock's starting instant from the
+host clock, saves its inputs as a small recording, and prints one warning on
+standard error, for example:
 
 ```text
-hermit: virtual-time epoch=2026-01-01T00:00:00+00:00 source=explicit; reproduce with --epoch=2026-01-01T00:00:00+00:00
+2026-10-16T21:08:46.731588Z  WARN hermit::controller: this run drew its epoch from the host; its inputs are saved as a recording in ~/.cache/hermit/; rerun it with: hermit replay 08cc944156444bfdb328b60bd008549e
 ```
 
-Without `--epoch` the line says `source=host-now` and shows the host time at
-which the run started.
+With `--epoch` nothing is printed. (The transcript below predates this
+warning: its `hermit: virtual-time epoch=` lines are what Hermit printed
+then.)
 
 ## What you will see
 

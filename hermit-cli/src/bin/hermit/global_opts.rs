@@ -30,7 +30,7 @@ use super::tracing::parse_max_log_bytes;
 /// The target named by controller diagnostics written to `--log-file`. It is
 /// not a tracing target: these lines are written directly, before tracing
 /// starts, so `--log`/`RUST_LOG` filtering does not apply to them.
-const CONTROLLER_TARGET: &str = "hermit::controller";
+pub(crate) const CONTROLLER_TARGET: &str = "hermit::controller";
 
 /// Hermit provides a sandbox for deterministic and reproducible execution.
 /// Arbitrary programs run inside (guests) become deterministic
@@ -253,6 +253,44 @@ impl GlobalOpts {
         Ok(())
     }
 
+    /// Report, before tracing starts, something the user needs to know about
+    /// this invocation: that the run drew an input from the host, or how a
+    /// replay reruns its recording. It is a real tracing event on the
+    /// controller target, at `level`, written where the run's own log goes
+    /// and filtered by its `--log` level (see
+    /// [`super::tracing::emit_before_tracing`]); at the default level a WARN
+    /// shows.
+    ///
+    /// Comparisons do not exclude it. A run whose logs are compared passes
+    /// every input explicitly (`--strict` refuses one that would not), so it
+    /// never carries one of these events; one in a compared log is a defect.
+    pub(crate) fn report_event(
+        &self,
+        level: ::tracing::Level,
+        message: std::fmt::Arguments<'_>,
+    ) -> Result<(), Error> {
+        use super::tracing::EarlyLog;
+
+        let log = match &self.log_file_handle {
+            Some(handle) => {
+                let file = handle
+                    .try_clone()
+                    .context("cannot duplicate the host log file descriptor")?;
+                let limit = log_max_bytes().map_err(Error::msg)?;
+                EarlyLog::File(CappedWriter::file(file, limit, self.log_budget()))
+            }
+            None => EarlyLog::Stderr(self.log_budget()),
+        };
+        super::tracing::emit_before_tracing(self.log, log, || {
+            if level == ::tracing::Level::WARN {
+                ::tracing::warn!(target: CONTROLLER_TARGET, "{message}");
+            } else {
+                ::tracing::info!(target: CONTROLLER_TARGET, "{message}");
+            }
+        });
+        Ok(())
+    }
+
     /// Initalizes tracing. If using a container, this must be done *inside* of
     /// the container because the tracer may create a new thread.
     ///
@@ -334,6 +372,41 @@ mod tests {
             unsafe_ignore_host_seccomp: false,
             backend: None,
         }
+    }
+
+    /// A reported event is a real tracing record in the run's log file, at
+    /// its level and on the controller target, and the run's `--log` level
+    /// filters it like any other.
+    #[test]
+    fn a_reported_event_is_a_tracing_record_in_the_log_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("run.log");
+        let mut options = log_options(path.clone());
+        options.open_log_file().unwrap();
+        options
+            .report_event(::tracing::Level::WARN, format_args!("drew a setting"))
+            .unwrap();
+        options
+            .report_event(::tracing::Level::INFO, format_args!("below the default"))
+            .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        let (timestamp, rest) = written.split_once("  WARN ").unwrap();
+        assert!(
+            regex::Regex::new(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z$")
+                .unwrap()
+                .is_match(timestamp),
+            "{written:?}"
+        );
+        assert_eq!(rest, "hermit::controller: drew a setting\n");
+
+        let path = directory.path().join("quiet.log");
+        let mut options = log_options(path.clone());
+        options.log = Some(LevelFilter::ERROR);
+        options.open_log_file().unwrap();
+        options
+            .report_event(::tracing::Level::WARN, format_args!("filtered"))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
     }
 
     /// Names the log file `a_log_file_is_written_synchronously` gives the copy

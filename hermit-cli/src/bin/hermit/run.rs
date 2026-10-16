@@ -5392,6 +5392,18 @@ fn restore_standard_fd_status_flags(before: [Option<libc::c_int>; VERIFY_RESTORE
     }
 }
 
+/// `path` with the user's home directory written as `~`, as a user types it.
+pub(super) fn home_relative(path: &Path) -> String {
+    match std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 /// Create two logging destinations and two global configs. Returns non-zero exit
 /// status if there was a difference in any component of the output.
 impl RunOpts {
@@ -6209,13 +6221,15 @@ impl RunOpts {
         // guest starts, so a run that fails or hangs still leaves it.
         self.write_saved_config()?;
         // For the same reason, the run manifest too. It is a convenience
-        // beside the diagnostic that already prints the inputs, so a data
+        // beside the warning that already prints the inputs, so a data
         // directory that cannot be written does not stop the run.
-        if let Err(error) = self.begin_manifest(global) {
+        let recording = self.begin_manifest(global).unwrap_or_else(|error| {
             crate::tracing::diagnostic_eprintln!(
                 "hermit: WARNING: this run's manifest was not written: {error:#}"
             );
-        }
+            None
+        });
+        self.warn_of_host_drawn_inputs(global, recording)?;
         // After every refusal above, which holds in every build, so a build
         // without the feature refuses those runs the way a feature build does;
         // and before stdin is read.
@@ -6241,19 +6255,6 @@ impl RunOpts {
             None
         };
 
-        if self.uses_virtual_time_determinization() {
-            let epoch = self.epoch_rfc3339();
-            let source = if self.epoch_captured_from_host {
-                "host-now"
-            } else if self.epoch_from_recording {
-                "recording"
-            } else {
-                "explicit"
-            };
-            global.write_controller_diagnostic(format_args!(
-                "hermit: virtual-time epoch={epoch} source={source}; reproduce with --epoch={epoch}"
-            ))?;
-        }
         if self.allow_unsupported_syscalls {
             crate::tracing::diagnostic_eprintln!(
                 "WARNING: --allow-unsupported-syscalls permits unmodeled syscalls to reach the \
@@ -9184,15 +9185,74 @@ impl RunOpts {
         )
     }
 
+    /// Warns, in one line, that this run drew inputs from the host and so
+    /// cannot be rerun from its command line, and says how to rerun it: from
+    /// the recording that saved them, or with the options that pass them.
+    /// A network recording's own line already names its replay. Nothing is
+    /// said of an input the command line gave, such as an explicit epoch, or
+    /// one a replayed recording supplied.
+    fn warn_of_host_drawn_inputs(
+        &self,
+        global: &GlobalOpts,
+        recording: Option<(hermit::Id, crate::manifest::Kind)>,
+    ) -> Result<(), Error> {
+        use crate::manifest;
+        use crate::run_config::EPOCH_KEY;
+        use crate::run_config::SEED_KEY;
+
+        let drawn = self.host_drawn_inputs();
+        let what = match drawn.keys().map(String::as_str).collect::<Vec<_>>()[..] {
+            [] => return Ok(()),
+            [EPOCH_KEY] => "its epoch",
+            [SEED_KEY] => "its seed",
+            [manifest::MAX_TIMESLICE_KEY] => "its preemption timer setting",
+            _ => "settings",
+        };
+        match recording {
+            Some((_, manifest::Kind::Network)) => Ok(()),
+            Some((id, _)) => global.report_event(
+                ::tracing::Level::WARN,
+                format_args!(
+                    "this run drew {what} from the host; its inputs are saved as a recording in \
+                     {}/; rerun it with: hermit replay {id}",
+                    home_relative(&manifest::data_dir())
+                ),
+            ),
+            None => {
+                let options = drawn
+                    .keys()
+                    .map(|key| match key.as_str() {
+                        EPOCH_KEY => format!("--epoch={}", self.epoch_rfc3339()),
+                        SEED_KEY => format!("--seed={}", self.seed_from_resolved.unwrap_or(0)),
+                        manifest::MAX_TIMESLICE_KEY => "--max-timeslice=disabled".to_owned(),
+                        other => format!("--{other}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                global.report_event(
+                    ::tracing::Level::WARN,
+                    format_args!(
+                        "this run drew {what} from the host and saved no recording; rerun it \
+                         with: {options}"
+                    ),
+                )
+            }
+        }
+    }
+
     /// Writes this run's manifest when the policy asks for one (see
-    /// `crate::manifest`), names it in a diagnostic, and remembers its path
-    /// for `finish_manifest`. Only a top-level `hermit run`, whose parser
-    /// captured the options it was given, writes one.
-    fn begin_manifest(&mut self, global: &GlobalOpts) -> Result<(), Error> {
+    /// `crate::manifest`), and remembers its path for `finish_manifest`.
+    /// Returns the recording's id and kind when it wrote one. Only a
+    /// top-level `hermit run`, whose parser captured the options it was
+    /// given, writes one.
+    fn begin_manifest(
+        &mut self,
+        global: &GlobalOpts,
+    ) -> Result<Option<(hermit::Id, crate::manifest::Kind)>, Error> {
         use crate::manifest;
 
         if self.config_capture.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         let user_config = match manifest::user_config_path() {
             Some(path) => manifest::read_user_config(&path)?,
@@ -9216,7 +9276,7 @@ impl RunOpts {
         let kind = match (&network_trace, policy, host_drawn.is_empty()) {
             (Some(_), _, _) => manifest::Kind::Network,
             (None, manifest::ManifestPolicy::Never, _)
-            | (None, manifest::ManifestPolicy::NonreproducibleOnly, true) => return Ok(()),
+            | (None, manifest::ManifestPolicy::NonreproducibleOnly, true) => return Ok(None),
             (None, _, false) => manifest::Kind::InputsOnly,
             (None, manifest::ManifestPolicy::Always, true) => manifest::Kind::History,
         };
@@ -9293,22 +9353,9 @@ impl RunOpts {
                  as recording {id}; replay it offline with: hermit replay {id}",
                 path.display(),
             ))?;
-        } else if kind == manifest::Kind::InputsOnly {
-            global.write_controller_diagnostic(format_args!(
-                "hermit: this run drew {} from the host; its inputs are saved as recording {id} \
-                 in {}; rerun it with: hermit replay {id}",
-                document
-                    .inputs
-                    .host_drawn
-                    .keys()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" and "),
-                path.parent().unwrap_or(&path).display()
-            ))?;
         }
         self.manifest_path = Some(path);
-        Ok(())
+        Ok(Some((id, kind)))
     }
 
     /// Records how the guest ended in this run's manifest, if it wrote one.
