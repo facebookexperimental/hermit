@@ -234,6 +234,12 @@ mod tests {
 
     use super::*;
 
+    /// The pinned Reverie checkout's own workspace, which the split
+    /// validator's fetch phase fetches like the root one (repository cwd,
+    /// project toolchain) for the Reverie-layer cross-backend check
+    /// (test.syscall_conformance_*).
+    const REVERIE_WORKSPACE_MANIFEST: &str = "reverie/Cargo.toml";
+
     /// Remove git's repository-location variables from `command`. Git exports
     /// them to hooks and `git rebase --exec` steps, and each overrides the
     /// working directory, so an inherited `GIT_DIR` would send a fixture's
@@ -363,6 +369,7 @@ mod tests {
             .expect("create nested workspace fixture");
         fs::create_dir_all(root.join("agent-utils/rs"))
             .expect("create Agent Utils workspace fixture");
+        fs::create_dir_all(root.join("reverie")).expect("create Reverie workspace fixture");
         fs::create_dir_all(&fake_bin).expect("create fake binary directory");
 
         let mut split = fs::read_to_string(source_root.join("ci/hermetic/run-split-validate.sh"))
@@ -464,6 +471,11 @@ mod tests {
             "[workspace]\nmembers = []\n",
         )
         .expect("write Agent Utils manifest fixture");
+        fs::write(
+            root.join("reverie/Cargo.toml"),
+            "[workspace]\nmembers = []\n",
+        )
+        .expect("write Reverie manifest fixture");
         fs::write(
             root.join("fixture.rs"),
             "#!/usr/bin/env -S rust-script --force\nfn main() {}\n",
@@ -896,10 +908,11 @@ esac
                     .map(|workspace| format!("{workspace}/Cargo.toml")),
             )
             .chain(std::iter::once("agent-utils/rs/Cargo.toml".to_owned()))
+            .chain(std::iter::once(REVERIE_WORKSPACE_MANIFEST.to_owned()))
             .collect::<BTreeSet<_>>();
         assert_eq!(
             expected, actual,
-            "the hermetic fetch phase must cover root, checked nested workspaces and the Agent Utils launcher workspace"
+            "the hermetic fetch phase must cover root, checked nested workspaces, the Agent Utils launcher workspace and the pinned Reverie workspace"
         );
         assert!(stdout.contains("-- fetch phase would run"));
         assert!(stdout.contains("-- offline phase would run"));
@@ -992,10 +1005,14 @@ esac
             "committed-locked-fetch:liteinst-runtime-build/Cargo.toml",
         );
         let agent_utils = journal_position(&journal, "agent-utils-neutral-locked-fetch");
+        let reverie = journal_position(
+            &journal,
+            &format!("committed-locked-fetch:{REVERIE_WORKSPACE_MANIFEST}"),
+        );
         let generated = journal_position(&journal, "generated-locked-fetch");
         let offline = journal_position(&journal, "offline-consumer");
-        assert!(root < liteinst && liteinst < agent_utils && agent_utils < generated);
-        assert!(generated < offline);
+        assert!(root < liteinst && liteinst < agent_utils && agent_utils < reverie);
+        assert!(reverie < generated && generated < offline);
     }
 
     #[test]
@@ -1084,13 +1101,14 @@ esac
             let rows = journal.lines().collect::<Vec<_>>();
             assert_eq!(
                 rows.len(),
-                7,
-                "all six Cargo operations plus offline: {journal}"
+                8,
+                "all seven Cargo operations plus offline: {journal}"
             );
-            for (row, prefix) in rows[..6].iter().zip([
+            for (row, prefix) in rows[..7].iter().zip([
                 "fetch:Cargo.toml:",
                 "fetch:liteinst-runtime-build/Cargo.toml:",
                 "fetch:",
+                "fetch:reverie/Cargo.toml:",
                 "metadata:",
                 "generate-lockfile:",
                 "fetch:",
@@ -1105,14 +1123,14 @@ esac
             }
             assert!(rows[2].contains("/agent-utils/rs/Cargo.toml:"), "{journal}");
             assert!(
-                rows[5].contains("/hermit-rust-script-packages."),
+                rows[6].contains("/hermit-rust-script-packages."),
                 "{journal}"
             );
             let original = environment
                 .iter()
                 .find(|(key, _)| *key == "CARGO_HTTP_PROXY");
             assert_eq!(
-                rows[6],
+                rows[7],
                 format!(
                     "offline:{}:{}",
                     if original.is_some() { "x" } else { "" },
@@ -1143,8 +1161,12 @@ esac
                     "{config:?} {configured_cwd}: {output:?}\n{journal}"
                 );
                 let rows = journal.lines().collect::<Vec<_>>();
-                assert_eq!(rows.len(), 7, "{journal}");
-                for (index, row) in rows[..6].iter().enumerate() {
+                assert_eq!(rows.len(), 8, "{journal}");
+                assert!(
+                    rows[3].starts_with("fetch:reverie/Cargo.toml:"),
+                    "{journal}"
+                );
+                for (index, row) in rows[..7].iter().enumerate() {
                     let explicit_config =
                         (index == 2) == (configured_cwd == "FIXTURE_NEUTRAL_CARGO_CONFIG");
                     let suffix = if explicit_config {
@@ -1157,7 +1179,7 @@ esac
                         "{configured_cwd} row {index}: {journal}"
                     );
                 }
-                assert_eq!(rows[6], "offline::");
+                assert_eq!(rows[7], "offline::");
             }
         }
     }
@@ -1231,15 +1253,19 @@ esac
         let journal = fs::read_to_string(&proxy_journal).unwrap_or_default();
         assert!(output.status.success(), "{output:?}\n{journal}");
         let rows = journal.lines().collect::<Vec<_>>();
-        assert_eq!(rows.len(), 7, "{journal}");
-        for row in &rows[..6] {
+        assert_eq!(rows.len(), 8, "{journal}");
+        for row in &rows[..7] {
             assert!(
                 row.ends_with(":x:https://environment.invalid::"),
                 "{journal}"
             );
         }
         assert!(rows[2].contains("/agent-utils/rs/Cargo.toml:"), "{journal}");
-        assert_eq!(rows[6], "offline::");
+        assert!(
+            rows[3].starts_with("fetch:reverie/Cargo.toml:"),
+            "{journal}"
+        );
+        assert_eq!(rows[7], "offline::");
     }
 
     fn install_rustup_fixture(fixture: &ProductionFixture, hardlink: bool) {
@@ -1321,7 +1347,11 @@ fi
                 assert!(output.status.success(), "{output:?}\n{journal}");
                 let proxy_journal = fs::read_to_string(&proxies).unwrap();
                 let rows = proxy_journal.lines().collect::<Vec<_>>();
-                assert_eq!(rows.len(), 7, "{proxy_journal}");
+                assert_eq!(rows.len(), 8, "{proxy_journal}");
+                assert!(
+                    rows[3].starts_with("fetch:reverie/Cargo.toml:"),
+                    "{proxy_journal}"
+                );
                 if explicit_stable {
                     assert!(!journal.contains("nightly:"), "{journal}");
                     assert!(!journal.contains("-Zunstable-options"), "{journal}");
@@ -1329,7 +1359,7 @@ fi
                         String::from_utf8_lossy(&output.stderr)
                             .contains("applying no proxy default")
                     );
-                    for row in &rows[..6] {
+                    for row in &rows[..7] {
                         assert!(row.ends_with("::::"), "{proxy_journal}");
                     }
                 } else {
@@ -1352,6 +1382,16 @@ fi
                         stable[0].ends_with("/agent-utils/rs/Cargo.toml"),
                         "{journal}"
                     );
+                    // The Reverie workspace is fetched like the root one: in
+                    // the repository, with the project's toolchain.
+                    let root = fixture.root.to_string_lossy();
+                    assert!(
+                        journal.lines().any(|row| row
+                            == format!(
+                                "nightly:{root}:fetch --locked --manifest-path {REVERIE_WORKSPACE_MANIFEST}"
+                            )),
+                        "{journal}"
+                    );
                     let expected = if config == "{}" {
                         ":x:https://environment.invalid::"
                     } else {
@@ -1359,7 +1399,7 @@ fi
                     };
                     assert!(rows[2].ends_with(expected), "{proxy_journal}");
                 }
-                assert_eq!(rows[6], "offline::");
+                assert_eq!(rows[7], "offline::");
             }
         }
     }
@@ -1387,13 +1427,17 @@ fi
             );
             let journal = fs::read_to_string(&proxies).unwrap();
             let rows = journal.lines().collect::<Vec<_>>();
-            assert_eq!(rows.len(), 7, "{journal}");
+            assert_eq!(rows.len(), 8, "{journal}");
+            assert!(
+                rows[3].starts_with("fetch:reverie/Cargo.toml:"),
+                "{journal}"
+            );
             let present = if explicit_proxy.is_some() { "x" } else { "" };
             let value = explicit_proxy.unwrap_or("");
-            for row in &rows[..6] {
+            for row in &rows[..7] {
                 assert!(row.ends_with(&format!(":{present}:{value}::")), "{journal}");
             }
-            assert_eq!(rows[6], format!("offline:{present}:{value}"));
+            assert_eq!(rows[7], format!("offline:{present}:{value}"));
         }
     }
 
@@ -1505,8 +1549,12 @@ fi
                 }
                 let proxy_journal = fs::read_to_string(&proxies).unwrap();
                 let rows = proxy_journal.lines().collect::<Vec<_>>();
-                assert_eq!(rows.len(), 7, "{proxy_journal}");
-                for (index, row) in rows[..6].iter().enumerate() {
+                assert_eq!(rows.len(), 8, "{proxy_journal}");
+                assert!(
+                    rows[3].starts_with("fetch:reverie/Cargo.toml:"),
+                    "{proxy_journal}"
+                );
+                for (index, row) in rows[..7].iter().enumerate() {
                     let expected = explicit_proxy.or_else(|| {
                         (index != 2 && config == "{}").then_some("https://environment.invalid")
                     });
@@ -1521,7 +1569,7 @@ fi
                 }
                 let present = if explicit_proxy.is_some() { "x" } else { "" };
                 assert_eq!(
-                    rows[6],
+                    rows[7],
                     format!("offline:{present}:{}", explicit_proxy.unwrap_or(""))
                 );
                 let operations = fs::read_to_string(&fixture.journal).unwrap();
