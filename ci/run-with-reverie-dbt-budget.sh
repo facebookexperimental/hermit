@@ -1761,7 +1761,12 @@ fi
 # native client and paired runtime to this source; identical tested artifacts
 # may be reused. SDK budget, job width and resource limits carry unchanged.
 # The preceding owner comments retain both 755..c4fb and c4fb..E1 carries.
-expected_pin=aed891104de8d8882fa71f24a5c152393596b69e
+# CARRY TO e9f043de2fa512630f749751d8f36a4306ebd0a2 (2026-10-16): from
+# aed891104de8d8882fa71f24a5c152393596b69e. Managed copied failures publish the
+# existing terminal stats record before root termination. Match native client
+# and tests to this source; identical tested artifacts may be reused. All seven
+# SDK inputs, inventory 961, calibrated budget, job width and limits are unchanged.
+expected_pin=e9f043de2fa512630f749751d8f36a4306ebd0a2
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

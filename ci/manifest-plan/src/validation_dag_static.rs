@@ -1624,7 +1624,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And https://github.com/rrnewton/hermit/issues/4262: record_version_rejects_streams_from_before_posix_timer_records_carry_si_timer: 1133.
     // And record_version_rejects_streams_from_before_cpuinfo_is_rendered
     // (https://github.com/rrnewton/hermit/issues/4213): 1134, executed.
-    ("test.hermit_unit", 1134),
+    // Complete terminal-failure decoding and execution-completeness controls: +2.
+    ("test.hermit_unit", 1136),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4458,7 +4459,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the descriptor-link record-version test: 1132, listed.
     // And https://github.com/rrnewton/hermit/issues/4262: the same +1 as test.hermit_unit, 1133.
     // And the rendered-cpuinfo record-version test: 1134, executed.
-    ("test.hermit_unit_on_host", 1134),
+    // Complete terminal-failure decoding and execution-completeness controls: +2.
+    ("test.hermit_unit_on_host", 1136),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

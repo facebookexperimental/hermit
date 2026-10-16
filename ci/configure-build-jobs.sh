@@ -1838,8 +1838,13 @@ fi
 # native client and paired runtime to this source; identical tested artifacts
 # may be reused. SDK budget, job width and resource limits carry unchanged.
 # The preceding owner comments retain both 755..c4fb and c4fb..E1 carries.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != aed891104de8d8882fa71f24a5c152393596b69e ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie aed891104de8d8882fa71f24a5c152393596b69e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO e9f043de2fa512630f749751d8f36a4306ebd0a2 (2026-10-16): from
+# aed891104de8d8882fa71f24a5c152393596b69e. Managed copied failures publish the
+# existing terminal stats record before root termination. Match native client
+# and tests to this source; identical tested artifacts may be reused. All seven
+# SDK inputs, inventory 961, calibrated budget, job width and limits are unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != e9f043de2fa512630f749751d8f36a4306ebd0a2 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie e9f043de2fa512630f749751d8f36a4306ebd0a2 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

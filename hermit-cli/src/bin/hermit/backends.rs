@@ -324,11 +324,11 @@ const DBT_BACKEND_FAILURE_EXIT_CODE: i32 = 101;
 /// backend failure in a guest child is found (see [`fail_on_dbt_backend_failure`]).
 #[cfg(feature = "dbt")]
 fn finish_single_run_dbt_stats(
-    capture: DbtStatsSink,
+    capture: &DbtStatsCapture,
     summary: bool,
     engagement_json: Option<&Path>,
 ) -> Result<Option<DbtBackendStatsSnapshot>, Error> {
-    match require_dbt_stats(&capture.capture()) {
+    match require_dbt_stats(capture) {
         Ok(stats) => {
             if summary {
                 eprint!("{}", format_dbt_stats(&stats));
@@ -343,10 +343,7 @@ fn finish_single_run_dbt_stats(
             if summary {
                 eprintln!(":: DBT summary unavailable: {error}");
             }
-            eprintln!(
-                ":: WARNING: the DBT process records are unavailable, so a backend failure in a \
-                 guest child cannot be ruled out: {error}"
-            );
+            eprintln!(":: WARNING: DBT execution statistics are unavailable: {error}");
             Ok(None)
         }
     }
@@ -363,9 +360,14 @@ fn finish_single_run_dbt_stats(
 #[cfg(feature = "dbt")]
 fn fail_on_dbt_backend_failure(
     status: ExitStatus,
-    stats: Option<&DbtBackendStatsSnapshot>,
+    capture: Option<&DbtStatsCapture>,
 ) -> ExitStatus {
-    let failures = stats.map_or(0, DbtBackendStatsSnapshot::backend_failures);
+    // A complete failure-only record remains authoritative even if the root
+    // was killed before it could publish execution counters. It cannot prove
+    // engagement or verification completeness; require_dbt_stats owns those.
+    let failures = capture
+        .and_then(|capture| capture.snapshot().ok())
+        .map_or(0, |stats| stats.backend_failures());
     if failures == 0 || status == ExitStatus::Exited(DBT_BACKEND_FAILURE_EXIT_CODE) {
         return status;
     }
@@ -1063,10 +1065,10 @@ impl DbtInvocation {
             write_output(&output)?;
             output_status(&output)
         };
-        let stats = stats
-            .map(|capture| finish_single_run_dbt_stats(capture, summary, engagement_json))
-            .transpose()?
-            .flatten();
+        let stats = stats.map(|sink| sink.capture());
+        if let Some(capture) = &stats {
+            finish_single_run_dbt_stats(capture, summary, engagement_json)?;
+        }
         Ok(fail_on_dbt_backend_failure(status, stats.as_ref()))
     }
 
@@ -3123,7 +3125,7 @@ mod tests {
             )
             .unwrap();
             let output = tempfile::NamedTempFile::new().unwrap();
-            finish_single_run_dbt_stats(capture, false, Some(output.path())).unwrap();
+            finish_single_run_dbt_stats(&capture.capture(), false, Some(output.path())).unwrap();
             serde_json::from_slice(&fs::read(output.path()).unwrap()).unwrap()
         }
 
@@ -3136,6 +3138,71 @@ mod tests {
             first, second,
             "mutating the producer count must move the record"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn terminal_failure_records_do_not_establish_execution_completeness() {
+        use reverie_dbt::backend_stats::DbtProcessRecord;
+        use reverie_dbt::backend_stats::encode_process_record;
+
+        let capture = DbtStatsCapture::Records(
+            encode_process_record(&DbtProcessRecord {
+                backend_failure: true,
+                process_identity: 7,
+                parent_identity: 3,
+                ..Default::default()
+            })
+            .to_vec(),
+        );
+        let killed = ExitStatus::Signaled(reverie::Signal::SIGKILL, false);
+        assert_eq!(
+            fail_on_dbt_backend_failure(killed, Some(&capture)),
+            ExitStatus::Exited(101)
+        );
+        assert!(require_dbt_stats(&capture).is_err());
+        assert!(
+            finish_single_run_dbt_stats(&capture, false, None)
+                .unwrap()
+                .is_none()
+        );
+        let output = tempfile::NamedTempFile::new().unwrap();
+        assert!(finish_single_run_dbt_stats(&capture, false, Some(output.path())).is_err());
+        assert_eq!(output.as_file().metadata().unwrap().len(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn terminal_failure_status_requires_a_complete_flagged_record() {
+        use reverie_dbt::backend_stats::DbtProcessRecord;
+        use reverie_dbt::backend_stats::encode_process_record;
+
+        let flagged = encode_process_record(&DbtProcessRecord {
+            backend_failure: true,
+            ..Default::default()
+        });
+        let mut bad_magic = flagged.to_vec();
+        bad_magic[0] ^= 1;
+        let malformed_tail = [flagged.as_slice(), &flagged[..13]].concat();
+        for capture in [
+            DbtStatsCapture::Missing,
+            DbtStatsCapture::Unreadable {
+                message: "unreadable".into(),
+                raw_os_error: None,
+            },
+            DbtStatsCapture::Records(Vec::new()),
+            DbtStatsCapture::Records(bad_magic),
+            DbtStatsCapture::Records(malformed_tail),
+            DbtStatsCapture::Records(encode_process_record(&DbtProcessRecord::default()).to_vec()),
+        ] {
+            for status in [
+                ExitStatus::Signaled(reverie::Signal::SIGKILL, false),
+                ExitStatus::Exited(0),
+                ExitStatus::Exited(101),
+            ] {
+                assert_eq!(fail_on_dbt_backend_failure(status, Some(&capture)), status);
+            }
+        }
     }
 
     #[test]
