@@ -2354,7 +2354,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +10 from d3151c64: 1820.
     // And +7 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 1827, listed.
     // And +1 from c0e13d24: 1828.
-    ("test.detcore_unit", 1828),
+    // And +2 from 3717a6b7: 1830.
+    ("test.detcore_unit", 1830),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2824,7 +2825,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And eight of the internal Buck matrix's nine unrecorded tests/rust
     // guests, record_rs_bind_connect_race through record_rs_socketpair; the
     // ninth, record_rs_futex_and_print, is ignored for its CPU budget: 211.
-    ("test.record_replay", 211),
+    // shared_own_getters_preserve_record_replay_stream retains the prior
+    // record/replay selection: 212 nonignored tests, freshly listed.
+    // And +1 from 3717a6b7: 212.
+    ("test.record_replay", 212),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -4030,7 +4034,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +10 from d3151c64: 1820.
     // And +7 from the R2b-1 reland (https://github.com/rrnewton/hermit/issues/4273): 1827, listed.
     // And +1 from c0e13d24: 1828.
-    ("test.detcore_unit_on_host", 1828),
+    // And +2 from 3717a6b7: 1830.
+    ("test.detcore_unit_on_host", 1830),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

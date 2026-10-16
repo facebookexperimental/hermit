@@ -8,6 +8,10 @@
 
 //! Deterministic views of kernel namespace metadata.
 
+#[cfg(test)]
+#[path = "namespace/own_getters_tests.rs"]
+mod own_getters_tests;
+
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Component;
@@ -959,6 +963,31 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Detcore's pid for the calling thread's process.
     pub(crate) fn own_detpid<G: Guest<Self>>(&self, guest: &G) -> crate::types::DetPid {
         guest.thread_state().detpid.unwrap_or(self.detpid)
+    }
+
+    /// Project an already-completed own-ID query. Like `guest_visible_own_pid`,
+    /// ordinary processes use the current thread's shared identity, including
+    /// a fork child that kept the parent Tool. A nested namespace keeps the
+    /// answer already delegated to the inner Tool, without a second injection.
+    ///
+    /// Detcore is a filter-map: a positive inner result establishes success,
+    /// not the final guest identity. Preserve unusual nonpositive values;
+    /// errors never reach this projection. This synchronous step adds no
+    /// future around the existing syscall delegation.
+    pub(crate) fn project_own_getter_result<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        call: Syscall,
+        result: i64,
+    ) -> i64 {
+        if result <= 0 || guest.thread_state().nested_pid_namespace {
+            return result;
+        }
+        match call {
+            Syscall::Getpid(_) => i64::from(self.own_detpid(guest).as_raw()),
+            Syscall::Gettid(_) => i64::from(guest.thread_state().dettid.as_raw()),
+            _ => unreachable!("only own-ID getters have a shared result projection"),
+        }
     }
 
     /// Answer `readlink` of a `/proc` link whose target Detcore decides from

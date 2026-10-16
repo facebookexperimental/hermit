@@ -747,6 +747,70 @@ fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) 
     canonical_record_replay_command_retrying_skid(name, program, args, 1, &[])
 }
 
+/// The outer own-ID policy must still delegate both getters to Recorder and
+/// Replayer. Their raw-event/expectation stream remains aligned, while the
+/// guest and the complete INFO comparison observe the shared own identities.
+#[test]
+fn shared_own_getters_preserve_record_replay_stream() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = build.path().join("own_pid_tid");
+    let compilation = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/own_pid_tid.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("compile the own-ID guest");
+    assert!(compilation.status.success(), "{compilation:?}");
+
+    let data = tempfile::tempdir().unwrap();
+    let verdict = data.path().join("verify.json");
+    let mut command = Command::new("timeout");
+    command
+        .env("HERMIT_MODE", "record")
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "--backend=ptrace",
+            "record",
+            "start",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--record-timeout=30",
+        ])
+        .arg(format!("--verify-json={}", verdict.display()))
+        .arg(format!("--data-dir={}", data.path().display()))
+        .arg("--")
+        .arg(&guest);
+    let output = hermit_test::hermit_output_attempts("record/replay own getters", 1, &mut command);
+    assert!(output.status.success(), "{command:?}: {output:?}");
+    let expected = format!("own pid={0} tid={0}\n", detcore::ROOT_DETPID.as_raw());
+    assert_eq!(output.stdout, expected.as_bytes());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Success: replay matched recording."),
+        "{output:?}"
+    );
+
+    let report: hermit::canonical_verdict::VerificationReport =
+        serde_json::from_slice(&fs::read(verdict).unwrap()).unwrap();
+    assert_eq!(report.verdict, hermit::canonical_verdict::Verdict::Matched);
+    assert!(report.verified && report.bitwise_parity);
+    let counts = report.compared_log_messages.expect("full INFO comparison");
+    assert!(counts.left > 0 && counts.right > 0);
+    let outputs = report.compared_outputs.expect("both guest observations");
+    outputs.require_exact_match().unwrap();
+    assert_eq!(outputs.left.exit_code, Some(0));
+    assert_eq!(outputs.left.signal, None);
+    assert_eq!(outputs.left.stdout_bytes, expected.len() as u64);
+    assert_eq!(outputs.left.stderr_bytes, 0);
+}
+
 /// `canonical_record_replay_command`, repeated only when an attempt ends in a
 /// typed PMU skid-overshoot refusal (`skid_overshoot_refusal`), at most
 /// `max_attempts` times in all (https://github.com/rrnewton/hermit/issues/1845).

@@ -1286,6 +1286,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/own_pid_tid.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/own_pid_tid.c is owned by hermit-cli/tests/record_replay.rs: shared_own_getters_preserve_record_replay_stream compiles this guest, checks repeated own PID/TID answers and exact shared-root output, and requires full canonical INFO and I/O record/replay parity. It is a test-owned fixture, not a separately selected manifest workload."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/own_process_signal.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/own_process_signal.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests a_signal_to_the_senders_own_process_goes_to_the_sender_at_bitwise_parity and each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name compile this guest, which sends kill or rt_sigqueueinfo to its own two-threaded process in one mode per admitted case and per named refusal, and require Linux's output at bitwise parity for each admitted mode and the named refusal for each other (https://github.com/rrnewton/hermit/issues/4034); it remains a guest fixture because a generic manifest cannot assert these exact outputs, refusal reasons or verdicts."

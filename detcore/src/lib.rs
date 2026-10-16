@@ -3698,6 +3698,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 self.handle_epoll_pwait2(guest, call).await
             }
             SyscallClassification::Determinized => match call {
+                Syscall::Getpid(_) | Syscall::Gettid(_) => {
+                    // Keep the inner Tool's syscall observation/injection and
+                    // all errors, then project a successful own ID from shared
+                    // state. Do not return early past the normal posthooks.
+                    self.passthrough(guest, call)
+                        .await
+                        .map(|result| self.project_own_getter_result(guest, call, result))
+                }
                 Syscall::Write(w) => self.handle_write(guest, w).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#547)
