@@ -1813,8 +1813,17 @@ fi
 # by name) changes reverie-dbt src/lib.rs and src/tools.rs and adds no file,
 # so the reverie-dbt inventory stays 961. build.rs, vendor/dynamorio, native/
 # and the root Cargo.toml are unchanged, so the SDK budget carries.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 75575dc018555cc08531b2b2204045a6fc9cfbbb ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 75575dc018555cc08531b2b2204045a6fc9cfbbb (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# REVERIE-LAYER E2E ON ALL BACKENDS SDK-BUDGET CARRY (2026-10-16): advance
+# 75575dc018555cc08531b2b2204045a6fc9cfbbb to c4fb4d70aa6d5d61545a4759289f101529329afd.
+# 14940a97 adds a test-only import to reverie-inguest/src/launcher/mod.rs (not
+# in the LiteInst M1 source catalog, whose 18 entries are byte-identical at both
+# pins). 682166d7 changes only reverie-examples/e2e. c4fb4d70 changes
+# reverie-examples, experimental/reverie-host, experimental/reverie-sabre-strace
+# and Reverie's Cargo.lock. git diff is empty under reverie-dbt/, so the
+# reverie-dbt inventory stays 961, and build.rs, vendor/dynamorio and the root
+# Cargo.toml are unchanged: the SDK budget carries.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c4fb4d70aa6d5d61545a4759289f101529329afd ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c4fb4d70aa6d5d61545a4759289f101529329afd (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
