@@ -1076,7 +1076,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // its three runs against a scripted Hermit (tests/cli.rs): 1589.
     // And hermit-verify's interpolate_refuses_schedules_recorded_under_different_pipe_wake_latencies (https://github.com/rrnewton/hermit/issues/4380): 1590, listed.
     // And +5 from 87bb6972: 1595.
-    ("test.regular_crates", 1595),
+    // Measured by the 57abff0a validate: 1596 executed.
+    ("test.regular_crates", 1596),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
