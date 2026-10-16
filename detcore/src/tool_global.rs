@@ -3104,6 +3104,11 @@ impl GlobalState {
             GlobalRequest::ThreadIsLive(dtid) => {
                 R::ThreadIsLive(self.lock_rpc_scheduler(false).await.thread_is_live(dtid))
             }
+            GlobalRequest::NamesARetiredExitedLeader(named) => R::NamesARetiredExitedLeader(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .names_a_retired_exited_leader(named),
+            ),
             GlobalRequest::ParentDeathSignal(arm) => {
                 let mut sched = self.lock_rpc_scheduler(false).await;
                 if let Some(signal) = arm {
@@ -5237,6 +5242,10 @@ pub enum GlobalRequest {
         /// Consumed successor ticket after real lifecycle and frontend checks.
         ticket: native_exec::ExecTicket,
     },
+    /// Whether a tid names a thread-group leader retired at its own exit
+    /// while its group lives on (`names_a_retired_exited_leader`). Appended
+    /// last, for the same reason as the controls above.
+    NamesARetiredExitedLeader(DetTid),
 }
 
 /// Responses from the global object
@@ -5398,6 +5407,8 @@ pub enum GlobalResponse {
     IssueNativeExec(Result<(), native_exec::ExecControlError>),
     CancelNativeExec(Result<(), native_exec::ExecControlError>),
     CompleteNativeExec(Result<(), native_exec::ExecControlError>),
+    /// Appended last, for the same reason.
+    NamesARetiredExitedLeader(bool),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -6970,6 +6981,23 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ThreadIdRefused(dettid)).await;
     match response.1 {
         GlobalResponse::ThreadIdRefused(refused) => refused,
+        _ => unreachable!(),
+    }
+}
+
+/// Whether `named` is a thread-group leader the scheduler retired at its own
+/// exit while its group lives on, so the kernel shows it a zombie
+/// (`Scheduler::names_a_retired_exited_leader`,
+/// https://github.com/rrnewton/hermit/issues/4445).
+pub(crate) async fn names_a_retired_exited_leader<G, T>(guest: &mut G, named: DetTid) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response =
+        send_and_update_time(guest, GlobalRequest::NamesARetiredExitedLeader(named)).await;
+    match response.1 {
+        GlobalResponse::NamesARetiredExitedLeader(retired) => retired,
         _ => unreachable!(),
     }
 }

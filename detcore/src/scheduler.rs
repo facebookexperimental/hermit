@@ -5717,6 +5717,17 @@ impl Scheduler {
                 .any(|tid| tid != leader && self.next_turns.contains_key(&tid))
     }
 
+    /// Whether `named` is a leader `retire_exited_leader` retired at its own
+    /// exit while its group lives on, and that has not registered again. The
+    /// scheduler commits no other turn until the kernel shows such a leader a
+    /// zombie (`step2a_wait_for_exited_leaders`), so from any later turn it is
+    /// one. Only a backend that models signal targets retires a leader so
+    /// (`leader_retires_at_exit`); elsewhere this is always false
+    /// (https://github.com/rrnewton/hermit/issues/4445).
+    pub(crate) fn names_a_retired_exited_leader(&self, named: DetTid) -> bool {
+        self.retired_exited_leaders.contains(&named) && !self.next_turns.contains_key(&named)
+    }
+
     /// Whether `dettid` is a leader `retire_exited_leader` already retired;
     /// its deregistration then retires nothing more. Consumes the record.
     pub(crate) fn take_retired_exited_leader(&mut self, dettid: DetTid) -> bool {
@@ -15874,6 +15885,23 @@ mod test {
         assert!(!sched.replay_registration_priority(late, REPLAY_DEFERRED_PRIORITY));
         assert_eq!(sched.priorities.get(&late), Some(&DEFAULT_PRIORITY));
         assert_eq!(sched.priorities.get(&early), Some(&DEFAULT_PRIORITY));
+    }
+
+    /// Only a leader retired at its own exit while its group lives on counts
+    /// as a retired exited leader; one that merely left `next_turns`, as at a
+    /// host-timed deregistration on DBT, does not
+    /// (https://github.com/rrnewton/hermit/issues/4445).
+    #[test]
+    fn only_a_leader_retired_at_its_exit_names_a_retired_exited_leader() {
+        let mut sched = Scheduler::new(&Config::default());
+        let retired = DetTid::from_raw(5);
+        let deregistered = DetTid::from_raw(7);
+        sched.retired_exited_leaders.insert(retired);
+        assert!(sched.names_a_retired_exited_leader(retired));
+        assert!(!sched.names_a_retired_exited_leader(deregistered));
+        // Registered again under the same tid: live, so no longer retired.
+        register_known_thread(&mut sched, retired);
+        assert!(!sched.names_a_retired_exited_leader(retired));
     }
 
     fn exec_replay(

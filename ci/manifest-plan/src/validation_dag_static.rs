@@ -2340,7 +2340,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and the_last_replayed_event_releases_the_replay_priorities and
     // a_thread_registering_after_the_replay_ran_out_takes_the_default_priority
     // (https://github.com/rrnewton/hermit/issues/4472): 1794, listed.
-    ("test.detcore_unit", 1794),
+    // And scheduler::test::only_a_leader_retired_at_its_exit_names_a_retired_exited_leader
+    // (https://github.com/rrnewton/hermit/issues/4445): 1795, listed.
+    ("test.detcore_unit", 1795),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3335,7 +3337,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from 7a4a7b54: 447.
     // And a_desynced_schedule_replay_admits_a_non_root_process_child
     // (https://github.com/rrnewton/hermit/issues/4472): 448, listed.
-    ("test.cli", 448),
+    // And a_sigkill_to_an_exited_leader_leaves_its_group_running and
+    // a_wait_after_a_sigkill_to_an_exited_leader_is_a_deadlock
+    // (https://github.com/rrnewton/hermit/issues/4445): 450, listed.
+    ("test.cli", 450),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3727,7 +3732,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from 7a4a7b54: 383.
     // And the 4472 schedule-replay test
     // (https://github.com/rrnewton/hermit/issues/4472): 384, listed.
-    ("test.cli_on_host", 384),
+    // And the two 4445 exited-leader SIGKILL tests
+    // (https://github.com/rrnewton/hermit/issues/4445): 386, listed.
+    ("test.cli_on_host", 386),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3995,7 +4002,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_placeholder_carries_the_uptime_of_the_first_read (https://github.com/rrnewton/hermit/issues/4213): 1722.
     // And +69 from a3a9c83a: 1791.
     // And the three 4472 replay-priority tests: 1794.
-    ("test.detcore_unit_on_host", 1794),
+    // And the 4445 retired-leader test: 1795.
+    ("test.detcore_unit_on_host", 1795),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

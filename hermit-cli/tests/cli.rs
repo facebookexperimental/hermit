@@ -26601,6 +26601,65 @@ fn a_cross_process_sigkill_edge_case_verifies_at_bitwise_parity() {
     ]);
 }
 
+/// A SIGKILL sent with tgkill or tkill to a child's leader that has exited
+/// while a sibling runs on: Linux keeps the leader a zombie and leaves its
+/// group running. Before the fix ptrace reserved the whole group as the
+/// kill's victims and refused the run after waiting 30 s for deaths that
+/// never came (https://github.com/rrnewton/hermit/issues/4445; see
+/// `verify_sigkill_cross_process_modes`).
+#[test]
+fn a_sigkill_to_an_exited_leader_leaves_its_group_running() {
+    verify_sigkill_cross_process_modes(&[
+        (
+            "exitedleader",
+            "tgkill of the exited leader: 0 errno 0, alive afterwards: 1\nchild killed by signal 9\n",
+            2,
+        ),
+        (
+            "exitedleader_tkill",
+            "tkill of the exited leader: 0 errno 0, alive afterwards: 1\nchild killed by signal 9\n",
+            2,
+        ),
+    ]);
+}
+
+/// After a SIGKILL to an exited leader, which kills nothing, a wait for that
+/// child, whose sibling pauses for ever, is a deadlock that Hermit reports:
+/// the send must not be recorded as a kill, which would count the child as
+/// about to die and keep the deadlock check quiet, so that the run hangs
+/// (Codex review of https://github.com/rrnewton/hermit/issues/4445).
+#[test]
+fn a_wait_after_a_sigkill_to_an_exited_leader_is_a_deadlock() {
+    let program = sigkill_cross_process_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            program.as_str(),
+            "exitedleader_wait",
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        stdout,
+        "tgkill of the exited leader: 0 errno 0; waiting for the child\n"
+    );
+    assert_eq!(status.and_then(|status| status.code()), Some(125), "{log}");
+    assert!(
+        log.contains("Deadlock detected")
+            && log.contains("thread(s) waiting for a child that cannot exit"),
+        "the deadlock report must name the wait:\n{log}"
+    );
+}
+
 /// The SIGCHLD notifications of killed children, collected with
 /// sigtimedwait, a handler or a signalfd (see
 /// `verify_sigkill_cross_process_modes`).

@@ -56,6 +56,7 @@ use crate::tool_global::SigalrmControl;
 use crate::tool_global::alarm_remaining;
 use crate::tool_global::commit_sigkill;
 use crate::tool_global::host_timed_signals;
+use crate::tool_global::names_a_retired_exited_leader;
 use crate::tool_global::notify_signal_pending;
 use crate::tool_global::own_process_signal_inputs;
 use crate::tool_global::record_host_timed_signals;
@@ -209,6 +210,26 @@ where
         }
     }
     Ok(guest.memory().read_value(address.cast())?)
+}
+
+/// Whether a thread-directed SIGKILL (`tgkill` or `tkill`) names `tid`, a
+/// thread-group leader that has exited while a sibling runs on. Linux keeps
+/// such a leader as a zombie, and a SIGKILL that names it does not end its
+/// group: `complete_signal` finds that the exiting leader does not want the
+/// signal, and a thread-directed signal goes to no other thread. So the send
+/// is not reserved as a group kill; it takes the ordinary path, and the
+/// kernel answers it as Linux does, with no effect. Only a leader the
+/// scheduler retired at its own `exit` counts: it commits no other turn until
+/// the kernel shows such a leader a zombie, so by this turn it is one, in
+/// every run (`Scheduler::names_a_retired_exited_leader`). A leader that left
+/// the scheduler at a host-timed deregistration, as on DBT, does not
+/// (https://github.com/rrnewton/hermit/issues/4445).
+async fn sigkill_names_an_exited_leader<G, T>(guest: &mut G, tid: DetTid) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    names_a_retired_exited_leader(guest, tid).await
 }
 
 /// Signal phase 1: the guest's SIGALRM disposition (a guest handler or not)
@@ -2591,16 +2612,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         // and is retired at this turn, like `kill`'s. Only a valid pair is
         // reserved: Linux rejects a thread outside the named group (ESRCH) or a
         // non-positive id (EINVAL) before anything happens, so such a send
-        // takes the ordinary path and gets the kernel's errno.
+        // takes the ordinary path and gets the kernel's errno. Nor is a send
+        // to a leader that has exited while its siblings run on
+        // (`sigkill_names_an_exited_leader`).
+        let mut exited_leader = false;
         if call.sig() == libc::SIGKILL
             && guest.config().sequentialize_threads
             && tgid > 0
             && tid > 0
             && registered_process_of(guest, DetTid::from_raw(tid)).await
                 == Some(DetPid::from_raw(tgid))
-            && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(tid)).await
         {
-            return self.send_reserved_sigkill(guest, reservation, call).await;
+            exited_leader = sigkill_names_an_exited_leader(guest, DetTid::from_raw(tid)).await;
+            if !exited_leader
+                && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(tid)).await
+            {
+                return self.send_reserved_sigkill(guest, reservation, call).await;
+            }
         }
         let value = self
             .send_guest_signal(
@@ -2613,6 +2641,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 DetTid::from_raw(tid),
             )
             .await?;
+        // The kernel accepted a SIGKILL that changes nothing: no thread takes
+        // it and no process dies, so the scheduler is not told of a kill.
+        if exited_leader {
+            return Ok(value);
+        }
         // `pthread_kill` lowers to `tgkill`, so this is the ordinary way one
         // guest THREAD signals a sibling. Like `kill`, a successful cross-task
         // send must tell the scheduler, or a target parked in a child wait is
@@ -2680,12 +2713,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await;
         // A non-positive tid is EINVAL in Linux, before anything happens.
-        if call.sig() == libc::SIGKILL
-            && guest.config().sequentialize_threads
-            && tid > 0
-            && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(tid)).await
-        {
-            return self.send_reserved_sigkill(guest, reservation, call).await;
+        let mut exited_leader = false;
+        if call.sig() == libc::SIGKILL && guest.config().sequentialize_threads && tid > 0 {
+            exited_leader = sigkill_names_an_exited_leader(guest, DetTid::from_raw(tid)).await;
+            if !exited_leader
+                && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(tid)).await
+            {
+                return self.send_reserved_sigkill(guest, reservation, call).await;
+            }
         }
         let value = self
             .send_guest_signal(
@@ -2698,6 +2733,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 DetTid::from_raw(tid),
             )
             .await?;
+        // As in `tgkill`, a SIGKILL to an exited leader changes nothing.
+        if exited_leader {
+            return Ok(value);
+        }
         // Same wakeup obligation as `tgkill`; `tkill` is the older two-argument
         // spelling of the same thread-directed send.
         self.notify_cross_task_signal(
