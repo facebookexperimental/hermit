@@ -819,10 +819,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// guest's process groups and sessions (`ThreadTree`), which `setpgid` and
     /// `setsid` keep, the same on every backend. The root process's group and
     /// session come from outside the container's PID namespace and read as 0,
-    /// as on Linux (`scheduler::OUTSIDE_NAMESPACE`). A pid that names no
-    /// process or thread Detcore registered is ESRCH; a negative one too, as
-    /// Linux finds no task for it. A caller in a nested PID namespace, whose
-    /// ids are not the model's, is answered by the kernel as before.
+    /// as on Linux (`scheduler::OUTSIDE_NAMESPACE`), and so do the namespace
+    /// init's, pid 1. A pid that names no task Linux still has (none
+    /// registered, an exited thread, a process already reaped, automatically
+    /// or by the namespace's init) is ESRCH; a negative one too, as Linux
+    /// finds no task for it (`Scheduler::group_or_session_of`). A caller in a
+    /// nested PID namespace, whose ids are not the model's, is answered by the
+    /// kernel as before.
     // TODO-HUMAN-REVIEW(PR-b3a4c): Review the group and session model answers
     // (slice B3a-4c of https://github.com/rrnewton/hermit/issues/4266).
     pub async fn handle_group_or_session_getter<G: Guest<Self>>(
@@ -839,21 +842,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             args.arg0 as libc::pid_t
         };
-        let process = match pid {
+        let task = match pid {
             0 => guest.thread_state().detpid.expect("detpid unset"),
             pid if pid < 0 => return Err(Errno::ESRCH.into()),
-            pid => crate::tool_global::registered_process_of(
-                guest,
-                crate::types::DetTid::from_raw(pid),
-            )
-            .await
-            .ok_or(Errno::ESRCH)?,
+            pid => DetPid::from_raw(pid),
         };
-        let answer = if sysno == Sysno::getsid {
-            crate::tool_global::session(guest, process).await
-        } else {
-            crate::tool_global::process_group(guest, process).await
-        };
+        let answer =
+            crate::tool_global::group_or_session_of(guest, task, sysno == Sysno::getsid).await;
         Ok(i64::from(answer.ok_or(Errno::ESRCH)?.as_raw()))
     }
 

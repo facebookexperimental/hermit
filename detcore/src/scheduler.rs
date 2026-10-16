@@ -2481,19 +2481,27 @@ impl ThreadTree {
     }
 
     /// Whether a process group `group` exists: whether any process of the
-    /// model, exited and not yet reaped included, belongs to it.
-    fn process_group_exists(&self, group: DetPid) -> bool {
+    /// model that Linux still has belongs to it, a zombie included. `gone`
+    /// names the processes whose wait record outlived them: an automatically
+    /// reaped child, an orphan the namespace's init reaped
+    /// (`Scheduler::process_exists`).
+    fn process_group_exists(&self, group: DetPid, gone: &dyn Fn(DetPid) -> bool) -> bool {
         self.process_wait
-            .values()
-            .any(|metadata| metadata.process_group == group)
+            .iter()
+            .any(|(pid, metadata)| metadata.process_group == group && !gone(*pid))
     }
 
     /// Linux's answer to `setsid()` by the process `process`
     /// (`ksys_setsid`): EPERM where a process group with its id exists, its
     /// own included, and otherwise success, which makes it the leader of a
     /// new session and process group (`Self::create_session` records that).
-    pub fn setsid_decision(&self, process: DetPid) -> Result<(), Errno> {
-        if self.process_group_exists(process) {
+    /// `gone` as for `Self::process_group_exists`.
+    pub fn setsid_decision(
+        &self,
+        process: DetPid,
+        gone: &dyn Fn(DetPid) -> bool,
+    ) -> Result<(), Errno> {
+        if self.process_group_exists(process, gone) {
             return Err(Errno::EPERM);
         }
         if !self.process_wait.contains_key(&process) {
@@ -2514,27 +2522,31 @@ impl ThreadTree {
     /// - a session leader cannot move (EPERM);
     /// - a group other than the process's own id must exist in the caller's
     ///   session (EPERM).
+    ///
+    /// `gone` names the processes Linux no longer has although their wait
+    /// record remains (`Self::process_group_exists`), and `live_nonleader`
+    /// the ids of live threads that lead no thread group
+    /// (`Scheduler::signal_target_process`): EINVAL rather than ESRCH.
     pub fn setpgid_decision(
         &self,
         caller: DetPid,
         pid: libc::pid_t,
         pgid: libc::pid_t,
+        gone: &dyn Fn(DetPid) -> bool,
+        live_nonleader: &dyn Fn(DetPid) -> bool,
     ) -> Result<(DetPid, DetPid), Errno> {
+        // In the kernel's order: a zero pid is the caller, a zero group is
+        // then the pid, and only that group is checked for a negative value,
+        // so `setpgid(-5, 0)` is EINVAL, not ESRCH.
+        let pid = if pid == 0 { caller.as_raw() } else { pid };
+        let pgid = if pgid == 0 { pid } else { pgid };
         if pgid < 0 {
             return Err(Errno::EINVAL);
         }
-        let target = if pid == 0 {
-            caller
-        } else {
-            DetPid::from_raw(pid)
-        };
-        let group = if pgid == 0 {
-            target
-        } else {
-            DetPid::from_raw(pgid)
-        };
-        let Some(target_metadata) = self.process_wait.get(&target) else {
-            return Err(if self.thread_to_leader.contains_key(&target) {
+        let target = DetPid::from_raw(pid);
+        let group = DetPid::from_raw(pgid);
+        let Some(target_metadata) = self.process_wait.get(&target).filter(|_| !gone(target)) else {
+            return Err(if live_nonleader(target) {
                 Errno::EINVAL
             } else {
                 Errno::ESRCH
@@ -2560,8 +2572,8 @@ impl ThreadTree {
             return Err(Errno::EPERM);
         }
         if group != target
-            && !self.process_wait.values().any(|metadata| {
-                metadata.process_group == group && metadata.session == caller_session
+            && !self.process_wait.iter().any(|(pid, metadata)| {
+                metadata.process_group == group && metadata.session == caller_session && !gone(*pid)
             })
         {
             return Err(Errno::EPERM);
@@ -8534,13 +8546,7 @@ impl Scheduler {
     /// reaps. Its `task` lists its live threads and its leader while the
     /// process is listed.
     pub fn procfs_listing(&self, process: Option<DetPid>) -> crate::procfs::listing::ListingFacts {
-        let listed = |leader: DetPid| {
-            self.thread_tree.process_wait.contains_key(&leader)
-                && match self.exited_process_is_zombie(leader) {
-                    None => true,
-                    Some(zombie) => zombie && self.thread_tree.parent_process(&leader).is_some(),
-                }
-        };
+        let listed = |leader: DetPid| self.process_exists(leader);
         let mut processes: Vec<i32> = self
             .thread_tree
             .thread_group_leaders
@@ -8882,6 +8888,69 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    /// Whether Linux still has the process `leader`: from its creation until
+    /// it is reaped, a zombie included, as `/proc` lists it
+    /// (`Self::procfs_listing`). Its wait record can outlive it: an
+    /// automatically reaped child, an orphan the namespace's init reaped, or
+    /// a process with no guest parent, which Hermit itself reaps, is gone at
+    /// its exit (`Self::exited_process_is_zombie`).
+    pub fn process_exists(&self, leader: DetPid) -> bool {
+        self.thread_tree.process_wait.contains_key(&leader)
+            && match self.exited_process_is_zombie(leader) {
+                None => true,
+                Some(zombie) => zombie && self.thread_tree.parent_process(&leader).is_some(),
+            }
+    }
+
+    /// The process group (`session` false) or session (`session` true) of the
+    /// task with id `pid`, as `getpgid` and `getsid` answer it: a live
+    /// non-leader thread's id names its process, and an id Linux no longer
+    /// has (an exited thread, a process that is gone, `Self::process_exists`)
+    /// names nothing. Pid 1 is the namespace's init, Hermit's own process
+    /// unless a guest holds it, whose group and session come from outside the
+    /// namespace and read as 0, as `/proc` lists it.
+    pub fn group_or_session_of(&self, pid: DetPid, session: bool) -> Option<DetPid> {
+        let Some(process) = self.signal_target_process(pid) else {
+            return (pid.as_raw() == 1).then_some(OUTSIDE_NAMESPACE);
+        };
+        if !self.process_exists(process) {
+            return None;
+        }
+        if session {
+            self.thread_tree.session(process)
+        } else {
+            self.thread_tree.process_group(process)
+        }
+    }
+
+    /// Linux's answer to `setsid()` by `process` (`ThreadTree::setsid_decision`),
+    /// counting only processes Linux still has (`Self::process_exists`).
+    pub fn setsid_decision(&self, process: DetPid) -> Result<(), Errno> {
+        self.thread_tree
+            .setsid_decision(process, &|pid| !self.process_exists(pid))
+    }
+
+    /// Linux's answer to `setpgid(pid, pgid)` by `caller`
+    /// (`ThreadTree::setpgid_decision`), naming and counting only tasks Linux
+    /// still has.
+    pub fn setpgid_decision(
+        &self,
+        caller: DetPid,
+        pid: libc::pid_t,
+        pgid: libc::pid_t,
+    ) -> Result<(DetPid, DetPid), Errno> {
+        self.thread_tree.setpgid_decision(
+            caller,
+            pid,
+            pgid,
+            &|pid| !self.process_exists(pid),
+            &|tid| {
+                !self.thread_tree.thread_group_leaders.contains(&tid)
+                    && self.signal_target_process(tid).is_some()
+            },
+        )
     }
 
     /// The exit state of `detpid` as a signal sees it: `Some(true)` for a
@@ -15503,55 +15572,139 @@ mod test {
         let root = DetPid::from_raw(3);
         let child = DetPid::from_raw(5);
         let other = DetPid::from_raw(7);
-        let tree = &mut scheduler.thread_tree;
-        tree.add_child(root, root, true);
-        tree.add_child(root, child, true);
-        tree.add_child(root, other, true);
+        for pid in [root, child, other] {
+            scheduler.thread_tree.add_child(root, pid, true);
+        }
         // The root's group and session come from outside the namespace.
-        assert_eq!(tree.process_group(root), Some(OUTSIDE_NAMESPACE));
-        assert_eq!(tree.session(child), Some(OUTSIDE_NAMESPACE));
-        // A child may lead its own group, and a sibling may join it.
-        assert_eq!(tree.setpgid_decision(child, 0, 0), Ok((child, child)));
-        tree.set_process_group(child, child);
         assert_eq!(
-            tree.setpgid_decision(root, other.as_raw(), child.as_raw()),
+            scheduler.thread_tree.process_group(root),
+            Some(OUTSIDE_NAMESPACE)
+        );
+        assert_eq!(
+            scheduler.thread_tree.session(child),
+            Some(OUTSIDE_NAMESPACE)
+        );
+        // A child may lead its own group, and a sibling may join it.
+        assert_eq!(scheduler.setpgid_decision(child, 0, 0), Ok((child, child)));
+        scheduler.thread_tree.set_process_group(child, child);
+        assert_eq!(
+            scheduler.setpgid_decision(root, other.as_raw(), child.as_raw()),
             Ok((other, child))
         );
         // No such group, a negative group, no such process.
         assert_eq!(
-            tree.setpgid_decision(root, other.as_raw(), 99),
+            scheduler.setpgid_decision(root, other.as_raw(), 99),
             Err(Errno::EPERM)
         );
-        assert_eq!(tree.setpgid_decision(root, 0, -1), Err(Errno::EINVAL));
-        assert_eq!(tree.setpgid_decision(root, 42, 0), Err(Errno::ESRCH));
+        assert_eq!(scheduler.setpgid_decision(root, 0, -1), Err(Errno::EINVAL));
+        // The kernel takes a zero group as the pid before checking its sign.
+        assert_eq!(scheduler.setpgid_decision(root, -5, 0), Err(Errno::EINVAL));
+        assert_eq!(scheduler.setpgid_decision(root, 42, 0), Err(Errno::ESRCH));
         // Not the caller's child.
         assert_eq!(
-            tree.setpgid_decision(child, other.as_raw(), 0),
+            scheduler.setpgid_decision(child, other.as_raw(), 0),
             Err(Errno::ESRCH)
         );
         // A group with the caller's id exists: setsid is EPERM.
-        assert_eq!(tree.setsid_decision(child), Err(Errno::EPERM));
+        assert_eq!(scheduler.setsid_decision(child), Err(Errno::EPERM));
         // The root leads no group: setsid succeeds, and it then leads both.
-        assert_eq!(tree.setsid_decision(root), Ok(()));
-        tree.create_session(root);
-        assert_eq!(tree.process_group(root), Some(root));
-        assert_eq!(tree.session(root), Some(root));
+        assert_eq!(scheduler.setsid_decision(root), Ok(()));
+        scheduler.thread_tree.create_session(root);
+        assert_eq!(scheduler.thread_tree.process_group(root), Some(root));
+        assert_eq!(scheduler.thread_tree.session(root), Some(root));
         // A session leader cannot move; a child in another session cannot be
         // moved.
-        assert_eq!(tree.setpgid_decision(root, 0, 0), Err(Errno::EPERM));
+        assert_eq!(scheduler.setpgid_decision(root, 0, 0), Err(Errno::EPERM));
         assert_eq!(
-            tree.setpgid_decision(root, other.as_raw(), 0),
+            scheduler.setpgid_decision(root, other.as_raw(), 0),
             Err(Errno::EPERM)
         );
         // A child that exec'd cannot be moved by its parent.
         let late = DetPid::from_raw(9);
-        tree.add_child(root, late, true);
-        tree.record_successful_exec(late);
+        scheduler.thread_tree.add_child(root, late, true);
+        scheduler.thread_tree.record_successful_exec(late);
         assert_eq!(
-            tree.setpgid_decision(root, late.as_raw(), 0),
+            scheduler.setpgid_decision(root, late.as_raw(), 0),
             Err(Errno::EACCES)
         );
-        assert_eq!(tree.setpgid_decision(late, 0, 0), Ok((late, late)));
+        assert_eq!(scheduler.setpgid_decision(late, 0, 0), Ok((late, late)));
+    }
+
+    /// A process Linux no longer has, although its wait record remains (a
+    /// child its parent reaps automatically, here), has no group or session,
+    /// is no member of its group, and cannot be moved; a live thread's id
+    /// names its process, and pid 1 is the namespace's init
+    /// (`group_or_session_of`, `process_exists`).
+    #[test]
+    fn process_groups_count_only_processes_linux_still_has() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let root = DetPid::from_raw(3);
+        let child = DetPid::from_raw(5);
+        let late = DetPid::from_raw(7);
+        for pid in [root, child, late] {
+            scheduler.thread_tree.add_child(root, pid, true);
+        }
+        assert_eq!(
+            scheduler.setpgid_decision(root, child.as_raw(), 0),
+            Ok((child, child))
+        );
+        scheduler.thread_tree.set_process_group(child, child);
+        assert_eq!(scheduler.group_or_session_of(child, false), Some(child));
+        assert_eq!(
+            scheduler.setpgid_decision(root, late.as_raw(), child.as_raw()),
+            Ok((late, child))
+        );
+        // The root ignores SIGCHLD, so its child is gone at its exit.
+        scheduler
+            .thread_tree
+            .set_sigchld_disposition(root, true, false);
+        exit_process(&mut scheduler, child);
+        assert!(!scheduler.process_exists(child));
+        assert_eq!(scheduler.group_or_session_of(child, false), None);
+        assert_eq!(scheduler.group_or_session_of(child, true), None);
+        // Its group had no other member, so it no longer exists.
+        assert_eq!(
+            scheduler.setpgid_decision(root, late.as_raw(), child.as_raw()),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            scheduler.setpgid_decision(root, child.as_raw(), 0),
+            Err(Errno::ESRCH)
+        );
+        // A live thread's id names its process; setpgid names a process, so
+        // another thread's id is EINVAL. Once the thread exits, its id names
+        // nothing.
+        let thread = DetTid::from_raw(9);
+        scheduler.thread_tree.add_child(late, thread, false);
+        register_known_thread(&mut scheduler, thread);
+        assert_eq!(
+            scheduler.group_or_session_of(thread, false),
+            Some(OUTSIDE_NAMESPACE)
+        );
+        assert_eq!(
+            scheduler.setpgid_decision(root, thread.as_raw(), 0),
+            Err(Errno::EINVAL)
+        );
+        scheduler.logically_kill_thread(&thread, &late, MmId::initial(late));
+        assert_eq!(scheduler.group_or_session_of(thread, false), None);
+        assert_eq!(
+            scheduler.setpgid_decision(root, thread.as_raw(), 0),
+            Err(Errno::ESRCH)
+        );
+        // The namespace's init, which no guest holds here.
+        let init = DetPid::from_raw(1);
+        assert_eq!(
+            scheduler.group_or_session_of(init, false),
+            Some(OUTSIDE_NAMESPACE)
+        );
+        assert_eq!(
+            scheduler.group_or_session_of(init, true),
+            Some(OUTSIDE_NAMESPACE)
+        );
+        assert_eq!(
+            scheduler.group_or_session_of(DetPid::from_raw(42), false),
+            None
+        );
     }
 
     /// Where the backend registers the kernel's ids (DBT), the guest's and

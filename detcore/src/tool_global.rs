@@ -3249,23 +3249,20 @@ impl GlobalState {
                     .await
                     .procfs_ids(to_kernel, &ids),
             ),
-            GlobalRequest::Session(process) => R::Session(
+            GlobalRequest::GroupOrSession(pid, session) => R::GroupOrSession(
                 self.lock_rpc_scheduler(false)
                     .await
-                    .thread_tree
-                    .session(process),
+                    .group_or_session_of(pid, session),
             ),
             GlobalRequest::SetsidDecision(process) => R::SetsidDecision(
                 self.lock_rpc_scheduler(false)
                     .await
-                    .thread_tree
                     .setsid_decision(process)
                     .map_err(|errno| errno.into_raw()),
             ),
             GlobalRequest::SetpgidDecision(caller, pid, pgid) => R::SetpgidDecision(
                 self.lock_rpc_scheduler(false)
                     .await
-                    .thread_tree
                     .setpgid_decision(caller, pid, pgid)
                     .map_err(|errno| errno.into_raw()),
             ),
@@ -5326,14 +5323,15 @@ pub enum GlobalRequest {
     /// the guest's for kernel numbers (`false`), as `/proc` spells them
     /// (`Scheduler::procfs_ids`). Appended last, for the same reason.
     ProcfsIds(bool, Vec<i32>),
-    /// The session of a process (`ThreadTree::session`). Appended last, for
-    /// the same reason.
-    Session(DetPid),
+    /// The process group (`false`) or session (`true`) of the task with an id,
+    /// as `getpgid` and `getsid` answer it (`Scheduler::group_or_session_of`).
+    /// Appended last, for the same reason.
+    GroupOrSession(DetPid, bool),
     /// Linux's answer to `setsid()` by a process
-    /// (`ThreadTree::setsid_decision`), deciding nothing yet. Appended last.
+    /// (`Scheduler::setsid_decision`), deciding nothing yet. Appended last.
     SetsidDecision(DetPid),
     /// Linux's answer to `setpgid(pid, pgid)` by a process
-    /// (`ThreadTree::setpgid_decision`), deciding nothing yet. Appended last.
+    /// (`Scheduler::setpgid_decision`), deciding nothing yet. Appended last.
     SetpgidDecision(DetPid, i32, i32),
 }
 
@@ -5504,7 +5502,7 @@ pub enum GlobalResponse {
     /// Appended last, for the same reason.
     ProcfsIds(Vec<Option<i32>>),
     /// Appended last, for the same reason.
-    Session(Option<DetPid>),
+    GroupOrSession(Option<DetPid>),
     /// Appended last; the error is an errno.
     SetsidDecision(Result<(), i32>),
     /// The process to move and its new group; the error is an errno. Appended
@@ -7488,7 +7486,7 @@ where
 }
 
 /// Linux's answer to `setsid()` by `process`, from Detcore's model
-/// (`ThreadTree::setsid_decision`).
+/// (`Scheduler::setsid_decision`).
 pub async fn setsid_decision<G, T>(guest: &mut G, process: DetPid) -> Result<(), reverie::Errno>
 where
     G: Guest<Detcore<T>>,
@@ -7502,7 +7500,7 @@ where
 }
 
 /// Linux's answer to `setpgid(pid, pgid)` by `caller`, from Detcore's model
-/// (`ThreadTree::setpgid_decision`): the process to move and its group.
+/// (`Scheduler::setpgid_decision`): the process to move and its group.
 pub async fn setpgid_decision<G, T>(
     guest: &mut G,
     caller: DetPid,
@@ -7521,15 +7519,17 @@ where
     }
 }
 
-/// The session of `process` in Detcore's model (`ThreadTree::session`).
-pub async fn session<G, T>(guest: &mut G, process: DetPid) -> Option<DetPid>
+/// The process group (`session` false) or session (`session` true) of the
+/// task with id `pid` in Detcore's model, as `getpgid` and `getsid` answer it
+/// (`Scheduler::group_or_session_of`); `None` where Linux has no such task.
+pub async fn group_or_session_of<G, T>(guest: &mut G, pid: DetPid, session: bool) -> Option<DetPid>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let response = send_and_update_time(guest, GlobalRequest::Session(process)).await;
+    let response = send_and_update_time(guest, GlobalRequest::GroupOrSession(pid, session)).await;
     match response.1 {
-        GlobalResponse::Session(session) => session,
+        GlobalResponse::GroupOrSession(answer) => answer,
         _ => unreachable!(),
     }
 }

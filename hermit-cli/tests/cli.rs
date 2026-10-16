@@ -1670,12 +1670,17 @@ fn process_groups_guest() -> &'static Path {
 /// `unshare --pid --fork`): getpgrp and getsid read 0 there, a child leads or
 /// joins a group, setsid makes the caller lead a new session and group, and
 /// each of Linux's refusals (no such group, a negative group, no such process,
-/// a group or session leader, another session, a child that exec'd) is the
-/// same on every backend. Detcore answers them from its model (slice B3a-4c of
+/// a group or session leader, another session, a child that exec'd, a negative
+/// pid with a zero group, a process already reaped and its former group) is
+/// the same on every backend, and the namespace's init reads 0 too. Detcore
+/// answers them from its model (slice B3a-4c of
 /// https://github.com/rrnewton/hermit/issues/4266); before, DBT's runtime made
 /// the guest a group leader and refused setsid and setpgid with EPERM, and
 /// KVM's executor answered ENOSYS. The guest names each id by the process it
-/// equals, so how a backend numbers processes does not matter.
+/// equals, so how a backend numbers processes does not matter. The expected
+/// output is checked against Linux itself (the guest under `unshare`, below a
+/// shell as the namespace's init), and on ptrace under `--verify` and record
+/// and replay.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-b3a4c): regression coverage for process groups and
 // sessions from Detcore's model.
@@ -1694,19 +1699,94 @@ fn process_groups_and_sessions_answer_as_linux_on_every_backend() {
                     setpgid(0, 0) as session leader=EPERM\n\
                     setpgid(b, b) in another session=EPERM\n\
                     a pgrp=self sid=0\n\
-                    setpgid(child that exec'd)=EACCES\n";
-    let backends = procfs_backends(test);
-    for backend in &backends {
-        let mut args = vec!["--backend", backend, "run", "--strict"];
-        if *backend == "liteinst" || *backend == "in-guest-trap" {
-            args.push("--max-timeslice=disabled");
+                    setpgid(child that exec'd)=EACCES\n\
+                    setpgid(-5, 0)=EINVAL\n\
+                    init pgrp=0 sid=0\n";
+    // `process_groups reaped`: a group leader its parent reaps automatically.
+    let reaped_test = "process_groups_and_sessions_answer_as_linux_on_every_backend (reaped)";
+    let expected_reaped = "setpgid(e, 0)=ok\n\
+                           waitpid(e)=ECHILD\n\
+                           getpgid(reaped e)=ESRCH getsid(reaped e)=ESRCH\n\
+                           setpgid(f, reaped e's group)=EPERM\n\
+                           waitpid(f)=ECHILD\n";
+    let guest_path = guest.to_str().expect("guest path is UTF-8");
+    let modes: [(&str, &[&str], &str); 2] = [
+        (test, &[], expected),
+        (reaped_test, &["reaped"], expected_reaped),
+    ];
+    let mut compared = Vec::new();
+    for (name, mode, expected) in modes {
+        // The baseline is Linux itself: the guest in a new PID namespace
+        // whose init is a shell, as Hermit's init is its own process, with
+        // the group and session of its parent outside.
+        let native = Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--pid",
+                "--fork",
+                "/bin/sh",
+                "-c",
+            ])
+            .arg("\"$0\" \"$@\"; exit $?")
+            .arg(guest_path)
+            .args(mode)
+            .output()
+            .expect("failed to run the guest under unshare");
+        assert!(
+            native.status.success(),
+            "{name}: native run failed: {native:?}"
+        );
+        assert_eq!(stdout(&native), expected, "{name}: native Linux");
+        let backends = procfs_backends(name);
+        for backend in &backends {
+            let mut args = vec!["--backend", backend, "run", "--strict"];
+            if *backend == "liteinst" || *backend == "in-guest-trap" {
+                args.push("--max-timeslice=disabled");
+            }
+            args.extend(["--", guest_path]);
+            args.extend(mode);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{name}: {backend}");
         }
-        args.extend(["--", guest.to_str().expect("guest path is UTF-8")]);
-        let output = hermit(&args);
-        assert_success(&output, &args);
-        assert_eq!(stdout(&output), expected, "{backend}");
+        // Repeat parity and record/replay on ptrace: the answers come from
+        // Detcore's model, so both runs and the replay agree.
+        let directory = tempfile::tempdir().expect("failed to create report directory");
+        let report = directory.path().join("verify.json");
+        let report_arg = report.to_str().expect("report path is UTF-8");
+        let mut verify_args = vec![
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
+            "--",
+            guest_path,
+        ];
+        verify_args.extend(mode);
+        let verified = hermit(&verify_args);
+        assert_success(&verified, &verify_args);
+        assert_eq!(stdout(&verified), expected, "{name}: ptrace --verify");
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                .expect("parse the verification report");
+        assert_eq!(verdict["bitwise_parity"], true, "{name}: {verdict}");
+        let mut record_args = vec!["record", "--verify", "--", guest_path];
+        record_args.extend(mode);
+        let recorded = hermit(&record_args);
+        assert_success(&recorded, &record_args);
+        assert!(
+            stderr(&recorded).contains("Success: replay matched recording."),
+            "{name}: replay must match the recording: {recorded:?}"
+        );
+        assert_eq!(stdout(&recorded), expected, "{name}: ptrace record");
+        compared.push(format!(
+            "{name}: native, {backends:?}, ptrace --verify, record/replay"
+        ));
     }
-    eprintln!("{test} compared {backends:?}");
+    eprintln!("compared {compared:?}");
 }
 
 static SESSION_CONTAINMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -4340,6 +4420,14 @@ const PROCFS_BACKENDS: [&str; 7] = [
 /// also need `--max-timeslice=disabled`, as the in-guest Tool host cannot
 /// deliver the preemption timer yet.
 const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
+    (
+        "process_groups_and_sessions_answer_as_linux_on_every_backend (reaped)",
+        "dbt, sabre",
+        "a child of a process that ignores SIGCHLD is not reaped at its exit: waitpid(child) \
+         returns the child where Linux, ptrace, KVM and the in-guest backends return ECHILD; \
+         the group and session answers already match (measured 2026-10-16 at 2f640c23; \
+         slice B3a-4c of https://github.com/rrnewton/hermit/issues/4266)",
+    ),
     (
         "process_groups_and_sessions_answer_as_linux_on_every_backend",
         "liteinst, in-guest-trap",

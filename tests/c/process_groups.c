@@ -9,7 +9,9 @@
 /* Process groups and sessions, as Linux answers them to a process that
  * starts in a new PID namespace with the group and session of its parent
  * outside it (as under `unshare --pid --fork`): getpgrp, getpgid, getsid,
- * setpgid and setsid, in the cases Linux distinguishes. Ids are printed
+ * setpgid and setsid, in the cases Linux distinguishes, including a process
+ * already reaped (automatically, with SIGCHLD ignored) and the namespace's
+ * init, pid 1, whose group and session are outside too. Ids are printed
  * relative to the process they should equal, so the output does not depend
  * on how a backend numbers processes.
  *
@@ -19,6 +21,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,7 +56,56 @@ static void must(int ok, const char* what) {
   }
 }
 
-int main(void) {
+/* A group leader that its parent reaps automatically: once it is gone, it
+ * has no group or session, and its group, which had no other member, no
+ * longer exists. Run as `process_groups reaped`. */
+static int reaped_group_leader(void) {
+  setvbuf(stdout, NULL, _IONBF, 0);
+  long r;
+  must(signal(SIGCHLD, SIG_IGN) != SIG_ERR, "signal");
+  int release[2];
+  must(pipe(release) == 0, "pipe");
+  pid_t e = fork();
+  must(e >= 0, "fork");
+  if (e == 0) {
+    char byte;
+    close(release[1]);
+    (void)!read(release[0], &byte, 1);
+    _exit(0);
+  }
+  close(release[0]);
+  r = setpgid(e, 0);
+  printf("setpgid(e, 0)=%s\n", outcome(r));
+  close(release[1]);
+  /* With SIGCHLD ignored, a wait for the child returns ECHILD once it is
+   * gone. */
+  r = waitpid(e, NULL, 0);
+  printf("waitpid(e)=%s\n", r == e ? "e" : outcome(r));
+  long g = getpgid(e);
+  printf("getpgid(reaped e)=%s ", outcome(g));
+  long s = getsid(e);
+  printf("getsid(reaped e)=%s\n", outcome(s));
+  must(pipe(release) == 0, "pipe");
+  pid_t f = fork();
+  must(f >= 0, "fork");
+  if (f == 0) {
+    char byte;
+    close(release[1]);
+    (void)!read(release[0], &byte, 1);
+    _exit(0);
+  }
+  close(release[0]);
+  r = setpgid(f, e);
+  printf("setpgid(f, reaped e's group)=%s\n", outcome(r));
+  close(release[1]);
+  r = waitpid(f, NULL, 0);
+  printf("waitpid(f)=%s\n", r == f ? "f" : outcome(r));
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  if (argc == 2 && strcmp(argv[1], "reaped") == 0)
+    return reaped_group_leader();
   setvbuf(stdout, NULL, _IONBF, 0);
   pid_t self = getpid();
   printf(
@@ -129,5 +181,15 @@ int main(void) {
   r = setpgid(c, 0);
   printf("setpgid(child that exec'd)=%s\n", outcome(r));
   must(waitpid(c, NULL, 0) == c, "waitpid");
+
+  /* The kernel takes a zero group as the pid before checking its sign. */
+  r = setpgid(-5, 0);
+  printf("setpgid(-5, 0)=%s\n", outcome(r));
+  /* The namespace's init: its group and session are outside the namespace. */
+  printf(
+      "init pgrp=%s sid=%s\n",
+      named(getpgid(1), self, 0, 0),
+      named(getsid(1), self, 0, 0));
+
   return 0;
 }
