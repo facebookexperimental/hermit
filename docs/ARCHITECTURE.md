@@ -18,6 +18,63 @@ The most important boundary is:
 - **Linux still implements most operations.** Detcore virtualizes selected
   results and orders selected effects; it is not a replacement kernel.
 
+## Architectural principles
+
+These rules bind every backend and every change, and a review checks a change
+against them (owner, 2026-10-15). A *backend* is a Reverie implementation of
+the `Tool`/`Guest` contract (ptrace, dbt, in-guest-trap, liteinst, sabre,
+e9patch, kvm); the *tool* is Detcore. Known violations are listed in the
+[backend architecture audit](https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/2026-10-15-kvm-backend-architecture-audit.md)
+and tracked from https://github.com/rrnewton/hermit/issues/4485.
+
+1. **A backend only intercepts.** It hooks guest syscalls and other events and
+   delivers them to the tool through the standard callbacks. How it hooks, and
+   where the tool's state lives, are its private business.
+   Checked by: not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
+2. **`inject()` reaches a kernel beneath the backend.** A syscall the tool
+   injects runs on the host Linux kernel (ptrace and the in-guest backends) or,
+   for KVM, on a swappable Linux provider behind a trait (host Linux, or an
+   emulated-Linux crate). A backend crate never embeds Linux semantics itself.
+   Checked by: not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
+3. **Re-implemented Linux lives only in Detcore's shared layer.** Behaviour
+   Hermit must model rather than pass through (futexes, scheduling, signals,
+   `/proc`, pids, time) is written once in Detcore and is identical for every
+   backend.
+   Checked by: not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
+4. **Detcore never branches on the backend.** Per-backend differences (task
+   creation by fork, clone or vfork; exec; delivering a signal to a handler
+   with a mask; the preemption timer; exit) are backend traits with written
+   semantics and invariants, which Detcore calls. A capability field may
+   describe mechanism; it never selects semantics.
+   Checked by: not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
+5. **Only launch and setup differ per backend.** Apart from interception (1)
+   and the traits of (4), the code that starts the guest is the only code that
+   may differ between backends.
+   Checked by: `tests/isolation/conformance.rs` for the container contract (https://github.com/rrnewton/hermit/issues/4009); the rest not yet enforced.
+6. **Unsupported means a loud, named refusal.** A feature Hermit does not
+   support on a backend stops the run with a message that names it (see
+   [ERROR_CATALOG.md](ERROR_CATALOG.md)), never a plausible Linux errno
+   (`ENOSYS`, `EPERM`, `EOPNOTSUPP`, ...) or a zero in place of the real result.
+   Checked by: not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
+7. **Interchangeability is shown by tests.** The Reverie-level
+   native-comparison conformance test runs the same tool on every backend and
+   on native Linux over the test corpus, and a cell-by-cell comparison against
+   ptrace shows where each backend's outcomes differ. Per-backend coverage
+   ratcheting waits until the foundation follows rules 1-6 (owner, 2026-10-15).
+   Checked by: both tests are being built; not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
+
+### Approved exceptions
+
+A listed item is VM mechanics, not Linux semantics: the backend applies or
+mirrors the effect and forwards the syscall; it never chooses the result the
+guest sees. Add an item only with the owner's approval and a written reason.
+
+- **kvm:** guest page tables and memory slots that mirror host mappings; vCPU
+  state (registers, FS/GS base, segment state); trap entry and exit (VM exits
+  and re-entry); building and popping the signal frame on the vCPU stack for
+  `rt_sigreturn`, while Detcore decides which signal is delivered with which
+  mask.
+
 ## System overview
 
 Hermit has three layers plus the guest and host kernel:
@@ -73,12 +130,12 @@ time) stays in the hermit process.
 | Backend | How a syscall reaches Detcore | Where Detcore's per-thread half runs | Status |
 | --- | --- | --- | --- |
 | **ptrace** | seccomp `SECCOMP_RET_TRACE` and a ptrace stop (`reverie-ptrace`) | In the tracer, outside the guest | Default and reference; the rest of this document describes it |
-| **dbt** | DynamoRIO pre-syscall event in a DynamoRIO client (`reverie-dbt`, `detcore-dbt`) | Inside the guest, in the DynamoRIO client | Experimental; handles clone, fork, exec and signals in its own C client |
+| **dbt** | DynamoRIO pre-syscall event in a DynamoRIO client (`reverie-dbt`, `detcore-dbt`) | Inside the guest, in the DynamoRIO client | Experimental; handles clone, fork, exec and signals in its own C client, contrary to principle 4 |
 | **in-guest-trap** | A seccomp filter turns every syscall into `SIGSYS`, and a handler inside the guest calls Detcore (`reverie-inguest`) | Inside the guest, in a preloaded runtime | Experimental; `fork` only: `execve` and thread creation are refused, signal handling is limited, and no preemption timer yet |
 | **liteinst** | in-guest-trap plus run-time patching: a syscall site that has trapped once is rewritten to jump straight to the handler (`reverie-liteinst`, `liteinst2`) | As in-guest-trap | Experimental; the same runtime as in-guest-trap with site patching on, so it has the same limits |
 | **sabre** | Load-time rewriting of syscall sites by the SaBRe loader, with a ptrace supervisor as the backstop for sites it missed (`reverie-sabre`, `detcore-sabre`) | Inside the guest, in a SaBRe plugin | Experimental |
 | **e9patch** | Ahead-of-time empty rewrite of the main ELF's candidate sites, then the ordinary ptrace path | In the tracer, as ptrace | Experimental; see below |
-| **kvm** | The guest runs in a KVM virtual machine and traps by VM exit (`reverie-kvm`) | In the hermit process, driven by the KVM executor | Experimental; the executor implements part of the Linux personality itself, including an allowlisted `/proc` |
+| **kvm** | The guest runs in a KVM virtual machine and traps by VM exit (`reverie-kvm`) | In the hermit process, driven by the KVM executor | Experimental; the executor implements part of the Linux personality itself, including an allowlisted `/proc`, contrary to principles 2 and 3 |
 
 in-guest-trap and liteinst are one runtime with a switch: Hermit sets
 `REVERIE_LITEINST_SITE_PATCHING=0` for in-guest-trap and refuses a run whose
