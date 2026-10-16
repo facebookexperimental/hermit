@@ -3416,7 +3416,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from A8 step 2 (no DBT clock or limit table):
     // dbt_rlimit_and_clock_answers_match_ptrace and
     // dbt_refuses_a_vfork_childs_clock_read_by_name: 476, listed.
-    ("test.cli", 476),
+    // And a_guest_that_left_the_process_group_does_not_outlive_the_run (B3a-4c): 477.
+    ("test.cli", 477),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3825,7 +3826,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three A8 step 1 DBT CPUID tests: 409, listed.
     // And +1 from 699c6948: 410.
     // And the two A8 step 2 DBT clock/limit tests: 412, listed.
-    ("test.cli_on_host", 412),
+    // And the B3a-4c containment test: 413.
+    ("test.cli_on_host", 413),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

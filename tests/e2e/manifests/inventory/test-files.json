@@ -1582,7 +1582,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/process_groups.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/process_groups.c is owned by hermit-cli/tests/cli.rs: the CLI test process_groups_and_sessions_answer_as_linux_on_every_backend compiles it and runs it on every backend, requiring the process-group and session answers Linux gives a process started in a new PID namespace (getpgrp, getpgid, getsid, setpgid, setsid and their refusals), the same on every backend, from Detcore's model (slice B3a-4c of https://github.com/rrnewton/hermit/issues/4266). DBT, LiteInst and in-guest-trap are named as not yet."
+      "why": "tests/c/process_groups.c is owned by hermit-cli/tests/cli.rs: the CLI test process_groups_and_sessions_answer_as_linux_on_every_backend compiles it and runs it on every backend, requiring the process-group and session answers Linux gives a process started in a new PID namespace (getpgrp, getpgid, getsid, setpgid, setsid and their refusals), the same on every backend, from Detcore's model (slice B3a-4c of https://github.com/rrnewton/hermit/issues/4266). LiteInst and in-guest-trap are named as not yet."
     },
     {
       "disposition": "manifest-test",
@@ -2099,6 +2099,12 @@
       "path": "tests/c/sendfile_copy.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/sendfile_copy.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/session_containment.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/session_containment.c is owned by hermit-cli/tests/cli.rs: the CLI test a_guest_that_left_the_process_group_does_not_outlive_the_run compiles it and runs it on every backend, requiring that a guest child that left the run's process group by setsid or setpgid(0, 0) stops writing its marker file once Hermit returns, so no backend contains the run by the guest's process group alone (slice B3a-4c of https://github.com/rrnewton/hermit/issues/4266)."
     },
     {
       "disposition": "manifest-test",

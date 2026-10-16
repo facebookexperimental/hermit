@@ -1743,8 +1743,17 @@ fi
 # the root Cargo.toml are unchanged, so the SDK build inputs and their budget
 # carry; the client rebuild is not an SDK rebuild. No reverie-dbt file is added
 # or removed; the inventory stays 956.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6109a170bd8833ab304edeb2e26a12aead413117 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 6109a170bd8833ab304edeb2e26a12aead413117 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# B3A-4C DBT CONTAINMENT SDK-BUDGET CARRY (2026-10-16): advance
+# 6109a170bd8833ab304edeb2e26a12aead413117 to da86dfbe50e6c53845f5f68439e9f32cb6d74f0f.
+# Two commits. f84f2f43 changes only reverie-sabre's vendored SaBRe loader
+# (backend stats under a launch specification). da86dfbe changes
+# reverie-dbt/native/client.c, src/launcher.rs and src/evidence.rs: the
+# launcher contains a Hermit run by its PID namespace, so the DynamoRIO client
+# rebuilds. build.rs, vendor/dynamorio and the root Cargo.toml are unchanged,
+# so the SDK build inputs and their budget carry; the client rebuild is not an
+# SDK rebuild. No reverie-dbt file is added or removed; the inventory stays 956.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != da86dfbe50e6c53845f5f68439e9f32cb6d74f0f ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie da86dfbe50e6c53845f5f68439e9f32cb6d74f0f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

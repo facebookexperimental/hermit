@@ -1657,6 +1657,77 @@ fn process_groups_and_sessions_answer_as_linux_on_every_backend() {
     eprintln!("{test} compared {backends:?}");
 }
 
+static SESSION_CONTAINMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+fn session_containment_guest() -> &'static Path {
+    SESSION_CONTAINMENT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("session-containment");
+        fs::create_dir_all(&build_root).expect("failed to create session-containment directory");
+        let guest = build_root.join("session_containment");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/session_containment.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile session-containment guest");
+        assert!(
+            output.status.success(),
+            "session-containment guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// A guest process that left the run's process group, by setsid or by
+/// setpgid(0, 0), does not outlive the run on any backend. The child keeps
+/// appending to a marker file after the root exits; once Hermit returns, the
+/// file must stop growing. A backend that contained the run by its process
+/// group alone would leave the child running.
+#[test]
+fn a_guest_that_left_the_process_group_does_not_outlive_the_run() {
+    let test = "a_guest_that_left_the_process_group_does_not_outlive_the_run";
+    let guest = session_containment_guest();
+    let directory = tempfile::tempdir().expect("failed to create marker directory");
+    let backends = procfs_backends(test);
+    for backend in &backends {
+        for mode in ["setsid", "setpgid"] {
+            let marker = directory.path().join(format!("{backend}-{mode}"));
+            let mut args = vec!["--backend", backend, "run", "--strict"];
+            if *backend == "liteinst" || *backend == "in-guest-trap" {
+                args.push("--max-timeslice=disabled");
+            }
+            args.extend([
+                "--",
+                guest.to_str().expect("guest path is UTF-8"),
+                mode,
+                marker.to_str().expect("marker path is UTF-8"),
+            ]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(
+                stdout(&output),
+                format!("{mode} left the group\n"),
+                "{backend}"
+            );
+            let length = || fs::metadata(&marker).map_or(0, |metadata| metadata.len());
+            let returned = length();
+            std::thread::sleep(Duration::from_millis(300));
+            let later = length();
+            assert_eq!(
+                returned, later,
+                "{backend}: the {mode} child kept writing after Hermit returned"
+            );
+        }
+    }
+    eprintln!("{test} compared {backends:?}");
+}
+
 fn virtual_kernel_files_guest() -> &'static Path {
     VIRTUAL_KERNEL_FILES_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4217,13 +4288,6 @@ const PROCFS_BACKENDS: [&str; 7] = [
 /// also need `--max-timeslice=disabled`, as the in-guest Tool host cannot
 /// deliver the preemption timer yet.
 const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
-    (
-        "process_groups_and_sessions_answer_as_linux_on_every_backend",
-        "dbt",
-        "the DBT runtime answers setsid and setpgid with EPERM itself, before Detcore, to keep \
-         its process-group containment (reverie-dbt native/client.c; slice B3a-4c of \
-         https://github.com/rrnewton/hermit/issues/4266)",
-    ),
     (
         "process_groups_and_sessions_answer_as_linux_on_every_backend",
         "liteinst, in-guest-trap",

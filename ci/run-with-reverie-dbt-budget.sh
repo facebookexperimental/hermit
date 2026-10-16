@@ -1666,7 +1666,16 @@ fi
 # the root Cargo.toml are unchanged, so the SDK build inputs and their budget
 # carry; the client rebuild is not an SDK rebuild. No reverie-dbt file is added
 # or removed; the inventory stays 956.
-expected_pin=6109a170bd8833ab304edeb2e26a12aead413117
+# B3A-4C DBT CONTAINMENT SDK-BUDGET CARRY (2026-10-16): advance
+# 6109a170bd8833ab304edeb2e26a12aead413117 to da86dfbe50e6c53845f5f68439e9f32cb6d74f0f.
+# Two commits. f84f2f43 changes only reverie-sabre's vendored SaBRe loader
+# (backend stats under a launch specification). da86dfbe changes
+# reverie-dbt/native/client.c, src/launcher.rs and src/evidence.rs: the
+# launcher contains a Hermit run by its PID namespace, so the DynamoRIO client
+# rebuilds. build.rs, vendor/dynamorio and the root Cargo.toml are unchanged,
+# so the SDK build inputs and their budget carry; the client rebuild is not an
+# SDK rebuild. No reverie-dbt file is added or removed; the inventory stays 956.
+expected_pin=da86dfbe50e6c53845f5f68439e9f32cb6d74f0f
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
