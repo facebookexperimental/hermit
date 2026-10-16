@@ -31562,14 +31562,30 @@ fn signals_to_hermits_own_tasks_are_dropped_in_every_mode() {
     for mode in ["--strict", "--no-sequentialize-threads"] {
         assert_eq!(run_signal_hermit_tasks(&[mode], &[]), expected, "{mode}");
     }
-    // F_SETOWN_EX and FIOSETOWN pass their owner through memory a sibling
-    // thread can change after Detcore checked it; Detcore hands the kernel its
-    // own copy, so PID 1 never becomes the owner. Without threads sequentialized, the swap won
-    // within a few attempts before that copy.
+}
+
+/// F_SETOWN_EX and FIOSETOWN pass their owner through memory a sibling thread
+/// can change after Detcore checked it; Detcore hands the kernel its own copy,
+/// so PID 1, Hermit's container init, never becomes the owner
+/// (https://github.com/rrnewton/hermit/issues/4083). Without threads
+/// sequentialized, the swap won within a few attempts before that copy.
+///
+/// This was the last run of [`signals_to_hermits_own_tasks_are_dropped_in_every_mode`],
+/// with 20000 attempts of each call, until that test reached the 22-second
+/// per-test CPU cap in the full validations of d554fa09, d7efd4cb and dbbbdc86
+/// (22.1, 24.6 and 26.0 CPU-seconds; 17-22 in the eleven before). Nearly all of
+/// it was this race. On the development host at load 300-400, four copies at
+/// once on 8 CPUs beside 4 busy loops, 12 runs each: the two mode runs took
+/// 0.43-0.74 CPU-seconds, and the race 3.3-6.1 with 5000 attempts of each
+/// call. The flipping thread spins for as long as the race lasts, so a loaded
+/// host stretches both. 5000 attempts, a quarter of the former CPU, are still
+/// a thousand times the few that won before Detcore copied the owner.
+#[test]
+fn a_racing_sibling_never_makes_hermits_init_a_descriptors_signal_owner() {
     assert_eq!(
         run_signal_hermit_tasks(
             &["--no-sequentialize-threads", "--max-timeslice=disabled"],
-            &["owner-race", "20000"]
+            &["owner-race", "5000"]
         ),
         "F_SETOWN_EX race: owner PID 1 0 times, other errors 0\n\
          FIOSETOWN race: owner PID 1 0 times, other errors 0\n"
@@ -37738,14 +37754,22 @@ fn poll_recheck_guest(name: &str) -> String {
 ///   `writev` that requested a turn first let the flush run before the
 ///   delivery, and the taken copy reached `h2`
 ///   (https://github.com/rrnewton/hermit/issues/4379; arm A21).
-#[test]
-fn pipe_calls_woken_by_signals_end_as_linux_does() {
+///
+/// The rows run as three tests, one per group of guests, so each verified run
+/// is charged to a test with its own CPU budget. Run as one test, the 56
+/// verified runs took 17.2-22.2 CPU-seconds in the full validations from
+/// 2026-10-15 on, and those of d7efd4cb, dbbbdc86 and 90dec733 reached the
+/// 22-second per-test cap. Split, on the development host at load 300-400
+/// (four copies at once on 8 CPUs beside 4 busy loops, 12 runs each), the
+/// three took 5.0-7.9, 4.7-7.2 and 3.4-4.4 CPU-seconds. `guests` selects the
+/// rows by guest and `rows` is how many it must select.
+fn run_pipe_calls_woken_by_signals(guests: &[&str], rows: usize) {
     let _guard = hermit_run_guard();
     const G: &str = "guest_poll_recheck";
     const P: &str = "guest_poll_recheck_partial";
     const T: &str = "guest_poll_recheck_timer";
     const E: &str = "guest_poll_recheck_entry";
-    let rows = [
+    let all_rows = [
         PollRecheckRow {
             guest: G,
             args: &["caught", "0"],
@@ -38165,8 +38189,13 @@ fn pipe_calls_woken_by_signals_end_as_linux_does() {
             line: "writev-full-h2: writev -1 EINTR, h1 1, h2 0",
         },
     ];
+    let selected: Vec<PollRecheckRow> = all_rows
+        .into_iter()
+        .filter(|row| guests.contains(&row.guest))
+        .collect();
+    assert_eq!(selected.len(), rows, "rows selected for {guests:?}");
     let spec_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    for row in rows {
+    for row in selected {
         let guest = poll_recheck_guest(row.guest);
         let mut args: Vec<String> = ["run", "--strict", "--verify", "--verify-strict"]
             .map(String::from)
@@ -38218,6 +38247,32 @@ fn pipe_calls_woken_by_signals_end_as_linux_does() {
             row.args
         );
     }
+}
+
+/// The rows of [`run_pipe_calls_woken_by_signals`] whose worker is not held:
+/// a read, write or `writev` woken by a caught, ignored, defaulted or flushed
+/// signal.
+#[test]
+fn pipe_calls_woken_by_signals_end_as_linux_does() {
+    run_pipe_calls_woken_by_signals(&["guest_poll_recheck"], 23);
+}
+
+/// The rows of [`run_pipe_calls_woken_by_signals`] whose worker is held at its
+/// call's entry by a happens-before edge.
+#[test]
+fn pipe_calls_held_at_entry_and_woken_by_signals_end_as_linux_does() {
+    run_pipe_calls_woken_by_signals(&["guest_poll_recheck_entry"], 22);
+}
+
+/// The rows of [`run_pipe_calls_woken_by_signals`] whose write has room for
+/// only part of its bytes, and those of the timer guest (a `writev` woken by
+/// a timer, or by a `tgkill` while blocked).
+#[test]
+fn partial_and_timer_woken_pipe_calls_end_as_linux_does() {
+    run_pipe_calls_woken_by_signals(
+        &["guest_poll_recheck_partial", "guest_poll_recheck_timer"],
+        11,
+    );
 }
 
 /// The R2b-1 rows under `record start --verify --verify-strict`: replay

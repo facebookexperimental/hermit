@@ -3431,7 +3431,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_exec_with_an_unprovable_timer_copy_pending_is_refused_by_name (folded into
     // exec_discards_a_posix_timers_pending_signal_at_bitwise_parity); the 4164
     // refusal test is renamed a_sigev_thread_id_expiration_beside_a_pending_copy_is_delivered_as_on_linux: +4, 481.
-    ("test.cli", 481),
+    // And +3: pipe_calls_woken_by_signals_end_as_linux_does split into three
+    // tests by guest (adding pipe_calls_held_at_entry_and_woken_by_signals_end_as_linux_does
+    // and partial_and_timer_woken_pipe_calls_end_as_linux_does), and the owner
+    // race left signals_to_hermits_own_tasks_are_dropped_in_every_mode as
+    // a_racing_sibling_never_makes_hermits_init_a_descriptors_signal_owner,
+    // so each has its own CPU budget: 484, listed (489 listed with this
+    // node's skips, 5 of them ignored).
+    ("test.cli", 484),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3844,7 +3851,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two A8 step 2 DBT clock/limit tests: 412, listed.
     // And the B3a-4c containment test: 413.
     // And https://github.com/rrnewton/hermit/issues/4262: the same +4 as test.cli, 417.
-    ("test.cli_on_host", 417),
+    // And the same +3 as test.cli (none is excluded here): 420.
+    ("test.cli_on_host", 420),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
