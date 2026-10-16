@@ -1613,7 +1613,16 @@ fi
 # vendor SDK input, native source or recipe changes, so no DynamoRIO build input
 # moves and the budget carries; no test is added or removed, so the reverie-dbt
 # inventory stays 956.
-expected_pin=b88d6af03a3976b17519582ef991969ae0760b48
+# M1 RELOCATION-WRITER SDK-BUDGET CARRY (2026-10-16): advance
+# b88d6af03a3976b17519582ef991969ae0760b48 to 30a02a848a0e00afc4b6584fffe904208237094f.
+# The fixed DBT code-region placement is retained exactly. The additional
+# source-catalog identities and fully checked relocation-writer list change
+# only the M1 artifact verifier. SDK recipe inputs build.rs ff1eeb32b140,
+# vendor/dynamorio 56df1bfed0e7 and third-party tree fb49c0ba7a9a remain
+# byte-identical; the tracked DBT inventory stays 956. SDK thresholds, width
+# and CMAKE/CMAKE_GENERATOR/SOURCE_DATE_EPOCH selections carry unchanged,
+# not remeasured. Fresh exact-pin runtime validation remains required.
+expected_pin=30a02a848a0e00afc4b6584fffe904208237094f
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

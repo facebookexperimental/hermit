@@ -44,6 +44,11 @@ use nextest_cpu::ResolvedBudgets;
 
 const CPU_WRAPPER_BIN_ENV: &str = "HERMIT_NEXTEST_CPU_WRAPPER_BIN";
 const CPU_WRAPPER_NAME: &str = "hermit-per-test-cpu";
+const DETCORE_ALLOCATOR_WRAPPER_NAME: &str = "hermit-detcore-allocator-cpu";
+// Authorized current-source recalibration, not success under the old 22 CPU seconds:
+// b27e26fc/67474066, N=3 CPU seconds: 18.762935, 19.040171, 20.171435.
+// The existing scalar formula gives ceil(1.5 * max(samples)) = 31; wall stays 57.
+const DETCORE_ALLOCATOR_CPU_SECONDS: u64 = 31;
 const CPU_TERMINATION_GRACE_SECONDS: u64 = 2;
 
 fn usage() -> &'static str {
@@ -188,6 +193,7 @@ fn add_cpu_wrapper(
     document: &mut DocumentMut,
     wrapper_bin: &Path,
     cpu_budget_usec: u64,
+    detcore_allocator_usec: Option<u64>,
 ) -> Result<(), String> {
     if !wrapper_bin.is_absolute() {
         return Err("nextest CPU wrapper executable must be absolute".into());
@@ -217,62 +223,99 @@ fn add_cpu_wrapper(
         experimental.push("wrapper-scripts");
     }
 
-    if document
-        .get("scripts")
-        .and_then(Item::as_table)
-        .and_then(|scripts| scripts.get("wrapper"))
-        .and_then(Item::as_table)
-        .is_some_and(|wrappers| wrappers.contains_key(CPU_WRAPPER_NAME))
-    {
-        return Err(format!(
-            "scripts.wrapper.{CPU_WRAPPER_NAME} is already defined"
-        ));
+    for name in [CPU_WRAPPER_NAME, DETCORE_ALLOCATOR_WRAPPER_NAME] {
+        if document
+            .get("scripts")
+            .and_then(Item::as_table)
+            .and_then(|scripts| scripts.get("wrapper"))
+            .and_then(Item::as_table)
+            .is_some_and(|wrappers| wrappers.contains_key(name))
+        {
+            return Err(format!("scripts.wrapper.{name} is already defined"));
+        }
     }
     let wrapper_path = wrapper_bin
         .to_str()
         .ok_or_else(|| "nextest CPU wrapper executable path is not UTF-8".to_string())?;
-    let mut command = InlineTable::new();
-    // An argv array preserves spaces and shell punctuation in a target path.
-    let mut argv = Array::new();
-    argv.push(wrapper_path);
-    argv.push("--cpu-timeout-usec");
-    argv.push(cpu_budget_usec.to_string());
-    argv.push("--termination-grace-ms");
-    argv.push((CPU_TERMINATION_GRACE_SECONDS * 1000).to_string());
-    argv.push("--");
-    command.insert("command-line", Value::Array(argv));
-    command.insert("relative-to", Value::from("none"));
-    let scripts = document
-        .entry("scripts")
-        .or_insert_with(|| Item::Table(Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| "scripts must be a table".to_string())?;
-    let wrappers = scripts
-        .entry("wrapper")
-        .or_insert_with(|| Item::Table(Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| "scripts.wrapper must be a table".to_string())?;
-    let mut wrapper = Table::new();
-    wrapper["command"] = value(command);
-    wrapper["target-runner"] = value("within-wrapper");
-    wrappers.insert(CPU_WRAPPER_NAME, Item::Table(wrapper));
-
-    let scripts = &mut document["profile"]["default"]["scripts"];
-    if scripts.is_none() {
-        *scripts = Item::ArrayOfTables(ArrayOfTables::new());
+    // Only a prepared, selected exact identity enables these predicates: Nextest
+    // rejects unknown binary/package predicates even inside their complement.
+    let exact = exact_filter(&detcore_allocator_identity());
+    let default_filter = if detcore_allocator_usec.is_some() {
+        format!("!({exact})")
+    } else {
+        "all()".into()
+    };
+    let mut rules = vec![(CPU_WRAPPER_NAME, default_filter, cpu_budget_usec)];
+    if let Some(budget) = detcore_allocator_usec {
+        rules.push((DETCORE_ALLOCATOR_WRAPPER_NAME, exact, budget));
     }
-    let scripts = scripts
-        .as_array_of_tables_mut()
-        .ok_or_else(|| "profile.default.scripts must be an array of tables".to_string())?;
-    let mut binding = Table::new();
-    binding["filter"] = value("all()");
-    binding["run-wrapper"] = value(CPU_WRAPPER_NAME);
-    scripts.push(binding);
+    for (name, filter, budget) in &rules {
+        let mut command = InlineTable::new();
+        // An argv array preserves spaces and shell punctuation in a target path.
+        let mut argv = Array::new();
+        argv.push(wrapper_path);
+        argv.push("--cpu-timeout-usec");
+        argv.push(budget.to_string());
+        argv.push("--termination-grace-ms");
+        argv.push((CPU_TERMINATION_GRACE_SECONDS * 1000).to_string());
+        argv.push("--");
+        command.insert("command-line", Value::Array(argv));
+        command.insert("relative-to", Value::from("none"));
+        let scripts = document
+            .entry("scripts")
+            .or_insert_with(|| Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| "scripts must be a table".to_string())?;
+        let wrappers = scripts
+            .entry("wrapper")
+            .or_insert_with(|| Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| "scripts.wrapper must be a table".to_string())?;
+        let mut wrapper = Table::new();
+        wrapper["command"] = value(command);
+        wrapper["target-runner"] = value("within-wrapper");
+        wrappers.insert(name, Item::Table(wrapper));
 
-    if run_wrapper_count(document, "default")? != 1 || run_wrapper_count(document, "ci")? != 0 {
+        let scripts = &mut document["profile"]["default"]["scripts"];
+        if scripts.is_none() {
+            *scripts = Item::ArrayOfTables(ArrayOfTables::new());
+        }
+        let scripts = scripts
+            .as_array_of_tables_mut()
+            .ok_or_else(|| "profile.default.scripts must be an array of tables".to_string())?;
+        let mut binding = Table::new();
+        binding["filter"] = value(filter.as_str());
+        binding["run-wrapper"] = value(*name);
+        scripts.push(binding);
+    }
+
+    if detcore_allocator_usec.is_none() {
+        if run_wrapper_count(document, "default")? != 1 || run_wrapper_count(document, "ci")? != 0 {
+            return Err(
+                "generated nextest config does not define exactly one inherited run wrapper for default and ci"
+                    .into(),
+            );
+        }
+    } else if run_wrapper_count(document, "default")? != 2
+        || run_wrapper_count(document, "ci")? != 0
+    {
+        return Err("generated nextest config does not define exactly two inherited run wrappers for default and ci".into());
+    }
+    let bindings = document["profile"]["default"]["scripts"]
+        .as_array_of_tables()
+        .ok_or("generated default scripts are missing")?;
+    let actual = bindings
+        .iter()
+        .filter(|binding| binding.contains_key("run-wrapper"))
+        .map(|binding| (binding["run-wrapper"].as_str(), binding["filter"].as_str()))
+        .collect::<Vec<_>>();
+    let expected = rules
+        .iter()
+        .map(|(name, filter, _)| (Some(*name), Some(filter.as_str())))
+        .collect::<Vec<_>>();
+    if actual != expected {
         return Err(
-            "generated nextest config does not define exactly one inherited run wrapper for default and ci"
-                .into(),
+            "generated nextest CPU wrapper filters differ from their exact partition".into(),
         );
     }
     Ok(())
@@ -282,6 +325,15 @@ fn scaled_config(
     source: &str,
     multiplier: f64,
     cpu_wrapper: Option<(&Path, f64)>,
+) -> Result<String, String> {
+    scaled_config_with_allocator(source, multiplier, cpu_wrapper, false)
+}
+
+fn scaled_config_with_allocator(
+    source: &str,
+    multiplier: f64,
+    cpu_wrapper: Option<(&Path, f64)>,
+    detcore_allocator_selected: bool,
 ) -> Result<String, String> {
     timeouts::validate_timeout_multiplier(multiplier, "wall multiplier")?;
     let mut document = source
@@ -301,7 +353,24 @@ fn scaled_config(
         let cpu_budget_usec = cpu_seconds
             .checked_mul(1_000_000)
             .ok_or("CPU timeout overflows microseconds")?;
-        let cpu_and_cleanup = cpu_seconds
+        let detcore_allocator_seconds = detcore_allocator_selected
+            .then(|| {
+                timeouts::scale_timeout_seconds(
+                    DETCORE_ALLOCATOR_CPU_SECONDS,
+                    cpu_multiplier,
+                    "CPU multiplier",
+                )
+            })
+            .transpose()?;
+        let detcore_allocator_usec = detcore_allocator_seconds
+            .map(|seconds| {
+                seconds
+                    .checked_mul(1_000_000)
+                    .ok_or("CPU timeout overflows microseconds")
+            })
+            .transpose()?;
+        let maximum_cpu_seconds = cpu_seconds.max(detcore_allocator_seconds.unwrap_or(cpu_seconds));
+        let cpu_and_cleanup = maximum_cpu_seconds
             .checked_add(CPU_TERMINATION_GRACE_SECONDS)
             .ok_or("CPU timeout plus cleanup grace overflows seconds")?;
         // Check complete profile/override values, including inherited defaults,
@@ -312,11 +381,16 @@ fn scaled_config(
             .any(|wall| *wall <= cpu_and_cleanup)
         {
             return Err(format!(
-                "nextest CPU timeout ({cpu_seconds}s) plus cleanup grace \
+                "nextest CPU timeout ({maximum_cpu_seconds}s) plus cleanup grace \
                  ({CPU_TERMINATION_GRACE_SECONDS}s) must be below every finite scaled wall termination bound"
             ));
         }
-        add_cpu_wrapper(&mut document, wrapper_bin, cpu_budget_usec)?;
+        add_cpu_wrapper(
+            &mut document,
+            wrapper_bin,
+            cpu_budget_usec,
+            detcore_allocator_usec,
+        )?;
     }
     Ok(document.to_string())
 }
@@ -346,6 +420,28 @@ fn exact_filter(identity: &nextest_cpu::AttemptIdentity) -> String {
         escape(&identity.binary),
         escape(&identity.test)
     )
+}
+
+fn detcore_allocator_identity() -> nextest_cpu::AttemptIdentity {
+    nextest_cpu::AttemptIdentity {
+        package: "hermit".into(),
+        binary: "hermit::liteinst_allocator".into(),
+        test: "genuine_detcore_leaf_keeps_scope_free_work_private".into(),
+        attempt: 1,
+    }
+}
+
+fn prepared_detcore_allocator_selected(
+    prepared: bool,
+    inventory: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> Result<bool, String> {
+    if !prepared {
+        // Legacy/null-context callers did not consume this input. In particular,
+        // do not make their previously unused malformed/missing inventory fatal.
+        return Ok(false);
+    }
+    // selected_inventory also performs the existing binary-map validation.
+    Ok(nextest_cpu::selected_inventory(&inventory()?)?.contains(&detcore_allocator_identity()))
 }
 
 /// The only overrides a regular configuration may carry, as (filter,
@@ -580,7 +676,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale calibration retains every selected default bound. Unknown context/profile/concurrency preserves legacy configuration without a map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection of the exact Detcore allocator test uses its measured 31-second base CPU allowance, scaled once; all other tests keep the 22-second base. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -596,7 +692,16 @@ fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     let cpu_multiplier =
         timeouts::timeout_multiplier_from_env(timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV)?;
     let wrapper = cpu_wrapper_from_env().ok_or("budget resolution requires the CPU wrapper")?;
-    let rendered = scaled_config(&source, wall_multiplier, Some((&wrapper, cpu_multiplier)))?;
+    let detcore_allocator_selected = prepared_detcore_allocator_selected(
+        env::var("HERMIT_PREPARED_NEXTEST_REQUIRED").as_deref() == Ok("1"),
+        || fs::read(&args[3]).map_err(|error| error.to_string()),
+    )?;
+    let rendered = scaled_config_with_allocator(
+        &source,
+        wall_multiplier,
+        Some((&wrapper, cpu_multiplier)),
+        detcore_allocator_selected,
+    )?;
     let mut document = rendered.parse::<DocumentMut>().map_err(|e| e.to_string())?;
     let context: Option<BudgetContext> =
         serde_json::from_slice(&fs::read(&args[4]).map_err(|e| e.to_string())?)
@@ -614,7 +719,18 @@ fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
         || settings.is_none()
         || !regular_config_compatible(&source.parse::<DocumentMut>().map_err(|e| e.to_string())?)
     {
-        eprintln!("nextest budgets: legacy bounds; regular population/concurrency not certified");
+        if detcore_allocator_selected {
+            eprintln!(
+                "nextest budgets: prepared exact Detcore allocator CPU base {DETCORE_ALLOCATOR_CPU_SECONDS}s \
+                 (CPU multiplier {cpu_multiplier}); other CPU base {}s; existing wall bounds unchanged \
+                 except wall multiplier {wall_multiplier}; regular population/concurrency not certified",
+                timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+            );
+        } else {
+            eprintln!(
+                "nextest budgets: legacy bounds; regular population/concurrency not certified"
+            );
+        }
         return fs::write(&args[2], rendered).map_err(|e| e.to_string());
     }
     let (threads, retries) = settings.unwrap();
@@ -1317,5 +1433,384 @@ mod tests {
             );
             assert!(scaled_config(&source, 1.0, Some((Path::new("/tmp/wrapper"), 1.0))).is_err());
         }
+    }
+
+    fn allocator_inventory(identity: &nextest_cpu::AttemptIdentity) -> serde_json::Value {
+        serde_json::json!({"rust-suites": {
+            (identity.binary.clone()): {
+                "package-name": identity.package,
+                "binary-id": identity.binary,
+                "binary-name": "liteinst_allocator",
+                "kind": "test",
+                "binary-path": "/fixture/allocator-tests",
+                "testcases": {
+                    (identity.test.clone()): {"ignored":false,"filter-match":{"status":"matches"}}
+                }
+            }
+        }})
+    }
+
+    fn wrapper_argv(document: &DocumentMut, name: &str) -> Vec<String> {
+        document["scripts"]["wrapper"][name]["command"]["command-line"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn only_the_prepared_exact_selected_allocator_identity_gets_the_measured_budget() {
+        let target = detcore_allocator_identity();
+        let mut identities = vec![target.clone()];
+        for (field, replacement) in [
+            (0, "other"),
+            (1, "other::liteinst_allocator"),
+            (1, "hermit::liteinst_allocator_extra"),
+            (1, "prefixhermit::liteinst_allocator"),
+            (2, "genuine_standalone_leaf_keeps_scope_free_work_private"),
+            (
+                2,
+                "genuine_detcore_leaf_keeps_scope_free_work_private_extra",
+            ),
+            (
+                2,
+                "prefix_genuine_detcore_leaf_keeps_scope_free_work_private",
+            ),
+        ] {
+            let mut identity = target.clone();
+            match field {
+                0 => identity.package = replacement.into(),
+                1 => identity.binary = replacement.into(),
+                _ => identity.test = replacement.into(),
+            }
+            identities.push(identity);
+        }
+        for identity in identities {
+            let bytes = serde_json::to_vec(&allocator_inventory(&identity)).unwrap();
+            let selected = prepared_detcore_allocator_selected(true, || Ok(bytes)).unwrap();
+            assert_eq!(selected, identity == target, "{identity:?}");
+            let rendered = scaled_config_with_allocator(
+                include_str!("../.config/nextest.toml"),
+                1.0,
+                Some((Path::new("/fixture/wrapper"), 1.0)),
+                selected,
+            )
+            .unwrap();
+            let document = rendered.parse::<DocumentMut>().unwrap();
+            assert_eq!(
+                run_wrapper_count(&document, "default").unwrap(),
+                if selected { 2 } else { 1 }
+            );
+            assert_eq!(run_wrapper_count(&document, "ci").unwrap(), 0);
+            assert_eq!(wrapper_argv(&document, CPU_WRAPPER_NAME)[2], "22000000");
+            if !selected {
+                assert_eq!(
+                    document["profile"]["default"]["scripts"]
+                        .as_array_of_tables()
+                        .unwrap()
+                        .iter()
+                        .next()
+                        .unwrap()["filter"]
+                        .as_str(),
+                    Some("all()")
+                );
+                assert!(
+                    document["scripts"]["wrapper"]
+                        .get(DETCORE_ALLOCATOR_WRAPPER_NAME)
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ignored_filtered_absent_and_legacy_inventory_keep_the_ordinary_wrapper() {
+        let target = detcore_allocator_identity();
+        for state in 0..3 {
+            let mut inventory = allocator_inventory(&target);
+            let cases = &mut inventory["rust-suites"][&target.binary]["testcases"];
+            match state {
+                0 => cases[&target.test]["ignored"] = true.into(),
+                1 => cases[&target.test]["filter-match"]["status"] = "mismatch".into(),
+                _ => {
+                    cases.as_object_mut().unwrap().clear();
+                }
+            }
+            let bytes = serde_json::to_vec(&inventory).unwrap();
+            assert!(!prepared_detcore_allocator_selected(true, || Ok(bytes)).unwrap());
+        }
+        assert!(
+            !prepared_detcore_allocator_selected(true, || Ok(br#"{"rust-suites":{}}"#.to_vec()))
+                .unwrap()
+        );
+        // The old null-context caller never consumed its unused inventory. Its
+        // malformed or missing input must stay unused when not prepared.
+        assert!(
+            !prepared_detcore_allocator_selected(false, || panic!("legacy inventory read"))
+                .unwrap()
+        );
+        assert!(
+            !prepared_detcore_allocator_selected(false, || Err("missing inventory".into()))
+                .unwrap()
+        );
+        assert!(!prepared_detcore_allocator_selected(false, || Ok(b"malformed".to_vec())).unwrap());
+        let initial = scaled_config(
+            include_str!("../.config/nextest.toml"),
+            1.0,
+            Some((Path::new("/fixture/wrapper"), 1.0)),
+        )
+        .unwrap();
+        assert_eq!(initial.matches("run-wrapper").count(), 1);
+        assert!(!initial.contains(DETCORE_ALLOCATOR_WRAPPER_NAME));
+    }
+
+    #[test]
+    fn prepared_inventory_refuses_missing_malformed_and_ambiguous_binary_evidence() {
+        assert!(
+            prepared_detcore_allocator_selected(true, || Err("missing inventory".into())).is_err()
+        );
+        for bytes in [b"malformed".as_slice(), b"{}".as_slice()] {
+            assert!(prepared_detcore_allocator_selected(true, || Ok(bytes.to_vec())).is_err());
+        }
+        let target = detcore_allocator_identity();
+        let original = allocator_inventory(&target);
+        for defect in 0..4 {
+            let mut inventory = original.clone();
+            match defect {
+                0 => inventory["rust-suites"][&target.binary]["binary-id"] = "different".into(),
+                1 => inventory["rust-suites"][&target.binary]["binary-path"] = "relative".into(),
+                2 => {
+                    inventory["rust-suites"][&target.binary]["testcases"][&target.test]["filter-match"]
+                        ["status"] = "unknown".into()
+                }
+                _ => {
+                    // A second valid key/id with the same actual executable is
+                    // ambiguous even though only one identity is the target.
+                    let mut duplicate = inventory["rust-suites"][&target.binary].clone();
+                    duplicate["binary-id"] = "other::test".into();
+                    duplicate["binary-name"] = "other".into();
+                    inventory["rust-suites"]["other::test"] = duplicate;
+                }
+            }
+            let bytes = serde_json::to_vec(&inventory).unwrap();
+            assert!(
+                prepared_detcore_allocator_selected(true, || Ok(bytes)).is_err(),
+                "defect {defect}"
+            );
+        }
+    }
+
+    #[test]
+    fn admitted_wrappers_are_an_exact_complement_with_one_executable_and_independent_scaling() {
+        let source = include_str!("../.config/nextest.toml");
+        let exact = "package(=hermit) & binary_id(=hermit::liteinst_allocator) & test(=genuine_detcore_leaf_keeps_scope_free_work_private)";
+        let path = "/tmp/a path/it's-$(literal)-wrapper";
+        for (multiplier, ordinary, detcore) in [
+            (1.0, "22000000", "31000000"),
+            (1.25, "28000000", "39000000"),
+            (0.01, "1000000", "1000000"),
+        ] {
+            let rendered = scaled_config_with_allocator(
+                source,
+                1.0,
+                Some((Path::new(path), multiplier)),
+                true,
+            )
+            .unwrap();
+            let document = rendered.parse::<DocumentMut>().unwrap();
+            assert_eq!(run_wrapper_count(&document, "default").unwrap(), 2);
+            assert_eq!(run_wrapper_count(&document, "ci").unwrap(), 0);
+            assert_eq!(document["scripts"]["wrapper"].as_table().unwrap().len(), 2);
+            let bindings = document["profile"]["default"]["scripts"]
+                .as_array_of_tables()
+                .unwrap();
+            let actual = bindings
+                .iter()
+                .filter(|rule| rule.contains_key("run-wrapper"))
+                .map(|rule| {
+                    (
+                        rule["filter"].as_str().unwrap(),
+                        rule["run-wrapper"].as_str().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                [
+                    (format!("!({exact})").as_str(), CPU_WRAPPER_NAME),
+                    (exact, DETCORE_ALLOCATOR_WRAPPER_NAME)
+                ]
+            );
+            for (name, budget) in [
+                (CPU_WRAPPER_NAME, ordinary),
+                (DETCORE_ALLOCATOR_WRAPPER_NAME, detcore),
+            ] {
+                assert_eq!(
+                    wrapper_argv(&document, name),
+                    [
+                        path,
+                        "--cpu-timeout-usec",
+                        budget,
+                        "--termination-grace-ms",
+                        "2000",
+                        "--"
+                    ]
+                );
+                assert_eq!(
+                    document["scripts"]["wrapper"][name]["command"]["relative-to"].as_str(),
+                    Some("none")
+                );
+                assert_eq!(
+                    document["scripts"]["wrapper"][name]["target-runner"].as_str(),
+                    Some("within-wrapper")
+                );
+            }
+            assert_eq!(
+                document["experimental"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|value| value.as_str() == Some("wrapper-scripts"))
+                    .count(),
+                1
+            );
+            assert!(rendered.contains("period = \"57s\""));
+        }
+    }
+
+    #[test]
+    fn larger_allocator_cpu_and_grace_must_fit_every_scaled_finite_wall_bound() {
+        let source =
+            "[profile.default]\nslow-timeout = { period = \"57s\", terminate-after = 1 }\n";
+        // The old 22+2 fits 33, but the admitted 31+2 must be strictly below it.
+        let short = source.replace("57s", "33s");
+        assert!(scaled_config(&short, 1.0, Some((Path::new("/fixture/wrapper"), 1.0))).is_ok());
+        assert!(
+            scaled_config_with_allocator(
+                &short,
+                1.0,
+                Some((Path::new("/fixture/wrapper"), 1.0)),
+                true
+            )
+            .unwrap_err()
+            .contains("31s")
+        );
+        let shorter_override = format!(
+            "{source}[[profile.ci.overrides]]\nfilter = \"test(short)\"\nslow-timeout = {{ period = \"33s\", terminate-after = 1 }}\n"
+        );
+        assert!(
+            scaled_config_with_allocator(
+                &shorter_override,
+                1.0,
+                Some((Path::new("/fixture/wrapper"), 1.0)),
+                true
+            )
+            .is_err()
+        );
+        for multiplier in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX, 1e12, 2.0] {
+            assert!(
+                scaled_config_with_allocator(
+                    source,
+                    1.0,
+                    Some((Path::new("/fixture/wrapper"), multiplier)),
+                    true
+                )
+                .is_err()
+            );
+        }
+        // CPU rounding: 31*1.25 -> 39; wall rounds 57*.7 -> 40, below 39+2.
+        assert!(
+            scaled_config_with_allocator(
+                source,
+                0.7,
+                Some((Path::new("/fixture/wrapper"), 1.25)),
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            scaled_config_with_allocator(
+                source,
+                1.25,
+                Some((Path::new("/fixture/wrapper"), 1.25)),
+                true
+            )
+            .unwrap()
+            .contains("period = \"72s\"")
+        );
+        let warning = "[profile.default]\nslow-timeout = { period = \"1s\" }\n";
+        assert!(
+            scaled_config_with_allocator(
+                warning,
+                1.0,
+                Some((Path::new("/fixture/wrapper"), 1.0)),
+                true
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn both_branches_refuse_existing_bindings_and_either_owned_command_collision() {
+        for admitted in [false, true] {
+            for profile in ["default", "ci"] {
+                let source = format!(
+                    "[profile.default]\nslow-timeout = {{ period = \"57s\" }}\n[[profile.{profile}.scripts]]\nfilter = \"all()\"\nrun-wrapper = \"other\"\n"
+                );
+                assert!(
+                    scaled_config_with_allocator(
+                        &source,
+                        1.0,
+                        Some((Path::new("/fixture/wrapper"), 1.0)),
+                        admitted
+                    )
+                    .unwrap_err()
+                    .contains("already defines")
+                );
+            }
+            for name in [CPU_WRAPPER_NAME, DETCORE_ALLOCATOR_WRAPPER_NAME] {
+                let source = format!(
+                    "[profile.default]\nslow-timeout = {{ period = \"57s\" }}\n[scripts.wrapper.{name}]\ntarget-runner = \"within-wrapper\"\ncommand = {{ command-line = [\"/other\"], relative-to = \"none\" }}\n"
+                );
+                assert!(
+                    scaled_config_with_allocator(
+                        &source,
+                        1.0,
+                        Some((Path::new("/fixture/wrapper"), 1.0)),
+                        admitted
+                    )
+                    .unwrap_err()
+                    .contains("already defined")
+                );
+            }
+            let duplicate_feature = "experimental = [\"wrapper-scripts\", \"wrapper-scripts\"]\n[profile.default]\nslow-timeout = { period = \"57s\" }\n";
+            assert!(
+                scaled_config_with_allocator(
+                    duplicate_feature,
+                    1.0,
+                    Some((Path::new("/fixture/wrapper"), 1.0)),
+                    admitted
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn exact_allocator_admission_does_not_enroll_hermit_in_regular_calibration() {
+        let inventory =
+            serde_json::to_vec(&allocator_inventory(&detcore_allocator_identity())).unwrap();
+        assert!(prepared_detcore_allocator_selected(true, || Ok(inventory.clone())).unwrap());
+        let (_, context, _) = budget_fixture();
+        assert!(
+            resolve_budgets(&inventory, context, None, 1, 0, 1.0, 1.0)
+                .unwrap_err()
+                .contains("regular calibration cannot cover the hermit package")
+        );
+        assert_eq!(
+            DETCORE_ALLOCATOR_CPU_SECONDS,
+            timeouts::cpu_bound_from_p90_usec(20_171_435)
+        );
     }
 }
