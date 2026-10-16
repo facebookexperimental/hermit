@@ -647,7 +647,15 @@ impl RecordVersion {
 // before any open is recorded, where the alias spelling let the open reach
 // the kernel), so an older recording with such an open would replay out of
 // step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x167);
+// 0x167 -> 0x168 (taken at land time, HIGHEST_SHIPPED + 1): under record and
+// replay, a POSIX timer's expiry is sent as an SI_TIMER record carrying the
+// timer's id and si_value (rt_sigqueueinfo, rt_tgsigqueueinfo), not a bare
+// kill or tgkill, so exec's own flush_itimer_signals removes it, and the
+// scheduler no longer takes timer copies back at exec
+// (https://github.com/rrnewton/hermit/issues/4262). An older recording's
+// guest saw si_code 0 and no si_value for such a signal, and a replay would
+// show it SI_TIMER.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x168);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -672,7 +680,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x167);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x167;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x168;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1668,6 +1676,15 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_replaced_read_descriptors_block_the_claim() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15b)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x168 sent a POSIX timer's expiry as a bare
+    /// kill or tgkill; it is now an SI_TIMER record with the timer's id and
+    /// si_value (https://github.com/rrnewton/hermit/issues/4262).
+    #[test]
+    fn record_version_rejects_streams_from_before_posix_timer_records_carry_si_timer() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x167)));
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 
