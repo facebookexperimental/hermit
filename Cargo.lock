@@ -525,6 +525,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "detcore-dbt-cdylib"
+version = "0.4.0"
+dependencies = [
+ "detcore-dbt",
+]
+
+[[package]]
 name = "detcore-liteinst"
 version = "0.4.0"
 dependencies = [
@@ -1025,6 +1032,13 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+
+[[package]]
+name = "hermit-cdylib"
+version = "0.4.1"
+dependencies = [
+ "hermit",
+]
 
 [[package]]
 name = "hermit-detcore"

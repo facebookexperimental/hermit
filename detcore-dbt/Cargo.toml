@@ -7,8 +7,10 @@ license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
 publish = false
 
+# libdetcore_dbt.so is built by detcore-dbt-cdylib, so this crate stays an rlib
+# and its dependents can start from its metadata.
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 detcore = { package = "hermit-detcore", version = "0.4.0", path = "../detcore" }

@@ -183,7 +183,7 @@ release_build=$!
 setsid -w cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit --bin hermit \
     --features hermit/third-party-backends --target-dir "$hermit_target_dir" >"$tmp/hermit-build.log" 2>&1 &
 hermit_build=$!
-cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p detcore-dbt --target-dir "$target_dir"
+cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p detcore-dbt -p detcore-dbt-cdylib --target-dir "$target_dir"
 # hermit-install's build script stages install_pkg/ next to the profile directories and
 # links libdetcore_sabre.so and libdetcore_liteinst.so into it. The links resolve only
 # when this invocation also builds both cdylibs; publish-hermit-e2e-artifact.sh requires

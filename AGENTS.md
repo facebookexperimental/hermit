@@ -132,14 +132,16 @@ and the reason is documented.
 
 ## Workspace Map
 
-The root Cargo workspace has sixteen members:
+The root Cargo workspace has eighteen members:
 
 | Path | Role |
 | --- | --- |
-| `hermit-cli` | Main `hermit` CLI and `libhermit`; run, record, replay, log-diff, analyze, and container orchestration. |
+| `hermit-cli` | Main `hermit` CLI and the `hermit` library; run, record, replay, log-diff, analyze, and container orchestration. |
+| `hermit-cdylib` | `libhermit.so`, the shared-object form of the `hermit` library, kept out of `hermit-cli` so Cargo can pipeline it. |
 | `detcore` | Core determinism engine and Reverie tool; scheduler, virtual time, syscall handling, content digests, CPUID handling, and record/replay behavior. |
 | `detcore-model` | Shared deterministic state and model types, including PIDs, file descriptors, futexes, schedules, and logical time. |
 | `detcore-dbt` | Feature-gated DynamoRIO backend glue; private while the public DBT package boundary and name remain undecided. |
+| `detcore-dbt-cdylib` | `libdetcore_dbt.so`, the Detcore runtime the DBT client loads, built from `detcore-dbt`. |
 | `detcore-sabre` | Feature-gated SaBRe backend glue; private while third-party backend packaging remains provisional. |
 | `detcore-liteinst` | In-guest Detcore runtime that Hermit preloads into the guest for `--backend=liteinst`. |
 | `detcore/tests/testutils` | Helpers used by Detcore integration tests. |

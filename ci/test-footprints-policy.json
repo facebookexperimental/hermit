@@ -53,6 +53,7 @@
         "detcore-model",
         "detcore-testutils",
         "hermit",
+        "hermit-cdylib",
         "hermit-test-workdir",
         "hermit-resources",
         "test-allocator"
@@ -139,7 +140,7 @@
     },
     {
       "_why": "The DBT plugin has a runtime-callback ABI check and DBT cells. The retired test.dbt_parity matrix's 28 cases are DBT cells of the c-programs and system-utils manifests since slice S13 of https://github.com/rrnewton/hermit/issues/3301, and check.dbt_runtime_abi lost the test.dbt_parity dependent that used to pull it in.",
-      "packages": ["detcore-dbt"],
+      "packages": ["detcore-dbt", "detcore-dbt-cdylib"],
       "nodes": ["check.dbt_runtime_abi", "e2e.manifest_c_programs_on_host", "e2e.manifest_system_utils_on_host"],
       "e2e_backends": ["dbt"]
     },

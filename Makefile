@@ -68,8 +68,8 @@ install-deps: install-hooks check-submodules ## Build and stage all third-party 
 	@echo 'make: building the third-party backend runtimes (release profile) -- expect ~60s cold'
 	@echo "make: cargo jobs=$(THIRD_PARTY_BUILD_JOBS) (host has $$(nproc) logical cores)"
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
-		-p detcore-dbt -p detcore-sabre -p detcore-liteinst -p hermit-install
-	@echo 'make: backend runtimes OK (release profile: detcore-dbt, detcore-sabre, detcore-liteinst, hermit-install)'
+		-p detcore-dbt -p detcore-dbt-cdylib -p detcore-sabre -p detcore-liteinst -p hermit-install
+	@echo 'make: backend runtimes OK (release profile: detcore-dbt, detcore-dbt-cdylib, detcore-sabre, detcore-liteinst, hermit-install)'
 
 # Install this clone's git pre-commit hooks (core.hooksPath -> .githooks) so a
 # fresh clone/worktree gets the BLOCKING local pin-consistency check plus the
