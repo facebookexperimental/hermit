@@ -55,6 +55,9 @@ and tracked from https://github.com/rrnewton/hermit/issues/4485.
    support on a backend stops the run with a message that names it (see
    [ERROR_CATALOG.md](ERROR_CATALOG.md)), never a plausible Linux errno
    (`ENOSYS`, `EPERM`, `EOPNOTSUPP`, ...) or a zero in place of the real result.
+   One opt-in is approved (owner, 2026-10-15): with `--allow-unsupported-syscalls`
+   the run prints the same named refusal and then returns the errno to the
+   guest instead of stopping. Without the flag, the run stops.
    Checked by: not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
 7. **Interchangeability is shown by tests.** The Reverie-level
    native-comparison conformance test runs the same tool on every backend and
