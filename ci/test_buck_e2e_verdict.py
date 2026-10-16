@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -1173,6 +1174,39 @@ class ValidateNodeTest(unittest.TestCase):
                 self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
                 self.assertIn("HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS is set, but DAGRUN_STEP_STARTED_MONOTONIC_NS",
                               process.stderr)
+                self.assertFalse(self.calls.exists(), "a step ran before the node was refused")
+
+    def slow_clock_python3(self, seconds, then):
+        """Put a python3 first on the node's PATH that, for the node's clock read alone (the
+        only `python3 -c` naming monotonic_ns), sleeps SECONDS and then runs the shell command
+        THEN instead; every other use runs the real interpreter."""
+        real = shutil.which("python3")
+        write_executable(self.root / "bin" / "python3",
+                         f'#!/bin/sh\ncase "$*" in *monotonic_ns*) sleep {seconds}; {then} ;; esac\n'
+                         f'exec {shlex.quote(real)} "$@"\n')
+
+    def test_a_clock_read_slowed_by_a_loaded_host_still_starts_the_step(self):
+        # At a load of about 450, hermit 32e1c019's validation refused the node because the
+        # interpreter reading CLOCK_MONOTONIC did not start within the 2 s it was given.
+        self.slow_clock_python3(3, ":")
+        process, _elapsed = self.run_as_step(self.root / "e2e-results", 3600)
+        stderr = (self.root / "node.stderr").read_text()
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual([call[0] for call in calls_in(self.calls)], ["regenerate-rust-deps", "stage", "run"])
+        self.assertEqual(self.phases(self.root / "e2e-results")[-1], "exit 0")
+
+    def test_a_clock_that_cannot_be_read_is_refused_by_name(self):
+        for name, then in (("a failed interpreter", "exit 1"), ("no reading", "exit 0"),
+                           ("one clock only", "echo 5; exit 0"), ("not a number", "echo soon 5; exit 0")):
+            with self.subTest(name):
+                self.slow_clock_python3(0, then)
+                process = self.validate_node(str(self.root / "e2e-results"),
+                                             HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS="3600",
+                                             DAGRUN_STEP_STARTED_MONOTONIC_NS=str(time.monotonic_ns()))
+                self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+                self.assertIn("HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS is set, but CLOCK_MONOTONIC could not be "
+                              "read: python3 exited ", process.stderr)
+                self.assertNotIn("not a time on CLOCK_MONOTONIC that has passed", process.stderr)
                 self.assertFalse(self.calls.exists(), "a step ran before the node was refused")
 
     def test_an_earlier_attempts_records_are_never_kept_for_a_step_that_fails_before_the_run(self):

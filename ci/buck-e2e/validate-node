@@ -59,7 +59,10 @@
 # daemon and exiting, before the bound that dagrun enforces from the step's start in
 # DAGRUN_STEP_STARTED_MONOTONIC_NS, and skips it when that time has gone, so work that
 # completed is never reported as a timeout. When it is set, the start must be a time on
-# CLOCK_MONOTONIC that has passed, or the node exits 2.
+# CLOCK_MONOTONIC that has passed, or the node exits 2. Bash cannot read CLOCK_MONOTONIC,
+# so the node reads it once, with the wall clock, as it starts (python3, given 60 seconds
+# because an interpreter can take seconds to start on a loaded host; a failed read exits
+# 2 with its own message), and from then on counts down to the bound on the wall clock.
 #
 # Steps, all on the host, in the checkout: regenerate the Buck third-party rules
 # (bootstrap/regenerate-rust-deps), stage the RE link inputs for buck-hybrid
@@ -161,22 +164,29 @@ fi
 step_wall_seconds=${HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS:-}
 step_started_ns=${DAGRUN_STEP_STARTED_MONOTONIC_NS:-}
 step_reserve_seconds=10
-step_left() { # set step_left_us to the microseconds left before this step's wall bound, less the reserve
-    local now_ns
-    now_ns=$(timeout --foreground -k 0.5 2 python3 -c 'import time; print(time.monotonic_ns())') &&
-        [[ $now_ns =~ ^[0-9]{1,18}$ ]] || return 1
-    ((now_ns >= step_started_ns)) || return 1
-    step_left_us=$(((step_started_ns + step_wall_seconds * 1000000000 - now_ns) / 1000 - step_reserve_seconds * 1000000))
-}
+step_end_us= # the epoch microseconds of this step's wall bound, less the reserve
 if [[ -n $step_wall_seconds ]]; then
     if [[ ! $step_wall_seconds =~ ^[1-9][0-9]{0,5}$ ]]; then
         echo "validate-node: HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS is '${step_wall_seconds}', not a positive number of seconds" >&2
         exit 2
     fi
-    if [[ ! $step_started_ns =~ ^[0-9]{1,18}$ ]] || ! step_left; then
+    if [[ ! $step_started_ns =~ ^[0-9]{1,18}$ ]]; then
         echo "validate-node: HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS is set, but DAGRUN_STEP_STARTED_MONOTONIC_NS is '${step_started_ns}', not a time on CLOCK_MONOTONIC that has passed" >&2
         exit 2
     fi
+    # One reading of both clocks, so the time python3 takes to start is in neither.
+    clocks_status=0
+    clocks=$(timeout --foreground -k 1 60 python3 -c 'import time; print(time.monotonic_ns(), time.time_ns())') ||
+        clocks_status=$?
+    if ((clocks_status != 0)) || [[ ! $clocks =~ ^([0-9]{1,18})\ ([0-9]{1,19})$ ]]; then
+        echo "validate-node: HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS is set, but CLOCK_MONOTONIC could not be read: python3 exited ${clocks_status} within 60 s and printed '${clocks}', not two clock readings" >&2
+        exit 2
+    fi
+    if ((BASH_REMATCH[1] < step_started_ns)); then
+        echo "validate-node: HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS is set, but DAGRUN_STEP_STARTED_MONOTONIC_NS is '${step_started_ns}', not a time on CLOCK_MONOTONIC that has passed" >&2
+        exit 2
+    fi
+    step_end_us=$(((BASH_REMATCH[2] + step_started_ns + step_wall_seconds * 1000000000 - BASH_REMATCH[1]) / 1000 - step_reserve_seconds * 1000000))
 fi
 state=$VALIDATE_RUN_STATE/buck-e2e
 failed_logs=$(realpath -m -- "$E2E_RESULT_ROOT")/buck-failed-verify-logs
@@ -234,17 +244,12 @@ on_exit() { # keep the invocations' records, then stop the buck2 daemon; the nod
     if [[ -n $kept ]]; then
         printf '%s\texit %s\n' "$(date -u +%s.%N)" "$status" >>"$kept/phases.tsv"
         local now deadline why
-        if [[ -n $step_wall_seconds ]] && ! step_left; then
-            deadline=0 why="this step's $step_wall_seconds s wall bound, whose remaining time could not be read,"
-        else
-            # Read after step_left, so the time it took is not counted twice.
-            now=${EPOCHREALTIME/[^0-9]/}
-            deadline=$((now + retention_seconds * 1000000))
-            why="the $retention_seconds s for keeping the Buck invocation records"
-            if [[ -n $step_wall_seconds ]] && ((now + step_left_us < deadline)); then
-                deadline=$((now + step_left_us))
-                why="the time left before this step's $step_wall_seconds s wall bound, less $step_reserve_seconds s for stopping buck2,"
-            fi
+        now=${EPOCHREALTIME/[^0-9]/}
+        deadline=$((now + retention_seconds * 1000000))
+        why="the $retention_seconds s for keeping the Buck invocation records"
+        if [[ -n $step_wall_seconds ]] && ((step_end_us < deadline)); then
+            deadline=$step_end_us
+            why="the time left before this step's $step_wall_seconds s wall bound, less $step_reserve_seconds s for stopping buck2,"
         fi
         keep_invocations "$deadline" "$why"
     fi
