@@ -1081,7 +1081,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1597, listed.
     // And nextest_binaries' listings_run_concurrently_without_the_budget_wrapper_and_report_a_failure:
     // 1598, listed.
-    ("test.regular_crates", 1598),
+    // And detcore-dbt's copied_child_refuses_group_and_session_getters_in_strict_mode:
+    // 1599, listed.
+    ("test.regular_crates", 1599),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4485,7 +4487,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (1595 -> 1596), which the twin does not exclude: 1582.
     // And the same new-cell gate test: 1583, listed.
     // And the same concurrent-listing test: 1584, listed.
-    ("test.regular_crates_on_host", 1584),
+    // And the same copied-child group-getter test: 1585.
+    ("test.regular_crates_on_host", 1585),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),

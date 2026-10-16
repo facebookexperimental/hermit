@@ -2168,6 +2168,21 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
     if sysno == Sysno::setpgid && strict {
         return 1;
     }
+    // getpgrp, getpgid and getsid FAIL CLOSED IN STRICT MODE BECAUSE THE
+    // KERNEL'S ANSWER IS NOT DETCORE'S.
+    //
+    // The instrumented root is answered from Detcore's model (slice B3a-4c of
+    // https://github.com/rrnewton/hermit/issues/4266): a group or session
+    // inherited from outside the container's PID namespace reads 0, as Linux
+    // shows it. In a copied child the call would run natively, and the kernel
+    // answers for the process group the DBT launcher made for the run, whose
+    // id is the root's pid. A child would read a different group from its
+    // parent's. As with setpgid above, no fixed errno is faithful (the root's
+    // calls succeed), and a wrong answer about process-group identity is
+    // worse than no answer.
+    if matches!(sysno, Sysno::getpgrp | Sysno::getpgid | Sysno::getsid) && strict {
+        return 1;
+    }
     if detcore::is_deterministically_refused_syscall(sysno)
         && (strict || !detcore::is_strict_only_deterministic_refusal_syscall(sysno))
     {
@@ -4698,6 +4713,30 @@ mod tests {
             );
         }
 
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+    }
+
+    /// The process-group and session getters, answered from Detcore's model in
+    /// the instrumented root, fail closed in a strict copied child, whose
+    /// native answer would be the kernel's group rather than the model's; a
+    /// non-strict copied child keeps native behaviour.
+    #[test]
+    fn copied_child_refuses_group_and_session_getters_in_strict_mode() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+        for (strict, expected) in [(true, 1), (false, 0)] {
+            COPIED_PANIC_ON_UNSUPPORTED.store(strict, Ordering::Release);
+            for sysno in [Sysno::getpgrp, Sysno::getpgid, Sysno::getsid] {
+                assert!(detcore::is_determinized_syscall(sysno));
+                assert_eq!(
+                    copied_child_action(sysno.id() as i64),
+                    expected,
+                    "{sysno} in a copied child, strict={strict}"
+                );
+            }
+        }
         COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
     }
 
