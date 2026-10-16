@@ -1588,7 +1588,14 @@ fi
 # This adds the accepted native exec pair after the DBT stats-path fix. The
 # third-party SDK tree, root Cargo.toml and reverie-dbt/build.rs are unchanged;
 # inventory remains 955. The existing SDK budget is carried, not remeasured.
-expected_pin=f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91
+
+# DBT COMPLETED-TOOL-RESULT SDK-BUDGET CARRY (2026-10-15): advance
+# f9be99dc93ba503b1cf89faa8b95e39c8e1b3b91 to 14bae9ad147c97b4d29f0cb8d49cdf772eb5bfce.
+# The interval contains a LiteInst glibc test correction, one DBT native
+# post-Tool override deletion and its regression. build.rs and vendor/dynamorio
+# are unchanged; the SDK budget carries. The added live test changes the
+# tracked reverie-dbt inventory from 955 to 956. No budget is increased.
+expected_pin=14bae9ad147c97b4d29f0cb8d49cdf772eb5bfce
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
