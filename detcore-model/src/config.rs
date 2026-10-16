@@ -636,7 +636,10 @@ pub struct Config {
     /// threads polling for that: the scheduler restores their priority, and once the acting
     /// thread's time is this far past its first readying action, at the next point where it
     /// returns to Detcore (a syscall's entry or exit, or a signal or trapped instruction), it is
-    /// moved behind them and yields, so they run before it continues. `0` hands off at the end of
+    /// moved behind them and yields, so they run before it continues. A poller is restored to its
+    /// own priority and the acting thread moves only within its band, so where `--chaos` has drawn
+    /// a poller a lower priority than the acting thread, that poller still runs after it and is
+    /// not guaranteed to run first. `0` hands off at the end of
     /// the readying syscall. Unset (the default), nothing changes: a polled thread whose peer is
     /// ready waits for the acting thread's slice to end, as before. Each hand-off adds at least two
     /// charged scheduler turns that the guest can observe as time (see `--scheduler-turn-cost`).

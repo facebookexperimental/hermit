@@ -2395,7 +2395,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // timer-copy maps the PR deletes: +57, 1912, listed.
     // And the two Detcore unit tests main counted in 90dec733: 1914, listed.
     // And scheduler::test::process_groups_count_only_processes_linux_still_has: 1915.
-    ("test.detcore_unit", 1915),
+    // And scheduler::pipe_wake::tests::a_readied_poller_stays_in_its_polling_wait
+    // (Claude review of https://github.com/rrnewton/hermit/pull/4424, N6): 1916, listed.
+    ("test.detcore_unit", 1916),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4145,7 +4147,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And https://github.com/rrnewton/hermit/issues/4262: the same +57 as test.detcore_unit, 1912.
     // And the two Detcore unit tests main counted in 90dec733: 1914, listed.
     // And scheduler::test::process_groups_count_only_processes_linux_still_has: 1915.
-    ("test.detcore_unit_on_host", 1915),
+    // And the same polling-wait test: 1916.
+    ("test.detcore_unit_on_host", 1916),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -282,7 +282,7 @@ impl Scheduler {
     /// step 4 has not seen yet, or step 4 deferred it as a poller. Between its
     /// grant and its next request the thread holds its turn, when no expiry
     /// commits.
-    fn in_polling_wait(&self, thread: DetTid) -> bool {
+    pub(super) fn in_polling_wait(&self, thread: DetTid) -> bool {
         self.sigalrm.polling.contains(&thread)
             || self
                 .next_turns

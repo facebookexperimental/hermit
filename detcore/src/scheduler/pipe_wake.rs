@@ -271,6 +271,29 @@ mod tests {
         assert!(!scheduler.hand_off_turn(ACTOR));
     }
 
+    /// A readied poller is still in its polling wait after its retry is made
+    /// runnable, so a due guest-handled SIGALRM takes the ledger's path for a
+    /// wait that phase 1 cannot interrupt, as after step 4's deferral (Claude
+    /// review of https://github.com/rrnewton/hermit/pull/4424, N6).
+    #[test]
+    fn a_readied_poller_stays_in_its_polling_wait() {
+        let mut scheduler = scheduler();
+        scheduler.ready_channel(ACTOR, channel(), Wants::Data);
+        for poller in [POLLER, SECOND_POLLER] {
+            let request = scheduler.next_turns[&poller]
+                .req
+                .try_read()
+                .unwrap()
+                .clone()
+                .unwrap();
+            // No longer a retry by its attempt count: only the readying keeps
+            // the wait.
+            assert_eq!(request.poll_attempt, 0);
+            assert!(scheduler.in_polling_wait(poller));
+        }
+        assert!(!scheduler.in_polling_wait(RUNNABLE));
+    }
+
     /// Only a poll of the same channel for the readied want is readied: room
     /// readies no reader, and another pipe's data readies no reader of this
     /// one. Nothing is restored and the hand-off does nothing.
