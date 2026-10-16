@@ -1117,10 +1117,7 @@ mod tests {
             };
             let subscriptions = <detcore::Detcore as reverie::Tool>::subscriptions(&config);
             assert!(subscriptions.has_rdtsc());
-            assert_eq!(
-                subscriptions.has_cpuid(),
-                config.virtualize_cpuid || config.backend.virtualizes_cpuid
-            );
+            assert_eq!(subscriptions.has_cpuid(), config.virtualize_cpuid);
             let masks = NativeSignalMasks::from_config(&config);
             assert_eq!(masks.installed, 0xffffffffbffbfaff);
             let bootstrap = bootstrap_image();

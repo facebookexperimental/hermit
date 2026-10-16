@@ -1926,7 +1926,9 @@ pub fn to_legacy_backend_json(config: &Config) -> serde_json::Result<String> {
 fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
     let backend = &config.backend;
     [
-        ("cpuid_virtualized_by_backend", backend.virtualizes_cpuid),
+        // No backend installs a CPUID policy of its own any more, so the key
+        // is always written false; see `from_legacy_backend_json`.
+        ("cpuid_virtualized_by_backend", false),
         ("backend_supports_madvise", backend.supports_madvise),
         (
             "discover_live_file_metadata",
@@ -2016,6 +2018,13 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// `runs_guest_code_between_injections` read back as false, the value DBT
 /// has and the value their earlier `Config` fields read back as.
 ///
+/// `cpuid_virtualized_by_backend` supplies no capability either: it said the
+/// backend installed a CPUID policy of its own, which no backend does any
+/// more (KVM stopped with Reverie 0f4d8852). It is still written, as false,
+/// so DBT's guest-visible configuration keeps its bytes, and an input that
+/// says `true` fails the parse rather than being read as a policy no backend
+/// has.
+///
 /// `kvm_shared_dequeue_timers` supplies no capability. It was read into a
 /// `Config` field that chose the controlled signal path, and that choice is
 /// now made from the capabilities, [`Config::sequentialize_threads`] and the
@@ -2056,6 +2065,12 @@ pub fn from_legacy_backend_json(json: &str) -> serde_json::Result<Config> {
         legacy_backend_json::LegacyConfigVisitor,
     )?;
     deserializer.end()?;
+    if legacy.cpuid_virtualized_by_backend {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "cpuid_virtualized_by_backend is true, but no backend installs a CPUID \
+             policy of its own; the key must be false or absent",
+        ));
+    }
     let controlled = legacy.backend_is_kvm && config.sequentialize_threads;
     if legacy.kvm_shared_dequeue_timers != controlled {
         return Err(<serde_json::Error as serde::de::Error>::custom(
@@ -2224,7 +2239,6 @@ impl LegacyBackendKeys {
             self.backend_supports_parked_write_signal_interruption;
         backend.defers_vfork_child_registration = self.backend_defers_vfork_child_registration;
         backend.virtualizes_capability_prctls = self.backend_virtualizes_capability_prctls;
-        backend.virtualizes_cpuid = self.cpuid_virtualized_by_backend;
         backend.supports_madvise = self.backend_supports_madvise;
         // A legacy encoding predates this key: every backend that supports
         // madvise supports MADV_DONTNEED, and KVM implements it alone.
@@ -3168,7 +3182,16 @@ mod tests {
         for (key, ptrace_value) in keys {
             let mut expected = legacy_ptrace;
             match key {
-                "cpuid_virtualized_by_backend" => expected.virtualizes_cpuid = true,
+                "cpuid_virtualized_by_backend" => {
+                    // No backend installs a CPUID policy of its own, so `true`
+                    // fails the parse.
+                    let mut flipped = ptrace.clone();
+                    flipped.insert(key.to_owned(), serde_json::Value::Bool(!ptrace_value));
+                    let error = from_legacy_backend_json(&serde_json::to_string(&flipped).unwrap())
+                        .unwrap_err();
+                    assert!(error.to_string().contains(key), "{error}");
+                    continue;
+                }
                 "backend_supports_madvise" => {
                     expected.supports_madvise = false;
                     expected.supports_madv_dontneed = false;

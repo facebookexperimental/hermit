@@ -2072,11 +2072,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // re-executes the host instruction, so trapping does not change what the guest
             // sees, but the subscription makes Reverie probe and enable CPUID faulting and log
             // an ERROR for each exec on hosts that lack it
-            // (https://github.com/rrnewton/hermit/issues/3460). A backend that installs its
-            // own CPUID table (KVM) still needs the trap for the guest to see host values.
+            // (https://github.com/rrnewton/hermit/issues/3460). No backend installs a CPUID
+            // table of its own, so an untrapped guest CPUID is the host's on every backend.
             let mut subscription = Subscription::all_syscalls();
             subscription.rdtsc();
-            if config.virtualize_cpuid || config.backend.virtualizes_cpuid {
+            if config.virtualize_cpuid {
                 subscription.cpuid();
             }
             subscription
@@ -4962,17 +4962,6 @@ mod subscription_tests {
                 "passthru_opt={passthru_opt}: the syscall set must not depend on CPUID virtualization"
             );
         }
-
-        // KVM installs its own CPUID table, so with virtualization off the guest
-        // sees host values only through the trap: keep subscribing there.
-        let kvm_host_cpuid = Config {
-            virtualize_cpuid: false,
-            ..strict_config(false).with_backend(|backend| backend.virtualizes_cpuid = true)
-        };
-        assert_eq!(
-            <Detcore as Tool>::subscriptions(&kvm_host_cpuid),
-            Subscription::all()
-        );
     }
 
     #[test]

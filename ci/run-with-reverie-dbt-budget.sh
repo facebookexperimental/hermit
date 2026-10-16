@@ -1714,7 +1714,17 @@ fi
 # reverie-liteinst and the M1 catalog. git diff is empty for reverie-dbt/, so
 # no DynamoRIO build input moves and the budget carries; the reverie-dbt
 # inventory is unchanged.
-expected_pin=caa1deb31e6fddd14d3ed764d2f1759f0feab3d0
+# VIRTUALIZES_CPUID REMOVAL SDK-BUDGET CARRY (2026-10-16): advance
+# caa1deb31e6fddd14d3ed764d2f1759f0feab3d0 to a59dc37f56ddbada4390686cec95c00433d0f7e5.
+# 21d91fa7 and 28f86f2d add reverie-examples (a cross-backend recorder) and
+# touch no reverie-dbt file. 60138390 (dbt: leave group and session queries to
+# Linux) changes reverie-dbt native/client.c and src/tools.rs, so the
+# DynamoRIO client rebuilds, and adds tests/fixtures/group_session_getters.c
+# and tests/group_session_getters_live.rs: the reverie-dbt inventory goes 959
+# -> 961. a59dc37f (drop virtualizes_cpuid) touches only reverie-core.
+# build.rs, vendor/dynamorio and the root Cargo.toml are unchanged, so the
+# SDK budget carries.
+expected_pin=a59dc37f56ddbada4390686cec95c00433d0f7e5
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

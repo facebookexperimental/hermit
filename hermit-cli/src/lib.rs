@@ -6853,10 +6853,6 @@ mod tests {
                 matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Kvm),
             "defers_vfork_child_registration": kvm,
             "virtualizes_capability_prctls": kvm,
-            // No backend installs a CPUID policy of its own: KVM's fixed
-            // profile went with Reverie c996abb2, so Detcore's machine
-            // description answers every subscribed CPUID on every backend.
-            "virtualizes_cpuid": false,
             "supports_madvise": !kvm,
             "supports_madv_dontneed": true,
             "reports_child_exit_publication":
@@ -7065,8 +7061,8 @@ mod tests {
     /// Current DBT therefore uses the separately checked typed envelope, not
     /// this lossy projection. LiteInst's row is its in-guest runtime. KVM's
     /// first two digits are the capabilities `run_kvm` formerly set itself; the
-    /// first, `cpuid_virtualized_by_backend`, went false with Reverie c996abb2,
-    /// when KVM stopped installing a CPUID profile of its own.
+    /// first, `cpuid_virtualized_by_backend`, is written false for every
+    /// backend now that no backend installs a CPUID profile of its own.
     #[test]
     fn every_backend_encodes_its_current_legacy_projection() {
         for (backend, unsequenced, sequential) in [

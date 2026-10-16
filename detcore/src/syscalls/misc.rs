@@ -361,24 +361,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::ArchPrctl,
     ) -> Result<i64, Error> {
-        let cpuid_uses_backend_policy =
-            self.cfg.virtualize_cpuid && self.cfg.backend.virtualizes_cpuid;
         let cpuid_uses_faulting = self.cfg.virtualize_cpuid && guest.has_cpuid_interception();
         match call.cmd() {
             ArchPrctlCmd::ARCH_SET_FS(_)
             | ArchPrctlCmd::ARCH_SET_GS(_)
             | ArchPrctlCmd::ARCH_GET_FS(_)
             | ArchPrctlCmd::ARCH_GET_GS(_) => Ok(guest.inject(call).await?),
-
-            // KVM installs a deterministic CPUID table while leaving the instruction enabled.
-            ArchPrctlCmd::ARCH_GET_CPUID(_) if cpuid_uses_backend_policy => Ok(1),
-            ArchPrctlCmd::ARCH_SET_CPUID(value) if cpuid_uses_backend_policy => {
-                if value == 0 {
-                    Err(Errno::EPERM.into())
-                } else {
-                    Ok(0)
-                }
-            }
 
             // When Reverie successfully disables native CPUID, Detcore answers its fault from a
             // fixed table. Preserve that backend state and reject attempts to re-enable CPUID.
