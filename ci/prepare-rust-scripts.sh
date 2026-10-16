@@ -16,6 +16,15 @@ esac
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# rustc runs LLVM's optimization passes on worker threads that get Rust's
+# default 2-MiB thread stack unless RUST_MIN_STACK says otherwise. In the full
+# validation of hermit d52ddea0, build.rust_scripts died when rustc, building
+# scripts/validate.rs in release, overflowed one in LLVM's inliner ("rustc
+# interrupted by SIGSEGV ... you can increase rustc's stack size by setting
+# RUST_MIN_STACK=16777216"); the same build passes at 2 MiB in other runs.
+# 16 MiB is the size rustc names, 8 times the default. A caller's own value wins.
+export RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}"
+
 find_real_rust_script() {
     local candidate dir
     if [[ -n ${HERMIT_REAL_RUST_SCRIPT:-} ]]; then
