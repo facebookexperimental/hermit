@@ -1822,8 +1822,17 @@ fi
 # and Reverie's Cargo.lock. git diff is empty under reverie-dbt/, so the
 # reverie-dbt inventory stays 961, and build.rs, vendor/dynamorio and the root
 # Cargo.toml are unchanged: the SDK budget carries.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c4fb4d70aa6d5d61545a4759289f101529329afd ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c4fb4d70aa6d5d61545a4759289f101529329afd (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# PROVIDER-INTO-CORE SDK-BUDGET CARRY (2026-10-16): advance
+# c4fb4d70aa6d5d61545a4759289f101529329afd to 4d50f85b288f5ab973e51c29e1701c5bb0d380ef.
+# The interval is one commit, 4d50f85b, which moves the Linux provider
+# interface from reverie-linux-provider into reverie-core as reverie::provider
+# and drops reverie-kvm's dependency on the old crate, which stays a workspace
+# member. git diff is empty under reverie-dbt/ (tree 981db5f4a9cf at both
+# pins), and build.rs, vendor/dynamorio, native/, third-party, the root
+# Cargo.toml and rust-toolchain.toml are unchanged, so no DynamoRIO build input
+# moves and the budget carries; the reverie-dbt inventory stays 961.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4d50f85b288f5ab973e51c29e1701c5bb0d380ef ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4d50f85b288f5ab973e51c29e1701c5bb0d380ef (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

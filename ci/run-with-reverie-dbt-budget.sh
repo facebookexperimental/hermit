@@ -1745,7 +1745,16 @@ fi
 # and Reverie's Cargo.lock. git diff is empty under reverie-dbt/, so the
 # reverie-dbt inventory stays 961, and build.rs, vendor/dynamorio and the root
 # Cargo.toml are unchanged: the SDK budget carries.
-expected_pin=c4fb4d70aa6d5d61545a4759289f101529329afd
+# PROVIDER-INTO-CORE SDK-BUDGET CARRY (2026-10-16): advance
+# c4fb4d70aa6d5d61545a4759289f101529329afd to 4d50f85b288f5ab973e51c29e1701c5bb0d380ef.
+# The interval is one commit, 4d50f85b, which moves the Linux provider
+# interface from reverie-linux-provider into reverie-core as reverie::provider
+# and drops reverie-kvm's dependency on the old crate, which stays a workspace
+# member. git diff is empty under reverie-dbt/ (tree 981db5f4a9cf at both
+# pins), and build.rs, vendor/dynamorio, native/, third-party, the root
+# Cargo.toml and rust-toolchain.toml are unchanged, so no DynamoRIO build input
+# moves and the budget carries; the reverie-dbt inventory stays 961.
+expected_pin=4d50f85b288f5ab973e51c29e1701c5bb0d380ef
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
