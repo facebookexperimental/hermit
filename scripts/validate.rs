@@ -12057,6 +12057,28 @@ const EXPECTED_SHARED_INTEGRATION_TESTS: [(&str, &[&str]); 2] = [
 // only verifies the binaries build.workspace_in_pinned_root prepared
 // (`nextest-binaries.rs assert privileged`), so excluding it from the
 // consumers only made every privileged test wait behind `test.cli`.
+//
+// For the same reason, since 2026-10-16 two cli consumers hold no token:
+// privileged-test.cli_kvm, whose cli executable is built with
+// kvm-execution-tests and so is not the one test.cli runs, and
+// privileged-test.pmu_cli_cases, which only runs the same executable beside
+// it. The token had queued them behind test.cli, isolated_dbt_workdir and
+// cpu_profile_v3: in the full validation of 32e1c019 pmu_cli_cases started 187
+// s after its last dependency and ended the PMU chain at +622 s.
+const EXPECTED_SHARED_INTEGRATION_TOKEN_HOLDERS: [(&str, &[&str]); 2] = [
+    (
+        "cli",
+        &[
+            "privileged-cpuid.cpu_profile_v3",
+            "test.cli",
+            "test.isolated_dbt_workdir",
+        ],
+    ),
+    (
+        "hermit_modes",
+        &["privileged-test.pmu_buck_chaos_cases", "test.hermit_modes"],
+    ),
+];
 
 fn assert_committed_shared_integration_test_consumers(steps: &[Step]) -> Result<(), String> {
     let mut by_binary: BTreeMap<&str, Vec<String>> = BTreeMap::new();
@@ -12099,12 +12121,12 @@ fn assert_committed_shared_integration_test_serialization(
         .filter(|resource| resource.starts_with("integration_test_binaries."))
         .collect::<BTreeSet<_>>()
         .len();
-    if resource_count != EXPECTED_SHARED_INTEGRATION_TESTS.len() {
+    if resource_count != EXPECTED_SHARED_INTEGRATION_TOKEN_HOLDERS.len() {
         return Err(format!(
             "fused shared integration-test resource count changed: {resource_count}"
         ));
     }
-    for (binary, consumers) in EXPECTED_SHARED_INTEGRATION_TESTS {
+    for (binary, consumers) in EXPECTED_SHARED_INTEGRATION_TOKEN_HOLDERS {
         let resource = format!("integration_test_binaries.{binary}");
         let mut expected: Vec<(String, i64)> = consumers
             .iter()
@@ -32159,8 +32181,6 @@ mod shared_consumer_tests {
                 "integration_test_binaries.cli",
                 vec![
                     "privileged-cpuid.cpu_profile_v3",
-                    "privileged-test.cli_kvm",
-                    "privileged-test.pmu_cli_cases",
                     "test.cli",
                     "test.isolated_dbt_workdir",
                 ],
@@ -32170,6 +32190,28 @@ mod shared_consumer_tests {
                 vec!["privileged-test.pmu_buck_chaos_cases", "test.hermit_modes"],
             ),
         ] {
+            // The two cli consumers that hold no token are refused if one
+            // takes it back, like any other change to the holders.
+            if resource == "integration_test_binaries.cli" {
+                for tag in ["privileged-test.cli_kvm", "privileged-test.pmu_cli_cases"] {
+                    let mut regained = full.steps.clone();
+                    regained
+                        .iter_mut()
+                        .find(|step| step.tag() == tag)
+                        .unwrap()
+                        .hint
+                        .resources
+                        .insert(resource.into(), 1);
+                    assert!(
+                        assert_committed_shared_integration_test_serialization(
+                            &regained,
+                            &full.resource_caps
+                        )
+                        .is_err(),
+                        "{tag} holding {resource} again was accepted"
+                    );
+                }
+            }
             let mut builder_holds = full.steps.clone();
             builder_holds
                 .iter_mut()

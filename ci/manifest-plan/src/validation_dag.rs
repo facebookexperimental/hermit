@@ -4367,11 +4367,16 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         // The verifying build node holds no token: since the one-build change
         // of 2026-09-30 it only checks the binaries the workspace prepare node
         // made, so nothing it does can disturb a consumer.
-        let mut expected = BTreeMap::from([(portable.to_string(), 1), (privileged.to_string(), 1)]);
+        // Since 2026-10-16 privileged-test.cli_kvm (whose cli executable is
+        // built with kvm-execution-tests, so is not test.cli's) and
+        // privileged-test.pmu_cli_cases hold no cli token either: with no
+        // relinking builder, the token only queued them behind test.cli.
+        let mut expected = BTreeMap::from([(portable.to_string(), 1)]);
         if binary == "cli" {
             expected.insert("test.isolated_dbt_workdir".into(), 1);
-            expected.insert("privileged-test.pmu_cli_cases".into(), 1);
             expected.insert("privileged-cpuid.cpu_profile_v3".into(), 1);
+        } else {
+            expected.insert(privileged.to_string(), 1);
         }
         let actual = cfg
             .steps
