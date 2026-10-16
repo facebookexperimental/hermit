@@ -1075,7 +1075,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And hermit-verify chaos-stress's three classification unit tests and
     // its three runs against a scripted Hermit (tests/cli.rs): 1589.
     // And hermit-verify's interpolate_refuses_schedules_recorded_under_different_pipe_wake_latencies (https://github.com/rrnewton/hermit/issues/4380): 1590, listed.
-    ("test.regular_crates", 1590),
+    // And +5 from 87bb6972: 1595.
+    ("test.regular_crates", 1595),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4426,7 +4427,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +13 from a3a9c83a: 1569.
     // And the same six chaos-stress tests, which need no PMU: 1575.
     // And the same interpolate refusal test (https://github.com/rrnewton/hermit/issues/4380): 1576, listed.
-    ("test.regular_crates_on_host", 1576),
+    // And +5 from 87bb6972: 1581.
+    ("test.regular_crates_on_host", 1581),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),

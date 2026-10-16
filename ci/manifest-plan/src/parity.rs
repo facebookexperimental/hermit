@@ -545,29 +545,39 @@ fn side_status(
     side: &str,
     selected_by_full: &BTreeSet<(String, String)>,
 ) -> Result<SideStatus, String> {
-    let Some(recipe) = test.modes.get(PARITY_MODE) else {
+    let selected = selected_by_full.contains(&(test.id.clone(), side.to_string()));
+    mode_side_status(test, PARITY_MODE, side, selected)
+}
+
+/// How full validation treats `side`'s `mode` cell of `test`, given whether
+/// full validation selects it.
+pub(crate) fn mode_side_status(
+    test: &TestRecipe,
+    mode: &str,
+    side: &str,
+    selected: bool,
+) -> Result<SideStatus, String> {
+    let Some(recipe) = test.modes.get(mode) else {
         return Ok(SideStatus::NoVerifyMode {
-            reason: format!("{} has no {PARITY_MODE} mode", test.id),
+            reason: format!("{} has no {mode} mode", test.id),
         });
     };
     if !recipe.backends_enabled.iter().any(|value| value == side) {
         // The manifest loader requires every mode to partition the backends,
         // so a backend that is not enabled has a stated disabled reason.
-        let why = recipe.backends_disabled.get(side).ok_or_else(|| {
-            format!(
-                "{}: {side} {PARITY_MODE} is neither enabled nor disabled",
-                test.id
-            )
-        })?;
+        let why = recipe
+            .backends_disabled
+            .get(side)
+            .ok_or_else(|| format!("{}: {side} {mode} is neither enabled nor disabled", test.id))?;
         return Ok(SideStatus::Disabled {
             reason: why.to_string(),
         });
     }
-    if selected_by_full.contains(&(test.id.clone(), side.to_string())) {
+    if selected {
         return Ok(SideStatus::Selected);
     }
-    let selection = configured_selection(recipe)
-        .map_err(|error| format!("{}: {PARITY_MODE} {error}", test.id))?;
+    let selection =
+        configured_selection(recipe).map_err(|error| format!("{}: {mode} {error}", test.id))?;
     let why = if let Some(reason) = selection.reason(side) {
         reason.reason.clone()
     } else if let Some(reason) = crate::runner::focused_run_type_reason(test, recipe, Some(side)) {
@@ -576,7 +586,7 @@ fn side_status(
         OCCASIONAL_REASON.to_string()
     } else {
         return Err(format!(
-            "{}/{PARITY_MODE}@{side} is not selected by full validation without a reason",
+            "{}/{mode}@{side} is not selected by full validation without a reason",
             test.id
         ));
     };

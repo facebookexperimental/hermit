@@ -194,6 +194,7 @@ Exit status: 0 when the files match (--check) or were written (--write), 1 when
 const PARITY_HELP: &str = "\
 Usage: test-harness parity compare --artifacts <DIR> --cell <TEST@BACKEND> [OPTIONS]
        test-harness parity export --e2e-root <DIR> [--expected-scope <FILE>]
+       test-harness parity outcomes --e2e-root <DIR> [--backend <B>]... [--json] [--baseline <FILE>]
 
 Measure parity cells from the logs a finished `run` retained, as its own
 post-pass does, without running any guest. Each cell compares TEST's verify
@@ -237,7 +238,25 @@ record-missing row for each cell the refused node's expected scope owed.
 
 Export options:
   --e2e-root <DIR>                 The run's e2e result root, holding <lane>/<node>/
-  --expected-scope <FILE>          The cells each planned node owed (see above)";
+  --expected-scope <FILE>          The cells each planned node owed (see above)
+
+`parity outcomes` prints, per candidate backend, every manifest cell whose
+outcome differs from ptrace's in one finished run. A cell's outcome is its
+final row's outcome in the run's results.jsonl files (PASS, FAIL, ERROR, ...),
+or with no row the manifest's own status, with its reason: disabled,
+not-selected (enabled, but full validation does not run it), no-mode, or
+not-run (full validation selects it, but the run has no row). The cells
+considered are every test and mode whose ptrace cell full validation selects,
+plus every test and mode with a row on any candidate. It runs no guest and
+writes nothing. With --baseline it exits 1 when a cell that matched ptrace in
+the baseline no longer does, and lists the cells that started matching.
+
+Outcomes options:
+  --e2e-root <DIR>                 The run's e2e result root, holding <lane>/<node>/results.jsonl
+  --backend <B>                    A candidate backend (dbt, in-guest-trap, kvm, liteinst,
+                                   sabre); may repeat (default: all five)
+  --json                           Print the differences as JSONL, the baseline format
+  --baseline <FILE>                Gate against an earlier run's --json output";
 
 const FILTER_OPTIONS: &str = "  --lane <portable|privileged>
   --category <CATEGORY>
@@ -977,6 +996,10 @@ fn main() -> ExitCode {
         let request = match parse_parity(values) {
             ParityRequest::Compare(request) => request,
             ParityRequest::Export(request) => return parity_export(&request),
+            ParityRequest::Outcomes(request) => {
+                let manifests = ManifestSet::load(&root(None)).unwrap_or_else(|error| fail(error));
+                return parity_outcomes(&manifests, &request);
+            }
         };
         let root = root(None);
         let manifests = ManifestSet::load(&root).unwrap_or_else(|error| fail(error));
@@ -3894,9 +3917,17 @@ struct ParityExportRequest {
     expected_scope: Option<PathBuf>,
 }
 
+struct ParityOutcomesRequest {
+    e2e_root: PathBuf,
+    backends: Vec<parity::ParityBackend>,
+    json: bool,
+    baseline: Option<PathBuf>,
+}
+
 enum ParityRequest {
     Compare(ParityCompareRequest),
     Export(ParityExportRequest),
+    Outcomes(ParityOutcomesRequest),
 }
 
 fn parse_parity(values: Vec<String>) -> ParityRequest {
@@ -3908,8 +3939,10 @@ fn parse_parity(values: Vec<String>) -> ParityRequest {
     match values.next().as_deref() {
         Some("compare") => ParityRequest::Compare(parse_parity_compare(values)),
         Some("export") => ParityRequest::Export(parse_parity_export(values)),
+        Some("outcomes") => ParityRequest::Outcomes(parse_parity_outcomes(values)),
         Some(other) => fail(format!(
-            "unknown parity command {other:?}; expected `parity compare` or `parity export`"
+            "unknown parity command {other:?}; expected `parity compare`, `parity export` or \
+             `parity outcomes`"
         )),
         None => fail("parity requires a command; try `test-harness parity --help`"),
     }
@@ -3936,6 +3969,184 @@ fn parse_parity_export(mut values: impl Iterator<Item = String>) -> ParityExport
         })),
         expected_scope: expected_scope.map(PathBuf::from),
     }
+}
+
+fn parse_parity_outcomes(mut values: impl Iterator<Item = String>) -> ParityOutcomesRequest {
+    let mut e2e_root = None;
+    let mut baseline = None;
+    let mut backends = Vec::new();
+    let mut json = false;
+    while let Some(flag) = values.next() {
+        match flag.as_str() {
+            "--e2e-root" => set_once(&mut e2e_root, &mut values, "--e2e-root"),
+            "--baseline" => set_once(&mut baseline, &mut values, "--baseline"),
+            "--backend" => {
+                let value = required_value(&mut values, "--backend");
+                let backend =
+                    parity::ParityBackend::parse(&value).unwrap_or_else(|error| fail(error));
+                if backends.contains(&backend) {
+                    fail(format!("--backend {value} is repeated"));
+                }
+                backends.push(backend);
+            }
+            "--json" => json = true,
+            other => fail(format!(
+                "unknown option {other} for parity outcomes; try `test-harness parity --help`"
+            )),
+        }
+    }
+    if backends.is_empty() {
+        backends = parity::ParityBackend::ALL.to_vec();
+    }
+    ParityOutcomesRequest {
+        e2e_root: PathBuf::from(e2e_root.unwrap_or_else(|| {
+            fail("parity outcomes requires --e2e-root <DIR>, the run's e2e result root")
+        })),
+        backends,
+        json,
+        baseline: baseline.map(PathBuf::from),
+    }
+}
+
+/// `test-harness parity outcomes`: per candidate backend, the cells whose
+/// outcome differs from ptrace's, and with a baseline the ones that stopped
+/// matching.
+fn parity_outcomes(manifests: &ManifestSet, request: &ParityOutcomesRequest) -> ExitCode {
+    use hermit_manifest_plan::parity_outcomes;
+    let report = parity_outcomes::compare(manifests, &request.e2e_root, &request.backends)
+        .unwrap_or_else(|error| fail(format!("parity outcomes: {error}")));
+    let mut out = std::io::stdout().lock();
+    let mut lines = Vec::new();
+    if request.json {
+        for row in &report.differences {
+            lines.push(serde_json::to_string(row).expect("a difference serializes"));
+        }
+    } else {
+        lines.push(format!(
+            "parity outcomes against ptrace: {} result rows in {} results.jsonl files under {} \
+             (Hermit {}); {} test/mode cells considered, {} with a ptrace row; {} final row(s) \
+             name a test and mode these manifests do not declare and are not compared",
+            report.rows,
+            report.results_files.len(),
+            request.e2e_root.display(),
+            report
+                .hermit_shas
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            report.cells,
+            report.reference_rows,
+            report.undeclared_rows,
+        ));
+        for backend in &request.backends {
+            let rows = report
+                .differences
+                .iter()
+                .filter(|row| row.backend == backend.as_str())
+                .collect::<Vec<_>>();
+            let mut by_outcome: BTreeMap<String, usize> = BTreeMap::new();
+            for row in &rows {
+                *by_outcome
+                    .entry(format!("ptrace {} -> {}", row.reference, row.candidate))
+                    .or_default() += 1;
+            }
+            lines.push(format!(
+                "{backend}: {} of {} cells differ from ptrace ({})",
+                rows.len(),
+                report.cells,
+                by_outcome
+                    .iter()
+                    .map(|(outcome, count)| format!("{outcome}: {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            for row in rows {
+                let mut reason = row.reason.clone().unwrap_or_default();
+                if reason.len() > 160 {
+                    let mut end = 160;
+                    while !reason.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    reason.truncate(end);
+                    reason.push_str("...");
+                }
+                lines.push(format!(
+                    "  {} {}: ptrace={} {backend}={}{}",
+                    row.test,
+                    row.mode,
+                    row.reference,
+                    row.candidate,
+                    if reason.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({reason})")
+                    }
+                ));
+            }
+        }
+    }
+    let mut code = ExitCode::SUCCESS;
+    if let Some(path) = &request.baseline {
+        let text = fs::read_to_string(path)
+            .unwrap_or_else(|error| fail(format!("cannot read {}: {error}", path.display())));
+        let baseline = parity_outcomes::parse_baseline(&text)
+            .unwrap_or_else(|error| fail(format!("{}: {error}", path.display())));
+        let gate = parity_outcomes::gate(&baseline, &report.differences, &request.backends);
+        let cell = |row: &parity_outcomes::OutcomeDifference| {
+            format!("{}@{}/{}", row.test, row.backend, row.mode)
+        };
+        let mut gate_lines = vec![format!(
+            "baseline {}: {} cell(s) stopped matching ptrace, {} started matching, {} changed outcome",
+            path.display(),
+            gate.regressions.len(),
+            gate.newly_matching.len(),
+            gate.changed.len()
+        )];
+        for row in &gate.regressions {
+            gate_lines.push(format!(
+                "  STOPPED MATCHING {}: ptrace={} candidate={}",
+                cell(row),
+                row.reference,
+                row.candidate
+            ));
+        }
+        for row in &gate.newly_matching {
+            gate_lines.push(format!(
+                "  started matching {} (was ptrace={} candidate={})",
+                cell(row),
+                row.reference,
+                row.candidate
+            ));
+        }
+        for (before, now) in &gate.changed {
+            gate_lines.push(format!(
+                "  changed {}: ptrace={} candidate={} -> ptrace={} candidate={}",
+                cell(now),
+                before.reference,
+                before.candidate,
+                now.reference,
+                now.candidate
+            ));
+        }
+        // JSONL stays the only thing on stdout, so the gate goes to stderr.
+        for line in gate_lines {
+            if request.json {
+                eprintln!("{line}");
+            } else {
+                lines.push(line);
+            }
+        }
+        if !gate.regressions.is_empty() {
+            code = ExitCode::FAILURE;
+        }
+    }
+    for line in lines {
+        if let Err(error) = writeln!(out, "{line}") {
+            fail(format!("cannot write parity outcomes: {error}"));
+        }
+    }
+    code
 }
 
 /// `test-harness parity export`: the ledger source rows of a finished run's
