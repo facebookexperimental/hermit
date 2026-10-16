@@ -24278,7 +24278,7 @@
       "group": "test",
       "job": "liteinst_stacks",
       "desc": "Require literal fixed placement of actual LiteInst signal and callback stacks",
-      "description": "Fourteen required identities: the original four genuine leaf rows, five artifact qualifier controls and two shared stack-observation controls, plus one actual Detcore constructor-placement row and two constructor-oracle refusal controls. Standalone native Strace SITE1 ALT1 must report the real fixed guarded altstack and absent continuation; ALT0 gets no stack credit; inert loading must reserve nothing. Genuine Detcore trap/site0 ALT1 must reach one actual callback at the exact marker IP/TID/RSP, with one completion and fixed guarded 8-MiB capacity. The additional constructor fixture executes the unchanged M2 workload and requires real bootstrap samples disjoint from both later stack extents including guards. Separate source-bound receipts, unchanged M1/M2 comparators, current constructor-bearing leaf qualification and independent clean H/RV source guards are mandatory. No consumer compilation, warm artifact search, caller-byte equality, full-entry/TLS or interior-write-protection claim. Raw observations remain separate from selection.",
+      "description": "Fourteen required identities: the original four genuine leaf rows, five artifact qualifier controls and two shared stack-observation controls, plus one actual Detcore constructor-placement row and two constructor-oracle refusal controls. Standalone native Strace SITE1 ALT1 must report the real fixed guarded altstack and absent continuation; ALT0 gets no stack credit; inert loading must reserve nothing. Genuine Detcore trap/site0 ALT1 must reach one actual callback at the exact marker IP/TID/RSP, with one completion and fixed guarded 8-MiB capacity. The additional constructor fixture executes the unchanged M2 workload and requires real bootstrap samples disjoint from both later stack extents including guards. Separate source-bound receipts, unchanged M1/M2 comparators, current constructor-bearing leaf qualification and independent clean H/RV source guards are mandatory. No consumer compilation, warm artifact search, caller-byte equality, full-entry/TLS or interior-write-protection claim. Raw observations remain separate from selection. The scheduler hint est_duration_s is 125 s, the median of the 12 passing full validations of 2026-10-15/16 (112-146 s); at 60 s, dispatch by longest estimate kept it waiting behind shorter nodes once its dependencies were done: in the full validation of 947ad92b it started at +429 s, 40 s after its last dependency ended at +389 s, while all 16 slots ran other nodes, and it set the end of the graph to within 11 s.",
       "labels": [
         "full",
         "portable"
@@ -24317,7 +24317,7 @@
       "jobs_env": null,
       "hint": {
         "resources": {},
-        "est_duration_s": 60.0,
+        "est_duration_s": 125.0,
         "rss_baseline_bytes": 1073741824,
         "hard_mem_max_bytes": 4294967296,
         "classification": "latency-bound",
