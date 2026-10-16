@@ -47,19 +47,25 @@ const CPU_WRAPPER_NAME: &str = "hermit-per-test-cpu";
 const DETCORE_ALLOCATOR_WRAPPER_NAME: &str = "hermit-detcore-allocator-cpu";
 const DETCORE_CONSTRUCTOR_WRAPPER_NAME: &str = "hermit-detcore-constructor-cpu";
 const STANDALONE_ALLOCATOR_WRAPPER_NAME: &str = "hermit-standalone-allocator-cpu";
-// Authorized current-source recalibration, not success under the old 22 CPU seconds:
-// b27e26fc/67474066, N=3 CPU seconds: 18.762935, 19.040171, 20.171435.
-// The existing scalar formula gives ceil(1.5 * max(samples)) = 31; wall stays 57.
-const DETCORE_ALLOCATOR_CPU_SECONDS: u64 = 31;
-// d554fa09/6109a170 host constructor N=5: maximum completed CPU 21.619340s;
-// ceil(1.5 * max(samples)) = 33. Retained d7efd4cb/da86dfbe diagnostic N=3
-// at CPU44/wall57 completed in 18.984049-19.191488s; old CPU22 timeouts remain censored.
-const DETCORE_CONSTRUCTOR_CPU_SECONDS: u64 = 33;
+const DETCORE_STACK_WRAPPER_NAME: &str = "hermit-detcore-stack-cpu";
+// Whole-attempt canonical observations and the decisions for all 24 fixture
+// identities are retained in ci/liteinst-fixture-cpu-budgets.md. Wall stays 57;
+// prior CPU timeouts remain censored, not successful old-cap completion samples.
+// Detcore allocator completed maximum 20.754169s: ceil(1.5 * max) = 32.
+const DETCORE_ALLOCATOR_CPU_SECONDS: u64 = 32;
+// Detcore constructor completed maximum 26.386976s: ceil(1.5 * max) = 40.
+const DETCORE_CONSTRUCTOR_CPU_SECONDS: u64 = 40;
 // Retained d7efd4cb/da86dfbe standalone diagnostic N=3 at CPU44/wall57:
 // 17.718674, 17.632669, 17.573148s. The completed-sample formula would give 27.
 // Use 33 conservatively after the concurrent CPU22 timeout at 22.799306s;
 // that censored failure has unknown completion cost. Wall and cleanup stay unchanged.
 const STANDALONE_ALLOCATOR_CPU_SECONDS: u64 = 33;
+// Detcore stack: completed prior maximum 21.060359s, then CPU22 timeout at
+// 22.359546s with unknown completion cost. The authorized conservative 34s is
+// ceil(1.5 * that censored lower bound), not measured 50% completion headroom.
+// Same-artifact diagnostic CPU33/wall57 completed in 19.476304, 20.099408,
+// 19.744570s; these passes do not turn the original timeout into a success.
+const DETCORE_STACK_CPU_SECONDS: u64 = 34;
 const RENDERED_PROCFS_WRAPPER_NAME: &str = "hermit-rendered-procfs-cpu";
 // hermit::cli detcore_renders_its_procfs_files_on_every_backend runs a
 // --verify of one guest on every backend this build has, DBT's among them, plus
@@ -93,7 +99,7 @@ impl MeasuredCpuAllowance {
     }
 }
 
-const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 4] = [
+const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 5] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
         binary: "hermit::liteinst_allocator",
@@ -117,6 +123,12 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 4] = [
         binary: "hermit::cli",
         test: "detcore_renders_its_procfs_files_on_every_backend",
         cpu_seconds: RENDERED_PROCFS_CPU_SECONDS,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: DETCORE_STACK_WRAPPER_NAME,
+        binary: "hermit::liteinst_stacks",
+        test: "genuine_detcore_reaches_fixed_guarded_callback_and_altstack",
+        cpu_seconds: DETCORE_STACK_CPU_SECONDS,
     },
 ];
 
@@ -751,7 +763,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), and standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s) base CPU allowances, each scaled once; all other tests keep the 22-second base. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), and rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s) base CPU allowances, each scaled once; all other tests keep the 22-second base. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -1581,16 +1593,24 @@ mod tests {
 
     #[test]
     fn new_measured_cells_require_exact_prepared_selected_identities() {
-        for (binary, test, name) in [
+        for (binary, test, name, budget) in [
             (
                 "hermit::liteinst_stacks",
                 "cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack",
                 DETCORE_CONSTRUCTOR_WRAPPER_NAME,
+                "40000000",
             ),
             (
                 "hermit::liteinst_allocator",
                 "genuine_standalone_leaf_keeps_scope_free_work_private",
                 STANDALONE_ALLOCATOR_WRAPPER_NAME,
+                "33000000",
+            ),
+            (
+                "hermit::liteinst_stacks",
+                "genuine_detcore_reaches_fixed_guarded_callback_and_altstack",
+                DETCORE_STACK_WRAPPER_NAME,
+                "34000000",
             ),
         ] {
             let target = nextest_cpu::AttemptIdentity {
@@ -1616,6 +1636,22 @@ mod tests {
                     2,
                     "genuine_detcore_reaches_fixed_guarded_callback_and_altstack".into(),
                 ),
+                (
+                    2,
+                    "genuine_standalone_registers_fixed_guarded_altstack_without_continuation".into(),
+                ),
+                (
+                    2,
+                    "standalone_altstack_disabled_receives_no_owned_stack_credit".into(),
+                ),
+                (
+                    2,
+                    "inert_preload_does_not_reserve_or_register_runtime_stacks".into(),
+                ),
+                (
+                    2,
+                    "cold_constructor::caller_stack_samples_never_receive_constructor_placement_credit".into(),
+                ),
                 (2, "source_copy::gitless_standalone_compiler_sources".into()),
             ] {
                 let mut identity = target.clone();
@@ -1632,9 +1668,15 @@ mod tests {
                         .unwrap();
                 let selected = prepared_selected_cpu_allowances(true, || Ok(bytes)).unwrap();
                 let expected = if identity == target {
-                    Some((name, "33000000"))
+                    Some((name, budget))
                 } else if identity == detcore_allocator_identity() {
-                    Some((DETCORE_ALLOCATOR_WRAPPER_NAME, "31000000"))
+                    Some((DETCORE_ALLOCATOR_WRAPPER_NAME, "32000000"))
+                } else if identity.package == "hermit"
+                    && identity.binary == "hermit::liteinst_stacks"
+                    && identity.test
+                        == "genuine_detcore_reaches_fixed_guarded_callback_and_altstack"
+                {
+                    Some((DETCORE_STACK_WRAPPER_NAME, "34000000"))
                 } else {
                     None
                 };
@@ -1706,13 +1748,17 @@ mod tests {
             DETCORE_ALLOCATOR_WRAPPER_NAME,
             DETCORE_CONSTRUCTOR_WRAPPER_NAME,
             STANDALONE_ALLOCATOR_WRAPPER_NAME,
+            RENDERED_PROCFS_WRAPPER_NAME,
+            DETCORE_STACK_WRAPPER_NAME,
         ];
         let filters = [
             "package(=hermit) & binary_id(=hermit::liteinst_allocator) & test(=genuine_detcore_leaf_keeps_scope_free_work_private)",
             "package(=hermit) & binary_id(=hermit::liteinst_stacks) & test(=cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack)",
             "package(=hermit) & binary_id(=hermit::liteinst_allocator) & test(=genuine_standalone_leaf_keeps_scope_free_work_private)",
+            "package(=hermit) & binary_id(=hermit::cli) & test(=detcore_renders_its_procfs_files_on_every_backend)",
+            "package(=hermit) & binary_id(=hermit::liteinst_stacks) & test(=genuine_detcore_reaches_fixed_guarded_callback_and_altstack)",
         ];
-        for mask in 0..8 {
+        for mask in 0..(1 << names.len()) {
             let identities = MEASURED_CPU_ALLOWANCES
                 .iter()
                 .enumerate()
@@ -1723,10 +1769,28 @@ mod tests {
             let bytes = serde_json::to_vec(&measured_inventory(&identities)).unwrap();
             let selected = prepared_selected_cpu_allowances(true, || Ok(bytes)).unwrap();
             assert_eq!(selected.len(), identities.len());
-            for (cpu, wall, ordinary, allocator, larger, period) in [
-                (1.0, 1.0, "22000000", "31000000", "33000000", "57s"),
-                (1.25, 1.5, "28000000", "39000000", "42000000", "86s"),
-                (0.01, 0.1, "1000000", "1000000", "1000000", "6s"),
+            for (cpu, wall, ordinary, measured, period) in [
+                (
+                    1.0,
+                    1.0,
+                    "22000000",
+                    ["32000000", "40000000", "33000000", "36000000", "34000000"],
+                    "57s",
+                ),
+                (
+                    1.25,
+                    1.5,
+                    "28000000",
+                    ["40000000", "50000000", "42000000", "45000000", "43000000"],
+                    "86s",
+                ),
+                (
+                    0.01,
+                    0.1,
+                    "1000000",
+                    ["1000000", "1000000", "1000000", "1000000", "1000000"],
+                    "6s",
+                ),
             ] {
                 let rendered = scaled_config_with_allowances(
                     include_str!("../.config/nextest.toml"),
@@ -1765,13 +1829,10 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 let mut expected = vec![(CPU_WRAPPER_NAME, ordinary_filter.as_str())];
-                for index in 0..3 {
+                for index in 0..names.len() {
                     if mask & (1 << index) != 0 {
                         expected.push((names[index], filters[index]));
-                        assert_eq!(
-                            wrapper_argv(&document, names[index])[2],
-                            if index == 0 { allocator } else { larger }
-                        );
+                        assert_eq!(wrapper_argv(&document, names[index])[2], measured[index]);
                     } else {
                         assert!(document["scripts"]["wrapper"].get(names[index]).is_none());
                     }
@@ -1807,11 +1868,11 @@ mod tests {
         );
         let mut reversed = MEASURED_CPU_ALLOWANCES.to_vec();
         reversed.reverse();
-        // The largest selected allowance is named, in either order: since
-        // the rendered-procfs entry, 36 s.
+        // The largest selected allowance is named in either order: the
+        // Detcore constructor's 40 s, above rendered-procfs's unchanged 36 s.
         for (selected, first) in [
-            (MEASURED_CPU_ALLOWANCES.as_slice(), "(36s)"),
-            (reversed.as_slice(), "(36s)"),
+            (MEASURED_CPU_ALLOWANCES.as_slice(), "(40s)"),
+            (reversed.as_slice(), "(40s)"),
         ] {
             let error = scaled_config_with_allowances(
                 &short,
@@ -1840,14 +1901,22 @@ mod tests {
         let stretched = Some((Path::new("/fixture/wrapper"), 1.25));
         assert!(scaled_config_with_allowances(source, 0.8, stretched, &rendered).is_err());
         assert!(scaled_config_with_allowances(source, 1.0, stretched, &rendered).is_ok());
-        for allowance in MEASURED_CPU_ALLOWANCES[1..]
-            .iter()
-            .filter(|allowance| allowance.cpu_seconds == 33)
-        {
+        // Every exact allowance rejects CPU+grace equality in either the
+        // default or an override, and accepts the next whole second. Literal
+        // expectations also preserve the unchanged standalone/procfs cells.
+        for (allowance, seconds, cutoff, first_pass, collision, separated, period) in [
+            (MEASURED_CPU_ALLOWANCES[0], 32, 34, 35, 0.7, 0.8, "46s"),
+            (MEASURED_CPU_ALLOWANCES[1], 40, 42, 43, 0.9, 0.95, "55s"),
+            (MEASURED_CPU_ALLOWANCES[2], 33, 35, 36, 0.75, 0.8, "46s"),
+            (MEASURED_CPU_ALLOWANCES[3], 36, 38, 39, 0.8, 0.85, "49s"),
+            (MEASURED_CPU_ALLOWANCES[4], 34, 36, 37, 0.78, 0.8, "46s"),
+        ] {
+            assert_eq!(allowance.cpu_seconds, seconds);
+            let collision_wall = format!("{cutoff}s");
             for source in [
-                short.clone(),
+                source.replace("57s", &collision_wall),
                 format!(
-                    "{source}[[profile.ci.overrides]]\nfilter = \"test(short)\"\nslow-timeout = {{ period = \"35s\", terminate-after = 1 }}\n"
+                    "{source}[[profile.ci.overrides]]\nfilter = \"test(short)\"\nslow-timeout = {{ period = \"{collision_wall}\", terminate-after = 1 }}\n"
                 ),
             ] {
                 assert!(
@@ -1855,40 +1924,41 @@ mod tests {
                         &source,
                         1.0,
                         Some((Path::new("/fixture/wrapper"), 1.0)),
-                        &[*allowance]
+                        &[allowance]
                     )
                     .unwrap_err()
-                    .contains("33s")
+                    .contains(&format!("({seconds}s)"))
                 );
             }
             assert!(
                 scaled_config_with_allowances(
-                    &short.replace("35s", "36s"),
+                    &source.replace("57s", &format!("{first_pass}s")),
                     1.0,
                     Some((Path::new("/fixture/wrapper"), 1.0)),
-                    &[*allowance]
+                    &[allowance]
                 )
                 .is_ok()
             );
-            // 33 * 1.25 rounds once to 42; 57 * .75 rounds to 43 <= 42 + 2.
+            // Scale CPU and wall independently once; test both sides of each
+            // selected allowance's post-scaling CPU+cleanup separation.
             assert!(
                 scaled_config_with_allowances(
                     source,
-                    0.75,
+                    collision,
                     Some((Path::new("/fixture/wrapper"), 1.25)),
-                    &[*allowance]
+                    &[allowance]
                 )
                 .is_err()
             );
             assert!(
                 scaled_config_with_allowances(
                     source,
-                    0.8,
+                    separated,
                     Some((Path::new("/fixture/wrapper"), 1.25)),
-                    &[*allowance]
+                    &[allowance]
                 )
                 .unwrap()
-                .contains("period = \"46s\"")
+                .contains(&format!("period = \"{period}\""))
             );
             for cpu in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX, 1e12, 2.0] {
                 assert!(
@@ -1896,7 +1966,7 @@ mod tests {
                         source,
                         1.0,
                         Some((Path::new("/fixture/wrapper"), cpu)),
-                        &[*allowance]
+                        &[allowance]
                     )
                     .is_err()
                 );
@@ -1904,7 +1974,13 @@ mod tests {
         }
         assert_eq!(
             DETCORE_CONSTRUCTOR_CPU_SECONDS,
-            timeouts::cpu_bound_from_p90_usec(21_619_340)
+            timeouts::cpu_bound_from_p90_usec(26_386_976)
+        );
+        // This is a conservative policy formula applied to a censored
+        // observation, not a completed-sample headroom claim.
+        assert_eq!(
+            DETCORE_STACK_CPU_SECONDS,
+            timeouts::cpu_bound_from_p90_usec(22_359_546)
         );
     }
 
@@ -2089,8 +2165,8 @@ mod tests {
         let exact = "package(=hermit) & binary_id(=hermit::liteinst_allocator) & test(=genuine_detcore_leaf_keeps_scope_free_work_private)";
         let path = "/tmp/a path/it's-$(literal)-wrapper";
         for (multiplier, ordinary, detcore) in [
-            (1.0, "22000000", "31000000"),
-            (1.25, "28000000", "39000000"),
+            (1.0, "22000000", "32000000"),
+            (1.25, "28000000", "40000000"),
             (0.01, "1000000", "1000000"),
         ] {
             let rendered = scaled_config_with_allocator(
@@ -2165,8 +2241,8 @@ mod tests {
     fn larger_allocator_cpu_and_grace_must_fit_every_scaled_finite_wall_bound() {
         let source =
             "[profile.default]\nslow-timeout = { period = \"57s\", terminate-after = 1 }\n";
-        // The old 22+2 fits 33, but the admitted 31+2 must be strictly below it.
-        let short = source.replace("57s", "33s");
+        // The ordinary 22+2 fits 34, but admitted 32+2 must be strictly below it.
+        let short = source.replace("57s", "34s");
         assert!(scaled_config(&short, 1.0, Some((Path::new("/fixture/wrapper"), 1.0))).is_ok());
         assert!(
             scaled_config_with_allocator(
@@ -2176,10 +2252,10 @@ mod tests {
                 true
             )
             .unwrap_err()
-            .contains("31s")
+            .contains("32s")
         );
         let shorter_override = format!(
-            "{source}[[profile.ci.overrides]]\nfilter = \"test(short)\"\nslow-timeout = {{ period = \"33s\", terminate-after = 1 }}\n"
+            "{source}[[profile.ci.overrides]]\nfilter = \"test(short)\"\nslow-timeout = {{ period = \"34s\", terminate-after = 1 }}\n"
         );
         assert!(
             scaled_config_with_allocator(
@@ -2201,7 +2277,7 @@ mod tests {
                 .is_err()
             );
         }
-        // CPU rounding: 31*1.25 -> 39; wall rounds 57*.7 -> 40, below 39+2.
+        // CPU scaling: 32*1.25 -> 40; wall rounds 57*.7 -> 40, below 40+2.
         assert!(
             scaled_config_with_allocator(
                 source,
@@ -2256,6 +2332,8 @@ mod tests {
                 DETCORE_ALLOCATOR_WRAPPER_NAME,
                 DETCORE_CONSTRUCTOR_WRAPPER_NAME,
                 STANDALONE_ALLOCATOR_WRAPPER_NAME,
+                RENDERED_PROCFS_WRAPPER_NAME,
+                DETCORE_STACK_WRAPPER_NAME,
             ] {
                 let source = format!(
                     "[profile.default]\nslow-timeout = {{ period = \"57s\" }}\n[scripts.wrapper.{name}]\ntarget-runner = \"within-wrapper\"\ncommand = {{ command-line = [\"/other\"], relative-to = \"none\" }}\n"
@@ -2302,7 +2380,7 @@ mod tests {
         );
         assert_eq!(
             DETCORE_ALLOCATOR_CPU_SECONDS,
-            timeouts::cpu_bound_from_p90_usec(20_171_435)
+            timeouts::cpu_bound_from_p90_usec(20_754_169)
         );
     }
 }

@@ -1,0 +1,99 @@
+# LiteInst fixture CPU budgets, measured October 16, 2026
+
+The full validation at `876ec26de98849ba789ba8612ebdfbb0d6134268` stopped
+`genuine_detcore_reaches_fixed_guarded_callback_and_altstack` at 22.359546 CPU
+seconds against a 22-second cap (27.983 seconds wall). This is a censored
+failure: its completion cost under that load is unknown.
+
+The table audits every test in `hermit::liteinst_stacks` (15) and
+`hermit::liteinst_allocator` (9), using the cgroup CPU receipts from five full
+validations. Each ran all 24 identities once, without retries or skips:
+119 completed successfully and one hit its CPU cap. These are measurements at
+different source/artifact cohorts, not repeated qualification of one head.
+
+The five heads, newest first, are:
+
+- `876ec26de98849ba789ba8612ebdfbb0d6134268`
+- `cfc14f5310916644eafd2e21c94a890c019fc765`
+- `41d13d7043f9e6608780673252ba654aefe03a36`
+- `38b6ffd9c70a2d050b8b889a9b8d0be3f1cab066`
+- `03f3d85dcc436d44bd51bcf957a4154675d23c61`
+
+CPU includes the test's descendant processes. Values below use actual cgroup
+usage, including cleanup; separate wait4 values are not substituted. A passing
+fixture does not imply that its whole validation passed.
+
+## Per-test evidence and caps
+
+CPU ranges contain successful completions only. `A` means allocator and `S`
+means stacks; the test names are exact. All values are seconds. The wall limit
+remains 57 and termination grace remains 2 for every test. The ordinary CPU
+limit remains 22. There is no new binary-wide exemption.
+
+| Binary | Test | Completed CPU range across five attempts | Completed max wall | Old CPU cap | CPU cap |
+| --- | --- | ---: | ---: | ---: | ---: |
+| A | `artifact::tests::credits_exact_local_relative_got_route_and_direct_tailcall` | 2.250767–2.707840 | 2.856 | 22 | 22 |
+| A | `artifact::tests::inline_endpoints_require_owned_allocator_allocation_methods` | 0.001765–0.004829 | 0.065 | 22 | 22 |
+| A | `artifact::tests::missing_build_finished_is_a_failed_current_artifact_selection` | 1.179818–1.459527 | 1.640 | 22 | 22 |
+| A | `artifact::tests::observed_integrated_detcore_e8_tls_whole_recipes` | 0.007128–0.010894 | 0.044 | 22 | 22 |
+| A | `artifact::tests::refuses_new_or_unrecognized_guest_symbol_versions` | 0.001974–0.004821 | 0.038 | 22 | 22 |
+| A | `artifact::tests::unresolved_or_preemptible_indirect_calls_do_not_earn_a_path` | 0.034053–0.037996 | 0.046 | 22 | 22 |
+| A | `genuine_detcore_leaf_keeps_scope_free_work_private` | 19.446122–20.754169 | 26.942 | 31 | 32 |
+| A | `genuine_standalone_leaf_keeps_scope_free_work_private` | 14.124147–14.513757 | 21.057 | 33 | 33 |
+| A | `source_copy::gitless_standalone_compiler_sources` | 2.843885–3.071309 | 3.599 | 22 | 22 |
+| S | `artifact::tests::credits_exact_local_relative_got_route_and_direct_tailcall` | 2.399077–2.803949 | 2.935 | 22 | 22 |
+| S | `artifact::tests::inline_endpoints_require_owned_allocator_allocation_methods` | 0.001839–0.003097 | 0.039 | 22 | 22 |
+| S | `artifact::tests::missing_build_finished_is_a_failed_current_artifact_selection` | 1.287499–1.853200 | 2.044 | 22 | 22 |
+| S | `artifact::tests::observed_integrated_detcore_e8_tls_whole_recipes` | 0.006894–0.013295 | 0.046 | 22 | 22 |
+| S | `artifact::tests::refuses_new_or_unrecognized_guest_symbol_versions` | 0.001662–0.003331 | 0.082 | 22 | 22 |
+| S | `artifact::tests::unresolved_or_preemptible_indirect_calls_do_not_earn_a_path` | 0.035496–0.049163 | 0.056 | 22 | 22 |
+| S | `cold_constructor::caller_stack_samples_never_receive_constructor_placement_credit` | 0.001788–0.002962 | 0.015 | 22 | 22 |
+| S | `cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack` | 21.742018–26.386976 | 34.903 | 33 | 40 |
+| S | `cold_constructor::later_guard_cannot_alias_the_retained_bootstrap_extent` | 0.001459–0.005124 | 0.041 | 22 | 22 |
+| S | `genuine_detcore_reaches_fixed_guarded_callback_and_altstack` | 17.998559–21.060359 | 26.772 | 22 | 34 |
+| S | `genuine_standalone_registers_fixed_guarded_altstack_without_continuation` | 13.932757–14.452312 | 19.574 | 22 | 22 |
+| S | `inert_preload_does_not_reserve_or_register_runtime_stacks` | 13.899600–14.308223 | 20.372 | 22 | 22 |
+| S | `stack_observation::tests::rejects_foreign_and_unreached_callback_records` | 0.001542–0.001754 | 0.066 | 22 | 22 |
+| S | `stack_observation::tests::rejects_unprobed_and_readable_guards` | 0.001514–0.001745 | 0.012 | 22 | 22 |
+| S | `standalone_altstack_disabled_receives_no_owned_stack_credit` | 13.673469–14.474550 | 20.045 | 22 | 22 |
+
+The Detcore allocator cap is `ceil(1.5 * 20.754169) = 32`; the constructor cap
+is `ceil(1.5 * 26.386976) = 40`. The other ordinary tests' completed maxima
+still fit their existing 22-second cap with this margin.
+
+The callback test's completed canonical maximum, 21.060359, would yield 32.
+Its interrupted 22.359546 observation is larger. The chosen 34 is the
+conservative `ceil(1.5 * 22.359546)` allowance, not a claim of 50% headroom over
+an observed completion under that load. Three serial replays of its unchanged,
+retained 876ec26d source and prepared binaries completed with a diagnostic
+33-second CPU cap and the original 57-second wall:
+
+| Replay | CPU | Wall |
+| --- | ---: | ---: |
+| 1 | 19.476304 | 25.001 |
+| 2 | 20.099408 | 26.750 |
+| 3 | 19.744570 | 24.829 |
+
+Each replay selected one test, ran one attempt, and preserved its source and
+artifact hashes. They are uncensored diagnostics, not successes under the old
+22-second cap or runtime qualification of a newer source/pin. An initial replay
+launcher assertion failed before any test ran; that failed preparation is
+retained separately from these three executed samples.
+
+The standalone allocator keeps its previously accepted 33-second allowance.
+Its older d7efd4cb run hit CPU22 at 22.799306, while three retained diagnostics
+completed at 17.718674, 17.632669 and 17.573148. The lower recent maximum does
+not erase that pressure evidence or justify reducing the existing cap.
+
+The allowance resolver still requires the exact package, binary and test name
+in a prepared inventory. Unit checks cover neighboring identities, independent
+scaling and CPU/wall inversion. Semantic assertions, required test counts,
+retries, source/artifact qualification and the unrelated procfs test's
+36-second allowance are unchanged. No full validation or manifest parity
+claim follows from these timing measurements.
+
+Evidence summary SHA256: `23ec442b9f3dfa3e85fe0a3d83c24ff203e536ca0c7db948aecaea2952d3a41b`.
+Canonical 120-attempt table SHA256: `59805a2dd0db2fdca7e22e2a1357d07e6a315d8bc40b907cac55337144ce1489`.
+The original receipts, copied runtime closure and failed attempts remain in the
+lane's handback evidence; the hashes identify those records without embedding
+machine-local paths or raw logs here.
