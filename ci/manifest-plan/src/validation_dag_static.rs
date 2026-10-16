@@ -2389,7 +2389,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // syscalls::files::test::an_open_through_a_descriptor_link_records_the_targets_path and
     // process_files_tests::every_thread_knows_the_table_its_process_holds
     // (https://github.com/rrnewton/hermit/issues/4213): 1855, listed.
-    ("test.detcore_unit", 1855),
+    // Main dbbbdc86 lists 1857 (nextest list on the node selection; two tests
+    // landed without this pin moving): 1857.
+    ("test.detcore_unit", 1857),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4113,7 +4115,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 699c6948: 1849.
     // And the two 4362 step-0b clear-TID admission tests: 1851.
     // And the four 4213 descriptor-link tests: 1855.
-    ("test.detcore_unit_on_host", 1855),
+    // Main dbbbdc86 lists 1857 (nextest list on the node selection; two tests
+    // landed without this pin moving): 1857.
+    ("test.detcore_unit_on_host", 1857),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
