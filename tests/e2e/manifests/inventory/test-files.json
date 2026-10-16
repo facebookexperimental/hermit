@@ -181,6 +181,12 @@
       "why": "tests/c/clock_passthrough.c is owned by hermit-cli/tests/clock_passthrough.rs: Guest that reads every clock syscall Detcore virtualizes through raw syscalls, including a NULL-timespec clock_gettime that must fail with EFAULT, and passes each value as an lseek offset so a replay that observed a different value diverges at that syscall's argument check. The Rust integration test records it and replays it twice, comparing stdout and the clock DETLOG exactly, and also runs it under --no-virtualize-time. Driven only by its own integration test, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/clock_rlimit_parity.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/clock_rlimit_parity.c is owned by hermit-cli/tests/cli.rs: dbt_rlimit_and_clock_answers_match_ptrace runs its limits mode under ptrace and DBT and requires byte-identical stdout (getrlimit and prlimit64 for every resource, the unknown-resource and raised-hard-limit errors, a lowered soft limit read back, clock_getres and the invalid-clock error), and dbt_refuses_a_vfork_childs_clock_read_by_name runs its vfork-clock mode, which ptrace's Detcore answers and DBT refuses by name, because the DBT client keeps no clock or limit table of its own (A8 step 2). It stays a fixture because a generic manifest cannot compare two backends' outputs or assert a named refusal."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/clone.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

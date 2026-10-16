@@ -196,6 +196,8 @@ static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "dbt")]
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
+#[cfg(feature = "dbt")]
+static CLOCK_RLIMIT_PARITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_RT_SIGNAL_PENDING_OBSERVED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -24809,6 +24811,90 @@ fn dbt_cpuid_rows_match_ptrace() {
     );
     assert!(!ptrace.contains("MISMATCH"), "{ptrace}");
     assert_eq!(run("dbt"), ptrace);
+}
+
+/// Under DBT, resource limits and clock resolutions are Detcore's, as under
+/// ptrace, so the two print the same bytes: getrlimit and prlimit64 for every
+/// resource, the errors for an unknown resource and a raised hard limit, a
+/// lowered soft limit read back, and clock_getres and the invalid-clock error
+/// for each clock. The DBT client no longer keeps a limit or clock table of
+/// its own (A8 step 2), so nothing but Detcore can answer these.
+#[test]
+#[cfg(feature = "dbt")]
+fn dbt_rlimit_and_clock_answers_match_ptrace() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&CLOCK_RLIMIT_PARITY_GUEST, "clock_rlimit_parity")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let run = |backend: &str| {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest.as_str(),
+            "limits",
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        stdout(&output)
+    };
+    let ptrace = run("ptrace");
+    assert!(ptrace.contains("rlimit lowered: 0 40 "), "{ptrace}");
+    // The invalid-clock line is compared, not checked against Linux: Detcore
+    // answers clock_gettime(1000) with 0 where Linux returns EINVAL, on both
+    // backends alike.
+    assert!(ptrace.contains("clock_gettime invalid: "), "{ptrace}");
+    assert_eq!(run("dbt"), ptrace);
+}
+
+/// A vfork child's clock read is refused by name under DBT. Ptrace's Detcore
+/// answers it, but a copied DBT child cannot enter Detcore, and the client no
+/// longer answers from a clock of its own (A8 step 2), so strict execution
+/// stops the run rather than let the child read the host's clock. Before, the
+/// client's own counter answered, a second clock beside Detcore's.
+#[test]
+#[cfg(feature = "dbt")]
+fn dbt_refuses_a_vfork_childs_clock_read_by_name() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&CLOCK_RLIMIT_PARITY_GUEST, "clock_rlimit_parity")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let args = |backend| {
+        [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest.as_str(),
+            "vfork-clock",
+        ]
+        .map(str::to_owned)
+    };
+    let ptrace_args = args("ptrace");
+    let ptrace_args: Vec<&str> = ptrace_args.iter().map(String::as_str).collect();
+    let ptrace = hermit(&ptrace_args);
+    assert_success(&ptrace, &ptrace_args);
+    assert_eq!(stdout(&ptrace), "vfork child clock_gettime: ok, exit 0\n");
+
+    let dbt_args = args("dbt");
+    let dbt_args: Vec<&str> = dbt_args.iter().map(String::as_str).collect();
+    let dbt = hermit(&dbt_args);
+    assert!(!dbt.status.success(), "{}", stderr(&dbt));
+    assert!(
+        stderr(&dbt).contains(&format!(
+            "detcore-dbt: unsupported syscall {} in copied child",
+            libc::SYS_clock_gettime
+        )),
+        "{}",
+        stderr(&dbt)
+    );
 }
 
 /// [`cpuinfo_matches_cpuid`] on the DBT backend, whose `/proc/cpuinfo` Detcore

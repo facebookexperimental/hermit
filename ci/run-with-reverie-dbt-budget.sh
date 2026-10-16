@@ -1657,7 +1657,16 @@ fi
 # reverie-inguest), and 875a66c9 moves KVM types into the new reverie-kvm-core
 # crate (the root Cargo.toml only adds that member). No DynamoRIO build input
 # moves, so the budget carries; the reverie-dbt inventory is unchanged.
-expected_pin=875a66c95de435f3bc4b56ea9c6020c55efc36f3
+# A8 STEP 2 CLOCK/RLIMIT SDK-BUDGET CARRY (2026-10-16): advance
+# 875a66c95de435f3bc4b56ea9c6020c55efc36f3 to 6109a170bd8833ab304edeb2e26a12aead413117.
+# The interval is one commit. 6109a170 deletes the DBT client's own clock and
+# resource-limit tables from native/client.c, so the DynamoRIO client
+# rebuilds, and updates scripts/test-example-tools.sh and
+# tests/fixtures/fork_clock_resource.c with it. build.rs, vendor/dynamorio and
+# the root Cargo.toml are unchanged, so the SDK build inputs and their budget
+# carry; the client rebuild is not an SDK rebuild. No reverie-dbt file is added
+# or removed; the inventory stays 956.
+expected_pin=6109a170bd8833ab304edeb2e26a12aead413117
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

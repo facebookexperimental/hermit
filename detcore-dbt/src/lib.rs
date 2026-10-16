@@ -2069,6 +2069,37 @@ fn copied_child_flock_action(operation: Option<i32>) -> i32 {
     }
 }
 
+/// Whether `sysno` reads the clock or a resource limit, which the DBT client no
+/// longer answers from a table of its own (Reverie A8 step 2) and which a copied
+/// child cannot take to Detcore. A relative `clock_nanosleep` on a wall or
+/// monotonic clock only waits and reads nothing; the client's table passed it
+/// to the kernel too, so it is not counted here.
+fn copied_child_reads_clock_or_limit(sysno: Sysno, args: *const u64) -> bool {
+    match sysno {
+        Sysno::clock_gettime
+        | Sysno::clock_getres
+        | Sysno::clock_settime
+        | Sysno::gettimeofday
+        | Sysno::time
+        | Sysno::getrlimit
+        | Sysno::setrlimit
+        | Sysno::prlimit64 => true,
+        Sysno::clock_nanosleep => {
+            if args.is_null() {
+                return true;
+            }
+            // SAFETY: Reverie's DBT client passes its live six-element syscall
+            // argument array for the duration of this callback.
+            let (clock, flags) = unsafe { (args.read() as i32, args.add(1).read() as i32) };
+            let cpu_clock = clock < 0
+                || clock == libc::CLOCK_PROCESS_CPUTIME_ID
+                || clock == libc::CLOCK_THREAD_CPUTIME_ID;
+            flags != 0 || cpu_clock
+        }
+        _ => false,
+    }
+}
+
 /// Applies the deterministic-refusal policy in a copied pre-exec DBT child.
 ///
 /// A copied pre-exec child runs natively on the DynamoRIO client stack with no
@@ -2181,6 +2212,15 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
     // calls succeed), and a wrong answer about process-group identity is
     // worse than no answer.
     if matches!(sysno, Sysno::getpgrp | Sysno::getpgid | Sysno::getsid) && strict {
+        return 1;
+    }
+    // A copied child's clock and resource-limit reads have no deterministic
+    // answer here: the DBT client keeps no table of its own any more, and
+    // Detcore, which answers them in the root and in forked children, cannot
+    // be entered from a copied child. Strict mode refuses them by name rather
+    // than let a vfork child read host time or host limits; non-strict keeps
+    // native behaviour, as the arms above do.
+    if strict && copied_child_reads_clock_or_limit(sysno, args) {
         return 1;
     }
     if detcore::is_deterministically_refused_syscall(sysno)
@@ -4491,6 +4531,12 @@ mod tests {
     // began projecting completed own-ID results. The native client already
     // answers copied-child queries without shared Tool projection. Record that
     // pre-existing escape until its ownership moves.
+    // The clock and resource-limit reads (clock_gettime, clock_getres,
+    // gettimeofday, time, getrlimit, setrlimit, prlimit64) left this register
+    // when the DBT client dropped its own tables (A8 step 2) and
+    // `copied_child_reads_clock_or_limit` began refusing them. `clock_nanosleep`
+    // stays: the census's zero arguments are a relative CLOCK_REALTIME sleep,
+    // which only waits and still reaches the kernel.
     const ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES: &[&str] = &[
         "accept",
         "accept4",
@@ -4500,8 +4546,6 @@ mod tests {
         "bind",
         "chown",
         "clock_adjtime",
-        "clock_getres",
-        "clock_gettime",
         "clock_nanosleep",
         "clone",
         "clone3",
@@ -4548,12 +4592,10 @@ mod tests {
         "getrandom",
         "getresgid",
         "getresuid",
-        "getrlimit",
         "getrusage",
         "getsockname",
         "getsockopt",
         "gettid",
-        "gettimeofday",
         "getuid",
         "inotify_add_watch",
         "inotify_init",
@@ -4592,7 +4634,6 @@ mod tests {
         "pread64",
         "preadv",
         "preadv2",
-        "prlimit64",
         "process_madvise",
         "pselect6",
         "pwrite64",
@@ -4636,7 +4677,6 @@ mod tests {
         "setresgid",
         "setresuid",
         "setreuid",
-        "setrlimit",
         "setsid",
         "setsockopt",
         "setuid",
@@ -4651,7 +4691,6 @@ mod tests {
         "sysinfo",
         "syslog",
         "tgkill",
-        "time",
         "timer_create",
         "timer_delete",
         "timer_getoverrun",
