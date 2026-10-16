@@ -867,7 +867,8 @@ mod tests {
             } else {
                 executed(tag)
             };
-            assert_eq!(population, 566);
+            // The ten DBT SIGKILL scenarios replace one aggregate test (+9).
+            assert_eq!(population, 575);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

@@ -2663,7 +2663,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
     // budget: 60 + 263 + 243 = 566.
-    ("test.hermit_integration_3", 243),
+    // Split the ten DBT SIGKILL scenarios, retaining all five runs per scenario:
+    // 60 + 263 + 252 = 575; nine additional independently bounded test IDs.
+    ("test.hermit_integration_3", 252),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4119,7 +4121,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the DBT thread-directed SIGKILL refusal test (4439 review, R1): 555.
     // And standalone's 12 running standalone targets: 567.
     // Less the ignored no_networking_network_bind_full: 566.
-    ("test.hermit_integration_on_host", 566),
+    // Ten DBT SIGKILL scenarios replace one aggregate test: 575.
+    ("test.hermit_integration_on_host", 575),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

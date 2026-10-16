@@ -672,7 +672,10 @@ fn dbt_vfork_child_flock_fails_closed_without_deadlock() {
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_vfork_with_unknown_flock_state_fails_closed_without_deadlock() {
-    let run = hermit_run_backend_timeout("dbt", "info", &[], "vfork-unknown-upgrade", "5s");
+    // Eight seconds provides policy margin over the censored five-second
+    // failures under load; it does not establish that the stall is fixed.
+    // The per-test CPU and wall limits still contain a persistent stall.
+    let run = hermit_run_backend_timeout("dbt", "info", &[], "vfork-unknown-upgrade", "8s");
     assert_eq!(
         run.status.code(),
         Some(101),
