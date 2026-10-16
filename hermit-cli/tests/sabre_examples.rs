@@ -910,15 +910,26 @@ fn sabre_verify_refuses_when_forwarded_records_go_missing() {
     const GUEST: &str = r#"
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
+
+// Hermit does not name the forwarding socket in the guest's environment, so
+// the guest finds it as its one inherited SOCK_SEQPACKET descriptor.
+static int tool_output_fd(void) {
+  for (int fd = 3; fd < 1024; fd++) {
+    int type;
+    socklen_t length = sizeof type;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &length) == 0 && type == SOCK_SEQPACKET)
+      return fd;
+  }
+  _exit(9);
+}
 
 static void drop_tool_output(int argc, char **argv, char **envp) {
   (void)argc;
   (void)argv;
-  for (char **entry = envp; *entry; entry++)
-    if (strncmp(*entry, "REVERIE_SABRE_TOOL_OUTPUT_FD=", 29) == 0)
-      close(atoi(*entry + 29));
+  (void)envp;
+  close(tool_output_fd());
 }
 __attribute__((section(".preinit_array"), used)) static void (*preinit)(int, char **, char **) =
     drop_tool_output;
@@ -975,14 +986,26 @@ fn sabre_verify_writes_no_tool_record_into_a_guest_stderr_file() {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
+
+// Hermit does not name the forwarding socket in the guest's environment, so
+// the guest finds it as its one inherited SOCK_SEQPACKET descriptor.
+static int tool_output_fd(void) {
+  for (int fd = 3; fd < 1024; fd++) {
+    int type;
+    socklen_t length = sizeof type;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &length) == 0 && type == SOCK_SEQPACKET)
+      return fd;
+  }
+  _exit(9);
+}
 
 static void take_stderr(int argc, char **argv, char **envp) {
   (void)argc;
   (void)argv;
-  for (char **entry = envp; *entry; entry++)
-    if (strncmp(*entry, "REVERIE_SABRE_TOOL_OUTPUT_FD=", 29) == 0)
-      close(atoi(*entry + 29));
+  (void)envp;
+  close(tool_output_fd());
   int file = open("guest-stderr.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (file < 0 || dup2(file, 2) != 2) _exit(3);
   close(file);
@@ -1046,20 +1069,29 @@ fn sabre_verify_sends_no_tool_record_to_a_guest_socket_at_the_passed_number() {
 
 static int peer = -1;
 
+// Hermit does not name the forwarding socket in the guest's environment, so
+// the guest finds it as its one inherited SOCK_SEQPACKET descriptor.
+static int tool_output_fd(void) {
+  for (int fd = 3; fd < 1024; fd++) {
+    int type;
+    socklen_t length = sizeof type;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &length) == 0 && type == SOCK_SEQPACKET)
+      return fd;
+  }
+  _exit(9);
+}
+
 static void replace_tool_output(int argc, char **argv, char **envp) {
   (void)argc;
   (void)argv;
-  for (char **entry = envp; *entry; entry++) {
-    if (strncmp(*entry, "REVERIE_SABRE_TOOL_OUTPUT_FD=", 29) == 0) {
-      int passed = atoi(*entry + 29);
-      int pair[2];
-      close(passed);
-      if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) _exit(3);
-      if (pair[0] != passed && dup2(pair[0], passed) != passed) _exit(4);
-      if (pair[0] != passed) close(pair[0]);
-      peer = pair[1];
-    }
-  }
+  (void)envp;
+  int passed = tool_output_fd();
+  int pair[2];
+  close(passed);
+  if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) _exit(3);
+  if (pair[0] != passed && dup2(pair[0], passed) != passed) _exit(4);
+  if (pair[0] != passed) close(pair[0]);
+  peer = pair[1];
 }
 __attribute__((section(".preinit_array"), used)) static void (*preinit)(int, char **, char **) =
     replace_tool_output;
