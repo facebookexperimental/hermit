@@ -300,9 +300,11 @@ async fn run_kvm(program: &Path, args: &[OsString]) -> anyhow::Result<Report> {
     for arg in args {
         argv.push(arg.to_str().context("non-UTF-8 argument")?.to_owned());
     }
-    let envp = std::env::vars()
+    // In name order, as for the other backends (see `run_native`).
+    let mut envp = std::env::vars()
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>();
+    envp.sort();
     let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
     let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
     // The guest gets this process's standard input as its descriptor 0, as
@@ -332,6 +334,7 @@ fn run_native(program: &Path, args: &[OsString]) -> anyhow::Result<Report> {
     use std::collections::BTreeSet;
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::OsStringExt;
 
     use nix::sys::ptrace;
     use nix::sys::signal::Signal;
@@ -346,12 +349,32 @@ fn run_native(program: &Path, args: &[OsString]) -> anyhow::Result<Report> {
         .map(|arg| CString::new(arg.as_bytes()))
         .collect::<Result<Vec<_>, _>>()?;
     let path = CString::new(program.as_os_str().as_bytes())?;
+    // The environment in name order, as reverie-process's `Command` passes
+    // it to a ptrace or KVM guest, so that the order, which a program can
+    // see, is not a difference between the launchers.
+    let mut environment = std::env::vars_os().collect::<Vec<_>>();
+    environment.sort();
+    let envp = environment
+        .into_iter()
+        .map(|(key, value)| {
+            let mut entry = key.into_vec();
+            entry.push(b'=');
+            entry.extend(value.into_vec());
+            CString::new(entry)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     // SAFETY: the child only calls async-signal-safe functions before exec.
     let child = match unsafe { nix::unistd::fork() }? {
         ForkResult::Child => {
+            // The Rust runtime ignores SIGPIPE; a program starts with the
+            // default, as reverie-ptrace's and the shell's children do.
+            // SAFETY: resetting a disposition in the forked child.
+            let _ = unsafe {
+                nix::sys::signal::signal(Signal::SIGPIPE, nix::sys::signal::SigHandler::SigDfl)
+            };
             let _ = ptrace::traceme();
             let _ = nix::sys::signal::raise(Signal::SIGSTOP);
-            let _ = nix::unistd::execv(&path, &argv);
+            let _ = nix::unistd::execve(&path, &argv, &envp);
             // SAFETY: exiting the forked child without unwinding.
             unsafe { libc::_exit(127) };
         }

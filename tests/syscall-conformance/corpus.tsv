@@ -10,3 +10,16 @@ sh-builtin	/bin/sh	-c	echo a; exit 3
 sh-fork	/bin/sh	-c	/bin/true; /bin/echo b
 head-zero	/usr/bin/head	-c	100	/dev/zero
 false	/bin/false
+sort-passwd	/bin/sort	/etc/passwd
+grep-passwd	/bin/grep	root	/etc/passwd
+sha256-true	/bin/sha256sum	/bin/true
+dd-zero	/bin/dd	if=/dev/zero	of=/dev/null	bs=4096	count=16	status=none
+seq	/bin/seq	1	2000
+sleep	/bin/sleep	0.01
+find-etc	/bin/find	/etc	-maxdepth	1	-name	host*
+tar-hostname	/bin/tar	-cf	/dev/null	/etc/hostname
+gzip-hostname	/bin/gzip	-c	/etc/hostname
+awk	/bin/awk	BEGIN{print 1}
+perl	/bin/perl	-e	print 1
+python3	/bin/python3	-c	pass
+sh-pipe	/bin/sh	-c	/bin/seq 1 100 | /bin/wc -l
