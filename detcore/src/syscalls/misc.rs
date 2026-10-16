@@ -781,7 +781,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// setsid system call, answered as Linux answers it from Detcore's model
     /// of the guest's sessions and process groups (`ThreadTree`), the same on
     /// every backend (slice B3a-4c of
-    /// https://github.com/rrnewton/hermit/issues/4266). The call then goes to
+    /// <https://github.com/rrnewton/hermit/issues/4266>). The call then goes to
     /// the backend too, so that a kernel that keeps process groups (ptrace's)
     /// stays in step; a backend that keeps none answers ENOSYS (KVM's
     /// executor), and the model is the guest's answer. Any other disagreement
