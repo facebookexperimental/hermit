@@ -33989,7 +33989,15 @@ fn an_unusable_verify_tmpdir_is_a_clean_error_naming_the_variable() {
 /// One `fifo_peer wake-*` run under `hermit run --strict`, with
 /// `--pipe-wake-latency` set to `latency` when given, and `extra` before the
 /// `--`.
+/// Held across each pipe-wake run. Under `cargo test` the tests are threads
+/// of one process, and two of them running the same mode in its one directory
+/// deleted each other's FIFO and `wake-shared` file mid-run. The directory
+/// stays per mode, not per test: the PMU rows' expected iteration depends on
+/// the guest's arguments, the directory among them.
+static PIPE_WAKE_RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn pipe_wake_run(mode: &str, latency: Option<&str>, extra: &[&str], guest_args: &[&str]) -> Output {
+    let _run = PIPE_WAKE_RUN.lock().unwrap_or_else(|e| e.into_inner());
     let args = pipe_wake_args(mode, latency, extra, guest_args);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut command = hermit_command(&args);
@@ -34006,6 +34014,7 @@ fn pipe_wake_run_without_pmu(
     extra: &[&str],
     guest_args: &[&str],
 ) -> Output {
+    let _run = PIPE_WAKE_RUN.lock().unwrap_or_else(|e| e.into_inner());
     let args = pipe_wake_args(mode, latency, extra, guest_args);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut command = hermit_command_under_host_filter(&args);
