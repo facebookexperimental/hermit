@@ -35436,9 +35436,10 @@ fn an_unusable_verify_tmpdir_is_a_clean_error_naming_the_variable() {
 
 /// Held across each pipe-wake run. Under `cargo test` the tests are threads
 /// of one process, and two of them running the same mode in its one directory
-/// deleted each other's FIFO and `wake-shared` file mid-run. The directory
-/// stays per mode, not per test: the PMU rows' expected iteration depends on
-/// the guest's arguments, the directory among them.
+/// deleted each other's FIFO and `wake-shared` file mid-run. The guest sees
+/// the directory only at its fixed bind target, [`PIPE_WAKE_GUEST_DIR`]
+/// ([`pipe_wake_args`]), so the host path is free to change; the lock is what
+/// keeps two runs of one mode apart.
 static PIPE_WAKE_RUN: Mutex<()> = Mutex::new(());
 
 /// One `fifo_peer wake-*` run under `hermit run --strict`, with
@@ -35495,7 +35496,13 @@ fn pipe_wake_args(
     let dir = process_build_root("fifo-peer").join("wake").join(mode);
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
-    fs::copy(fifo_peer_guest(), dir.join("fifo_peer")).expect("failed to copy the guest");
+    // A hard link, not a copy: each mode's directory outlives the run, and a
+    // copy left 92 KB behind per mode and test process. The guest is built in
+    // the same build root, so linking is expected to work; copy if it fails.
+    let guest = dir.join("fifo_peer");
+    if fs::hard_link(fifo_peer_guest(), &guest).is_err() {
+        fs::copy(fifo_peer_guest(), &guest).expect("failed to place the guest");
+    }
     let mut args = vec![
         "run".to_owned(),
         "--strict".to_owned(),
