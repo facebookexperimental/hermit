@@ -933,8 +933,9 @@ pub enum DiscardedSignalControl {
         nodefer: bool,
     },
     /// The signals whose list in the calling thread's private queue, and in
-    /// its process's shared queue, holds an entry behind its front
-    /// (`signal_lists`), as `Bits`: a dequeue of one sends the next.
+    /// its process's shared queue, holds an entry behind its front or a stale
+    /// timer entry (`signal_lists`), as `Bits`: a dequeue of one sends the
+    /// next, or drops a record Linux would have skipped.
     Queued,
     /// `timer_gettime` or `timer_getoverrun` of the calling thread's
     /// process's timer `timer` at the caller's time `now`
@@ -1394,6 +1395,9 @@ impl Scheduler {
                     thread_holds,
                     process_holds,
                 );
+                if how != (Consumption::KeptResume { blocked: true }) {
+                    self.note_replayed_copy_taken(dtid, signal, thread_holds, process_holds);
+                }
                 self.discarded_at_send.consume(
                     dtid,
                     process,
@@ -1530,7 +1534,12 @@ impl Scheduler {
                 let listed = |queue: QueueId| {
                     (1..32)
                         .filter(|&signal| {
-                            self.discarded_at_send.lists.entries(queue, signal).len() > 1
+                            let entries = self.discarded_at_send.lists.entries(queue, signal);
+                            entries.len() > 1
+                                || entries.iter().any(|entry| {
+                                    matches!(entry, super::signal_lists::Entry::Timer(timer)
+                                        if !self.timer_entry_valid(timer))
+                                })
                         })
                         .fold(0, |bits, signal| bits | kernel_signal_bit(signal))
                 };

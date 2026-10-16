@@ -1676,6 +1676,16 @@ pub struct Scheduler {
     /// observable (`signal_observable`); sticky.
     signal_unobservable: BTreeSet<(DetPid, i32)>,
 
+    /// Under record and replay: the queues and signals a POSIX timer copy was
+    /// sent to (`replayed_timer_copies`), and those of them a signalfd may
+    /// have read since (`replay_unproven_copies`). A replayed signalfd read
+    /// dequeues nothing, so an exec with such a signal pending would replay
+    /// another flush than the recording's, and is refused
+    /// (`replay_exec_refusal`). An `rt_sigtimedwait` take is the scheduler's
+    /// own in replay too, so it dequeues as recorded.
+    replayed_timer_copies: BTreeSet<(discarded_at_send::QueueId, i32)>,
+    replay_unproven_copies: BTreeSet<(discarded_at_send::QueueId, i32)>,
+
     /// Each process's caught signals, with the handler's `sa_mask` and whether
     /// it has `SA_NODEFER` (`DiscardedSignalControl::Handler`): a forked child
     /// copies them, and exec resets them, as Linux does with the actions.
@@ -1789,6 +1799,11 @@ pub struct Scheduler {
     /// if it landed, instead of signalling a host task.
     #[cfg(test)]
     pub(crate) test_sent_signals: Option<Vec<TestSend>>,
+
+    /// The targets a captured send (`test_sent_signals`) would have woken
+    /// (`send_wakes`).
+    #[cfg(test)]
+    pub(crate) test_send_wakes: Vec<DetTid>,
 
     /// The set each thread polling `rt_sigtimedwait` waits for: a signal in
     /// it is taken at the thread's next poll whatever its mask, so the
@@ -3914,6 +3929,8 @@ impl Scheduler {
             signal_unobservable: Default::default(),
             pending_timer_dequeues: Default::default(),
             handler_masks: Default::default(),
+            replayed_timer_copies: Default::default(),
+            replay_unproven_copies: Default::default(),
             delivery_mask_override: None,
             signal_control_caller: None,
             saved_guest_sigmasks: Default::default(),
@@ -3932,6 +3949,8 @@ impl Scheduler {
             test_guest_sends_land: false,
             #[cfg(test)]
             test_sent_signals: None,
+            #[cfg(test)]
+            test_send_wakes: Vec::new(),
             sigtimedwait_sets: Default::default(),
             undelivered_scheduler_signals: Default::default(),
             thread_timer_copies: Default::default(),
@@ -6139,6 +6158,7 @@ impl Scheduler {
             }
             None => self.sigtimedwait_sets.remove(&dettid).unwrap_or(0),
         };
+
         self.thread_timer_copies.retain(|(thread, signo), _| {
             *thread != dettid || covered & kernel_signal_bit(*signo) == 0
         });
@@ -7970,6 +7990,10 @@ impl Scheduler {
         ) {
             return;
         }
+        self.note_replayed_timer_copy(
+            discarded_at_send::QueueId::Process(process),
+            sig as libc::c_int,
+        );
         // Rule 4: a scheduler send of SIGALRM into the shared queue gives a
         // copy-less Inactive ITIMER_REAL its copy, whose dequeue restarts it
         // as on Linux (https://github.com/rrnewton/hermit/issues/4139).
@@ -8056,6 +8080,9 @@ impl Scheduler {
         self.pending_real_time_expirations.remove(&process);
         self.thread_timer_copies
             .retain(|(thread, _), _| *thread != survivor);
+        if let Some(refusal) = self.replay_exec_refusal(survivor, process) {
+            return Err(refusal);
+        }
         self.discarded_at_send.forget_parks_of(process);
         let (private, shared) = (
             discarded_at_send::QueueId::Thread(survivor),
@@ -8069,6 +8096,9 @@ impl Scheduler {
             }
         }
         let outcome = self.discarded_at_send.lists.exec(&[private, shared]);
+        // The survivor is running its exec: a re-send to it wakes nothing
+        // (`send_wakes`).
+        self.signal_control_caller = Some(survivor);
         for (queue, signo, _) in &outcome.resend {
             let Ok(sig) = Signal::try_from(*signo) else {
                 continue;
@@ -8088,6 +8118,7 @@ impl Scheduler {
                 discarded_at_send::SendFate::Kept,
             );
         }
+        self.signal_control_caller = None;
         let mut flush = ExecTimerFlush::default();
         for (queue, signo) in outcome.take_back {
             match queue {
@@ -8170,6 +8201,7 @@ impl Scheduler {
         } else {
             self.thread_timer_copies.remove(&(thread, signo));
         }
+        self.note_replayed_timer_copy(discarded_at_send::QueueId::Thread(thread), signo);
         let producer = self.posix_timer_producer(id);
         // Its `SI_TIMER` record, with the overrun counted at the pop
         // (`fire_posix_timer_fallback`), which exec flushes.
@@ -9066,6 +9098,9 @@ impl Scheduler {
                 self.discard_note_fate(token, fate, record);
             }
             self.guest_send_landed = Some(true);
+            if self.send_wakes(dettid) {
+                self.test_send_wakes.push(dettid);
+            }
             return;
         }
         // Whether a SIGCHLD is already pending in the shared queue, read before
@@ -9200,13 +9235,19 @@ impl Scheduler {
             );
         }
         self.guest_send_landed = Some(true);
-        // The thread whose own message caused this send (a promotion at its
-        // delivery stop or take, an exec re-send) is running, not parked: it
-        // meets the signal when it resumes.
-        if self.signal_control_caller == Some(dettid) {
+        if !self.send_wakes(dettid) {
             return;
         }
         self.wake_signaled_guest_as(dettid, signal, discarded);
+    }
+
+    /// Whether a scheduler send to `dettid` wakes it. The thread whose own
+    /// message caused the send (a promotion at its delivery stop or take, an
+    /// exec re-send, `signal_control_caller`) is running, not parked: it
+    /// meets the signal when it resumes, and a wake would assert that it is
+    /// parked.
+    fn send_wakes(&self, dettid: DetTid) -> bool {
+        self.signal_control_caller != Some(dettid)
     }
 
     /// Record a process-directed `signal` the scheduler just sent `dettid`

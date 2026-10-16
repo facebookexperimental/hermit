@@ -117,8 +117,22 @@ pub(crate) struct PendingDequeue {
     /// the overrun its delivery reports.
     reconcile: Option<(i32, LogicalTime, i32)>,
     /// A valid timer entry whose siginfo the delivery's turn has yet to ask
-    /// for (`DeliveryAnswer::TimerEntry`).
-    awaiting_info: Option<TimerEntry>,
+    /// for (`DeliveryAnswer::TimerEntry`), with its timer's state as the stop
+    /// found it.
+    awaiting_info: Option<CapturedEntry>,
+}
+
+/// A timer entry as a delivery stop dequeued it: its `si_value` and, for a
+/// periodic timer waiting for this dequeue, its last expiry and interval.
+/// Linux fills the siginfo at the dequeue, so a `timer_settime` or
+/// `timer_delete` another thread commits before the delivery's turn does not
+/// change it (the Claude review of https://github.com/rrnewton/hermit/pull/4491,
+/// P3-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapturedEntry {
+    entry: TimerEntry,
+    value: u64,
+    grid: Option<(LogicalTime, LogicalTime)>,
 }
 
 /// End the run with a named refusal (`exit_on_scheduler_refusal`); a unit
@@ -128,6 +142,13 @@ fn refuse(refusal: std::fmt::Arguments<'_>) -> ! {
     panic!("{refusal}");
     #[cfg(not(test))]
     super::exit_on_scheduler_refusal(&refusal)
+}
+
+/// The overrun a captured entry's delivery at `at` reports.
+fn captured_overrun(captured: &CapturedEntry, at: LogicalTime) -> i32 {
+    captured
+        .grid
+        .map_or(0, |(last, interval)| overrun_at(last, interval, at))
 }
 
 /// The overrun Linux reports for a periodic timer last expired at `last`
@@ -202,7 +223,7 @@ impl Scheduler {
 
     /// Whether `entry` is current: its timer was not set or deleted since it
     /// was sent (Linux's `it_signal_seq == it_sigqueue_seq`).
-    fn timer_entry_valid(&self, entry: &TimerEntry) -> bool {
+    pub(super) fn timer_entry_valid(&self, entry: &TimerEntry) -> bool {
         self.posix_timer_live(entry.process, entry.timer)
             && entry.gen_at_send == self.posix_timer_arm_generation(entry.process, entry.timer)
     }
@@ -277,6 +298,24 @@ impl Scheduler {
             }
             self.discarded_at_send.lists.take_all(queue, signal);
         }
+        // A periodic timer that waited for the dequeue of the entry the lists
+        // held goes onto the fallback's recurrence now: no dequeue the
+        // scheduler sees will re-arm it (the Claude review of
+        // https://github.com/rrnewton/hermit/pull/4491, P1-1).
+        if let Ok(sig) = Signal::try_from(signal) {
+            let now = self.committed_time;
+            for id in self
+                .blocked
+                .timed_waiters
+                .inactive_posix_timers(process, sig)
+            {
+                let next = self.blocked.timed_waiters.signal_timer_rearm_after(id, now);
+                debug!(
+                    "[dpid {}] {:?} waited for its entry's dequeue; on the fallback, re-armed at {:?}.",
+                    process, id, next
+                );
+            }
+        }
         if self
             .discarded_at_send
             .parked_timers(process, signal)
@@ -286,6 +325,117 @@ impl Scheduler {
             refuse(format_args!(
                 "hermit: signal {signal} of process {process} stopped being observable while a POSIX timer's ignored expiry of it is parked: Linux re-queues it when the signal stops being ignored, which the fallback cannot follow, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)"
             ));
+        }
+    }
+
+    /// Under record and replay, a POSIX timer copy was sent into `queue` as
+    /// `signal` (`replayed_timer_copies`); one sent while a signalfd covers
+    /// the signal may be read at once.
+    pub(crate) fn note_replayed_timer_copy(&mut self, queue: QueueId, signal: i32) {
+        if !self.recordreplay_modes || !self.models_signal_targets {
+            return;
+        }
+        self.replayed_timer_copies.insert((queue, signal));
+        let bit = kernel_signal_bit(signal);
+        if self.signalfd_masks.values().any(|mask| mask & bit != 0) {
+            self.replay_unproven_copies.insert((queue, signal));
+        }
+    }
+
+    /// Under record and replay, a signalfd now covers `mask` in `process`
+    /// (`None`: any process, a signalfd's description being shareable): the
+    /// timer copies of those signals may be read.
+    pub(crate) fn note_replay_take_cover(&mut self, process: Option<DetPid>, mask: u64) {
+        if !self.recordreplay_modes {
+            return;
+        }
+        let covered: Vec<(QueueId, i32)> = self
+            .replayed_timer_copies
+            .iter()
+            .copied()
+            .filter(|(queue, signal)| {
+                let owner = match queue {
+                    QueueId::Process(owner) => *owner,
+                    QueueId::Thread(thread) => self.sigchld_process(*thread),
+                };
+                mask & kernel_signal_bit(*signal) != 0 && process.is_none_or(|p| p == owner)
+            })
+            .collect();
+        self.replay_unproven_copies.extend(covered);
+    }
+
+    /// Under record and replay, an exec of `process` whose survivor is
+    /// `survivor`, with a signal pending that a timer copy may have been
+    /// taken for unobserved: a replayed take dequeues nothing, so replay would
+    /// flush another record than the recording did. Refused by name, as
+    /// before https://github.com/rrnewton/hermit/issues/4262 (the Claude
+    /// review of https://github.com/rrnewton/hermit/pull/4491, P1-2). The
+    /// process's records go either way.
+    pub(crate) fn replay_exec_refusal(
+        &mut self,
+        survivor: DetTid,
+        process: DetPid,
+    ) -> Option<String> {
+        if !self.recordreplay_modes {
+            return None;
+        }
+        let (private, shared) = (QueueId::Thread(survivor), QueueId::Process(process));
+        let unproven: Vec<(QueueId, i32)> = self
+            .replay_unproven_copies
+            .iter()
+            .copied()
+            .filter(|(queue, _)| *queue == private || *queue == shared)
+            .collect();
+        self.replayed_timer_copies
+            .retain(|(queue, _)| *queue != private && *queue != shared);
+        self.replay_unproven_copies
+            .retain(|(queue, _)| *queue != private && *queue != shared);
+        if unproven.is_empty() {
+            return None;
+        }
+        let state = match self.read_sleeper_signal_state(survivor) {
+            Ok(state) => state,
+            Err(failure) => {
+                return Some(format!(
+                    "the pending signals of thread {survivor} could not be read ({failure:?})"
+                ));
+            }
+        };
+        unproven.into_iter().find_map(|(queue, signal)| {
+            let pending = match queue {
+                QueueId::Thread(_) => state.thread_pending,
+                QueueId::Process(_) => state.shared_pending,
+            };
+            (pending & kernel_signal_bit(signal) != 0).then(|| {
+                format!(
+                    "signal {signal} is pending in {queue:?}, and under record and replay a POSIX timer's copy of it may have been read by a signalfd, which a replayed read does not dequeue, so the exec would replay another flush"
+                )
+            })
+        })
+    }
+
+    /// Under record and replay, a reported delivery of `signal` to `thread`
+    /// left its queues as read (`thread_holds`, `process_holds`): a timer
+    /// copy no longer there was taken where the schedule sees it.
+    pub(crate) fn note_replayed_copy_taken(
+        &mut self,
+        thread: DetTid,
+        signal: i32,
+        thread_holds: bool,
+        process_holds: bool,
+    ) {
+        if !self.recordreplay_modes {
+            return;
+        }
+        let process = self.sigchld_process(thread);
+        for (queue, holds) in [
+            (QueueId::Thread(thread), thread_holds),
+            (QueueId::Process(process), process_holds),
+        ] {
+            if !holds {
+                self.replayed_timer_copies.remove(&(queue, signal));
+                self.replay_unproven_copies.remove(&(queue, signal));
+            }
         }
     }
 
@@ -657,7 +807,7 @@ impl Scheduler {
             }
         };
         let awaiting_info = match (answer, front) {
-            (DeliveryAnswer::TimerEntry, Entry::Timer(entry)) => Some(entry),
+            (DeliveryAnswer::TimerEntry, Entry::Timer(entry)) => Some(self.capture_entry(entry)),
             _ => None,
         };
         self.pending_timer_dequeues.insert(
@@ -687,14 +837,40 @@ impl Scheduler {
         at: LogicalTime,
     ) -> Option<KernelSiginfo> {
         let pending = self.pending_timer_dequeues.get(&thread)?;
-        let entry = pending.awaiting_info.filter(|_| pending.signal == signal)?;
+        let captured = pending.awaiting_info.filter(|_| pending.signal == signal)?;
         let at = at.max(self.committed_time);
-        let overrun = self.dequeue_overrun(&entry, at);
+        let overrun = captured_overrun(&captured, at);
         let pending = self.pending_timer_dequeues.get_mut(&thread)?;
         pending.awaiting_info = None;
-        pending.reconcile = Some((entry.timer, at, overrun));
-        let info = self.timer_signal_info(signal, &entry, overrun);
-        Some(KernelSiginfo::from_user(&info))
+        pending.reconcile = Some((captured.entry.timer, at, overrun));
+        Some(timer_siginfo(
+            signal,
+            captured.entry.timer,
+            overrun,
+            captured.value,
+        ))
+    }
+
+    /// `entry` as a delivery stop dequeues it (`CapturedEntry`).
+    fn capture_entry(&self, entry: TimerEntry) -> CapturedEntry {
+        let id = SignalTimerId::Posix(entry.process, entry.timer);
+        let grid = match self.blocked.timed_waiters.signal_timer_state(id) {
+            Some((last, interval, AlarmPhase::Inactive { .. }))
+                if entry.periodic_at_send && interval != LogicalTime::ZERO =>
+            {
+                Some((last, interval))
+            }
+            _ => None,
+        };
+        CapturedEntry {
+            entry,
+            value: self
+                .posix_timer_values
+                .get(&(entry.process, entry.timer))
+                .copied()
+                .unwrap_or(0),
+            grid,
+        }
     }
 
     /// A take of `signal` by `thread` at its time `at` (4262 design §4.4,
@@ -920,9 +1096,9 @@ impl Scheduler {
         }
         // A delivery that never asked for its siginfo (it ended the thread
         // group first) still re-arms its timer, at the committed time.
-        if let Some(entry) = pending.awaiting_info.take() {
+        if let Some(captured) = pending.awaiting_info.take() {
             let at = self.committed_time;
-            pending.reconcile = Some((entry.timer, at, self.dequeue_overrun(&entry, at)));
+            pending.reconcile = Some((captured.entry.timer, at, captured_overrun(&captured, at)));
         }
         self.check_taken_queues(thread, pending.queue, signal, thread_holds, process_holds);
         Some(pending)

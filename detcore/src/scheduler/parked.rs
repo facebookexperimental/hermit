@@ -903,6 +903,8 @@ impl Scheduler {
     /// (`real_time_expiration_fate`).
     pub(crate) fn register_signalfd(&mut self, process: DetPid, mask: u64) {
         *self.signalfd_masks.entry(process).or_default() |= mask;
+        // Its description may be shared with any process.
+        self.note_replay_take_cover(None, mask);
         // The call may have changed the mask of a descriptor a background read
         // already holds (`signalfd4` on an existing descriptor, whose
         // description any process may share), so a read out now may read

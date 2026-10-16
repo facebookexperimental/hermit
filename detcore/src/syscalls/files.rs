@@ -5129,12 +5129,14 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Whether a signalfd read of `fd` takes one record per kernel read
     /// (4262 design §4.4): some signal it covers has an entry behind the
-    /// front of its list in the calling thread's or its process's queue, so
-    /// a read must dequeue one record at a time, sending that list's next
-    /// entry before the next record, as Linux's `signalfd_dequeue` loop takes
-    /// them in its order. With at most one entry per list every entry is
-    /// physically queued, so one kernel read takes them in Linux's order, and
-    /// a stale timer entry among them is dropped in place.
+    /// front of its list, or a stale timer entry, in the calling thread's or
+    /// its process's queue. A read must then dequeue one record at a time:
+    /// sending a list's next entry before the next record, as Linux's
+    /// `signalfd_dequeue` loop takes them in its order, and refilling the slot
+    /// of a stale record it drops, as Linux skips such an entry inside the
+    /// dequeue. With only single valid entries, every entry is physically
+    /// queued and none is dropped, so one kernel read returns what Linux
+    /// returns, in count and in order.
     async fn signalfd_reads_per_record<G: Guest<Self>>(&self, guest: &mut G, fd: i32) -> bool {
         use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
         use crate::scheduler::discarded_at_send::DiscardedSignalControl;
@@ -5167,6 +5169,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let mask = crate::syscalls::signal::signalfd_mask(guest.pid().as_raw(), call.fd());
         let mut done = 0usize;
+        // A read whose records were all dropped (stale timer entries) frees
+        // its slot; each drop pops an entry, so this bounds the extra reads.
+        let mut drops_left = call.len() / RECORD + 64;
         while done + RECORD <= call.len() {
             if done > 0 {
                 let pending =
@@ -5186,6 +5191,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             match self.read_signalfd(guest, record, done == 0).await {
                 Ok(read) if read > 0 => done += read as usize,
                 Ok(read) if done == 0 => return Ok(read),
+                // Linux skips a stale entry inside the dequeue and fills the
+                // slot with the next pending signal (the Claude review of
+                // https://github.com/rrnewton/hermit/pull/4491, P2-1).
+                Ok(_) if drops_left > 0 => drops_left -= 1,
                 Ok(_) => break,
                 Err(error) if done == 0 => return Err(error),
                 Err(_) => break,

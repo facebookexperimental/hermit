@@ -3123,6 +3123,106 @@ fn record_sigev_thread_id_timers() {
     }
 }
 
+/// Every mode of `tests/c/timer_exec_flush.c` under record and replay
+/// (https://github.com/rrnewton/hermit/issues/4262): a POSIX timer's copy is
+/// sent as an `SI_TIMER` record, which exec's own flush removes, so each
+/// mode records and replays Linux's output identically (`record start
+/// --verify --verify-strict`; native, 5 runs each, 2026-10-16). In two modes a
+/// signalfd may have read a timer copy before the guest sent its own copy of
+/// the signal; a replayed signalfd read dequeues nothing, so the exec would
+/// replay another flush than the recording's, and the recording is refused by
+/// name, as it was on main (the Claude review of
+/// https://github.com/rrnewton/hermit/pull/4491, P1-2: replay had printed
+/// `hits=0` where the recording printed `hits=1`, with exit 0).
+#[test]
+fn record_exec_discards_posix_timer_copies_as_on_linux() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = build.path().join("timer_exec_flush");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/timer_exec_flush.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the timer_exec_flush guest");
+    assert!(
+        output.status.success(),
+        "guest compilation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (mode, expected) in [
+        ("thread", "thread pending_after_exec=0 hits=0\n"),
+        ("process", "process pending_after_exec=0 hits=0\n"),
+        ("kill", "kill pending_after_exec=1 hits=1\n"),
+        ("both", "both pending_after_exec=1 hits=1\n"),
+        (
+            "taken_then_kill",
+            "taken_then_kill before_exec hits=1\ntaken_then_kill pending_after_exec=1 hits=1\n",
+        ),
+        ("rt_process", "rt_process pending_after_exec=0 hits=0\n"),
+        ("worker_timer", "worker_timer pending_after_exec=0 hits=0\n"),
+        ("leader_exec", "leader_exec pending_after_exec=1 hits=1\n"),
+        (
+            "stw_taken",
+            "stw_taken took=1\nstw_taken pending_after_exec=1 hits=1\n",
+        ),
+        (
+            "dead_armer",
+            "dead_armer retired=1 pending_at_retirement=0 pending_before_exec=1\n\
+             dead_armer pending_after_exec=0 hits=0\n",
+        ),
+        (
+            "shared_sfd_no_timer",
+            "shared_sfd_no_timer pending_after_exec=1 hits=1\n",
+        ),
+        ("sfd_process", "sfd_process pending_after_exec=0 hits=0\n"),
+        ("cont_flush", "cont_flush pending_after_exec=1 hits=1\n"),
+        ("stw_other", "stw_other pending_after_exec=0 hits=0\n"),
+        (
+            "cont_flush_process",
+            "cont_flush_process pending_after_exec=1 hits=1\n",
+        ),
+    ] {
+        let output = canonical_record_replay_command(
+            &format!("timer_exec_flush, {mode}"),
+            &guest,
+            &[OsStr::new(mode)],
+        );
+        assert!(
+            output.contains(expected),
+            "{mode}: the guest must print {expected:?}:\n{output}"
+        );
+    }
+    for mode in ["sfd_thread", "shared_sfd"] {
+        let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+        let mut record = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        record
+            .env("HERMIT_MODE", "record")
+            .args(["--backend=ptrace", "record", "start", "--strict"])
+            .arg(format!("--data-dir={}", data_dir.path().display()))
+            .arg("--")
+            .arg(&guest)
+            .arg(mode);
+        let output = hermit_test::hermit_output(&format!("{record:?}"), &mut record);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}: {stderr}"
+        );
+        assert!(
+            stderr.contains("exec'd with a POSIX timer's signal possibly pending")
+                && stderr.contains("a replayed read does not dequeue"),
+            "{mode}: {stderr}"
+        );
+    }
+}
+
 /// A guest in a nested PID namespace gets its own namespace's pids from fork
 /// and waitpid, and its kill of a nested sibling by that pid, identically in
 /// record and replay (https://github.com/rrnewton/hermit/issues/4155,

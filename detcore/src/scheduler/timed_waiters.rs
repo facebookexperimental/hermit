@@ -513,6 +513,20 @@ impl TimedEvents {
             .map(|state| (state.deadline, state.interval, state.phase))
     }
 
+    /// `dp`'s POSIX timers notifying `signal` that are `Inactive`, waiting for
+    /// the dequeue of their entry.
+    pub(crate) fn inactive_posix_timers(&self, dp: DetPid, signal: Signal) -> Vec<SignalTimerId> {
+        self.signal_timers
+            .iter()
+            .filter(|(id, state)| {
+                matches!(id, SignalTimerId::Posix(owner, _) if *owner == dp)
+                    && matches!(state.phase, AlarmPhase::Inactive { .. })
+                    && state.sig == TimerSignal::Send(signal)
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// The processes whose `ITIMER_REAL` is `Inactive`, in process order.
     pub(crate) fn inactive_alarm_processes(&self) -> Vec<DetPid> {
         self.signal_timers
