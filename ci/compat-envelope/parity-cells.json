@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 2995,
-      "applicable": 1932,
-      "selectable": 1681,
-      "population": 2925,
-      "population_candidate_selected": 1681,
+      "cells": 3000,
+      "applicable": 1934,
+      "selectable": 1683,
+      "population": 2930,
+      "population_candidate_selected": 1683,
       "population_candidate_not_selected": 240,
-      "population_candidate_disabled": 1004
+      "population_candidate_disabled": 1007
     },
     "by_backend": {
       "dbt": {
-        "cells": 599,
-        "applicable": 256,
-        "selectable": 252,
-        "population": 585,
-        "population_candidate_selected": 252,
+        "cells": 600,
+        "applicable": 257,
+        "selectable": 253,
+        "population": 586,
+        "population_candidate_selected": 253,
         "population_candidate_not_selected": 3,
         "population_candidate_disabled": 330
       },
       "in-guest-trap": {
-        "cells": 599,
+        "cells": 600,
         "applicable": 319,
         "selectable": 318,
-        "population": 585,
+        "population": 586,
         "population_candidate_selected": 318,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 267
+        "population_candidate_disabled": 268
       },
       "kvm": {
-        "cells": 599,
-        "applicable": 559,
-        "selectable": 553,
-        "population": 585,
-        "population_candidate_selected": 553,
+        "cells": 600,
+        "applicable": 560,
+        "selectable": 554,
+        "population": 586,
+        "population_candidate_selected": 554,
         "population_candidate_not_selected": 3,
         "population_candidate_disabled": 29
       },
       "liteinst": {
-        "cells": 599,
+        "cells": 600,
         "applicable": 320,
         "selectable": 319,
-        "population": 585,
+        "population": 586,
         "population_candidate_selected": 319,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 266
+        "population_candidate_disabled": 267
       },
       "sabre": {
-        "cells": 599,
+        "cells": 600,
         "applicable": 478,
         "selectable": 239,
-        "population": 585,
+        "population": 586,
         "population_candidate_selected": 239,
         "population_candidate_not_selected": 234,
-        "population_candidate_disabled": 112
+        "population_candidate_disabled": 113
       }
     }
   },
@@ -900,6 +900,11 @@
     {"test_id":"c-programs/print-memaddrs","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/print-memaddrs","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/print-memaddrs","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/print-memaddrs-threads","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/print-memaddrs-threads","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: pthread_create fails with EOPNOTSUPP and the runtime prints \"reverie-liteinst: clone injection requires ptrace fallback\", so the guest exits 1 before printing any thread; measured at hermit 238231ed on 2026-10-16"},
+    {"test_id":"c-programs/print-memaddrs-threads","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/print-memaddrs-threads","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: pthread_create fails with EOPNOTSUPP and the runtime prints \"reverie-liteinst: clone injection requires ptrace fallback\", so the guest exits 1 before printing any thread; measured at hermit 238231ed on 2026-10-16"},
+    {"test_id":"c-programs/print-memaddrs-threads","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Strict verify diverged in 4 of 7 runs at hermit 238231ed on 2026-10-16: the runs print the same addresses, but one has two more DETLOG records, an extra futex(FUTEX_WAIT_BITSET_PRIVATE) by an exiting thread before main writes its output; ptrace, kvm and dbt matched 8 of 8"},
     {"test_id":"c-programs/printf-with-threads","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
     {"test_id":"c-programs/printf-with-threads","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/printf-with-threads","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

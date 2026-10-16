@@ -7215,6 +7215,34 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/print-memaddrs-threads",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/print-memaddrs-threads",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/print-memaddrs-threads",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/print-memaddrs-threads",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/print-memaddrs",
           "mode": "replay",
           "backend": "ptrace"
@@ -27255,6 +27283,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/print-memaddrs-threads",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/print-memaddrs",
           "mode": "verify",
           "backend": "ptrace"
@@ -34470,6 +34505,27 @@
           "test": "c-programs/preadv2-flags",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/print-memaddrs-threads",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/print-memaddrs-threads",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/print-memaddrs-threads",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -54011,6 +54067,34 @@
           "test": "c-programs/preadv2-flags",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/print-memaddrs-threads",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/print-memaddrs-threads",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/print-memaddrs-threads",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/print-memaddrs-threads",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",

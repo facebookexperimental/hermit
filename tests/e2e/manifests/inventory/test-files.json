@@ -1485,8 +1485,14 @@
     {
       "disposition": "manifest-test",
       "path": "tests/c/print_memaddrs.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/print_memaddrs.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (blocking CI)",
+      "why": "tests/c/print_memaddrs.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (cell c-programs/print-memaddrs): strict verify on all six backends and ptrace record/replay; it prints every kind of address a program sees, so a side-by-side of two backends' stdout names the region whose layout differs"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/print_memaddrs_threads.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (blocking CI)",
+      "why": "tests/c/print_memaddrs_threads.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (cell c-programs/print-memaddrs-threads): strict verify on ptrace, kvm and dbt and ptrace record/replay; sabre, liteinst and in-guest-trap are disabled with their measured reasons in the manifest"
     },
     {
       "disposition": "manifest-test",

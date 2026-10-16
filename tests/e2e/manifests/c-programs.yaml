@@ -6537,7 +6537,7 @@ test:
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/print-memaddrs
-    description: Strict verification for tests/c/print_memaddrs.c
+    description: Prints every kind of address a program sees (initial stack, auxv, image, libc, thread-local, program break, malloc, mmap) so verify proves each backend repeats its layout and a side-by-side of the stdout of two backends names the region whose layout differs
     lane: portable
     requires:
       - linux
@@ -6605,6 +6605,80 @@ test:
           in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/print-memaddrs-threads
+    description: Four live threads allocate one at a time in a fixed order and record their stack, thread-local and malloc addresses, which main prints in thread order, so the output depends on the memory layout and not on the interleaving
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/print_memaddrs_threads.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+        - -pthread
+        - -Wno-error=unused-parameter
+        - -Wno-error=unused-function
+        - -Wno-error=unused-variable
+        - -Wno-error=attributes
+        - -Wno-error=unknown-pragmas
+        - -Wno-error=sign-compare
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+          - dbt
+        backends_disabled:
+          sabre: "Strict verify diverged in 4 of 7 runs at hermit 238231ed on 2026-10-16: the runs print the same addresses, but one has two more DETLOG records, an extra futex(FUTEX_WAIT_BITSET_PRIVATE) by an exiting thread before main writes its output; ptrace, kvm and dbt matched 8 of 8"
+          liteinst: "pthread_create fails with EOPNOTSUPP and the runtime prints \"reverie-liteinst: clone injection requires ptrace fallback\", so the guest exits 1 before printing any thread; measured at hermit 238231ed on 2026-10-16"
+          in-guest-trap: "pthread_create fails with EOPNOTSUPP and the runtime prints \"reverie-liteinst: clone injection requires ptrace fallback\", so the guest exits 1 before printing any thread; measured at hermit 238231ed on 2026-10-16"
+      naked:
+        ci: false
+        ci_disabled_reason: A native run varies its addresses with ASLR and the environment; this test compares Hermit runs
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: The threads allocate in a fixed turn order, so chaos scheduling cannot change what the guest prints
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: The guest takes no arguments
         backends_enabled: []
         backends_disabled:
           ptrace: No custom edge-case arguments have been calibrated for this C guest
