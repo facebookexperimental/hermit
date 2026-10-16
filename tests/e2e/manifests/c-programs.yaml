@@ -3032,15 +3032,13 @@ test:
           ptrace: true
           sabre: false
           kvm: false
-          liteinst: true
-          in-guest-trap: true
         backends_enabled:
           - ptrace
           - sabre
           - kvm
-          - liteinst
-          - in-guest-trap
         backends_disabled:
+          liteinst: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
+          in-guest-trap: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
@@ -3048,12 +3046,6 @@ test:
             result: timeout
             evidence: RUN1709 at Hermit 8c2bb5620f13e5d351e7bdb5d20c8dcec1f3eaba
             reason: Both canonical full-validation attempts exceeded the 57-second wall backstop and produced no comparison, so KVM remains red without a divergence claim.
-        hermit_args:
-          liteinst:
-            - --max-timeslice=disabled
-          in-guest-trap:
-            - --max-timeslice=disabled
-        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         backends_enabled: []
@@ -4811,24 +4803,16 @@ test:
           ptrace: true
           sabre: false
           kvm: true
-          liteinst: true
-          in-guest-trap: true
         backends_enabled:
           - ptrace
           - sabre
           - kvm
-          - liteinst
-          - in-guest-trap
         backends_disabled:
+          liteinst: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
+          in-guest-trap: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
-        hermit_args:
-          liteinst:
-            - --max-timeslice=disabled
-          in-guest-trap:
-            - --max-timeslice=disabled
-        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         backends_enabled: []
@@ -6719,24 +6703,16 @@ test:
           ptrace: true
           sabre: false
           kvm: true
-          liteinst: true
-          in-guest-trap: true
         backends_enabled:
           - ptrace
           - sabre
           - kvm
-          - liteinst
-          - in-guest-trap
         backends_disabled:
+          liteinst: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 9) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
+          in-guest-trap: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 9) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
-        hermit_args:
-          liteinst:
-            - --max-timeslice=disabled
-          in-guest-trap:
-            - --max-timeslice=disabled
-        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         backends_enabled: []
@@ -11072,17 +11048,11 @@ test:
         backends_enabled:
           - ptrace
           - kvm
-          - liteinst
-          - in-guest-trap
         backends_disabled:
+          liteinst: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 373) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
+          in-guest-trap: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 373) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-        hermit_args:
-          liteinst:
-            - --max-timeslice=disabled
-          in-guest-trap:
-            - --max-timeslice=disabled
-        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         backends_enabled: []

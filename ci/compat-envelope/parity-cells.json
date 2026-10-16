@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 3000,
-      "applicable": 1934,
-      "selectable": 1683,
+      "applicable": 1926,
+      "selectable": 1675,
       "population": 2930,
-      "population_candidate_selected": 1683,
+      "population_candidate_selected": 1675,
       "population_candidate_not_selected": 240,
-      "population_candidate_disabled": 1007
+      "population_candidate_disabled": 1015
     },
     "by_backend": {
       "dbt": {
@@ -28,12 +28,12 @@
       },
       "in-guest-trap": {
         "cells": 600,
-        "applicable": 319,
-        "selectable": 318,
+        "applicable": 315,
+        "selectable": 314,
         "population": 586,
-        "population_candidate_selected": 318,
+        "population_candidate_selected": 314,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 268
+        "population_candidate_disabled": 272
       },
       "kvm": {
         "cells": 600,
@@ -46,12 +46,12 @@
       },
       "liteinst": {
         "cells": 600,
-        "applicable": 320,
-        "selectable": 319,
+        "applicable": 316,
+        "selectable": 315,
         "population": 586,
-        "population_candidate_selected": 319,
+        "population_candidate_selected": 315,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 267
+        "population_candidate_disabled": 271
       },
       "sabre": {
         "cells": 600,
@@ -491,9 +491,9 @@
     {"test_id":"c-programs/ipc-determinism","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
     {"test_id":"c-programs/ipc-determinism","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"},
     {"test_id":"c-programs/just-spin","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
-    {"test_id":"c-programs/just-spin","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/just-spin","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"},
     {"test_id":"c-programs/just-spin","backend":"kvm","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: kvm verify is not selected by full validation: Both canonical full-validation attempts exceeded the 57-second wall backstop and produced no comparison, so KVM remains red without a divergence claim."},
-    {"test_id":"c-programs/just-spin","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/just-spin","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"},
     {"test_id":"c-programs/just-spin","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites"},
     {"test_id":"c-programs/kcmp-eperm","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/kcmp-eperm","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -686,9 +686,9 @@
     {"test_id":"c-programs/nanosleep-par","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/nanosleep-par","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The pinned GCC 15 and glibc 2.42 guest timed out twice during SaBRe Run1 after the fork child died with SIGSEGV at RIP 0; ptrace passed and issue #2807 tracks requalification."},
     {"test_id":"c-programs/nanosleep-threads-nocrash","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
-    {"test_id":"c-programs/nanosleep-threads-nocrash","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/nanosleep-threads-nocrash","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"},
     {"test_id":"c-programs/nanosleep-threads-nocrash","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/nanosleep-threads-nocrash","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/nanosleep-threads-nocrash","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"},
     {"test_id":"c-programs/nanosleep-threads-nocrash","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites"},
     {"test_id":"c-programs/nanosleep-threads-simple","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
     {"test_id":"c-programs/nanosleep-threads-simple","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
@@ -906,9 +906,9 @@
     {"test_id":"c-programs/print-memaddrs-threads","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: pthread_create fails with EOPNOTSUPP and the runtime prints \"reverie-liteinst: clone injection requires ptrace fallback\", so the guest exits 1 before printing any thread; measured at hermit 238231ed on 2026-10-16"},
     {"test_id":"c-programs/print-memaddrs-threads","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Strict verify diverged in 4 of 7 runs at hermit 238231ed on 2026-10-16: the runs print the same addresses, but one has two more DETLOG records, an extra futex(FUTEX_WAIT_BITSET_PRIVATE) by an exiting thread before main writes its output; ptrace, kvm and dbt matched 8 of 8"},
     {"test_id":"c-programs/printf-with-threads","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
-    {"test_id":"c-programs/printf-with-threads","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/printf-with-threads","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 9) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"},
     {"test_id":"c-programs/printf-with-threads","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/printf-with-threads","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/printf-with-threads","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 9) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"},
     {"test_id":"c-programs/printf-with-threads","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
     {"test_id":"c-programs/proc-fd-link-aliases","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/proc-fd-link-aliases","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -1376,9 +1376,9 @@
     {"test_id":"c-programs/sysinfo","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/sysinfo","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/sysinfo-uptime","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
-    {"test_id":"c-programs/sysinfo-uptime","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/sysinfo-uptime","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 373) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"},
     {"test_id":"c-programs/sysinfo-uptime","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/sysinfo-uptime","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/sysinfo-uptime","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 373) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"},
     {"test_id":"c-programs/sysinfo-uptime","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"},
     {"test_id":"c-programs/syslog-deterministic","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/syslog-deterministic","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

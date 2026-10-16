@@ -25995,46 +25995,6 @@
       "requires_host_capabilities": [
         "cpuid-faulting"
       ],
-      "test": "c-programs/just-spin",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/just-spin",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "in-guest-trap",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
       "test": "c-programs/kcmp-eperm",
       "timeout_seconds": 57
     },
@@ -27515,46 +27475,6 @@
       "requires_host_capabilities": [
         "cpuid-faulting"
       ],
-      "test": "c-programs/nanosleep-threads-nocrash",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/nanosleep-threads-nocrash",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "in-guest-trap",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
       "test": "c-programs/netlink-autobind-generic",
       "timeout_seconds": 57
     },
@@ -28976,46 +28896,6 @@
         "cpuid-faulting"
       ],
       "test": "c-programs/print-memaddrs",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "in-guest-trap",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/printf-with-threads",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/printf-with-threads",
       "timeout_seconds": 57
     },
     {
@@ -31816,46 +31696,6 @@
         "cpuid-faulting"
       ],
       "test": "c-programs/sysinfo",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "in-guest-trap",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/sysinfo-uptime",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/sysinfo-uptime",
       "timeout_seconds": 57
     },
     {

@@ -4004,20 +4004,6 @@
           "category": "c-programs",
           "test": "c-programs/just-spin",
           "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/just-spin",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/just-spin",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -5614,21 +5600,7 @@
           "category": "c-programs",
           "test": "c-programs/nanosleep-threads-nocrash",
           "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/nanosleep-threads-nocrash",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/nanosleep-threads-nocrash",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -7301,21 +7273,7 @@
           "category": "c-programs",
           "test": "c-programs/printf-with-threads",
           "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/printf-with-threads",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/printf-with-threads",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -10591,21 +10549,7 @@
           "category": "c-programs",
           "test": "c-programs/sysinfo-uptime",
           "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysinfo-uptime",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysinfo-uptime",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -50937,20 +50881,6 @@
           "category": "c-programs",
           "test": "c-programs/just-spin",
           "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/just-spin",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/just-spin",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -52547,21 +52477,7 @@
           "category": "c-programs",
           "test": "c-programs/nanosleep-threads-nocrash",
           "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/nanosleep-threads-nocrash",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/nanosleep-threads-nocrash",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -54234,21 +54150,7 @@
           "category": "c-programs",
           "test": "c-programs/printf-with-threads",
           "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/printf-with-threads",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/printf-with-threads",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -57524,21 +57426,7 @@
           "category": "c-programs",
           "test": "c-programs/sysinfo-uptime",
           "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysinfo-uptime",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysinfo-uptime",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
