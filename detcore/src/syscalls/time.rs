@@ -48,6 +48,20 @@ use crate::types::LogicalTime;
 use crate::types::PosixTimerThread;
 use crate::types::SigWrapper;
 
+/// Whether Linux accepts `clockid` in clock_gettime and clock_getres, as far as
+/// the id alone decides: the fixed clocks 0 to 9 and CLOCK_TAI (11). Linux
+/// answers EINVAL for 10 (CLOCK_SGI_CYCLE, gone since Linux 4.x) and for
+/// every id from 12 up. A negative id names a process's or thread's CPU
+/// clock, or a clock descriptor; whether it is valid depends on the process
+/// or descriptor it names, so it is accepted here as before.
+fn clock_id_is_known(clockid: ClockId) -> bool {
+    use reverie::syscalls::FromToRaw;
+    match clockid.into_raw() as i32 {
+        0..=9 | 11 => true,
+        id => id < 0,
+    }
+}
+
 fn time_from_resources(rsrcs: &Resources) -> Option<LogicalTime> {
     if rsrcs.resources.len() > 1 {
         panic!(
@@ -621,6 +635,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::ClockGettime,
     ) -> Result<i64, Error> {
+        if !clock_id_is_known(call.clockid()) {
+            return Err(Errno::EINVAL.into());
+        }
         let time_ns = guest_clock_time(guest).await;
         trace!("Converting nanoseconds into clock_gettime: {}", time_ns);
 
@@ -633,12 +650,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
-    /// clock_gettime
+    /// clock_getres
     pub async fn handle_clock_getres<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::ClockGetres,
     ) -> Result<i64, Error> {
+        if !clock_id_is_known(call.clockid()) {
+            return Err(Errno::EINVAL.into());
+        }
         // A NULL `res` pointer is valid for clock_getres: the kernel validates
         // the clockid and returns 0 without storing the resolution. GHC's RTS
         // probes the per-thread CPU clock exactly this way

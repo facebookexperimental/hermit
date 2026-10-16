@@ -176,6 +176,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/clock_id_validation.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/clock_id_validation.c is owned by hermit-cli/tests/cli.rs: clock_ids_are_validated_as_linux_validates_them runs it natively and under hermit run --strict and requires equal stdout, the result and errno of clock_gettime and clock_getres for clock ids 0-7, 10, 11, 12, 16, 1000, -6 and -2 (before, Detcore answered 0 for the ids Linux rejects with EINVAL). It stays a fixture because a generic manifest cannot compare a run with the same program's native output."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/clock_passthrough.c",
       "runner": "hermit-cli/tests/clock_passthrough.rs",
       "why": "tests/c/clock_passthrough.c is owned by hermit-cli/tests/clock_passthrough.rs: Guest that reads every clock syscall Detcore virtualizes through raw syscalls, including a NULL-timespec clock_gettime that must fail with EFAULT, and passes each value as an lseek offset so a replay that observed a different value diverges at that syscall's argument check. The Rust integration test records it and replays it twice, comparing stdout and the clock DETLOG exactly, and also runs it under --no-virtualize-time. Driven only by its own integration test, so it is a test-owned guest fixture rather than a manifest-discovered CI program."

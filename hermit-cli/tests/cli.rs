@@ -196,6 +196,7 @@ static OMITTED_PROCFS_NAMES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "dbt")]
 static CLOCK_RLIMIT_PARITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -24971,10 +24972,10 @@ fn dbt_rlimit_and_clock_answers_match_ptrace() {
     };
     let ptrace = run("ptrace");
     assert!(ptrace.contains("rlimit lowered: 0 40 "), "{ptrace}");
-    // The invalid-clock line is compared, not checked against Linux: Detcore
-    // answers clock_gettime(1000) with 0 where Linux returns EINVAL, on both
-    // backends alike.
-    assert!(ptrace.contains("clock_gettime invalid: "), "{ptrace}");
+    assert!(
+        ptrace.contains("clock_gettime invalid: -1 EINVAL\n"),
+        "{ptrace}"
+    );
     assert_eq!(run("dbt"), ptrace);
 }
 
@@ -28680,6 +28681,36 @@ fn a_cpu_set_sized_from_kernel_max_holds_the_one_virtual_cpu() {
 /// is the same on every host and natively. Before, the file showed the host's
 /// CPU while CPUID showed Hermit's virtual one, and on an AMD EPYC host 15 of
 /// the 27 lines were MISMATCH.
+/// clock_gettime and clock_getres accept exactly the clock ids Linux accepts:
+/// the guest prints each call's result and errno, never a time, natively and
+/// under Hermit, and the two outputs must be equal. Before, Detcore answered
+/// every id with its virtual clock, so the retired CLOCK_SGI_CYCLE (10) and
+/// the ids past the end (12, 16, 1000) read 0 where Linux returns EINVAL.
+#[test]
+fn clock_ids_are_validated_as_linux_validates_them() {
+    let guest = futex_c_guest(&CLOCK_ID_VALIDATION_GUEST, "clock_id_validation")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let native = Command::new(&guest).output().unwrap();
+    assert!(native.status.success(), "{native:?}");
+    let native = String::from_utf8(native.stdout).unwrap();
+    assert!(
+        native.contains("clock 1000: gettime -1 EINVAL, getres -1 EINVAL\n"),
+        "{native}"
+    );
+    let args = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        guest.as_str(),
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), native);
+}
+
 #[test]
 fn cpuinfo_matches_cpuid() {
     assert_cpuinfo_matches_cpuid(&[]);

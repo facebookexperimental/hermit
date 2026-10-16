@@ -3438,7 +3438,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_racing_sibling_never_makes_hermits_init_a_descriptors_signal_owner,
     // so each has its own CPU budget: 484, listed (489 listed with this
     // node's skips, 5 of them ignored).
-    ("test.cli", 484),
+    // And clock_ids_are_validated_as_linux_validates_them (Detcore's clock
+    // ids answer EINVAL as Linux's do): 485, listed.
+    ("test.cli", 485),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3852,7 +3854,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the B3a-4c containment test: 413.
     // And https://github.com/rrnewton/hermit/issues/4262: the same +4 as test.cli, 417.
     // And the same +3 as test.cli (none is excluded here): 420.
-    ("test.cli_on_host", 420),
+    // And clock_ids_are_validated_as_linux_validates_them: 421, listed.
+    ("test.cli_on_host", 421),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
