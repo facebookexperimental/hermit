@@ -34147,44 +34147,6 @@
       "requires_host_capabilities": [
         "cpuid-faulting"
       ],
-      "test": "compat/logname",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "liteinst",
-      "category": "compat",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "compat/logname",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "in-guest-trap",
-      "category": "compat",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
       "test": "compat/lsirq",
       "timeout_seconds": 57
     },

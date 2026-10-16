@@ -120,7 +120,7 @@ corpus:
         [
           arch, b2sum, base32, base64, basename, bash, bracket, cal, cat, cksum,
           curl, date, df-direct, dirname, du, echo, expr, findmnt, free, getopt,
-          groups, head, hostname, id, kill, logname, ls, lsirq, lsmod,
+          groups, head, hostname, id, kill, ls, lsirq, lsmod,
           lua-direct, md5sum, mpstat-softirqs, nproc, numactl-hardware, numastat, numfmt,
           openssl, perl-direct, pidstat-disk, pinky, pr, printf, ps, pwd, readlink, realpath,
           sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, sleep, stat, sum,
@@ -143,6 +143,14 @@ corpus:
         without the compat fixtures; the second survey did not run this
         sabre-compat-only row (https://github.com/rrnewton/hermit/issues/3745)
       disabled:
+        logname: >-
+          Its verify runs end as a named policy refusal on liteinst: the
+          row's shell runs /usr/bin/logname in a command substitution, a
+          forked child that execs it, and the in-guest runtime refuses exec
+          with a typed refusal that ends the run (HERMIT_POLICY_REFUSAL;
+          hermit 16f99cd0, reverie 2f10ec67). It passed before only because
+          that exec failed with EOPNOTSUPP in both runs, so the row printed
+          logname:no-login-record without running logname.
         seq: >-
           Its first verify run on liteinst failed in the second local survey
           of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
@@ -789,7 +797,7 @@ corpus:
         [
           arch, b2sum, base32, base64, basename, bash, bracket, cal, cat, cksum,
           curl, date, df-direct, dirname, du, echo, expr, findmnt, free, getopt,
-          groups, head, hostname, id, kill, logname, ls, lsirq, lsmod,
+          groups, head, hostname, id, kill, ls, lsirq, lsmod,
           lua-direct, md5sum, nproc, numactl-hardware, numastat, numfmt,
           openssl, perl-direct, pinky, pr, printf, ps, pwd, readlink, realpath,
           sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, sleep, stat, sum,
@@ -802,6 +810,14 @@ corpus:
         without the compat fixtures; the second survey did not run this
         sabre-compat-only row (https://github.com/rrnewton/hermit/issues/3745)
       disabled:
+        logname: >-
+          Its verify runs end as a named policy refusal on in-guest-trap: the
+          row's shell runs /usr/bin/logname in a command substitution, a
+          forked child that execs it, and the in-guest runtime refuses exec
+          with a typed refusal that ends the run (HERMIT_POLICY_REFUSAL;
+          hermit 16f99cd0, reverie 2f10ec67). It passed before only because
+          that exec failed with EOPNOTSUPP in both runs, so the row printed
+          logname:no-login-record without running logname.
         seq: >-
           Its first verify run on in-guest-trap failed in the second local
           survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures

@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 3000,
-      "applicable": 1919,
-      "selectable": 1668,
+      "applicable": 1917,
+      "selectable": 1666,
       "population": 2930,
-      "population_candidate_selected": 1668,
+      "population_candidate_selected": 1666,
       "population_candidate_not_selected": 240,
-      "population_candidate_disabled": 1022
+      "population_candidate_disabled": 1024
     },
     "by_backend": {
       "dbt": {
@@ -28,12 +28,12 @@
       },
       "in-guest-trap": {
         "cells": 600,
-        "applicable": 312,
-        "selectable": 311,
+        "applicable": 311,
+        "selectable": 310,
         "population": 586,
-        "population_candidate_selected": 311,
+        "population_candidate_selected": 310,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 275
+        "population_candidate_disabled": 276
       },
       "kvm": {
         "cells": 600,
@@ -46,12 +46,12 @@
       },
       "liteinst": {
         "cells": 600,
-        "applicable": 313,
-        "selectable": 312,
+        "applicable": 312,
+        "selectable": 311,
         "population": 586,
-        "population_candidate_selected": 312,
+        "population_candidate_selected": 311,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 274
+        "population_candidate_disabled": 275
       },
       "sabre": {
         "cells": 600,
@@ -2010,10 +2010,10 @@
     {"test_id":"compat/logger","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/logger","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/logger","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: logger --stderr --no-act exits 1 with no output under SaBRe"},
-    {"test_id":"compat/logname","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on liteinst and in-guest-trap and kvm, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
-    {"test_id":"compat/logname","backend":"in-guest-trap","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"compat/logname","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on kvm, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
+    {"test_id":"compat/logname","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its verify runs end as a named policy refusal on in-guest-trap: the row's shell runs /usr/bin/logname in a command substitution, a forked child that execs it, and the in-guest runtime refuses exec with a typed refusal that ends the run (HERMIT_POLICY_REFUSAL; hermit 16f99cd0, reverie 2f10ec67). It passed before only because that exec failed with EOPNOTSUPP in both runs, so the row printed logname:no-login-record without running logname."},
     {"test_id":"compat/logname","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"compat/logname","backend":"liteinst","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"compat/logname","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its verify runs end as a named policy refusal on liteinst: the row's shell runs /usr/bin/logname in a command substitution, a forked child that execs it, and the in-guest runtime refuses exec with a typed refusal that ends the run (HERMIT_POLICY_REFUSAL; hermit 16f99cd0, reverie 2f10ec67). It passed before only because that exec failed with EOPNOTSUPP in both runs, so the row printed logname:no-login-record without running logname."},
     {"test_id":"compat/logname","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
     {"test_id":"compat/ls","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on liteinst and in-guest-trap and kvm, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
     {"test_id":"compat/ls","backend":"in-guest-trap","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

@@ -13405,21 +13405,7 @@
           "category": "compat",
           "test": "compat/logname",
           "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logname",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logname",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -60212,21 +60198,7 @@
           "category": "compat",
           "test": "compat/logname",
           "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logname",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logname",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
