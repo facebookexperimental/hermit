@@ -21,28 +21,28 @@ backend-parity-c bucket was folded into c-programs,
 https://github.com/rrnewton/hermit/issues/3301)
 separate calibrated blocking cells from discoverable migration inventory. CI
 creates one independently schedulable run node for every bucket.
-Seven buckets currently contain calibrated blocking workloads:
+Every bucket now contains blocking workloads. Counted on 2026-10-15 as rows
+with at least one mode whose `ci` is true for some backend:
 
-- `system-utils.yaml`
-- `data-handling.yaml`
-- `determinism-stress.yaml`
-- `language-runtimes.yaml`
-- `applications.yaml`
-- `c-programs.yaml` (eight calibrated Buck-derived C probes)
-- `compat.yaml` (the 189-program strict compatibility corpus, written as a
-  `corpus` section; five of its rows are diagnostics; 63 of its rows also
+- `c-programs.yaml`: 283 of its 284 Buck-derived C guests;
+- the other six C buckets (`bin-c`, `chaos-c`, `debugger-c`,
+  `determinism-stress-c`, `shared-futex-c`, `util-c`): 17 of 20 rows;
+- `system-utils.yaml` 39 of 39, `language-runtimes.yaml` 19 of 19,
+  `data-handling.yaml` 6 of 6, `determinism-stress.yaml` 6 of 6 and
+  `applications.yaml` 5 of 6;
+- `compat.yaml`: the 189-program strict compatibility corpus, written as a
+  `corpus` section. Five of its rows are diagnostics. 63 of its rows also
   have a verify cell on liteinst and on in-guest-trap that the full run type
-  runs (`additional`); it also holds the
-  `sabre-compat-only` run type's SaBRe cells and its 27 extra rows, and the
-  `rr-compat-only` run type's 139 replay cells. Each row is one test: its
-  ptrace verify cell runs at the host's strictness level, below)
+  runs (`additional`). It also holds the `sabre-compat-only` run type's SaBRe
+  cells and its 27 extra rows, and the `rr-compat-only` run type's 139 replay
+  cells. Each row is one test: its ptrace verify cell runs at the host's
+  strictness level, below.
 
-Eight additional `*-c.yaml`/`c-programs.yaml` buckets make 180 more C guests
-centrally discoverable. Eight `c-programs.yaml` entries have calibrated
-standalone build and output contracts and run in blocking CI; the remaining
-172 C guests keep `ci = false` until they are calibrated. Buckets without a
-calibrated cell still have a CI node that intentionally reports zero cells,
-and the correspondence audit proves that this cannot hide a calibrated cell.
+These counts go stale as cells are enabled; the YAML is the authority, and
+`ci/optional-e2e-cells.txt` lists the enabled `ci = false` cells. A bucket
+without a calibrated cell would still have a CI node that intentionally
+reports zero cells, and the correspondence audit proves that this cannot hide
+a calibrated cell.
 Every entry still declares all five modes and every backend exclusion, so
 inventory does not silently imply support.
 
