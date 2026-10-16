@@ -1754,7 +1754,14 @@ fi
 # pins), and build.rs, vendor/dynamorio, native/, third-party, the root
 # Cargo.toml and rust-toolchain.toml are unchanged, so no DynamoRIO build input
 # moves and the budget carries; the reverie-dbt inventory stays 961.
-expected_pin=4d50f85b288f5ab973e51c29e1701c5bb0d380ef
+# CARRY TO aed891104de8d8882fa71f24a5c152393596b69e (2026-10-16): from
+# 4d50f85b288f5ab973e51c29e1701c5bb0d380ef. The paired scheduler change
+# removes only the sched_getscheduler native screen and extends existing live
+# tests. All seven SDK inputs and inventory 961 remain unchanged. Match the
+# native client and paired runtime to this source; identical tested artifacts
+# may be reused. SDK budget, job width and resource limits carry unchanged.
+# The preceding owner comments retain both 755..c4fb and c4fb..E1 carries.
+expected_pin=aed891104de8d8882fa71f24a5c152393596b69e
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

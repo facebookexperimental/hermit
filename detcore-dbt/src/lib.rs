@@ -2214,6 +2214,21 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
     if matches!(sysno, Sysno::getpgrp | Sysno::getpgid | Sysno::getsid) && strict {
         return 1;
     }
+    // Detcore answers ordinary scheduling-policy queries with SCHED_OTHER.
+    // A copied child cannot enter the Tool and may inherit a different native
+    // policy. Refuse that strict escape without inventing a second answer.
+    if sysno == Sysno::sched_getscheduler && strict {
+        // The emitter is installed before READY and inherited by copied
+        // children. Use its raw write path, without an allocating/locking
+        // stderr fallback on the copied runtime stack.
+        if let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get() {
+            emit_marker(
+                *emit,
+                b"detcore-dbt: unsupported syscall sched_getscheduler (145) in copied child\n",
+            );
+        }
+        return 1;
+    }
     // A copied child's clock and resource-limit reads have no deterministic
     // answer here: the DBT client keeps no table of its own any more, and
     // Detcore, which answers them in the root and in forked children, cannot
@@ -4652,7 +4667,6 @@ mod tests {
         "sched_getaffinity",
         "sched_getattr",
         "sched_getparam",
-        "sched_getscheduler",
         "sched_rr_get_interval",
         "sched_setaffinity",
         "sched_setattr",
@@ -4775,6 +4789,24 @@ mod tests {
                     "{sysno} in a copied child, strict={strict}"
                 );
             }
+        }
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+    }
+
+    #[test]
+    fn copied_child_refuses_scheduler_policy_queries_only_in_strict_mode() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+        assert!(detcore::is_determinized_syscall(Sysno::sched_getscheduler));
+        for (strict, expected) in [(true, 1), (false, 0)] {
+            COPIED_PANIC_ON_UNSUPPORTED.store(strict, Ordering::Release);
+            assert_eq!(
+                copied_child_action(Sysno::sched_getscheduler.id() as i64),
+                expected,
+                "sched_getscheduler in a copied child, strict={strict}"
+            );
         }
         COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
     }
