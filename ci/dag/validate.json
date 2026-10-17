@@ -58033,7 +58033,7 @@
       "jobs_env": null,
       "hint": {
         "resources": {},
-        "est_duration_s": 1.0,
+        "est_duration_s": 30.0,
         "rss_baseline_bytes": 1073741824,
         "hard_mem_max_bytes": 3221225472,
         "classification": "light",
@@ -61956,7 +61956,7 @@
       "jobs_env": null,
       "hint": {
         "resources": {},
-        "est_duration_s": 1.0,
+        "est_duration_s": 11.0,
         "rss_baseline_bytes": 1073741824,
         "hard_mem_max_bytes": 3221225472,
         "classification": "light",
@@ -63916,7 +63916,7 @@
       "jobs_env": null,
       "hint": {
         "resources": {},
-        "est_duration_s": 1.0,
+        "est_duration_s": 4.0,
         "rss_baseline_bytes": 1073741824,
         "hard_mem_max_bytes": 3221225472,
         "classification": "light",

@@ -1634,6 +1634,18 @@ pub const HERMIT_INTEGRATION_SHARDS: &[Shard] = &[
     ("hermit_integration_3", Some("procfs_determinism"), 125.0),
 ];
 
+/// Buck import twins whose import is not about a second: the medians of 38
+/// full validations (2026-10-16 to 2026-10-17). The others take 1-2 s. At the
+/// former 1 s for every twin, the dispatch order ranked
+/// e2e.manifest_c_programs_buck (one worker importing 1,498 cells and a
+/// 1,415-cell parity pass), which full-scorecard.compatibility_buck waits for,
+/// below every ready test node.
+pub const BUCK_TWIN_MEASURED_ESTIMATES: &[(&str, f64)] = &[
+    ("e2e.manifest_c_programs_buck", 30.0),
+    ("e2e.manifest_compat_buck", 11.0),
+    ("e2e.manifest_system_utils_buck", 4.0),
+];
+
 /// The authored PMU integration node, which runs in shards.
 pub const PMU_INTEGRATION_TAG: &str = "test.pmu_integration_cases";
 
@@ -2053,7 +2065,10 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
         twin.timeout = crate::parity::PARITY_STEP_WALL_FLOOR.as_secs() as i64;
         twin.cpu_timeout = 600;
         twin.hint.resources.clear();
-        twin.hint.est_duration_s = 1.0;
+        twin.hint.est_duration_s = BUCK_TWIN_MEASURED_ESTIMATES
+            .iter()
+            .find_map(|(twin_tag, seconds)| (*twin_tag == tag).then_some(*seconds))
+            .unwrap_or(1.0);
         twin.hint.rss_baseline_bytes = Some(1 << 30);
         twin.hint.hard_mem_max_bytes = Some(3 << 30);
         twin.hint.classification = dagrun::model::StepClass::Light;

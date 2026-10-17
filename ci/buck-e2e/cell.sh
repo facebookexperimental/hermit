@@ -16,7 +16,7 @@
 #                                  (default: Tpx timeout - 30 s; Tpx returns no
 #                                  artifacts at all from an RE action it kills)
 #        HERMIT_E2E_KVM_SLOTS      how many local KVM cells may run at once on this host
-#                                  (default 8; see acquire_kvm_slot)
+#                                  (default 16; see acquire_kvm_slot)
 #        HERMIT_E2E_KVM_SLOT_DIR   where their slot files live
 #                                  (default /tmp/hermit-e2e-kvm-slots-UID)
 # stdout: Tpx HPHP-JSON (`type = "json"`): the harness's test_done for the cell, turned
@@ -99,14 +99,20 @@ extra=()
 # The compat bucket node runs with --diagnostic-results; so does its Buck cell.
 [[ $TEST == compat/* ]] && extra+=(--diagnostic-results)
 
-# A local KVM cell runs only while it holds one of HERMIT_E2E_KVM_SLOTS (default 8) slots
+# A local KVM cell runs only while it holds one of HERMIT_E2E_KVM_SLOTS (default 16) slots
 # shared by every cell on the host. reverie-kvm makes about seven ioctls per guest exit,
 # and on this fleet every ioctl passes a host BPF LSM program on security_file_ioctl that
 # takes one global ring-buffer spin lock (83% of the cycles in a perf profile of 48 cells),
 # so a KVM cell's CPU time grows with the number of KVM cells running beside it. The
 # applications/timed-progress-bar verify cell measured 2.4 s of CPU alone, 3.6 s with 8
 # running at once, 5.3 s with 16 and 16.6 s with 48, against its 24 s budget; Buck starts
-# every runnable local cell at once, while the cargo flow runs at most 8. A slot is an
+# every runnable local cell at once, while the cargo flow runs at most 8. Measured again
+# on 2026-10-17 (devbig014, 48 copies through test-harness as this script's host path
+# runs them), the same cell's harness CPU was 1.39 s at 8, 1.72 s at 16, 3.25 s at 24 and
+# 5.50 s at 48 (max 5.73 s), and 48 c-programs KVM verify cells ran 5.25 cells/s at 8 and
+# 9.16 at 16 at about 1.3 s of CPU each: the lock costs about a third of what it did.
+# With 557 local KVM cells in a full validation, 8 slots bounded e2e.buck_cells, so the
+# default is 16. A slot is an
 # flock on a file in HERMIT_E2E_KVM_SLOT_DIR (default /tmp/hermit-e2e-kvm-slots-UID),
 # held on fd 9 by this script alone (the commands it runs get 9>&-), so it is released
 # when this script exits, however it exits. A cell that finds no free slot within half
@@ -114,7 +120,7 @@ extra=()
 kvm_slot='' kvm_slot_wait_ms=0
 acquire_kvm_slot() {
     [[ $BACKEND == kvm && ${HERMIT_E2E_ROUTE:-} == local ]] || return 0
-    local slots=${HERMIT_E2E_KVM_SLOTS:-8} dir=${HERMIT_E2E_KVM_SLOT_DIR:-/tmp/hermit-e2e-kvm-slots-$(id -u)}
+    local slots=${HERMIT_E2E_KVM_SLOTS:-16} dir=${HERMIT_E2E_KVM_SLOT_DIR:-/tmp/hermit-e2e-kvm-slots-$(id -u)}
     local fds=() fd i t
     [[ $slots =~ ^[1-9][0-9]*$ ]] || emit_fatal "HERMIT_E2E_KVM_SLOTS must be a positive integer, not '$slots'"
     mkdir -p "$dir" || emit_fatal "cannot create the KVM slot directory $dir"
