@@ -19,6 +19,7 @@ use super::super::libtest_counts;
 use super::super::monotonic_now_ns;
 use super::super::nextest_test_observations;
 use super::super::run_lane_once;
+use super::super::seeded_lane_log;
 use super::super::step_with_caps;
 use super::super::test_id_summary;
 use super::super::utc_now;
@@ -457,7 +458,7 @@ fn run_preparation_step(dir: &Path, step: dagrun::model::Step, deadline: u64) {
         true,
         0,
         None,
-        &dir.join("driver.log"),
+        &seeded_lane_log(dir.join("driver.log")),
         Some(deadline),
         false,
     );
@@ -756,7 +757,7 @@ fn actual_nextest_results_and_publication_failures() {
             true,
             0,
             None,
-            &case.join("driver.log"),
+            &seeded_lane_log(case.join("driver.log")),
             Some(deadline),
             false,
         );

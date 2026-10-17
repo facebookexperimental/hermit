@@ -16791,6 +16791,29 @@ fn read_log_since_settled(path: &Path, start: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes[start..]).into_owned())
 }
 
+/// Create the durable log a unit test passes to `run_lane_once`, in its
+/// production shape.
+///
+/// Production never reaches `run_lane_once` with a missing or empty log:
+/// `setup_durable_log` creates the file before it spawns the tee and then
+/// writes `validate: durable log: ...` through it. A fixture path that nothing
+/// creates makes `settled_log_len` spend its full 3 s bound twice per lane,
+/// waiting for bytes no tee will write (about 197 s of the unit tests' serial
+/// time, the 2026-10-17 test audit). With the file seeded, the settle stops
+/// after one 100 ms poll. The post-lane slice is empty, and
+/// `extract_node_detail` finds no region in it, exactly as it did when the
+/// fixture's log was unreadable, so no attempt is stamped differently.
+///
+/// Do not use this for a log a DAG step writes itself: the step's `>` would
+/// truncate below the watermark. Do not use it for the absent-log deadline
+/// control in `validate_classification`'s timeout tests, which relies on the
+/// settle using up its allowance.
+#[cfg(test)]
+fn seeded_lane_log(path: PathBuf) -> PathBuf {
+    std::fs::write(&path, "unit-test lane log\n").unwrap();
+    path
+}
+
 /// Forward this scheduler invocation's rows to the directory uploaded by the
 /// hosted shard.
 ///
@@ -30543,7 +30566,7 @@ mod committed_selection_preservation_tests {
                         true,
                         0,
                         None,
-                        &temp.path().join("failed.log"),
+                        &seeded_lane_log(temp.path().join("failed.log")),
                         None,
                         false,
                     );
@@ -30577,7 +30600,7 @@ mod committed_selection_preservation_tests {
                         true,
                         0,
                         None,
-                        &temp.path().join("missing-edge.log"),
+                        &seeded_lane_log(temp.path().join("missing-edge.log")),
                         None,
                         false,
                     );
@@ -30645,7 +30668,7 @@ mod committed_selection_preservation_tests {
             true,
             0,
             None,
-            &temp.path().join("keep-going.log"),
+            &seeded_lane_log(temp.path().join("keep-going.log")),
             None,
             false,
         );
@@ -30686,7 +30709,7 @@ mod committed_selection_preservation_tests {
             true,
             0,
             None,
-            &temp.path().join("success-edge.log"),
+            &seeded_lane_log(temp.path().join("success-edge.log")),
             None,
             false,
         );
@@ -31833,7 +31856,7 @@ mod memory_cap_near_miss_tests {
             true,
             0,
             None,
-            &temp.path().join("lane.log"),
+            &seeded_lane_log(temp.path().join("lane.log")),
             None,
             false,
         );

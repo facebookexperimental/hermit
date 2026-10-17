@@ -1029,7 +1029,7 @@ mod tests {
                 true,
                 0,
                 None,
-                &dir.path().join(format!("{name}.log")),
+                &super::super::seeded_lane_log(dir.path().join(format!("{name}.log"))),
                 None,
                 false,
             );
@@ -1145,7 +1145,7 @@ mod tests {
                 true,
                 0,
                 None,
-                &dir.path().join(format!("{name}.log")),
+                &super::super::seeded_lane_log(dir.path().join(format!("{name}.log"))),
                 None,
                 false,
             );
@@ -1461,7 +1461,7 @@ mod timeout_tests {
             true,
             0,
             None,
-            &dir.path().join("node-limit.log"),
+            &super::super::seeded_lane_log(dir.path().join("node-limit.log")),
             None,
             false,
         );
