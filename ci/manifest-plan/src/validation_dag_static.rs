@@ -1106,7 +1106,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's launch_image_never_enters_the_legacy_form: 1606.
     // Measured with copied_child_refuses_priority_queries_only_in_strict_mode: 1607.
     // Measured with copied_child_refuses_scheduler_parameter_queries_only_in_strict_mode: 1608.
-    ("test.regular_crates", 1_609),
+    // And manifest-plan runner::tests' 5 session-census tests (3920bf94): 1614.
+    ("test.regular_crates", 1_614),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4738,7 +4739,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same launch-image legacy-form test: 1592.
     // Measured with copied_child_refuses_priority_queries_only_in_strict_mode: 1593.
     // Measured with copied_child_refuses_scheduler_parameter_queries_only_in_strict_mode: 1594.
-    ("test.regular_crates_on_host", 1_595),
+    // And the same 5 session-census tests (3920bf94): 1600.
+    ("test.regular_crates_on_host", 1_600),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),
