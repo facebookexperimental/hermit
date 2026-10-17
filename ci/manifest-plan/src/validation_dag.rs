@@ -4162,11 +4162,27 @@ fn assert_m2_stack_gate(cfg: &DagConfig) -> Result<(), String> {
         "HERMIT_M2_STACK_FIXTURE_BUNDLE",
         "HERMIT_COLD_STACK_FIXTURE_BUNDLE",
         "--print-stack-standalone",
-        "--test liteinst_stacks -j 1",
+        "--test liteinst_stacks",
     ] {
         if !command.contains(required) {
             return Err(format!("M2 consumer lost {required}"));
         }
+    }
+    // At most five tests at a time, all of them reserved: the width rides
+    // NEXTEST_TEST_THREADS from preferred_inner_jobs, so the step's CPU quota
+    // follows it, and the command names no width of its own. liteinst
+    // approved up to five (2026-10-17); it was one test at a time before.
+    let width = consumer.hint.preferred_inner_jobs;
+    if !matches!(width, Some(1..=5))
+        || consumer.jobs_env.as_deref() != Some("NEXTEST_TEST_THREADS")
+        || consumer.jobs_flag.as_deref() != Some("")
+        || command.contains("--test liteinst_stacks -j")
+        || command.contains("--test-threads")
+    {
+        return Err(format!(
+            "M2 consumer must run at most five tests at a time, reserved through NEXTEST_TEST_THREADS (preferred_inner_jobs {width:?}, jobs_env {:?}, jobs_flag {:?})",
+            consumer.jobs_env, consumer.jobs_flag
+        ));
     }
     Ok(())
 }

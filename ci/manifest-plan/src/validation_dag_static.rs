@@ -7658,7 +7658,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Require literal fixed placement of actual LiteInst signal and callback stacks"########,
         description: r########"Fourteen required identities: the original four genuine leaf rows, five artifact qualifier controls and two shared stack-observation controls, plus one actual Detcore constructor-placement row and two constructor-oracle refusal controls. Standalone native Strace SITE1 ALT1 must report the real fixed guarded altstack and absent continuation; ALT0 gets no stack credit; inert loading must reserve nothing. Genuine Detcore trap/site0 ALT1 must reach one actual callback at the exact marker IP/TID/RSP, with one completion and fixed guarded 8-MiB capacity. The additional constructor fixture executes the unchanged M2 workload and requires real bootstrap samples disjoint from both later stack extents including guards. Separate source-bound receipts, unchanged M1/M2 comparators, current constructor-bearing leaf qualification and independent clean H/RV source guards are mandatory. No consumer compilation, warm artifact search, caller-byte equality, full-entry/TLS or interior-write-protection claim. Raw observations remain separate from selection. The scheduler hint est_duration_s is 125 s, the median of the 12 passing full validations of 2026-10-15/16 (112-146 s); at 60 s, dispatch by longest estimate kept it waiting behind shorter nodes once its dependencies were done: in the full validation of 947ad92b it started at +429 s, 40 s after its last dependency ended at +389 s, while all 16 slots ran other nodes, and it set the end of the graph to within 11 s."########,
         labels: &[r########"full"########, r########"portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_M2_STACK_FIXTURE_BUNDLE="$PWD/target/ci/m2-stack-fixtures.path"; export HERMIT_COLD_STACK_FIXTURE_BUNDLE="$PWD/target/ci/cold-stack-fixtures.path"; REVERIE_LITEINST_PRELOAD=$(./ci/build-liteinst-allocator-fixtures.rs --print-stack-standalone) && export REVERIE_LITEINST_PRELOAD && ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_stacks -j 1"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_M2_STACK_FIXTURE_BUNDLE="$PWD/target/ci/m2-stack-fixtures.path"; export HERMIT_COLD_STACK_FIXTURE_BUNDLE="$PWD/target/ci/cold-stack-fixtures.path"; REVERIE_LITEINST_PRELOAD=$(./ci/build-liteinst-allocator-fixtures.rs --print-stack-standalone) && export REVERIE_LITEINST_PRELOAD && ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_stacks"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"liteinst_stacks"########]),
@@ -7675,7 +7675,12 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             rss_baseline_bytes: Some(1073741824),
             hard_mem_max_bytes: Some(4294967296),
             classification: StepClass::LatencyBound,
-            preferred_inner_jobs: None,
+            // Five tests at a time: the five real-runtime tests are 17-48 s each
+            // and the other ten under 4 s (146 s serially in the validation of
+            // 40c58818). liteinst confirmed the fixtures need no serial order
+            // (each test writes its own evidence directory); the width rides
+            // NEXTEST_TEST_THREADS, so the step reserves five CPUs.
+            preferred_inner_jobs: Some(5),
             measured_effective_cores: None,
             measured_cpu_utilization: None,
         },
@@ -7683,8 +7688,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         engine_only: false,
         timeout: 900,
         cpu_timeout: 900,
-        jobs_flag: None,
-        jobs_env: None,
+        jobs_flag: Some(r########""########),
+        jobs_env: Some(r########"NEXTEST_TEST_THREADS"########),
     },
     StaticStepSpec {
         group: r########"test"########,
