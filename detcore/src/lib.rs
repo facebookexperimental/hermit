@@ -2513,7 +2513,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         rpc: &R,
         unreported: reverie::UnreportedSignal,
     ) -> bool {
-        if unreported.signal() == Signal::SIGALRM
+        if unreported.signal() == Some(Signal::SIGALRM)
             && scheduler::discarded_at_send::records(&self.cfg)
         {
             let tid = DetTid::from_raw(unreported.tid().as_raw());
@@ -2529,11 +2529,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // A POSIX timer's stale entry is skipped, as Linux skips it inside the
         // dequeue (<https://github.com/rrnewton/hermit/issues/4262>).
         let stale_timer_entry = scheduler::discarded_at_send::records(&self.cfg)
-            && (1..32).contains(&(unreported.signal() as i32))
+            && (1..32).contains(&unreported.number())
             && {
                 let tid = DetTid::from_raw(unreported.tid().as_raw());
                 let control = scheduler::discarded_at_send::DiscardedSignalControl::Unreported {
-                    signal: unreported.signal() as i32,
+                    signal: unreported.number(),
                 };
                 // Carries no logical time; answered before any clock accounting.
                 let (_, response) = rpc
@@ -2556,7 +2556,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // The test-only claim fault drops the claimed copy here too, where a
             // relative `nanosleep`'s restart code makes the backend pass it on
             // unreported (`syscalls::signal::take_claim_fault`).
-            if unreported.signal() == Signal::SIGCHLD
+            if unreported.signal() == Some(Signal::SIGCHLD)
                 && crate::syscalls::take_claim_fault(crate::syscalls::ClaimFault::DropClaimed)
             {
                 warn!(
@@ -2565,7 +2565,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 );
                 return false;
             }
-            if unreported.signal() != Signal::SIGCHLD
+            if unreported.signal() != Some(Signal::SIGCHLD)
                 || !self.cfg.backend.reports_child_exit_publication
             {
                 return true;
@@ -2617,7 +2617,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             && let Some(control) = consumed_signal_control(
                 unreported.pid(),
                 unreported.tid(),
-                unreported.signal() as i32,
+                unreported.number(),
                 kept,
             )
         {
@@ -2635,7 +2635,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // unreported is one it never saw.
         // Reverie's own preemption signal, SIGKILL and SIGSTOP never reach a
         // guest handler.
-        let signal = unreported.signal() as i32;
+        let signal = unreported.number();
         if kept
             && crate::syscalls::signal_shadow::enabled()
             && self.cfg.sequentialize_threads

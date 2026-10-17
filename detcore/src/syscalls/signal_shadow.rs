@@ -239,9 +239,9 @@ where
 /// backend does so for many signals it held during a Tool injection), as
 /// (host pid, host tid, signal). They are recorded where the copy lives, in
 /// this process (`Tool::filter_unreported_signal`), and consumed at that
-/// thread's next operation, whether or not it has a copy. A realtime signal,
-/// which that hook cannot name, is not recorded (see the issue draft named in
-/// the A5 design note, section 11).
+/// thread's next operation, whether or not it has a copy. Realtime signals
+/// are shown and recorded like any other
+/// (<https://github.com/rrnewton/reverie/issues/207>).
 #[cfg(not(test))]
 static UNREPORTED: std::sync::Mutex<Vec<(i32, i32, i32)>> = std::sync::Mutex::new(Vec::new());
 
@@ -552,21 +552,6 @@ pub(super) fn record_rt_sigaction<G, T>(
             &format!(
                 "old action of signal {signum}: the kernel wrote {:?}, the copy holds {old:?}",
                 Action::from(written)
-            ),
-        );
-    }
-    // A caught realtime signal can reach its handler without any report:
-    // Reverie never shows one passed on unreported to the Tool (A5 design
-    // section 11). Until it does, the copy cannot follow such a thread.
-    if let Some(new) = new
-        && (32..=crate::signal_state::MAX_SIGNAL).contains(&signum)
-        && new.handler > 1
-    {
-        return give_up(
-            guest,
-            &format!(
-                "signal {signum} is a caught realtime signal, which can reach its handler \
-                 unreported"
             ),
         );
     }
@@ -924,8 +909,8 @@ where
 /// Reports a divergence once, by name, drops this thread's copy and marks the
 /// actions it shares unknown, so no sharing thread reports the consequence
 /// again. Every source of a copy error that host timing could decide gives
-/// the copy up quietly first (an unreported delivery, a caught realtime
-/// signal, a pending note at a clone), so this line is not host-timed.
+/// the copy up quietly first (an unreported delivery, a pending note at a
+/// clone), so this line is not host-timed.
 fn diverged<G, T>(guest: &mut G, after: &str, what: &str)
 where
     G: Guest<Detcore<T>>,
@@ -1580,10 +1565,11 @@ mod tests {
     }
 
     #[test]
-    fn installing_a_caught_realtime_handler_gives_the_copy_up() {
+    fn a_caught_realtime_handler_is_followed_until_one_is_passed_on_unreported() {
         let kernel = Kernel::default();
         let _seam = kernel.install();
         let mut guest = seeded(&kernel, 0);
+        let (pid, tid) = (guest.pid().as_raw(), guest.tid().as_raw());
         let action = KernelSigaction {
             handler: 0x4000,
             flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
@@ -1591,7 +1577,17 @@ mod tests {
             mask: 0,
         };
         let reported = DIVERGENCES.with(std::cell::Cell::get);
+        kernel.set(0, 0, 1 << (40 - 1));
         record_rt_sigaction(&mut guest, 40, Some(action), None, &Ok(0));
+        assert!(
+            guest.thread.signal_shadow.is_some(),
+            "installing a caught realtime handler keeps the copy"
+        );
+        // Reverie shows a realtime signal passed on unreported
+        // (https://github.com/rrnewton/reverie/issues/207); its note gives
+        // the copy up at the thread's next operation.
+        note_unreported(pid, tid, 40);
+        at_syscall_entry(&mut guest);
         assert!(guest.thread.signal_shadow.is_none());
         assert_eq!(DIVERGENCES.with(std::cell::Cell::get), reported);
     }
