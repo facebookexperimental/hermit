@@ -458,6 +458,8 @@ fn remount(request: i32, done: i32) {
 /// Each cycle numbers the first entry of a fresh tmpfs, removes its last name,
 /// has the tmpfs replaced, and reaches the new tmpfs's first entry, which the
 /// host gives the same device and inode number.
+// Guest code: a guest's own directory reads are what this exercises.
+#[allow(clippy::disallowed_methods)]
 fn reuse_guest(mount_point: &Path, fifos: &Path, reach: FirstReach) {
     // The test process holds both FIFOs open for reading and writing, so
     // neither open waits for a peer.

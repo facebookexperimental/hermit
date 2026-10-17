@@ -76,7 +76,7 @@ impl ExecRecord {
     pub fn resolve(root: &Path, cwd: &Path, path: &Path) -> Option<Self> {
         let mut spelled = cwd.join(path);
         for _ in 0..=MAX_INTERPRETER_DEPTH {
-            let found = fs::canonicalize(below(root, &spelled)?).ok()?;
+            let found = crate::util::canonicalize(&below(root, &spelled)?).ok()?;
             // Linux execs only a regular file, and refuses anything else
             // (EACCES) before it opens it.
             if !fs::metadata(&found).ok()?.is_file() {
@@ -631,11 +631,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // std::fs::canonicalize is the independent oracle
     fn a_script_resolves_to_its_interpreter_and_a_link_to_its_file() {
         let directory = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(directory.path()).unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
         let interpreter = std::env::current_exe().unwrap();
-        let interpreter = fs::canonicalize(interpreter).unwrap();
+        let interpreter = std::fs::canonicalize(&interpreter).unwrap();
         let script = root.join("script");
         fs::write(&script, format!("#!{}\n", interpreter.display())).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();

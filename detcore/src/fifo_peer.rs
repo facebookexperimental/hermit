@@ -474,18 +474,19 @@ fn scan(fifo: (u64, u64), peer: FifoPeer, own: Option<(i32, i32)>) -> bool {
         return false;
     }
     let proc_root = Path::new("/proc");
-    let Ok(entries) = fs::read_dir(proc_root) else {
-        return false;
-    };
     let tracer = tracer.to_string();
-    entries
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|name| name.bytes().all(|b| b.is_ascii_digit()) && *name != tracer)
-        .any(|process| {
-            descriptor_tables(&proc_root.join(process))
+    // Directories are listed without the C library's heap
+    // (util::find_in_directory) throughout.
+    crate::util::find_in_directory(proc_root, |name| {
+        let name = name.to_str()?;
+        (name.bytes().all(|b| b.is_ascii_digit())
+            && name != tracer
+            && descriptor_tables(&proc_root.join(name))
                 .iter()
-                .any(|(table, task)| holds_peer(table, *task, fifo, peer, own))
-        })
+                .any(|(table, task)| holds_peer(table, *task, fifo, peer, own)))
+        .then_some(())
+    })
+    .is_ok_and(|found| found.is_some())
 }
 
 /// Whether the descriptor table at `table` (a task's `/proc` directory, of
@@ -499,22 +500,16 @@ fn holds_peer(
     peer: FifoPeer,
     own: Option<(i32, i32)>,
 ) -> bool {
-    let Ok(descriptors) = fs::read_dir(table.join("fd")) else {
-        return false;
-    };
-    descriptors.filter_map(Result::ok).any(|descriptor| {
-        let Some(fd) = descriptor
-            .file_name()
-            .to_str()
-            .and_then(|fd| fd.parse::<i32>().ok())
-        else {
-            return false;
-        };
-        fs::metadata(descriptor.path())
+    let descriptors = table.join("fd");
+    crate::util::find_in_directory(&descriptors, |name| {
+        let fd = name.to_str()?.parse::<i32>().ok()?;
+        (fs::metadata(descriptors.join(name))
             .is_ok_and(|meta| meta.file_type().is_fifo() && meta.dev() == dev && meta.ino() == ino)
             && fdinfo_flags(table, &fd.to_string()).is_some_and(|flags| peer.accepts_flags(flags))
-            && !own.is_some_and(|(tid, own_fd)| same_description(tid, own_fd, task, fd))
+            && !own.is_some_and(|(tid, own_fd)| same_description(tid, own_fd, task, fd)))
+        .then_some(())
     })
+    .is_ok_and(|found| found.is_some())
 }
 
 /// Each distinct descriptor table of a process, as a task's `/proc` directory
@@ -528,20 +523,27 @@ fn holds_peer(
 /// beside a live thread hangs before a FIFO is read
 /// (<https://github.com/rrnewton/hermit/issues/4100>).
 fn descriptor_tables(process: &Path) -> Vec<(std::path::PathBuf, i32)> {
-    let Ok(tasks) = fs::read_dir(process.join("task")) else {
-        return Vec::new();
-    };
-    let mut tasks: Vec<(std::path::PathBuf, i32)> = tasks
-        .filter_map(|task| {
-            let task = task.ok()?;
-            let id = task.file_name().to_str()?.parse::<i32>().ok()?;
-            Some((task.path(), id))
-        })
-        .collect();
+    let task_root = process.join("task");
+    let mut tasks: Vec<(std::path::PathBuf, i32)> = Vec::new();
+    // A listing error keeps the tasks listed before it, as std's read_dir
+    // iteration did.
+    let _ = crate::util::find_in_directory(&task_root, |name| {
+        if let Some(id) = name.to_str().and_then(|id| id.parse::<i32>().ok()) {
+            tasks.push((task_root.join(name), id));
+        }
+        None::<()>
+    });
     tasks.sort_by_key(|(_, id)| *id);
     let mut tables: Vec<(std::path::PathBuf, i32)> = Vec::new();
     for (dir, id) in tasks {
-        let listed = fs::read_dir(dir.join("fd")).is_ok_and(|mut entries| entries.next().is_some());
+        // Close to std's `read_dir(..).next().is_some()`: a listing error
+        // still counts where the directory exists, which costs only a
+        // second look (holds_peer then finds nothing there).
+        let fd_directory = dir.join("fd");
+        let listed = match crate::util::find_in_directory(&fd_directory, |_| Some(())) {
+            Ok(found) => found.is_some(),
+            Err(_) => crate::util::raw_stat(&fd_directory).is_ok(),
+        };
         if listed && !tables.iter().any(|(_, seen)| same_table(*seen, id)) {
             tables.push((dir, id));
         }

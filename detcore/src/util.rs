@@ -698,6 +698,49 @@ impl RawFd {
         Ok(Self(fd))
     }
 
+    /// `name`, relative to this directory, opened with `flags` (`O_CLOEXEC`
+    /// added) by a raw `openat`.
+    pub fn open_at(&self, name: &std::ffi::OsStr, flags: libc::c_int) -> std::io::Result<Self> {
+        let name = raw_path(std::path::Path::new(name))?;
+        // SAFETY: a NUL-terminated name.
+        let fd = raw_result(unsafe {
+            raw_syscall(
+                libc::SYS_openat,
+                [
+                    self.0,
+                    name.as_ptr() as u64,
+                    (flags | libc::O_CLOEXEC) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        })?;
+        Ok(Self(fd))
+    }
+
+    /// The status of `name` in this directory, without following a final
+    /// link, by a raw `newfstatat`.
+    pub fn stat_at(&self, name: &std::ffi::OsStr) -> std::io::Result<libc::stat> {
+        let name = raw_path(std::path::Path::new(name))?;
+        // SAFETY: a NUL-terminated name; an all-zero `stat` is a valid value.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        raw_zero_result(unsafe {
+            raw_syscall(
+                libc::SYS_newfstatat,
+                [
+                    self.0,
+                    name.as_ptr() as u64,
+                    &mut stat as *mut libc::stat as u64,
+                    libc::AT_SYMLINK_NOFOLLOW as u64,
+                    0,
+                    0,
+                ],
+            )
+        })?;
+        Ok(stat)
+    }
+
     /// The descriptor's number.
     pub fn raw(&self) -> u64 {
         self.0
@@ -824,6 +867,179 @@ pub fn raw_read_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
+/// `path` with every symbolic link followed and every `.` and `..` resolved,
+/// as glibc's `realpath` (`std::fs::canonicalize`) gives it: relative paths
+/// from the working directory, and the same errors for an empty path
+/// (`ENOENT`), a missing component (`ENOENT`), a component that is not a
+/// directory but is followed by more, by `.`, `..` or a trailing `/`
+/// (`ENOTDIR`), and links nested too deep (`ELOOP` after 40, Linux's
+/// `MAXSYMLINKS`).
+///
+/// Walked with raw `getcwd`, `readlinkat` and `newfstatat` into buffers from
+/// Rust's allocator, never with `std::fs::canonicalize`: that calls glibc's
+/// `realpath`, whose result comes from the C library's `malloc`. Where
+/// Detcore runs in the guest's process (SaBRe, in-guest LiteInst), that heap
+/// is the guest's, and the allocation moves the guest's own `malloc` results
+/// and can grow its program break (see `find_in_directory`).
+pub fn canonicalize(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+    let error = std::io::Error::from_raw_os_error;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.is_empty() {
+        return Err(error(libc::ENOENT));
+    }
+    // What is left to walk, as `/`-separated pieces in reverse, so the next
+    // is at the end. A trailing `/` is kept as a final `.` piece: Linux then
+    // requires a directory, as it does before `.` and `..`.
+    let mut pending: Vec<Vec<u8>> = Vec::new();
+    let push = |pending: &mut Vec<Vec<u8>>, bytes: &[u8]| {
+        let mut pieces: Vec<Vec<u8>> = bytes
+            .split(|&byte| byte == b'/')
+            .filter(|piece| !piece.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect();
+        if bytes.len() > 1 && bytes.ends_with(b"/") {
+            pieces.push(b".".to_vec());
+        }
+        pieces.reverse();
+        pending.extend(pieces);
+    };
+    let mut resolved = if bytes.starts_with(b"/") {
+        PathBuf::from("/")
+    } else {
+        // The kernel answers within one PATH_MAX page and fails
+        // ENAMETOOLONG past it, where glibc's getcwd walks `..` itself; so
+        // does this (path_of_directory).
+        let mut cwd = vec![0_u8; libc::PATH_MAX as usize];
+        // SAFETY: the buffer is writable for its length. The kernel's length
+        // counts the terminating NUL.
+        let length = unsafe {
+            raw_syscall(
+                libc::SYS_getcwd,
+                [cwd.as_mut_ptr() as u64, cwd.len() as u64, 0, 0, 0, 0],
+            )
+        };
+        let length = if length == -(libc::ENAMETOOLONG as i64) {
+            let here = RawFd::open(
+                std::path::Path::new("."),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            )?;
+            cwd = path_of_directory(here)?;
+            cwd.push(0);
+            cwd.len()
+        } else {
+            raw_result(length)? as usize
+        };
+        cwd.truncate(length.saturating_sub(1));
+        // A working directory outside the process's root reads as
+        // "(unreachable)..."; glibc's getcwd fails ENOENT there.
+        if !cwd.starts_with(b"/") {
+            return Err(error(libc::ENOENT));
+        }
+        PathBuf::from(std::ffi::OsStr::from_bytes(&cwd))
+    };
+    push(&mut pending, bytes);
+    let is_directory = |path: &std::path::Path| {
+        raw_stat(path).map(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFDIR)
+    };
+    let mut links = 0;
+    while let Some(piece) = pending.pop() {
+        if piece == b"." || piece == b".." {
+            if !is_directory(&resolved)? {
+                return Err(error(libc::ENOTDIR));
+            }
+            if piece == b".." {
+                resolved.pop();
+            }
+            continue;
+        }
+        let candidate = resolved.join(std::ffi::OsStr::from_bytes(&piece));
+        let spelled = std::ffi::CString::new(candidate.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        // A target that fills the buffer may have been cut short: read again
+        // into a larger one.
+        let mut target = vec![0_u8; libc::PATH_MAX as usize];
+        let read = loop {
+            // SAFETY: a NUL-terminated path and a buffer writable for its
+            // length.
+            let read = unsafe {
+                raw_syscall(
+                    libc::SYS_readlinkat,
+                    [
+                        libc::AT_FDCWD as u64,
+                        spelled.as_ptr() as u64,
+                        target.as_mut_ptr() as u64,
+                        target.len() as u64,
+                        0,
+                        0,
+                    ],
+                )
+            };
+            if read != target.len() as i64 {
+                break read;
+            }
+            target.resize(target.len() * 2, 0);
+        };
+        if read == -(libc::EINVAL as i64) {
+            // There, and not a link.
+            resolved = candidate;
+            continue;
+        }
+        let read = raw_result(read)? as usize;
+        links += 1;
+        if links > 40 {
+            return Err(error(libc::ELOOP));
+        }
+        if target[..read].starts_with(b"/") {
+            resolved = PathBuf::from("/");
+        }
+        push(&mut pending, &target[..read]);
+    }
+    Ok(resolved)
+}
+
+/// The absolute path of the directory open at `start`: each directory's
+/// name is found among its parent's entries by device and inode, walking `..`
+/// up to the process's root, as glibc's getcwd does where the kernel's
+/// `getcwd` cannot answer (a path longer than a page). Raw syscalls
+/// throughout. `ENOENT` where a directory is missing from its parent (it was
+/// removed, or lies outside the root).
+fn path_of_directory(start: RawFd) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    let mut current = start;
+    loop {
+        let here = current.stat()?;
+        let parent = current.open_at(
+            std::ffi::OsStr::new(".."),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )?;
+        let above = parent.stat()?;
+        if (above.st_dev, above.st_ino) == (here.st_dev, here.st_ino) {
+            break;
+        }
+        let name = find_in_open_directory(&parent, |name| {
+            parent
+                .stat_at(name)
+                .is_ok_and(|stat| (stat.st_dev, stat.st_ino) == (here.st_dev, here.st_ino))
+                .then(|| name.as_bytes().to_vec())
+        })?
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+        names.push(name);
+        current = parent;
+    }
+    let mut path = Vec::new();
+    for name in names.iter().rev() {
+        path.push(b'/');
+        path.extend_from_slice(name);
+    }
+    if path.is_empty() {
+        path.push(b'/');
+    }
+    Ok(path)
+}
+
 /// Calls `visit` with each name in directory `path`, without `.` and `..`,
 /// in the kernel's order, until it returns `Some`, and returns that value
 /// (`None` when every name was visited).
@@ -840,37 +1056,24 @@ pub fn raw_read_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
 /// so a directory of any size costs the one buffer.
 pub fn find_in_directory<T>(
     path: &std::path::Path,
+    visit: impl FnMut(&std::ffi::OsStr) -> Option<T>,
+) -> std::io::Result<Option<T>> {
+    // Raw syscalls throughout (see raw_syscall); the descriptor closes when
+    // dropped, a panicking visitor included.
+    let directory = RawFd::open(path, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    find_in_open_directory(&directory, visit)
+}
+
+/// [`find_in_directory`] of a directory already open at `directory`, from
+/// its current offset.
+pub fn find_in_open_directory<T>(
+    directory: &RawFd,
     mut visit: impl FnMut(&std::ffi::OsStr) -> Option<T>,
 ) -> std::io::Result<Option<T>> {
     use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    // Raw syscalls throughout (see raw_syscall). SAFETY: a NUL-terminated
-    // path; the descriptor is closed below on every path, a panicking visitor
-    // included.
-    let fd = raw_result(unsafe {
-        raw_syscall(
-            libc::SYS_openat,
-            [
-                libc::AT_FDCWD as u64,
-                path.as_ptr() as u64,
-                (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
-                0,
-                0,
-                0,
-            ],
-        )
-    })?;
-    struct CloseOnDrop(u64);
-    impl Drop for CloseOnDrop {
-        fn drop(&mut self) {
-            // SAFETY: a descriptor find_in_directory opened and owns.
-            unsafe { raw_syscall(libc::SYS_close, [self.0, 0, 0, 0, 0, 0]) };
-        }
-    }
-    let directory = CloseOnDrop(fd);
+    let fd = directory.raw();
     let mut buffer = vec![0_u8; 32 * 1024];
-    let result = 'listing: loop {
+    'listing: loop {
         // SAFETY: the buffer is writable for its length.
         let read = unsafe {
             raw_syscall(
@@ -905,9 +1108,7 @@ pub fn find_in_directory<T>(
             }
             offset += reclen;
         }
-    };
-    drop(directory);
-    result
+    }
 }
 
 #[cfg(test)]
@@ -917,6 +1118,7 @@ mod find_in_directory_tests {
     /// Every name `std::fs::read_dir` finds is visited once, the visit stops
     /// at the first `Some`, and a path that is not a directory is an error.
     #[test]
+    #[allow(clippy::disallowed_methods)] // std::fs::read_dir is the reference
     fn find_in_directory_visits_every_name_and_stops_at_the_first_find() {
         let directory = tempfile::tempdir().unwrap();
         for index in 0..300 {
@@ -953,5 +1155,141 @@ mod find_in_directory_tests {
         assert_eq!(calls, 7);
         let file = directory.path().join("entry-with-a-long-name-0");
         assert!(find_in_directory(&file, |_| Some(())).is_err());
+    }
+}
+
+#[cfg(test)]
+mod canonicalize_tests {
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+
+    use super::*;
+
+    /// A directory's path is found by walking `..` where it is longer than
+    /// the kernel's getcwd answers (a page), as glibc's getcwd does.
+    #[test]
+    fn a_long_directory_path_is_found_by_walking_up() {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = tempfile::tempdir().unwrap();
+        #[allow(clippy::disallowed_methods)] // std::fs::canonicalize is the independent oracle
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let name = "d".repeat(200);
+        let spelled = std::ffi::CString::new(name.as_str()).unwrap();
+        let mut levels = vec![RawFd::open(&root, libc::O_RDONLY | libc::O_DIRECTORY).unwrap()];
+        let mut expected = root.clone();
+        // 25 levels of 201 bytes: past the 4096-byte page.
+        for _ in 0..25 {
+            let parent = levels.last().unwrap();
+            // SAFETY: a NUL-terminated name relative to an open directory.
+            assert_eq!(
+                unsafe { libc::mkdirat(parent.raw() as i32, spelled.as_ptr(), 0o700) },
+                0
+            );
+            let child = parent
+                .open_at(
+                    std::ffi::OsStr::new(&name),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                )
+                .unwrap();
+            levels.push(child);
+            expected.push(&name);
+        }
+        assert!(expected.as_os_str().len() > 4096);
+        let deepest = levels
+            .last()
+            .unwrap()
+            .open_at(
+                std::ffi::OsStr::new("."),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            )
+            .unwrap();
+        let found = path_of_directory(deepest).unwrap();
+        // A path short enough for the kernel is found the same way.
+        let short = RawFd::open(&root, libc::O_RDONLY | libc::O_DIRECTORY).unwrap();
+        let short = path_of_directory(short).unwrap();
+        // The tree is too deep for a path-based removal: remove it level by
+        // level before asserting.
+        for parent in levels[..25].iter().rev() {
+            // SAFETY: a NUL-terminated name relative to an open directory.
+            unsafe { libc::unlinkat(parent.raw() as i32, spelled.as_ptr(), libc::AT_REMOVEDIR) };
+        }
+        assert_eq!(std::ffi::OsStr::from_bytes(&found), expected.as_os_str());
+        assert_eq!(std::ffi::OsStr::from_bytes(&short), root.as_os_str());
+    }
+
+    /// The walk gives what glibc's `realpath` gives (`std::fs::canonicalize`,
+    /// allowed here as the reference) through absolute, relative and chained
+    /// links, `..` across a link, and procfs's own links; and the same errors
+    /// for a missing component, a file used as a directory, and a link loop.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // std::fs::canonicalize is the reference
+    fn canonicalize_matches_realpath() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("a/b/c")).unwrap();
+        std::fs::write(root.join("a/b/c/file"), b"").unwrap();
+        symlink(root.join("a/b"), root.join("absolute")).unwrap();
+        symlink("a/b/c", root.join("relative")).unwrap();
+        symlink("relative", root.join("chained")).unwrap();
+        symlink("../../b", root.join("a/b/c/up")).unwrap();
+        symlink("loop2", root.join("loop1")).unwrap();
+        symlink("loop1", root.join("loop2")).unwrap();
+        for spelled in [
+            root.join("a/b/c/file"),
+            root.join("absolute/c/file"),
+            root.join("relative/file"),
+            root.join("chained/./file"),
+            root.join("chained/../c/file"),
+            root.join("a/b/c/up/c/file"),
+            root.join("absolute/c/up/../.."),
+            Path::new("/proc/self").to_path_buf(),
+            Path::new("/proc/self/exe").to_path_buf(),
+            Path::new("/").to_path_buf(),
+        ] {
+            assert_eq!(
+                canonicalize(&spelled).unwrap(),
+                std::fs::canonicalize(&spelled).unwrap(),
+                "{spelled:?}"
+            );
+        }
+        // Trailing separators and `.` on directories, and a link to one.
+        for spelled in [
+            root.join("a/b/"),
+            root.join("a/b/."),
+            root.join("absolute/"),
+            root.join("relative/."),
+        ] {
+            assert_eq!(
+                canonicalize(&spelled).unwrap(),
+                std::fs::canonicalize(&spelled).unwrap(),
+                "{spelled:?}"
+            );
+        }
+        // The same errors as realpath, including after a regular file.
+        let error = |spelled: &Path| canonicalize(spelled).unwrap_err().raw_os_error();
+        let reference = |spelled: &Path| std::fs::canonicalize(spelled).unwrap_err().raw_os_error();
+        let file = root.join("a/b/c/file");
+        let violating = [
+            Path::new("").to_path_buf(),
+            root.join("missing/file"),
+            root.join("a/b/c/file/x"),
+            root.join("loop1"),
+            file.join(""),
+            Path::new(&format!("{}/.", file.display())).to_path_buf(),
+            Path::new(&format!("{}/..", file.display())).to_path_buf(),
+            Path::new(&format!("{}/../file", file.display())).to_path_buf(),
+        ];
+        for spelled in &violating {
+            assert_eq!(error(spelled), reference(spelled), "{spelled:?}");
+        }
+        assert_eq!(error(&violating[0]), Some(libc::ENOENT));
+        assert_eq!(error(&violating[3]), Some(libc::ELOOP));
+        assert_eq!(error(&violating[5]), Some(libc::ENOTDIR));
+        // A relative path starts from the working directory.
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(
+            canonicalize(Path::new(".")).unwrap(),
+            std::fs::canonicalize(&here).unwrap()
+        );
     }
 }

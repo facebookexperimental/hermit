@@ -337,17 +337,22 @@ fn free_name(dir: &Path, stem: &str) -> std::io::Result<String> {
 /// counting, but it never stops this capture.
 fn remove_orphaned_temps(dir: &Path, min_age: Duration) -> std::io::Result<()> {
     let now = SystemTime::now();
-    for entry in fs::read_dir(dir)? {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !(name.starts_with(".hermit-") && name.contains("core.") && name.ends_with(".zst.tmp")) {
-            continue;
+    // Listed without the C library's heap (util::find_in_directory): this
+    // can run in the guest's process. As with std's read_dir, a directory
+    // that cannot be opened is the caller's error, and a listing error ends
+    // the cleanup without failing the capture.
+    drop(crate::util::RawFd::open(
+        dir,
+        libc::O_RDONLY | libc::O_DIRECTORY,
+    )?);
+    let _ = crate::util::find_in_directory(dir, |name| {
+        let text = name.to_string_lossy();
+        if !(text.starts_with(".hermit-") && text.contains("core.") && text.ends_with(".zst.tmp")) {
+            return None::<()>;
         }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
+        let path = dir.join(name);
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return None;
         };
         let old = metadata
             .modified()
@@ -355,22 +360,30 @@ fn remove_orphaned_temps(dir: &Path, min_age: Duration) -> std::io::Result<()> {
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age >= min_age);
         if metadata.is_file() && old {
-            let _ = fs::remove_file(entry.path());
+            let _ = fs::remove_file(&path);
         }
-    }
+        None
+    });
     Ok(())
 }
 
 /// Bytes held by the regular files directly in `dir`.
 fn regular_file_bytes(dir: &Path) -> std::io::Result<u64> {
     let mut total = 0u64;
-    for entry in fs::read_dir(dir)? {
-        let metadata = entry?.metadata()?;
-        if metadata.file_type().is_file() {
-            total = total.saturating_add(metadata.len());
-        }
+    let failed =
+        crate::util::find_in_directory(dir, |name| match fs::symlink_metadata(dir.join(name)) {
+            Ok(metadata) => {
+                if metadata.file_type().is_file() {
+                    total = total.saturating_add(metadata.len());
+                }
+                None
+            }
+            Err(error) => Some(error),
+        })?;
+    match failed {
+        Some(error) => Err(error),
+        None => Ok(total),
     }
-    Ok(total)
 }
 
 /// Everything a core needs except memory contents, read before writing.
@@ -921,6 +934,12 @@ fn read_fully(mem: &File, buf: &mut [u8], addr: u64) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// The number of names in `dir`, read with std as an independent oracle.
+    #[allow(clippy::disallowed_methods)]
+    fn entries(dir: &std::path::Path) -> usize {
+        fs::read_dir(dir).unwrap().count()
+    }
+
     #[test]
     fn headers_lay_out_notes_then_page_aligned_segments() {
         let segments = [
@@ -1246,7 +1265,7 @@ mod tests {
         let late = own_exit(true, Some(Instant::now()));
         let outcome = capture_from(&config(dir.path()), &late, Some(&mem), &flag).unwrap();
         assert!(matches!(outcome, Outcome::NoRoom { .. }), "{outcome:?}");
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(entries(dir.path()), 0);
     }
 
     #[test]
@@ -1340,11 +1359,7 @@ mod tests {
             &abandoned,
         );
         assert!(outcome.is_err(), "{outcome:?}");
-        assert_eq!(
-            fs::read_dir(dir.path()).unwrap().count(),
-            0,
-            "an abandoned capture left a file"
-        );
+        assert_eq!(entries(dir.path()), 0, "an abandoned capture left a file");
     }
 
     #[test]

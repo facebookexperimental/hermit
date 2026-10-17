@@ -595,6 +595,7 @@ mod tests {
     /// a path whose lexical spelling names a safe procfs file but whose
     /// target is another procfs file is on procfs but not a safe snapshot.
     #[test]
+    #[allow(clippy::disallowed_methods)] // test cleanup of its own temp directory
     fn sigalrm_phase1_provenance_comes_from_the_kernel() {
         use std::os::fd::AsRawFd;
 
@@ -635,12 +636,14 @@ mod tests {
 
         // A whole disk's statistics, through its /sys/block alias, where the
         // host has one.
-        if let Some(disk) = std::fs::read_dir("/sys/block")
+        if let Some(disk) =
+            crate::util::find_in_directory(std::path::Path::new("/sys/block"), |name| {
+                Some(std::path::Path::new("/sys/block").join(name))
+            })
             .ok()
-            .and_then(|mut entries| entries.next())
-            .and_then(Result::ok)
+            .flatten()
         {
-            let stat = std::fs::File::open(disk.path().join("stat")).unwrap();
+            let stat = std::fs::File::open(disk.join("stat")).unwrap();
             assert!(kernel_provenance(pid, stat.as_raw_fd()).safe_snapshot);
         }
     }

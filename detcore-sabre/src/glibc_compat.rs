@@ -281,6 +281,8 @@ fn loaded_object_containing(pc: usize) -> Option<LoadedObject> {
 }
 
 #[cfg(test)]
+// Test setup and cleanup outside any guest.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::ffi::CStr;
     use std::ffi::CString;

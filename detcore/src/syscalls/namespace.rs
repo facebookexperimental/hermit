@@ -1337,7 +1337,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let pid = if numbered_procfs {
             guest.pid().as_raw()
         } else if guest.thread_state().nested_pid_namespace {
-            let own = std::fs::canonicalize(root.join("proc/thread-self")).ok()?;
+            let own = crate::util::canonicalize(&root.join("proc/thread-self")).ok()?;
             let own = inside(&own)?;
             let mut parts = own.components().skip(2);
             parts.next()?.as_os_str().to_str()?.parse().ok()?
@@ -1349,8 +1349,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         for _ in 0..40 {
             let name = spelled.file_name()?.to_owned();
             let parent = spelled.parent()?;
-            let directory =
-                inside(&std::fs::canonicalize(root.join(parent.strip_prefix("/").ok()?)).ok()?)?;
+            let directory = inside(
+                &crate::util::canonicalize(&root.join(parent.strip_prefix("/").ok()?)).ok()?,
+            )?;
             let candidate = directory.join(&name);
             if let Some(subject) = exe_link_subject(candidate.as_os_str().as_bytes(), pid) {
                 return Some(subject);
@@ -1526,7 +1527,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// canonical.
     pub(crate) fn declared_launcher(&self) -> Option<PathBuf> {
         let launcher = self.cfg.launch_image.as_ref()?.launcher.as_ref()?;
-        Some(std::fs::canonicalize(launcher).unwrap_or_else(|_| launcher.clone()))
+        Some(crate::util::canonicalize(launcher).unwrap_or_else(|_| launcher.clone()))
     }
 
     /// Answer a readlink of an `exe` link from `exe` (`Self::launched_exe`)

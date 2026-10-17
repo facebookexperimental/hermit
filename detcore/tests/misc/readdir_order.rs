@@ -186,6 +186,8 @@ fn read_listing(dir: *mut libc::DIR) -> Listing {
     listing
 }
 
+// Guest code: a guest's own directory reads are what this exercises.
+#[allow(clippy::disallowed_methods)]
 fn open_dir(path: &Path) -> *mut libc::DIR {
     let path = CString::new(path.as_os_str().as_bytes()).unwrap();
     let dir = unsafe { libc::opendir(path.as_ptr()) };
@@ -238,6 +240,8 @@ fn creation_order_directories() -> tempfile::TempDir {
     root
 }
 
+// Guest code: a guest's own directory reads are what this exercises.
+#[allow(clippy::disallowed_methods)]
 fn creation_order_does_not_change_enumeration_guest(root: &tempfile::TempDir) {
     let forward = root.path().join("forward");
     let shuffled = root.path().join("shuffled");

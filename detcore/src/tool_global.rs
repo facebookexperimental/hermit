@@ -12777,6 +12777,7 @@ mod tests {
     /// dropped record leaves them nothing. Without sequentialized threads no
     /// record is kept.
     #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // std::fs::canonicalize is the independent oracle
     async fn an_exec_record_stands_only_where_the_kernel_names_it_or_the_launcher() {
         use std::os::unix::fs::MetadataExt;
         let directory = tempfile::tempdir().unwrap();
@@ -12849,6 +12850,7 @@ mod tests {
     /// root's record stands without sequentialized threads too, as it comes
     /// from no preparation.
     #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // std::fs::canonicalize is the independent oracle
     async fn the_launch_image_goes_to_the_registered_roots_first_image_only() {
         let directory = tempfile::tempdir().unwrap();
         let directory = std::fs::canonicalize(directory.path()).unwrap();
