@@ -26015,6 +26015,20 @@ fn run_owned_cache_bracket() -> Result<(), String> {
     .map_err(|error| format!("run-owned cache: cannot write workspace manifest: {error}"))?;
     std::fs::write(workspace.join("probe.rs"), "fn main() {}\n")
         .map_err(|error| format!("run-owned cache: cannot write probe: {error}"))?;
+    // create_safe_cache's fallback is the directory above the OUTERMOST Cargo workspace, so a
+    // fixture under a TMPDIR inside a checkout would select a cache beside that checkout:
+    // for a checkout at worktrees/slots/<slot>, worktrees/slots/ignored/validate/cache, shared by
+    // every slot. The self-test must only ever write inside its own fixture.
+    let boundary = cargo_manifest_boundary(&workspace);
+    if boundary != workspace {
+        return Err(format!(
+            "run-owned cache: the fixture {} is inside Cargo workspace {}, so the cache it would \
+             select lies outside the fixture; run the self-test with TMPDIR outside every Cargo \
+             workspace",
+            fixture.path().display(),
+            boundary.display()
+        ));
+    }
 
     let generated_manifest = |cache: &Path, label: &str| -> Result<PathBuf, String> {
         let output = Command::new("rust-script")
@@ -26121,6 +26135,13 @@ fn run_owned_cache_bracket() -> Result<(), String> {
             "run-owned cache: selected path {} is still inside {}",
             outside_path.display(),
             workspace.display()
+        ));
+    }
+    if path_is_outside(&outside_path, fixture.path()) {
+        return Err(format!(
+            "run-owned cache: selected path {} is outside the fixture {}",
+            outside_path.display(),
+            fixture.path().display()
         ));
     }
     let outside_manifest = generated_manifest(&outside_path, "outside-workspace")?;
