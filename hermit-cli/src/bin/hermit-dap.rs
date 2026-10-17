@@ -211,8 +211,11 @@ fn accept_client(listen: &Listen) -> Result<(), String> {
     let local = listener
         .local_addr()
         .map_err(|error| format!("--listen-fd's descriptor is not a TCP socket: {error}"))?;
-    // Tools that pass port 0 read the chosen port from this line.
-    eprintln!("hermit-dap: listening on {local}");
+    // Tools that pass port 0 read the chosen port from this line, often by
+    // polling a file that stderr goes to. One write: `eprintln!` can split a
+    // line into several writes, and a reader between them saw a truncated
+    // address (test.cli in the validation of 263f7477, 2026-10-17).
+    let _ = io::stderr().write_all(format!("hermit-dap: listening on {local}\n").as_bytes());
     let _ = io::stderr().flush();
     let (client, peer) = listener
         .accept()

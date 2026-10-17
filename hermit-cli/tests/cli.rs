@@ -18424,11 +18424,8 @@ impl DapClient {
         );
         let address = loop {
             let text = fs::read_to_string(&stderr_path).unwrap_or_default();
-            if let Some(address) = text
-                .lines()
-                .find_map(|line| line.strip_prefix("hermit-dap: listening on "))
-            {
-                break address.trim().to_owned();
+            if let Some(address) = dap_listen_address(&text) {
+                break address;
             }
             let exited = adapter.0.try_wait().ok().flatten();
             assert!(
@@ -19542,6 +19539,18 @@ fn hermit_run_dap_listen_names_the_program_the_guest_runs() {
     }
 }
 
+/// The address on hermit-dap's "listening on" line, once that line is
+/// complete. The tests poll a stderr file that is still being written, and
+/// `str::lines` yields a last line that has no newline yet: the validation of
+/// 263f7477 (2026-10-17) read part of the line and failed to connect to an
+/// "invalid socket address".
+fn dap_listen_address(text: &str) -> Option<String> {
+    text.split_inclusive('\n')
+        .filter_map(|line| line.strip_suffix('\n'))
+        .find_map(|line| line.strip_prefix("hermit-dap: listening on "))
+        .map(|address| address.trim().to_owned())
+}
+
 /// A `--dap-listen` run whose debugger ends before it connects to the run's
 /// gdbserver is ended, in bounded time, with the reason, instead of waiting
 /// for a debugger that can never come: when GDB cannot be executed, when it
@@ -19590,11 +19599,8 @@ fn hermit_run_dap_listen_ends_the_run_when_its_debugger_cannot_attach() {
         let deadline = Instant::now() + Duration::from_secs(40);
         let address = loop {
             let text = fs::read_to_string(&stderr_path).unwrap_or_default();
-            if let Some(address) = text
-                .lines()
-                .find_map(|line| line.strip_prefix("hermit-dap: listening on "))
-            {
-                break address.trim().to_owned();
+            if let Some(address) = dap_listen_address(&text) {
+                break address;
             }
             assert!(
                 Instant::now() < deadline && run.0.try_wait().ok().flatten().is_none(),
