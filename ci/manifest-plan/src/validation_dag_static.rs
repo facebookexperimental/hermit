@@ -2430,7 +2430,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1932, executed.
     // And the 24 signal_state::tests of audit step A5's shadow signal state
     // (https://github.com/rrnewton/hermit/issues/4485): 1956, listed.
-    ("test.detcore_unit", 1956),
+    // And its 21 syscalls::signal_shadow::tests: 1977, listed.
+    ("test.detcore_unit", 1977),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4214,7 +4215,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 2447c8e8: 1927.
     // And the same five exec-record tests: 1932, executed.
     // And the same 24 A5 signal_state tests: 1956, listed.
-    ("test.detcore_unit_on_host", 1956),
+    // And the same 21 signal_shadow tests: 1977, listed.
+    ("test.detcore_unit_on_host", 1977),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

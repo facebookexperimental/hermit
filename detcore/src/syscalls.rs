@@ -29,6 +29,7 @@ pub(crate) use network_trace::received_descriptors;
 mod network_trace;
 pub(crate) mod robust_list;
 mod signal;
+pub(crate) mod signal_shadow;
 /// The guest's virtual SIGALRM blocked bit (signal phase 1).
 pub(crate) use signal::ClaimFault;
 pub(crate) use signal::claim_still_pending;

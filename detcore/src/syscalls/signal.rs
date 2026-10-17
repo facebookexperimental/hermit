@@ -1029,6 +1029,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
 
         let temporary_mask = read_kernel_sigset(guest, mask_addr).await?;
+        super::signal_shadow::note_wait_mask(guest, temporary_mask);
         // The temporary mask lets the kernel take a pending real-time timer
         // expiration that every thread blocked when it expired
         // (https://github.com/rrnewton/hermit/issues/4089).
@@ -1212,6 +1213,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             guest.inject(call).await
         };
+        super::signal_shadow::record_rt_sigaction(
+            guest,
+            call.signum(),
+            kernel_action.map(|action| KernelSigaction {
+                mask: without_perf_event_signal(action.mask),
+                ..action
+            }),
+            call.old_action(),
+            &result,
+        );
         // Publish the state the runtime now holds whenever the disposition may
         // have changed: from a handler, or to one the runtime did not refuse.
         // Any result counts, since an EFAULT copying the old action out comes
@@ -1395,7 +1406,54 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The kernel checks sigsetsize before copying from either user pointer.
         validate_kernel_sigset_size(call.sigsetsize())?;
 
-        let result = self.rt_sigprocmask_inner(guest, call).await;
+        let (result, validated_set) = self.rt_sigprocmask_inner(guest, call).await;
+        if guest.thread_state().signal_shadow.is_some() {
+            use super::signal_shadow::SetInput;
+            let errno_result = match &result {
+                Ok(value) => Some(Ok(*value)),
+                Err(Error::Errno(errno)) => Some(Err(*errno)),
+                Err(_) => {
+                    super::signal_shadow::give_up(
+                        guest,
+                        "rt_sigprocmask failed without an errno, so its effect is unknown",
+                    );
+                    None
+                }
+            };
+            let set = match (call.set(), validated_set) {
+                (None, _) => SetInput::None,
+                (Some(_), ValidatedSet::Validated(set)) => {
+                    SetInput::Validated(without_perf_event_signal(set))
+                }
+                (Some(_), ValidatedSet::NotRun) => SetInput::NotRun,
+                // Read after the call, from memory the kernel itself just
+                // read, and only when it succeeded; an old mask written over
+                // any of the set's bytes leaves it unknown.
+                (Some(set), ValidatedSet::NotValidated) => SetInput::Unvalidated(
+                    (result.is_ok()
+                        && !call.oldset().is_some_and(|old| {
+                            old.as_raw().abs_diff(set.as_raw()) < KERNEL_SIGSET_SIZE
+                        }))
+                    .then(|| {
+                        guest
+                            .memory()
+                            .read_value::<_, KernelSigset>(set.cast::<KernelSigset>())
+                            .ok()
+                    })
+                    .flatten()
+                    .map(without_perf_event_signal),
+                ),
+            };
+            if let Some(errno_result) = errno_result {
+                super::signal_shadow::record_rt_sigprocmask(
+                    guest,
+                    call.how(),
+                    set,
+                    call.oldset(),
+                    &errno_result,
+                );
+            }
+        }
         if call.how() != libc::SIG_BLOCK && call.set().is_some() {
             // The new mask may unblock a pending real-time timer expiration
             // that every thread blocked when it expired, which the kernel then
@@ -1421,18 +1479,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
+    /// The call itself. Also says whether, and with what set, the kernel ran
+    /// it: the `SIG_BLOCK` and `SIG_SETMASK` paths read the set through the
+    /// kernel first and inject nothing when that fails.
     async fn rt_sigprocmask_inner<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::RtSigprocmask,
-    ) -> Result<i64, Error> {
+    ) -> (Result<i64, Error>, ValidatedSet) {
         if call.how() != libc::SIG_BLOCK && call.how() != libc::SIG_SETMASK {
-            Ok(guest.inject_with_retry(call).await?)
+            let result = guest.inject_with_retry(call).await;
+            (result.map_err(Into::into), ValidatedSet::NotValidated)
         } else if let Some(set) = call.set() {
-            let set_mask = read_kernel_sigset(guest, set).await?;
+            let set_mask = match read_kernel_sigset(guest, set).await {
+                Ok(set_mask) => set_mask,
+                Err(error) => return (Err(error), ValidatedSet::NotRun),
+            };
             let mut stack = guest.stack().await;
             let new_set = stack.push(without_perf_event_signal(set_mask));
-            let _stack_guard = stack.commit()?;
+            let _stack_guard = match stack.commit() {
+                Ok(guard) => guard,
+                Err(error) => return (Err(error.into()), ValidatedSet::NotRun),
+            };
             let modified_call = syscalls::RtSigprocmask::new()
                 .with_how(call.how())
                 .with_set(Some(new_set.cast()))
@@ -1440,9 +1508,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_sigsetsize(call.sigsetsize());
             // Keep returning to the handler so post_handler_hook can run, but
             // do not expose a tracer preemption as ERESTARTSYS to the guest.
-            Ok(guest.inject_with_retry(modified_call).await?)
+            let result = guest.inject_with_retry(modified_call).await;
+            (
+                result.map_err(Into::into),
+                ValidatedSet::Validated(set_mask),
+            )
         } else {
-            Ok(guest.inject_with_retry(call).await?)
+            let result = guest.inject_with_retry(call).await;
+            (result.map_err(Into::into), ValidatedSet::NotValidated)
         }
     }
 
@@ -3576,10 +3649,20 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
+/// What [`Detcore::rt_sigprocmask_inner`] knows of the set the kernel used.
+enum ValidatedSet {
+    /// The kernel read and accepted this set before Detcore injected the call.
+    Validated(KernelSigset),
+    /// Detcore injected nothing: its own read of the set failed first.
+    NotRun,
+    /// The call ran as the guest made it; only the kernel read its set.
+    NotValidated,
+}
+
 /// The offset of `uc_sigmask` in the x86-64 kernel `ucontext` that
 /// `rt_sigreturn` restores: after uc_flags (8), uc_link (8), uc_stack (24) and
 /// uc_mcontext (256 bytes).
-const UC_SIGMASK_OFFSET: usize = 8 + 8 + 24 + 256;
+pub(super) const UC_SIGMASK_OFFSET: usize = 8 + 8 + 24 + 256;
 
 fn should_notify_cross_task_signal(sender: DetTid, target: DetTid, raw_signal: i32) -> bool {
     raw_signal != 0 && target != sender
