@@ -75,6 +75,14 @@ mod resources;
 mod scheduler;
 mod shared_open_files;
 mod sigalrm_phase1;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "A5 step 1a: the signal state lands before its recorders (step 1b)"
+    )
+)]
+mod signal_state;
 mod sock_diag;
 mod stat;
 mod syscall_classification;

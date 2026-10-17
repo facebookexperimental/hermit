@@ -2428,7 +2428,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_global::tests::an_exec_record_stands_only_where_the_kernel_names_it_or_the_launcher
     // and tool_global::tests::the_launch_image_goes_to_the_registered_roots_first_image_only:
     // 1932, executed.
-    ("test.detcore_unit", 1932),
+    // And the 24 signal_state::tests of audit step A5's shadow signal state
+    // (https://github.com/rrnewton/hermit/issues/4485): 1956, listed.
+    ("test.detcore_unit", 1956),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4211,7 +4213,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // A6: explicit timer refusals and separate configuration/timer reporting; re-listed.
     // And +1 from 2447c8e8: 1927.
     // And the same five exec-record tests: 1932, executed.
-    ("test.detcore_unit_on_host", 1932),
+    // And the same 24 A5 signal_state tests: 1956, listed.
+    ("test.detcore_unit_on_host", 1956),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
