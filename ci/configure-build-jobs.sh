@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# CARRY TO ae40c7f1 (2026-10-16): 51ecc8fb..ae40c7f1 adds a facts-only
+# Guest runtime-FD query and normalizes the existing RPC owner to physical PID.
+# Native C/CMake/vendor/SDK inputs and seven SDK object IDs are unchanged.
+# Existing CPU, memory and parallel-job limits carry without recalibration;
+# fresh Rust consumers and runtime checks remain required.
 # Shared inner-build width for every Hermit CI DAG launch path.
 #
 # The outer safe-ci cpu.max is a containment ceiling, not a request for Cargo to
@@ -1868,8 +1873,8 @@ fi
 # source and DBT inventory 961 remain unchanged. The calibrated SDK budget,
 # job width and limits carry without increase; final runtime/source-closure
 # checks must bind this composition rather than older receipts.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 51ecc8fb0c7b38ff03ce1596d765a9a0055e7d09 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 51ecc8fb0c7b38ff03ce1596d765a9a0055e7d09 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 3137866aa09275237db3715eadeca3c756751c1c ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 3137866aa09275237db3715eadeca3c756751c1c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

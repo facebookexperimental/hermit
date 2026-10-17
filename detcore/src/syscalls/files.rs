@@ -10281,22 +10281,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Getdents,
     ) -> Result<i64, Error> {
-        if !guest.config().virtualize_metadata {
+        let virtualize = guest.config().virtualize_metadata;
+        if !virtualize
+            && (call.dirent().is_none()
+                || !self.is_caller_descriptor_table(guest, call.fd() as i32))
+        {
             return Ok(self.record_or_replay(guest, call).await?);
         }
         let buf = call.dirent().ok_or(Errno::EFAULT)?.cast::<u8>();
-        self.serve_directory_stream(
-            guest,
-            GetdentsCall {
-                call: Syscall::from(call),
-                empty: Syscall::from(call.with_count(0)),
-                fd: call.fd() as i32,
-                buf,
-                capacity: call.count() as usize,
-                format: DirentFormat::Legacy,
-            },
-        )
-        .await
+        let call = GetdentsCall {
+            call: Syscall::from(call),
+            empty: Syscall::from(call.with_count(0)),
+            fd: call.fd() as i32,
+            buf,
+            capacity: call.count() as usize,
+            format: DirentFormat::Legacy,
+        };
+        if virtualize {
+            self.serve_directory_stream(guest, call).await
+        } else {
+            self.project_one_buffer(guest, call).await
+        }
     }
 
     /// getdents64 system call.
@@ -10305,22 +10310,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Getdents64,
     ) -> Result<i64, Error> {
-        if !guest.config().virtualize_metadata {
+        let virtualize = guest.config().virtualize_metadata;
+        if !virtualize
+            && (call.dirent().is_none()
+                || !self.is_caller_descriptor_table(guest, call.fd() as i32))
+        {
             return Ok(self.record_or_replay(guest, call).await?);
         }
         let buf = call.dirent().ok_or(Errno::EFAULT)?.cast::<u8>();
-        self.serve_directory_stream(
-            guest,
-            GetdentsCall {
-                call: Syscall::from(call),
-                empty: Syscall::from(call.with_count(0)),
-                fd: call.fd() as i32,
-                buf,
-                capacity: call.count() as usize,
-                format: DirentFormat::Dirent64,
-            },
-        )
-        .await
+        let call = GetdentsCall {
+            call: Syscall::from(call),
+            empty: Syscall::from(call.with_count(0)),
+            fd: call.fd() as i32,
+            buf,
+            capacity: call.count() as usize,
+            format: DirentFormat::Dirent64,
+        };
+        if virtualize {
+            self.serve_directory_stream(guest, call).await
+        } else {
+            self.project_one_buffer(guest, call).await
+        }
     }
 
     /// Answer a `getdents` call from the open file's sorted directory stream
@@ -10350,7 +10360,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(Errno::EBADF) if negative => {
                 return self.serve_negative_count(guest, call, None).await;
             }
-            Err(Errno::EBADF) => return self.sort_one_buffer(guest, call).await,
+            Err(Errno::EBADF) => return self.project_one_buffer(guest, call).await,
             Err(errno) => return Err(errno.into()),
         };
         let _serving = lock.lock().await;
@@ -10371,7 +10381,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self.serve_negative_count(guest, call, stream).await;
         }
         if host_order {
-            return self.sort_one_buffer(guest, call).await;
+            return self.project_one_buffer(guest, call).await;
         }
         if !needs_snapshot {
             return self.serve_next_batch(guest, call).await;
@@ -10411,7 +10421,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest
                     .thread_state()
                     .with_detfd(call.fd, |detfd| detfd.use_host_directory_order())?;
-                self.sort_one_buffer(guest, call).await
+                self.project_one_buffer(guest, call).await
             }
             Err(error) => Err(error),
         }
@@ -11021,15 +11031,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         // tasks, KVM, or is unreadable after a `chroot`).
         let tool_sees_caller =
             crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend);
-        let on_procfs = match (
-            tool_sees_caller
-                .then(|| std::fs::metadata(&link).ok())
-                .flatten(),
-            rendered_procfs::proc_device(),
-        ) {
+        let directory_metadata = tool_sees_caller
+            .then(|| std::fs::metadata(&link).ok())
+            .flatten();
+        let on_procfs = match (&directory_metadata, rendered_procfs::proc_device()) {
             (Some(metadata), Some(device)) => metadata.dev() == device,
             _ => false,
         };
+        if self.is_caller_descriptor_table(guest, fd) {
+            entries.retain(|entry| {
+                !runtime_owned_descriptor_entry(&entry.name, |fd| guest.is_runtime_owned_fd(fd))
+            });
+        }
         // The kernel's path for the descriptor; or, where the tool cannot
         // read it (after a `chroot` into a root without `/proc`, where the
         // tool runs inside the guest), the path the guest opened it by.
@@ -11062,9 +11075,46 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Whether the opened procfs object names the caller's own descriptor
+    /// table. Authenticate kernel object identity, not the guest spelling:
+    /// an inherited directory may belong to a different process. Process and
+    /// thread aliases have distinct inodes; the process alias requires the
+    /// existing shared-table proof. Independent of metadata virtualization.
+    fn is_caller_descriptor_table<G: Guest<Self>>(&self, guest: &G, fd: RawFd) -> bool {
+        if self.cfg.recordreplay_modes
+            || !crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend)
+        {
+            return false;
+        }
+        let link = format!("{}/fd/{fd}", self.caller_proc_directory(guest));
+        let directory_metadata = std::fs::metadata(link).ok();
+        let on_procfs = match (&directory_metadata, rendered_procfs::proc_device()) {
+            (Some(metadata), Some(device)) => metadata.dev() == device,
+            _ => false,
+        };
+        let state = guest.thread_state();
+        let holds_process_table =
+            state.dettid == self.own_detpid(guest) || state.holds_process_files();
+        let process = if self.cfg.backend.tool_shares_guest_descriptor_table {
+            String::from("/proc/self")
+        } else {
+            format!("/proc/{}", guest.pid().as_raw())
+        };
+        on_procfs
+            && directory_metadata.as_ref().is_some_and(|metadata| {
+                is_caller_descriptor_directory(
+                    metadata,
+                    &self.caller_proc_directory(guest),
+                    holds_process_table.then_some(process.as_str()),
+                )
+            })
+    }
+
     /// Answer `getdents` without a directory stream by issuing the guest's own
-    /// call, sorting the entries of that one kernel buffer and determinizing
-    /// their inodes. The host's `d_off` cookies are kept, so the kernel can
+    /// call. With metadata virtualization, sort that kernel buffer and
+    /// determinize its inodes. Without it, only omit runtime-owned entries
+    /// from an authenticated caller descriptor table; keep host order and
+    /// inodes. The host's `d_off` cookies are kept, so the kernel can
     /// still interpret them. A directory larger than one buffer comes back as
     /// sorted runs whose boundaries depend on the host.
     ///
@@ -11075,16 +11125,26 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// call or one it reissued, are zeroed, as they may name the entries
     /// dropped; so is a buffer every dropped entry was written to when the
     /// directory then ends.
-    async fn sort_one_buffer<G: Guest<Self>>(
+    async fn project_one_buffer<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: GetdentsCall<'_>,
     ) -> Result<i64, Error> {
         // The longest any call wrote: a reissued call can write less than the
         // one before it, whose dropped names lie past it.
+        let virtualize = guest.config().virtualize_metadata;
         let mut written = 0;
+        let mut dropped = false;
         let (len, mut entries) = loop {
-            let len = self.record_or_replay(guest, call.call).await? as usize;
+            let len = match self.record_or_replay(guest, call.call).await {
+                Ok(len) => len as usize,
+                Err(error) => {
+                    if written > 0 {
+                        guest.memory().write_exact(call.buf, &vec![0; written])?;
+                    }
+                    return Err(error.into());
+                }
+            };
             if len == 0 {
                 if written > 0 {
                     guest.memory().write_exact(call.buf, &vec![0; written])?;
@@ -11092,19 +11152,45 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Ok(0);
             }
             written = written.max(len);
-            let mut entries = read_records(&guest.memory(), call.buf, len, call.format)?;
-            self.drop_absent_entries(guest, call.fd, &mut entries);
+            let mut entries = match read_records(&guest.memory(), call.buf, len, call.format) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    guest.memory().write_exact(call.buf, &vec![0; written])?;
+                    return Err(error.into());
+                }
+            };
+            if virtualize {
+                self.drop_absent_entries(guest, call.fd, &mut entries);
+            } else {
+                let original = entries.len();
+                entries.retain(|entry| {
+                    !runtime_owned_descriptor_entry(&entry.name, |fd| guest.is_runtime_owned_fd(fd))
+                });
+                if entries.len() == original && !dropped {
+                    return Ok(len as i64);
+                }
+                dropped = true;
+            }
             if !entries.is_empty() {
                 break (len, entries);
             }
         };
-        sort_dir_entries(&mut entries);
-        let inodes = self.directory_inodes(guest, call.fd).await?;
+        let inodes = if virtualize {
+            sort_dir_entries(&mut entries);
+            Some(self.directory_inodes(guest, call.fd).await?)
+        } else {
+            None
+        };
         let mut records = Vec::with_capacity(len);
         for entry in &entries {
+            let Some(inodes) = &inodes else {
+                call.format
+                    .encode(entry, entry.ino, entry.off, &mut records);
+                continue;
+            };
             let (host, path) = inodes.entry_inode(&entry.name, entry.ino);
             let d_ino = match self.rendered_listed_inode(
-                &inodes,
+                inodes,
                 &entry.name,
                 entry.ino,
                 self.rendered_files(guest),
@@ -11724,6 +11810,31 @@ fn user_address_end() -> usize {
     })
 }
 
+/// Authenticate the current task's FD/fdinfo directory by kernel object
+/// identity, including symlink/bind aliases, without interpreting guest PIDs.
+fn is_caller_descriptor_directory(
+    observed: &std::fs::Metadata,
+    caller: &str,
+    process: Option<&str>,
+) -> bool {
+    [Some(caller), process].into_iter().flatten().any(|owner| {
+        ["fd", "fdinfo"].into_iter().any(|kind| {
+            std::fs::metadata(format!("{owner}/{kind}")).is_ok_and(|expected| {
+                observed.dev() == expected.dev() && observed.ino() == expected.ino()
+            })
+        })
+    })
+}
+
+fn runtime_owned_descriptor_entry(name: &[u8], owns: impl FnOnce(RawFd) -> bool) -> bool {
+    !name.is_empty()
+        && name.iter().all(u8::is_ascii_digit)
+        && std::str::from_utf8(name)
+            .ok()
+            .and_then(|name| name.parse::<RawFd>().ok())
+            .is_some_and(owns)
+}
+
 /// The signals a signalfd reads, from its `/proc/<pid>/fdinfo` entry.
 fn signalfd_sigmask(pid: i32, fd: i32) -> Option<u64> {
     let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
@@ -11779,8 +11890,8 @@ mod guest_proc_visibility_tests {
     /// With this process's own pipe and file, those read the links. KVM, whose
     /// guest is not a host task, never consults them and gives the helpers'
     /// "unknown" answers.
-    #[test]
-    fn host_proc_links_are_read_except_under_kvm() {
+    #[tokio::test]
+    async fn host_proc_links_are_read_except_under_kvm() {
         let pid = std::process::id() as i32;
         let (reader, _writer) = nix::unistd::pipe().unwrap();
         let alias = nix::unistd::dup(&reader).unwrap();
@@ -11811,6 +11922,49 @@ mod guest_proc_visibility_tests {
             &[pipe_fd]
         ));
         assert_eq!(resolved_open_path(&kvm, pid, file_fd), None);
+
+        // Runtime ownership is exact: ordinary high application descriptors
+        // remain visible, and a directory merely named "fd" is not procfs.
+        for name in [
+            b"1023".as_slice(),
+            b"1025",
+            b"4096",
+            b".",
+            b"..",
+            b"+1024",
+            b"2147483648",
+        ] {
+            assert!(!super::runtime_owned_descriptor_entry(name, |fd| fd == 1024));
+        }
+        assert!(super::runtime_owned_descriptor_entry(b"1024", |fd| fd == 1024));
+        assert!(!super::runtime_owned_descriptor_entry(b"1024", |_| false));
+        for kind in ["fd", "fdinfo"] {
+            let thread = std::fs::metadata(format!("/proc/thread-self/{kind}")).unwrap();
+            let process = std::fs::metadata(format!("/proc/self/{kind}")).unwrap();
+            assert!(super::is_caller_descriptor_directory(
+                &thread,
+                "/proc/thread-self",
+                None
+            ));
+            assert!(!super::is_caller_descriptor_directory(
+                &process,
+                "/proc/thread-self",
+                None
+            ));
+            assert!(super::is_caller_descriptor_directory(
+                &process,
+                "/proc/thread-self",
+                Some("/proc/self")
+            ));
+        }
+        let ordinary = tempfile::tempdir().unwrap();
+        let metadata = std::fs::metadata(ordinary.path()).unwrap();
+        assert!(!super::is_caller_descriptor_directory(
+            &metadata,
+            "/proc/thread-self",
+            Some("/proc/self")
+        ));
+        super::inject_fstat_scratch::raw_directory_projection().await;
     }
 }
 
@@ -13588,6 +13742,8 @@ mod inject_fstat_scratch {
         unmapped: Vec<(usize, usize)>,
         /// Descriptors closed through injection.
         closed: Vec<RawFd>,
+        runtime_fd: Option<RawFd>,
+        directory_batches: std::collections::VecDeque<Result<Vec<u8>, Errno>>,
     }
 
     impl ScriptedGuest {
@@ -13613,6 +13769,8 @@ mod inject_fstat_scratch {
                 mapped: Vec::new(),
                 unmapped: Vec::new(),
                 closed: Vec::new(),
+                runtime_fd: None,
+                directory_batches: Default::default(),
             };
             (tool, guest)
         }
@@ -13645,6 +13803,9 @@ mod inject_fstat_scratch {
         fn ppid(&self) -> Option<Pid> {
             None
         }
+        fn is_runtime_owned_fd(&self, fd: RawFd) -> bool {
+            self.runtime_fd == Some(fd)
+        }
         fn memory(&self) -> Self::Memory {
             LocalMemory::new()
         }
@@ -13670,6 +13831,18 @@ mod inject_fstat_scratch {
         async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
             let (number, args) = syscall.into_parts();
             self.injected.push(number);
+            if matches!(number, Sysno::getdents | Sysno::getdents64) {
+                let bytes = self
+                    .directory_batches
+                    .pop_front()
+                    .expect("scripted getdents")?;
+                assert!(bytes.len() <= args.arg2);
+                if !bytes.is_empty() {
+                    let buffer = AddrMut::from_raw(args.arg1).unwrap();
+                    self.memory().write_exact(buffer, &bytes)?;
+                }
+                return Ok(bytes.len() as i64);
+            }
             // SAFETY: each arm runs the syscall Detcore asked for against this
             // process, on addresses Detcore obtained from this guest.
             let raw = match Syscall::from_raw(number, args) {
@@ -13734,6 +13907,124 @@ mod inject_fstat_scratch {
         }
         fn read_clock(&mut self) -> Result<u64, Error> {
             panic!("fd registration must not read a clock")
+        }
+    }
+
+    pub(super) async fn raw_directory_projection() {
+        use std::os::fd::AsRawFd;
+        let directory = std::fs::File::open("/proc/self/fd").unwrap();
+        for format in [DirentFormat::Legacy, DirentFormat::Dirent64] {
+            let entries = [
+                DirEntry {
+                    ino: 91,
+                    off: 29,
+                    name: b"40960".to_vec(),
+                    ty: 8,
+                },
+                DirEntry {
+                    ino: 92,
+                    off: 17,
+                    name: b"1024".to_vec(),
+                    ty: 10,
+                },
+                DirEntry {
+                    ino: 93,
+                    off: 31,
+                    name: b"1023".to_vec(),
+                    ty: 8,
+                },
+            ];
+            let encode = |rows: &[DirEntry]| {
+                let mut bytes = Vec::new();
+                for entry in rows {
+                    format.encode(entry, entry.ino, entry.off, &mut bytes);
+                }
+                bytes
+            };
+            let mut unmodified = encode(&entries[..1]);
+            for at in format.name_offset() + entries[0].name.len() + 1..unmodified.len() {
+                if at != format.type_offset(unmodified.len()) {
+                    unmodified[at] = 0x7c;
+                }
+            }
+            for (batches, expected, calls) in [
+                (
+                    vec![Ok(encode(&entries))],
+                    Ok(encode(&[entries[0].clone(), entries[2].clone()])),
+                    1,
+                ),
+                (
+                    vec![Ok(encode(&entries[1..2])), Ok(encode(&entries[..1]))],
+                    Ok(encode(&entries[..1])),
+                    2,
+                ),
+                (
+                    vec![Ok(encode(&entries[1..2])), Ok(Vec::new())],
+                    Ok(Vec::new()),
+                    2,
+                ),
+                (
+                    vec![Ok(encode(&entries[1..2])), Err(Errno::EIO)],
+                    Err(Errno::EIO),
+                    2,
+                ),
+                (vec![Ok(unmodified.clone())], Ok(unmodified.clone()), 1),
+            ] {
+                let (_, mut guest) = ScriptedGuest::new(true, false);
+                guest.config.virtualize_metadata = false;
+                guest.config.backend = reverie::BackendCapabilities::DBT;
+                guest.runtime_fd = Some(1024);
+                let written = batches
+                    .iter()
+                    .filter_map(|batch| batch.as_ref().ok().map(Vec::len))
+                    .max()
+                    .unwrap();
+                let untouched = expected.as_ref().is_ok_and(|bytes| bytes == &unmodified);
+                guest.directory_batches = batches.into();
+                let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+                let mut bytes = vec![0xa5; 512];
+                let buffer: AddrMut<u8> = AddrMut::from_raw(bytes.as_mut_ptr() as usize).unwrap();
+                let result = match format {
+                    DirentFormat::Legacy => {
+                        tool.handle_getdents(
+                            &mut guest,
+                            syscalls::Getdents::new()
+                                .with_fd(directory.as_raw_fd() as u32)
+                                .with_dirent(Some(buffer.cast()))
+                                .with_count(bytes.len() as u32),
+                        )
+                        .await
+                    }
+                    DirentFormat::Dirent64 => {
+                        tool.handle_getdents64(
+                            &mut guest,
+                            syscalls::Getdents64::new()
+                                .with_fd(directory.as_raw_fd() as u32)
+                                .with_dirent(Some(buffer.cast()))
+                                .with_count(bytes.len() as u32),
+                        )
+                        .await
+                    }
+                };
+                assert_eq!(guest.injected.len(), calls, "{format:?}");
+                assert!(bytes[written..].iter().all(|byte| *byte == 0xa5));
+                match expected {
+                    Ok(expected) => {
+                        assert_eq!(result.unwrap(), expected.len() as i64, "{format:?}");
+                        assert_eq!(&bytes[..expected.len()], expected, "{format:?}");
+                        if !untouched {
+                            assert!(bytes[expected.len()..written].iter().all(|byte| *byte == 0));
+                        }
+                    }
+                    Err(expected) => {
+                        assert!(
+                            matches!(result, Err(Error::Errno(actual)) if actual == expected),
+                            "{format:?}: {result:?}"
+                        );
+                        assert!(bytes[..format.record_len(4)].iter().all(|byte| *byte == 0));
+                    }
+                }
+            }
         }
     }
 
