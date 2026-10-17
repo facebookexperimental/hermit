@@ -1686,7 +1686,12 @@ corpus:
     - {label: "jq", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "jq"]}
     - {label: "xmllint", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "xmllint"]}
     - {label: "bash", argv: ["bash", "-c", "for i in 1 2 3; do echo \"$i\"; done"]}
-    - {label: "shell-build", argv: ["bash", "{{ROOT_DIR}}/tests/compat/complex_shell_workload.sh", "{{VALIDATE_RUN_STATE}}/strict-compat/shell-build"]}
+    # shell-build names no work directory: the script makes its own with mktemp
+    # in the guest's private /tmp. A path below {{VALIDATE_RUN_STATE}} is one
+    # directory for the whole run, so its ptrace and kvm cells, which the Cargo
+    # route's bucket runs side by side, deleted each other's tree (both failed
+    # in every concurrent run; the Buck route gives every cell its own run state).
+    - {label: "shell-build", argv: ["bash", "{{ROOT_DIR}}/tests/compat/complex_shell_workload.sh"]}
     - {label: "cargo", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "cargo"]}
     - {label: "clang", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "clang"]}
     - {label: "ruby", argv: ["/usr/bin/ruby", "--disable-gems", "-e", "values = (1..5).map { |value| value * value }; raise \"unexpected squares\" unless values == [1, 4, 9, 16, 25]; puts values.join(\",\")"]}

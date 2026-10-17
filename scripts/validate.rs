@@ -13487,7 +13487,6 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     }
     for (label, path) in [
         ("seq", "/run-state/strict-compat/real-compat-fixtures"),
-        ("shell-build", "/run-state/strict-compat/shell-build"),
         ("top", "/run-state/strict-compat/top-home"),
     ] {
         let argv = rows
@@ -13498,6 +13497,19 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
                 "strict-compat bucket: {label} does not use its run-owned path {path}: {argv:?}"
             ));
         }
+    }
+    // shell-build deletes and rebuilds its work directory, so that directory must be the
+    // cell's own: the script's mktemp in the guest's private /tmp. A run-state path is shared
+    // by the row's ptrace and kvm cells, which the bucket runs concurrently, and they deleted
+    // each other's tree.
+    let shell_build = rows
+        .get("shell-build")
+        .ok_or("strict-compat bucket: path row shell-build is absent")?;
+    if contains(shell_build, "/run-state") {
+        return Err(format!(
+            "strict-compat bucket: shell-build names a run-state work directory, which its \
+             concurrent cells share: {shell_build:?}"
+        ));
     }
     if first.steps.iter().any(|step| {
         step.cmd.contains("scripts/validate.rs")
