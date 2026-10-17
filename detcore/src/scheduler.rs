@@ -95,7 +95,6 @@ use crate::ivar::Ivar;
 use crate::preemptions::PreemptionWriter;
 use crate::preemptions::read_trace;
 use crate::resources::ExternalOpId;
-use crate::resources::HOST_TIMED_INTERNAL_PIPE_IO_FYI;
 use crate::resources::LOOPBACK_POLL_YIELD_FYI;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
@@ -13036,14 +13035,6 @@ impl Scheduler {
             })
     }
 
-    /// A backend whose internal pipe turns are host-timed (today SaBRe) discovers an
-    /// inherited stdio pipe as a device resource before the inner
-    /// `InternalIOPolling` request. Both turns belong to one host-timing-sensitive pipe
-    /// operation, so their logical-time logging must use the same retry normalization.
-    fn is_host_timed_internal_pipe_io_turn(&self, rsrcs: &Resources) -> bool {
-        rsrcs.fyi == HOST_TIMED_INTERNAL_PIPE_IO_FYI
-    }
-
     /// A strong yield issued, on a backend whose loopback pollers yield to their peers
     /// (today SaBRe), before a zero-timeout poll while the task owns a
     /// loopback connection. Its count is kernel-readiness timing, not guest-visible progress.
@@ -13094,11 +13085,7 @@ impl Scheduler {
         // between runs, but those are numerically normalized before comparison.
         let last_turn_was_polling = last_turn
             .as_ref()
-            .map(|resources| {
-                Self::is_polling_turn(resources)
-                    || self.is_host_timed_internal_pipe_io_turn(resources)
-                    || self.is_loopback_poll_yield_turn(resources)
-            })
+            .map(Self::is_polling_turn)
             .unwrap_or(false);
 
         // A turn that only delivers signals to the thread whose committed turn
@@ -13267,18 +13254,9 @@ impl Scheduler {
                 // (the order rule at `detlog::set_forwarded_source`).
                 crate::detlog::write_forwarded_for(next_dtid.as_raw(), true);
                 self.chaos_passed_over.remove(&next_dtid);
-                let normalization_marker = if self.is_host_timed_internal_pipe_io_turn(rsrcs) {
-                    " [sabre-internal-pipe-io]"
-                } else if self.is_loopback_poll_yield_turn(rsrcs) {
-                    " [sabre-loopback-poll-zero-timeout]"
-                } else {
-                    ""
-                };
                 if enabled!(Level::INFO) {
                     let internal_io_poll =
-                        rsrcs.resources.contains_key(&ResourceID::InternalIOPolling)
-                            || self.is_host_timed_internal_pipe_io_turn(rsrcs)
-                            || self.is_loopback_poll_yield_turn(rsrcs);
+                        rsrcs.resources.contains_key(&ResourceID::InternalIOPolling);
                     let runtime_maps_read = rsrcs.resources.keys().any(|resource| {
                         matches!(
                             resource,
@@ -13293,13 +13271,8 @@ impl Scheduler {
                         runtime_maps_read,
                     );
                     info!(
-                        "[sched-step5] >>>>>>>\n\n COMMIT turn {}, dettid {} using resources {:?}, on previously committed {}{}{}",
-                        self.turn,
-                        next_dtid,
-                        rsrcs.resources,
-                        self.committed_time,
-                        normalization_marker,
-                        record_suffix,
+                        "[sched-step5] >>>>>>>\n\n COMMIT turn {}, dettid {} using resources {:?}, on previously committed {}{}",
+                        self.turn, next_dtid, rsrcs.resources, self.committed_time, record_suffix,
                     );
                 }
                 self.forget_pipe_handoff(next_dtid);

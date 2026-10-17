@@ -27,20 +27,19 @@ use crate::types::MmId;
 use crate::types::RcbTimeMultiplier;
 use crate::types::SigWrapper;
 
-/// Identifies the outer resource turn for a physically nonblocking, guest-internal pipe
+/// Names the outer resource turn for a physically nonblocking, guest-internal pipe
 /// operation on a backend whose internal pipe turns are host-timed
 /// (`BackendCapabilities::internal_pipe_turns_are_host_timed`; today only SaBRe). Such a
 /// backend reports these inherited stdio pipes as device resources before Detcore's
-/// `InternalIOPolling` turn, so the scheduler tags the outer turn for the same retry-count
-/// normalization as the polling turn itself. The string value is a DETLOG marker that the log
-/// verifier matches, so it keeps its historical name.
+/// `InternalIOPolling` turn. The name is descriptive only: the log comparison counts these
+/// turns like any other.
 pub(crate) const HOST_TIMED_INTERNAL_PIPE_IO_FYI: &str = "sabre-internal-pipe-io";
 
 /// Identifies the strong one-turn yield issued before a task with a loopback peer performs
 /// a zero-timeout poll, on a backend whose loopback pollers yield to their peers
-/// (`BackendCapabilities::loopback_pollers_yield_to_peers`; today only SaBRe). The string value
-/// is a DETLOG marker that the log verifier matches, so it keeps its historical name. The number of these guest polling-loop iterations depends on when the
-/// peer's kernel readiness becomes visible, so the verifier normalizes their scheduler-only turns.
+/// (`BackendCapabilities::loopback_pollers_yield_to_peers`; today only SaBRe). The scheduler
+/// keeps such a yield's one-turn exclusion even under chaos (`Scheduler::requeue_after`). The
+/// log comparison counts these turns like any other.
 pub(crate) const LOOPBACK_POLL_YIELD_FYI: &str = "sabre-loopback-poll-zero-timeout";
 
 /// Identifies an emulated `pause` request (`SleepUntil(INDEFINITE)`), which a SIGALRM

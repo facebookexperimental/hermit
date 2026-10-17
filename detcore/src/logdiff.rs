@@ -797,26 +797,18 @@ fn is_detlog(message: &LogMessage<'_>) -> bool {
 /// comparison consistent and focused on guest-observable events (the actual syscall
 /// results, still compared via their DETLOG entries).
 ///
-/// SaBRe's inherited stdio pipes emit an outer device-resource turn before the inner polling
-/// turn. The scheduler tags that outer turn with `[sabre-internal-pipe-io]`; it is the same
-/// host-timing-sensitive operation and is normalized here as well. A SaBRe task with a loopback
-/// peer similarly tags the strong yield before each zero-timeout poll with
-/// `[sabre-loopback-poll-zero-timeout]`. The scheduler additionally suppresses the per-retry
-/// "advance global time for scheduler turn" DETLOG line for these turns at the source (see
-/// `Scheduler::bump_global_time`), so the two mechanisms together make the deterministic
-/// comparison insensitive to host-timing-dependent polling-loop counts.
+/// Only these grants are excluded. SaBRe's outer device-resource turn for an inherited stdio
+/// pipe, and the strong yield a SaBRe task with a loopback peer takes before each zero-timeout
+/// poll, were once tagged `[sabre-internal-pipe-io]` and `[sabre-loopback-poll-zero-timeout]`
+/// and excluded too, which hid how many of them a run took. They are compared like any other
+/// turn now: a SaBRe run whose count of them depends on host timing shows it as a divergence.
 fn is_internal_io_poll_commit(message: &LogMessage<'_>) -> bool {
     match message.event {
         Some(DetLogEvent::SchedulerCommit {
             internal_io_poll, ..
         }) => internal_io_poll,
         Some(_) => false,
-        None => {
-            historical_is_commit(message.text)
-                && (message.text.contains("{InternalIOPolling: ")
-                    || message.text.contains(" [sabre-internal-pipe-io]")
-                    || message.text.contains(" [sabre-loopback-poll-zero-timeout]"))
-        }
+        None => historical_is_commit(message.text) && message.text.contains("{InternalIOPolling: "),
     }
 }
 
@@ -4112,55 +4104,29 @@ mod test {
     }
 
     #[test]
-    fn test_filter_deterministic_drops_sabre_internal_pipe_resource_turn() {
+    /// A SaBRe turn once tagged `[sabre-internal-pipe-io]` is compared like any other turn:
+    /// the comparison no longer hides how many of them a run took.
+    fn test_filter_deterministic_keeps_sabre_internal_pipe_resource_turns() {
         let opts = super::LogDiffOpts::default();
-        let v = opts.filter_deterministic(&[
-            historical(
-                0,
-                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 1s [sabre-internal-pipe-io]",
-            ),
-            historical(
-                1,
-                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 2s",
-            ),
-        ]);
+        let tagged = "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 1s [sabre-internal-pipe-io]";
+        let untagged = "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 2s";
+        let v = opts.filter_deterministic(&[historical(0, tagged), historical(1, untagged)]);
 
-        assert_eq!(
-            indexed_text(&v),
-            vec![(
-                1,
-                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 2s"
-            )]
-        );
+        assert_eq!(indexed_text(&v), vec![(0, tagged), (1, untagged)]);
     }
 
     #[test]
-    fn test_filter_deterministic_drops_sabre_loopback_poll_yield() {
+    /// A SaBRe turn once tagged `[sabre-loopback-poll-zero-timeout]` is compared like any other turn:
+    /// the comparison no longer hides how many of them a run took.
+    fn test_filter_deterministic_keeps_sabre_loopback_poll_yields() {
         let opts = super::LogDiffOpts::default();
-        let v = opts.filter_deterministic(&[
-            historical(
-                0,
-                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {SchedYield: W}, on previously committed 1s [sabre-loopback-poll-zero-timeout]",
-            ),
-            historical(
-                1,
-                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {SchedYield: W}, on previously committed 2s",
-            ),
-        ]);
+        let tagged = "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {SchedYield: W}, on previously committed 1s [sabre-loopback-poll-zero-timeout]";
+        let untagged = "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {SchedYield: W}, on previously committed 2s";
+        let v = opts.filter_deterministic(&[historical(0, tagged), historical(1, untagged)]);
 
-        assert_eq!(
-            indexed_text(&v),
-            vec![(
-                1,
-                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {SchedYield: W}, on previously committed 2s"
-            )]
-        );
+        assert_eq!(indexed_text(&v), vec![(0, tagged), (1, untagged)]);
     }
 
-    /// Regression: two runs that differ only in how many nonblocking-IO poll retries occurred
-    /// must compare as deterministic, while a genuine guest-observable divergence must still be
-    /// reported. `run_b` below performs one extra poll retry (an extra InternalIOPolling COMMIT
-    /// plus its committed_time advance) but the guest syscalls are identical.
     #[test]
     fn test_log_diff_ignores_extra_io_poll_retries() -> std::io::Result<()> {
         let common_head = "2022-09-06T14:15:47.000000Z  INFO detcore: DETLOG [syscall][detcore, dtid 5] inbound syscall: poll(0x1000, 1, -1) = ?";
