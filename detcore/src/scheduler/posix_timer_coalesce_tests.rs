@@ -1457,7 +1457,7 @@ fn retiring_an_old_generations_early_entry_keeps_the_new_generation_waiting() {
 /// so the run is refused by name rather than the front retired (the Claude
 /// re-check of the in-flight-dequeue fix, B1).
 #[test]
-#[should_panic(expected = "another delivery had already taken that send's copy")]
+#[should_panic(expected = "another thread had already taken that send's copy")]
 fn a_blocked_resume_after_the_joined_copy_was_taken_is_refused() {
     let mut f = family();
     let sh = shared(&f);
@@ -1491,5 +1491,78 @@ fn a_blocked_resume_after_the_joined_copy_was_taken_is_refused() {
             thread_holds: false,
             process_holds: false,
         },
+    );
+}
+
+/// No early pop: a delivery resumed blocked with its queue clear at the stop's
+/// read requeues its copy into the empty queue, and the list still holds
+/// that front, so there is no refusal and the front stays listed, on either
+/// queue (the Claude re-check of the in-flight-dequeue fix at 6916a6a3, N1:
+/// the early-pop condition of the blocked-resume refusal).
+#[test]
+fn a_blocked_resume_without_an_early_pop_keeps_its_front() {
+    for shared_queue in [false, true] {
+        let mut f = family();
+        let q = if shared_queue {
+            shared(&f)
+        } else {
+            private(&f)
+        };
+        let bit = kernel_signal_bit(USR1);
+        let code = if shared_queue { 0 } else { -6 };
+        f.guest_send(q, ordinary_siginfo(USR1, code, 100, 1000));
+        if shared_queue {
+            f.queues(0, bit)
+        } else {
+            f.queues(bit, 0)
+        }
+        f.sched
+            .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(10)));
+        f.queues(0, 0);
+        f.sched.discarded_signal_control(
+            f.leader,
+            DiscardedSignalControl::Consumed {
+                signal: USR1,
+                how: Consumption::KeptResume { blocked: true },
+                thread_holds: false,
+                process_holds: false,
+            },
+        );
+        assert!(
+            matches!(f.entries(q).as_slice(), [Entry::Plain { .. }]),
+            "shared_queue={shared_queue}: {:?}",
+            f.entries(q)
+        );
+    }
+}
+
+/// After an early pop, a finish naming another signal and resumed blocked,
+/// with both queues clear for that signal, retires the mismatched pending
+/// dequeue (its timer re-arms) and is not refused (N1: the same-signal
+/// condition of the blocked-resume refusal).
+#[test]
+fn a_mismatched_blocked_finish_after_an_early_pop_retires() {
+    let mut f = family();
+    let pr = private(&f);
+    let bit = kernel_signal_bit(USR1);
+    f.arm(0, SignalTarget::Thread(f.leader), 10, 10);
+    f.pop(10);
+    f.queues(bit, 0);
+    f.sched
+        .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(15)));
+    f.queues(0, 0);
+    f.guest_send(pr, ordinary_siginfo(USR1, -6, 100, 1000));
+    f.sched.discarded_signal_control(
+        f.leader,
+        DiscardedSignalControl::Consumed {
+            signal: libc::SIGUSR2,
+            how: Consumption::KeptResume { blocked: true },
+            thread_holds: false,
+            process_holds: false,
+        },
+    );
+    assert!(
+        f.sched.blocked.timed_waiters.next_deadline().is_some(),
+        "the timer re-armed"
     );
 }

@@ -1159,7 +1159,7 @@ impl Scheduler {
             })
         {
             refuse(format_args!(
-                "hermit: thread {thread}'s delivery of signal {signal} was resumed blocked after a send had taken the place of its front in {:?}, and another delivery had already taken that send's copy: the kernel queues the requeued copy, which the model of pending entries cannot hold, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)",
+                "hermit: thread {thread}'s delivery of signal {signal} was resumed blocked after a send had taken the place of its front in {:?}, and another thread had already taken that send's copy (a delivery or an `rt_sigtimedwait`): the kernel queues the requeued copy, which the model of pending entries cannot hold, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)",
                 pending.queue
             ));
         }
