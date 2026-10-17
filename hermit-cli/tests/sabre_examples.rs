@@ -1048,6 +1048,82 @@ int main(void) {
     );
 }
 
+/// Detcore answers a SIGSTKFLT handler with success but does not install it
+/// (the backends reserve that signal; refusing would break the Go runtime). It
+/// announces that once per run, in Hermit's own diagnostics: here a parent
+/// sets the handler twice and a forked child once more, on ptrace and SaBRe.
+#[test]
+fn sigstkflt_handler_not_installed_is_announced_once_per_run() {
+    const GUEST: &str = r#"
+#include <signal.h>
+#include <stdio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static void handler(int signo) { (void)signo; }
+
+static int set_handler(void) {
+  struct sigaction action = {0};
+  action.sa_handler = handler;
+  return sigaction(SIGSTKFLT, &action, NULL);
+}
+
+int main(void) {
+  int first = set_handler();
+  int second = set_handler();
+  pid_t child = fork();
+  if (child == 0) _exit(set_handler() == 0 ? 0 : 1);
+  int status = 0;
+  waitpid(child, &status, 0);
+  printf("sigaction %d %d child %d\n", first, second, WEXITSTATUS(status));
+  return 0;
+}
+"#;
+    const ANNOUNCEMENT: &str = "HERMIT_SIGNAL_HANDLER_NOT_INSTALLED signum=16 (SIGSTKFLT)";
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-sigstkflt-announce-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest(dir.path(), "sigstkflt_announce", GUEST);
+    let mut stdouts = Vec::new();
+    for (backend, label) in [(None, "ptrace"), (Some(loader.as_path()), "SaBRe")] {
+        let log = tempfile::Builder::new()
+            .prefix("sigstkflt-announce-")
+            .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create the diagnostic log");
+        let (_file, log) = log.keep().expect("failed to keep the diagnostic log");
+        let output = run_bounded(
+            example_command(&guest, &[], backend, false, Some(&log), None),
+            &format!("{label} SIGSTKFLT announcement"),
+            Some(&log),
+        );
+        assert!(output.status.success(), "{label}: {output:?}");
+        let diagnostics = controller_diagnostics(Some(&log));
+        assert_eq!(
+            diagnostics.matches(ANNOUNCEMENT).count(),
+            1,
+            "{label} must announce exactly once per run:\n{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("did not install it"),
+            "{label}: {diagnostics}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains(ANNOUNCEMENT),
+            "{label}: the announcement must not reach the guest's own stderr"
+        );
+        stdouts.push(output.stdout);
+    }
+    assert_eq!(stdouts[0], stdouts[1], "guest output parity");
+    assert_eq!(
+        String::from_utf8_lossy(&stdouts[0]),
+        "sigaction 0 0 child 0\n"
+    );
+}
+
 /// A guest whose preinit code (which runs before the plugin can adopt the
 /// forwarding socket) closes the socket and points its own stderr at a file of
 /// its own. The plugin was asked for the socket and could not adopt it, so it

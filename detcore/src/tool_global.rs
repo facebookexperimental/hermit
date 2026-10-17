@@ -1147,6 +1147,10 @@ pub struct GlobalState {
     // Unsupported syscall names observed across every process in this run.
     unsupported_syscalls: Mutex<BTreeSet<String>>,
 
+    // Signals whose requested disposition Detcore did not install, already
+    // announced in this run (`GlobalRequest::AnnounceSignalHandlerNotInstalled`).
+    announced_handlers_not_installed: Mutex<BTreeSet<i32>>,
+
     // Why the fail-closed policy ended the run, from the Tool image that
     // refused (`GlobalRequest::PolicyRefusal`); the first report is kept.
     policy_refusal: Mutex<Option<String>>,
@@ -1439,6 +1443,7 @@ impl GlobalState {
             next_port: AtomicU16::new(range[0]),
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
+            announced_handlers_not_installed: Mutex::new(BTreeSet::new()),
             policy_refusal: Mutex::new(None),
             host_inputs: Mutex::new(Vec::new()),
             host_mutations: Mutex::new(BTreeSet::new()),
@@ -2593,6 +2598,17 @@ impl GlobalState {
                     warn!("failed to append unsupported-syscall report: {error}");
                 }
                 R::ReportUnsupportedSyscall(())
+            }
+            GlobalRequest::AnnounceSignalHandlerNotInstalled(signum) => {
+                if self
+                    .announced_handlers_not_installed
+                    .lock()
+                    .unwrap()
+                    .insert(signum)
+                {
+                    warn!("{}", signal_handler_not_installed_warning(signum));
+                }
+                R::AnnounceSignalHandlerNotInstalled(())
             }
             GlobalRequest::PrepareExec(process, mm, fd_blocking) => {
                 let mut sched = self.lock_rpc_scheduler(false).await;
@@ -5130,6 +5146,11 @@ pub enum GlobalRequest {
     /// Add a syscall to the run-wide unsupported-use summary.
     ReportUnsupportedSyscall(String),
 
+    /// A guest asked for a disposition of this signal that Detcore answered
+    /// with success but did not install. The coordinator announces it once per
+    /// signal per run.
+    AnnounceSignalHandlerNotInstalled(i32),
+
     /// The fail-closed policy is ending the run, for this reason. Sent just
     /// before the Tool image exits with `HERMIT_POLICY_REFUSAL_EXIT`, which on
     /// an in-guest backend ends only the guest process: the launcher reads the
@@ -5613,6 +5634,7 @@ pub enum GlobalResponse {
     ReleaseAllResources(()),
     // TODO-HUMAN-REVIEW(PR-643): Review this new Detcore global RPC response.
     ReportUnsupportedSyscall(()),
+    AnnounceSignalHandlerNotInstalled(()),
     PolicyRefusal(()),
     PrepareExec(()),
     CancelExec(()),
@@ -6032,6 +6054,37 @@ where
     )
     .await;
     assert_eq!(response, GlobalResponse::ReportUnsupportedSyscall(()));
+}
+
+/// The once-per-run WARN for a signal disposition a guest asked for and
+/// Detcore answered with success but did not install.
+pub(crate) fn signal_handler_not_installed_warning(signum: i32) -> String {
+    format!(
+        "HERMIT_SIGNAL_HANDLER_NOT_INSTALLED signum={signum} (SIGSTKFLT): the guest set a handler \
+         or SIG_IGN for it and rt_sigaction reported success, but Hermit did not install it, \
+         because the backend reserves SIGSTKFLT (Reverie's PMU preemption timer, SaBRe's \
+         controlled exit). A SIGSTKFLT the guest receives takes the default action. Hermit \
+         answers success on purpose so that programs that register it routinely, such as the \
+         Go runtime, still start."
+    )
+}
+
+/// Tells the coordinator a guest's disposition for `signum` was answered with
+/// success but not installed (`GlobalRequest::AnnounceSignalHandlerNotInstalled`).
+pub(crate) async fn announce_signal_handler_not_installed<G, T>(guest: &mut G, signum: i32)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = send_and_update_time(
+        guest,
+        GlobalRequest::AnnounceSignalHandlerNotInstalled(signum),
+    )
+    .await;
+    assert_eq!(
+        response,
+        GlobalResponse::AnnounceSignalHandlerNotInstalled(())
+    );
 }
 
 /// Tells the coordinator why the fail-closed policy is ending the run, before

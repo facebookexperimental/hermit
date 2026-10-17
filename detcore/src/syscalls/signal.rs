@@ -1138,16 +1138,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             None => None,
         };
 
-        // Both appropriated signals are reported here, at the one point where the
-        // guest states its expectation. SIGTRAP falls through to the ordinary
-        // path below (its handler really is installed; ptrace just eats the
-        // signal), so this must run before the SIGSTKFLT early return.
-        if let Some(action) = kernel_action {
+        // SIGTRAP is reported here, at the one point where the guest states its
+        // expectation: it falls through to the ordinary path below (its handler
+        // really is installed; ptrace just eats the signal).
+        // SIGSTKFLT's disposition is not installed at all; the branch below
+        // announces that once per run instead.
+        if let Some(action) = kernel_action
+            && call.signum() != reverie::PERF_EVENT_SIGNAL as i32
+        {
             warn_appropriated_signal(call.signum(), action.handler);
         }
 
         // PERF_EVENT_SIGNAL is reserved.
         if call.signum() == reverie::PERF_EVENT_SIGNAL as i32 {
+            // A kept fake success, announced: once per run, the coordinator
+            // names the signal and says the disposition was not installed.
+            if kernel_action.is_some_and(|action| action.handler != libc::SIG_DFL as u64) {
+                crate::tool_global::announce_signal_handler_not_installed(guest, call.signum())
+                    .await;
+            }
             // The go runtime attempts to register this (unused) signal handler.  We will never
             // deliver signals of this kind to the guest, so we just turn this action into a noop
             // rather than returning `Err(Errno::EINVAL.into())`. Preserve that established
