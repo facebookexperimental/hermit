@@ -1202,26 +1202,31 @@ fn an_early_popped_timer_entry_rearms_when_its_thread_exits() {
         f.sched.blocked.timed_waiters.next_deadline().is_none(),
         "the timer still waits for its entry's dequeue"
     );
-    f.sched.forget_pending_dequeue(f.leader);
+    // The thread's retirement, as the scheduler runs it.
+    let mm = crate::types::MmId::initial(f.process);
+    let (leader, process) = (f.leader, f.process);
+    f.sched.logically_kill_thread(&leader, &process, mm);
     assert!(
         f.sched.blocked.timed_waiters.next_deadline().is_some(),
         "the timer re-armed"
     );
 }
 
-/// A delivery resumed blocked requeues its copy, so Linux never consumed
-/// the front a send's early pop replaced: the merged record is refused by
-/// name rather than modelled wrongly.
+/// A delivery resumed blocked requeues its copy, which `legacy_queue` drops
+/// because the joined send's copy is pending: the kernel holds exactly the
+/// joined send, as the list does. The early-popped periodic timer entry is
+/// retired, so its timer re-arms (the Claude re-check of the in-flight-dequeue
+/// fix, R4).
 #[test]
-#[should_panic(expected = "was resumed blocked, which requeues it")]
-fn a_blocked_resume_after_an_early_pop_is_refused() {
+fn a_blocked_resume_after_an_early_pop_retires_the_entry() {
     let mut f = family();
     let pr = private(&f);
     let bit = kernel_signal_bit(USR1);
-    f.guest_send(pr, ordinary_siginfo(USR1, -6, 100, 1000));
+    f.arm(0, SignalTarget::Thread(f.leader), 10, 10);
+    f.pop(10);
     f.queues(bit, 0);
     f.sched
-        .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(10)));
+        .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(15)));
     f.queues(0, 0);
     f.guest_send(pr, ordinary_siginfo(USR1, -6, 100, 1000));
     f.queues(bit, 0);
@@ -1233,6 +1238,42 @@ fn a_blocked_resume_after_an_early_pop_is_refused() {
             thread_holds: true,
             process_holds: false,
         },
+    );
+    assert!(matches!(f.entries(pr).as_slice(), [Entry::Plain { .. }]));
+    assert!(
+        f.sched.blocked.timed_waiters.next_deadline().is_some(),
+        "the timer re-armed"
+    );
+}
+
+/// An early-popped periodic timer entry whose delivery's finish names
+/// another signal (the pending dequeue does not match) is retired, and its
+/// timer re-arms (the Claude re-check of the in-flight-dequeue fix, R3).
+#[test]
+fn an_early_popped_timer_entry_rearms_when_its_finish_names_another_signal() {
+    let mut f = family();
+    let pr = private(&f);
+    let bit = kernel_signal_bit(USR1);
+    f.arm(0, SignalTarget::Thread(f.leader), 10, 10);
+    f.pop(10);
+    f.queues(bit, 0);
+    f.sched
+        .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(15)));
+    f.queues(0, 0);
+    f.guest_send(pr, ordinary_siginfo(USR1, -6, 100, 1000));
+    assert!(f.sched.blocked.timed_waiters.next_deadline().is_none());
+    f.sched.discarded_signal_control(
+        f.leader,
+        DiscardedSignalControl::Consumed {
+            signal: libc::SIGUSR2,
+            how: Consumption::KeptResume { blocked: false },
+            thread_holds: false,
+            process_holds: false,
+        },
+    );
+    assert!(
+        f.sched.blocked.timed_waiters.next_deadline().is_some(),
+        "the timer re-armed"
     );
 }
 
@@ -1302,6 +1343,50 @@ fn a_second_delivery_of_the_joined_copy_is_no_unseen_consumer() {
             );
         }
         assert!(f.entries(sh).is_empty(), "sibling_first={sibling_first}");
+    }
+    // Three sends: copy 2 early-pops copy 1 into the leader's dequeue, the
+    // sibling's stop takes copy 2, and copy 3 early-pops copy 2 into the
+    // sibling's dequeue and stays queued. The leader's dequeue, whose own
+    // front was popped early, took no copy that is still listed, so copy 3
+    // is expected in the queue at both turns (the Claude re-check, R2).
+    for sibling_first in [false, true] {
+        let mut f = family();
+        let sh = shared(&f);
+        let bit = kernel_signal_bit(USR1);
+        f.guest_send(sh, ordinary_siginfo(USR1, 0, 100, 1000));
+        f.queues(0, bit);
+        f.sched
+            .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(10)));
+        f.queues(0, 0);
+        f.guest_send(sh, ordinary_siginfo(USR1, 0, 101, 1000));
+        f.queues(0, bit);
+        f.sched
+            .timer_signal_dequeue(f.sibling, USR1, Some(LogicalTime::from_nanos(20)));
+        f.queues(0, 0);
+        f.guest_send(sh, ordinary_siginfo(USR1, 0, 102, 1000));
+        assert_eq!(f.entries(sh).len(), 1, "copy 3 joined");
+        f.queues(0, bit);
+        let order = if sibling_first {
+            [f.sibling, f.leader]
+        } else {
+            [f.leader, f.sibling]
+        };
+        for thread in order {
+            f.sched.discarded_signal_control(
+                thread,
+                DiscardedSignalControl::Consumed {
+                    signal: USR1,
+                    how: Consumption::KeptResume { blocked: false },
+                    thread_holds: false,
+                    process_holds: true,
+                },
+            );
+        }
+        assert_eq!(
+            f.entries(sh).len(),
+            1,
+            "copy 3 stays listed, sibling_first={sibling_first}"
+        );
     }
 }
 

@@ -1139,16 +1139,13 @@ impl Scheduler {
         process_holds: bool,
     ) -> Option<PendingDequeue> {
         let mut pending = self.pending_timer_dequeues.remove(&thread)?;
-        if pending.early.is_some() && how == (Consumption::KeptResume { blocked: true }) {
-            // The kernel requeued the copy, so Linux never consumed the front
-            // popped early, and the send that joined its list was one Linux
-            // drops; the requeue merged into that send's record, so the
-            // physical record is no longer the front's.
-            refuse(format_args!(
-                "hermit: thread {thread}'s delivery of signal {signal} was resumed blocked, which requeues it, after a send had taken the place of its front in {:?}: the model of pending entries cannot hold the merged record, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)",
-                pending.queue
-            ));
-        }
+        // A delivery resumed blocked requeues its copy (`ptrace_signal`'s
+        // `send_signal_locked`). After an early pop the joined send's copy is
+        // pending, so `legacy_queue` drops that requeue, and the kernel holds
+        // exactly the joined send, as the list does; natively the blocked
+        // signal would have stayed pending and coalesced the same way. The
+        // early-popped front is retired below with the other unfinished
+        // dequeues (the Claude re-check of the in-flight-dequeue fix, R4).
         if pending.signal != signal || how == (Consumption::KeptResume { blocked: true }) {
             self.retire_unfinished_dequeue(pending);
             return None;
@@ -1169,10 +1166,11 @@ impl Scheduler {
                 .discarded_at_send
                 .lists
                 .is_listed(pending.queue, signal)
-            && !self
-                .pending_timer_dequeues
-                .values()
-                .any(|other| other.queue == pending.queue && other.signal == signal);
+            && !self.pending_timer_dequeues.values().any(|other| {
+                // Another stop whose own front was popped early took a
+                // copy before this send joined, not the joined copy.
+                other.queue == pending.queue && other.signal == signal && other.early.is_none()
+            });
         self.check_taken_queues(
             thread,
             pending.queue,
@@ -1293,7 +1291,8 @@ impl Scheduler {
     }
 
     /// A pending dequeue dropped without finishing (its thread exited, a new
-    /// stop replaced it, or its finish did not match it): a front it holds
+    /// stop replaced it, its finish did not match it, or its delivery was
+    /// resumed blocked): a front it holds
     /// after an early pop (`pop_in_flight_front`) no longer has an owner, so
     /// it is retired as a dead thread's entries are, and a periodic timer
     /// that waited for its dequeue re-arms instead of stopping (the Claude
