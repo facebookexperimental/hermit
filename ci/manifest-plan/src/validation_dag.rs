@@ -2484,7 +2484,9 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
             }
             twin.cmd = twin.cmd.replacen(DAGRUN_PREPARE_COMMAND, "", 1);
             if twin.cmd.matches(RUST_SCRIPT_PRODUCER_INVOCATION).count() != 1 {
-                return Err("rust-script producer lost its one prepare-rust-scripts.sh call".into());
+                return Err(
+                    "rust-script producer lost its one prepare-rust-scripts.sh call".into(),
+                );
             }
             twin.cmd = twin.cmd.replacen(
                 RUST_SCRIPT_PRODUCER_INVOCATION,
