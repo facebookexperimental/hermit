@@ -1921,7 +1921,7 @@ int main(void) {
         .arg("--")
         .arg(&guest);
     let (status, stderr) = run_expecting_failure(command, "SaBRe brk_preinit");
-    assert_eq!(status.code(), Some(122), "{stderr}");
+    assert_eq!(status.code(), Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT), "{stderr}");
     assert!(
         stderr.contains("guest code moved the launcher's break before Detcore modeled its own"),
         "{stderr}"
@@ -1941,7 +1941,7 @@ int main(void) {
         .arg("--")
         .arg(&query);
     let (status, stderr) = run_expecting_failure(command, "SaBRe unsequentialized brk_query");
-    assert_eq!(status.code(), Some(122), "{stderr}");
+    assert_eq!(status.code(), Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT), "{stderr}");
     assert!(
         stderr.contains("no model of the guest's: threads are not sequentialized"),
         "{stderr}"
@@ -1961,7 +1961,7 @@ int main(void) {
         .arg("--")
         .arg(&queried);
     let (status, stderr) = run_expecting_failure(command, "SaBRe brk_queried");
-    assert_eq!(status.code(), Some(122), "{stderr}");
+    assert_eq!(status.code(), Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT), "{stderr}");
     assert!(
         stderr.contains("brk from the launcher's break, which the guest's libc read before Detcore modeled the guest's"),
         "{stderr}"
