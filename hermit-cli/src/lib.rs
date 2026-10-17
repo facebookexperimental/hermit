@@ -3925,26 +3925,18 @@ fn parse_controlling_terminal_device(stat: &str) -> Option<i64> {
 ///
 /// Backends whose crate is always linked are asked directly. The LiteInst and
 /// DBT constants are checked against their crates by tests built with those
-/// features; the SaBRe and E9patch values have no such check.
+/// features; the SaBRe value has no such check. e9patch takes ptrace's.
 #[doc(hidden)]
 pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
     match backend {
-        Backend::Ptrace => <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
-        Backend::Kvm => reverie_kvm::KvmBackend::capabilities(),
-        Backend::E9patch => {
-            let mut capabilities = reverie::BackendCapabilities::E9PATCH;
-            // This arm is reached only when a caller passes `Backend::E9patch`
-            // to this helper directly. `hermit run --backend=e9patch` maps the
-            // selection to `Backend::Ptrace` before it configures the run, so
-            // that run takes ptrace's value. A direct caller has always seen
-            // the robust-list transition left undeferred, and this keeps that.
-            // TODO: decide whether this direct path should inherit ptrace's value.
-            capabilities.runs_exit_robust_list = false;
-            // The same direct path never interrupted blocked waits with
-            // signals: that was set only for `Backend::Ptrace` by name.
-            capabilities.supports_blocked_wait_signal_interruption = false;
-            capabilities
+        // e9patch is binary-rewriting preprocessing whose guest runs on the
+        // ptrace backend (`hermit run --backend=e9patch` configures its run as
+        // `Backend::Ptrace`), so it has ptrace's capabilities. A direct caller
+        // used to get two of them turned off by this name.
+        Backend::Ptrace | Backend::E9patch => {
+            <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities()
         }
+        Backend::Kvm => reverie_kvm::KvmBackend::capabilities(),
         // Site patching changes how a syscall reaches the Tool, not what the
         // Tool host can do, so in-guest-trap has in-guest LiteInst's capabilities.
         Backend::Liteinst | Backend::InGuestTrap => reverie::BackendCapabilities::LITEINST_IN_GUEST,
@@ -6881,7 +6873,7 @@ mod tests {
             "virtualizes_guest_sigalrm": in_guest_liteinst,
             "signal_interrupts_external_syscalls": sabre,
             "tracks_process_children": !dbt,
-            "runs_exit_robust_list": backend == Backend::Ptrace,
+            "runs_exit_robust_list": matches!(backend, Backend::Ptrace | Backend::E9patch),
             "requires_thread_directed_process_signals": dbt,
             "supports_parked_write_signal_interruption":
                 matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Kvm),
@@ -6893,10 +6885,10 @@ mod tests {
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "provides_process_signal_control": kvm,
             "emulates_child_waits": kvm,
-            // Each was a Config field Hermit set from the backend's name
-            // before it was a stated capability; the values are the ones that
-            // name test gave.
-            "supports_blocked_wait_signal_interruption": backend == Backend::Ptrace,
+            // A Config field Hermit set from the backend's name before it was
+            // a stated capability. e9patch runs on ptrace and has its value.
+            "supports_blocked_wait_signal_interruption":
+                matches!(backend, Backend::Ptrace | Backend::E9patch),
             "delivers_preemption_timer_events":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "runs_guest_code_between_injections": sabre || in_guest_liteinst,
@@ -7101,7 +7093,7 @@ mod tests {
     fn every_backend_encodes_its_current_legacy_projection() {
         for (backend, unsequenced, sequential) in [
             (Backend::Ptrace, "010000011000100", "010000011000100"),
-            (Backend::E9patch, "010000010000100", "010000010000100"),
+            (Backend::E9patch, "010000011000100", "010000011000100"),
             (Backend::Liteinst, "010001010000000", "010001010000000"),
             (Backend::InGuestTrap, "010001010000000", "010001010000000"),
             (Backend::Sabre, "011111110000000", "011111110000000"),
@@ -7216,7 +7208,7 @@ mod tests {
             (Backend::Sabre, false),
             (Backend::Liteinst, false),
             (Backend::InGuestTrap, false),
-            (Backend::E9patch, false),
+            (Backend::E9patch, true),
         ] {
             let config = prepare_backend_config(super::DetConfig::default(), backend);
             assert_eq!(
