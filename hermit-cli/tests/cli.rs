@@ -7853,16 +7853,75 @@ fn run_dbt_verify_replays_stdin_bytes_and_eof() {
     }
 }
 
-/// `program`'s resolved path, as every backend's guest can run it: e9patch
-/// refuses a program reached through a symbolic link across the guest's mounts,
-/// and in validate's pinned root `/bin/cat` and `/usr/bin/head` are links into
-/// the Nix store.
-fn resolved_guest_program(program: &str) -> String {
-    fs::canonicalize(program)
-        .unwrap_or_else(|error| panic!("resolve {program}: {error}"))
-        .into_os_string()
-        .into_string()
-        .expect("guest program path is UTF-8")
+/// The piped-stdin tests' two guests: a `cat` that copies its stdin to stdout
+/// until EOF, and a `head -c1` that reads exactly one byte and writes it. They
+/// are compiled here, so each is a regular file every backend runs as it is.
+/// The host's own tools may be symbolic links (e9patch refuses a program
+/// reached through one when the run has a guest mount, as validate's runs do)
+/// or one multi-call binary that dispatches on argv[0] (validate's pinned
+/// root: coreutils).
+const PIPED_STDIN_CAT_SOURCE: &str = r#"
+#include <unistd.h>
+
+int main(void) {
+  char buffer[4096];
+  for (;;) {
+    ssize_t got = read(0, buffer, sizeof(buffer));
+    if (got == 0) return 0;
+    if (got < 0) return 1;
+    for (ssize_t done = 0; done < got;) {
+      ssize_t put = write(1, buffer + done, (size_t)(got - done));
+      if (put <= 0) return 2;
+      done += put;
+    }
+  }
+}
+"#;
+
+const PIPED_STDIN_HEAD_ONE_SOURCE: &str = r#"
+#include <unistd.h>
+
+int main(void) {
+  char byte;
+  if (read(0, &byte, 1) != 1) return 1;
+  return write(1, &byte, 1) == 1 ? 0 : 2;
+}
+"#;
+
+static PIPED_STDIN_GUESTS: OnceLock<(String, String)> = OnceLock::new();
+
+/// The compiled `cat` and `head -c1` guests (`PIPED_STDIN_CAT_SOURCE`,
+/// `PIPED_STDIN_HEAD_ONE_SOURCE`), as UTF-8 paths.
+fn piped_stdin_guests() -> &'static (String, String) {
+    PIPED_STDIN_GUESTS.get_or_init(|| {
+        let build_root = process_build_root("piped-stdin-guests");
+        fs::create_dir_all(&build_root).expect("create the piped-stdin guest directory");
+        let compile = |name: &str, source: &str| -> String {
+            let source_path = build_root.join(format!("{name}.c"));
+            fs::write(&source_path, source).expect("write a piped-stdin guest source");
+            let guest = build_root.join(name);
+            let output = Command::new("cc")
+                .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+                .arg(&source_path)
+                .arg("-o")
+                .arg(&guest)
+                .output()
+                .expect("compile a piped-stdin guest");
+            assert!(
+                output.status.success(),
+                "{name} guest compilation failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            guest
+                .into_os_string()
+                .into_string()
+                .expect("guest path is UTF-8")
+        };
+        (
+            compile("piped_stdin_cat", PIPED_STDIN_CAT_SOURCE),
+            compile("piped_stdin_head_one", PIPED_STDIN_HEAD_ONE_SOURCE),
+        )
+    })
 }
 
 /// `hermit --backend=<backend> run`, with the in-guest backends' one required
@@ -7887,7 +7946,7 @@ fn piped_stdin_is_read_to_eof_on_every_backend() {
     let test = "piped_stdin_is_read_to_eof_on_every_backend";
     let _guard = hermit_run_guard();
     let input = b"first\0line\nlast-without-newline\xff";
-    let cat = resolved_guest_program("/bin/cat");
+    let cat = &piped_stdin_guests().0;
     for backend in procfs_backends(test) {
         let args = piped_stdin_run_args(backend, &[cat.as_str()]);
         let output = hermit_with_stdin(&args, input);
@@ -7905,7 +7964,7 @@ fn piped_stdin_verifies_at_bitwise_parity_on_every_backend() {
     let _guard = hermit_run_guard();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let input = b"first\0line\nlast-without-newline\xff";
-    let cat = resolved_guest_program("/bin/cat");
+    let cat = &piped_stdin_guests().0;
     for backend in procfs_backends(test) {
         let report = directory.path().join(format!("{backend}.json"));
         let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
@@ -7939,8 +7998,8 @@ fn piped_stdin_verifies_at_bitwise_parity_on_every_backend() {
 
 /// A guest that reads one byte of its piped stdin leaves the rest in the pipe
 /// for the next reader, on every backend, as natively: neither the backend nor
-/// Hermit reads ahead of the guest. The guest is `head -c1`, which reads
-/// exactly one byte (the native run below checks that premise).
+/// Hermit reads ahead of the guest. The guest reads exactly one byte
+/// (`PIPED_STDIN_HEAD_ONE_SOURCE`; the native run below checks that premise).
 #[test]
 fn a_guest_takes_only_the_stdin_it_reads_on_every_backend() {
     let test = "a_guest_takes_only_the_stdin_it_reads_on_every_backend";
@@ -7961,15 +8020,15 @@ fn a_guest_takes_only_the_stdin_it_reads_on_every_backend() {
         std::io::Read::read_to_end(&mut &ours, &mut rest).unwrap();
         (output, rest)
     };
-    let head = resolved_guest_program("/usr/bin/head");
-    let (native, rest) = remainder(Command::new(&head).arg("-c1"));
+    let head = &piped_stdin_guests().1;
+    let (native, rest) = remainder(&mut Command::new(head));
     assert!(native.status.success(), "native: {native:?}");
     assert_eq!(
         (native.stdout.as_slice(), rest.as_slice()),
         (&b"a"[..], &b"bc"[..])
     );
     for backend in procfs_backends(test) {
-        let args = piped_stdin_run_args(backend, &[head.as_str(), "-c1"]);
+        let args = piped_stdin_run_args(backend, &[head.as_str()]);
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
         append_hermit_args(&mut command, &args);
         let (output, rest) = remainder(&mut command);
