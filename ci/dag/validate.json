@@ -24046,7 +24046,7 @@
       "labels": [
         "full"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; rm -rf target/ci/syscall-conformance/ptrace && mkdir -p target/ci/syscall-conformance && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=\"$PWD/target/reverie-e2e\" cargo build --locked --offline --manifest-path reverie/Cargo.toml -p reverie-examples -p reverie-sabre-strace --lib --bin recorder --bin reverie-e2e-compare --bin reverie-sabre-strace && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=\"$PWD/target/reverie-e2e\" CARGO_NET_OFFLINE=true bash reverie/reverie-dbt/scripts/build-client.sh && SABRE_BINARY=\"$(target/reverie-e2e/debug/reverie-sabre-strace --print-sabre)\" target/reverie-e2e/debug/reverie-e2e-compare --recorder target/reverie-e2e/debug/recorder --backends ptrace,liteinst,in-guest-trap,e9patch,dbt,sabre --corpus reverie/reverie-examples/e2e/corpus.tsv --expected reverie/reverie-examples/e2e/expected-mismatches.tsv --artifacts target/ci/syscall-conformance/ptrace'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; rm -rf target/ci/syscall-conformance/ptrace && mkdir -p target/ci/syscall-conformance && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=\"$PWD/target/reverie-e2e\" ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --offline --manifest-path reverie/Cargo.toml -p reverie-examples -p reverie-sabre-strace --lib --bin recorder --bin reverie-e2e-compare --bin reverie-sabre-strace && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=\"$PWD/target/reverie-e2e\" CARGO_NET_OFFLINE=true ./ci/run-with-reverie-dbt-budget.sh bash reverie/reverie-dbt/scripts/build-client.sh && SABRE_BINARY=\"$(target/reverie-e2e/debug/reverie-sabre-strace --print-sabre)\" target/reverie-e2e/debug/reverie-e2e-compare --recorder target/reverie-e2e/debug/recorder --backends ptrace,liteinst,in-guest-trap,e9patch,dbt,sabre --corpus reverie/reverie-examples/e2e/corpus.tsv --expected reverie/reverie-examples/e2e/expected-mismatches.tsv --artifacts target/ci/syscall-conformance/ptrace'",
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
@@ -24062,14 +24062,14 @@
       "timeout": 1200,
       "cpu_timeout": 3600,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 240.0,
         "rss_baseline_bytes": 4294967296,
         "hard_mem_max_bytes": 17179869184,
-        "classification": "latency-bound",
-        "preferred_inner_jobs": 1,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 8,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
@@ -25903,7 +25903,7 @@
         "full",
         "kvm"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf '\\''%s: /dev/kvm is required\\n'\\'' privileged-test.syscall_conformance_kvm >&2; exit 2; fi; exec 9>&-; rm -rf target/ci/syscall-conformance/kvm && mkdir -p target/ci/syscall-conformance && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=\"$PWD/target/reverie-e2e\" cargo build --locked --offline --manifest-path reverie/Cargo.toml -p reverie-examples --lib --bin recorder --bin reverie-e2e-compare && target/reverie-e2e/debug/reverie-e2e-compare --recorder target/reverie-e2e/debug/recorder --backends kvm --corpus reverie/reverie-examples/e2e/corpus.tsv --expected reverie/reverie-examples/e2e/expected-mismatches.tsv --artifacts target/ci/syscall-conformance/kvm'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf '\\''%s: /dev/kvm is required\\n'\\'' privileged-test.syscall_conformance_kvm >&2; exit 2; fi; exec 9>&-; rm -rf target/ci/syscall-conformance/kvm && mkdir -p target/ci/syscall-conformance && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=\"$PWD/target/reverie-e2e\" ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --offline --manifest-path reverie/Cargo.toml -p reverie-examples --lib --bin recorder --bin reverie-e2e-compare && target/reverie-e2e/debug/reverie-e2e-compare --recorder target/reverie-e2e/debug/recorder --backends kvm --corpus reverie/reverie-examples/e2e/corpus.tsv --expected reverie/reverie-examples/e2e/expected-mismatches.tsv --artifacts target/ci/syscall-conformance/kvm'",
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
@@ -25919,14 +25919,14 @@
       "timeout": 1200,
       "cpu_timeout": 3600,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 240.0,
         "rss_baseline_bytes": 4294967296,
         "hard_mem_max_bytes": 17179869184,
-        "classification": "latency-bound",
-        "preferred_inner_jobs": 1,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 8,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
