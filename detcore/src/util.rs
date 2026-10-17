@@ -867,6 +867,43 @@ pub fn raw_read_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
+/// The whole contents of the procfs listing at `path`, read with raw
+/// syscalls and without allocating between reads, so that where the tool
+/// shares the guest's process its own allocator maps nothing while the
+/// kernel walks the address space: the buffer is allocated before the first
+/// read, and a listing that fills it is read again, from the start, into one
+/// twice the size.
+pub fn raw_read_listing(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let mut capacity = 64 * 1024;
+    loop {
+        let file = RawFd::open(path, libc::O_RDONLY)?;
+        let mut contents = vec![0_u8; capacity];
+        let mut filled = 0;
+        while filled < capacity {
+            // SAFETY: the buffer is writable from `filled` to its length.
+            let read = raw_result(unsafe {
+                raw_syscall(
+                    libc::SYS_read,
+                    [
+                        file.raw(),
+                        contents[filled..].as_mut_ptr() as u64,
+                        (capacity - filled) as u64,
+                        0,
+                        0,
+                        0,
+                    ],
+                )
+            })? as usize;
+            if read == 0 {
+                contents.truncate(filled);
+                return Ok(contents);
+            }
+            filled += read;
+        }
+        capacity *= 2;
+    }
+}
+
 /// `path` with every symbolic link followed and every `.` and `..` resolved,
 /// as glibc's `realpath` (`std::fs::canonicalize`) gives it: relative paths
 /// from the working directory, and the same errors for an empty path

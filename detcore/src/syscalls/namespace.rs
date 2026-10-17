@@ -1569,11 +1569,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(written as i64)
     }
 
-    /// Linux's start of the program break for the image the calling thread's
-    /// exec ran: load_elf_binary's rule ([`crate::exec_record::ElfLayout`],
-    /// read from the exec record's file, checked to be the recorded inode) at
-    /// the load bias the process's `AT_PHDR` shows, or why there is none.
-    fn modeled_start_brk<G: Guest<Self>>(&self, guest: &G) -> Result<u64, &'static str> {
+    /// The layout ([`crate::exec_record::ElfLayout`]) of the image the
+    /// calling thread's exec ran, read from the exec record's file and checked
+    /// to be the recorded inode, with that inode; or why there is none.
+    fn recorded_image_layout<G: Guest<Self>>(
+        &self,
+        guest: &G,
+    ) -> Result<(crate::exec_record::ElfLayout, u64), &'static str> {
         let exe = guest.thread_state().exe.clone().ok_or("no exec record")?;
         let root = self
             .guest_root(guest)
@@ -1605,6 +1607,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         .map_err(|_| "the image is unreadable")?;
         let layout = crate::exec_record::ElfLayout::read_file(&file)
             .ok_or("the image is not an ELF64 executable")?;
+        Ok((layout, stat.st_ino))
+    }
+
+    /// Linux's start of the program break for the image the calling thread's
+    /// exec ran: load_elf_binary's rule (`Self::recorded_image_layout`) at
+    /// the load bias the process's `AT_PHDR` shows, or why there is none.
+    fn modeled_start_brk<G: Guest<Self>>(&self, guest: &G) -> Result<u64, &'static str> {
+        let (layout, _) = self.recorded_image_layout(guest)?;
         let auxv = self
             .guest_task_directory(guest)
             .and_then(|directory| crate::util::raw_read_file(&directory.join("auxv")).ok())
@@ -1632,23 +1642,42 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// the flag after a randomized exec; that case would need the exec-time
     /// personality.
     ///
-    /// Where the run declares a launcher there is no model: the kernel exec'd
-    /// the launcher, so the process's auxiliary vector (its `AT_PHDR`) and its
-    /// break are the launcher's. Detcore does not service brk there either:
-    /// SaBRe's tool shares the guest's C library, and a C library call that
-    /// allocates from the tool (a `realpath`, an `opendir`) grows the guest's
-    /// heap through the kernel's break, which a serviced break would then
-    /// contradict.
-    pub(crate) fn check_brk_model<G: Guest<Self>>(&self, guest: &G) {
+    /// Where the run declares a launcher, the kernel exec'd the launcher, so
+    /// the process's auxiliary vector and break are the launcher's: Detcore
+    /// keeps its own model instead (`Self::launched_brk_model`), with no
+    /// kernel to compare it with, and answers `brk(2)` from it
+    /// (`Self::handle_brk`). That needs Detcore's tool, which shares the
+    /// guest's C library there, never to grow the guest's heap through the
+    /// kernel's break; its `realpath` and `opendir` calls were removed for that
+    /// (detcore/clippy.toml). Without a model, a brk is refused by name with
+    /// the reason (`Detcore::handle_brk`).
+    pub(crate) async fn check_brk_model<G: Guest<Self>>(&self, guest: &mut G) {
         use crate::exec_record::BrkCheck;
-        let check = if self
-            .cfg
-            .launch_image
-            .as_ref()
-            .is_some_and(|image| image.launcher.is_some())
-        {
-            BrkCheck::Unmodeled("the run declares a launcher")
-        } else {
+        let dettid = guest.thread_state().dettid;
+        if self.declares_launcher() {
+            let model = self.launched_brk_model(guest).await;
+            match &model {
+                Ok(model) => tracing::debug!(
+                    "[detcore, dtid {}] program break serviced from a model starting at {:#x}: the run declares a launcher",
+                    dettid,
+                    model.start,
+                ),
+                Err(reason) => tracing::warn!(
+                    "[detcore, dtid {}] program break not modeled: {}; a brk is refused by name",
+                    dettid,
+                    reason,
+                ),
+            }
+            let mut metadata = guest
+                .thread_state()
+                .memory_metadata
+                .lock()
+                .expect("memory metadata mutex poisoned");
+            metadata.brk_unmodeled = model.as_ref().err().map(|reason| (*reason).to_owned());
+            metadata.brk_model = model.ok();
+            return;
+        }
+        let check = {
             match self.modeled_start_brk(guest) {
                 Err(reason) => BrkCheck::Unmodeled(reason),
                 model => BrkCheck::of(
@@ -1658,12 +1687,71 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ),
             }
         };
-        let dettid = guest.thread_state().dettid;
         if let BrkCheck::Differs { .. } = check {
             tracing::error!("[detcore, dtid {}] program break {}", dettid, check);
         } else {
             tracing::debug!("[detcore, dtid {}] program break {}", dettid, check);
         }
+    }
+
+    /// Whether the run declares a launcher ([`crate::LaunchImage::launcher`]):
+    /// the kernel exec'd it in the guest's place, so the process's auxiliary
+    /// vector and program break are the launcher's.
+    pub(crate) fn declares_launcher(&self) -> bool {
+        self.cfg
+            .launch_image
+            .as_ref()
+            .is_some_and(|image| image.launcher.is_some())
+    }
+
+    /// Detcore's model of the program break for the image an exec just ran,
+    /// where the run declares a launcher (`Self::declares_launcher`):
+    /// load_elf_binary's rule (`Self::recorded_image_layout`) at the bias of
+    /// the image's own executable mapping ([`crate::exec_record::load_bias`]),
+    /// since the process's `AT_PHDR` is the launcher's. Or why there is none.
+    async fn launched_brk_model<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<crate::memory::BrkModel, &'static str> {
+        // Detcore's brk transaction (`Self::handle_brk`) spans injected
+        // calls, which Linux makes atomic under the address space's lock;
+        // only sequentialized threads keep another thread out of it.
+        if !self.cfg.sequentialize_threads {
+            return Err("threads are not sequentialized");
+        }
+        let exe = guest.thread_state().exe.clone().ok_or("no exec record")?;
+        let (layout, ino) = self.recorded_image_layout(guest)?;
+        let maps = self
+            .guest_task_directory(guest)
+            .and_then(|directory| crate::util::raw_read_file(&directory.join("maps")).ok())
+            .ok_or("the mappings are unreadable")?;
+        let text = layout
+            .text
+            .ok_or("an image without an executable segment")?;
+        let bias = crate::exec_record::load_bias(&maps, &exe.exe, ino, text)?;
+        let start = layout.start_brk_at_bias(bias)?;
+        // Guest code that ran before Detcore's first callback (a pre-init
+        // function, an IFUNC resolver) used the kernel's break, the
+        // launcher's, if it moved it: its heap is there, and a model elsewhere
+        // would split it.
+        let kernel_start = self
+            .kernel_start_brk(guest)
+            .ok_or("the kernel's start of the break is unreadable")?;
+        let kernel_break = guest
+            .inject_with_retry(reverie::syscalls::Syscall::Brk(
+                reverie::syscalls::Brk::new().with_addr(None),
+            ))
+            .await
+            .map_err(|_| "the kernel's break is unreadable")? as u64;
+        if kernel_break != kernel_start {
+            return Err("guest code moved the launcher's break before Detcore modeled its own");
+        }
+        Ok(crate::memory::BrkModel {
+            start,
+            current: start,
+            data_span: layout.data_span,
+            launcher_break: kernel_start,
+        })
     }
 
     /// Whether the kernel randomized the calling thread's program break at
@@ -1697,7 +1785,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     fn kernel_start_brk<G: Guest<Self>>(&self, guest: &G) -> Option<u64> {
         let stat =
             crate::util::raw_read_file(&self.guest_task_directory(guest)?.join("stat")).ok()?;
-        crate::exec_record::stat_start_brk(std::str::from_utf8(&stat).ok()?)
+        // The command name may be any bytes; the fields after it are ASCII.
+        crate::exec_record::stat_start_brk(&String::from_utf8_lossy(&stat))
     }
 
     /// Detcore's pid for the calling thread's process.

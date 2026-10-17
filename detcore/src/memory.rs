@@ -61,6 +61,35 @@ pub(crate) struct MemoryMetadata {
     /// The guest's most recently observed program break.
     #[serde(default)]
     brk_current: Option<u64>,
+    /// Detcore's model of the program break, where Detcore answers `brk(2)`
+    /// itself ([`BrkModel`]); `None` elsewhere, and where the image's layout
+    /// could not be read.
+    #[serde(default)]
+    pub(crate) brk_model: Option<BrkModel>,
+    /// Why there is no [`BrkModel`] where Detcore answers `brk(2)` itself
+    /// (`Detcore::handle_brk` refuses a brk by this name).
+    #[serde(default)]
+    pub(crate) brk_unmodeled: Option<String>,
+}
+
+/// Detcore's model of a process's program break: where Linux starts it for
+/// the image the process exec'd (`crate::exec_record::ElfLayout`) and where
+/// it stands now. Detcore keeps one, and answers `brk(2)` from it, only where
+/// the run declares a launcher, whose break the kernel's is
+/// (`Detcore::handle_brk`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BrkModel {
+    /// `mm->start_brk`.
+    pub(crate) start: u64,
+    /// `mm->brk`, as `brk(2)` last set it (not page-aligned).
+    pub(crate) current: u64,
+    /// `mm->end_data - mm->start_data`
+    /// (`crate::exec_record::ElfLayout::data_span`).
+    pub(crate) data_span: u64,
+    /// The kernel's break when the model was made, the launcher's: what a
+    /// libc that queried the break before Detcore's first callback holds
+    /// as the guest's (`Detcore::handle_brk`).
+    pub(crate) launcher_break: u64,
 }
 
 impl MemoryMetadata {
@@ -75,6 +104,8 @@ impl MemoryMetadata {
             && self.shared_mappings.is_empty()
             && self.brk_start.is_none()
             && self.brk_current.is_none()
+            && self.brk_model.is_none()
+            && self.brk_unmodeled.is_none()
     }
 
     /// Record a program break reported by a `brk(2)` return.
@@ -99,8 +130,15 @@ impl MemoryMetadata {
     /// belongs to the loader, the kernel tags nothing, and the guest's heap is
     /// an ordinary anonymous mapping. Binding to the observed break keeps the
     /// heap identifiable on every backend.
+    ///
+    /// Where Detcore models the break, the heap is the model's: its start is
+    /// known before any brk returns, which the first observation is not when
+    /// the guest's first brk already grows the break.
     pub(crate) fn brk_heap_range(&self) -> Option<(u64, u64)> {
-        let (start, current) = (self.brk_start?, self.brk_current?);
+        let (start, current) = match self.brk_model {
+            Some(model) => (model.start, model.current),
+            None => (self.brk_start?, self.brk_current?),
+        };
         (current > start).then_some((start, current))
     }
 
@@ -302,6 +340,26 @@ mod brk_tests {
 
         // Back to the base means an empty heap again, not an inverted range.
         mm.observe_brk(0x405000);
+        assert_eq!(mm.brk_heap_range(), None);
+    }
+
+    #[test]
+    fn a_modeled_heap_is_the_models_from_the_first_growth() {
+        // A guest whose first brk grows the break: the observations alone
+        // would take its result as the base and report no heap.
+        let mut mm = MemoryMetadata::new();
+        mm.brk_model = Some(BrkModel {
+            start: 0x405000,
+            current: 0x426000,
+            data_span: 0x1000,
+            launcher_break: 0x555555580000,
+        });
+        mm.observe_brk(0x426000);
+        assert_eq!(mm.brk_heap_range(), Some((0x405000, 0x426000)));
+        mm.brk_model = Some(BrkModel {
+            current: 0x405000,
+            ..mm.brk_model.unwrap()
+        });
         assert_eq!(mm.brk_heap_range(), None);
     }
 

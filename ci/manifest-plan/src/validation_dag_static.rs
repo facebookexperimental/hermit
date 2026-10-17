@@ -2482,7 +2482,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from 577c5911: 2020.
     // And +6 from 43503a9b: 2026.
     // And the two blocked-resume guard units of the 4499 follow-up: 2028, listed.
-    ("test.detcore_unit", 2028),
+    // And exec_record::tests::a_load_bias_comes_from_the_images_executable_mapping and
+    // syscalls::memory::tests::a_break_grows_and_shrinks_only_where_linuxs_brk_would and
+    // memory::brk_tests::a_modeled_heap_is_the_models_from_the_first_growth: 2031, listed.
+    ("test.detcore_unit", 2031),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3588,7 +3591,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // sabre_refuses_a_timerfd_by_name (B3) retains all 30: 31.
     // sigstkflt_handler_not_installed_is_announced_once_per_run: 32.
     // sabre_guest_close_of_stderr_closes_it: 33.
-    ("test.sabre_examples", 33),
+    // And sabre_program_break_is_the_guests_as_natively,
+    // sabre_program_break_of_a_pie_starts_at_linuxs_rule and
+    // sabre_refuses_brk_it_cannot_model_by_name: 36.
+    // And sabre_heap_records_are_ptraces: 37.
+    ("test.sabre_examples", 37),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -4304,7 +4311,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from 577c5911: 2020.
     // And +6 from 43503a9b: 2026.
     // And the same two blocked-resume guard units: 2028.
-    ("test.detcore_unit_on_host", 2028),
+    // And the same load-bias, brk-room and modeled-heap tests: 2031, listed.
+    ("test.detcore_unit_on_host", 2031),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4768,7 +4776,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same timerfd refusal test: 31.
     // sigstkflt_handler_not_installed_is_announced_once_per_run: 32.
     // sabre_guest_close_of_stderr_closes_it: 33.
-    ("test.sabre_examples_on_host", 33),
+    // And the same three program-break tests: 36, and the heap-record test: 37.
+    ("test.sabre_examples_on_host", 37),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {

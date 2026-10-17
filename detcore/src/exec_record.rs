@@ -153,6 +153,15 @@ pub struct ElfLayout {
     /// The end of the highest `PT_LOAD` segment in memory, `p_vaddr +
     /// p_memsz`, before the load bias: the end of its bss.
     pub end: u64,
+    /// The first executable `PT_LOAD` segment's file offset and virtual
+    /// address, each page-aligned down: where its text mapping starts in the
+    /// file and, before the load bias, in memory. `None` without one.
+    pub text: Option<(u64, u64)>,
+    /// `mm->end_data - mm->start_data` as Linux sets them: the highest
+    /// segment end in the file (`p_vaddr + p_filesz`) less the highest
+    /// segment start, which `RLIMIT_DATA` counts with the heap
+    /// (`check_data_rlimit`).
+    pub data_span: u64,
 }
 
 impl ElfLayout {
@@ -197,6 +206,7 @@ impl ElfLayout {
         }
         let mut entry = vec![0_u8; phentsize];
         let (mut phdr, mut end, mut interpreter) = (0, None::<u64>, false);
+        let (mut text, mut start_data, mut end_data) = (None::<(u64, u64)>, 0_u64, 0_u64);
         for index in 0..u64::from(phnum) {
             read_at(phoff.checked_add(index * phentsize as u64)?, &mut entry)?;
             let field = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
@@ -210,9 +220,15 @@ impl ElfLayout {
                 _ => continue,
             }
             let (offset, vaddr, filesz, memsz) = (field(8), field(16), field(32), field(40));
+            // PF_X.
+            if text.is_none() && u32::from_le_bytes(entry[4..8].try_into().unwrap()) & 1 != 0 {
+                text = Some((offset & !(PAGE_SIZE - 1), vaddr & !(PAGE_SIZE - 1)));
+            }
             if offset <= phoff && phoff < offset.checked_add(filesz)? {
                 phdr = (phoff - offset).checked_add(vaddr)?;
             }
+            start_data = start_data.max(vaddr);
+            end_data = end_data.max(vaddr.checked_add(filesz)?);
             let segment_end = vaddr.checked_add(memsz)?;
             end = Some(end.map_or(segment_end, |end| end.max(segment_end)));
         }
@@ -221,6 +237,8 @@ impl ElfLayout {
             interpreter,
             phdr,
             end: end?,
+            text,
+            data_span: end_data.saturating_sub(start_data),
         })
     }
 
@@ -230,6 +248,14 @@ impl ElfLayout {
     /// bias, page-aligned up (`mm->start_brk = mm->brk =
     /// ELF_PAGEALIGN(elf_brk)`), or why there is no answer.
     pub fn start_brk(&self, at_phdr: u64) -> Result<u64, &'static str> {
+        let bias = at_phdr
+            .checked_sub(self.phdr)
+            .ok_or("AT_PHDR below the image's program headers")?;
+        self.start_brk_at_bias(bias)
+    }
+
+    /// [`Self::start_brk`] for an image loaded at load bias `bias`.
+    pub fn start_brk_at_bias(&self, bias: u64) -> Result<u64, &'static str> {
         if self.position_independent && !self.interpreter {
             // Recent kernels (6.17's load_elf_binary) move it to
             // ELF_ET_DYN_BASE even without randomization, unless built with
@@ -238,14 +264,72 @@ impl ElfLayout {
                 "a position-independent image without an interpreter, whose break depends on the kernel's build",
             );
         }
-        let bias = at_phdr
-            .checked_sub(self.phdr)
-            .ok_or("AT_PHDR below the image's program headers")?;
         bias.checked_add(self.end)
             .and_then(|end| end.checked_add(PAGE_SIZE - 1))
             .map(|end| end & !(PAGE_SIZE - 1))
             .ok_or("an image ending past the address space")
     }
+}
+
+/// The load bias of the image file at `path` with inode `ino`, in a
+/// process whose `/proc/<pid>/maps` reads `maps`: the start of the file's
+/// executable mapping at the text segment's offset less the text segment's
+/// address ([`ElfLayout::text`]), or why there is none. The executable
+/// mapping, because a launcher may also map the file to read it (SaBRe's
+/// rewriter maps it read-only at offset 0) and may not map the image's first
+/// page at all. The file is matched by inode and its whole pathname as the
+/// reader sees it, not by device: maps shows the superblock's device, which
+/// on btrfs and overlay is not the `st_dev` a `stat` of the file reports.
+/// Where several such mappings give different biases, there is no answer.
+/// This is
+/// how Detcore finds an image's bias where the kernel exec'd a launcher,
+/// whose `AT_PHDR` the process's auxiliary vector holds.
+pub fn load_bias(
+    maps: &[u8],
+    path: &Path,
+    ino: u64,
+    (text_offset, text_page): (u64, u64),
+) -> Result<u64, &'static str> {
+    // Bytes, not text: a pathname in the mappings is whatever bytes the file
+    // was named with.
+    fn text(field: &[u8]) -> Option<&str> {
+        std::str::from_utf8(field).ok()
+    }
+    // As the mappings show it: Linux writes a newline in a pathname as
+    // `\012` (`show_map_vma`, `seq_file_path(m, file, "\n")`).
+    let mut displayed = Vec::new();
+    for &byte in path.as_os_str().as_bytes() {
+        if byte == b'\n' {
+            displayed.extend_from_slice(b"\\012");
+        } else {
+            displayed.push(byte);
+        }
+    }
+    let mut biases = maps.split(|&byte| byte == b'\n').filter_map(|line| {
+        let mut fields = line.splitn(6, |byte| byte.is_ascii_whitespace());
+        let range = text(fields.next()?)?;
+        let permissions = fields.next()?;
+        let offset = u64::from_str_radix(text(fields.next()?)?, 16).ok()?;
+        let _device = fields.next()?;
+        let map_ino: u64 = text(fields.next()?)?.parse().ok()?;
+        let pathname = fields.next()?.trim_ascii_start();
+        if !permissions.contains(&b'x')
+            || offset != text_offset
+            || map_ino != ino
+            || pathname != displayed
+        {
+            return None;
+        }
+        let start = u64::from_str_radix(range.split_once('-')?.0, 16).ok()?;
+        start.checked_sub(text_page)
+    });
+    let bias = biases
+        .next()
+        .ok_or("no executable mapping of the image's text")?;
+    if biases.any(|other| other != bias) {
+        return Err("executable mappings of the image's text at different biases");
+    }
+    Ok(bias)
 }
 
 /// The kernel's `start_brk` in a `/proc/<pid>/stat` line: field 47, counted
@@ -425,6 +509,9 @@ mod tests {
         // A real image: this test binary, linked by the toolchain.
         let layout = ElfLayout::read(&std::env::current_exe().unwrap()).unwrap();
         assert!(layout.end > layout.phdr);
+        // Its text segment is executable and page-aligned in file and memory.
+        let (text_offset, text_page) = layout.text.unwrap();
+        assert_eq!((text_offset % 4096, text_page % 4096), (0, 0));
         // A non-ELF file and a 32-bit or big-endian header have none.
         assert_eq!(ElfLayout::read(Path::new("/proc/self/status")), None);
         let mut header = [0_u8; 64];
@@ -471,6 +558,10 @@ mod tests {
                 interpreter: false,
                 phdr: 0x400040,
                 end: 0x4050b0,
+                // The synthetic headers carry no flags, so no executable
+                // segment.
+                text: None,
+                data_span: 0x290,
             }
         );
         assert_eq!(layout.start_brk(0x400040), Ok(0x406000));
@@ -549,10 +640,16 @@ mod tests {
         let image = fs::read_link(process.join("exe")).unwrap();
         let at_phdr = auxv_entry(&fs::read(process.join("auxv")).unwrap(), libc::AT_PHDR).unwrap();
         let start_brk = stat_start_brk(&fs::read_to_string(process.join("stat")).unwrap()).unwrap();
+        let maps = fs::read(process.join("maps")).unwrap();
         drop(child.stdin.take());
         child.wait().unwrap();
         let layout = ElfLayout::read(&image).unwrap();
         assert_eq!(layout.start_brk(at_phdr), Ok(start_brk), "{image:?}");
+        // The same start from the image's executable mapping, as Detcore
+        // finds it where the kernel exec'd a launcher.
+        let ino = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&image).unwrap());
+        let bias = load_bias(&maps, &image, ino, layout.text.unwrap()).unwrap();
+        assert_eq!(layout.start_brk_at_bias(bias), Ok(start_brk), "{image:?}");
     }
 
     #[test]
@@ -598,6 +695,79 @@ mod tests {
             BrkCheck::of(Err("no exec record"), Some(false), Some(0x406000)),
             BrkCheck::Unmodeled("no exec record")
         );
+    }
+
+    #[test]
+    fn a_load_bias_comes_from_the_images_executable_mapping() {
+        // A non-PIE image's text and data, another file's text, a read-only
+        // mapping of the whole image at offset 0 (as SaBRe's rewriter makes),
+        // and a position-independent image whose name has a space.
+        let listed = "\
+00401000-00402000 r-xp 00001000 00:20 1234 /dir/image
+00402000-00403000 r--p 00002000 00:20 1234 /dir/image
+555555553000-555555554000 r-xp 00001000 00:20 99 /other
+7ffff7bac000-7ffff7bb1000 r--p 00000000 00:20 1234 /dir/image
+7ffff7fc6000-7ffff7fc7000 r-xp 00001000 00:21 5678 /with spaces
+";
+        let maps = listed.as_bytes();
+        let path = |path: &'static str| Path::new(path);
+        let text = (0x1000, 0x401000);
+        assert_eq!(load_bias(maps, path("/dir/image"), 1234, text), Ok(0));
+        assert!(load_bias(maps, path("/dir/image"), 4321, text).is_err());
+        assert!(load_bias(maps, path("/dir/ima"), 1234, text).is_err());
+        // The same inode and name under another directory (another
+        // filesystem's file) is not the image.
+        assert!(load_bias(maps, path("/elsewhere/image"), 1234, text).is_err());
+        // Two executable mappings of the text at different biases: no answer.
+        let twice =
+            format!("{listed}7ffff0001000-7ffff0002000 r-xp 00001000 00:20 1234 /dir/image\n");
+        assert!(load_bias(twice.as_bytes(), path("/dir/image"), 1234, text).is_err());
+        // The same bias twice is still one answer.
+        let again = format!("{listed}00401000-00402000 r-xp 00001000 00:20 1234 /dir/image\n");
+        assert_eq!(
+            load_bias(again.as_bytes(), path("/dir/image"), 1234, text),
+            Ok(0)
+        );
+        // A text segment at another offset has no executable mapping here.
+        assert_eq!(
+            load_bias(maps, path("/dir/image"), 1234, (0x2000, 0x402000)).ok(),
+            None
+        );
+        // A position-independent image at its bias.
+        assert_eq!(
+            load_bias(maps, path("/with spaces"), 5678, (0x1000, 0x1000)),
+            Ok(0x7ffff7fc5000)
+        );
+        // A name that is not UTF-8, anywhere in the mappings, is still bytes
+        // to compare.
+        let mut named = maps.to_vec();
+        named.extend_from_slice(b"7ffff7fd0000-7ffff7fd1000 r-xp 00001000 00:21 42 /n\xffme\n");
+        let unnamed = Path::new(std::ffi::OsStr::from_bytes(b"/n\xffme"));
+        assert_eq!(
+            load_bias(&named, unnamed, 42, (0x1000, 0x1000)),
+            Ok(0x7ffff7fcf000)
+        );
+        assert_eq!(load_bias(&named, path("/dir/image"), 1234, text), Ok(0));
+        // A newline in the name, which the mappings show as `\012`.
+        named.extend_from_slice(
+            b"7ffff7fe0000-7ffff7fe1000 r-xp 00001000 00:21 43 /line\\012break\n",
+        );
+        let broken = Path::new("/line\nbreak");
+        assert_eq!(
+            load_bias(&named, broken, 43, (0x1000, 0x1000)),
+            Ok(0x7ffff7fdf000)
+        );
+        // The model at a bias from the mapping: the synthetic image's end
+        // page-aligned up from the bias.
+        let layout = ElfLayout {
+            position_independent: true,
+            interpreter: true,
+            phdr: 0x40,
+            end: 0x50b0,
+            text: Some((0x1000, 0x1000)),
+            data_span: 0x290,
+        };
+        assert_eq!(layout.start_brk_at_bias(0x555555556000), Ok(0x55555555c000));
     }
 
     #[test]

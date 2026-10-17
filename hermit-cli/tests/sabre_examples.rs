@@ -1586,6 +1586,388 @@ int main(int argc, char **argv) {
     assert_backend_parity_and_sabre_verify(&guest, &[], &loader, "exe link");
 }
 
+/// Under SaBRe the kernel exec'd the loader, so the kernel's program break is
+/// the loader's; Detcore answers `brk(2)` from its model of the guest's
+/// (`Detcore::handle_brk`). The guest's break must start, grow, stay within a
+/// page, shrink, refuse a request below its start, refuse growth that would
+/// meet another mapping or a grow-down mapping's guard gap, keep its break
+/// on a shrink with nothing left to unmap, give a fork child its own break,
+/// and carry malloc's arena exactly as natively, for an `ET_EXEC` image,
+/// which SaBRe loads at its own addresses.
+#[test]
+fn sabre_program_break_is_the_guests_as_natively() {
+    const GUEST: &str = r#"
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static long brk_(long to) { return syscall(SYS_brk, to); }
+
+int main(void) {
+  /* Raw brk first, before stdio or malloc touch the heap; printed after. */
+  long r[13];
+  r[0] = brk_(0);
+  long start = r[0];
+  r[1] = brk_(start + 3 * 4096);
+  memset((void *)start, 0x5a, 3 * 4096);
+  r[2] = brk_(start + 3 * 4096 + 100);
+  r[3] = brk_(start + 4096);
+  r[4] = brk_(start - 4096);
+  r[5] = brk_(0);
+  r[6] = brk_(start + 5000);
+  r[7] = ((volatile char *)start)[4095] == 0x5a;
+  r[8] = brk_(start);
+  /* Growth that would come within a page of a mapping is refused. */
+  void *blocker = mmap((void *)(start + 2 * 4096), 4096, PROT_READ,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+  r[9] = blocker == (void *)(start + 2 * 4096);
+  r[10] = brk_(start + 3 * 4096);
+  r[11] = brk_(start + 4096);
+  r[12] = brk_(start + 2 * 4096);
+  munmap(blocker, 4096);
+  brk_(start);
+  /* A shrink with nothing left to unmap keeps the old break. */
+  long empty[3];
+  empty[0] = brk_(start + 3 * 4096);
+  munmap((void *)start, 3 * 4096);
+  empty[1] = brk_(start + 4096);
+  empty[2] = brk_(0);
+  /* Growth into a grow-down mapping's guard gap is refused. */
+  long gap[2];
+  void *down = mmap((void *)(start + 64 * 4096), 4096, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN | MAP_FIXED_NOREPLACE, -1, 0);
+  gap[0] = down == (void *)(start + 64 * 4096);
+  gap[1] = brk_(start + 3 * 4096 + 2 * 4096);
+  munmap(down, 4096);
+  brk_(start);
+  const char *labels[] = {"start", "grow 3 pages", "within the page", "shrink to 1 page",
+                          "below the start", "query", "unaligned grow", "kept bytes", "back",
+                          "blocker placed", "past the blocker", "a page short of it",
+                          "up to it"};
+  /* A fork child moves its own break, not its parent's. */
+  long before_fork = brk_(0), child_grew = 0;
+  int pipefd[2];
+  pipe(pipefd);
+  pid_t child = fork();
+  if (child == 0) {
+    long grew = brk_(before_fork + 3 * 4096);
+    write(pipefd[1], &grew, sizeof grew);
+    _exit(0);
+  }
+  read(pipefd[0], &child_grew, sizeof child_grew);
+  waitpid(child, NULL, 0);
+  long parent_after = brk_(0);
+  for (int i = 0; i < 13; i++)
+    printf("%s: %#lx\n", labels[i], r[i]);
+  printf("emptied heap grown to %#lx, shrink answers %#lx, query %#lx\n", empty[0], empty[1],
+         empty[2]);
+  printf("grow-down mapping placed: %ld, growth into its gap: %#lx\n", gap[0], gap[1]);
+  printf("child grew by 3 pages: %s, the parent kept its own: %s\n",
+         child_grew == before_fork + 3 * 4096 ? "yes" : "no",
+         parent_after == before_fork ? "yes" : "no");
+  char *small = malloc(24), *medium = malloc(5000);
+  printf("malloc small %p medium %p\n", (void *)small, (void *)medium);
+  free(medium);
+  printf("sbrk(0) %p\n", sbrk(0));
+  return 0;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-brk-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let name = "brk_exec";
+    let guest = compile_guest_with(dir.path(), name, GUEST, &["-fno-pie", "-no-pie"]);
+    // Natively without address randomization, as Hermit runs every guest.
+    let native = Command::new("setarch")
+        .args(["-R"])
+        .arg(&guest)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "{native:?}");
+    let native_stdout = String::from_utf8(native.stdout).unwrap();
+    for line in [
+        "kept bytes: 0x1\n",
+        "blocker placed: 0x1\n",
+        "grow-down mapping placed: 1,",
+        "child grew by 3 pages: yes, the parent kept its own: yes\n",
+    ] {
+        assert!(native_stdout.contains(line), "{line}{native_stdout}");
+    }
+    let ptrace = parity_run(&guest, &[], None, &format!("ptrace {name}"));
+    assert_eq!(
+        String::from_utf8_lossy(&ptrace.stdout),
+        native_stdout,
+        "ptrace's program break differs from Linux's: {name}"
+    );
+    assert_backend_parity_and_sabre_verify(&guest, &[], &loader, name);
+}
+
+/// A position-independent image's program break starts where Linux's rule
+/// puts it for wherever the image was loaded: its highest loaded segment's
+/// end at the image's bias, page-aligned (natively, under ptrace, and under
+/// SaBRe, whose loader picks another bias).
+#[test]
+fn sabre_program_break_of_a_pie_starts_at_linuxs_rule() {
+    const GUEST: &str = r#"
+#define _GNU_SOURCE
+#include <link.h>
+#include <stdio.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static unsigned long expected;
+
+static int own_image(struct dl_phdr_info *info, size_t size, void *unused) {
+  (void)size;
+  (void)unused;
+  unsigned long end = 0;
+  for (int i = 0; i < info->dlpi_phnum; i++)
+    if (info->dlpi_phdr[i].p_type == PT_LOAD &&
+        info->dlpi_phdr[i].p_vaddr + info->dlpi_phdr[i].p_memsz > end)
+      end = info->dlpi_phdr[i].p_vaddr + info->dlpi_phdr[i].p_memsz;
+  expected = (info->dlpi_addr + end + 4095) & ~4095UL;
+  return 1; /* the program itself is listed first */
+}
+
+int main(void) {
+  long start = syscall(SYS_brk, 0);
+  dl_iterate_phdr(own_image, NULL);
+  printf("start as load_elf_binary puts it: %s\n", (unsigned long)start == expected ? "yes" : "no");
+  return 0;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-brk-pie-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest_with(dir.path(), "brk_pie", GUEST, &["-fpie", "-pie"]);
+    let native = Command::new("setarch")
+        .args(["-R"])
+        .arg(&guest)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "{native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "start as load_elf_binary puts it: yes\n"
+    );
+    let ptrace = parity_run(&guest, &[], None, "ptrace brk_pie");
+    assert_eq!(ptrace.stdout, native.stdout, "ptrace brk_pie");
+    assert_backend_parity_and_sabre_verify(&guest, &[], &loader, "brk_pie");
+}
+
+/// Under SaBRe, `--detlog-heap` records the guest's heap as ptrace's kernel
+/// labels it: from the guest's first brk, even where that brk already grows
+/// the break, to an unaligned break's page-aligned end, one record per piece
+/// once an mprotect splits the heap, and none of the pages the guest
+/// unmapped.
+#[test]
+fn sabre_heap_records_are_ptraces() {
+    const GUEST: &str = r#"
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+extern char end;
+int main(void) {
+  /* The first brk grows the break, to an unaligned end: no query comes
+     before it. */
+  unsigned long start = ((unsigned long)&end + 4095) & ~4095UL;
+  long grown = syscall(SYS_brk, start + 4 * 4096 + 1);
+  memset((void *)start, 0x5a, 4 * 4096 + 1);
+  /* Split the heap: its second page read-only. */
+  int split = mprotect((void *)(start + 4096), 4096, PROT_READ);
+  long query = syscall(SYS_brk, 0);
+  /* Back to a page boundary, then unmap it all; the break stays. */
+  long aligned = syscall(SYS_brk, start + 4 * 4096);
+  int gone = munmap((void *)start, 4 * 4096);
+  long after = syscall(SYS_brk, 0);
+  printf("grown %d split %d query %d gone %d after %d\n", grown == (long)(start + 4 * 4096 + 1), split,
+         query == grown, gone, after == aligned && aligned == (long)(start + 4 * 4096));
+  return 0;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-heap-records-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest_with(dir.path(), "heap_records", GUEST, &["-fno-pie", "-no-pie"]);
+    let expected = "grown 1 split 0 query 1 gone 0 after 1\n";
+    let heap_records = |backend: &str| {
+        let mut command = Command::new(hermit_binary());
+        command
+            .env("HERMIT_SABRE_BINARY", &loader)
+            .args(["--backend", backend, "--log", "info", "run", "--strict"])
+            .args(["--detlog-heap", COMPARISON_EPOCH, "--"])
+            .arg(&guest)
+            .stdin(Stdio::null());
+        let output = run_bounded(command, backend, None);
+        assert!(output.status.success(), "{backend}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "{backend}"
+        );
+        // The records without the thread number, which the backends assign
+        // differently, and without what follows the hash.
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| Some(&line[line.find("[memory]")?..]))
+            .filter(|record| record.contains(" [heap]->"))
+            .map(|record| {
+                let record = record
+                    .split_once(" DETLOG_RECORD")
+                    .map_or(record, |(record, _)| record);
+                let (_, rest) = record.split_once("] ").expect("a [memory][dtid N] prefix");
+                rest.to_owned()
+            })
+            .collect::<Vec<_>>()
+    };
+    let ptrace = heap_records("ptrace");
+    assert!(
+        ptrace
+            .iter()
+            .any(|record| record.contains("(READ | PRIVATE)")),
+        "the split piece is recorded under ptrace: {ptrace:#?}"
+    );
+    assert_eq!(heap_records("sabre"), ptrace);
+}
+
+/// Guest code that runs before Detcore's first callback under SaBRe (here a
+/// pre-init function) moves the launcher's break if it uses brk; Detcore
+/// cannot then model the guest's own without splitting its heap, so the
+/// guest's next brk is refused by name, where the launcher's break would be
+/// a plausible wrong answer. So is every brk of a run whose threads are not
+/// sequentialized, where one thread's brk could race another's mapping, and
+/// a position-independent guest's brk from the launcher's break, which its
+/// libc read in a pre-init function: Linux's answer, the guest's break above
+/// that request, would read as a grant at an address nothing mapped.
+#[test]
+fn sabre_refuses_brk_it_cannot_model_by_name() {
+    const QUERIED: &str = r#"
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+static void early(void) { sbrk(0); }
+__attribute__((section(".preinit_array"), used)) static void (*preinit)(void) = early;
+int main(void) {
+  char *grown = sbrk(4096);
+  if (grown != (void *)-1)
+    memset(grown, 1, 4096);
+  printf("sbrk after a pre-init query: %s\n", grown == (void *)-1 ? "refused" : "granted");
+  return 0;
+}
+"#;
+    const QUERY: &str = r#"
+#include <stdio.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(void) {
+  printf("break: %s\n", syscall(SYS_brk, 0) > 0 ? "yes" : "no");
+  return 0;
+}
+"#;
+    const GUEST: &str = r#"
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+static void early(void) { sbrk(4096); }
+__attribute__((section(".preinit_array"), used)) static void (*preinit)(void) = early;
+int main(void) {
+  long now = syscall(SYS_brk, 0);
+  printf("brk moved before main: %s\n", now > 0 ? "yes" : "no");
+  return 0;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-brk-preinit-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest_with(dir.path(), "brk_preinit", GUEST, &["-fno-pie", "-no-pie"]);
+    let ptrace = parity_run(&guest, &[], None, "ptrace brk_preinit");
+    assert!(ptrace.status.success(), "{ptrace:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&ptrace.stdout),
+        "brk moved before main: yes\n"
+    );
+    let mut command = Command::new(hermit_binary());
+    command
+        .env("HERMIT_SABRE_BINARY", &loader)
+        .args(["--backend", "sabre", "run", "--strict", COMPARISON_EPOCH])
+        .arg("--")
+        .arg(&guest);
+    let (status, stderr) = run_expecting_failure(command, "SaBRe brk_preinit");
+    assert_eq!(status.code(), Some(122), "{stderr}");
+    assert!(
+        stderr.contains("guest code moved the launcher's break before Detcore modeled its own"),
+        "{stderr}"
+    );
+
+    let query = compile_guest_with(dir.path(), "brk_query", QUERY, &["-fno-pie", "-no-pie"]);
+    let mut command = Command::new(hermit_binary());
+    command
+        .env("HERMIT_SABRE_BINARY", &loader)
+        .args([
+            "--backend",
+            "sabre",
+            "run",
+            "--no-sequentialize-threads",
+            COMPARISON_EPOCH,
+        ])
+        .arg("--")
+        .arg(&query);
+    let (status, stderr) = run_expecting_failure(command, "SaBRe unsequentialized brk_query");
+    assert_eq!(status.code(), Some(122), "{stderr}");
+    assert!(
+        stderr.contains("no model of the guest's: threads are not sequentialized"),
+        "{stderr}"
+    );
+
+    let queried = compile_guest_with(dir.path(), "brk_queried", QUERIED, &["-fpie", "-pie"]);
+    let ptrace = parity_run(&queried, &[], None, "ptrace brk_queried");
+    assert!(ptrace.status.success(), "{ptrace:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&ptrace.stdout),
+        "sbrk after a pre-init query: granted\n"
+    );
+    let mut command = Command::new(hermit_binary());
+    command
+        .env("HERMIT_SABRE_BINARY", &loader)
+        .args(["--backend", "sabre", "run", "--strict", COMPARISON_EPOCH])
+        .arg("--")
+        .arg(&queried);
+    let (status, stderr) = run_expecting_failure(command, "SaBRe brk_queried");
+    assert_eq!(status.code(), Some(122), "{stderr}");
+    assert!(
+        stderr.contains("brk from the launcher's break, which the guest's libc read before Detcore modeled the guest's"),
+        "{stderr}"
+    );
+}
+
 /// Under SaBRe, whose kernel's `exe` link names the loader, an `exe` link
 /// Detcore cannot answer faithfully is refused by name, where the loader's
 /// would be a plausible wrong answer: the link of an image no longer at its

@@ -1834,10 +1834,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             return Ok(());
         }
+        // Where Detcore answers brk from its model (a launcher run), the
+        // kernel's `[heap]` is the launcher's, not the guest's.
+        let modeled_brk = guest
+            .thread_state()
+            .memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .brk_model
+            .is_some();
         let mut labelled_heap = false;
         for mmap in procmaps::from_pid(guest.pid(), |map| match map.pathname {
             procmaps::MMapPath::Stack if self.cfg.detlog_stack => true,
-            procmaps::MMapPath::Heap if self.cfg.detlog_heap => true,
+            procmaps::MMapPath::Heap if self.cfg.detlog_heap && !modeled_brk => true,
             _ => false,
         })? {
             labelled_heap |= matches!(mmap.pathname, procmaps::MMapPath::Heap);
@@ -1857,6 +1866,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // than a wrong one: downstream a zero-record heap comparison reads as
         // "compared and matched" rather than "never measured". Fall back to the
         // brk range Detcore observed, which identifies the heap on every backend.
+        // Where Detcore models the break, the observed range is the model's.
         if self.cfg.detlog_heap && !labelled_heap {
             self.detlog_brk_heap(guest)?;
         }
@@ -1895,6 +1905,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         else {
             return Ok(());
         };
+        let modeled = guest
+            .thread_state()
+            .memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .brk_model
+            .is_some();
+        if modeled {
+            return self.detlog_modeled_brk_heap(guest, start, end);
+        }
         let enclosing = procmaps::from_pid(guest.pid(), |map| {
             matches!(map.pathname, procmaps::MMapPath::Anonymous)
                 && map.address.0 <= start
@@ -1910,6 +1930,40 @@ impl<T: RecordOrReplay> Detcore<T> {
             procmaps::display_range_as(&mmap, start, end, "[heap]"),
             procmaps::compute_hash_range(guest, start, end)?
         );
+        Ok(())
+    }
+
+    /// The heap records where Detcore models the break (a launcher run): one
+    /// per anonymous mapping that holds part of the modeled `[start, end)`,
+    /// clipped to it, as Linux's `[heap]` is one mapping per piece once an
+    /// mprotect splits it, and up to the break's page-aligned end, where the
+    /// kernel's `[heap]` mapping ends. So the records are the ones the
+    /// kernel's `[heap]` mappings give where the kernel's break is the
+    /// guest's, and a heap whose pages the guest unmapped gives none, as
+    /// Linux's label goes with its last page.
+    fn detlog_modeled_brk_heap<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        start: u64,
+        end: u64,
+    ) -> Result<(), reverie::Error> {
+        // The page brk(2) rounds the break up to.
+        let end = end.checked_add(4095).map_or(end, |end| end & !4095);
+        let pieces = procmaps::from_pid(guest.pid(), |map| {
+            matches!(map.pathname, procmaps::MMapPath::Anonymous)
+                && map.address.0 < end
+                && start < map.address.1
+        })?;
+        let dettid = guest.thread_state().dettid;
+        for piece in pieces {
+            let (from, to) = (piece.address.0.max(start), piece.address.1.min(end));
+            detlog!(
+                "[memory][dtid {}] {}->{}",
+                dettid,
+                procmaps::display_range_as(&piece, from, to, "[heap]"),
+                procmaps::compute_hash_range(guest, from, to)?
+            );
+        }
         Ok(())
     }
 }
@@ -3143,7 +3197,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         tool_global::mark_past_first_execve(guest).await;
         // The new image's program-break model, checked against the kernel's
         // once its exec record is in place.
-        self.check_brk_model(guest);
+        self.check_brk_model(guest).await;
         // Linux discards every queued POSIX timer signal at exec
         // (`flush_itimer_signals`), and Hermit's are ordinary signals it sent:
         // take them back before the new image runs
@@ -4524,6 +4578,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
                 }
             },
+            // Where the run declares a launcher, the kernel's program break
+            // is the launcher's: Detcore answers brk from its model of the
+            // guest's (`Detcore::handle_brk`).
+            SyscallClassification::PassThrough
+                if call.number() == Sysno::brk && self.declares_launcher() =>
+            {
+                self.handle_brk(guest, call).await
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-2985): Review scheduler tracking of set_tid_address.
             // Linux and the backend own the pass-through call. Detcore also
