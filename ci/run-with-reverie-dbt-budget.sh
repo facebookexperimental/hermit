@@ -1814,7 +1814,18 @@ fi
 # only). git diff is empty under reverie-dbt/, and the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml are unchanged. All seven SDK inputs,
 # inventory 961, calibrated budget, job width and limits are unchanged.
-expected_pin=638ee64ae72b819ef12aa90321423e38117c50a1
+# CARRY TO 42555ccdb136fe0984cee211a3932139ea32eede (2026-10-17): from
+# 638ee64ae72b819ef12aa90321423e38117c50a1. Two commits, 0339779e (provider step E2b:
+# execute takes the issuing task and a &mut per-call context, with a guard
+# unit test) and 42555ccd (provider step E2c: cancelled reads and committed
+# group exits become provider outcomes), touching only reverie-core,
+# reverie-linux-provider and reverie-kvm. git diff is empty under reverie-dbt/
+# (tree 61bc6e936c77 at both pins), and build.rs, vendor/dynamorio, native/,
+# third-party, the root Cargo.toml, Cargo.lock and rust-toolchain.toml have the
+# same object ids, so no DynamoRIO build input moves: all seven SDK inputs,
+# native client source, DBT inventory 961, calibrated budget, job width and
+# limits are unchanged.
+expected_pin=42555ccdb136fe0984cee211a3932139ea32eede
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
