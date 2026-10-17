@@ -14674,6 +14674,32 @@ fn host_inapplicable_plan_summary(nodes: &[validate_plan::HostInapplicableNode])
 }
 
 /// Per-node cost table, built entirely from typed `StepOutcome` fields.
+/// The wall time of each step this process takes after the step graph has ended.
+/// Measured validations spent 82 to 388 s there (2026-10-17), on no critical path the
+/// scheduler can see, and the log had no line between some of those steps; each mark
+/// prints the step's own time and the time since the graph ended.
+struct AfterGraphClock {
+    ended: std::time::Instant,
+    last: std::time::Instant,
+}
+
+impl AfterGraphClock {
+    fn start() -> Self {
+        let now = std::time::Instant::now();
+        Self { ended: now, last: now }
+    }
+
+    fn mark(&mut self, step: &str) {
+        let now = std::time::Instant::now();
+        eprintln!(
+            "validate: after the graph: {step} took {:.1} s ({:.1} s since the graph ended)",
+            now.duration_since(self.last).as_secs_f64(),
+            now.duration_since(self.ended).as_secs_f64()
+        );
+        self.last = now;
+    }
+}
+
 fn print_cost_table(
     outcomes: &[StepOutcome],
     attempts: &[NodeAttempt],
@@ -24437,6 +24463,7 @@ fn write_ledger_with_snapshot(
         );
         return None;
     }
+    let census_started = std::time::Instant::now();
     let (census, retries) = match raw_inputs {
         Some((snapshot, authority)) => {
             let result = authority
@@ -24460,6 +24487,10 @@ fn write_ledger_with_snapshot(
     };
     add_raw_census(&mut record, census);
     add_framework_retries(&mut record, retries);
+    eprintln!(
+        "validate: after the graph: the raw-result census took {:.1} s",
+        census_started.elapsed().as_secs_f64()
+    );
     let line = format!("{}\n", serde_json::to_string(&record).unwrap());
     let explicit = std::env::var(LEDGER_ENV)
         .ok()
@@ -24478,6 +24509,7 @@ fn write_ledger_with_snapshot(
             );
             return None;
         };
+        let writer_started = std::time::Instant::now();
         let mut child = match Command::new("python3")
             .arg(&adapter)
             .arg("record")
@@ -24511,6 +24543,10 @@ fn write_ledger_with_snapshot(
                     "validate: canonical ledger record appended via {}: {}",
                     adapter.display(),
                     String::from_utf8_lossy(&output.stdout).trim()
+                );
+                eprintln!(
+                    "validate: after the graph: the canonical ledger writer took {:.1} s",
+                    writer_started.elapsed().as_secs_f64()
                 );
                 return Some(record);
             }
@@ -28161,6 +28197,7 @@ fn run(
     let validation_complete =
         validation_is_complete(execution_complete, &classification, &planned_tags);
     print_cost_table(&outcomes, &attempts, &skipped, &plan.host_inapplicable);
+    let mut after_graph = AfterGraphClock::start();
     // Like host-inapplicable nodes, listed outside the status table: a withheld
     // node has no status in that vocabulary.
     for tag in &plan.frozen_run_withheld {
@@ -28213,6 +28250,7 @@ fn run(
             }
         }
     };
+    after_graph.mark("the raw-result capture and the per-cell series append");
     // Parity is not appended here: each path below appends it after its
     // ledger row (`append_run_parity`), because the append can wait minutes
     // and nothing in this section may hold the run's record back for it.
@@ -28809,6 +28847,7 @@ fn run(
         );
     }
 
+    after_graph.mark("result retention and coverage");
     // A NESTED payload writes nothing: the outer run owns the ledger and the
     // receipt, and a second row for one logical run is exactly the duplication
     // the re-entrancy guard exists to prevent.
@@ -28836,6 +28875,7 @@ fn run(
         None
     };
 
+    after_graph.mark("the canonical ledger record");
     // Receipt publication, strictly AFTER the ledger append: `ci-hub
     // apply-local-label` re-derives the receipt FROM the ledger, so publishing
     // first would label the PR from the previous run's newest row. Non-fatal by
@@ -28860,6 +28900,7 @@ fn run(
         }
     }
 
+    after_graph.mark("the receipt");
     // Parity goes out after the ledger row and the receipt, neither of which
     // may wait on it, and before the writeback that publishes what it spooled.
     append_run_parity(
@@ -28881,6 +28922,7 @@ fn run(
         &commit,
     );
 
+    after_graph.mark("the parity append");
     // This must remain below the ledger append and receipt publication. Writing
     // the generated scorecard sooner changes the working tree while the run is
     // still establishing whether its receipt is commit-anchored. The checkout
@@ -28902,6 +28944,7 @@ fn run(
         },
     );
 
+    after_graph.mark("the scorecard write-back");
     // Read the individual results before removing the disposable build root: a
     // caller may deliberately place E2E_RESULT_ROOT there. The scheduler is
     // finished, and `read_log_since_settled` flushes the live tee before reading.
