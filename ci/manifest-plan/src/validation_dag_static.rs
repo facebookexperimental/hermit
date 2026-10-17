@@ -2481,7 +2481,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from 4c6cf49f: 2018.
     // And +2 from 577c5911: 2020.
     // And +6 from 43503a9b: 2026.
-    ("test.detcore_unit", 2026),
+    // And the two blocked-resume guard units of the 4499 follow-up: 2028, listed.
+    ("test.detcore_unit", 2028),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4296,7 +4297,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from 4c6cf49f: 2018.
     // And +2 from 577c5911: 2020.
     // And +6 from 43503a9b: 2026.
-    ("test.detcore_unit_on_host", 2026),
+    // And the same two blocked-resume guard units: 2028.
+    ("test.detcore_unit_on_host", 2028),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
