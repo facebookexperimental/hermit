@@ -48,24 +48,25 @@ const DETCORE_ALLOCATOR_WRAPPER_NAME: &str = "hermit-detcore-allocator-cpu";
 const DETCORE_CONSTRUCTOR_WRAPPER_NAME: &str = "hermit-detcore-constructor-cpu";
 const STANDALONE_ALLOCATOR_WRAPPER_NAME: &str = "hermit-standalone-allocator-cpu";
 const DETCORE_STACK_WRAPPER_NAME: &str = "hermit-detcore-stack-cpu";
-// Whole-attempt canonical observations and the decisions for all 24 fixture
-// identities are retained in ci/liteinst-fixture-cpu-budgets.md. Wall stays 57;
+// Whole-attempt observations and all 24 fixture decisions are retained in
+// ci/liteinst-fixture-cpu-budgets.md. Every prepared stacks test has a separate
+// 3x-CPU wall backstop; allocator and unrelated wall policies stay unchanged.
 // prior CPU timeouts remain censored, not successful old-cap completion samples.
 // Detcore allocator completed maximum 20.754169s: ceil(1.5 * max) = 32.
 const DETCORE_ALLOCATOR_CPU_SECONDS: u64 = 32;
-// Detcore constructor completed maximum 26.386976s: ceil(1.5 * max) = 40.
-const DETCORE_CONSTRUCTOR_CPU_SECONDS: u64 = 40;
+// Detcore constructor completed maximum 36.113714s: ceil(1.5 * max) = 55.
+const DETCORE_CONSTRUCTOR_CPU_SECONDS: u64 = 55;
+// Separately approved host-load backstop, not measured wall headroom.
+// The earlier f141 wall timeout remains a failed run.
+const DETCORE_CONSTRUCTOR_WALL_SECONDS: u64 = 3 * DETCORE_CONSTRUCTOR_CPU_SECONDS;
 // Retained d7efd4cb/da86dfbe standalone diagnostic N=3 at CPU44/wall57:
 // 17.718674, 17.632669, 17.573148s. The completed-sample formula would give 27.
 // Use 33 conservatively after the concurrent CPU22 timeout at 22.799306s;
 // that censored failure has unknown completion cost. Wall and cleanup stay unchanged.
 const STANDALONE_ALLOCATOR_CPU_SECONDS: u64 = 33;
-// Detcore stack: completed prior maximum 21.060359s, then CPU22 timeout at
-// 22.359546s with unknown completion cost. The authorized conservative 34s is
-// ceil(1.5 * that censored lower bound), not measured 50% completion headroom.
-// Same-artifact diagnostic CPU33/wall57 completed in 19.476304, 20.099408,
-// 19.744570s; these passes do not turn the original timeout into a success.
-const DETCORE_STACK_CPU_SECONDS: u64 = 34;
+// Detcore stack completed maximum 27.542858s: ceil(1.5 * max) = 42.
+// Earlier CPU22 timeouts stay censored, not successful completion samples.
+const DETCORE_STACK_CPU_SECONDS: u64 = 42;
 const RENDERED_PROCFS_WRAPPER_NAME: &str = "hermit-rendered-procfs-cpu";
 // hermit::cli detcore_renders_its_procfs_files_on_every_backend runs a
 // --verify of one guest on every backend this build has, DBT's among them, plus
@@ -86,9 +87,20 @@ struct MeasuredCpuAllowance {
     binary: &'static str,
     test: &'static str,
     cpu_seconds: u64,
+    wall_seconds: Option<u64>,
 }
 
 impl MeasuredCpuAllowance {
+    const fn stack(wrapper_name: &'static str, test: &'static str, cpu_seconds: u64) -> Self {
+        Self {
+            wrapper_name,
+            binary: "hermit::liteinst_stacks",
+            test,
+            cpu_seconds,
+            wall_seconds: Some(3 * cpu_seconds),
+        }
+    }
+
     fn identity(self) -> nextest_cpu::AttemptIdentity {
         nextest_cpu::AttemptIdentity {
             package: "hermit".into(),
@@ -99,37 +111,107 @@ impl MeasuredCpuAllowance {
     }
 }
 
-const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 5] = [
+const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 18] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
         binary: "hermit::liteinst_allocator",
         test: "genuine_detcore_leaf_keeps_scope_free_work_private",
         cpu_seconds: DETCORE_ALLOCATOR_CPU_SECONDS,
+        wall_seconds: None,
     },
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_CONSTRUCTOR_WRAPPER_NAME,
         binary: "hermit::liteinst_stacks",
         test: "cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack",
         cpu_seconds: DETCORE_CONSTRUCTOR_CPU_SECONDS,
+        wall_seconds: Some(DETCORE_CONSTRUCTOR_WALL_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: STANDALONE_ALLOCATOR_WRAPPER_NAME,
         binary: "hermit::liteinst_allocator",
         test: "genuine_standalone_leaf_keeps_scope_free_work_private",
         cpu_seconds: STANDALONE_ALLOCATOR_CPU_SECONDS,
+        wall_seconds: None,
     },
     MeasuredCpuAllowance {
         wrapper_name: RENDERED_PROCFS_WRAPPER_NAME,
         binary: "hermit::cli",
         test: "detcore_renders_its_procfs_files_on_every_backend",
         cpu_seconds: RENDERED_PROCFS_CPU_SECONDS,
+        wall_seconds: None,
     },
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_STACK_WRAPPER_NAME,
         binary: "hermit::liteinst_stacks",
         test: "genuine_detcore_reaches_fixed_guarded_callback_and_altstack",
         cpu_seconds: DETCORE_STACK_CPU_SECONDS,
+        wall_seconds: Some(3 * DETCORE_STACK_CPU_SECONDS),
     },
+    MeasuredCpuAllowance::stack(
+        "hermit-stack-exact-got-cpu",
+        "artifact::tests::credits_exact_local_relative_got_route_and_direct_tailcall",
+        22,
+    ),
+    MeasuredCpuAllowance::stack(
+        "hermit-stack-allocator-endpoints-cpu",
+        "artifact::tests::inline_endpoints_require_owned_allocator_allocation_methods",
+        22,
+    ),
+    MeasuredCpuAllowance::stack(
+        "hermit-stack-build-finished-cpu",
+        "artifact::tests::missing_build_finished_is_a_failed_current_artifact_selection",
+        22,
+    ),
+    MeasuredCpuAllowance::stack(
+        "hermit-stack-tls-recipes-cpu",
+        "artifact::tests::observed_integrated_detcore_e8_tls_whole_recipes",
+        22,
+    ),
+    MeasuredCpuAllowance::stack(
+        "hermit-stack-symbol-versions-cpu",
+        "artifact::tests::refuses_new_or_unrecognized_guest_symbol_versions",
+        22,
+    ),
+    MeasuredCpuAllowance::stack(
+        "hermit-stack-indirect-calls-cpu",
+        "artifact::tests::unresolved_or_preemptible_indirect_calls_do_not_earn_a_path",
+        22,
+    ),
+    MeasuredCpuAllowance::stack(
+        "hermit-stack-caller-stack-cpu",
+        "cold_constructor::caller_stack_samples_never_receive_constructor_placement_credit",
+        22,
+    ),
+    MeasuredCpuAllowance::stack(
+        "hermit-stack-guard-alias-cpu",
+        "cold_constructor::later_guard_cannot_alias_the_retained_bootstrap_extent",
+        22,
+    ),
+    MeasuredCpuAllowance::stack(
+        "hermit-stack-standalone-altstack-cpu",
+        "genuine_standalone_registers_fixed_guarded_altstack_without_continuation",
+        36,
+    ),
+    MeasuredCpuAllowance::stack(
+        "hermit-stack-inert-preload-cpu",
+        "inert_preload_does_not_reserve_or_register_runtime_stacks",
+        31,
+    ),
+    MeasuredCpuAllowance::stack(
+        "hermit-stack-foreign-callback-cpu",
+        "stack_observation::tests::rejects_foreign_and_unreached_callback_records",
+        22,
+    ),
+    MeasuredCpuAllowance::stack(
+        "hermit-stack-readable-guards-cpu",
+        "stack_observation::tests::rejects_unprobed_and_readable_guards",
+        22,
+    ),
+    MeasuredCpuAllowance::stack(
+        "hermit-stack-disabled-altstack-cpu",
+        "standalone_altstack_disabled_receives_no_owned_stack_credit",
+        30,
+    ),
 ];
 
 fn usage() -> &'static str {
@@ -415,6 +497,54 @@ fn add_cpu_wrapper(
     Ok(())
 }
 
+// Exact selected identities only. Put the wall policy before existing rules in
+// default and any profile with its own overrides: Nextest uses the first matching
+// override, and a profile's own overrides take precedence over inherited ones.
+fn add_wall_allowances(
+    document: &mut DocumentMut,
+    selected: &[MeasuredCpuAllowance],
+    multiplier: f64,
+) -> Result<(), String> {
+    for allowance in selected {
+        let Some(base_seconds) = allowance.wall_seconds else {
+            continue;
+        };
+        let seconds = timeouts::scale_timeout_seconds(base_seconds, multiplier, "wall multiplier")?;
+        let mut timeout = InlineTable::new();
+        timeout.insert("period", Value::from(format!("{seconds}s")));
+        timeout.insert("terminate-after", Value::from(1_i64));
+        timeout.insert("grace-period", Value::from("2s"));
+        let mut rule = Table::new();
+        rule["filter"] = value(exact_filter(&allowance.identity()));
+        rule["slow-timeout"] = value(timeout);
+        let profiles = document["profile"]
+            .as_table_mut()
+            .ok_or("profile must be a table")?;
+        profiles
+            .entry("default")
+            .or_insert_with(|| Item::Table(Table::new()));
+        for (name, profile) in profiles.iter_mut() {
+            let profile = profile.as_table_mut().ok_or("profile must be a table")?;
+            if name != "default" && !profile.contains_key("overrides") {
+                continue;
+            }
+            let item = profile
+                .entry("overrides")
+                .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
+            let existing = item
+                .as_array_of_tables()
+                .ok_or("profile overrides must be an array of tables")?;
+            let mut overrides = ArrayOfTables::new();
+            overrides.push(rule.clone());
+            for entry in existing.iter() {
+                overrides.push(entry.clone());
+            }
+            *item = Item::ArrayOfTables(overrides);
+        }
+    }
+    Ok(())
+}
+
 fn scaled_config(
     source: &str,
     multiplier: f64,
@@ -447,7 +577,26 @@ fn scaled_config_with_allowances(
         let cpu_budget_usec = cpu_seconds
             .checked_mul(1_000_000)
             .ok_or("CPU timeout overflows microseconds")?;
+        // Original deadlines still bound the ordinary partition and every
+        // allowance without an exact wall override. Owned walls are checked
+        // against their own CPU budget, not another test's budget.
         let mut maximum_cpu_seconds = cpu_seconds;
+        if selected_allowances
+            .iter()
+            .any(|row| row.wall_seconds.is_some())
+        {
+            let mut default = document
+                .get("profile")
+                .and_then(|profiles| profiles.get("default"))
+                .and_then(|profile| profile.get("slow-timeout"))
+                .cloned()
+                .ok_or("owned wall allowances require an original finite default timeout")?;
+            if scale_timeout_item(&mut default, 1.0)?.is_none() {
+                return Err(
+                    "owned wall allowances require an original finite default timeout".into(),
+                );
+            }
+        }
         let measured_budgets = selected_allowances
             .iter()
             .map(|allowance| {
@@ -456,7 +605,19 @@ fn scaled_config_with_allowances(
                     cpu_multiplier,
                     "CPU multiplier",
                 )?;
-                maximum_cpu_seconds = maximum_cpu_seconds.max(seconds);
+                if let Some(base_wall) = allowance.wall_seconds {
+                    let wall = timeouts::scale_timeout_seconds(base_wall, multiplier, "wall multiplier")?;
+                    let cpu_and_cleanup = seconds.checked_add(CPU_TERMINATION_GRACE_SECONDS)
+                        .ok_or("CPU timeout plus cleanup grace overflows seconds")?;
+                    if wall <= cpu_and_cleanup {
+                        return Err(format!(
+                            "nextest owned wall ({wall}s) for {} must exceed its CPU timeout ({seconds}s) plus cleanup grace ({CPU_TERMINATION_GRACE_SECONDS}s)",
+                            allowance.test,
+                        ));
+                    }
+                } else {
+                    maximum_cpu_seconds = maximum_cpu_seconds.max(seconds);
+                }
                 let budget = seconds
                     .checked_mul(1_000_000)
                     .ok_or("CPU timeout overflows microseconds")?;
@@ -466,8 +627,9 @@ fn scaled_config_with_allowances(
         let cpu_and_cleanup = maximum_cpu_seconds
             .checked_add(CPU_TERMINATION_GRACE_SECONDS)
             .ok_or("CPU timeout plus cleanup grace overflows seconds")?;
-        // Check complete profile/override values, including inherited defaults,
-        // without lengthening a wall timeout or treating a warning as a stop.
+        // Every original finite deadline still bounds the unoverridden
+        // partition. An exact owned wall deliberately replaces that deadline
+        // for its selected test only, with separation checked above.
         if wall_deadlines
             .iter()
             .flatten()
@@ -478,6 +640,7 @@ fn scaled_config_with_allowances(
                  ({CPU_TERMINATION_GRACE_SECONDS}s) must be below every finite scaled wall termination bound"
             ));
         }
+        add_wall_allowances(&mut document, selected_allowances, multiplier)?;
         add_cpu_wrapper(
             &mut document,
             wrapper_bin,
@@ -763,7 +926,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), and rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s) base CPU allowances, each scaled once; all other tests keep the 22-second base. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity gets a separate base wall backstop of three times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -808,10 +971,19 @@ fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     {
         if !selected_allowances.is_empty() {
             for allowance in &selected_allowances {
+                let wall = match allowance.wall_seconds {
+                    Some(base) => format!(
+                        "wall backstop base {base}s effective {}s (wall multiplier {wall_multiplier}); cleanup 2s",
+                        timeouts::scale_timeout_seconds(base, wall_multiplier, "wall multiplier")?
+                    ),
+                    None => format!(
+                        "existing wall bounds unchanged except wall multiplier {wall_multiplier}"
+                    ),
+                };
                 eprintln!(
                     "nextest budgets: prepared exact {} test {} CPU base {}s \
-                     (CPU multiplier {cpu_multiplier}); ordinary CPU base {}s; existing wall bounds unchanged \
-                     except wall multiplier {wall_multiplier}; regular population/concurrency not certified",
+                     (CPU multiplier {cpu_multiplier}); ordinary CPU base {}s; \
+                     {wall}; regular population/concurrency not certified",
                     allowance.binary,
                     allowance.test,
                     allowance.cpu_seconds,
@@ -1598,7 +1770,7 @@ mod tests {
                 "hermit::liteinst_stacks",
                 "cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack",
                 DETCORE_CONSTRUCTOR_WRAPPER_NAME,
-                "40000000",
+                "55000000",
             ),
             (
                 "hermit::liteinst_allocator",
@@ -1610,7 +1782,7 @@ mod tests {
                 "hermit::liteinst_stacks",
                 "genuine_detcore_reaches_fixed_guarded_callback_and_altstack",
                 DETCORE_STACK_WRAPPER_NAME,
-                "34000000",
+                "42000000",
             ),
         ] {
             let target = nextest_cpu::AttemptIdentity {
@@ -1673,10 +1845,25 @@ mod tests {
                     Some((DETCORE_ALLOCATOR_WRAPPER_NAME, "32000000"))
                 } else if identity.package == "hermit"
                     && identity.binary == "hermit::liteinst_stacks"
-                    && identity.test
-                        == "genuine_detcore_reaches_fixed_guarded_callback_and_altstack"
                 {
-                    Some((DETCORE_STACK_WRAPPER_NAME, "34000000"))
+                    match identity.test.as_str() {
+                        "genuine_detcore_reaches_fixed_guarded_callback_and_altstack" => {
+                            Some((DETCORE_STACK_WRAPPER_NAME, "42000000"))
+                        }
+                        "genuine_standalone_registers_fixed_guarded_altstack_without_continuation" => {
+                            Some(("hermit-stack-standalone-altstack-cpu", "36000000"))
+                        }
+                        "standalone_altstack_disabled_receives_no_owned_stack_credit" => {
+                            Some(("hermit-stack-disabled-altstack-cpu", "30000000"))
+                        }
+                        "inert_preload_does_not_reserve_or_register_runtime_stacks" => {
+                            Some(("hermit-stack-inert-preload-cpu", "31000000"))
+                        }
+                        "cold_constructor::caller_stack_samples_never_receive_constructor_placement_credit" => {
+                            Some(("hermit-stack-caller-stack-cpu", "22000000"))
+                        }
+                        _ => None,
+                    }
                 } else {
                     None
                 };
@@ -1703,6 +1890,31 @@ mod tests {
                     document["profile"]["default"]["slow-timeout"]["period"].as_str(),
                     Some("57s")
                 );
+                let wall_overrides = document["profile"]["default"]["overrides"]
+                    .as_array_of_tables()
+                    .unwrap()
+                    .iter()
+                    .filter(|entry| entry.contains_key("slow-timeout"))
+                    .collect::<Vec<_>>();
+                let expected_wall = expected
+                    .filter(|_| identity.binary == "hermit::liteinst_stacks")
+                    .map(|(_, cpu)| format!("{}s", cpu.parse::<u64>().unwrap() / 1_000_000 * 3));
+                assert_eq!(wall_overrides.len(), usize::from(expected_wall.is_some()));
+                if let Some(entry) = wall_overrides.first() {
+                    assert_eq!(
+                        entry["filter"].as_str(),
+                        Some(exact_filter(&identity).as_str())
+                    );
+                    assert_eq!(
+                        entry["slow-timeout"]["period"].as_str(),
+                        expected_wall.as_deref()
+                    );
+                    assert_eq!(
+                        entry["slow-timeout"]["terminate-after"].as_integer(),
+                        Some(1)
+                    );
+                    assert_eq!(entry["slow-timeout"]["grace-period"].as_str(), Some("2s"));
+                }
                 for allowance in MEASURED_CPU_ALLOWANCES {
                     if let Some((expected_name, expected_budget)) = expected
                         .filter(|(expected_name, _)| *expected_name == allowance.wrapper_name)
@@ -1743,7 +1955,7 @@ mod tests {
     }
 
     #[test]
-    fn every_measured_subset_partitions_once_and_scales_cpu_and_wall_independently() {
+    fn original_five_allowance_subsets_partition_once_and_scale_independently() {
         let names = [
             DETCORE_ALLOCATOR_WRAPPER_NAME,
             DETCORE_CONSTRUCTOR_WRAPPER_NAME,
@@ -1769,20 +1981,24 @@ mod tests {
             let bytes = serde_json::to_vec(&measured_inventory(&identities)).unwrap();
             let selected = prepared_selected_cpu_allowances(true, || Ok(bytes)).unwrap();
             assert_eq!(selected.len(), identities.len());
-            for (cpu, wall, ordinary, measured, period) in [
+            for (cpu, wall, ordinary, measured, period, constructor_period, callback_period) in [
                 (
                     1.0,
                     1.0,
                     "22000000",
-                    ["32000000", "40000000", "33000000", "36000000", "34000000"],
+                    ["32000000", "55000000", "33000000", "36000000", "42000000"],
                     "57s",
+                    "165s",
+                    "126s",
                 ),
                 (
                     1.25,
                     1.5,
                     "28000000",
-                    ["40000000", "50000000", "42000000", "45000000", "43000000"],
+                    ["40000000", "69000000", "42000000", "45000000", "53000000"],
                     "86s",
+                    "248s",
+                    "189s",
                 ),
                 (
                     0.01,
@@ -1790,6 +2006,17 @@ mod tests {
                     "1000000",
                     ["1000000", "1000000", "1000000", "1000000", "1000000"],
                     "6s",
+                    "17s",
+                    "13s",
+                ),
+                (
+                    1.0,
+                    1.01,
+                    "22000000",
+                    ["32000000", "55000000", "33000000", "36000000", "42000000"],
+                    "58s",
+                    "167s",
+                    "128s",
                 ),
             ] {
                 let rendered = scaled_config_with_allowances(
@@ -1805,6 +2032,36 @@ mod tests {
                     document["profile"]["default"]["slow-timeout"]["period"].as_str(),
                     Some(period)
                 );
+                let wall_overrides = document["profile"]["default"]["overrides"]
+                    .as_array_of_tables()
+                    .unwrap()
+                    .iter()
+                    .filter(|entry| entry.contains_key("slow-timeout"))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    wall_overrides.len(),
+                    usize::from(mask & 2 != 0) + usize::from(mask & 16 != 0)
+                );
+                for (index, expected_period) in [(1, constructor_period), (4, callback_period)] {
+                    let matches = wall_overrides
+                        .iter()
+                        .filter(|row| row["filter"].as_str() == Some(filters[index]))
+                        .collect::<Vec<_>>();
+                    assert_eq!(matches.len(), usize::from(mask & (1 << index) != 0));
+                    if let Some(entry) = matches.first() {
+                        assert_eq!(
+                            entry["slow-timeout"]["period"].as_str(),
+                            Some(expected_period)
+                        );
+                        assert_eq!(
+                            entry["slow-timeout"]["terminate-after"].as_integer(),
+                            Some(1)
+                        );
+                        assert_eq!(entry["slow-timeout"]["grace-period"].as_str(), Some("2s"));
+                    }
+                }
+                // ci inherits the default exact rule; no extra profile rule is needed.
+                assert!(document["profile"]["ci"].get("overrides").is_none());
                 let active_filters = filters
                     .iter()
                     .enumerate()
@@ -1852,71 +2109,333 @@ mod tests {
     }
 
     #[test]
-    fn new_allowances_keep_strict_cpu_cleanup_separation_from_every_finite_wall() {
+    fn whole_stacks_inventory_has_exact_cpu_and_wall_rules_without_neighbor_credit() {
+        let expected: [(&str, u64, u64); 15] = [
+            (
+                "artifact::tests::credits_exact_local_relative_got_route_and_direct_tailcall",
+                22,
+                66,
+            ),
+            (
+                "artifact::tests::inline_endpoints_require_owned_allocator_allocation_methods",
+                22,
+                66,
+            ),
+            (
+                "artifact::tests::missing_build_finished_is_a_failed_current_artifact_selection",
+                22,
+                66,
+            ),
+            (
+                "artifact::tests::observed_integrated_detcore_e8_tls_whole_recipes",
+                22,
+                66,
+            ),
+            (
+                "artifact::tests::refuses_new_or_unrecognized_guest_symbol_versions",
+                22,
+                66,
+            ),
+            (
+                "artifact::tests::unresolved_or_preemptible_indirect_calls_do_not_earn_a_path",
+                22,
+                66,
+            ),
+            (
+                "cold_constructor::caller_stack_samples_never_receive_constructor_placement_credit",
+                22,
+                66,
+            ),
+            (
+                "cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack",
+                55,
+                165,
+            ),
+            (
+                "cold_constructor::later_guard_cannot_alias_the_retained_bootstrap_extent",
+                22,
+                66,
+            ),
+            (
+                "genuine_detcore_reaches_fixed_guarded_callback_and_altstack",
+                42,
+                126,
+            ),
+            (
+                "genuine_standalone_registers_fixed_guarded_altstack_without_continuation",
+                36,
+                108,
+            ),
+            (
+                "inert_preload_does_not_reserve_or_register_runtime_stacks",
+                31,
+                93,
+            ),
+            (
+                "stack_observation::tests::rejects_foreign_and_unreached_callback_records",
+                22,
+                66,
+            ),
+            (
+                "stack_observation::tests::rejects_unprobed_and_readable_guards",
+                22,
+                66,
+            ),
+            (
+                "standalone_altstack_disabled_receives_no_owned_stack_credit",
+                30,
+                90,
+            ),
+        ];
+        let identities = expected
+            .iter()
+            .map(|(test, _, _)| nextest_cpu::AttemptIdentity {
+                package: "hermit".into(),
+                binary: "hermit::liteinst_stacks".into(),
+                test: (*test).into(),
+                attempt: 1,
+            })
+            .collect::<Vec<_>>();
+        let inventory = measured_inventory(&identities);
+        let selected =
+            prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(&inventory).unwrap()))
+                .unwrap();
+        assert_eq!(selected.len(), 15);
+        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 18);
+        for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5), (0.01, 0.1)] {
+            let rendered = scaled_config_with_allowances(
+                include_str!("../.config/nextest.toml"),
+                wall_multiplier,
+                Some((Path::new("/fixture/wrapper"), cpu_multiplier)),
+                &selected,
+            )
+            .unwrap();
+            let doc = rendered.parse::<DocumentMut>().unwrap();
+            let walls = doc["profile"]["default"]["overrides"]
+                .as_array_of_tables()
+                .unwrap()
+                .iter()
+                .filter(|r| r.contains_key("slow-timeout"))
+                .collect::<Vec<_>>();
+            assert_eq!(walls.len(), 15);
+            assert_eq!(run_wrapper_count(&doc, "default").unwrap(), 16);
+            assert_eq!(run_wrapper_count(&doc, "ci").unwrap(), 0);
+            assert!(doc["profile"]["ci"].get("overrides").is_none());
+            for ((test, cpu, wall), identity) in expected.iter().zip(&identities) {
+                let allowance = selected.iter().find(|a| a.test == *test).unwrap();
+                assert_eq!(
+                    (allowance.cpu_seconds, allowance.wall_seconds),
+                    (*cpu, Some(*wall))
+                );
+                let cpu_usec =
+                    timeouts::scale_timeout_seconds(*cpu, cpu_multiplier, "CPU multiplier")
+                        .unwrap()
+                        * 1_000_000;
+                assert_eq!(
+                    wrapper_argv(&doc, allowance.wrapper_name)[2],
+                    cpu_usec.to_string()
+                );
+                let filter = exact_filter(identity);
+                let matching = walls
+                    .iter()
+                    .filter(|r| r["filter"].as_str() == Some(&filter))
+                    .collect::<Vec<_>>();
+                assert_eq!(matching.len(), 1);
+                let wall_seconds =
+                    timeouts::scale_timeout_seconds(*wall, wall_multiplier, "wall multiplier")
+                        .unwrap();
+                assert_eq!(
+                    matching[0]["slow-timeout"]["period"].as_str(),
+                    Some(format!("{wall_seconds}s").as_str())
+                );
+                assert_eq!(
+                    matching[0]["slow-timeout"]["terminate-after"].as_integer(),
+                    Some(1)
+                );
+                assert_eq!(
+                    matching[0]["slow-timeout"]["grace-period"].as_str(),
+                    Some("2s")
+                );
+                assert!(wall_seconds > cpu_usec / 1_000_000 + 2);
+            }
+        }
+        // Every identity retains prepared admission and literal spelling.
+        for identity in &identities {
+            for field in 0..3 {
+                for prefix in [true, false] {
+                    let mut neighbor = identity.clone();
+                    let target = match field {
+                        0 => &mut neighbor.package,
+                        1 => &mut neighbor.binary,
+                        _ => &mut neighbor.test,
+                    };
+                    *target = if prefix {
+                        format!("prefix_{target}")
+                    } else {
+                        format!("{target}_extra")
+                    };
+                    assert!(
+                        prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(
+                            &measured_inventory(&[neighbor])
+                        )
+                        .unwrap()))
+                        .unwrap()
+                        .is_empty()
+                    );
+                }
+            }
+            for state in 0..3 {
+                let mut inventory = measured_inventory(std::slice::from_ref(identity));
+                let case =
+                    &mut inventory["rust-suites"][&identity.binary]["testcases"][&identity.test];
+                match state {
+                    0 => case["ignored"] = true.into(),
+                    1 => case["filter-match"]["status"] = "mismatch".into(),
+                    _ => {}
+                }
+                assert!(
+                    prepared_selected_cpu_allowances(state != 2, || Ok(serde_json::to_vec(
+                        &inventory
+                    )
+                    .unwrap()))
+                    .unwrap()
+                    .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn constructor_wall_rule_precedes_matching_overrides_and_keeps_unrelated_rules() {
+        let canonical = include_str!("../.config/nextest.toml");
+        assert!(regular_config_compatible(
+            &canonical.parse::<DocumentMut>().unwrap()
+        ));
+        let source = format!(
+            "{canonical}\n[[profile.default.overrides]]\nfilter = \"all()\"\n\
+             slow-timeout = {{ period = \"60s\", terminate-after = 1 }}\n\
+             [[profile.ci.overrides]]\nfilter = \"all()\"\n\
+             slow-timeout = {{ period = \"90s\", terminate-after = 1 }}\n"
+        );
+        let rendered = scaled_config_with_allowances(
+            &source,
+            1.25,
+            Some((Path::new("/fixture/wrapper"), 1.0)),
+            &[MEASURED_CPU_ALLOWANCES[1]],
+        )
+        .unwrap();
+        let document = rendered.parse::<DocumentMut>().unwrap();
+        for (profile, old_period, old_index) in [("default", "75s", 2), ("ci", "113s", 1)] {
+            let entries = document["profile"][profile]["overrides"]
+                .as_array_of_tables()
+                .unwrap();
+            assert_eq!(entries.len(), old_index + 1);
+            assert_eq!(
+                entries.get(0).unwrap()["filter"].as_str(),
+                Some(
+                    "package(=hermit) & binary_id(=hermit::liteinst_stacks) & test(=cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack)"
+                )
+            );
+            assert_eq!(
+                entries.get(0).unwrap()["slow-timeout"]["period"].as_str(),
+                Some("207s")
+            );
+            let previous = entries.get(old_index).unwrap();
+            assert_eq!(previous["filter"].as_str(), Some("all()"));
+            assert_eq!(
+                previous["slow-timeout"]["period"].as_str(),
+                Some(old_period)
+            );
+        }
+        let group = document["profile"]["default"]["overrides"]
+            .as_array_of_tables()
+            .unwrap()
+            .get(1)
+            .unwrap();
+        assert_eq!(group["filter"].as_str(), Some(REGULAR_GROUP_OVERRIDES[0].0));
+        assert_eq!(group["test-group"].as_str(), Some("cli-gdbserver-port"));
+        assert_eq!(
+            wrapper_argv(&document, DETCORE_CONSTRUCTOR_WRAPPER_NAME)[2],
+            "55000000"
+        );
+    }
+
+    #[test]
+    fn owned_wall_rules_require_finite_defaults_and_separate_actual_cpu_bounds() {
+        let selected = [MEASURED_CPU_ALLOWANCES[1]];
+        let wrapper = Some((Path::new("/fixture/wrapper"), 1.0));
+        for source in [
+            "[profile.default]\n",
+            "[profile.default]\nslow-timeout = { period = \"57s\" }\n",
+            "[[profile.ci.overrides]]\nfilter = \"all()\"\nslow-timeout = { period = \"200s\", terminate-after = 1 }\n",
+        ] {
+            assert!(scaled_config_with_allowances(source, 1.0, wrapper, &selected).is_err());
+        }
         let source =
-            "[profile.default]\nslow-timeout = { period = \"57s\", terminate-after = 1 }\n";
-        let short = source.replace("57s", "35s");
-        assert!(scaled_config(&short, 1.0, Some((Path::new("/fixture/wrapper"), 1.0))).is_ok());
+            "[profile.default]\nslow-timeout = { period = \"200s\", terminate-after = 1 }\n";
+        // The actual constructor wall is 165*.34 -> 57, exactly CPU55+2:
+        // equality refuses, even though the original default200*.34 is ample.
         assert!(
-            scaled_config_with_allocator(
-                &short,
+            scaled_config_with_allowances(source, 0.34, wrapper, &selected)
+                .unwrap_err()
+                .contains("(55s)")
+        );
+        let rendered = scaled_config_with_allowances(source, 0.35, wrapper, &selected).unwrap();
+        let document = rendered.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            document["profile"]["default"]["overrides"]
+                .as_array_of_tables()
+                .unwrap()
+                .get(0)
+                .unwrap()["slow-timeout"]["period"]
+                .as_str(),
+            Some("58s")
+        );
+        // An owned wall never hides an ordinary/default collision.
+        assert!(
+            scaled_config_with_allowances(&source.replace("200s", "24s"), 1.0, wrapper, &selected)
+                .is_err()
+        );
+        assert!(
+            scaled_config_with_allowances(&source.replace("200s", "25s"), 1.0, wrapper, &selected)
+                .is_ok()
+        );
+        // Two owned tests do not inherit each other's CPU maxima: a 66s
+        // ordinary stack backstop may coexist with constructor CPU55/wall165.
+        assert!(
+            scaled_config_with_allowances(
+                source,
                 1.0,
-                Some((Path::new("/fixture/wrapper"), 1.0)),
-                true
+                wrapper,
+                &[MEASURED_CPU_ALLOWANCES[1], MEASURED_CPU_ALLOWANCES[5]]
             )
             .is_ok()
         );
-        let mut reversed = MEASURED_CPU_ALLOWANCES.to_vec();
-        reversed.reverse();
-        // The largest selected allowance is named in either order: the
-        // Detcore constructor's 40 s, above rendered-procfs's unchanged 36 s.
-        for (selected, first) in [
-            (MEASURED_CPU_ALLOWANCES.as_slice(), "(40s)"),
-            (reversed.as_slice(), "(40s)"),
-        ] {
-            let error = scaled_config_with_allowances(
-                &short,
-                1.0,
-                Some((Path::new("/fixture/wrapper"), 1.0)),
-                selected,
-            )
-            .unwrap_err();
-            assert!(error.contains(first), "{error}");
-        }
-        // The 36-second rendered-procfs allowance needs a wall above 38 s,
-        // and a CPU multiplier stretches it past a shortened wall.
-        let rendered = [MEASURED_CPU_ALLOWANCES[3]];
-        assert_eq!(rendered[0].cpu_seconds, 36);
-        let wrapper = Some((Path::new("/fixture/wrapper"), 1.0));
-        let error =
-            scaled_config_with_allowances(&short.replace("35s", "38s"), 1.0, wrapper, &rendered)
-                .unwrap_err();
-        assert!(error.contains("(36s)"), "{error}");
-        assert!(
-            scaled_config_with_allowances(&short.replace("35s", "39s"), 1.0, wrapper, &rendered)
-                .is_ok()
+        assert_eq!(
+            (
+                DETCORE_CONSTRUCTOR_CPU_SECONDS,
+                DETCORE_CONSTRUCTOR_WALL_SECONDS
+            ),
+            (55, 165)
         );
-        // 36 * 1.25 = 45 and 57 * 0.8 rounds to 46 <= 45 + 2; at the full
-        // 57-second wall, 47 is below it.
-        let stretched = Some((Path::new("/fixture/wrapper"), 1.25));
-        assert!(scaled_config_with_allowances(source, 0.8, stretched, &rendered).is_err());
-        assert!(scaled_config_with_allowances(source, 1.0, stretched, &rendered).is_ok());
-        // Every exact allowance rejects CPU+grace equality in either the
-        // default or an override, and accepts the next whole second. Literal
-        // expectations also preserve the unchanged standalone/procfs cells.
+    }
+
+    #[test]
+    fn unoverridden_allowances_keep_strict_cpu_cleanup_separation_from_every_finite_wall() {
+        let source =
+            "[profile.default]\nslow-timeout = { period = \"57s\", terminate-after = 1 }\n";
+        // These allocator/procfs assertions and boundaries are unchanged.
         for (allowance, seconds, cutoff, first_pass, collision, separated, period) in [
             (MEASURED_CPU_ALLOWANCES[0], 32, 34, 35, 0.7, 0.8, "46s"),
-            (MEASURED_CPU_ALLOWANCES[1], 40, 42, 43, 0.9, 0.95, "55s"),
             (MEASURED_CPU_ALLOWANCES[2], 33, 35, 36, 0.75, 0.8, "46s"),
             (MEASURED_CPU_ALLOWANCES[3], 36, 38, 39, 0.8, 0.85, "49s"),
-            (MEASURED_CPU_ALLOWANCES[4], 34, 36, 37, 0.78, 0.8, "46s"),
         ] {
             assert_eq!(allowance.cpu_seconds, seconds);
-            let collision_wall = format!("{cutoff}s");
+            assert!(allowance.wall_seconds.is_none());
             for source in [
-                source.replace("57s", &collision_wall),
+                source.replace("57s", &format!("{cutoff}s")),
                 format!(
-                    "{source}[[profile.ci.overrides]]\nfilter = \"test(short)\"\nslow-timeout = {{ period = \"{collision_wall}\", terminate-after = 1 }}\n"
+                    "{source}[[profile.ci.overrides]]\nfilter = \"test(short)\"\nslow-timeout = {{ period = \"{cutoff}s\", terminate-after = 1 }}\n"
                 ),
             ] {
                 assert!(
@@ -1939,8 +2458,6 @@ mod tests {
                 )
                 .is_ok()
             );
-            // Scale CPU and wall independently once; test both sides of each
-            // selected allowance's post-scaling CPU+cleanup separation.
             assert!(
                 scaled_config_with_allowances(
                     source,
@@ -1972,15 +2489,37 @@ mod tests {
                 );
             }
         }
+        // The largest non-owned cap remains36 regardless of the stack rows.
+        let mut reversed = MEASURED_CPU_ALLOWANCES.to_vec();
+        reversed.reverse();
+        for selected in [MEASURED_CPU_ALLOWANCES.as_slice(), reversed.as_slice()] {
+            assert!(
+                scaled_config_with_allowances(
+                    &source.replace("57s", "38s"),
+                    1.0,
+                    Some((Path::new("/fixture/wrapper"), 1.0)),
+                    selected
+                )
+                .unwrap_err()
+                .contains("(36s)")
+            );
+            assert!(
+                scaled_config_with_allowances(
+                    &source.replace("57s", "39s"),
+                    1.0,
+                    Some((Path::new("/fixture/wrapper"), 1.0)),
+                    selected
+                )
+                .is_ok()
+            );
+        }
         assert_eq!(
             DETCORE_CONSTRUCTOR_CPU_SECONDS,
-            timeouts::cpu_bound_from_p90_usec(26_386_976)
+            timeouts::cpu_bound_from_p90_usec(36_113_714)
         );
-        // This is a conservative policy formula applied to a censored
-        // observation, not a completed-sample headroom claim.
         assert_eq!(
             DETCORE_STACK_CPU_SECONDS,
-            timeouts::cpu_bound_from_p90_usec(22_359_546)
+            timeouts::cpu_bound_from_p90_usec(27_542_858)
         );
     }
 

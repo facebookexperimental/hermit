@@ -1,4 +1,72 @@
-# LiteInst fixture CPU budgets, measured October 16, 2026
+# LiteInst fixture CPU and wall budgets
+
+## Complete stacks node, October 16 evening
+
+All 15 `hermit::liteinst_stacks` tests now have an independent CPU allowance
+and a wall backstop of three times that allowance. The wall policy accommodates
+waiting under host load; it is an authorized tolerance increase, not a claim
+that a test needs three CPU seconds for each wall second. Termination grace
+remains two seconds. Allocator tests, other binaries, required selections,
+retries, and every fixture/source/placement assertion are unchanged.
+
+The retained inventory has 274 finalized per-attempt cgroup CPU receipts:
+272 successful completions and two CPU-censored failures. It covers 18 complete
+15-test selections plus four separately diagnostic constructor replays.
+These are mixed source and artifact cohorts, not 18 repetitions of this change.
+The original `f141091f` wall timeout has no finalized individual CPU receipt
+and is excluded from the CPU ranges.
+
+| Test | Completed samples | CPU range (seconds) | CPU cap | Wall backstop |
+| --- | ---: | ---: | ---: | ---: |
+| `artifact::tests::credits_exact_local_relative_got_route_and_direct_tailcall` | 18 | 2.376328–3.546702 | 22 | 66 |
+| `artifact::tests::inline_endpoints_require_owned_allocator_allocation_methods` | 18 | 0.001778–0.007302 | 22 | 66 |
+| `artifact::tests::missing_build_finished_is_a_failed_current_artifact_selection` | 18 | 1.094687–2.182613 | 22 | 66 |
+| `artifact::tests::observed_integrated_detcore_e8_tls_whole_recipes` | 18 | 0.006894–0.017616 | 22 | 66 |
+| `artifact::tests::refuses_new_or_unrecognized_guest_symbol_versions` | 18 | 0.001485–0.008026 | 22 | 66 |
+| `artifact::tests::unresolved_or_preemptible_indirect_calls_do_not_earn_a_path` | 18 | 0.035160–0.057074 | 22 | 66 |
+| `cold_constructor::caller_stack_samples_never_receive_constructor_placement_credit` | 18 | 0.001490–0.010135 | 22 | 66 |
+| `cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack` | 22 | 18.243929–36.113714 | 55 | 165 |
+| `cold_constructor::later_guard_cannot_alias_the_retained_bootstrap_extent` | 18 | 0.001459–0.006932 | 22 | 66 |
+| `genuine_detcore_reaches_fixed_guarded_callback_and_altstack` | 17 | 17.998559–27.542858 | 42 | 126 |
+| `genuine_standalone_registers_fixed_guarded_altstack_without_continuation` | 17 | 13.932757–21.467302 | 36 | 108 |
+| `inert_preload_does_not_reserve_or_register_runtime_stacks` | 18 | 13.899600–20.004790 | 31 | 93 |
+| `stack_observation::tests::rejects_foreign_and_unreached_callback_records` | 18 | 0.001491–0.001912 | 22 | 66 |
+| `stack_observation::tests::rejects_unprobed_and_readable_guards` | 18 | 0.001398–0.001866 | 22 | 66 |
+| `standalone_altstack_disabled_receives_no_owned_stack_credit` | 18 | 13.673469–19.622632 | 30 | 90 |
+
+For the constructor, `ceil(1.5 * 36.113714) = 55`; for the callback test,
+`ceil(1.5 * 27.542858) = 42`. The inert-preload and disabled-altstack maxima
+require 31 and 30 seconds. All ten small controls retain the existing 22-second
+CPU allowance, which exceeds their measured maxima by more than 50%.
+
+The standalone-altstack completed maximum would require 33 seconds. Its newer
+attempt at Hermit `6b9c57afbfc3cfb66155aba24e8e0c31fd5c290c` instead hit CPU22:
+the kill triggered at 22.008933 seconds, and cleanup-inclusive CPU ended at
+23.338877 seconds (30.296 wall). Its completion cost is unknown. The cap of
+36 seconds is conservative after that censored failure; qualification must
+also establish an uncensored current-source completion and at least 50%
+measured CPU headroom. The timeout remains a failure, not a completion sample.
+The same main run completed the constructor in 34.780724 CPU seconds and the
+callback in 27.454128; therefore changing only their wall bounds was insufficient.
+
+Exact prepared package, binary and test identities admit these allowances.
+Every selected stack test gets its own first-priority timeout in the default
+profile and profiles with local overrides. CPU and wall multipliers remain
+independent and each is applied once. The effective wall must strictly exceed
+that test's CPU cap plus cleanup. Original finite timeouts still constrain the
+ordinary partition and allocator/procfs exceptions. The former comparison of
+every test's maximum CPU against every other test's wall is intentionally
+replaced for stack tests with an explicit wall override; it would incorrectly
+reject CPU55/wall165 because an unrelated ordinary test keeps wall57. A finite
+original default remains required, and missing or warning-only defaults refuse.
+
+The exact tables and source/run identities are retained under measurement
+inventory SHA256 `9871284b456fa1500339d3f7499f7292a906d5431ceb37c13ac030255588c84f`.
+This table states measured budget evidence; passing the fresh canonical node
+is a separate hand-back requirement. The earlier measurements and decisions
+below remain historical evidence rather than the current stacks policy.
+
+# Earlier October 16 fixture measurements (historical caps)
 
 The full validation at `876ec26de98849ba789ba8612ebdfbb0d6134268` stopped
 `genuine_detcore_reaches_fixed_guarded_callback_and_altstack` at 22.359546 CPU
