@@ -1853,7 +1853,14 @@ fi
 # bb913edb at both pins), and the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml are unchanged: all seven SDK inputs, DBT inventory 961,
 # calibrated budget, job width and limits are unchanged.
-expected_pin=586d929ed48607c751606552593241eabeca047e
+# CARRY TO 3da25ef38b2b2ba1784fdbc6aface1610dc0c74a (2026-10-17): from
+# 586d929ed48607c751606552593241eabeca047e. Shared callback memory copies,
+# a test-only source transaction helper, and ptrace interrupt-latency headroom.
+# The full reverie-dbt tree and all seven SDK recipe inputs are unchanged;
+# inventory remains 961. Cargo.lock adds only the inguest-to-existing-syscalls
+# edge. Preserve the new base's calibration, widths, bounds and prior carries.
+# Fresh locked Rust consumers, fixtures and ptrace checks remain required.
+expected_pin=3da25ef38b2b2ba1784fdbc6aface1610dc0c74a
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

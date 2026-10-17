@@ -1930,8 +1930,15 @@ fi
 # bb913edb at both pins), and the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml are unchanged: all seven SDK inputs, DBT inventory 961,
 # calibrated budget, job width and limits are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 586d929ed48607c751606552593241eabeca047e ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 586d929ed48607c751606552593241eabeca047e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 3da25ef38b2b2ba1784fdbc6aface1610dc0c74a (2026-10-17): from
+# 586d929ed48607c751606552593241eabeca047e. Shared callback memory copies,
+# a test-only source transaction helper, and ptrace interrupt-latency headroom.
+# The full reverie-dbt tree and all seven SDK recipe inputs are unchanged;
+# inventory remains 961. Cargo.lock adds only the inguest-to-existing-syscalls
+# edge. Preserve the new base's calibration, widths, bounds and prior carries.
+# Fresh locked Rust consumers, fixtures and ptrace checks remain required.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 3da25ef38b2b2ba1784fdbc6aface1610dc0c74a ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 3da25ef38b2b2ba1784fdbc6aface1610dc0c74a (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

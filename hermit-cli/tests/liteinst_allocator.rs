@@ -127,7 +127,7 @@ fn qualify(
         Duration::from_secs(60),
         64 * 1024 * 1024,
     )?;
-    let compiled_sources = VerifiedCompiledSources::resolve(
+    let (receipt, compiled_sources) = VerifiedCompiledSources::with_resolved(
         &CompiledSourceExpectation {
             layout: CompiledSourceLayout::HermitGit,
             image_kind: if standalone {
@@ -140,137 +140,140 @@ fn qualify(
             reverie_pin: pin,
         },
         &mut runner,
-    )?;
-    let receipt: RuntimeReceipt = serde_json::from_slice(
-        &fs::read(artifact::real_file(&leaf.receipt)?).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    let source = format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
-    let (name, target, manifest, package_source, id, initializer) = if standalone {
-        require(
-            fs::read_to_string(format!("{}.revision", leaf.runtime.display()))
-                .map_err(|e| e.to_string())?
-                .trim()
-                == pin,
-            "standalone revision sidecar differs",
-        )?;
-        require(
-            receipt.cargo_artifact.package.source.as_deref() == Some(source.as_str()),
-            "standalone exact Git source differs",
-        )?;
-        let manifest = artifact::real_file(&compiled_sources.package().manifest)?;
-        require(
-            manifest.file_name().is_some_and(|n| n == "Cargo.toml")
-                && manifest
-                    .parent()
-                    .and_then(Path::file_name)
-                    .is_some_and(|n| n == "reverie-liteinst-preload"),
-            "standalone selected package is not the real preload leaf",
-        )?;
-        (
-            "reverie-liteinst-preload",
-            "reverie_liteinst_preload",
-            manifest,
-            Some(source.clone()),
-            format!(
-                "git+https://github.com/rrnewton/reverie.git?rev={pin}#reverie-liteinst-preload@0.4.1"
-            ),
-            artifact::STANDALONE_ROOT,
-        )
-    } else {
-        let manifest = artifact::real_file(&root.join("detcore-liteinst/Cargo.toml"))?;
-        (
-            "detcore-liteinst",
-            "detcore_liteinst",
-            manifest,
-            None,
-            format!(
-                "path+file://{}#0.4.0",
-                root.join("detcore-liteinst").display()
-            ),
-            "detcore_liteinst_initialize",
-        )
-    };
-    let package = PackageIdentity {
-        id,
-        name: name.into(),
-        manifest: manifest.clone(),
-        source: package_source,
-        target: target.into(),
-        kind: vec!["cdylib".into()],
-        crate_types: vec!["cdylib".into()],
-        target_source: artifact::real_file(
-            &manifest
-                .parent()
-                .ok_or("leaf directory absent")?
-                .join("src/lib.rs"),
-        )?,
-    };
-    require(
-        compiled_sources.package() == &package,
-        "fresh metadata package differs from the independent leaf expectations",
-    )?;
-    let expected_profile = json!({"opt_level":"3", "debuginfo":0, "debug_assertions":!standalone,
-        "overflow_checks":!standalone, "test":false});
-    let profile_name = if standalone { "release" } else { "validate" };
-    require(
-        leaf.profile_name == profile_name && leaf.cargo_profile == expected_profile,
-        "leaf profile differs from required diagnostic producer",
-    )?;
-    let features = vec!["allocator-fixture".into()];
-    let expected = ConsumerExpectation {
-        package: &package,
-        features: &features,
-        profile_name,
-        profile: &expected_profile,
-        initializer,
-        source_head: &bundle.hermit_head,
-        source_tree: &bundle.hermit_tree,
-        source_lock_sha256: if standalone {
-            &bundle.nested_lock_sha256
-        } else {
-            &bundle.hermit_lock_sha256
+        |compiled_sources| {
+            let receipt: RuntimeReceipt = serde_json::from_slice(
+                &fs::read(artifact::real_file(&leaf.receipt)?).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            let source = format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
+            let (name, target, manifest, package_source, id, initializer) = if standalone {
+                require(
+                    fs::read_to_string(format!("{}.revision", leaf.runtime.display()))
+                        .map_err(|e| e.to_string())?
+                        .trim()
+                        == pin,
+                    "standalone revision sidecar differs",
+                )?;
+                require(
+                    receipt.cargo_artifact.package.source.as_deref() == Some(source.as_str()),
+                    "standalone exact Git source differs",
+                )?;
+                let manifest = artifact::real_file(&compiled_sources.package().manifest)?;
+                require(
+                    manifest.file_name().is_some_and(|n| n == "Cargo.toml")
+                        && manifest
+                            .parent()
+                            .and_then(Path::file_name)
+                            .is_some_and(|n| n == "reverie-liteinst-preload"),
+                    "standalone selected package is not the real preload leaf",
+                )?;
+                (
+                    "reverie-liteinst-preload",
+                    "reverie_liteinst_preload",
+                    manifest,
+                    Some(source.clone()),
+                    format!(
+                        "git+https://github.com/rrnewton/reverie.git?rev={pin}#reverie-liteinst-preload@0.4.1"
+                    ),
+                    artifact::STANDALONE_ROOT,
+                )
+            } else {
+                let manifest = artifact::real_file(&root.join("detcore-liteinst/Cargo.toml"))?;
+                (
+                    "detcore-liteinst",
+                    "detcore_liteinst",
+                    manifest,
+                    None,
+                    format!(
+                        "path+file://{}#0.4.0",
+                        root.join("detcore-liteinst").display()
+                    ),
+                    "detcore_liteinst_initialize",
+                )
+            };
+            let package = PackageIdentity {
+                id,
+                name: name.into(),
+                manifest: manifest.clone(),
+                source: package_source,
+                target: target.into(),
+                kind: vec!["cdylib".into()],
+                crate_types: vec!["cdylib".into()],
+                target_source: artifact::real_file(
+                    &manifest
+                        .parent()
+                        .ok_or("leaf directory absent")?
+                        .join("src/lib.rs"),
+                )?,
+            };
+            require(
+                compiled_sources.package() == &package,
+                "fresh metadata package differs from the independent leaf expectations",
+            )?;
+            let expected_profile = json!({"opt_level":"3", "debuginfo":0, "debug_assertions":!standalone,
+                "overflow_checks":!standalone, "test":false});
+            let profile_name = if standalone { "release" } else { "validate" };
+            require(
+                leaf.profile_name == profile_name && leaf.cargo_profile == expected_profile,
+                "leaf profile differs from required diagnostic producer",
+            )?;
+            let features = vec!["allocator-fixture".into()];
+            let expected = ConsumerExpectation {
+                package: &package,
+                features: &features,
+                profile_name,
+                profile: &expected_profile,
+                initializer,
+                source_head: &bundle.hermit_head,
+                source_tree: &bundle.hermit_tree,
+                source_lock_sha256: if standalone {
+                    &bundle.nested_lock_sha256
+                } else {
+                    &bundle.hermit_lock_sha256
+                },
+                oracle_sha256: &bundle.oracle_sha256,
+                compiled_sources: Some(compiled_sources),
+            };
+            let intact_receipt = FileIdentity::read(&leaf.receipt)?;
+            let receipt =
+                artifact::verify_runtime_receipt(&leaf.receipt, &leaf.runtime, &expected)?;
+            // Receipt fields are evidence, not source authority. Start from the real
+            // qualifying receipt and change exactly its recorded full pin, while
+            // retaining the independently resolved expectation and actual runtime.
+            let mut changed = serde_json::to_value(&receipt).map_err(|e| e.to_string())?;
+            let actual_pin = changed["compiled_sources"]["reverie_pin"]
+                .as_str()
+                .ok_or("qualified receipt lacks its source pin")?;
+            let mut wrong_pin = actual_pin.to_owned();
+            wrong_pin.replace_range(
+                ..1,
+                if actual_pin.starts_with('0') {
+                    "1"
+                } else {
+                    "0"
+                },
+            );
+            changed["compiled_sources"]["reverie_pin"] = json!(wrong_pin);
+            let changed_path = evidence.join(format!("{phase}-wrong-compiled-source-receipt.json"));
+            artifact::write_new(
+                &changed_path,
+                &serde_json::to_vec_pretty(&changed).map_err(|e| e.to_string())?,
+            )?;
+            let error = artifact::verify_runtime_receipt(&changed_path, &leaf.runtime, &expected)
+                .err()
+                .ok_or("receipt-authored source pin unexpectedly authorized the runtime")?;
+            require(
+                error == "runtime independently resolved compiled source identities differ",
+                &format!("tampered source receipt failed for an unrelated reason: {error}"),
+            )?;
+            intact_receipt.verify()?;
+            Ok(receipt)
         },
-        oracle_sha256: &bundle.oracle_sha256,
-        compiled_sources: Some(&compiled_sources),
-    };
-    let intact_receipt = FileIdentity::read(&leaf.receipt)?;
-    let receipt = artifact::verify_runtime_receipt(&leaf.receipt, &leaf.runtime, &expected)?;
-    // Receipt fields are evidence, not source authority. Start from the real
-    // qualifying receipt and change exactly its recorded full pin, while
-    // retaining the independently resolved expectation and actual runtime.
-    let mut changed = serde_json::to_value(&receipt).map_err(|e| e.to_string())?;
-    let actual_pin = changed["compiled_sources"]["reverie_pin"]
-        .as_str()
-        .ok_or("qualified receipt lacks its source pin")?;
-    let mut wrong_pin = actual_pin.to_owned();
-    wrong_pin.replace_range(
-        ..1,
-        if actual_pin.starts_with('0') {
-            "1"
-        } else {
-            "0"
-        },
-    );
-    changed["compiled_sources"]["reverie_pin"] = json!(wrong_pin);
-    let changed_path = evidence.join(format!("{phase}-wrong-compiled-source-receipt.json"));
-    artifact::write_new(
-        &changed_path,
-        &serde_json::to_vec_pretty(&changed).map_err(|e| e.to_string())?,
     )?;
-    let error = artifact::verify_runtime_receipt(&changed_path, &leaf.runtime, &expected)
-        .err()
-        .ok_or("receipt-authored source pin unexpectedly authorized the runtime")?;
-    require(
-        error == "runtime independently resolved compiled source identities differ",
-        &format!("tampered source receipt failed for an unrelated reason: {error}"),
-    )?;
-    intact_receipt.verify()?;
-    compiled_sources.verify_unchanged(&mut runner)?;
     artifact::write_new(
         &evidence.join(format!("{phase}-compiled-sources.json")),
         &serde_json::to_vec_pretty(&json!({
-            "compiled_sources": compiled_sources.record(),
+            "compiled_sources": compiled_sources,
             "commands": runner.commands,
         }))
         .map_err(|e| e.to_string())?,
