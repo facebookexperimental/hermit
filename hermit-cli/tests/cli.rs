@@ -4583,10 +4583,11 @@ fn kvm_unavailable(test: &str) -> bool {
     true
 }
 
-/// Every backend that runs Detcore, in the order the cross-backend `/proc`
-/// tests compare them, ptrace first. SaBRe rewrites the guest statically and
-/// keeps ptrace's runtime; e9patch is preprocessing with the ptrace backend;
-/// LiteInst and in-guest-trap host Detcore's tool in the guest.
+/// Every backend that runs Detcore, in the order the cross-backend tests
+/// (the `/proc` tests and the piped-stdin tests) compare them, ptrace first.
+/// SaBRe rewrites the guest statically and keeps ptrace's runtime; e9patch is
+/// preprocessing with the ptrace backend; LiteInst and in-guest-trap host
+/// Detcore's tool in the guest.
 const PROCFS_BACKENDS: [&str; 7] = [
     "ptrace",
     "dbt",
@@ -4597,12 +4598,27 @@ const PROCFS_BACKENDS: [&str; 7] = [
     "e9patch",
 ];
 
-/// The backends that do not pass a cross-backend `/proc` test yet: the test,
+/// The backends that do not pass a cross-backend test yet: the test,
 /// the backend, and what fails, with its issue. A listed backend is not run,
 /// and the test names it. When an in-guest backend's entry goes, its runs
 /// also need `--max-timeslice=disabled`, as the in-guest Tool host cannot
 /// deliver the preemption timer yet.
 const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
+    (
+        "piped_stdin_verifies_at_bitwise_parity_on_every_backend",
+        "liteinst, in-guest-trap",
+        "the in-guest backends refuse --verify by name before reading stdin \
+         (liteinst_in_guest_refuses_verify_without_reading_stdin)",
+    ),
+    (
+        "a_guest_takes_only_the_stdin_it_reads_on_every_backend",
+        "dbt",
+        "Hermit's DBT launch pumps its stdin into a pipe of the launcher's own \
+         (output_with_detached_reader_and_global), and the pump reads ahead, so the \
+         input after the guest's one byte is gone when the guest exits (measured \
+         2026-10-17 on hermit main 782ab33e; recorded with \
+         https://github.com/rrnewton/hermit/issues/4447, owned by the dbt lane)",
+    ),
     (
         "detcore_renders_process_cgroup_on_every_backend",
         "sabre",
@@ -7833,6 +7849,121 @@ fn run_dbt_verify_replays_stdin_bytes_and_eof() {
         assert!(
             report["compared_log_messages"][side].as_u64().unwrap() > 0,
             "{report}"
+        );
+    }
+}
+
+/// `hermit --backend=<backend> run`, with the in-guest backends' one required
+/// relaxation: their Tool host cannot deliver the preemption timer yet.
+fn piped_stdin_run_args<'a>(backend: &'a str, program: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["--backend", backend, "run"];
+    if backend == "liteinst" || backend == "in-guest-trap" {
+        args.push("--max-timeslice=disabled");
+    }
+    args.push("--");
+    args.extend(program);
+    args
+}
+
+/// A guest whose stdin is a pipe from outside the run reads every byte of it
+/// and then EOF, on every backend, as natively. On a backend whose Tool shares
+/// the guest's descriptor table, Detcore once took the inherited pipe for one
+/// of the guest's own and SaBRe aborted at the first blocking read
+/// (https://github.com/rrnewton/hermit/issues/4447).
+#[test]
+fn piped_stdin_is_read_to_eof_on_every_backend() {
+    let test = "piped_stdin_is_read_to_eof_on_every_backend";
+    let _guard = hermit_run_guard();
+    let input = b"first\0line\nlast-without-newline\xff";
+    for backend in procfs_backends(test) {
+        let args = piped_stdin_run_args(backend, &["/bin/cat"]);
+        let output = hermit_with_stdin(&args, input);
+        assert_success(&output, &args);
+        assert_eq!(output.stdout, input, "{backend}: {}", stderr(&output));
+    }
+}
+
+/// The same piped stdin at `--strict --verify --verify-strict`: both runs read
+/// the same bytes and EOF, at bitwise parity with nonzero compared INFO
+/// messages, on every backend that verifies.
+#[test]
+fn piped_stdin_verifies_at_bitwise_parity_on_every_backend() {
+    let test = "piped_stdin_verifies_at_bitwise_parity_on_every_backend";
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let input = b"first\0line\nlast-without-newline\xff";
+    for backend in procfs_backends(test) {
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--",
+            "/bin/cat",
+        ];
+        let output = hermit_with_stdin(&args, input);
+        assert_success(&output, &args);
+        assert_eq!(output.stdout, input, "{backend}: {}", stderr(&output));
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                .expect("parse the verification report");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+        let compared = &verdict["compared_log_messages"];
+        assert!(
+            compared["left"].as_u64().is_some_and(|count| count > 0)
+                && compared["left"] == compared["right"],
+            "{backend} compared no INFO messages: {verdict}"
+        );
+    }
+}
+
+/// A guest that reads one byte of its piped stdin leaves the rest in the pipe
+/// for the next reader, on every backend, as natively: neither the backend nor
+/// Hermit reads ahead of the guest. The guest is `head -c1`, which reads
+/// exactly one byte (the native run below checks that premise).
+#[test]
+fn a_guest_takes_only_the_stdin_it_reads_on_every_backend() {
+    let test = "a_guest_takes_only_the_stdin_it_reads_on_every_backend";
+    let _guard = hermit_run_guard();
+    // The bytes after the first left in a pipe once `command`, given its read
+    // end, has run to completion.
+    // A run is never retried here: a retry would find the input consumed.
+    let remainder = |command: &mut Command| -> (Output, Vec<u8>) {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(b"abc").unwrap();
+        drop(writer);
+        let ours = reader.try_clone().unwrap();
+        let output = command
+            .stdin(reader)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to start {command:?}: {error}"));
+        let mut rest = Vec::new();
+        std::io::Read::read_to_end(&mut &ours, &mut rest).unwrap();
+        (output, rest)
+    };
+    let (native, rest) = remainder(Command::new("/usr/bin/head").arg("-c1"));
+    assert!(native.status.success(), "native: {native:?}");
+    assert_eq!(
+        (native.stdout.as_slice(), rest.as_slice()),
+        (&b"a"[..], &b"bc"[..])
+    );
+    for backend in procfs_backends(test) {
+        let args = piped_stdin_run_args(backend, &["/usr/bin/head", "-c1"]);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        append_hermit_args(&mut command, &args);
+        let (output, rest) = remainder(&mut command);
+        assert_success(&output, &args);
+        assert_eq!(
+            (output.stdout.as_slice(), rest.as_slice()),
+            (&b"a"[..], &b"bc"[..]),
+            "{backend}: {}",
+            stderr(&output)
         );
     }
 }

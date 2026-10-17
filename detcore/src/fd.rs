@@ -94,7 +94,9 @@ pub(crate) enum NetworkSocketKind {
 }
 
 /// Read provenance authenticated at the container's initial image: a terminal
-/// checked with TCGETS, or the launcher's actually created controller input pipe.
+/// checked with TCGETS, the launcher's actually created controller input pipe,
+/// or a readable pipe end the initial image holds on fds 0-2
+/// (`FileMetadata::discover_inherited_pipes`).
 ///
 /// The original open-file identity distinguishes aliases from separate opens
 /// of the same tty. The raw identity is used only to validate an exec handoff;

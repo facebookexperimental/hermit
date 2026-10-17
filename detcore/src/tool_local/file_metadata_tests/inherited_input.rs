@@ -7,6 +7,7 @@
  */
 
 use std::fs::File;
+use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 
 use super::*;
@@ -284,5 +285,168 @@ fn a_writer_with_the_same_pipe_identity_cannot_be_seeded_as_input() {
         metadata.file_handles[&fd]
             .inherited_external_read()
             .is_none()
+    );
+}
+
+/// A pipe's read end at `slot`, with its writer held by a child process outside
+/// this one (as Hermit holds a guest's stdin writer), and that child.
+fn pipe_written_by_a_child() -> (OwnedFd, std::process::Child) {
+    let mut ends = [0; 2];
+    // SAFETY: pipe2 writes two new descriptors into `ends`.
+    assert_eq!(
+        unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    // SAFETY: pipe2 returned these two descriptors, owned from here on.
+    let (reader, writer) =
+        unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .stdout(std::process::Stdio::from(writer))
+        .spawn()
+        .unwrap();
+    (reader, child)
+}
+
+#[test]
+fn first_image_pipe_whose_writer_is_outside_is_an_inherited_external_read() {
+    let owner = DetTid::from_raw(9);
+    let (reader, mut child) = pipe_written_by_a_child();
+    let fd = reader.as_raw_fd();
+    // Inherited across exec, as a guest's stdin is.
+    // SAFETY: F_SETFD changes only this owned descriptor's flags.
+    assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+    let mut metadata = FileMetadata::new(owner);
+    metadata
+        .discover_fd_from_current_process(owner, fd)
+        .unwrap();
+    metadata.file_handles[&fd].set_resource(ResourceID::Device(Device::ContainerStdin));
+    metadata.discover_inherited_pipes([fd]);
+    let detfd = &metadata.file_handles[&fd];
+    let origin = detfd.inherited_external_read().unwrap();
+    let stat = stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).unwrap();
+    assert_eq!(detfd.ty(), FdType::Pipe);
+    assert_eq!(origin.file_type, libc::S_IFIFO);
+    assert_eq!(origin.access_mode, libc::O_RDONLY);
+    assert_eq!((origin.dev, origin.inode), (stat.st_dev, stat.st_ino));
+    assert_eq!(origin.origin, detfd.open_file_id());
+    assert_eq!(
+        origin.resource,
+        Some(ResourceID::Device(Device::ContainerStdin))
+    );
+    // It carries through exec as a launcher-bound input does.
+    assert!(metadata.inherited_reads_for_exec().contains_key(&fd));
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// The image also holds the pipe's write end. Such a pipe was not made by
+/// Detcore's `pipe2`, so it is physically blocking and cannot be one of the
+/// guest's internal pipes; it is inherited external input as well, and its
+/// reads take the external-input path (a blocking read of an unmarked one would
+/// trip `record_or_replay_blocking`'s internal-descriptor invariant).
+#[test]
+fn first_image_pipe_with_its_writer_inside_is_also_external_input() {
+    let owner = DetTid::from_raw(9);
+    let mut ends = [0; 2];
+    // SAFETY: pipe2 writes two new descriptors into `ends`.
+    assert_eq!(
+        unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    // SAFETY: pipe2 returned these two descriptors, owned from here on.
+    let (reader, writer) =
+        unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    let mut metadata = FileMetadata::new(owner);
+    for fd in [reader.as_raw_fd(), writer.as_raw_fd()] {
+        metadata
+            .discover_fd_from_current_process(owner, fd)
+            .unwrap();
+    }
+    metadata.discover_inherited_pipes([reader.as_raw_fd(), writer.as_raw_fd()]);
+    let marked = metadata.file_handles[&reader.as_raw_fd()]
+        .inherited_external_read()
+        .unwrap();
+    assert_eq!(marked.access_mode, libc::O_RDONLY);
+    // The write end carries no read provenance.
+    assert!(
+        metadata.file_handles[&writer.as_raw_fd()]
+            .inherited_external_read()
+            .is_none()
+    );
+}
+
+/// A FIFO opened for reading and writing reads like any other inherited pipe.
+#[test]
+fn first_image_read_write_fifo_is_external_input() {
+    let owner = DetTid::from_raw(9);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("fifo");
+    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: mkfifo reads a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let fifo: OwnedFd = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .into();
+    let mut metadata = FileMetadata::new(owner);
+    metadata
+        .discover_fd_from_current_process(owner, fifo.as_raw_fd())
+        .unwrap();
+    metadata.discover_inherited_pipes([fifo.as_raw_fd()]);
+    let marked = metadata.file_handles[&fifo.as_raw_fd()]
+        .inherited_external_read()
+        .unwrap();
+    assert_eq!(marked.access_mode, libc::O_RDWR);
+}
+
+#[test]
+fn only_a_readable_pipe_end_in_the_table_is_considered() {
+    let owner = DetTid::from_raw(9);
+    let (reader, mut child) = pipe_written_by_a_child();
+    let fd = reader.as_raw_fd();
+    let mut metadata = FileMetadata::new(owner);
+    // Not in Detcore's table: nothing to mark.
+    metadata.discover_inherited_pipes([fd]);
+    assert!(!metadata.file_handles.contains_key(&fd));
+    // A character device is not a pipe.
+    let device: OwnedFd = File::open("/dev/null").unwrap().into();
+    metadata
+        .discover_fd_from_current_process(owner, device.as_raw_fd())
+        .unwrap();
+    metadata.discover_inherited_pipes([device.as_raw_fd()]);
+    assert!(
+        metadata.file_handles[&device.as_raw_fd()]
+            .inherited_external_read()
+            .is_none()
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// A launcher's binding is not replaced: after `install`, the description's
+/// resource changes, so a fresh mark would carry the new one.
+#[test]
+fn a_launcher_bound_input_keeps_its_binding() {
+    let owner = DetTid::from_raw(9);
+    let (reader, writer, identity) = input_at_owned_slot();
+    drop(writer);
+    let fd = reader.as_raw_fd();
+    let mut metadata = FileMetadata::new(owner);
+    metadata
+        .discover_fd_from_current_process(owner, fd)
+        .unwrap();
+    install(&mut metadata, owner, identity).unwrap();
+    let bound = metadata.file_handles[&fd]
+        .inherited_external_read()
+        .unwrap();
+    assert_eq!(bound.resource, None);
+    metadata.file_handles[&fd].set_resource(ResourceID::Device(Device::ContainerStdin));
+    metadata.discover_inherited_pipes([fd]);
+    assert_eq!(
+        metadata.file_handles[&fd].inherited_external_read(),
+        Some(bound)
     );
 }

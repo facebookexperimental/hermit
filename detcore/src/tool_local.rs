@@ -1043,6 +1043,47 @@ impl FileMetadata {
         }
     }
 
+    /// Called only in the actual shared guest descriptor table, after the
+    /// global state confirms this is the container's first image, beside
+    /// `discover_inherited_terminals`. The guest has not run yet, so a pipe
+    /// end the first image holds came from outside the run: a readable one is
+    /// an inherited external read, as a terminal or a launcher-bound input is
+    /// (https://github.com/rrnewton/hermit/issues/4447), and its reads take
+    /// the same external-input path theirs do. That holds even when the image
+    /// also holds the pipe's write end: such a pipe was not made by Detcore's
+    /// `pipe2`, so it is not physically nonblocking and cannot take the
+    /// internal-pipe path, whose invariant (`record_or_replay_blocking`) a
+    /// blocking read of it would otherwise trip. The decision reads only what
+    /// discovery recorded for the descriptor (its type, the kernel's stat and
+    /// its access mode), so no later probe can change it; a description a
+    /// launcher already bound keeps its binding. Inherited descriptors above 2
+    /// are not discovered here.
+    fn discover_inherited_pipes(&mut self, descriptors: impl IntoIterator<Item = RawFd>) {
+        for fd in descriptors {
+            let Some(detfd) = self.file_handles.get(&fd) else {
+                continue;
+            };
+            let access_mode = detfd.status_flags() & libc::O_ACCMODE;
+            if detfd.ty() != FdType::Pipe
+                || detfd.is_socketpair_endpoint()
+                || access_mode == libc::O_WRONLY
+                || detfd.inherited_external_read().is_some()
+            {
+                continue;
+            }
+            let Some(stat) = detfd.stat() else { continue };
+            detfd.set_inherited_external_read(crate::fd::InheritedExternalRead {
+                origin: detfd.open_file_id(),
+                dev: stat.dev,
+                inode: stat.inode,
+                rdev: stat.rdev,
+                file_type: libc::S_IFIFO,
+                access_mode,
+                resource: detfd.resource(),
+            });
+        }
+    }
+
     /// Restore only external-read descriptions proven to survive the prepared exec. Unknown
     /// descriptors and guest-created PTYs are not promoted by rediscovery.
     fn restore_inherited_reads(
@@ -1139,6 +1180,7 @@ impl FileMetadata {
         }
         if state.initialize_inherited_stdio {
             self.discover_inherited_terminals(0..=2);
+            self.discover_inherited_pipes(0..=2);
         } else {
             self.restore_inherited_reads(owner, state.inherited_reads)?;
         }
@@ -5065,9 +5107,11 @@ impl<T> ThreadState<T> {
     /// `handle_pipe2` leaves a guest-created pipe (and how exec restores it).
     /// On ptrace, a pipe inherited from the host is not in this set: stdio is
     /// typed `Regular`, and another inherited FIFO is physically nonblocking
-    /// only when it is logically nonblocking too. On SaBRe, stdio is discovered
-    /// as `Pipe` and a guest `F_SETFL` gives it the marker, so a host stdin pipe
-    /// can appear here (as its fd 0 already behaves like an internal pipe).
+    /// only when it is logically nonblocking too. On a backend whose tool
+    /// shares the guest's descriptor table, a readable pipe inherited on fds
+    /// 0-2 is an inherited external read (`discover_inherited_pipes`), so it is
+    /// not here either, and a guest `F_SETFL` leaves its kernel status flags
+    /// as the guest set them (`keeps_physically_nonblocking`).
     /// Sorted, so callers probe them in a deterministic order.
     pub(crate) fn scheduler_managed_pipe_fds(&self) -> Vec<RawFd> {
         let mut fds: Vec<RawFd> = self
