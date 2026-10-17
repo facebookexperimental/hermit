@@ -3363,8 +3363,8 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: c-programs/lsm-get-self-attr-enosys
-    description: Strict verification for tests/c/lsm_get_self_attr_enosys.c
+  - id: c-programs/lsm-refusals
+    description: Strict verification for tests/c/lsm_refusals.c, which runs the lsm_get_self_attr, lsm_set_self_attr and lsm_list_modules ENOSYS refusals each in a fresh child process
     lane: portable
     requires:
       - linux
@@ -3373,7 +3373,7 @@ test:
       - ptrace
       - cc
     occasional: false
-    program: tests/c/lsm_get_self_attr_enosys.c
+    program: tests/c/lsm_refusals.c
     observation:
       status: true
       stdout: true
@@ -3383,7 +3383,7 @@ test:
       verify:
         ci:
           ptrace: true
-          # DBT lsm-get-self-attr-enosys: 20/20 strict canonical pairs at c0216c84; whole fixture.
+          # DBT: each member program passed 20/20 strict canonical pairs at c0216c84 as its own row (lsm-*-enosys); the merged program first runs on DBT in the full validate after the 2026-10-17 test audit.
           dbt: true
           sabre: true
           kvm: true
@@ -3405,11 +3405,13 @@ test:
         hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
+        ci_disabled_reason: 'This migration inventories strict verification; it does not assert native nondeterminism'
         backends_enabled: []
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
         ci: false
+        ci_disabled_reason: 'Record/replay qualification is separate from the initial strict-verification migration'
         backends_enabled: []
         backends_disabled:
           ptrace: Record/replay qualification is separate from the initial strict-verification migration
@@ -3420,6 +3422,7 @@ test:
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       chaos:
         ci: false
+        ci_disabled_reason: 'Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle'
         backends_enabled: []
         backends_disabled:
           ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
@@ -3430,156 +3433,7 @@ test:
           in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No custom edge-case arguments have been calibrated for this C guest
-          dbt: No custom edge-case arguments have been calibrated for this C guest
-          kvm: No custom edge-case arguments have been calibrated for this C guest
-          sabre: No custom edge-case arguments have been calibrated for this C guest
-          liteinst: No custom edge-case arguments have been calibrated for this C guest
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: c-programs/lsm-list-modules-enosys
-    description: Strict verification for tests/c/lsm_list_modules_enosys.c
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
-      - ptrace
-      - cc
-    occasional: false
-    program: tests/c/lsm_list_modules_enosys.c
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      verify:
-        ci:
-          ptrace: true
-          # DBT lsm-list-modules-enosys: 20/20 strict canonical pairs at c0216c84; whole fixture.
-          dbt: true
-          sabre: true
-          kvm: true
-          liteinst: true
-          in-guest-trap: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - sabre
-          - kvm
-          - liteinst
-          - in-guest-trap
-        backends_disabled: {}
-        hermit_args:
-          liteinst:
-            - --max-timeslice=disabled
-          in-guest-trap:
-            - --max-timeslice=disabled
-        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
-      naked:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          native: This migration inventories strict verification; it does not assert native nondeterminism
-      replay:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No custom edge-case arguments have been calibrated for this C guest
-          dbt: No custom edge-case arguments have been calibrated for this C guest
-          kvm: No custom edge-case arguments have been calibrated for this C guest
-          sabre: No custom edge-case arguments have been calibrated for this C guest
-          liteinst: No custom edge-case arguments have been calibrated for this C guest
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: c-programs/lsm-set-self-attr-enosys
-    description: Strict verification for tests/c/lsm_set_self_attr_enosys.c
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
-      - ptrace
-      - cc
-    occasional: false
-    program: tests/c/lsm_set_self_attr_enosys.c
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      verify:
-        ci:
-          ptrace: true
-          # DBT lsm-set-self-attr-enosys: 20/20 strict canonical pairs at c0216c84; whole fixture.
-          dbt: true
-          sabre: true
-          kvm: true
-          liteinst: true
-          in-guest-trap: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - sabre
-          - kvm
-          - liteinst
-          - in-guest-trap
-        backends_disabled: {}
-        hermit_args:
-          liteinst:
-            - --max-timeslice=disabled
-          in-guest-trap:
-            - --max-timeslice=disabled
-        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
-      naked:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          native: This migration inventories strict verification; it does not assert native nondeterminism
-      replay:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
+        ci_disabled_reason: 'No custom edge-case arguments have been calibrated for this C guest'
         backends_enabled: []
         backends_disabled:
           ptrace: No custom edge-case arguments have been calibrated for this C guest
@@ -5422,8 +5276,8 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: c-programs/perf-event-hardware-enosys
-    description: Strict verification for tests/c/perf_event_hardware_enosys.c
+  - id: c-programs/perf-event-refusals
+    description: Strict verification for tests/c/perf_event_refusals.c, which runs the hardware, software and watchpoint perf_event_open ENOSYS refusals each in a fresh child process
     lane: portable
     requires:
       - linux
@@ -5432,7 +5286,7 @@ test:
       - ptrace
       - cc
     occasional: false
-    program: tests/c/perf_event_hardware_enosys.c
+    program: tests/c/perf_event_refusals.c
     observation:
       status: true
       stdout: true
@@ -5442,7 +5296,7 @@ test:
       verify:
         ci:
           ptrace: true
-          # DBT perf-event-hardware-enosys: 20/20 strict canonical pairs at c0216c84; whole fixture.
+          # DBT: each member program passed 20/20 strict canonical pairs at c0216c84 as its own row (perf-event-*-enosys); the merged program first runs on DBT in the full validate after the 2026-10-17 test audit.
           dbt: true
           sabre: true
           kvm: true
@@ -5464,11 +5318,13 @@ test:
         hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
+        ci_disabled_reason: 'This migration inventories strict verification; it does not assert native nondeterminism'
         backends_enabled: []
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
         ci: false
+        ci_disabled_reason: 'Record/replay qualification is separate from the initial strict-verification migration'
         backends_enabled: []
         backends_disabled:
           ptrace: Record/replay qualification is separate from the initial strict-verification migration
@@ -5479,6 +5335,7 @@ test:
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       chaos:
         ci: false
+        ci_disabled_reason: 'Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle'
         backends_enabled: []
         backends_disabled:
           ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
@@ -5489,156 +5346,7 @@ test:
           in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No custom edge-case arguments have been calibrated for this C guest
-          dbt: No custom edge-case arguments have been calibrated for this C guest
-          kvm: No custom edge-case arguments have been calibrated for this C guest
-          sabre: No custom edge-case arguments have been calibrated for this C guest
-          liteinst: No custom edge-case arguments have been calibrated for this C guest
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: c-programs/perf-event-software-enosys
-    description: Strict verification for tests/c/perf_event_software_enosys.c
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
-      - ptrace
-      - cc
-    occasional: false
-    program: tests/c/perf_event_software_enosys.c
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      verify:
-        ci:
-          ptrace: true
-          # DBT perf-event-software-enosys: 20/20 strict canonical pairs at c0216c84; whole fixture.
-          dbt: true
-          sabre: true
-          kvm: true
-          liteinst: true
-          in-guest-trap: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - sabre
-          - kvm
-          - liteinst
-          - in-guest-trap
-        backends_disabled: {}
-        hermit_args:
-          liteinst:
-            - --max-timeslice=disabled
-          in-guest-trap:
-            - --max-timeslice=disabled
-        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
-      naked:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          native: This migration inventories strict verification; it does not assert native nondeterminism
-      replay:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: No custom edge-case arguments have been calibrated for this C guest
-          dbt: No custom edge-case arguments have been calibrated for this C guest
-          kvm: No custom edge-case arguments have been calibrated for this C guest
-          sabre: No custom edge-case arguments have been calibrated for this C guest
-          liteinst: No custom edge-case arguments have been calibrated for this C guest
-          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
-  - id: c-programs/perf-event-watchpoint-enosys
-    description: Strict verification for tests/c/perf_event_watchpoint_enosys.c
-    lane: portable
-    requires:
-      - linux
-      - x86_64
-      - userns
-      - ptrace
-      - cc
-    occasional: false
-    program: tests/c/perf_event_watchpoint_enosys.c
-    observation:
-      status: true
-      stdout: true
-      stderr: false
-      artifacts: []
-    modes:
-      verify:
-        ci:
-          ptrace: true
-          # DBT perf-event-watchpoint-enosys: 20/20 strict canonical pairs at c0216c84; whole fixture.
-          dbt: true
-          sabre: true
-          kvm: true
-          liteinst: true
-          in-guest-trap: true
-        backends_enabled:
-          - ptrace
-          - dbt
-          - sabre
-          - kvm
-          - liteinst
-          - in-guest-trap
-        backends_disabled: {}
-        hermit_args:
-          liteinst:
-            - --max-timeslice=disabled
-          in-guest-trap:
-            - --max-timeslice=disabled
-        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
-      naked:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          native: This migration inventories strict verification; it does not assert native nondeterminism
-      replay:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
-          dbt: Record/replay is unsupported by DBT
-          kvm: Record/replay is unsupported by KVM
-          sabre: Record/replay is unsupported by SaBRe
-          liteinst: Record/replay is unsupported by LiteInst
-          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      chaos:
-        ci: false
-        backends_enabled: []
-        backends_disabled:
-          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
-          dbt: Chaos scheduling is unsupported by DBT
-          kvm: Chaos scheduling is unsupported by KVM
-          sabre: Chaos scheduling is unsupported by SaBRe
-          liteinst: Chaos scheduling is unsupported by LiteInst
-          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-      custom:
-        ci: false
+        ci_disabled_reason: 'No custom edge-case arguments have been calibrated for this C guest'
         backends_enabled: []
         backends_disabled:
           ptrace: No custom edge-case arguments have been calibrated for this C guest

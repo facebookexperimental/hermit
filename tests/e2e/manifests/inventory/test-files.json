@@ -1033,22 +1033,28 @@
       "why": "tests/c/lseek_positioning.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
-      "disposition": "manifest-test",
+      "disposition": "guest-fixture",
       "path": "tests/c/lsm_get_self_attr_enosys.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/lsm_get_self_attr_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "hermit-cli/tests/host_security_identity.rs",
+      "why": "tests/c/lsm_get_self_attr_enosys.c is owned by hermit-cli/tests/host_security_identity.rs: the test compiles it with -Werror and requires a ptrace run --strict --verify to report Determinism verified, so lsm_get_self_attr must return ENOSYS. Since the 2026-10-17 test audit it is also the member source that tests/c/lsm_refusals.c (c-programs/lsm-refusals) includes with its main renamed and runs in a fresh child process on all six manifest backends; it has no manifest row of its own."
     },
     {
-      "disposition": "manifest-test",
+      "disposition": "guest-fixture",
       "path": "tests/c/lsm_list_modules_enosys.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/lsm_list_modules_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "hermit-cli/tests/host_kernel_probes.rs",
+      "why": "tests/c/lsm_list_modules_enosys.c is owned by hermit-cli/tests/host_kernel_probes.rs: the test compiles it with -Werror and requires a ptrace run --strict --verify to report Determinism verified, so lsm_list_modules must return ENOSYS. Since the 2026-10-17 test audit it is also the member source that tests/c/lsm_refusals.c (c-programs/lsm-refusals) includes with its main renamed and runs in a fresh child process on all six manifest backends; it has no manifest row of its own."
     },
     {
       "disposition": "manifest-test",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "path": "tests/c/lsm_refusals.c",
+      "why": "tests/c/lsm_refusals.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): c-programs/lsm-refusals strict-verifies the lsm_get_self_attr, lsm_set_self_attr and lsm_list_modules ENOSYS refusals, each member program included with its main renamed and run in a fresh child process (tests/c/probe_family.h), replacing the three per-syscall rows the 2026-10-17 test audit merged."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/lsm_set_self_attr_enosys.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/lsm_set_self_attr_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "hermit-cli/tests/host_security_identity.rs",
+      "why": "tests/c/lsm_set_self_attr_enosys.c is owned by hermit-cli/tests/host_security_identity.rs: the test compiles it with -Werror and requires a ptrace run --strict --verify to report Determinism verified, so lsm_set_self_attr must return ENOSYS. Since the 2026-10-17 test audit it is also the member source that tests/c/lsm_refusals.c (c-programs/lsm-refusals) includes with its main renamed and runs in a fresh child process on all six manifest backends; it has no manifest row of its own."
     },
     {
       "disposition": "manifest-test",
@@ -1375,28 +1381,34 @@
       "why": "tests/c/pause_sigchld.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_pause_returns_for_a_childs_sigchld compiles this guest, whose parent waits in pause() for the SIGCHLD of a child that exits at once, and requires the run to finish with the handler's output (https://github.com/rrnewton/hermit/issues/4126); it remains a guest fixture because its CLI test checks the exact status and stdout of one strict run."
     },
     {
-      "disposition": "manifest-test",
+      "disposition": "guest-fixture",
       "path": "tests/c/perf_event_hardware_enosys.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/perf_event_hardware_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "hermit-cli/tests/perf_event_refusal.rs",
+      "why": "tests/c/perf_event_hardware_enosys.c is owned by hermit-cli/tests/perf_event_refusal.rs: the test compiles it with -Werror and requires a ptrace run --strict --verify to report Determinism verified, so a hardware perf_event_open must return ENOSYS. Since the 2026-10-17 test audit it is also the member source that tests/c/perf_event_refusals.c (c-programs/perf-event-refusals) includes with its main renamed and runs in a fresh child process on all six manifest backends; it has no manifest row of its own."
     },
     {
       "disposition": "guest-fixture",
       "path": "tests/c/perf_event_open_enosys.c",
       "runner": "hermit-cli/tests/privileged_observation.rs",
-      "why": "tests/c/perf_event_open_enosys.c is owned by hermit-cli/tests/privileged_observation.rs: the test compiles it with -Werror and requires a ptrace run --strict --verify --panic-on-unsupported-syscalls to report Determinism verified, so a software-clock perf_event_open must return ENOSYS. Its former manifest row was deleted by the 2026-10-17 test audit because c-programs/perf-event-software-enosys asserts the same by-number refusal on the same six backends."
+      "why": "tests/c/perf_event_open_enosys.c is owned by hermit-cli/tests/privileged_observation.rs: the test compiles it with -Werror and requires a ptrace run --strict --verify --panic-on-unsupported-syscalls to report Determinism verified, so a software-clock perf_event_open must return ENOSYS. Its former manifest row was deleted by the 2026-10-17 test audit because c-programs/perf-event-refusals (its perf_event_software_enosys member) asserts the same by-number refusal on the same six backends."
     },
     {
       "disposition": "manifest-test",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "path": "tests/c/perf_event_refusals.c",
+      "why": "tests/c/perf_event_refusals.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): c-programs/perf-event-refusals strict-verifies the hardware, software and watchpoint perf_event_open ENOSYS refusals, each member program included with its main renamed and run in a fresh child process (tests/c/probe_family.h), replacing the three per-event rows the 2026-10-17 test audit merged."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/perf_event_software_enosys.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/perf_event_software_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "hermit-cli/tests/perf_event_refusal.rs",
+      "why": "tests/c/perf_event_software_enosys.c is owned by hermit-cli/tests/perf_event_refusal.rs: the test compiles it with -Werror and requires a ptrace run --strict --verify to report Determinism verified, so a software perf_event_open must return ENOSYS. Since the 2026-10-17 test audit it is also the member source that tests/c/perf_event_refusals.c (c-programs/perf-event-refusals) includes with its main renamed and runs in a fresh child process on all six manifest backends; it has no manifest row of its own."
     },
     {
-      "disposition": "manifest-test",
+      "disposition": "guest-fixture",
       "path": "tests/c/perf_event_watchpoint_enosys.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/perf_event_watchpoint_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "hermit-cli/tests/perf_event_refusal.rs",
+      "why": "tests/c/perf_event_watchpoint_enosys.c is owned by hermit-cli/tests/perf_event_refusal.rs: the test compiles it with -Werror and requires a ptrace run --strict --verify to report Determinism verified, so a watchpoint perf_event_open must return ENOSYS. Since the 2026-10-17 test audit it is also the member source that tests/c/perf_event_refusals.c (c-programs/perf-event-refusals) includes with its main renamed and runs in a fresh child process on all six manifest backends; it has no manifest row of its own."
     },
     {
       "disposition": "manifest-test",

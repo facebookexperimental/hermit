@@ -4382,108 +4382,6 @@
         "ptrace",
         "cc"
       ],
-      "test": "c-programs/lsm-get-self-attr-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/lsm-get-self-attr-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/lsm-list-modules-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/lsm-list-modules-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/lsm-set-self-attr-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/lsm-set-self-attr-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
       "test": "c-programs/madvise-determinism",
       "timeout_seconds": 57
     },
@@ -4723,108 +4621,6 @@
         "cc"
       ],
       "test": "c-programs/netlink-autobind-usersock",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/perf-event-hardware-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/perf-event-hardware-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/perf-event-software-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/perf-event-software-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/perf-event-watchpoint-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/perf-event-watchpoint-enosys",
       "timeout_seconds": 57
     },
     {
@@ -6380,66 +6176,6 @@
       "requires_host_capabilities": [
         "kvm"
       ],
-      "test": "c-programs/lsm-get-self-attr-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "kvm"
-      ],
-      "test": "c-programs/lsm-list-modules-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "kvm"
-      ],
-      "test": "c-programs/lsm-set-self-attr-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "kvm"
-      ],
       "test": "c-programs/map-shadow-stack-enosys",
       "timeout_seconds": 57
     },
@@ -6721,66 +6457,6 @@
         "kvm"
       ],
       "test": "c-programs/netns-cookie-udp4",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "kvm"
-      ],
-      "test": "c-programs/perf-event-hardware-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "kvm"
-      ],
-      "test": "c-programs/perf-event-software-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "kvm"
-      ],
-      "test": "c-programs/perf-event-watchpoint-enosys",
       "timeout_seconds": 57
     },
     {
@@ -25679,126 +25355,6 @@
       "requires_host_capabilities": [
         "cpuid-faulting"
       ],
-      "test": "c-programs/lsm-get-self-attr-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/lsm-get-self-attr-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "in-guest-trap",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/lsm-list-modules-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/lsm-list-modules-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "in-guest-trap",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/lsm-set-self-attr-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/lsm-set-self-attr-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "in-guest-trap",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
       "test": "c-programs/madvise-determinism",
       "timeout_seconds": 57
     },
@@ -27340,126 +26896,6 @@
         "cpuid-faulting"
       ],
       "test": "c-programs/path-file-ops",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "in-guest-trap",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/perf-event-hardware-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/perf-event-hardware-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "in-guest-trap",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/perf-event-software-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/perf-event-software-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "in-guest-trap",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/perf-event-watchpoint-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/perf-event-watchpoint-enosys",
       "timeout_seconds": 57
     },
     {
@@ -40888,57 +40324,6 @@
         "ptrace",
         "cc"
       ],
-      "test": "c-programs/lsm-get-self-attr-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/lsm-list-modules-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/lsm-set-self-attr-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
       "test": "c-programs/map-shadow-stack-enosys",
       "timeout_seconds": 57
     },
@@ -40957,57 +40342,6 @@
         "cc"
       ],
       "test": "c-programs/memfd-secret-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/perf-event-hardware-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/perf-event-software-enosys",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/perf-event-watchpoint-enosys",
       "timeout_seconds": 57
     },
     {
@@ -41521,6 +40855,228 @@
         "cc"
       ],
       "test": "c-programs/unix-autobind",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/lsm-refusals",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "in-guest-trap",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "c-programs/lsm-refusals",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "c-programs/lsm-refusals",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "c-programs/lsm-refusals",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/lsm-refusals",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "sabre",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/lsm-refusals",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/perf-event-refusals",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "in-guest-trap",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "c-programs/perf-event-refusals",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "c-programs/perf-event-refusals",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "c-programs/perf-event-refusals",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/perf-event-refusals",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "sabre",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/perf-event-refusals",
       "timeout_seconds": 57
     }
   ],

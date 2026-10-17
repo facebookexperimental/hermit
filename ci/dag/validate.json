@@ -4297,126 +4297,42 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "dbt"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "kvm"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "liteinst"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "sabre"
         },
@@ -6152,126 +6068,42 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "dbt"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "kvm"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "liteinst"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "sabre"
         },
@@ -26421,21 +26253,7 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -26743,21 +26561,7 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -32665,63 +32469,21 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "dbt"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "sabre"
         },
@@ -33610,63 +33372,21 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "dbt"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "sabre"
         },
@@ -50663,126 +50383,42 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "dbt"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "kvm"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "liteinst"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
+          "test": "c-programs/lsm-refusals",
           "mode": "verify",
           "backend": "sabre"
         },
@@ -52518,126 +52154,42 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "dbt"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "kvm"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "liteinst"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
+          "test": "c-programs/perf-event-refusals",
           "mode": "verify",
           "backend": "sabre"
         },
