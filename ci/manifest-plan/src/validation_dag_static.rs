@@ -7641,7 +7641,10 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         env: &[],
         hint: HintSpec {
             resources: &[],
-            est_duration_s: 60.0,
+            // Median of 41 full validations, 2026-10-16 to 2026-10-17 (p75 74 s).
+            // At 60 s it waited a median 106 s for a slot after its last
+            // dependency ended, behind nodes with larger estimates.
+            est_duration_s: 69.0,
             rss_baseline_bytes: Some(1073741824),
             hard_mem_max_bytes: Some(4294967296),
             classification: StepClass::LatencyBound,
