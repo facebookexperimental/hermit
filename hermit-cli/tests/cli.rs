@@ -11143,12 +11143,13 @@ fn a_run_with_host_drawn_inputs_reruns_bitwise_from_its_manifest() {
     let id = manifest["id"].as_str().unwrap().to_owned();
     // With --log-file, Hermit's warning goes to the log: one WARN record
     // naming what was drawn, the data directory (with `~` for the home
-    // directory) and the replay command.
+    // directory), the replay command and how to show the recording.
     let diagnostics = fs::read_to_string(&left_log).unwrap();
     assert!(
         diagnostics.contains(&format!(
             " WARN hermit::controller: this run drew settings from the host; its inputs are \
-             saved as a recording in {}/; rerun it with: hermit replay {id}\n",
+             saved as a recording in {}/; rerun it with: hermit replay {id} (hermit show \
+             last-run)\n",
             home_relative(Path::new(&data))
         )),
         "the warning names the recording and its replay:\n{diagnostics}"

@@ -53,7 +53,7 @@ host clock, saves its inputs as a small recording, and prints one warning on
 standard error, for example:
 
 ```text
-2026-10-16T21:08:46.731588Z  WARN hermit::controller: this run drew its epoch from the host; its inputs are saved as a recording in ~/.cache/hermit/; rerun it with: hermit replay 08cc944156444bfdb328b60bd008549e
+2026-10-16T21:08:46.731588Z  WARN hermit::controller: this run drew its epoch from the host; its inputs are saved as a recording in ~/.cache/hermit/; rerun it with: hermit replay 08cc944156444bfdb328b60bd008549e (hermit show last-run)
 ```
 
 With `--epoch` nothing is printed. (The transcript below predates this

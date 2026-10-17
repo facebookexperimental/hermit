@@ -873,12 +873,12 @@ args: [-c, echo $FOO$BAR]
 A run whose options give every input is reproduced by its command line. A run
 that draws an input from the host is not: an epoch taken from the host clock
 (no `--epoch`), or a seed from `--seed-from=SystemRandom`. Such a run writes a
-run manifest, a small recording of those inputs, and names it in a diagnostic
+run manifest, a small recording of those inputs, and names it in a warning
 (https://github.com/rrnewton/hermit/issues/4271):
 
 ```text
 $ hermit run --seed-from=SystemRandom -- PROGRAM ARGS
-hermit: this run drew epoch and seed from the host; its inputs are saved as recording 04cba9fc... in ~/.cache/hermit/04cba9fc...; rerun it with: hermit replay 04cba9fc...
+... WARN hermit::controller: this run drew settings from the host; its inputs are saved as a recording in ~/.cache/hermit/; rerun it with: hermit replay 04cba9fc... (hermit show last-run)
 $ hermit replay last-run             # rerun the newest run from its manifest
 $ hermit run --from last-run --sched-seed=7   # the same inputs, another schedule
 $ hermit list

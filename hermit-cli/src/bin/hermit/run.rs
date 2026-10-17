@@ -9285,8 +9285,10 @@ impl RunOpts {
             Some((id, _)) => global.report_event(
                 ::tracing::Level::WARN,
                 format_args!(
+                    // `hermit show` alone shows `last`, which a run manifest does not
+                    // move, so the warning names `last-run`.
                     "this run drew {what} from the host; its inputs are saved as a recording in \
-                     {}/; rerun it with: hermit replay {id}",
+                     {}/; rerun it with: hermit replay {id} (hermit show last-run)",
                     home_relative(&manifest::data_dir())
                 ),
             ),
