@@ -1374,8 +1374,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// How Detcore answers an `exe` link the caller names by `path` from
     /// `dirfd`: in a run whose launch exec'd a launcher in the guest's place
-    /// ([`crate::LaunchImage::launcher`], SaBRe's loader), where the kernel's
-    /// link names the launcher instead of the guest's image,
+    /// ([`crate::LaunchImage::launcher`]: SaBRe's loader, DynamoRIO's
+    /// library), where the kernel's link names the launcher instead of the
+    /// guest's image,
     /// `Some(record)`: the image Detcore recorded at the exec of the process
     /// the link reaches ([`crate::exec_record`]), `None` when it has none to
     /// give, which the caller refuses by name rather than let the kernel name
@@ -1634,13 +1635,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// personality read is the process's current one. Every launcher Hermit
     /// execs a guest through sets `ADDR_NO_RANDOMIZE` before the exec, and a
     /// ptrace guest's own exec is checked at its exec stop, before any of the
-    /// new image's code. The in-guest backends check only the image they
-    /// launched: they refuse a guest's exec today. So a guest can only clear
-    /// the flag before the check (a skipped comparison), not set it after a
-    /// randomized exec. Should an in-guest backend come to follow an exec, its
-    /// check would run after the new image's constructors, which could set
-    /// the flag after a randomized exec; that case would need the exec-time
-    /// personality.
+    /// new image's code. The in-guest backends that declare no launcher
+    /// (LiteInst, in-guest-trap) check only the image they launched: they
+    /// refuse a guest's exec today. So a guest can only clear the flag before
+    /// the check (a skipped comparison), not set it after a randomized exec.
+    /// Should one of them come to follow an exec, its check would run after
+    /// the new image's constructors, which could set the flag after a
+    /// randomized exec; that case would need the exec-time personality. DBT
+    /// and SaBRe, which follow execs, declare a launcher and take the branch
+    /// below, which compares nothing with the kernel.
     ///
     /// Where the run declares a launcher, the kernel exec'd the launcher, so
     /// the process's auxiliary vector and break are the launcher's: Detcore

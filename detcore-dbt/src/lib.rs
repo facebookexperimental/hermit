@@ -573,6 +573,7 @@ fn send_dbt_prepare_exec(
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
+    path: Option<PathBuf>,
 ) -> PreparedExec {
     let runtime = current_runtime();
     let mm = thread_state.mm_id;
@@ -597,14 +598,17 @@ fn send_dbt_prepare_exec(
     // is mapped and before the client rewrites owner TIDs, and hand them to
     // the coordinator (https://github.com/rrnewton/hermit/issues/4268).
     let robust_wakes = run_ready(tool.exec_robust_list_wakes(&mut guest));
+    // The image the exec runs, resolved as Detcore's own execve handler
+    // resolves it. DBT declares DynamoRIO's library as its launcher, so the
+    // kernel's link names that library: the new image's `exe` link and its
+    // program break model come from this record.
+    let exe = path.and_then(|path| tool.exec_image_at(&guest, libc::AT_FDCWD, &path));
     run_ready(prepare_exec(
         &mut guest,
         mm,
         blocking_overrides,
         robust_wakes,
-        // DBT's launcher config carries no first image, and its exec link
-        // stays the kernel's.
-        None,
+        exe,
     ));
     PreparedExec {
         context: context as usize,
@@ -613,6 +617,34 @@ fn send_dbt_prepare_exec(
         read_registers,
         write_registers,
     }
+}
+
+/// The NUL-terminated path at guest `address`, read through DynamoRIO's
+/// reader a page at a time, so a string that ends near an unmapped page is
+/// still read whole: `None` for an unreadable address or a path no shorter
+/// than `PATH_MAX`, which the kernel's execve refuses too. The reader works
+/// where Reverie's `LocalMemory` does not, after the thread group's leader has
+/// exited (it copies through the leader's pid).
+fn read_guest_path(address: u64, read_memory: MemoryReader) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+    const PAGE: u64 = 4096;
+    let mut path = Vec::new();
+    let mut at = address;
+    while path.len() < libc::PATH_MAX as usize {
+        let chunk = (PAGE - at % PAGE) as usize;
+        let mut bytes = vec![0_u8; chunk];
+        if unsafe { read_memory(at as usize, bytes.as_mut_ptr(), chunk) } == 0 {
+            return None;
+        }
+        if let Some(end) = bytes.iter().position(|&byte| byte == 0) {
+            path.extend_from_slice(&bytes[..end]);
+            return (path.len() < libc::PATH_MAX as usize)
+                .then(|| PathBuf::from(std::ffi::OsString::from_vec(path)));
+        }
+        path.extend_from_slice(&bytes);
+        at += chunk as u64;
+    }
+    None
 }
 
 fn prepare_exec_guest_identity(scheduler_tid: Pid, physical_pid: i32) -> (Pid, Pid) {
@@ -2938,6 +2970,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
                         invoke_syscall,
                         read_registers,
                         write_registers,
+                        read_guest_path(raw_args[0], read_memory),
                     );
                     thread.prepared_exec = Some(prepared);
                 }

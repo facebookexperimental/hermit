@@ -152,8 +152,8 @@ pub struct LaunchImage {
     /// could not resolve it, which leaves the first image without a record.
     pub exe: Option<PathBuf>,
     /// The image the kernel exec'd in the guest's place, where a launcher
-    /// loads the guest itself (SaBRe's loader), so that the kernel's
-    /// `/proc/<pid>/exe` names the launcher. Detcore keeps a recorded image
+    /// loads the guest itself (SaBRe's loader, DynamoRIO's library), so that
+    /// the kernel's `/proc/<pid>/exe` names the launcher. Detcore keeps a recorded image
     /// only where the kernel's link names that image or this one
     /// (`detcore::exec_record`). `None` where the kernel execs the guest.
     pub launcher: Option<PathBuf>,
@@ -2370,8 +2370,9 @@ mod legacy_backend_json {
     /// `in_guest_site_patching_off` is false for DBT (it is set only for
     /// in-guest LiteInst), so it is never written and reads as false.
     /// `launch_image` came after the legacy form froze: it is never written
-    /// and reads as unset (DBT's own launcher passes no launcher, and its
-    /// execs pass no record).
+    /// and reads as unset. DBT's runtime takes it from the coordinator's
+    /// configuration instead, which declares DynamoRIO's library as the
+    /// launcher.
     /// `inherited_seccomp` came after the legacy form froze too. It is never
     /// written and reads as unknown.
     /// `cpu_profile` and `cpu_profile_host` came after it as well. DBT refuses

@@ -3288,24 +3288,55 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &G,
         call: &syscalls::Execveat,
     ) -> Option<crate::exec_record::ExecRecord> {
+        let path: std::path::PathBuf = call.path()?.read(&guest.memory()).ok()?;
+        self.exec_image_at(guest, call.dirfd(), &path)
+    }
+
+    /// The image this one's exec ran, from the pathname the exec was given
+    /// (`AT_EXECFN`), resolved as [`Self::exec_image`] resolves an `execve`'s
+    /// from the working directory, which an exec keeps. For an exec Detcore
+    /// did not prepare: a backend's copied vfork child runs its `execve`
+    /// without Detcore. `None` where the auxiliary vector has no such entry
+    /// or its string cannot be read.
+    pub(crate) fn exec_image_from_execfn<G: Guest<Self>>(
+        &self,
+        guest: &G,
+    ) -> Option<crate::exec_record::ExecRecord> {
+        use reverie::syscalls::FromToRaw;
+        let address = guest.auxv().at_execfn()?.as_raw();
+        let path: std::path::PathBuf = Option::<syscalls::PathPtr>::from_raw(address)?
+            .read(&guest.memory())
+            .ok()?;
+        self.exec_image_at(guest, libc::AT_FDCWD, &path)
+    }
+
+    /// `Self::exec_image` for a `path` the caller already read from the
+    /// guest: public for a backend that runs the native `execve` outside
+    /// Detcore's handler, prepares the exec itself (`crate::prepare_exec`)
+    /// and reads guest memory its own way.
+    pub fn exec_image_at<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        dirfd: i32,
+        path: &std::path::Path,
+    ) -> Option<crate::exec_record::ExecRecord> {
         let task = self.guest_task_directory(guest)?;
         let root = std::fs::read_link(task.join("root")).ok()?;
         let inside = |link: std::path::PathBuf| {
             Some(std::path::Path::new("/").join(link.strip_prefix(&root).ok()?))
         };
         let cwd = inside(std::fs::read_link(task.join("cwd")).ok()?)?;
-        let path: std::path::PathBuf = call.path()?.read(&guest.memory()).ok()?;
-        let spelled = if path.is_absolute() || call.dirfd() == libc::AT_FDCWD {
-            cwd.join(&path)
+        let spelled = if path.is_absolute() || dirfd == libc::AT_FDCWD {
+            cwd.join(path)
         } else {
-            let descriptor = task.join("fd").join(call.dirfd().to_string());
+            let descriptor = task.join("fd").join(dirfd.to_string());
             let directory = inside(std::fs::read_link(descriptor).ok()?)?;
             // An empty path names the descriptor itself; without
             // `AT_EMPTY_PATH` the exec fails, and the record with it.
             if path.as_os_str().is_empty() {
                 directory
             } else {
-                directory.join(&path)
+                directory.join(path)
             }
         };
         // An exec of the caller's own `exe` link runs the image it executes,

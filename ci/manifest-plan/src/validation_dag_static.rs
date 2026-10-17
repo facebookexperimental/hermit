@@ -1654,7 +1654,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +15 from 2447c8e8: 1153.
     // And metadata::tests::record_version_rejects_streams_from_before_received_directory_lookups
     // (https://github.com/rrnewton/hermit/issues/4213): 1154, executed.
-    ("test.hermit_unit", 1154),
+    // And dbt_launched_program_tests::a_relative_path_entry_is_taken_from_the_guests_directory_not_the_launchers:
+    // 1155.
+    ("test.hermit_unit", 1155),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2498,7 +2500,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the nine 4213 process-auxv units (procfs, tool_global,
     // rendered_procfs and files tests of /proc/<pid>/auxv): 2065, listed.
     // And the refused_signal_controls warning-text test: 2066.
-    ("test.detcore_unit", 2066),
+    // And tool_global::tests::an_images_own_record_fills_in_and_outranks_only_the_launchs_search:
+    // 2067.
+    ("test.detcore_unit", 2067),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3573,7 +3577,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4213): 525.
     // And a_refused_guest_signal_handler_is_announced_once_per_run: 526.
     // And tool_output_respects_page_protection_and_the_private_page (https://github.com/rrnewton/hermit/pull/4502): 527.
-    ("test.cli", 527),
+    // And run_dbt_program_break_is_the_guests_as_natively,
+    // run_dbt_program_break_of_a_pie_starts_at_linuxs_rule and
+    // run_dbt_heap_records_are_ptraces (DBT brk servicing): 530.
+    // And run_dbt_answers_brk_for_a_program_found_through_path: 531.
+    ("test.cli", 531),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4023,7 +4031,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 4213 process-auxv test: 460.
     // And a_refused_guest_signal_handler_is_announced_once_per_run: 461.
     // And the same tool-output protection test: 462.
-    ("test.cli_on_host", 462),
+    // And the same three DBT program-break tests: 465, and the PATH one: 466.
+    ("test.cli_on_host", 466),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4347,7 +4356,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +5 from 2977da2b: 2056.
     // And the nine 4213 process-auxv units: 2065, listed.
     // And the refused_signal_controls warning-text test: 2066.
-    ("test.detcore_unit_on_host", 2066),
+    // And the same own-record test: 2067.
+    ("test.detcore_unit_on_host", 2067),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4626,7 +4636,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the reported-event log-file test: 1138.
     // And +15 from 2447c8e8: 1153.
     // And the 4213 received-directory record-version test: 1154.
-    ("test.hermit_unit_on_host", 1154),
+    // And the same DBT launched-program test: 1155.
+    ("test.hermit_unit_on_host", 1155),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

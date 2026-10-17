@@ -82,7 +82,7 @@ async fn subsequent_leader_exec_cancellation_consumes_prepared_incarnation() {
         ),
         (
             mm1,
-            GlobalRequest::MarkPastFirstExecve(LEADER, None, None),
+            GlobalRequest::MarkPastFirstExecve(LEADER, None, None, None),
             GlobalResponse::MarkPastFirstExecve(Default::default()),
         ),
         (
@@ -301,7 +301,7 @@ async fn inherited_terminal_initialization_is_once_only_across_failed_exec_retry
             (
                 time.clone(),
                 mm0,
-                GlobalRequest::MarkPastFirstExecve(LEADER, None, None),
+                GlobalRequest::MarkPastFirstExecve(LEADER, None, None, None),
             ),
         )
         .await;
@@ -328,7 +328,7 @@ async fn inherited_terminal_initialization_is_once_only_across_failed_exec_retry
         ),
         (
             mm1,
-            GlobalRequest::MarkPastFirstExecve(LEADER, None, None),
+            GlobalRequest::MarkPastFirstExecve(LEADER, None, None, None),
             GlobalResponse::MarkPastFirstExecve(Default::default()),
         ),
     ] {

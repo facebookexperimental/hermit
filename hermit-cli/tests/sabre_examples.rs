@@ -1605,87 +1605,7 @@ int main(int argc, char **argv) {
 #[test]
 #[ignore = "known failure: https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/issue-drafts/2026-10-17-sabre-brk-exec-verify-flake.md (SaBRe delivers both Detcore's SI_USER SIGCHLD and the kernel's CLD_EXITED copy; strict verify diverged in 2 of 20 runs on SaBRe, 0 of 20 on ptrace)"]
 fn sabre_program_break_is_the_guests_as_natively() {
-    const GUEST: &str = r#"
-#define _GNU_SOURCE
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/mman.h>
-#include <sys/syscall.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-static long brk_(long to) { return syscall(SYS_brk, to); }
-
-int main(void) {
-  /* Raw brk first, before stdio or malloc touch the heap; printed after. */
-  long r[13];
-  r[0] = brk_(0);
-  long start = r[0];
-  r[1] = brk_(start + 3 * 4096);
-  memset((void *)start, 0x5a, 3 * 4096);
-  r[2] = brk_(start + 3 * 4096 + 100);
-  r[3] = brk_(start + 4096);
-  r[4] = brk_(start - 4096);
-  r[5] = brk_(0);
-  r[6] = brk_(start + 5000);
-  r[7] = ((volatile char *)start)[4095] == 0x5a;
-  r[8] = brk_(start);
-  /* Growth that would come within a page of a mapping is refused. */
-  void *blocker = mmap((void *)(start + 2 * 4096), 4096, PROT_READ,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-  r[9] = blocker == (void *)(start + 2 * 4096);
-  r[10] = brk_(start + 3 * 4096);
-  r[11] = brk_(start + 4096);
-  r[12] = brk_(start + 2 * 4096);
-  munmap(blocker, 4096);
-  brk_(start);
-  /* A shrink with nothing left to unmap keeps the old break. */
-  long empty[3];
-  empty[0] = brk_(start + 3 * 4096);
-  munmap((void *)start, 3 * 4096);
-  empty[1] = brk_(start + 4096);
-  empty[2] = brk_(0);
-  /* Growth into a grow-down mapping's guard gap is refused. */
-  long gap[2];
-  void *down = mmap((void *)(start + 64 * 4096), 4096, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN | MAP_FIXED_NOREPLACE, -1, 0);
-  gap[0] = down == (void *)(start + 64 * 4096);
-  gap[1] = brk_(start + 3 * 4096 + 2 * 4096);
-  munmap(down, 4096);
-  brk_(start);
-  const char *labels[] = {"start", "grow 3 pages", "within the page", "shrink to 1 page",
-                          "below the start", "query", "unaligned grow", "kept bytes", "back",
-                          "blocker placed", "past the blocker", "a page short of it",
-                          "up to it"};
-  /* A fork child moves its own break, not its parent's. */
-  long before_fork = brk_(0), child_grew = 0;
-  int pipefd[2];
-  pipe(pipefd);
-  pid_t child = fork();
-  if (child == 0) {
-    long grew = brk_(before_fork + 3 * 4096);
-    write(pipefd[1], &grew, sizeof grew);
-    _exit(0);
-  }
-  read(pipefd[0], &child_grew, sizeof child_grew);
-  waitpid(child, NULL, 0);
-  long parent_after = brk_(0);
-  for (int i = 0; i < 13; i++)
-    printf("%s: %#lx\n", labels[i], r[i]);
-  printf("emptied heap grown to %#lx, shrink answers %#lx, query %#lx\n", empty[0], empty[1],
-         empty[2]);
-  printf("grow-down mapping placed: %ld, growth into its gap: %#lx\n", gap[0], gap[1]);
-  printf("child grew by 3 pages: %s, the parent kept its own: %s\n",
-         child_grew == before_fork + 3 * 4096 ? "yes" : "no",
-         parent_after == before_fork ? "yes" : "no");
-  char *small = malloc(24), *medium = malloc(5000);
-  printf("malloc small %p medium %p\n", (void *)small, (void *)medium);
-  free(medium);
-  printf("sbrk(0) %p\n", sbrk(0));
-  return 0;
-}
-"#;
+    const GUEST: &str = include_str!("fixtures/program_break.c");
     let Some(loader) = sabre_loader() else {
         return;
     };
@@ -1727,34 +1647,7 @@ int main(void) {
 /// SaBRe, whose loader picks another bias).
 #[test]
 fn sabre_program_break_of_a_pie_starts_at_linuxs_rule() {
-    const GUEST: &str = r#"
-#define _GNU_SOURCE
-#include <link.h>
-#include <stdio.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-
-static unsigned long expected;
-
-static int own_image(struct dl_phdr_info *info, size_t size, void *unused) {
-  (void)size;
-  (void)unused;
-  unsigned long end = 0;
-  for (int i = 0; i < info->dlpi_phnum; i++)
-    if (info->dlpi_phdr[i].p_type == PT_LOAD &&
-        info->dlpi_phdr[i].p_vaddr + info->dlpi_phdr[i].p_memsz > end)
-      end = info->dlpi_phdr[i].p_vaddr + info->dlpi_phdr[i].p_memsz;
-  expected = (info->dlpi_addr + end + 4095) & ~4095UL;
-  return 1; /* the program itself is listed first */
-}
-
-int main(void) {
-  long start = syscall(SYS_brk, 0);
-  dl_iterate_phdr(own_image, NULL);
-  printf("start as load_elf_binary puts it: %s\n", (unsigned long)start == expected ? "yes" : "no");
-  return 0;
-}
-"#;
+    const GUEST: &str = include_str!("fixtures/program_break_pie.c");
     let Some(loader) = sabre_loader() else {
         return;
     };
@@ -1786,32 +1679,7 @@ int main(void) {
 /// unmapped.
 #[test]
 fn sabre_heap_records_are_ptraces() {
-    const GUEST: &str = r#"
-#define _GNU_SOURCE
-#include <stdio.h>
-#include <string.h>
-#include <sys/mman.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-extern char end;
-int main(void) {
-  /* The first brk grows the break, to an unaligned end: no query comes
-     before it. */
-  unsigned long start = ((unsigned long)&end + 4095) & ~4095UL;
-  long grown = syscall(SYS_brk, start + 4 * 4096 + 1);
-  memset((void *)start, 0x5a, 4 * 4096 + 1);
-  /* Split the heap: its second page read-only. */
-  int split = mprotect((void *)(start + 4096), 4096, PROT_READ);
-  long query = syscall(SYS_brk, 0);
-  /* Back to a page boundary, then unmap it all; the break stays. */
-  long aligned = syscall(SYS_brk, start + 4 * 4096);
-  int gone = munmap((void *)start, 4 * 4096);
-  long after = syscall(SYS_brk, 0);
-  printf("grown %d split %d query %d gone %d after %d\n", grown == (long)(start + 4 * 4096 + 1), split,
-         query == grown, gone, after == aligned && aligned == (long)(start + 4 * 4096));
-  return 0;
-}
-"#;
+    const GUEST: &str = include_str!("fixtures/heap_records.c");
     let Some(loader) = sabre_loader() else {
         return;
     };

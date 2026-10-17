@@ -2030,8 +2030,26 @@ fi
 # removed (DBT inventory 961). reverie-dbt/vendor, third-party, build.rs, the root
 # Cargo.toml, Cargo.lock and rust-toolchain.toml have the same object ids: all
 # seven SDK inputs, calibrated budget, job width and limits are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0afd4fe6e9292853e253a9b0d1accf79ea6c25d2 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0afd4fe6e9292853e253a9b0d1accf79ea6c25d2 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 48e0d7f1fa9a89aa70f379c5ff6f6d24ee9dda6f (2026-10-18): from
+# 0afd4fe6e9292853e253a9b0d1accf79ea6c25d2. Two commits: 38c87aed
+# (DbtRunner::tool_answers_brk; replayed from 57406bba with the same patch-id)
+# and 48e0d7f1 (Auxv::at_execfn, reverie/src only; replayed from cf46ad3e with
+# the same patch-id). 38c87aed changes two vendored DynamoRIO sources,
+# reverie-dbt/vendor/dynamorio/core/lib/globals_shared.h (+4 lines) and
+# core/unix/loader.c (+12 lines), changes src/launcher.rs, and adds two files,
+# tests/fixtures/tool_answers_brk.c and tests/tool_answers_brk_live.rs: DBT
+# inventory 961 -> 963 (REVERIE_DBT_FILES in
+# scripts/lib/reverie_dbt_inventory.rs). build.rs, native/, third-party, the
+# root Cargo.toml, Cargo.lock and rust-toolchain.toml have the same object ids.
+# Cold DynamoRIO builds, back to back, 16 jobs, load about 300 of 316 CPUs
+# (host in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts"): unpatched
+# (Reverie e53cc6f4, whose vendor/dynamorio is 0afd4fe6's) 13.06s (208.95
+# job-seconds), patched (7e0cabd7, whose DynamoRIO sources differ from
+# 48e0d7f1's only in a loader.c comment) 13.32s (213.16 job-seconds), against
+# the 572 job-second ceiling. Calibrated job width and CPU/wall limits carry
+# unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 48e0d7f1fa9a89aa70f379c5ff6f6d24ee9dda6f ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 48e0d7f1fa9a89aa70f379c5ff6f6d24ee9dda6f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

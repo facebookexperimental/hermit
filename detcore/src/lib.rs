@@ -3218,7 +3218,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
         }
 
-        tool_global::mark_past_first_execve(guest).await;
+        // In a run that declares a launcher, an exec Detcore did not prepare
+        // leaves the new image without a record: resolve it here from the
+        // path the exec was given.
+        let unprepared_exe = if self.declares_launcher() {
+            self.exec_image_from_execfn(guest)
+        } else {
+            None
+        };
+        tool_global::mark_past_first_execve(guest, unprepared_exe).await;
         // The new image's auxiliary vector, as it finds it on its initial
         // stack, for its `/proc/<pid>/auxv` (package K slice K2 of
         // https://github.com/rrnewton/hermit/issues/4213). Not under record

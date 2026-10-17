@@ -9362,6 +9362,170 @@ fn run_dbt_verifies_application_mmap() {
     );
 }
 
+/// Compiles `hermit-cli/tests/fixtures/<source>` with `flags` into a build
+/// directory named for `name`, for the program-break guests.
+fn program_break_guest(name: &str, source: &str, flags: &[&str]) -> PathBuf {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let build_root = process_build_root(name);
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let guest = build_root.join(name);
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .args(flags)
+        .arg(fixtures.join(source))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the program-break guest");
+    assert!(
+        output.status.success(),
+        "{source} failed to compile:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    guest
+}
+
+/// `guest`'s standard output natively, without address randomization, as
+/// Hermit runs every guest.
+fn native_stdout(guest: &Path) -> String {
+    let output = Command::new("setarch")
+        .arg("-R")
+        .arg(guest)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(output.status.success(), "{guest:?} natively: {output:?}");
+    String::from_utf8(output.stdout).expect("the guest's stdout should be UTF-8")
+}
+
+/// Under DBT the kernel exec'd DynamoRIO's library, so the kernel's program
+/// break is DynamoRIO's: Detcore answers `brk(2)` from its model of the
+/// guest's, and DynamoRIO reserves nothing for the break. The guest's break
+/// must start, grow, stay within a page, shrink, refuse a request below its
+/// start, refuse growth that would meet another mapping or a grow-down
+/// mapping's guard gap, keep its break on a shrink with nothing left to
+/// unmap, give a fork child its own break, and carry malloc's arena exactly
+/// as natively (`hermit-cli/tests/fixtures/program_break.c`), under ptrace and under DBT, at L2
+/// under DBT.
+#[test]
+fn run_dbt_program_break_is_the_guests_as_natively() {
+    if dbt_unavailable("run_dbt_program_break_is_the_guests_as_natively") {
+        return;
+    }
+    let guest = program_break_guest("program-break", "program_break.c", &["-fno-pie", "-no-pie"]);
+    let native = native_stdout(&guest);
+    for line in [
+        "kept bytes: 0x1\n",
+        "blocker placed: 0x1\n",
+        "grow-down mapping placed: 1,",
+        "child grew by 3 pages: yes, the parent kept its own: yes\n",
+    ] {
+        assert!(native.contains(line), "{line}{native}");
+    }
+    let program = guest.to_str().expect("guest path should be UTF-8");
+    for backend in ["ptrace", "dbt"] {
+        let args = ["--backend", backend, "run", "--strict", "--", program];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), native, "{backend}");
+    }
+    assert_dbt_guest_mode_at_l2(&guest, "-", &native);
+}
+
+/// Under DBT, a guest named without a `/`, as a user types it, is found
+/// through the guest's `PATH`, and Detcore's record of its image, which the
+/// program-break model needs, comes from that search: `echo`'s first brk is
+/// answered, where it was refused by name for want of an exec record.
+#[test]
+fn run_dbt_answers_brk_for_a_program_found_through_path() {
+    if dbt_unavailable("run_dbt_answers_brk_for_a_program_found_through_path") {
+        return;
+    }
+    let args = ["--backend", "dbt", "run", "--strict", "--", "echo", "found"];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "found\n");
+}
+
+/// A position-independent image's program break starts where Linux's rule
+/// puts it for wherever the image was loaded (`hermit-cli/tests/fixtures/program_break_pie.c`),
+/// under DBT, whose loader picks its own bias, as natively and under ptrace.
+#[test]
+fn run_dbt_program_break_of_a_pie_starts_at_linuxs_rule() {
+    if dbt_unavailable("run_dbt_program_break_of_a_pie_starts_at_linuxs_rule") {
+        return;
+    }
+    let guest = program_break_guest(
+        "program-break-pie",
+        "program_break_pie.c",
+        &["-fpie", "-pie"],
+    );
+    let expected = "start as load_elf_binary puts it: yes\n";
+    assert_eq!(native_stdout(&guest), expected);
+    let program = guest.to_str().expect("guest path should be UTF-8");
+    for backend in ["ptrace", "dbt"] {
+        let args = ["--backend", backend, "run", "--strict", "--", program];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{backend}");
+    }
+}
+
+/// Under DBT, `--detlog-heap` records the guest's heap as ptrace's kernel
+/// labels it (`hermit-cli/tests/fixtures/heap_records.c`): from the guest's first brk, even
+/// where that brk already grows the break, to an unaligned break's
+/// page-aligned end, one record per piece once an mprotect splits the heap,
+/// and none of the pages the guest unmapped.
+#[test]
+fn run_dbt_heap_records_are_ptraces() {
+    if dbt_unavailable("run_dbt_heap_records_are_ptraces") {
+        return;
+    }
+    let guest = program_break_guest("heap-records", "heap_records.c", &["-fno-pie", "-no-pie"]);
+    let expected = "grown 1 split 0 query 1 gone 0 after 1\n";
+    assert_eq!(native_stdout(&guest), expected);
+    let program = guest.to_str().expect("guest path should be UTF-8");
+    let heap_records = |backend: &str| {
+        let args = [
+            "--backend",
+            backend,
+            "--log",
+            "info",
+            "run",
+            "--strict",
+            "--detlog-heap",
+            "--",
+            program,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{backend}");
+        // The records without the thread number, which the backends assign
+        // differently, and without what follows the hash.
+        stderr(&output)
+            .lines()
+            .filter_map(|line| Some(line[line.find("[memory]")?..].to_owned()))
+            .filter(|record| record.contains(" [heap]->"))
+            .map(|record| {
+                let record = record
+                    .split_once(" DETLOG_RECORD")
+                    .map_or(record.as_str(), |(record, _)| record);
+                let (_, rest) = record.split_once("] ").expect("a [memory][dtid N] prefix");
+                rest.to_owned()
+            })
+            .collect::<Vec<_>>()
+    };
+    let ptrace = heap_records("ptrace");
+    assert!(
+        ptrace
+            .iter()
+            .any(|record| record.contains("(READ | PRIVATE)")),
+        "the split piece is recorded under ptrace: {ptrace:#?}"
+    );
+    assert_eq!(heap_records("dbt"), ptrace);
+}
+
 /// Runs the thread-join guest in `mode` under DBT at L2 (`--strict --verify
 /// --verify-strict`) and requires `expected` on stdout, a matched verdict,
 /// bitwise parity and nonzero compared INFO messages.

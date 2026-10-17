@@ -2848,7 +2848,12 @@ impl GlobalState {
                 }
                 R::CancelExec(())
             }
-            GlobalRequest::MarkPastFirstExecve(detpid, signal_identity, kernel_image) => {
+            GlobalRequest::MarkPastFirstExecve(
+                detpid,
+                signal_identity,
+                unprepared_exe,
+                kernel_image,
+            ) => {
                 let mut sched = self.lock_rpc_scheduler(false).await;
                 // A backend preserving the leader's ThreadState does not use
                 // the identity-transfer RPC. This successful-exec edge still
@@ -2965,15 +2970,33 @@ impl GlobalState {
                 } else if overrides.exe.is_none() {
                     overrides.exe = prepared
                         .filter(|prepared| prepared.caller == dtid)
-                        .and_then(|prepared| prepared.fd_blocking.exe);
+                        .and_then(|prepared| prepared.fd_blocking.exe)
+                        // An exec no Detcore prepared (a backend's copied
+                        // vfork child runs it without Detcore): the record the
+                        // new image resolved from the path the exec was given.
+                        .or(unprepared_exe);
                 }
                 if self.root_dettid.get() == Some(&dtid)
                     && !self.root_image_marked.swap(true, SeqCst)
                     && let Some(launch) = &self.cfg.launch_image
                 {
-                    overrides.exe = launch.exe.as_deref().and_then(|exe| {
+                    let launched = launch.exe.as_deref().and_then(|exe| {
                         crate::exec_record::ExecRecord::at(std::path::Path::new("/"), exe)
                     });
+                    overrides.exe = if launch.launcher.is_some() {
+                        // In a run that declares a launcher, the image's own
+                        // record (from its `AT_EXECFN`) is the file the
+                        // launcher actually ran, where it names one other
+                        // than the launcher: it outranks the launch's own
+                        // search, which stands where the image gave none.
+                        overrides
+                            .exe
+                            .take()
+                            .filter(|record| Some(record.identity()) != self.launcher_identity())
+                            .or(launched)
+                    } else {
+                        launched
+                    };
                 }
                 // A record stands only where the kernel's own link, which the
                 // new image read (`kernel_image`), names the recorded file or
@@ -5421,10 +5444,13 @@ pub enum GlobalRequest {
     /// The last field is the device and inode of the file the kernel's
     /// `/proc/<pid>/exe` link names for the new image, where the tool can
     /// read it, which the image's record is checked against
-    /// (`crate::exec_record`).
+    /// (`crate::exec_record`). Before it, in a run that declares a launcher,
+    /// the record the new image resolved from the path its exec was given,
+    /// for an exec Detcore did not prepare.
     MarkPastFirstExecve(
         DetPid,
         Option<reverie::SignalTaskIdentity>,
+        Option<crate::exec_record::ExecRecord>,
         Option<(u64, u64)>,
     ),
 
@@ -6230,8 +6256,10 @@ where
     assert_eq!(response, GlobalResponse::CancelExec(()));
 }
 
-pub async fn mark_past_first_execve<G, T>(guest: &mut G)
-where
+pub async fn mark_past_first_execve<G, T>(
+    guest: &mut G,
+    unprepared_exe: Option<crate::exec_record::ExecRecord>,
+) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
@@ -6256,7 +6284,7 @@ where
     });
     let (_, response) = send_and_update_time(
         guest,
-        GlobalRequest::MarkPastFirstExecve(detpid, signal_identity, kernel_image),
+        GlobalRequest::MarkPastFirstExecve(detpid, signal_identity, unprepared_exe, kernel_image),
     )
     .await;
     let mut overrides = match response {
@@ -10352,7 +10380,7 @@ mod tests {
                     (
                         DetTime::new(&config),
                         mm,
-                        GlobalRequest::MarkPastFirstExecve(detpid, None, None),
+                        GlobalRequest::MarkPastFirstExecve(detpid, None, None, None),
                     ),
                 )
                 .await
@@ -10371,7 +10399,7 @@ mod tests {
                 (
                     DetTime::new(&config),
                     root_mm.for_exec(root),
-                    GlobalRequest::MarkPastFirstExecve(root, None, None),
+                    GlobalRequest::MarkPastFirstExecve(root, None, None, None),
                 ),
             )
             .await
@@ -10391,7 +10419,7 @@ mod tests {
                 (
                     DetTime::new(&config),
                     root_mm,
-                    GlobalRequest::MarkPastFirstExecve(root, None, None),
+                    GlobalRequest::MarkPastFirstExecve(root, None, None, None),
                 ),
             )
             .await
@@ -10407,7 +10435,7 @@ mod tests {
                 (
                     DetTime::new(&config),
                     root_mm,
-                    GlobalRequest::MarkPastFirstExecve(root, None, None),
+                    GlobalRequest::MarkPastFirstExecve(root, None, None, None),
                 ),
             )
             .await
@@ -13408,7 +13436,7 @@ mod tests {
                 (
                     worker_clock,
                     old_mm.for_exec(detpid),
-                    GlobalRequest::MarkPastFirstExecve(detpid, None, None),
+                    GlobalRequest::MarkPastFirstExecve(detpid, None, None, None),
                 ),
             )
             .await;
@@ -13820,7 +13848,7 @@ mod tests {
                     (
                         clock,
                         mm.for_exec(detpid),
-                        GlobalRequest::MarkPastFirstExecve(detpid, None, Some(kernel)),
+                        GlobalRequest::MarkPastFirstExecve(detpid, None, None, Some(kernel)),
                     ),
                 )
                 .await;
@@ -13881,7 +13909,7 @@ mod tests {
                     (
                         clock.clone(),
                         MmId::initial(process),
-                        GlobalRequest::MarkPastFirstExecve(process, None, None),
+                        GlobalRequest::MarkPastFirstExecve(process, None, None, None),
                     ),
                 )
             };
@@ -13893,6 +13921,191 @@ mod tests {
                 };
                 assert_eq!(overrides.exe.as_ref(), expected, "{sequentialize} {tid:?}");
             }
+        }
+    }
+
+    /// The record a new image resolved from its own `AT_EXECFN` (the
+    /// unprepared one) fills in only where no exec was prepared, never
+    /// outranks a prepared record, never stands for the launcher, and is
+    /// dropped without sequentialized threads, as a prepared one is. For the
+    /// registered root's first image it outranks the launch's own search,
+    /// which stands where the image gave none or named the launcher; in a run
+    /// that declares no launcher, the launch's record stands at the root
+    /// whatever the image's exec prepared, as before.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // std::fs::canonicalize is the independent oracle
+    async fn an_images_own_record_fills_in_and_outranks_only_the_launchs_search() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = std::fs::canonicalize(directory.path()).unwrap();
+        let (image, other, launcher) = (
+            directory.join("image"),
+            directory.join("other"),
+            directory.join("launcher"),
+        );
+        for file in [&image, &other, &launcher] {
+            std::fs::write(file, file.as_os_str().as_encoded_bytes()).unwrap();
+        }
+        let record_of = |path: &std::path::Path| {
+            crate::exec_record::ExecRecord::at(std::path::Path::new("/"), path)
+        };
+        let (image_record, other_record, launcher_record) =
+            (record_of(&image), record_of(&other), record_of(&launcher));
+
+        // A process other than the root.
+        for (sequentialize, prepared, unprepared, expected) in [
+            (true, None, other_record.clone(), other_record.clone()),
+            (
+                true,
+                image_record.clone(),
+                other_record.clone(),
+                image_record.clone(),
+            ),
+            (true, None, launcher_record.clone(), None),
+            (false, None, other_record.clone(), None),
+        ] {
+            let (config, state, leader, detpid) = exec_record_test_state(sequentialize, &launcher);
+            install_test_registration(&state, leader, Ivar::new());
+            let clock = DetTime::new(&config);
+            let mm = MmId::initial(detpid);
+            let tid = reverie::Tid::from_raw(leader.as_raw());
+            let preparation = ExecFdState {
+                exe: prepared.clone(),
+                ..Default::default()
+            };
+            let response = state
+                .receive_rpc(
+                    tid,
+                    (
+                        clock.clone(),
+                        mm,
+                        GlobalRequest::PrepareExec(detpid, mm, Box::new(preparation)),
+                    ),
+                )
+                .await;
+            assert_eq!(response.1, GlobalResponse::PrepareExec(()));
+            let response = state
+                .receive_rpc(
+                    tid,
+                    (
+                        clock,
+                        mm.for_exec(detpid),
+                        GlobalRequest::MarkPastFirstExecve(detpid, None, unprepared.clone(), None),
+                    ),
+                )
+                .await;
+            let GlobalResponse::MarkPastFirstExecve(overrides) = response.1 else {
+                panic!("unexpected response {:?}", response.1);
+            };
+            assert_eq!(
+                overrides.exe, expected,
+                "{sequentialize} prepared {prepared:?} unprepared {unprepared:?}"
+            );
+        }
+
+        // The registered root's first image of a run that declares no
+        // launcher (ptrace): the launch's record stands over the one its
+        // bootstrap exec prepared.
+        {
+            let config = Config {
+                sequentialize_threads: true,
+                launch_image: Some(crate::LaunchImage {
+                    exe: Some(image.clone()),
+                    launcher: None,
+                }),
+                ..Config::default()
+            };
+            let state = GlobalState::initialize(&config, false);
+            let root = DetTid::from_raw(17);
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .thread_tree
+                .add_child(root, root, true);
+            install_test_registration(&state, root, Ivar::new());
+            state.root_dettid.set(root).unwrap();
+            let process = DetPid::from_raw(root.as_raw());
+            let tid = reverie::Tid::from_raw(root.as_raw());
+            let clock = DetTime::new(&config);
+            let mm = MmId::initial(process);
+            let preparation = ExecFdState {
+                exe: other_record.clone(),
+                ..Default::default()
+            };
+            let response = state
+                .receive_rpc(
+                    tid,
+                    (
+                        clock.clone(),
+                        mm,
+                        GlobalRequest::PrepareExec(process, mm, Box::new(preparation)),
+                    ),
+                )
+                .await;
+            assert_eq!(response.1, GlobalResponse::PrepareExec(()));
+            let response = state
+                .receive_rpc(
+                    tid,
+                    (
+                        clock,
+                        mm.for_exec(process),
+                        GlobalRequest::MarkPastFirstExecve(process, None, None, None),
+                    ),
+                )
+                .await;
+            let GlobalResponse::MarkPastFirstExecve(overrides) = response.1 else {
+                panic!("unexpected response {:?}", response.1);
+            };
+            assert_eq!(
+                overrides.exe, image_record,
+                "no launcher: the launch's record"
+            );
+        }
+
+        // The registered root's first image of a run that declares a
+        // launcher.
+        for (launch_exe, unprepared, expected) in [
+            (Some(&image), other_record.clone(), other_record.clone()),
+            (Some(&image), None, image_record.clone()),
+            (None, other_record.clone(), other_record.clone()),
+            (Some(&image), launcher_record.clone(), image_record.clone()),
+        ] {
+            let config = Config {
+                sequentialize_threads: true,
+                launch_image: Some(crate::LaunchImage {
+                    exe: launch_exe.cloned(),
+                    launcher: Some(launcher.clone()),
+                }),
+                ..Config::default()
+            };
+            let state = GlobalState::initialize(&config, false);
+            let root = DetTid::from_raw(17);
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .thread_tree
+                .add_child(root, root, true);
+            install_test_registration(&state, root, Ivar::new());
+            state.root_dettid.set(root).unwrap();
+            let process = DetPid::from_raw(root.as_raw());
+            let response = state
+                .receive_rpc(
+                    reverie::Tid::from_raw(root.as_raw()),
+                    (
+                        DetTime::new(&config),
+                        MmId::initial(process),
+                        GlobalRequest::MarkPastFirstExecve(process, None, unprepared.clone(), None),
+                    ),
+                )
+                .await;
+            let GlobalResponse::MarkPastFirstExecve(overrides) = response.1 else {
+                panic!("unexpected response {:?}", response.1);
+            };
+            assert_eq!(
+                overrides.exe, expected,
+                "launch {launch_exe:?} unprepared {unprepared:?}"
+            );
         }
     }
 
@@ -13960,7 +14173,7 @@ mod tests {
                 (
                     clock,
                     mm.for_exec(detpid),
-                    GlobalRequest::MarkPastFirstExecve(detpid, None, None),
+                    GlobalRequest::MarkPastFirstExecve(detpid, None, None, None),
                 ),
             )
             .await;

@@ -3597,6 +3597,157 @@ mod dbt_detconfig_tests {
     }
 }
 
+/// The program a DBT launch runs and the working directory it runs from, as
+/// reverie-dbt's launcher finds them: a name without a `/` through `path`,
+/// whose relative entries are taken from the guest's working directory;
+/// `cwd` relative to `current` (the launcher's own directory) when it is
+/// relative, and `current` when there is none. `None` where the search finds
+/// no executable file.
+#[cfg(feature = "dbt")]
+fn dbt_launched_program(
+    program: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+    path: Option<&std::ffi::OsStr>,
+    current: &std::path::Path,
+) -> Option<(PathBuf, PathBuf)> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let cwd = cwd.map_or_else(|| current.to_owned(), |cwd| current.join(cwd));
+    let spelled = if program.as_os_str().as_bytes().contains(&b'/') {
+        program.to_owned()
+    } else {
+        std::env::split_paths(path?)
+            .map(|directory| cwd.join(directory).join(program))
+            .find(|candidate| {
+                candidate.metadata().is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+            })?
+    };
+    Some((spelled, cwd))
+}
+
+#[cfg(all(test, feature = "dbt"))]
+mod dbt_launched_program_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn executable(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_relative_path_entry_is_taken_from_the_guests_directory_not_the_launchers() {
+        let root = tempfile::tempdir().unwrap();
+        let launcher_dir = root.path().join("launcher");
+        // A decoy where the launcher's own directory would find it, and the
+        // program where the guest's directory does.
+        executable(&launcher_dir.join("bin/prog"));
+        executable(&root.path().join("guest/bin/prog"));
+        std::fs::write(root.path().join("guest/plain"), b"").unwrap();
+        let path = std::ffi::OsStr::new("bin");
+        let found = |program: &str, cwd: Option<&str>| {
+            dbt_launched_program(
+                std::path::Path::new(program),
+                cwd.map(std::path::Path::new),
+                Some(path),
+                &launcher_dir,
+            )
+        };
+        let guest = root.path().join("guest");
+        // An absolute and a relative working directory find the same file.
+        let expected = Some((guest.join("bin/prog"), guest.clone()));
+        assert_eq!(found("prog", Some(guest.to_str().unwrap())), expected);
+        assert_eq!(
+            found("prog", Some("../guest")),
+            Some((
+                launcher_dir.join("../guest/bin/prog"),
+                launcher_dir.join("../guest")
+            ))
+        );
+        // Without a working directory, the launcher's own is the guest's.
+        assert_eq!(
+            found("prog", None),
+            Some((launcher_dir.join("bin/prog"), launcher_dir.clone()))
+        );
+        // A name with a `/` is not searched for.
+        assert_eq!(
+            found("./plain", Some(guest.to_str().unwrap())),
+            Some((std::path::PathBuf::from("./plain"), guest.clone()))
+        );
+        // A file that is not executable is not found.
+        assert_eq!(found("plain", Some(guest.to_str().unwrap())), None);
+    }
+}
+
+/// Records, for a DBT run, the guest's first image: `program`, found and
+/// run from `cwd` with the guest's `PATH`, `path`, as the launch finds it
+/// (`dbt_launched_program`), then resolved as the kernel resolves an
+/// `execve`. Both DBT launch paths call it in the container, whose root is
+/// the guest's, in place of `launched_image`'s search, which takes a
+/// relative `PATH` entry from the coordinator's directory rather than the
+/// guest's. Where nothing is found the record stays unset, and the image's
+/// own `AT_EXECFN` gives it after the exec.
+#[cfg(feature = "dbt")]
+pub fn record_dbt_launched_image(
+    config: &mut DetConfig,
+    program: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+    path: Option<&std::ffi::OsStr>,
+) {
+    let exe = std::env::current_dir()
+        .ok()
+        .and_then(|current| dbt_launched_program(program, cwd, path, &current))
+        .and_then(|(spelled, cwd)| {
+            detcore::exec_record::ExecRecord::resolve(std::path::Path::new("/"), &cwd, &spelled)
+        })
+        .map(|record| record.exe);
+    config
+        .launch_image
+        .get_or_insert(detcore::LaunchImage {
+            exe: None,
+            launcher: None,
+        })
+        .exe = exe;
+}
+
+/// Declares, for a DBT run through `drrun`, the image the kernel execs in the
+/// guest's place: DynamoRIO's library (`lib64/release/libdynamorio.so` beside
+/// `drrun`'s `bin64`), which loads the guest itself. So the kernel's `exe`
+/// link and program break are DynamoRIO's (`detcore::LaunchImage::launcher`),
+/// and Detcore answers the guest's brk from its own model; the runner tells
+/// DynamoRIO to reserve nothing for the break
+/// (`reverie_dbt::DbtRunner::tool_answers_brk`).
+/// An error where that library is missing: the run would otherwise
+/// declare a launcher the kernel never execs, and refuse every brk for want
+/// of a record the launcher check can accept.
+#[cfg(feature = "dbt")]
+pub fn declare_dbt_launcher(config: &mut DetConfig, drrun: &std::path::Path) -> Result<(), Error> {
+    let library = drrun
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap_or(std::path::Path::new("/"))
+        .join("lib64/release/libdynamorio.so");
+    if !library.is_file() {
+        return Err(anyhow!(
+            "DynamoRIO's library is not at {} beside drrun {}",
+            library.display(),
+            drrun.display()
+        ));
+    }
+    config
+        .launch_image
+        .get_or_insert(detcore::LaunchImage {
+            exe: None,
+            launcher: None,
+        })
+        .launcher = Some(library);
+    Ok(())
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-737): Review public DBT dispatch and child environment ownership.
 /// Dispatch a command onto the Detcore-linked reverie-dbt runtime.
@@ -3620,11 +3771,22 @@ async fn run_dbt(
     // runtime decodes the backend facts back out of it (here DBT's own); when
     // the string is absent or does not parse, it uses the strict default's
     // facts, which are ptrace's.
+    let (drrun, client) = detcore_dbt::prepare_native_client()
+        .map_err(|error| anyhow!("failed to prepare the Detcore DynamoRIO client: {error}"))?;
+    let mut config = config;
+    declare_dbt_launcher(&mut config, &drrun)?;
+    record_dbt_launched_image(
+        &mut config,
+        std::path::Path::new(command.get_program()),
+        command.get_current_dir(),
+        command
+            .get_captured_envs()
+            .get(std::ffi::OsStr::new("PATH"))
+            .map(std::ffi::OsString::as_os_str),
+    );
     let config_json = dbt_detconfig_json(&config)
         .map_err(|error| anyhow!("failed to serialize the Detcore config for DBT: {error}"))?;
     let panic_on_unsupported_syscalls = config.panic_on_unsupported_syscalls;
-    let (drrun, client) = detcore_dbt::prepare_native_client()
-        .map_err(|error| anyhow!("failed to prepare the Detcore DynamoRIO client: {error}"))?;
     let mut runner = reverie_dbt::DbtRunner::new(&drrun, &client)
         .map_err(|error| {
             anyhow!(
@@ -3634,7 +3796,8 @@ async fn run_dbt(
             )
         })?
         .summary(print_summary)
-        .isolated_process_group(panic_on_unsupported_syscalls);
+        .isolated_process_group(panic_on_unsupported_syscalls)
+        .tool_answers_brk(true);
     if panic_on_unsupported_syscalls {
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
     }

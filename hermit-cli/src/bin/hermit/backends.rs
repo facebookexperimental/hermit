@@ -941,6 +941,15 @@ impl DbtInvocation {
         // The DBT runtime decodes the backend facts back out of it (here DBT's
         // own); when the string is absent or does not parse, it uses the strict
         // default's facts, which are ptrace's.
+        let (drrun, client) = detcore_dbt::prepare_native_client().map_err(|error| {
+            Error::msg(format!(
+                "failed to prepare the Detcore DynamoRIO client: {error}"
+            ))
+        })?;
+        let mut config = config.clone();
+        hermit::declare_dbt_launcher(&mut config, &drrun)
+            .map_err(|error| Error::msg(format!("{error:#}")))?;
+        let config = &config;
         let config_json = hermit::dbt_detconfig_json(config).map_err(|error| {
             Error::msg(format!(
                 "failed to serialize the Detcore config for the DBT backend: {error}"
@@ -974,13 +983,13 @@ impl DbtInvocation {
         let execution = DbtExecution::new(
             options,
             isolated_workdir.is_some() && workdir == isolated_workdir,
+        )
+        .launching(
+            program,
+            workdir,
+            environment.get(OsStr::new("PATH")).map(OsString::as_os_str),
         );
 
-        let (drrun, client) = detcore_dbt::prepare_native_client().map_err(|error| {
-            Error::msg(format!(
-                "failed to prepare the Detcore DynamoRIO client: {error}"
-            ))
-        })?;
         let mut runner = DbtRunner::new(&drrun, &client)
             .map_err(|error| {
                 Error::msg(format!(
@@ -990,7 +999,8 @@ impl DbtInvocation {
                 ))
             })?
             .summary(options.summary)
-            .isolated_process_group(panic_on_unsupported_syscalls);
+            .isolated_process_group(panic_on_unsupported_syscalls)
+            .tool_answers_brk(true);
         if panic_on_unsupported_syscalls {
             runner = runner.client_argument("-panic-on-unsupported-syscalls");
         }
@@ -1536,6 +1546,10 @@ struct DbtExecution {
     /// DynamoRIO's configuration directory inside the container; see
     /// `contained_command`.
     config_dir: PathBuf,
+    /// The guest program, working directory and `PATH`, from which the
+    /// container records the guest's first image
+    /// (`hermit::record_dbt_launched_image`).
+    launched: Option<(PathBuf, Option<PathBuf>, Option<OsString>)>,
 }
 
 #[cfg(feature = "dbt")]
@@ -1559,7 +1573,20 @@ impl DbtExecution {
             options: options.with_dbt_mounts(&[], mounts),
             statistics: Default::default(),
             config_dir: dynamorio_config_dir(),
+            launched: None,
         }
+    }
+
+    /// Records `program`, run from `workdir` and found through `path`, as
+    /// the guest's first image in the container
+    /// (`hermit::record_dbt_launched_image`).
+    fn launching(mut self, program: &Path, workdir: Option<&Path>, path: Option<&OsStr>) -> Self {
+        self.launched = Some((
+            program.to_owned(),
+            workdir.map(Path::to_owned),
+            path.map(OsStr::to_owned),
+        ));
+        self
     }
 
     fn stats_capture(&self) -> Result<DbtStatsSink, Error> {
@@ -1651,6 +1678,7 @@ impl DbtExecution {
             .options
             .with_dbt_mounts(self.statistics.borrow().as_slice(), Vec::new());
         let config = config.clone();
+        let launched = self.launched.clone();
         let config_dir = self
             .options
             .uses_container()
@@ -1673,7 +1701,16 @@ impl DbtExecution {
                     // its common namespace baseline exactly once, before any
                     // coordinator task starts, just as the tracing paths do.
                     super::tracing::align_tracing_pid_baseline(hermit::Backend::Dbt);
-                    let config = super::run::complete_container_config(config.clone(), identity)?;
+                    let mut config =
+                        super::run::complete_container_config(config.clone(), identity)?;
+                    if let Some((program, workdir, path)) = &launched {
+                        hermit::record_dbt_launched_image(
+                            &mut config,
+                            program,
+                            workdir.as_deref(),
+                            path.as_deref(),
+                        );
+                    }
                     let _config_dir = config_dir
                         .as_deref()
                         .map(DynamoRioConfigDir::create)
