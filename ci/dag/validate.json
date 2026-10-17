@@ -3219,48 +3219,6 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
           "test": "c-programs/get-robust-list-thread",
           "mode": "verify",
           "backend": "kvm"
@@ -6230,48 +6188,6 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/perf-event-hardware-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
           "mode": "verify",
           "backend": "sabre"
         },
@@ -10703,90 +10619,6 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/sysv-ipc-refusal",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
           "mode": "verify",
           "backend": "sabre"
         },
@@ -22096,48 +21928,6 @@
         {
           "lane": "portable",
           "category": "system-utils",
-          "test": "system-utils/echo-stdout",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/echo-stdout",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/echo-stdout",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/echo-stdout",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/echo-stdout",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/echo-stdout",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
           "test": "system-utils/errno-path-identity",
           "mode": "verify",
           "backend": "dbt"
@@ -26512,13 +26302,6 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
           "test": "c-programs/get-robust-list-thread",
           "mode": "verify",
           "backend": "ptrace"
@@ -27045,13 +26828,6 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/perf-event-hardware-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -27919,20 +27695,6 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
           "test": "c-programs/tcp-info-accept4",
           "mode": "verify",
           "backend": "ptrace"
@@ -28459,13 +28221,6 @@
           "lane": "portable",
           "category": "system-utils",
           "test": "system-utils/du-tree-summary",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/echo-stdout",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -32420,27 +32175,6 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
           "test": "c-programs/get-robust-list-thread",
           "mode": "verify",
           "backend": "ptrace"
@@ -33989,27 +33723,6 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/perf-event-hardware-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
           "mode": "verify",
           "backend": "sabre"
         },
@@ -36313,48 +36026,6 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/sysv-ipc-refusal",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
           "mode": "verify",
           "backend": "sabre"
         },
@@ -39249,27 +38920,6 @@
           "test": "system-utils/du-tree-summary",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/echo-stdout",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/echo-stdout",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/echo-stdout",
-          "mode": "verify",
-          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -50075,48 +49725,6 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
           "test": "c-programs/get-robust-list-thread",
           "mode": "verify",
           "backend": "kvm"
@@ -53086,48 +52694,6 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/perf-event-hardware-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
           "mode": "verify",
           "backend": "sabre"
         },
@@ -57559,90 +57125,6 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/sysv-ipc-refusal",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
           "mode": "verify",
           "backend": "sabre"
         },
@@ -63731,48 +63213,6 @@
           "test": "system-utils/du-tree-summary",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/echo-stdout",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/echo-stdout",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/echo-stdout",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/echo-stdout",
-          "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/echo-stdout",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/echo-stdout",
-          "mode": "verify",
-          "backend": "sabre"
         },
         {
           "lane": "portable",

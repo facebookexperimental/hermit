@@ -697,10 +697,10 @@
       "why": "tests/c/get_robust_list_child.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
-      "disposition": "manifest-test",
+      "disposition": "guest-fixture",
       "path": "tests/c/get_robust_list_self.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
-      "why": "tests/c/get_robust_list_self.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and DBT and runs in blocking GitHub CI"
+      "runner": "hermit-cli/tests/robust_list_queries.rs",
+      "why": "tests/c/get_robust_list_self.c is owned by hermit-cli/tests/robust_list_queries.rs: the test compiles it with -Werror and requires a ptrace run --strict --verify --panic-on-unsupported-syscalls to report Determinism verified, so the calling thread's glibc-registered robust-list head must be present with the kernel's length. Its former manifest row was merged by the 2026-10-17 test audit into c-programs/robust-list, whose guest now asserts the same head shape on the same six backends."
     },
     {
       "disposition": "manifest-test",
@@ -1381,10 +1381,10 @@
       "why": "tests/c/perf_event_hardware_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
-      "disposition": "manifest-test",
+      "disposition": "guest-fixture",
       "path": "tests/c/perf_event_open_enosys.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/perf_event_open_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "hermit-cli/tests/privileged_observation.rs",
+      "why": "tests/c/perf_event_open_enosys.c is owned by hermit-cli/tests/privileged_observation.rs: the test compiles it with -Werror and requires a ptrace run --strict --verify --panic-on-unsupported-syscalls to report Determinism verified, so a software-clock perf_event_open must return ENOSYS. Its former manifest row was deleted by the 2026-10-17 test audit because c-programs/perf-event-software-enosys asserts the same by-number refusal on the same six backends."
     },
     {
       "disposition": "manifest-test",
@@ -2575,16 +2575,16 @@
       "why": "tests/c/sysv_ipc_refusal.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
-      "disposition": "manifest-test",
+      "disposition": "guest-fixture",
       "path": "tests/c/sysv_sem_enosys.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/sysv_sem_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "hermit-cli/tests/sysv_legacy_fallbacks.rs",
+      "why": "tests/c/sysv_sem_enosys.c is owned by hermit-cli/tests/sysv_legacy_fallbacks.rs: the test compiles it with -Werror and requires a ptrace run --strict --verify --panic-on-unsupported-syscalls to report Determinism verified, so a raw semget must return ENOSYS. Its former manifest row was deleted by the 2026-10-17 test audit because c-programs/sysv-ipc-refusal asserts the semget, shmget and msgget refusals on the same six backends."
     },
     {
-      "disposition": "manifest-test",
+      "disposition": "guest-fixture",
       "path": "tests/c/sysv_shm_enosys.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/sysv_shm_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "hermit-cli/tests/sysv_legacy_fallbacks.rs",
+      "why": "tests/c/sysv_shm_enosys.c is owned by hermit-cli/tests/sysv_legacy_fallbacks.rs: the test compiles it with -Werror and requires a ptrace run --strict --verify --panic-on-unsupported-syscalls to report Determinism verified, so a raw shmget must return ENOSYS. Its former manifest row was deleted by the 2026-10-17 test audit because c-programs/sysv-ipc-refusal asserts the semget, shmget and msgget refusals on the same six backends."
     },
     {
       "disposition": "manifest-test",
