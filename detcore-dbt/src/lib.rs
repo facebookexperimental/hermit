@@ -597,6 +597,9 @@ fn send_dbt_prepare_exec(
         mm,
         blocking_overrides,
         robust_wakes,
+        // DBT's launcher config carries no first image, and its exec link
+        // stays the kernel's.
+        None,
     ));
     PreparedExec {
         context: context as usize,

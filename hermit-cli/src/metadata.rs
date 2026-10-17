@@ -970,6 +970,8 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         guest_may_inherit_a_terminal: false,
         in_guest_detlog_forward_policy: None,
         in_guest_site_patching_off: false,
+        // The first image's link stays the kernel's in record and replay.
+        launch_image: None,
         // Not measured for record and replay.
         inherited_seccomp: detcore::InheritedSeccomp::Unknown,
         has_uts_namespace: true,

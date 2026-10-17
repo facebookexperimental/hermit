@@ -2379,6 +2379,17 @@ async fn run_sabre(
         && IN_GUEST_DETLOG_SINK.lock().unwrap().is_some())
     .then(|| policy.encode());
     let sabre = resolve_sabre_binary()?;
+    // The kernel execs SaBRe's loader, which loads the guest itself, so the
+    // kernel's `exe` link names the loader (`detcore::LaunchImage::launcher`).
+    // Declared even where the first image could not be resolved, so that a
+    // link Detcore cannot answer is refused rather than named the loader.
+    config
+        .launch_image
+        .get_or_insert(detcore::LaunchImage {
+            exe: None,
+            launcher: None,
+        })
+        .launcher = Some(PathBuf::from(&sabre));
     let plugin = sabre_runtime_library_path()
         .map_err(|error| anyhow!("failed to locate the Detcore SaBRe plugin: {error}"))?;
     let program = command.find_program().map_err(|error| {
@@ -4098,9 +4109,29 @@ async fn run_with_backend_inner(
     with_run_deadline(timeout, guest).await
 }
 
+/// The guest's first image, as its `/proc/self/exe` link names it
+/// (`detcore::Config::launch_image`): the program the launch executes, found
+/// as the launch finds it, then resolved as the kernel resolves an `execve`
+/// (`detcore::exec_record::ExecRecord::resolve`). Read in the container,
+/// whose root is the guest's. A launch through a launcher names it itself
+/// (`run_sabre`). `None` when it cannot be found, which leaves the link to the
+/// kernel, and the launch reports the missing program itself.
+fn launched_image(command: &Command) -> Option<detcore::LaunchImage> {
+    let program = command.find_program().ok()?;
+    let cwd = match command.get_current_dir() {
+        Some(cwd) => cwd.to_owned(),
+        None => std::env::current_dir().ok()?,
+    };
+    let record = detcore::exec_record::ExecRecord::resolve(Path::new("/"), &cwd, &program)?;
+    Some(detcore::LaunchImage {
+        exe: Some(record.exe),
+        launcher: None,
+    })
+}
+
 async fn dispatch_backend(
     command: Command,
-    config: DetConfig,
+    mut config: DetConfig,
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
@@ -4108,6 +4139,7 @@ async fn dispatch_backend(
 ) -> Result<ExitStatus, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
+    config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
         return Ok(run_kvm(
             &command,
@@ -4414,7 +4446,7 @@ async fn run_with_output_backend_inner(
 
 async fn dispatch_output_backend(
     mut command: Command,
-    config: DetConfig,
+    mut config: DetConfig,
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
@@ -4422,6 +4454,7 @@ async fn dispatch_output_backend(
 ) -> Result<Output, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
+    config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
         return run_kvm(
             &command,

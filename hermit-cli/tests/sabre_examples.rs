@@ -263,6 +263,31 @@ fn run_bounded_polling_once(
     let mut child = command
         .spawn()
         .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    // Drain both pipes while the command runs. Read only after it exits, a
+    // command whose output exceeds a pipe's capacity blocks writing it and
+    // never exits: Linux gives a new pipe two pages (8 KiB) once its user
+    // holds more than `pipe-user-pages-soft` pages, as a busy host can.
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+    );
     let timed_out = loop {
         match child.try_wait() {
             Ok(Some(_)) => break false,
@@ -285,14 +310,19 @@ fn run_bounded_polling_once(
         }
     };
     // Hermit should drain its process tree before exiting. Kill any survivors anyway so leaked
-    // guest processes cannot retain a pipe descriptor and hang `wait_with_output`.
+    // guest processes cannot retain a pipe descriptor and hold the readers open.
     kill_process_group(child.id(), label);
-    let output = child.wait_with_output().unwrap_or_else(|error| {
+    let status = child.wait().unwrap_or_else(|error| {
         panic!(
             "failed to collect {label}: {rendered}: {error}\ncontroller diagnostics:\n{}",
             controller_diagnostics(diagnostic_log),
         )
     });
+    let output = Output {
+        status,
+        stdout: stdout.join().expect("the stdout reader panicked"),
+        stderr: stderr.join().expect("the stderr reader panicked"),
+    };
     (output, (timed_out, rendered))
 }
 
@@ -1137,6 +1167,368 @@ int main(void) {
         stderr.contains("forwarded records lost: thread"),
         "the refusal does not name the lost records:\n{stderr}"
     );
+}
+
+/// The guest's `/proc/<pid>/exe` links name the guest's images on SaBRe as
+/// natively and on ptrace, by every spelling, from the process itself and
+/// from its parent and child, and an open of the link opens that image.
+/// SaBRe's kernel exec'd its loader, so the kernel's link names the loader;
+/// Detcore answers from the image it recorded at each exec
+/// (`detcore::exec_record`). The guest checks its first image, a fork child
+/// (and its parent's link), a failed exec, an exec through a relative
+/// symbolic link, an exec of a second copy (its parent reading its link, and
+/// it reading its parent's), an `execveat` of a descriptor, an exec of
+/// `/proc/self/exe`, and a script whose interpreter is the guest.
+#[test]
+fn sabre_exe_link_names_the_guest_image_as_natively() {
+    const GUEST: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <libgen.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char **environ;
+
+static void show(const char *label, ssize_t n, const char *buf) {
+  if (n < 0)
+    printf("%s: error\n", label);
+  else
+    printf("%s: %.*s\n", label, (int)n, buf);
+}
+
+static void show_link(const char *label, pid_t pid) {
+  char path[64], buf[4096];
+  snprintf(path, sizeof path, "/proc/%d/exe", (int)pid);
+  show(label, readlink(path, buf, sizeof buf), buf);
+}
+
+/* Whether a read-only open of `path` opens the file the link named. */
+static void show_open(const char *label, const char *path, const char *named) {
+  struct stat opened, at_path;
+  int fd = open(path, O_RDONLY);
+  int same = fd >= 0 && fstat(fd, &opened) == 0 && stat(named, &at_path) == 0 &&
+             opened.st_dev == at_path.st_dev && opened.st_ino == at_path.st_ino;
+  printf("%s: %s\n", label, fd < 0 ? "error" : same ? "the linked file" : "another file");
+  if (fd >= 0)
+    close(fd);
+}
+
+static void report(const char *stage) {
+  char buf[4096], path[128], named[4096];
+  printf("[%s]\n", stage);
+  show("readlink self", readlink("/proc/self/exe", buf, sizeof buf), buf);
+  ssize_t target = readlinkat(AT_FDCWD, "/proc/self/exe", buf, sizeof buf);
+  show("readlinkat self", target, buf);
+  snprintf(named, sizeof named, "%.*s", (int)(target < 0 ? 0 : target), buf);
+  show("readlink thread-self", readlink("/proc/thread-self/exe", buf, sizeof buf), buf);
+  snprintf(path, sizeof path, "/proc/%d/exe", getpid());
+  show("readlink pid", readlink(path, buf, sizeof buf), buf);
+  snprintf(path, sizeof path, "/proc/%d/task/%ld/exe", getpid(), (long)syscall(SYS_gettid));
+  show("readlink task", readlink(path, buf, sizeof buf), buf);
+  int proc = open("/proc", O_RDONLY | O_DIRECTORY);
+  show("readlinkat proc-dir", readlinkat(proc, "self/exe", buf, sizeof buf), buf);
+  close(proc);
+  int self = open("/proc/self", O_RDONLY | O_DIRECTORY);
+  show("readlinkat self-dir", readlinkat(self, "exe", buf, sizeof buf), buf);
+  close(self);
+  printf("readlink short: %zd\n", readlink("/proc/self/exe", buf, 3));
+  show("readlink dotdot", readlink("/proc/self/../self/exe", buf, sizeof buf), buf);
+  show_open("open dotdot", "/proc/self/../self/exe", named);
+  /* exe_self is a symbolic link to /proc/self/exe. */
+  show_open("open alias", "./exe_self", named);
+  /* Ordinary links Detcore must leave alone. */
+  show("readlink root", readlink("/proc/self/root", buf, sizeof buf), buf);
+  show("readlink exe_dir/exe", readlink("exe_dir/exe", buf, sizeof buf), buf);
+  show("readlink exe_dir/exe short", readlink("exe_dir/exe", buf, 1), buf);
+  int writer = open("/proc/self/exe", O_WRONLY);
+  printf("open write: %s\n",
+         writer >= 0 ? "opened" : errno == ETXTBSY ? "ETXTBSY" : "another error");
+  if (writer >= 0)
+    close(writer);
+  int fd = open("/proc/self/exe", O_RDONLY);
+  struct stat opened, at_path;
+  unsigned char magic[4] = {0};
+  if (fd < 0 || fstat(fd, &opened) != 0 || read(fd, magic, 4) != 4) {
+    printf("open self: error\n");
+  } else {
+    int same = stat(named, &at_path) == 0 && opened.st_dev == at_path.st_dev &&
+               opened.st_ino == at_path.st_ino;
+    printf("open self: %02x%c%c%c, same file as the link: %s\n", magic[0], magic[1],
+           magic[2], magic[3], same ? "yes" : "no");
+  }
+  if (fd >= 0)
+    close(fd);
+  printf("open nofollow: %s\n",
+         open("/proc/self/exe", O_RDONLY | O_NOFOLLOW) < 0 ? "error" : "opened");
+  fflush(stdout);
+}
+
+static int wait_for(pid_t child) {
+  int status;
+  if (waitpid(child, &status, 0) != child)
+    return 1;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
+/* Each stage is named by the last argument; a script's interpreter gets the
+   script's path before it. */
+int main(int argc, char **argv) {
+  const char *stage = argc > 1 ? argv[argc - 1] : "first image";
+  if (argc == 1) {
+    /* Later stages name their images relative to the guest's directory. */
+    char directory[4096];
+    snprintf(directory, sizeof directory, "%s", argv[0]);
+    if (chdir(dirname(directory)) != 0)
+      return 2;
+  }
+  report(stage);
+  if (!strcmp(stage, "first image")) {
+    pid_t child = fork();
+    if (child == 0) {
+      report("fork child");
+      show_link("parent", getppid());
+      /* A failed exec keeps the image. */
+      execl("./exe_missing", "exe_missing", (char *)NULL);
+      show_link("after a failed exec", getpid());
+      fflush(stdout);
+      /* A relative symbolic link, which the kernel follows to this image. */
+      execl("./exe_alias", "exe_alias", "exec'd image", (char *)NULL);
+      _exit(5);
+    }
+    return wait_for(child);
+  }
+  if (!strcmp(stage, "exec'd image")) {
+    int ready[2], go[2];
+    if (pipe(ready) != 0 || pipe(go) != 0)
+      return 6;
+    pid_t child = fork();
+    if (child == 0) {
+      char r[16], g[16];
+      snprintf(r, sizeof r, "%d", ready[1]);
+      snprintf(g, sizeof g, "%d", go[0]);
+      /* Another image: a stale record would show. */
+      execl("./exe_copy", "exe_copy", r, g, "copied image", (char *)NULL);
+      _exit(6);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1)
+      return 6;
+    show_link("child", child);
+    fflush(stdout);
+    if (write(go[1], "x", 1) != 1)
+      return 6;
+    int status = wait_for(child);
+    if (status != 0)
+      return status;
+    /* execveat of a descriptor. */
+    /* Not O_CLOEXEC: SaBRe re-execs its loader on /proc/self/fd/N. */
+    int image = open("./exe_copy", O_PATH);
+    char *args[] = {"exe_copy", "fd-exec'd image", NULL};
+    syscall(SYS_execveat, image, "", args, environ, AT_EMPTY_PATH);
+    return 7;
+  }
+  if (!strcmp(stage, "copied image")) {
+    show_link("parent", getppid());
+    fflush(stdout);
+    char byte;
+    if (write(atoi(argv[1]), "x", 1) != 1 || read(atoi(argv[2]), &byte, 1) != 1)
+      return 8;
+    return 0;
+  }
+  if (!strcmp(stage, "fd-exec'd image")) {
+    /* An exec of the own link runs this image again. */
+    execl("/proc/self/exe", "self", "self-exec'd image", (char *)NULL);
+    return 9;
+  }
+  if (!strcmp(stage, "self-exec'd image")) {
+    /* A script whose interpreter is exe_link. */
+    execl("./exe_script", "exe_script", "script image", (char *)NULL);
+    return 10;
+  }
+  return 0;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-exe-link-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let directory = std::fs::canonicalize(dir.path()).unwrap();
+    let guest = compile_guest(&directory, "exe_link", GUEST);
+    let copy = directory.join("exe_copy");
+    std::fs::copy(&guest, &copy).unwrap();
+    // A relative link, which the kernel follows to the guest.
+    std::os::unix::fs::symlink("exe_link", directory.join("exe_alias")).unwrap();
+    // An alias of each process's own exe link.
+    std::os::unix::fs::symlink("/proc/self/exe", directory.join("exe_self")).unwrap();
+    // An ordinary link named `exe`, which Detcore must leave alone.
+    std::fs::create_dir(directory.join("exe_dir")).unwrap();
+    std::os::unix::fs::symlink("/", directory.join("exe_dir/exe")).unwrap();
+    // Its interpreter is the guest; the script runs as the last stage.
+    let script = directory.join("exe_script");
+    std::fs::write(&script, format!("#!{}\n", guest.display())).unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    let native = Command::new(&guest)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "{native:?}");
+    let native_stdout = String::from_utf8(native.stdout).unwrap();
+    let names = |image: &Path| format!("readlink self: {}\n", image.display());
+    assert_eq!(
+        native_stdout.matches(&names(&guest)).count(),
+        4,
+        "{native_stdout}"
+    );
+    assert_eq!(
+        native_stdout.matches(&names(&copy)).count(),
+        3,
+        "{native_stdout}"
+    );
+    assert_eq!(
+        native_stdout.matches("same file as the link: yes").count(),
+        7,
+        "{native_stdout}"
+    );
+    for (line, stages) in [
+        ("open dotdot: the linked file\n", 7),
+        ("open alias: the linked file\n", 7),
+        // A write open of a running image is the kernel's ETXTBSY.
+        ("open write: ETXTBSY\n", 7),
+        ("readlink root: /\n", 7),
+        ("readlink exe_dir/exe: /\n", 7),
+        ("readlink exe_dir/exe short: /\n", 7),
+    ] {
+        assert_eq!(
+            native_stdout.matches(line).count(),
+            stages,
+            "{line}{native_stdout}"
+        );
+    }
+    for line in [
+        format!("parent: {}\n", guest.display()),
+        format!("after a failed exec: {}\n", guest.display()),
+        format!("child: {}\n", copy.display()),
+    ] {
+        assert!(native_stdout.contains(&line), "{line}{native_stdout}");
+    }
+
+    let ptrace = parity_run(&guest, &[], None, "ptrace exe link");
+    assert_eq!(
+        String::from_utf8_lossy(&ptrace.stdout),
+        native_stdout,
+        "ptrace's exe links differ from Linux's"
+    );
+    assert_backend_parity_and_sabre_verify(&guest, &[], &loader, "exe link");
+}
+
+/// Under SaBRe, whose kernel's `exe` link names the loader, an `exe` link
+/// Detcore cannot answer faithfully is refused by name, where the loader's
+/// would be a plausible wrong answer: the link of an image no longer at its
+/// path, whose current name or Linux's " (deleted)" only the kernel's link to
+/// the image could give, and a readlink through a descriptor for the link
+/// itself, a spelling Detcore cannot resolve.
+#[test]
+fn sabre_refuses_exe_links_it_cannot_answer_by_name() {
+    const REMOVED: &str = r#"
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <unistd.h>
+
+/* Run as a copy of itself: removes that copy, then reads its own exe link,
+   which Linux renders with " (deleted)". */
+int main(int argc, char **argv) {
+  (void)argc;
+  char buf[4096];
+  if (unlink(argv[0]) != 0)
+    return 2;
+  ssize_t n = readlink("/proc/self/exe", buf, sizeof buf);
+  if (n < 0)
+    printf("readlink: error\n");
+  else
+    printf("readlink: %.*s\n", (int)n, buf);
+  return 0;
+}
+"#;
+    const DESCRIPTOR: &str = r#"
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+/* Reads its own exe link through a descriptor for the link itself, a
+   spelling Detcore cannot resolve: Linux names the image. */
+int main(void) {
+  char buf[4096];
+  int link = open("/proc/self/exe", O_PATH | O_NOFOLLOW);
+  if (link < 0)
+    return 2;
+  ssize_t n = readlinkat(link, "", buf, sizeof buf);
+  if (n < 0)
+    printf("readlinkat: error\n");
+  else
+    printf("readlinkat: %.*s\n", (int)n, buf);
+  return 0;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-exe-refused-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let directory = std::fs::canonicalize(dir.path()).unwrap();
+    for (name, source, reason) in [
+        ("removed", REMOVED, "no longer at its path"),
+        ("descriptor", DESCRIPTOR, "no record of"),
+    ] {
+        let built = compile_guest(&directory, name, source);
+        // Natively the link names the image: removed, as " (deleted)".
+        let native_copy = directory.join(format!("{name}-native"));
+        std::fs::copy(&built, &native_copy).unwrap();
+        let native = Command::new(&native_copy)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run the guest natively");
+        let expected = match name {
+            "removed" => format!("readlink: {} (deleted)\n", native_copy.display()),
+            _ => format!("readlinkat: {}\n", native_copy.display()),
+        };
+        assert_eq!(String::from_utf8_lossy(&native.stdout), expected, "{name}");
+        // Under SaBRe: refused by name.
+        let guest = directory.join(format!("{name}-sabre"));
+        std::fs::copy(&built, &guest).unwrap();
+        let mut command = Command::new(hermit_binary());
+        command
+            .env("HERMIT_SABRE_BINARY", &loader)
+            .args([
+                "--backend",
+                "sabre",
+                "run",
+                "--strict",
+                COMPARISON_EPOCH,
+                "--",
+            ])
+            .arg(&guest);
+        let (status, stderr) = run_expecting_failure(command, name);
+        assert_eq!(
+            status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "{name}: {stderr}"
+        );
+        assert!(stderr.contains(reason), "{name}: {stderr}");
+    }
 }
 
 /// A guest that execs itself, where the new image's preinit code removes the

@@ -3204,6 +3204,86 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Open an `exe` link, by `call`, as the image Detcore recorded for the
+    /// process it reaches, `exe` (`Detcore::launched_exe`): Linux opens the
+    /// image the link names, which the kernel's link here does not (it names
+    /// the launcher). The kernel first opens the guest's spelling itself as
+    /// a path (`O_PATH`), so whether the link is there and every error stay
+    /// its own (an exited thread-group leader's `ENOENT`). Without a record,
+    /// or for an image no longer at its path, which only the kernel's link to
+    /// the image could still open, the run is refused by name.
+    async fn open_launched_exe<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat,
+        exe: Option<&crate::exec_record::ExecRecord>,
+    ) -> Result<i64, Error> {
+        // The longest path Linux opens, NUL included.
+        const CAPACITY: usize = libc::PATH_MAX as usize;
+        let probe = syscalls::Openat::new()
+            .with_dirfd(call.dirfd())
+            .with_path(call.path())
+            .with_flags(OFlag::O_PATH | OFlag::O_CLOEXEC);
+        let probed = guest.inject(probe).await?;
+        let _ = guest
+            .inject(syscalls::Close::new().with_fd(probed as RawFd))
+            .await;
+        let present = exe.filter(|exe| {
+            self.guest_root(guest)
+                .is_some_and(|root| exe.is_present(&root))
+        });
+        let Some(exe) = present else {
+            return self.refuse_launched_exe(guest, Sysno::openat, exe).await;
+        };
+        let bytes = std::os::unix::ffi::OsStrExt::as_bytes(exe.exe.as_os_str());
+        let mut stack = guest.stack().await;
+        if bytes.len() >= CAPACITY || stack.capacity() < CAPACITY {
+            drop(stack);
+            let reason = format!(
+                "unsupported: opening the /proc/<pid>/exe link of {:?}, whose path does not \
+                 fit the guest stack, where the kernel's link names the launcher",
+                exe.exe
+            );
+            return self
+                .refuse_launched_exe_because(guest, Sysno::openat, reason)
+                .await;
+        }
+        let mut buffer = [0_u8; CAPACITY];
+        buffer[..bytes.len()].copy_from_slice(bytes);
+        let address = stack.push(buffer).cast::<libc::c_char>();
+        let stack_guard = stack.commit()?;
+        let call = call.with_path(PathPtr::from_ptr(address.as_raw() as *const libc::c_char));
+        let result = self.record_or_replay(guest, Syscall::Openat(call)).await;
+        drop(stack_guard);
+        Ok(result?)
+    }
+
+    /// Whether guest descriptor `fd` is open on the launcher a launched run
+    /// declared (`Detcore::launched_exe`), read where the tool shares the
+    /// guest's descriptor table, as a launcher's tool does. Asked only for an
+    /// open of a possible `exe` link
+    /// (`crate::syscalls::namespace::exe_link_candidate`).
+    fn opened_the_launcher(&self, fd: RawFd) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Some(launcher) = self.declared_launcher() else {
+            return false;
+        };
+        if !self.cfg.backend.tool_shares_guest_descriptor_table {
+            return false;
+        }
+        let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+        // Runtime-owned read-only inspection of the shared descriptor table.
+        let result = unsafe {
+            crate::util::raw_syscall(
+                libc::SYS_fstat,
+                [fd as u64, (&raw mut opened) as u64, 0, 0, 0, 0],
+            )
+        };
+        result == 0
+            && std::fs::metadata(launcher)
+                .is_ok_and(|meta| (meta.dev(), meta.ino()) == (opened.st_dev, opened.st_ino))
+    }
+
     /// Openat system call.
     pub async fn handle_openat<G: Guest<Self>>(
         &self,
@@ -3259,6 +3339,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_release_all(guest).await;
             return result;
         }
+        // An `exe` link Detcore answers from its record (`Detcore::launched_exe`)
+        // opens that image, for reading only: a write open of a running image
+        // is the kernel's `ETXTBSY`, `O_NOFOLLOW` its `ELOOP`, and `O_PATH`
+        // with it the link itself.
+        let launched_exe = if call.flags().bits() & libc::O_ACCMODE == libc::O_RDONLY
+            && !call
+                .flags()
+                .intersects(OFlag::O_NOFOLLOW | OFlag::O_TRUNC | OFlag::O_CREAT)
+        {
+            self.launched_exe(guest, (call.dirfd(), &path), true).await
+        } else {
+            None
+        };
         // Signal phase 1 (`sigalrm_phase1`): in a process that handles SIGALRM,
         // an open that may wait (a FIFO, a character or block device) is
         // refused. Checked after the grant: no other guest runs before the open.
@@ -3320,15 +3413,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.open_fifo_once_a_guest_holds_its_peer(guest, call, fifo, &fifo_path)
                     .await
             }
-            None => self
-                .record_or_replay(guest, Syscall::Openat(call))
-                .await
-                .map_err(Error::from),
+            None => match launched_exe {
+                Some(exe) => self.open_launched_exe(guest, call, exe.as_deref()).await,
+                None => self
+                    .record_or_replay(guest, Syscall::Openat(call))
+                    .await
+                    .map_err(Error::from),
+            },
         };
 
         match res {
             Ok(fd) => {
                 let fd = fd as RawFd;
+                // A link Detcore could not resolve whose kernel open reached
+                // the launcher, in the guest's image's place.
+                if crate::syscalls::namespace::exe_link_candidate(&path)
+                    && self.opened_the_launcher(fd)
+                {
+                    let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+                    resource_release_all(guest).await;
+                    return self.refuse_launched_exe(guest, Sysno::openat, None).await;
+                }
                 // Another process's descriptor link, or another spelling of
                 // this one's, to a placeholder: the guest opened the rendered
                 // file again, as Linux opens the procfs file again.

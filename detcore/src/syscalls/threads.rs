@@ -27,6 +27,7 @@ use reverie::syscalls::AddrMut;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
@@ -3217,6 +3218,53 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// The image `call` runs if it succeeds
+    /// ([`crate::exec_record::ExecRecord::resolve`]), looked up as the kernel
+    /// will look it up: through the calling thread's root and working
+    /// directory, or the directory descriptor, or with `AT_EMPTY_PATH` the
+    /// descriptor itself. `None` where Detcore cannot see the thread's
+    /// filesystem ([`Self::guest_task_directory`]) or the kernel would
+    /// refuse the exec; the new image's `/proc/<pid>/exe` link is then the
+    /// kernel's.
+    fn exec_image<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        call: &syscalls::Execveat,
+    ) -> Option<crate::exec_record::ExecRecord> {
+        let task = self.guest_task_directory(guest)?;
+        let root = std::fs::read_link(task.join("root")).ok()?;
+        let inside = |link: std::path::PathBuf| {
+            Some(std::path::Path::new("/").join(link.strip_prefix(&root).ok()?))
+        };
+        let cwd = inside(std::fs::read_link(task.join("cwd")).ok()?)?;
+        let path: std::path::PathBuf = call.path()?.read(&guest.memory()).ok()?;
+        let spelled = if path.is_absolute() || call.dirfd() == libc::AT_FDCWD {
+            cwd.join(&path)
+        } else {
+            let descriptor = task.join("fd").join(call.dirfd().to_string());
+            let directory = inside(std::fs::read_link(descriptor).ok()?)?;
+            // An empty path names the descriptor itself; without
+            // `AT_EMPTY_PATH` the exec fails, and the record with it.
+            if path.as_os_str().is_empty() {
+                directory
+            } else {
+                directory.join(&path)
+            }
+        };
+        // An exec of the caller's own `exe` link runs the image it executes,
+        // which the link names, also where the kernel's link names the
+        // guest's launcher (SaBRe's loader).
+        match self.resolve_exe_subject(guest, &spelled, true) {
+            Some(crate::syscalls::namespace::ExeLinkSubject::Own) => {
+                return guest.thread_state().exe.as_deref().cloned();
+            }
+            // Another process's image, which only the coordinator records.
+            Some(crate::syscalls::namespace::ExeLinkSubject::Other(_)) => return None,
+            None => {}
+        }
+        crate::exec_record::ExecRecord::resolve(&root, &cwd, &spelled)
+    }
+
     /// Execveat system call.  Doesn't return if successful.
     pub async fn handle_execveat<G: Guest<Self>>(
         &self,
@@ -3244,6 +3292,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
         };
         let preserve_exec_fd_status = guest.config().backend.rediscovers_descriptors_after_exec;
+        let exe = self.exec_image(guest, &call);
 
         prepare_exec(
             guest,
@@ -3255,6 +3304,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             },
             // This handler stages the exec's owner-death wakes itself, below.
             Vec::new(),
+            exe,
         )
         .await;
 

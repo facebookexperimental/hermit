@@ -14,9 +14,11 @@ mod own_getters_tests;
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use reverie::Errno;
 use reverie::Error;
@@ -140,10 +142,35 @@ pub(crate) fn saved_link_bytes<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     buffer: Option<AddrMut<'_, libc::c_char>>,
     buffer_len: usize,
 ) -> Option<Vec<u8>> {
-    let buffer = buffer?;
     // Also what a pipe or socket link's canonicalization restores, so it is
     // read for every link, not only a placeholder's.
-    let mut saved = vec![0; buffer_len.min(ANONYMOUS_PROC_FD_TARGET_CAPACITY)];
+    saved_link_prefix(
+        guest,
+        buffer,
+        buffer_len.min(ANONYMOUS_PROC_FD_TARGET_CAPACITY),
+    )
+}
+
+/// The bytes of a readlink buffer that the kernel's answer for an `exe` link
+/// may cover, read before the kernel writes it: as many as a path Linux
+/// renders can have, so that every byte past a shorter substituted target
+/// is restored (`Detcore::substitute_exe_link`).
+fn saved_exe_link_bytes<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &G,
+    buffer: Option<AddrMut<'_, libc::c_char>>,
+    buffer_len: usize,
+) -> Option<Vec<u8>> {
+    saved_link_prefix(guest, buffer, buffer_len.min(libc::PATH_MAX as usize))
+}
+
+/// The first `len` bytes of a readlink buffer, or its readable prefix.
+fn saved_link_prefix<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &G,
+    buffer: Option<AddrMut<'_, libc::c_char>>,
+    len: usize,
+) -> Option<Vec<u8>> {
+    let buffer = buffer?;
+    let mut saved = vec![0; len];
     if guest
         .memory()
         .read_exact(buffer.cast::<u8>(), &mut saved)
@@ -454,6 +481,114 @@ fn decided_procfs_link_parts(parts: &[&[u8]], pid: i32, tid: i32) -> Option<Deci
         }
         [process, b"task", thread, b"fd", fd] if own_process(process) && own_thread(thread) => {
             decimal_fd(OsStr::from_bytes(fd)).map(DecidedLink::SelfFd)
+        }
+        _ => None,
+    }
+}
+
+/// The procfs directory of guest thread `tid` as the tool reaches it: its
+/// own `/proc/thread-self` where the tool runs in the guest's process
+/// (`tool_shares_guest_descriptor_table`), `/proc/<tid>` where it is a
+/// separate tracer. `None` where guest threads are not host tasks
+/// ([`crate::procfs_inode::tool_can_name_guest_descriptors`]: KVM), after a
+/// guest `chroot` (`changed_root`), and where a tracer's guest has a mount
+/// namespace of its own: the tool would look paths up in another
+/// filesystem view than the guest's.
+pub(crate) fn guest_task_procfs(
+    backend: &reverie::BackendCapabilities,
+    tid: i32,
+    changed_root: bool,
+) -> Option<PathBuf> {
+    if !crate::procfs_inode::tool_can_name_guest_descriptors(backend) || changed_root {
+        return None;
+    }
+    if backend.tool_shares_guest_descriptor_table {
+        return Some(PathBuf::from("/proc/thread-self"));
+    }
+    let task = PathBuf::from(format!("/proc/{tid}"));
+    let namespace = |path: &Path| std::fs::metadata(path).ok().map(|meta| meta.ino());
+    (namespace(&task.join("ns/mnt"))? == namespace(Path::new("/proc/self/ns/mnt"))?).then_some(task)
+}
+
+/// Whether the guest's pathname `path` may name an `exe` link Detcore
+/// could not resolve: its final component is `exe`, or it is empty (a
+/// descriptor for the link itself). The launcher guards look only at these
+/// (`Detcore::refuse_launcher_link`, `Detcore::opened_the_launcher`), so
+/// that a guest's own link or open of any other file is never refused.
+pub(crate) fn exe_link_candidate(path: &Path) -> bool {
+    path.as_os_str().is_empty() || path.file_name() == Some(OsStr::new("exe"))
+}
+
+/// Put back the first `written` bytes of a readlink buffer from `saved`,
+/// read before the kernel wrote it, as far as `saved` reaches.
+fn restore_saved_link_bytes<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    buffer: AddrMut<'_, libc::c_char>,
+    written: usize,
+    saved: Option<&[u8]>,
+) {
+    if let Some(saved) = saved {
+        let end = written.min(saved.len());
+        let _ = guest
+            .memory()
+            .write_exact(buffer.cast::<u8>(), &saved[..end]);
+    }
+}
+
+/// Whose `exe` link a `/proc` spelling names ([`exe_link_subject`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExeLinkSubject {
+    /// The caller's own process: `self`, `thread-self`, its pid, or a thread
+    /// in its `task` directory.
+    Own,
+    /// Another process, by the pid the guest sees.
+    Other(i32),
+}
+
+/// Whose `exe` link the absolute, already resolved spelling `path` names
+/// (callers resolve its directory first, `Detcore::resolve_exe_subject`),
+/// for a caller whose pid, as the guest sees it, is `pid`: `/proc/<p>/exe` and
+/// `/proc/<p>/task/<t>/exe` name process `p` (`self` and `thread-self` the
+/// caller's). Linux reads a thread's link from its process's image, and
+/// answers a thread outside `p` with `ENOENT`, which the kernel decides
+/// here too. `None` for any other path, for a spelling with `..`, and for
+/// one that follows the link (a trailing slash or `.`).
+pub(crate) fn exe_link_subject(path: &[u8], pid: i32) -> Option<ExeLinkSubject> {
+    let rest = path.strip_prefix(b"/proc/")?;
+    if path.ends_with(b"/") || path.ends_with(b"/.") {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in rest.split(|byte| *byte == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." => return None,
+            part => parts.push(part),
+        }
+    }
+    let number = |part: &[u8]| -> Option<i32> {
+        let digits = std::str::from_utf8(part).ok()?;
+        // procfs names tasks without leading zeros.
+        (!digits.starts_with('0') && digits.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| digits.parse().ok())?
+    };
+    let process = |part: &[u8]| -> Option<ExeLinkSubject> {
+        if part == b"self" {
+            return Some(ExeLinkSubject::Own);
+        }
+        let process = number(part)?;
+        Some(if process == pid {
+            ExeLinkSubject::Own
+        } else {
+            ExeLinkSubject::Other(process)
+        })
+    };
+    match parts.as_slice() {
+        [b"thread-self", b"exe"] => Some(ExeLinkSubject::Own),
+        [subject, b"exe"] => process(subject),
+        [subject, b"task", thread, b"exe"] => {
+            number(thread)?;
+            process(subject)
         }
         _ => None,
     }
@@ -1098,6 +1233,315 @@ impl<T: RecordOrReplay> Detcore<T> {
             .then(|| (self.own_detpid(guest).as_raw(), state.dettid.as_raw()))
     }
 
+    /// The calling thread's procfs directory as the tool reaches it
+    /// ([`guest_task_procfs`]).
+    pub(crate) fn guest_task_directory<G: Guest<Self>>(&self, guest: &G) -> Option<PathBuf> {
+        guest_task_procfs(
+            &self.cfg.backend,
+            guest.tid().as_raw(),
+            guest
+                .thread_state()
+                .changed_root
+                .load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// The calling thread's root directory as the tool sees it, read from its
+    /// procfs directory ([`Self::guest_task_directory`]).
+    pub(crate) fn guest_root<G: Guest<Self>>(&self, guest: &G) -> Option<PathBuf> {
+        std::fs::read_link(self.guest_task_directory(guest)?.join("root")).ok()
+    }
+
+    /// The absolute spelling of an `exe` link the caller names by `path`
+    /// from `dirfd`, read through its own procfs directory: a relative path
+    /// joined to the directory the kernel holds for its working directory
+    /// or descriptor, which names the process a descriptor on `/proc/self`
+    /// was opened for (a child that inherited it reads its parent's link).
+    /// `None` where the directory cannot be read, and for an empty path.
+    pub(crate) fn exe_link_spelling<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        dirfd: i32,
+        path: &Path,
+    ) -> Option<PathBuf> {
+        if path.is_absolute() {
+            return Some(path.to_path_buf());
+        }
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+        let task = self.guest_task_directory(guest)?;
+        let directory = if dirfd == libc::AT_FDCWD {
+            task.join("cwd")
+        } else {
+            task.join("fd").join(dirfd.to_string())
+        };
+        let directory = std::fs::read_link(directory).ok()?;
+        let root = std::fs::read_link(task.join("root")).ok()?;
+        Some(
+            Path::new("/")
+                .join(directory.strip_prefix(&root).ok()?)
+                .join(path),
+        )
+    }
+
+    /// Whose `exe` link the absolute spelling `spelled` reaches, decided the
+    /// way the kernel looks it up: its directory resolved in the guest's
+    /// view, so `self`, `thread-self`, `..` and symbolic links within it name
+    /// the process they lead to, and with `follow` (an open or an exec, which
+    /// follow the final link) a symbolic link in the final component followed
+    /// too. `None` for any other file, and where the tool cannot read the
+    /// guest's filesystem view ([`Self::guest_task_directory`]).
+    pub(crate) fn resolve_exe_subject<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        spelled: &Path,
+        follow: bool,
+    ) -> Option<ExeLinkSubject> {
+        let root = self.guest_root(guest)?;
+        let inside = |path: &Path| -> Option<PathBuf> {
+            Some(Path::new("/").join(path.strip_prefix(&root).ok()?))
+        };
+        // The caller's pid as its procfs numbers it: Detcore's, or in a
+        // nested PID namespace the namespace's, read from its own
+        // `thread-self` (the tool shares the guest's process where it
+        // resolves these, under a launcher).
+        let pid = if guest.thread_state().nested_pid_namespace {
+            if !self.cfg.backend.tool_shares_guest_descriptor_table {
+                // A tracer's own `thread-self` is not the guest's.
+                return None;
+            }
+            let own = std::fs::canonicalize(root.join("proc/thread-self")).ok()?;
+            let own = inside(&own)?;
+            let mut parts = own.components().skip(2);
+            parts.next()?.as_os_str().to_str()?.parse().ok()?
+        } else {
+            self.own_detpid(guest).as_raw()
+        };
+        let mut spelled = spelled.to_path_buf();
+        // As many links as the kernel follows (`MAXSYMLINKS`).
+        for _ in 0..40 {
+            let name = spelled.file_name()?.to_owned();
+            let parent = spelled.parent()?;
+            let directory =
+                inside(&std::fs::canonicalize(root.join(parent.strip_prefix("/").ok()?)).ok()?)?;
+            let candidate = directory.join(&name);
+            if let Some(subject) = exe_link_subject(candidate.as_os_str().as_bytes(), pid) {
+                return Some(subject);
+            }
+            if !follow {
+                return None;
+            }
+            let link = root.join(candidate.strip_prefix("/").ok()?);
+            if !std::fs::symlink_metadata(&link)
+                .ok()?
+                .file_type()
+                .is_symlink()
+            {
+                return None;
+            }
+            spelled = directory.join(std::fs::read_link(&link).ok()?);
+        }
+        None
+    }
+
+    /// How Detcore answers an `exe` link the caller names by `path` from
+    /// `dirfd`: in a run whose launch exec'd a launcher in the guest's place
+    /// ([`crate::LaunchImage::launcher`], SaBRe's loader), where the kernel's
+    /// link names the launcher instead of the guest's image,
+    /// `Some(record)`: the image Detcore recorded at the exec of the process
+    /// the link reaches ([`crate::exec_record`]), `None` when it has none to
+    /// give, which the caller refuses by name rather than let the kernel name
+    /// the launcher. `None` outside such a run and for any other path: the
+    /// kernel's answer stands, as on every backend whose kernel exec'd the
+    /// guest itself. `follow` as [`Self::resolve_exe_subject`].
+    pub(crate) async fn launched_exe<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        (dirfd, path): (i32, &Path),
+        follow: bool,
+    ) -> Option<Option<Arc<crate::exec_record::ExecRecord>>> {
+        self.cfg.launch_image.as_ref()?.launcher.as_ref()?;
+        let spelled = self.exe_link_spelling(guest, dirfd, path)?;
+        let subject = self.resolve_exe_subject(guest, &spelled, follow)?;
+        if guest.thread_state().nested_pid_namespace && matches!(subject, ExeLinkSubject::Other(_))
+        {
+            // Its pids are not Detcore's.
+            return Some(None);
+        }
+        Some(match subject {
+            ExeLinkSubject::Own => guest.thread_state().exe.clone(),
+            ExeLinkSubject::Other(pid) => {
+                crate::tool_global::process_image(guest, crate::types::DetPid::from_raw(pid))
+                    .await
+                    .map(Arc::new)
+            }
+        })
+    }
+
+    /// Refuse, by name, an `exe` link Detcore cannot answer faithfully in a
+    /// run whose kernel names the launcher (`Self::launched_exe`): without a
+    /// record, or for an image no longer at its path, whose current name
+    /// (or " (deleted)") only the kernel's link to the image could give.
+    pub(crate) async fn refuse_launched_exe<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
+        exe: Option<&crate::exec_record::ExecRecord>,
+    ) -> Result<i64, Error> {
+        let reason = match exe {
+            None => "unsupported: a /proc/<pid>/exe link of an image Detcore has no record of, \
+                     where the kernel's link names the launcher"
+                .to_owned(),
+            Some(exe) => format!(
+                "unsupported: a /proc/<pid>/exe link of {:?}, no longer at its path, \
+                 where the kernel's link names the launcher",
+                exe.exe
+            ),
+        };
+        self.refuse_launched_exe_because(guest, sysno, reason).await
+    }
+
+    /// [`Self::refuse_launched_exe`], for `reason`.
+    pub(crate) async fn refuse_launched_exe_because<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
+        reason: String,
+    ) -> Result<i64, Error> {
+        tracing::error!("[tid {}] {}", guest.tid(), reason);
+        // Said here too: a launched run's launcher does not print the reason
+        // the coordinator records.
+        let _ = std::io::Write::write_fmt(
+            &mut crate::util::RetryingStderr,
+            format_args!("hermit: {reason}\n"),
+        );
+        self.refuse_unserviceable_operation_because(guest, sysno, Errno::EOPNOTSUPP, &reason)
+            .await
+    }
+
+    /// Refuse, by name, a readlink of a possible `exe` link at `path`
+    /// ([`exe_link_candidate`]) whose answer, `result` bytes in `buffer`,
+    /// is the launcher, in a run that declared one
+    /// ([`crate::LaunchImage::launcher`]): a link Detcore could not resolve
+    /// (after a guest `chroot`, through a descriptor for the link itself)
+    /// whose kernel answer would be the launcher in the guest's image's
+    /// place. The answer must be the launcher's whole path; one the kernel
+    /// truncated to the buffer is read again whole (`link`, the guest's
+    /// lookup) before it counts. The buffer gets back the bytes in `saved`
+    /// before the refusal, so a run that lets the guest go on sees it
+    /// untouched. Every other result passes through.
+    async fn refuse_launcher_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        (sysno, path, link): (reverie::syscalls::Sysno, &Path, (i32, Option<PathPtr<'_>>)),
+        (buffer, buffer_len): (Option<AddrMut<'_, libc::c_char>>, usize),
+        result: i64,
+        saved: Option<&[u8]>,
+    ) -> Result<i64, Error> {
+        let (Some(launcher), Some(buffer), Ok(len)) =
+            (self.declared_launcher(), buffer, usize::try_from(result))
+        else {
+            return Ok(result);
+        };
+        if len == 0 || !exe_link_candidate(path) {
+            return Ok(result);
+        }
+        let launcher = launcher.as_os_str().as_bytes();
+        let truncated = len == buffer_len && len < launcher.len();
+        if len > launcher.len() || (len < launcher.len() && !truncated) {
+            return Ok(result);
+        }
+        let mut answer = vec![0; len];
+        if guest
+            .memory()
+            .read_exact(buffer.cast::<u8>(), &mut answer)
+            .is_err()
+            || !launcher.starts_with(&answer)
+        {
+            return Ok(result);
+        }
+        if truncated && self.whole_link(guest, link).await.as_deref() != Some(launcher) {
+            return Ok(result);
+        }
+        restore_saved_link_bytes(guest, buffer, len, saved);
+        self.refuse_launched_exe(guest, sysno, None).await
+    }
+
+    /// The whole target of the link the guest names by `link` (its `dirfd`
+    /// and pathname), read again by the kernel into a buffer that holds any
+    /// path Linux renders. `None` where it cannot be read so, or the guest
+    /// stack cannot hold the buffer.
+    async fn whole_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        (dirfd, path): (i32, Option<PathPtr<'_>>),
+    ) -> Option<Vec<u8>> {
+        const CAPACITY: usize = libc::PATH_MAX as usize;
+        let mut stack = guest.stack().await;
+        if stack.capacity() < CAPACITY {
+            return None;
+        }
+        let scratch = stack.reserve::<[u8; CAPACITY]>().cast::<libc::c_char>();
+        let guard = stack.commit().ok()?;
+        let call = syscalls::Readlinkat::new()
+            .with_dirfd(dirfd)
+            .with_path(path)
+            .with_buf(Some(scratch))
+            .with_buf_len(CAPACITY);
+        let length = usize::try_from(guest.inject(call).await.ok()?).ok()?;
+        let mut target = vec![0; length.min(CAPACITY)];
+        let read = guest.memory().read_exact(scratch.cast(), &mut target);
+        drop(guard);
+        read.ok().map(|()| target)
+    }
+
+    /// The launcher a launched run declared ([`crate::LaunchImage::launcher`]),
+    /// canonical.
+    pub(crate) fn declared_launcher(&self) -> Option<PathBuf> {
+        let launcher = self.cfg.launch_image.as_ref()?.launcher.as_ref()?;
+        Some(std::fs::canonicalize(launcher).unwrap_or_else(|_| launcher.clone()))
+    }
+
+    /// Answer a readlink of an `exe` link from `exe` (`Self::launched_exe`)
+    /// after the kernel answered the guest's call, with `result`: the kernel
+    /// decides whether the link is there and every error (an exited
+    /// thread-group leader's `ENOENT`, a permission refusal, an unwritable
+    /// buffer), and Detcore what it names, the image's path. The bytes the
+    /// kernel wrote past the shorter target are restored from `saved`, as
+    /// Linux leaves them.
+    async fn substitute_exe_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        (sysno, exe): (
+            reverie::syscalls::Sysno,
+            Option<Arc<crate::exec_record::ExecRecord>>,
+        ),
+        (buffer, buffer_len): (Option<AddrMut<'_, libc::c_char>>, usize),
+        result: i64,
+        saved: Option<&[u8]>,
+    ) -> Result<i64, Error> {
+        let (Some(buffer), Ok(kernel_len)) = (buffer, usize::try_from(result)) else {
+            return Ok(result);
+        };
+        let present = exe.as_ref().filter(|exe| {
+            self.guest_root(guest)
+                .is_some_and(|root| exe.is_present(&root))
+        });
+        let Some(exe) = present else {
+            restore_saved_link_bytes(guest, buffer, kernel_len, saved);
+            return self.refuse_launched_exe(guest, sysno, exe.as_deref()).await;
+        };
+        let target = exe.exe.as_os_str().as_bytes();
+        let written = target.len().min(readlink_size(buffer_len)?);
+        guest
+            .memory()
+            .write_exact(buffer.cast::<u8>(), &target[..written])
+            .map_err(|_| Errno::EFAULT)?;
+        restore_link_tail(guest, buffer, written, kernel_len, saved)?;
+        Ok(written as i64)
+    }
+
     /// Detcore's pid for the calling thread's process.
     pub(crate) fn own_detpid<G: Guest<Self>>(&self, guest: &G) -> crate::types::DetPid {
         guest.thread_state().detpid.unwrap_or(self.detpid)
@@ -1251,7 +1695,60 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Readlink,
     ) -> Result<i64, Error> {
+        // Linux refuses a size that is not positive before it reads the path.
+        readlink_size(call.bufsize())?;
         let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        if let Some(exe) = self
+            .launched_exe(guest, (libc::AT_FDCWD, &path), false)
+            .await
+        {
+            let saved = saved_exe_link_bytes(guest, call.buf(), call.bufsize());
+            // As `readlinkat`, the same lookup: a launcher may answer an exact
+            // `readlink` of the own link itself (SaBRe's plugin before
+            // Reverie dropped it), and the kernel must decide existence.
+            let kernel = syscalls::Readlinkat::new()
+                .with_dirfd(libc::AT_FDCWD)
+                .with_path(call.path())
+                .with_buf(call.buf())
+                .with_buf_len(call.bufsize());
+            let result = self.record_or_replay(guest, kernel).await?;
+            let buffer = (call.buf(), call.bufsize());
+            return self
+                .substitute_exe_link(
+                    guest,
+                    (reverie::syscalls::Sysno::readlink, exe),
+                    buffer,
+                    result,
+                    saved.as_deref(),
+                )
+                .await;
+        }
+        let saved = self
+            .declared_launcher()
+            .and_then(|_| saved_exe_link_bytes(guest, call.buf(), call.bufsize()));
+        let result = self.readlink_unlaunched(guest, call, path.clone()).await?;
+        self.refuse_launcher_link(
+            guest,
+            (
+                reverie::syscalls::Sysno::readlink,
+                &path,
+                (libc::AT_FDCWD, call.path()),
+            ),
+            (call.buf(), call.bufsize()),
+            result,
+            saved.as_deref(),
+        )
+        .await
+    }
+
+    /// [`Self::handle_readlink`] of a link Detcore does not answer from an
+    /// exec record.
+    async fn readlink_unlaunched<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readlink,
+        path: PathBuf,
+    ) -> Result<i64, Error> {
         if let Some(result) = self
             .readlink_rendered_procfs(guest, &path, call.buf(), call.bufsize())
             .await?
@@ -1323,7 +1820,51 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Readlinkat,
     ) -> Result<i64, Error> {
+        // Linux refuses a size that is not positive before it reads the path.
+        readlink_size(call.buf_len())?;
         let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        if let Some(exe) = self.launched_exe(guest, (call.dirfd(), &path), false).await {
+            let saved = saved_exe_link_bytes(guest, call.buf(), call.buf_len());
+            let result = self.record_or_replay(guest, call).await?;
+            let buffer = (call.buf(), call.buf_len());
+            return self
+                .substitute_exe_link(
+                    guest,
+                    (reverie::syscalls::Sysno::readlinkat, exe),
+                    buffer,
+                    result,
+                    saved.as_deref(),
+                )
+                .await;
+        }
+        let saved = self
+            .declared_launcher()
+            .and_then(|_| saved_exe_link_bytes(guest, call.buf(), call.buf_len()));
+        let result = self
+            .readlinkat_unlaunched(guest, call, path.clone())
+            .await?;
+        self.refuse_launcher_link(
+            guest,
+            (
+                reverie::syscalls::Sysno::readlinkat,
+                &path,
+                (call.dirfd(), call.path()),
+            ),
+            (call.buf(), call.buf_len()),
+            result,
+            saved.as_deref(),
+        )
+        .await
+    }
+
+    /// [`Self::handle_readlinkat`] of a link Detcore does not answer from an
+    /// exec record.
+    async fn readlinkat_unlaunched<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readlinkat,
+        path: PathBuf,
+    ) -> Result<i64, Error> {
         let observed_path = if path.is_absolute() || call.dirfd() == libc::AT_FDCWD {
             path.clone()
         } else {
@@ -1420,6 +1961,40 @@ mod tests {
             let error = anonymous_object_device(&unread, kind).unwrap_err();
             assert!(matches!(error, Error::Tool(_)), "{error:?}");
             assert!(error.to_string().contains("os error 24"), "{error}");
+        }
+    }
+
+    #[test]
+    fn names_whose_exe_link_a_spelling_reads() {
+        let subject = |path: &str| exe_link_subject(path.as_bytes(), 3);
+        for path in [
+            "/proc/self/exe",
+            "/proc/thread-self/exe",
+            "/proc/3/exe",
+            "/proc//self/./exe",
+            "/proc/self/task/5/exe",
+            "/proc/3/task/7/exe",
+        ] {
+            assert_eq!(subject(path), Some(ExeLinkSubject::Own), "{path}");
+        }
+        assert_eq!(subject("/proc/4/exe"), Some(ExeLinkSubject::Other(4)));
+        assert_eq!(
+            subject("/proc/4/task/9/exe"),
+            Some(ExeLinkSubject::Other(4))
+        );
+        for path in [
+            "/proc/self/exe/",
+            "/proc/self/exe/.",
+            "/proc/self/../self/exe",
+            "/proc/04/exe",
+            "/proc/self/cwd",
+            "/proc/thread-self/task/5/exe",
+            "/proc/self/task/x/exe",
+            "/proc/exe",
+            "proc/self/exe",
+            "/tmp/self/exe",
+        ] {
+            assert_eq!(subject(path), None, "{path}");
         }
     }
 

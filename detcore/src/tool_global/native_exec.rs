@@ -1753,7 +1753,7 @@ mod control_tests {
                         let mark = state
                             .receive_rpc(
                                 Tid::from_raw(owner.as_raw()),
-                                (mark_time, mm, Q::MarkPastFirstExecve(owner, None)),
+                                (mark_time, mm, Q::MarkPastFirstExecve(owner, None, None)),
                             )
                             .await;
                         let mark_response = match mark.1 {
@@ -1900,7 +1900,7 @@ mod control_tests {
                         let mark = state
                             .receive_rpc(
                                 Tid::from_raw(owner.as_raw()),
-                                (mark_time, mm, Q::MarkPastFirstExecve(owner, None)),
+                                (mark_time, mm, Q::MarkPastFirstExecve(owner, None, None)),
                             )
                             .await;
                         let response = match mark.1 {

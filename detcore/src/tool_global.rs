@@ -1124,6 +1124,18 @@ pub struct GlobalState {
     /// Descriptor state retained after the one-shot scheduler transition is consumed.
     post_exec_fd_blocking: Arc<Mutex<BTreeMap<DetTid, ExecFdState>>>,
 
+    /// The image each guest process executes, as its last successful exec
+    /// recorded and the kernel's link confirmed (`crate::exec_record`), for
+    /// another process's `/proc/<pid>/exe`. A new process starts with its
+    /// creator's; the record goes with the process.
+    exec_images: Arc<Mutex<BTreeMap<DetPid, crate::exec_record::ExecRecord>>>,
+    /// The registered root thread, whose first image
+    /// `Config::launch_image` names, and whether that image was completed.
+    root_dettid: OnceLock<DetTid>,
+    root_image_marked: AtomicBool,
+    /// The device and inode of `Config::launch_image`'s launcher, read once.
+    launcher_identity: OnceLock<Option<(u64, u64)>>,
+
     sched_handle: Option<tokio::task::JoinHandle<()>>,
 
     /// Global time is a *volatile* vector clock of individual thread progress. Each
@@ -1161,6 +1173,7 @@ struct ProcessExitCleanup {
     pending_exec_states: Arc<Mutex<BTreeMap<DetPid, PendingExecState>>>,
     completed_exec_transfers: Arc<Mutex<BTreeMap<DetPid, exec_identity::ExecTransferReceipt>>>,
     post_exec_fd_blocking: Arc<Mutex<BTreeMap<DetTid, ExecFdState>>>,
+    exec_images: Arc<Mutex<BTreeMap<DetPid, crate::exec_record::ExecRecord>>>,
 }
 
 impl ProcessExitCleanup {
@@ -1202,6 +1215,7 @@ impl ProcessExitCleanup {
             .unwrap()
             .remove(&process);
         self.post_exec_fd_blocking.lock().unwrap().remove(&process);
+        self.exec_images.lock().unwrap().remove(&process);
         if consume_unreported {
             let consumed = sched.consume_unreported_exit(process);
             debug_assert_eq!(consumed, loss.is_some());
@@ -1362,6 +1376,10 @@ impl GlobalState {
             pending_exec_states: process_exit_cleanup.pending_exec_states,
             completed_exec_transfers: process_exit_cleanup.completed_exec_transfers,
             post_exec_fd_blocking: process_exit_cleanup.post_exec_fd_blocking,
+            exec_images: process_exit_cleanup.exec_images,
+            root_dettid: OnceLock::new(),
+            root_image_marked: AtomicBool::new(false),
+            launcher_identity: OnceLock::new(),
             native_exec_registry: OnceLock::new(),
             inodes: Arc::new(Mutex::new(InodePool::new())),
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1505,7 +1523,19 @@ impl GlobalState {
             pending_exec_states: self.pending_exec_states.clone(),
             completed_exec_transfers: self.completed_exec_transfers.clone(),
             post_exec_fd_blocking: self.post_exec_fd_blocking.clone(),
+            exec_images: self.exec_images.clone(),
         }
+    }
+
+    /// The device and inode of the launcher `Config::launch_image` names,
+    /// the file the kernel's `exe` link names in a launched guest's place.
+    fn launcher_identity(&self) -> Option<(u64, u64)> {
+        *self.launcher_identity.get_or_init(|| {
+            use std::os::unix::fs::MetadataExt;
+            let launcher = self.cfg.launch_image.as_ref()?.launcher.as_ref()?;
+            let meta = std::fs::metadata(launcher).ok()?;
+            Some((meta.dev(), meta.ino()))
+        })
     }
 
     /// Answers a control message about a shared open file description. Only
@@ -1570,6 +1600,7 @@ impl GlobalState {
         self.pending_exec_states.lock().unwrap().clear();
         self.completed_exec_transfers.lock().unwrap().clear();
         self.post_exec_fd_blocking.lock().unwrap().clear();
+        self.exec_images.lock().unwrap().clear();
         let released = self
             .sched
             .lock()
@@ -2525,7 +2556,7 @@ impl GlobalState {
                 }
                 R::CancelExec(())
             }
-            GlobalRequest::MarkPastFirstExecve(detpid, signal_identity) => {
+            GlobalRequest::MarkPastFirstExecve(detpid, signal_identity, kernel_image) => {
                 let mut sched = self.lock_rpc_scheduler(false).await;
                 // A backend preserving the leader's ThreadState does not use
                 // the identity-transfer RPC. This successful-exec edge still
@@ -2627,6 +2658,54 @@ impl GlobalState {
                 );
                 overrides.initialize_inherited_stdio =
                     first_image && self.cfg.backend.tool_shares_guest_descriptor_table;
+                // The image the exec ran: a reloading backend carried it in the
+                // preparation it reconnected with (above); a state-preserving
+                // one left the preparation to this edge. The registered root's
+                // first image is the one its launch named, which a backend
+                // whose launcher loads the guest (SaBRe) never execs.
+                // Without sequentialized threads, sibling execs may prepare
+                // concurrently and the preparation this edge consumed may be
+                // another thread's, which the launcher check cannot tell
+                // apart: no prepared record is kept (a launched run then
+                // refuses the link by name).
+                if !self.cfg.sequentialize_threads {
+                    overrides.exe = None;
+                } else if overrides.exe.is_none() {
+                    overrides.exe = prepared
+                        .filter(|prepared| prepared.caller == dtid)
+                        .and_then(|prepared| prepared.fd_blocking.exe);
+                }
+                if self.root_dettid.get() == Some(&dtid)
+                    && !self.root_image_marked.swap(true, SeqCst)
+                    && let Some(launch) = &self.cfg.launch_image
+                {
+                    overrides.exe = launch.exe.as_deref().and_then(|exe| {
+                        crate::exec_record::ExecRecord::at(std::path::Path::new("/"), exe)
+                    });
+                }
+                // A record stands only where the kernel's own link, which the
+                // new image read (`kernel_image`), names the recorded file or
+                // the launcher the run declared: Detcore's resolution looked the
+                // path up in its own view, which a binfmt_misc handler, another
+                // filesystem view or a racing exec can make wrong. Where the
+                // tool cannot read the link (KVM), the record stands.
+                if let Some(kernel) = kernel_image {
+                    overrides.exe = overrides.exe.filter(|record| {
+                        record.identity() == kernel || self.launcher_identity() == Some(kernel)
+                    });
+                }
+                // The launcher itself is never the guest's image (a link to it
+                // resolved, as the kernel's link names it).
+                overrides.exe = overrides
+                    .exe
+                    .filter(|record| Some(record.identity()) != self.launcher_identity());
+                {
+                    let mut images = self.exec_images.lock().unwrap();
+                    match &overrides.exe {
+                        Some(record) => images.insert(detpid, record.clone()),
+                        None => images.remove(&detpid),
+                    };
+                }
                 if self.cfg.backend.tool_shares_guest_descriptor_table {
                     let mut input = self.inherited_input.lock().unwrap();
                     if input
@@ -3278,6 +3357,21 @@ impl GlobalState {
                     .await
                     .procfs_ids(to_kernel, &ids),
             ),
+            GlobalRequest::ProcessImage(process) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                // `/proc/<tid>/exe` names a thread's process's image.
+                let process = sched
+                    .registered_process(DetTid::from_raw(process.as_raw()))
+                    .unwrap_or(process);
+                R::ProcessImage(
+                    self.exec_images
+                        .lock()
+                        .unwrap()
+                        .get(&process)
+                        .cloned()
+                        .map(Box::new),
+                )
+            }
             GlobalRequest::GroupOrSession(pid, session) => R::GroupOrSession(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -3808,6 +3902,13 @@ impl GlobalState {
                     }
                 }
                 if is_group_leader && flags.is_some() {
+                    // A new process runs its creator's image until it execs.
+                    let mut images = self.exec_images.lock().unwrap();
+                    match images.get(&parent_detpid).cloned() {
+                        Some(image) => images.insert(child_dettid, image),
+                        None => images.remove(&child_dettid),
+                    };
+                    drop(images);
                     sched.inherit_real_time_records(parent_detpid, child_dettid);
                 }
             }
@@ -3845,6 +3946,11 @@ impl GlobalState {
                 && input.root.is_none()
             {
                 input.root = Some((child_dettid, child_mm));
+            }
+            // The same root self-registration names the thread whose first
+            // image `Config::launch_image` describes.
+            if flags.is_none() && parent_dettid == child_dettid && parent_detpid == child_dettid {
+                let _ = self.root_dettid.set(child_dettid);
             }
 
             // Record this thread in deterministic creation order so a
@@ -4970,7 +5076,15 @@ pub enum GlobalRequest {
 
     /// Complete a successful image transition, including the initial image, and
     /// delete the process's POSIX timer deadlines before the new image runs.
-    MarkPastFirstExecve(DetPid, Option<reverie::SignalTaskIdentity>),
+    /// The last field is the device and inode of the file the kernel's
+    /// `/proc/<pid>/exe` link names for the new image, where the tool can
+    /// read it, which the image's record is checked against
+    /// (`crate::exec_record`).
+    MarkPastFirstExecve(
+        DetPid,
+        Option<reverie::SignalTaskIdentity>,
+        Option<(u64, u64)>,
+    ),
 
     /// The parent is adding a child-thread to the round-robin pool.  Contains the dettid
     /// of the new child and it's starting scheduler priority IF it is available to the caller.
@@ -5367,6 +5481,10 @@ pub enum GlobalRequest {
     /// Linux's answer to `setpgid(pid, pgid)` by a process
     /// (`Scheduler::setpgid_decision`), deciding nothing yet. Appended last.
     SetpgidDecision(DetPid, i32, i32),
+    /// The image a guest process executes, as Detcore recorded it at the
+    /// process's exec (`crate::exec_record`), for its `/proc/<pid>/exe`
+    /// link. Appended last.
+    ProcessImage(DetPid),
 }
 
 /// Responses from the global object
@@ -5543,6 +5661,8 @@ pub enum GlobalResponse {
     /// The process to move and its new group; the error is an errno. Appended
     /// last.
     SetpgidDecision(Result<(DetPid, DetPid), i32>),
+    /// Boxed, to keep the response small. Appended last.
+    ProcessImage(Option<Box<crate::exec_record::ExecRecord>>),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -5610,11 +5730,16 @@ pub fn format_unsupported_syscall_warning(syscalls: &BTreeSet<String>) -> Option
 /// at the new image's reconnect, or when the caller's thread ends without
 /// one, and drops them at [`cancel_exec`]. A backend whose execve Detcore handles stages
 /// them in its own thread state instead and passes none.
+///
+/// `exe` is the image the exec runs, where the caller resolved it
+/// ([`crate::exec_record::ExecRecord::resolve`]); the new image's
+/// `/proc/<pid>/exe` link answers from it.
 pub async fn prepare_exec<G, T>(
     guest: &mut G,
     mm: MmId,
     fd_blocking: ExecFdBlockingOverrides,
     robust_wakes: Vec<(DetTid, FutexID)>,
+    exe: Option<crate::exec_record::ExecRecord>,
 ) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -5632,6 +5757,7 @@ pub async fn prepare_exec<G, T>(
             .expect("prepared exec descriptors are no longer live"),
         channels: Default::default(),
         open_file_namespace: None,
+        exe,
     };
     // `--pipe-wake-latency` on a backend that rediscovers its descriptors
     // after exec: carry the channels, and reserve the old numbering at every
@@ -5677,18 +5803,36 @@ where
         guest.signal_control_mode() == reverie::BackendSignalControlMode::ToolControlled;
     let signal_identity = controlled.then(|| guest.signal_task_identity()).flatten();
     let detpid = guest.thread_state().detpid.expect("detpid unset");
+    // The device and inode of the file the kernel's `exe` link names for the
+    // new image, which the coordinator checks the exec's record against.
+    let kernel_image = crate::syscalls::guest_task_procfs(
+        &guest.config().backend,
+        guest.tid().as_raw(),
+        guest
+            .thread_state()
+            .changed_root
+            .load(std::sync::atomic::Ordering::SeqCst),
+    )
+    .and_then(|task| std::fs::metadata(task.join("exe")).ok())
+    .map(|meta| {
+        use std::os::unix::fs::MetadataExt;
+        (meta.dev(), meta.ino())
+    });
     let (_, response) = send_and_update_time(
         guest,
-        GlobalRequest::MarkPastFirstExecve(detpid, signal_identity),
+        GlobalRequest::MarkPastFirstExecve(detpid, signal_identity, kernel_image),
     )
     .await;
-    let overrides = match response {
+    let mut overrides = match response {
         GlobalResponse::MarkPastFirstExecve(overrides) => *overrides,
         _ => unreachable!(),
     };
     if controlled {
         guest.thread_state_mut().signal_task_identity = signal_identity;
     }
+    // The new image's `/proc/<pid>/exe` link answers from its record, or
+    // without one is the kernel's.
+    guest.thread_state_mut().exe = overrides.exe.take().map(Arc::new);
     if !overrides.is_empty() {
         if let Some(open_files) = &overrides.open_files {
             guest
@@ -7586,6 +7730,26 @@ where
     }
 }
 
+/// The image guest process `process` executes, as Detcore recorded it at its
+/// exec (`crate::exec_record`); `None` without a record, and for a process
+/// that has exited.
+pub(crate) async fn process_image<G, T>(
+    guest: &mut G,
+    process: DetPid,
+) -> Option<crate::exec_record::ExecRecord>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::ProcessImage(process))
+        .await
+        .1
+    {
+        GlobalResponse::ProcessImage(image) => image.map(|image| *image),
+        _ => unreachable!(),
+    }
+}
+
 pub async fn set_process_group<G, T>(guest: &mut G, process: DetPid, group: DetPid) -> bool
 where
     G: Guest<Detcore<T>>,
@@ -9404,7 +9568,7 @@ mod tests {
                     (
                         DetTime::new(&config),
                         mm,
-                        GlobalRequest::MarkPastFirstExecve(detpid, None),
+                        GlobalRequest::MarkPastFirstExecve(detpid, None, None),
                     ),
                 )
                 .await
@@ -9423,7 +9587,7 @@ mod tests {
                 (
                     DetTime::new(&config),
                     root_mm.for_exec(root),
-                    GlobalRequest::MarkPastFirstExecve(root, None),
+                    GlobalRequest::MarkPastFirstExecve(root, None, None),
                 ),
             )
             .await
@@ -9443,7 +9607,7 @@ mod tests {
                 (
                     DetTime::new(&config),
                     root_mm,
-                    GlobalRequest::MarkPastFirstExecve(root, None),
+                    GlobalRequest::MarkPastFirstExecve(root, None, None),
                 ),
             )
             .await
@@ -9459,7 +9623,7 @@ mod tests {
                 (
                     DetTime::new(&config),
                     root_mm,
-                    GlobalRequest::MarkPastFirstExecve(root, None),
+                    GlobalRequest::MarkPastFirstExecve(root, None, None),
                 ),
             )
             .await
@@ -11917,6 +12081,7 @@ mod tests {
             open_files: None,
             channels: Default::default(),
             open_file_namespace: None,
+            exe: None,
         };
         state.pending_exec_states.lock().unwrap().insert(
             detpid,
@@ -12104,7 +12269,7 @@ mod tests {
                 (
                     worker_clock,
                     old_mm.for_exec(detpid),
-                    GlobalRequest::MarkPastFirstExecve(detpid, None),
+                    GlobalRequest::MarkPastFirstExecve(detpid, None, None),
                 ),
             )
             .await;
@@ -12235,7 +12400,7 @@ mod tests {
             (identity.dev(), identity.inode(), identity.rdev())
         );
         let old_mm = old.thread.mm_id;
-        super::prepare_exec(&mut old, old_mm, Default::default(), Vec::new()).await;
+        super::prepare_exec(&mut old, old_mm, Default::default(), Vec::new(), None).await;
         {
             let pending = state.pending_exec_states.lock().unwrap();
             let prepared = &pending[&leader].fd_blocking.inherited_reads;
@@ -12407,7 +12572,7 @@ mod tests {
         // A second successful exec also exercises deletion of an empty table.
         for _ in 0..2 {
             let old_mm = guest.thread.mm_id;
-            super::prepare_exec(&mut guest, old_mm, Default::default(), Vec::new()).await;
+            super::prepare_exec(&mut guest, old_mm, Default::default(), Vec::new(), None).await;
             guest.thread.mm_id = old_mm.for_exec(detpid);
             let before = guest.thread.thread_logical_time.as_nanos();
             tokio::time::timeout(Duration::from_secs(2), tool.handle_post_exec(&mut guest))
@@ -12433,6 +12598,161 @@ mod tests {
         assert_eq!(new, 3);
         assert_eq!(timers.settime(new, 0, Some(t(300)), t(10)), Some((0, 0)));
         assert_eq!(timers.gettime(new, t(20)), Some((280, 0)));
+    }
+
+    /// A state like [`cancellation_test_state`]'s for a run that declared
+    /// `launcher` as the image the kernel execs in the guest's place.
+    fn exec_record_test_state(
+        sequentialize_threads: bool,
+        launcher: &std::path::Path,
+    ) -> (Config, GlobalState, DetTid, DetPid) {
+        let config = Config {
+            sequentialize_threads,
+            launch_image: Some(crate::LaunchImage {
+                exe: None,
+                launcher: Some(launcher.to_path_buf()),
+            }),
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let dettid = DetTid::from_raw(17);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(dettid, dettid, true);
+        (config, state, dettid, DetPid::from_raw(17))
+    }
+
+    /// An exec's record stands only where the kernel's link, as the new
+    /// image read it, names the recorded file or the launcher the run
+    /// declared; it is what other processes then read for the process, and a
+    /// dropped record leaves them nothing. Without sequentialized threads no
+    /// record is kept.
+    #[tokio::test]
+    async fn an_exec_record_stands_only_where_the_kernel_names_it_or_the_launcher() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let directory = std::fs::canonicalize(directory.path()).unwrap();
+        let (image, launcher, other) = (
+            directory.join("image"),
+            directory.join("launcher"),
+            directory.join("other"),
+        );
+        for file in [&image, &launcher, &other] {
+            std::fs::write(file, file.as_os_str().as_encoded_bytes()).unwrap();
+        }
+        let identity = |path: &std::path::Path| {
+            let meta = std::fs::metadata(path).unwrap();
+            (meta.dev(), meta.ino())
+        };
+        let record = crate::exec_record::ExecRecord::at(std::path::Path::new("/"), &image).unwrap();
+        for (sequentialize, kernel, kept) in [
+            (true, identity(&image), true),
+            (true, identity(&launcher), true),
+            (true, identity(&other), false),
+            (false, identity(&image), false),
+        ] {
+            let (config, state, leader, detpid) = exec_record_test_state(sequentialize, &launcher);
+            install_test_registration(&state, leader, Ivar::new());
+            let clock = DetTime::new(&config);
+            let mm = MmId::initial(detpid);
+            let tid = reverie::Tid::from_raw(leader.as_raw());
+            let prepared = ExecFdState {
+                exe: Some(record.clone()),
+                ..Default::default()
+            };
+            let response = state
+                .receive_rpc(
+                    tid,
+                    (
+                        clock.clone(),
+                        mm,
+                        GlobalRequest::PrepareExec(detpid, mm, Box::new(prepared)),
+                    ),
+                )
+                .await;
+            assert_eq!(response.1, GlobalResponse::PrepareExec(()));
+            let response = state
+                .receive_rpc(
+                    tid,
+                    (
+                        clock,
+                        mm.for_exec(detpid),
+                        GlobalRequest::MarkPastFirstExecve(detpid, None, Some(kernel)),
+                    ),
+                )
+                .await;
+            let GlobalResponse::MarkPastFirstExecve(overrides) = response.1 else {
+                panic!("unexpected response {:?}", response.1);
+            };
+            let expected = kept.then(|| record.clone());
+            assert_eq!(overrides.exe, expected, "{sequentialize} {kernel:?}");
+            assert_eq!(
+                state.exec_images.lock().unwrap().get(&detpid).cloned(),
+                expected,
+                "{sequentialize} {kernel:?}"
+            );
+        }
+    }
+
+    /// The launch's first image goes to the registered root's first
+    /// completed image only: another thread's completion, first or not,
+    /// gets none, and the root's later images get none from the launch. The
+    /// root's record stands without sequentialized threads too, as it comes
+    /// from no preparation.
+    #[tokio::test]
+    async fn the_launch_image_goes_to_the_registered_roots_first_image_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = std::fs::canonicalize(directory.path()).unwrap();
+        let (image, launcher) = (directory.join("image"), directory.join("launcher"));
+        for file in [&image, &launcher] {
+            std::fs::write(file, file.as_os_str().as_encoded_bytes()).unwrap();
+        }
+        let record = crate::exec_record::ExecRecord::at(std::path::Path::new("/"), &image).unwrap();
+        for sequentialize in [true, false] {
+            let config = Config {
+                sequentialize_threads: sequentialize,
+                launch_image: Some(crate::LaunchImage {
+                    exe: Some(image.clone()),
+                    launcher: Some(launcher.clone()),
+                }),
+                ..Config::default()
+            };
+            let state = GlobalState::initialize(&config, false);
+            let (root, other) = (DetTid::from_raw(17), DetTid::from_raw(23));
+            for tid in [root, other] {
+                state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .thread_tree
+                    .add_child(tid, tid, true);
+                install_test_registration(&state, tid, Ivar::new());
+            }
+            state.root_dettid.set(root).unwrap();
+            let clock = DetTime::new(&config);
+            let mark = |tid: DetTid| {
+                let process = DetPid::from_raw(tid.as_raw());
+                (
+                    reverie::Tid::from_raw(tid.as_raw()),
+                    (
+                        clock.clone(),
+                        MmId::initial(process),
+                        GlobalRequest::MarkPastFirstExecve(process, None, None),
+                    ),
+                )
+            };
+            for (tid, expected) in [(other, None), (root, Some(&record)), (root, None)] {
+                let (from, request) = mark(tid);
+                let response = state.receive_rpc(from, request).await;
+                let GlobalResponse::MarkPastFirstExecve(overrides) = response.1 else {
+                    panic!("unexpected response {:?}", response.1);
+                };
+                assert_eq!(overrides.exe.as_ref(), expected, "{sequentialize} {tid:?}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -12499,7 +12819,7 @@ mod tests {
                 (
                     clock,
                     mm.for_exec(detpid),
-                    GlobalRequest::MarkPastFirstExecve(detpid, None),
+                    GlobalRequest::MarkPastFirstExecve(detpid, None, None),
                 ),
             )
             .await;

@@ -46,6 +46,7 @@ pub mod dispatch_observer;
 /// Schedule-alignment and edit-distance algorithms shared by Hermit tools.
 #[allow(missing_docs)]
 pub mod edit_distance;
+pub mod exec_record;
 pub mod exit_dependencies;
 mod fatal_core;
 mod fd;
@@ -101,6 +102,7 @@ pub use config::Config;
 pub use config::FatalCoreCapture;
 pub use config::InheritedSeccomp;
 pub use config::LITEINST_CONFIG_FINGERPRINT_ENV;
+pub use config::LaunchImage;
 pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
 pub use config::config_fingerprint_mismatch;
@@ -2723,6 +2725,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             pts.1.changed_root.load(std::sync::atomic::Ordering::SeqCst),
                         ))
                     },
+                    // A new task runs its creator's image.
+                    exe: pts.1.exe.clone(),
                     // POSIX timers are shared among threads of a process but are
                     // NOT inherited across fork(2). Share the table for a new
                     // thread (CLONE_THREAD); give a new process a fresh, empty

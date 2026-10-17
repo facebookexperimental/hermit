@@ -240,6 +240,13 @@ pub struct ExecFdState {
     /// channel elsewhere may still carry.
     #[serde(default)]
     pub(crate) open_file_namespace: Option<(DetTid, u64)>,
+    /// The image the exec runs, as Detcore resolved it from the exec's
+    /// arguments before the exec ([`crate::exec_record`]), or for the
+    /// registered root's first image the one its launch named
+    /// (`Config::launch_image`), once the coordinator checked it against the
+    /// kernel's link. `None` leaves the new image without a record.
+    #[serde(default)]
+    pub(crate) exe: Option<crate::exec_record::ExecRecord>,
 }
 
 /// Written out, not derived, so that the `--pipe-wake-latency` fields are
@@ -262,6 +269,9 @@ impl std::fmt::Debug for ExecFdState {
         }
         if let Some(namespace) = &self.open_file_namespace {
             debug.field("open_file_namespace", namespace);
+        }
+        if let Some(exe) = &self.exe {
+            debug.field("exe", &exe.exe);
         }
         debug.finish()
     }
@@ -335,6 +345,7 @@ impl ExecFdState {
             && self.open_files.is_none()
             && self.channels.is_empty()
             && self.open_file_namespace.is_none()
+            && self.exe.is_none()
     }
 }
 
@@ -3489,6 +3500,13 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) changed_root: Arc<std::sync::atomic::AtomicBool>,
 
+    /// The image this thread's process executes ([`crate::exec_record`]),
+    /// which answers the process's `/proc/<pid>/exe` link; `None` leaves the
+    /// link to the kernel. A new task starts with its creator's, and a
+    /// successful exec replaces it (`tool_global::mark_past_first_execve`).
+    #[serde(default)]
+    pub(crate) exe: Option<Arc<crate::exec_record::ExecRecord>>,
+
     /// The identity of the descriptor table this thread's process holds:
     /// the one its thread-group leader holds now, which procfs reads for
     /// the process's descriptor links (`/proc/self/fd/N`, `/proc/<pid>/fd/N`,
@@ -4309,6 +4327,7 @@ impl<T> ThreadState<T> {
             default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             nested_pid_namespace: false,
             changed_root: Default::default(),
+            exe: None,
             process_files,
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
             resource_limits: Arc::new(Mutex::new(ResourceLimits::default())),

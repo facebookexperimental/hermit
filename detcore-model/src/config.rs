@@ -138,6 +138,23 @@ impl InheritedSeccomp {
     }
 }
 
+/// What a launch tells Detcore about the guest's first image
+/// ([`Config::launch_image`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchImage {
+    /// The first image as its `/proc/self/exe` link names it: the program's
+    /// canonical path, or for a script the interpreter it runs
+    /// (`detcore::exec_record::ExecRecord::resolve`). `None` where the launch
+    /// could not resolve it, which leaves the first image without a record.
+    pub exe: Option<PathBuf>,
+    /// The image the kernel exec'd in the guest's place, where a launcher
+    /// loads the guest itself (SaBRe's loader), so that the kernel's
+    /// `/proc/<pid>/exe` names the launcher. Detcore keeps a recorded image
+    /// only where the kernel's link names that image or this one
+    /// (`detcore::exec_record`). `None` where the kernel execs the guest.
+    pub launcher: Option<PathBuf>,
+}
+
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
 pub struct Config {
@@ -248,6 +265,19 @@ pub struct Config {
     #[serde(default)]
     #[clap(skip)]
     pub in_guest_site_patching_off: bool,
+
+    /// The guest's first image, as its `/proc/self/exe` link names it, and
+    /// the image the kernel exec'd in its place where a launcher loads the
+    /// guest ([`LaunchImage`]). Detcore answers that link from it until the
+    /// guest's next exec, which Detcore resolves itself. `None` leaves the
+    /// first image's link to the kernel.
+    ///
+    /// The host sets it, not a flag, from the program it launches. Like
+    /// `in_guest_detlog_forward_policy` it has no legacy key, so DBT's
+    /// legacy form never carries it.
+    #[serde(default)]
+    #[clap(skip)]
+    pub launch_image: Option<LaunchImage>,
 
     /// The seccomp state the guest inherits from the thread that starts it
     /// ([`InheritedSeccomp`]). The caller that starts the guest states it, as
@@ -1887,7 +1917,8 @@ impl Default for Config {
 /// only DBT, whose launcher collects no host inputs. So is
 /// [`Config::guest_may_inherit_a_terminal`], which only DBT-false
 /// capability `supports_blocked_wait_signal_interruption` reads, and [`Config::in_guest_detlog_forward_policy`] and
-/// [`Config::in_guest_site_patching_off`], which are unset for DBT. So is [`Config::target_timeslice_syscalls_only`],
+/// [`Config::in_guest_site_patching_off`], which is unset for DBT, and
+/// [`Config::launch_image`], which came after it. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
 /// option has no effect. So are [`Config::futex_wake_yields`] and
 /// [`Config::scheduler_turn_cost`], also added after this form froze, which
@@ -2316,16 +2347,20 @@ mod legacy_backend_json {
     /// replay runs only on the ptrace backend.
     /// `in_guest_site_patching_off` is false for DBT (it is set only for
     /// in-guest LiteInst), so it is never written and reads as false.
+    /// `launch_image` came after the legacy form froze: it is never written
+    /// and reads as unset (DBT's own launcher passes no launcher, and its
+    /// execs pass no record).
     /// `inherited_seccomp` came after the legacy form froze too. It is never
     /// written and reads as unknown.
     /// `cpu_profile` and `cpu_profile_host` came after it as well. DBT refuses
     /// the x86-64-v3 profile, so they are never written and read as v2.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 13] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 14] = [
         "backend",
         "record_host_inputs",
         "guest_may_inherit_a_terminal",
         "in_guest_detlog_forward_policy",
         "in_guest_site_patching_off",
+        "launch_image",
         "target_timeslice_syscalls_only",
         "futex_wake_yields",
         "pipe_wake_latency",
@@ -2425,7 +2460,7 @@ mod legacy_backend_json {
     /// there nor [`Config::record_host_inputs`],
     /// [`Config::guest_may_inherit_a_terminal`],
     /// [`Config::in_guest_detlog_forward_policy`],
-    /// [`Config::in_guest_site_patching_off`],
+    /// [`Config::in_guest_site_patching_off`], [`Config::launch_image`],
     /// [`Config::target_timeslice_syscalls_only`],
     /// [`Config::futex_wake_yields`], [`Config::replaying`],
     /// [`Config::scheduler_turn_cost`] or [`Config::inherited_seccomp`] takes
@@ -2469,7 +2504,10 @@ mod legacy_backend_json {
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Unset, as its serde default is.
                 Some(
-                    "in_guest_detlog_forward_policy" | "scheduler_turn_cost" | "pipe_wake_latency",
+                    "in_guest_detlog_forward_policy"
+                    | "launch_image"
+                    | "scheduler_turn_cost"
+                    | "pipe_wake_latency",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
@@ -2737,6 +2775,7 @@ mod legacy_backend_json {
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
+                | "launch_image"
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
                 | "pipe_wake_latency"
@@ -2815,6 +2854,7 @@ mod tests {
         assert!(!config.guest_may_inherit_a_terminal);
         assert!(config.in_guest_detlog_forward_policy.is_none());
         assert!(!config.in_guest_site_patching_off);
+        assert!(config.launch_image.is_none());
     }
 
     #[test]
@@ -3346,7 +3386,8 @@ mod tests {
     /// with the fifteen legacy keys where `backend` stands and no
     /// `record_host_inputs`, `guest_may_inherit_a_terminal`,
     /// `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
-    /// `target_timeslice_syscalls_only`, `futex_wake_yields`, `replaying`,
+    /// `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
+    /// `replaying`,
     /// `scheduler_turn_cost` or
     /// `inherited_seccomp`, which is the
     /// key order the encoder writes.
@@ -3368,6 +3409,7 @@ mod tests {
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
+                | "launch_image"
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
                 | "pipe_wake_latency"
@@ -3388,12 +3430,12 @@ mod tests {
         // `backend` becomes fifteen keys; `record_host_inputs`,
         // `guest_may_inherit_a_terminal`,
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
-        // `target_timeslice_syscalls_only`, `futex_wake_yields`,
+        // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
         // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
         // `inherited_seccomp`, `cpu_profile` and `cpu_profile_host` none:
-        // fourteen more keys, and twelve fewer.
+        // fourteen more keys, and thirteen fewer.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 2, keys.len());
+        assert_eq!(fields.len() + 1, keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -3518,6 +3560,44 @@ mod tests {
             from_legacy_backend_json(&json)
                 .unwrap()
                 .in_guest_detlog_forward_policy
+                .is_none()
+        );
+    }
+
+    /// `launch_image` has no legacy key, so the legacy form never carries
+    /// it, and it reads back as unset from both the object and the array
+    /// form.
+    #[test]
+    fn launch_image_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            launch_image: Some(LaunchImage {
+                exe: Some(PathBuf::from("/usr/bin/true")),
+                launcher: Some(PathBuf::from("/usr/bin/env")),
+            }),
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("launch_image"), "{json}");
+        assert!(
+            from_legacy_backend_json(&json)
+                .unwrap()
+                .launch_image
+                .is_none()
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            from_legacy_backend_json(&array)
+                .unwrap()
+                .launch_image
                 .is_none()
         );
     }

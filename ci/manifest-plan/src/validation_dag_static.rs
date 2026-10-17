@@ -1091,7 +1091,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1602, listed.
     // A6 adds 3 explicit-refusal/configuration/timer controls; combined source count, listing pending.
     // And +3 from 2447c8e8: 1605.
-    ("test.regular_crates", 1605),
+    // And detcore-model's launch_image_never_enters_the_legacy_form: 1606.
+    ("test.regular_crates", 1606),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2421,7 +2422,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4213): 1926, executed.
     // A6: explicit timer refusals and separate configuration/timer reporting; re-listed.
     // And +1 from 2447c8e8: 1927.
-    ("test.detcore_unit", 1927),
+    // And exec_record::tests::a_script_line_names_its_interpreter_as_the_kernel_reads_it,
+    // exec_record::tests::a_script_resolves_to_its_interpreter_and_a_link_to_its_file and
+    // syscalls::namespace::tests::names_whose_exe_link_a_spelling_reads and
+    // tool_global::tests::an_exec_record_stands_only_where_the_kernel_names_it_or_the_launcher
+    // and tool_global::tests::the_launch_image_goes_to_the_registered_roots_first_image_only:
+    // 1932, executed.
+    ("test.detcore_unit", 1932),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3511,7 +3518,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 26: 27.
     // sabre_hands_a_readied_pipe_poller_the_turn_across_exec
     // (https://github.com/rrnewton/hermit/issues/4380) retains all 27: 28.
-    ("test.sabre_examples", 28),
+    // sabre_exe_link_names_the_guest_image_as_natively retains all 28: 29.
+    // sabre_refuses_exe_links_it_cannot_answer_by_name retains all 29: 30.
+    ("test.sabre_examples", 30),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -4201,7 +4210,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four 4213 rendered-cpuinfo tests: 1926, executed.
     // A6: explicit timer refusals and separate configuration/timer reporting; re-listed.
     // And +1 from 2447c8e8: 1927.
-    ("test.detcore_unit_on_host", 1927),
+    // And the same five exec-record tests: 1932, executed.
+    ("test.detcore_unit_on_host", 1932),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4640,7 +4650,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same copied-child scheduler-policy test: 1588.
     // A6 adds 3 explicit-refusal/configuration/timer controls; combined source count, listing pending.
     // And +3 from 2447c8e8: 1591.
-    ("test.regular_crates_on_host", 1591),
+    // And the same launch-image legacy-form test: 1592.
+    ("test.regular_crates_on_host", 1592),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),
@@ -4655,7 +4666,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // early RDTSC tests: 23, and the same re-entrant RDTSC test: 24, and the
     // same stack-limit and early limit-change tests: 26, and the same marker
     // limit-read test: 27. And the same --pipe-wake-latency exec test: 28.
-    ("test.sabre_examples_on_host", 28),
+    // And the same exe-link test: 29, and the same refusal test: 30.
+    ("test.sabre_examples_on_host", 30),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
