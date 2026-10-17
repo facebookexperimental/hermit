@@ -21532,36 +21532,6 @@ fn self_test(root: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod cells_file_selection_tests {
-    use super::*;
-
-    #[test]
-    fn disabled_cells_file_preserves_exact_selection_and_retained_evidence() {
-        // Rust's test harness runs cases concurrently, and sibling fixtures
-        // temporarily change the process-wide current directory. Anchor this
-        // repository fixture to the source path instead of racing on cwd.
-        let root = Path::new(file!())
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .unwrap()
-            .to_path_buf();
-        let path = env::temp_dir().join(format!(
-            "hermit-pressure-disabled-cells-file-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
-        fs::create_dir(&path).unwrap();
-        let cleanup = SelfTestDirectory::new(path.clone());
-        disabled_cells_file_self_test(&root, &path).unwrap();
-        cleanup.remove().unwrap();
-    }
-}
-
-#[cfg(test)]
 mod typed_termination_tests {
     use super::*;
 
@@ -29251,36 +29221,6 @@ mod validate_run_state_tests {
 }
 
 #[cfg(test)]
-mod parity_reference_tests {
-    //! A seeded sample runs each sampled parity candidate's ptrace verify
-    //! reference as an extra cell, once, and scores the pair in the post-pass.
-    use super::*;
-
-    #[test]
-    fn a_sample_adds_each_candidates_reference_once_and_nothing_else() {
-        let root = Path::new(file!())
-            .canonicalize()
-            .unwrap()
-            .ancestors()
-            .nth(3)
-            .unwrap()
-            .to_path_buf();
-        let path = env::temp_dir().join(format!(
-            "hermit-pressure-self-test-parity-reference-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&path).unwrap();
-        let cleanup = SelfTestDirectory::new(path.clone());
-        parity_reference_sample_self_test(&root, &path).unwrap();
-        cleanup.remove().unwrap();
-    }
-}
-
-#[cfg(test)]
 mod runner_outcome_tests {
     //! The run path accepts the typed scheduler's outcomes only when they are
     //! exactly the planned cell runs: the sample's and its parity references'.
@@ -29362,61 +29302,5 @@ mod runner_outcome_tests {
                 "{repetitions:?}: a foreign outcome was accepted in place of a reference"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod run_state_exclusive_tests {
-    use super::*;
-
-    #[test]
-    fn runs_of_a_test_that_writes_its_run_state_never_overlap() {
-        let root = Path::new(file!())
-            .canonicalize()
-            .unwrap()
-            .ancestors()
-            .nth(3)
-            .unwrap()
-            .to_path_buf();
-        let path = env::temp_dir().join(format!(
-            "hermit-pressure-self-test-run-state-exclusive-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&path).unwrap();
-        let cleanup = SelfTestDirectory::new(path.clone());
-        run_state_exclusive_self_test(&root, &path).unwrap();
-        cleanup.remove().unwrap();
-    }
-}
-
-#[cfg(test)]
-mod unsampleable_sample_tests {
-    use super::*;
-
-    #[test]
-    fn a_sample_never_draws_a_cell_whose_declared_path_cannot_fit_and_names_it() {
-        let root = Path::new(file!())
-            .canonicalize()
-            .unwrap()
-            .ancestors()
-            .nth(3)
-            .unwrap()
-            .to_path_buf();
-        let path = env::temp_dir().join(format!(
-            "hermit-pressure-self-test-unsampleable-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&path).unwrap();
-        let cleanup = SelfTestDirectory::new(path.clone());
-        unsampleable_sample_self_test(&root, &path).unwrap();
-        cleanup.remove().unwrap();
     }
 }
