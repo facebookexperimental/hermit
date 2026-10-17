@@ -1796,7 +1796,13 @@ fi
 # source and DBT inventory 961 remain unchanged. The calibrated SDK budget,
 # job width and limits carry without increase; final runtime/source-closure
 # checks must bind this composition rather than older receipts.
-expected_pin=3137866aa09275237db3715eadeca3c756751c1c
+# CARRY TO c313920fd73ceb63b52038b595846d608efa31b2 (2026-10-16): from
+# 3137866aa09275237db3715eadeca3c756751c1c through kvm E2a (async LinuxProvider::execute) and liteinst's
+# callback-RPC private syscall gate plus native-exec fixture alignment.
+# The reverie-dbt tree (61bc6e93), root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml are the same objects at both pins, so the seven SDK
+# inputs, inventory 961, budget, job width and limits carry unchanged.
+expected_pin=c313920fd73ceb63b52038b595846d608efa31b2
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

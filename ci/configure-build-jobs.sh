@@ -1873,8 +1873,14 @@ fi
 # source and DBT inventory 961 remain unchanged. The calibrated SDK budget,
 # job width and limits carry without increase; final runtime/source-closure
 # checks must bind this composition rather than older receipts.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 3137866aa09275237db3715eadeca3c756751c1c ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 3137866aa09275237db3715eadeca3c756751c1c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO c313920fd73ceb63b52038b595846d608efa31b2 (2026-10-16): from
+# 3137866aa09275237db3715eadeca3c756751c1c through kvm E2a (async LinuxProvider::execute) and liteinst's
+# callback-RPC private syscall gate plus native-exec fixture alignment.
+# The reverie-dbt tree (61bc6e93), root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml are the same objects at both pins, so the seven SDK
+# inputs, inventory 961, budget, job width and limits carry unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c313920fd73ceb63b52038b595846d608efa31b2 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c313920fd73ceb63b52038b595846d608efa31b2 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
