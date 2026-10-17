@@ -1869,7 +1869,13 @@ fi
 # native/, third-party, the root Cargo.toml, Cargo.lock and rust-toolchain.toml
 # have the same object ids: all seven SDK inputs, DBT inventory 961, calibrated
 # budget, job width and limits are unchanged.
-expected_pin=bb86c5d9801493eddd4089b8b34091b40603ef87
+# CARRY TO 5aa3284d0202a9c69e2db20dfcf3ac314b3014e1 (2026-10-17): from
+# bb86c5d9801493eddd4089b8b34091b40603ef87 through liteinst's Tool-owned syscall gate (60bbf180) and A5 step
+# 2's sigreturn report (Tool::observes_sigreturns, Tool::handle_sigreturn,
+# BackendCapabilities::reports_sigreturns). reverie-dbt tree, root Cargo.toml,
+# Cargo.lock and rust-toolchain.toml are unchanged, so the budget carries
+# unchanged.
+expected_pin=5aa3284d0202a9c69e2db20dfcf3ac314b3014e1
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

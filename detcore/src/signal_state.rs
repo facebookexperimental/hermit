@@ -287,6 +287,13 @@ pub(crate) struct ThreadSignals {
     /// predicted.
     #[serde(default)]
     pub(crate) observed: Vec<bool>,
+    /// A backend report changed this thread's mask, or found the frame
+    /// faulting, since the last check: the next syscall entry compares the
+    /// copy with the kernel even with no handler frame open, so a report
+    /// the kernel did not follow fails closed there rather than at a later
+    /// check.
+    #[serde(default)]
+    pub(crate) verify_at_entry: bool,
 }
 
 impl ThreadSignals {
@@ -298,6 +305,7 @@ impl ThreadSignals {
             wait_mask: None,
             activations: Vec::new(),
             observed: Vec::new(),
+            verify_at_entry: false,
         }
     }
 
@@ -399,8 +407,8 @@ impl ThreadSignals {
     /// `uc_sigmask` to an outer frame's saved mask looks like that many
     /// returns; a caller that needs certainty treats a match deeper than the
     /// innermost frame as ambiguous. Only a backend report of each
-    /// `rt_sigreturn` removes the ambiguity; the ptrace backend does not trap
-    /// the call.
+    /// `rt_sigreturn` removes the ambiguity, and where the backend reports
+    /// them the copy does not use this.
     pub(crate) fn reconcile_returns(&mut self, observed: Sigset, ignore: Sigset) -> bool {
         let same = |mask: Sigset| mask & !ignore == observed & !ignore;
         if same(self.blocked) {

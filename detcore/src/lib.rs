@@ -2094,6 +2094,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
     }
 
+    /// The opt-in signal-state copy follows handler returns from the backend's
+    /// reports where it has them (`syscalls::signal_shadow`).
+    fn observes_sigreturns(config: &Config) -> bool {
+        crate::syscalls::signal_shadow::observes_sigreturns(config)
+    }
+
+    fn handle_sigreturn(
+        &self,
+        thread_state: &mut Self::ThreadState,
+        report: reverie::SigreturnReport,
+    ) {
+        crate::syscalls::signal_shadow::record_sigreturn_report(thread_state, report);
+    }
+
     /// NOTE: these subscriptions are used ONLY for hermit run mode.  Hermit record has its own
     /// subscriptions specified in recorder/mod.rs.
     fn subscriptions(config: &Config) -> Subscription {

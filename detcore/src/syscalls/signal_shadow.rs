@@ -47,10 +47,11 @@ use crate::signal_state::ThreadSignals;
 use crate::signal_state::sigbit;
 
 /// The environment variable that turns the copy on: `1` seeds, records and
-/// checks it; unset (the default) leaves every run as it was. Step 1 of A5 is
-/// a diagnostic until step 2 relies on the copy: without exact backend reports
-/// of handler returns and deliveries (ptrace traps neither), a checked copy
-/// can still report a divergence in rare valid cases, so it is opt-in.
+/// checks it; unset (the default) leaves every run as it was. The copy is a
+/// diagnostic until A5 step 2 relies on it. The ptrace backend reports
+/// handler returns to it (`Tool::handle_sigreturn`), but not every delivery,
+/// and asking for the reports adds a stop at each handler return, so it is
+/// opt-in.
 pub const SIGNAL_STATE_CHECK_ENV: &str = "HERMIT_SIGNAL_STATE_CHECK";
 
 /// Whether [`SIGNAL_STATE_CHECK_ENV`] turns the copy on, read once. Tests
@@ -208,10 +209,15 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if let Some(shadow) = guest.thread_state().signal_shadow.as_ref() {
+    drop_thread_copy(guest.thread_state_mut());
+}
+
+/// [`drop_copy`] given only the thread's state.
+fn drop_thread_copy<T>(thread: &mut crate::tool_local::ThreadState<T>) {
+    if let Some(shadow) = thread.signal_shadow.as_ref() {
         shadow.forget_dispositions();
     }
-    guest.thread_state_mut().signal_shadow = None;
+    thread.signal_shadow = None;
 }
 
 /// At a syscall's entry, the thread has run guest code since its last event:
@@ -346,10 +352,12 @@ where
     }
 }
 
-/// Accounts for handler returns the kernel ran without a report (the ptrace
-/// backend never traps `rt_sigreturn`), from the kernel's current mask, before
-/// a transition that depends on the mask. Does nothing while no handler frame
-/// is open, or where the kernel's state is not the guest's.
+/// Before a transition that depends on the mask: where the backend reports
+/// `rt_sigreturn`, checks that the kernel holds the mask the copy predicts
+/// (with a handler frame open, or after a report); elsewhere, accounts for
+/// handler returns the kernel ran without a report, from the kernel's
+/// current mask. Does nothing otherwise, or where the kernel's state is not
+/// the guest's.
 fn reconcile_returns<G, T>(guest: &mut G, before: &str)
 where
     G: Guest<Detcore<T>>,
@@ -360,12 +368,43 @@ where
         .signal_shadow
         .as_ref()
         .is_some_and(|shadow| !shadow.thread.activations.is_empty());
-    if !open_frames || !kernel_state_is_the_guests(guest) {
+    let verify = guest
+        .thread_state()
+        .signal_shadow
+        .as_ref()
+        .is_some_and(|shadow| shadow.thread.verify_at_entry);
+    if !(open_frames || verify) || !kernel_state_is_the_guests(guest) {
         return;
     }
     let Some(kernel) = read_or_give_up(guest, before) else {
         return;
     };
+    // Where the backend reports rt_sigreturn, frames close only on its
+    // reports, so nothing is inferred. The kernel must still hold the mask
+    // the copy predicts, for an open handler or after a report; otherwise a
+    // report was missed (the capability names the calls it does not
+    // report), the kernel did not follow one, or the handler's frame was
+    // never written, and the copy fails closed.
+    if observes_sigreturns(guest.config()) {
+        let Some(shadow) = guest.thread_state_mut().signal_shadow.as_mut() else {
+            return;
+        };
+        shadow.thread.verify_at_entry = false;
+        let ignore = reserved() | trap();
+        if kernel.blocked & !ignore == shadow.thread.blocked & !ignore {
+            shadow.thread.observe_handler_mask();
+            if compare(kernel.blocked, shadow.thread.blocked) == Compared::TrapOnly {
+                trap_changed(guest, before);
+            }
+        } else {
+            give_up(
+                guest,
+                "the kernel's mask is not the one the copy predicts after a reported return or \
+                 for an open handler frame",
+            );
+        }
+        return;
+    }
     let Some(shadow) = guest.thread_state_mut().signal_shadow.as_mut() else {
         return;
     };
@@ -766,8 +805,100 @@ where
     }
 }
 
-/// Unused until a backend reports `rt_sigreturn` (A5 step 3): the ptrace
-/// backend, the only one whose copy is seeded today, never traps it.
+/// Whether this tool asks the backend to report every guest `rt_sigreturn`
+/// (`Tool::observes_sigreturns`): where the copy is kept (serialized
+/// threads), the backend can report them, no gdbserver is attached (the
+/// ptrace backend does not report then), and the guest is known to inherit
+/// no seccomp filter. An inherited filter could let an `rt_sigreturn` run
+/// unreported (`BackendCapabilities::reports_sigreturns`) where nothing would
+/// check the copy before a later check reports a divergence. Handler frames then close only on those reports
+/// ([`record_sigreturn_report`]), not by inference ([`reconcile_returns`]).
+pub(crate) fn observes_sigreturns(config: &crate::Config) -> bool {
+    enabled()
+        && config.sequentialize_threads
+        && !config.gdbserver
+        && config.backend.reports_sigreturns
+        && config.inherited_seccomp == detcore_model::config::InheritedSeccomp::Disabled
+}
+
+/// `sizeof(struct rt_sigframe)` on x86-64: the return address (8), the
+/// `ucontext` (304) and the `siginfo` (128).
+const RT_SIGFRAME_SIZE: u64 = 8 + 304 + 128;
+
+/// The end of the x86-64 user address space under 4-level paging
+/// (`TASK_SIZE_MAX`). Under 5-level paging it is higher.
+const USER_ADDRESS_LIMIT_4_LEVEL: u64 = 0x7fff_ffff_f000;
+
+/// Records a guest `rt_sigreturn` the backend reported before it runs
+/// (`Tool::handle_sigreturn`). x86-64 `rt_sigreturn` installs the frame's
+/// mask once `access_ok` accepts the whole frame at `sp - 8` and the frame's
+/// `uc_sigmask` and `uc_flags` read without a fault, before restoring the
+/// registers can fail (`arch/x86/kernel/signal_64.c`): the innermost handler
+/// frame then closes and the mask is installed. A frame that fails either
+/// (an overflowing range, or an unmapped word) changes no mask; the kernel
+/// then sends SIGSEGV. The copy gives itself up quietly where it cannot tell
+/// what Linux does: a frame that reaches past 4-level paging's user limit,
+/// which the paging mode accepts or not, and a protected frame, whose
+/// protection decides whether the kernel's read faults. For every report
+/// that keeps the copy, the next syscall entry compares the copy with the
+/// kernel ([`reconcile_returns`]), so a report the kernel did not follow (a
+/// protection key, say) fails closed there.
+pub(crate) fn record_sigreturn_report<T>(
+    thread: &mut crate::tool_local::ThreadState<T>,
+    report: reverie::SigreturnReport,
+) {
+    let dettid = thread.dettid;
+    if thread.signal_shadow.is_none() {
+        return;
+    }
+    let frame_end = report
+        .stack_pointer()
+        .checked_sub(8)
+        .and_then(|frame| frame.checked_add(RT_SIGFRAME_SIZE));
+    let installed = match (report.frame(), frame_end) {
+        (reverie::SigreturnFrame::Readable { mask }, Some(end))
+            if end <= USER_ADDRESS_LIMIT_4_LEVEL =>
+        {
+            Some(mask)
+        }
+        (reverie::SigreturnFrame::Readable { .. }, Some(_)) => {
+            debug!(
+                "[dtid {dettid}] signal-state copy dropped: rt_sigreturn's frame reaches past \
+                 the 4-level user address limit"
+            );
+            return drop_thread_copy(thread);
+        }
+        (reverie::SigreturnFrame::Protected, Some(_)) => {
+            debug!(
+                "[dtid {dettid}] signal-state copy dropped: rt_sigreturn's frame is mapped but \
+                 protected from the guest"
+            );
+            return drop_thread_copy(thread);
+        }
+        _ => None,
+    };
+    let Some(shadow) = thread.signal_shadow.as_mut() else {
+        return;
+    };
+    shadow.thread.verify_at_entry = true;
+    match installed {
+        Some(mask) => {
+            shadow.thread.sigreturn(mask & !reserved());
+            #[cfg(test)]
+            REPORTED_RETURNS.with(|count| count.set(count.get() + 1));
+            trace!(
+                "[dtid {dettid}] signal-state copy: rt_sigreturn reported, installing {:#x}",
+                shadow.thread.blocked
+            );
+        }
+        None => {
+            trace!("[dtid {dettid}] signal-state copy: rt_sigreturn's frame faults, no mask change")
+        }
+    }
+}
+
+/// For a backend that shows `rt_sigreturn` as a syscall, which none does
+/// today; the ptrace backend reports it through [`record_sigreturn_report`].
 ///
 /// Records an `rt_sigreturn` at its entry, before it runs: Linux installs the
 /// frame's `uc_sigmask` as soon as it can read it, before restoring the
@@ -869,6 +1000,8 @@ thread_local! {
     /// This test thread's handler entries taken as returned before any
     /// check saw their mask.
     static UNVERIFIED_ENTRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// This test thread's `rt_sigreturn` reports applied to a copy.
+    static REPORTED_RETURNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// This thread's kernel signal state, where a check or a choice needs it.
@@ -1065,14 +1198,34 @@ mod tests {
         }
     }
 
-    /// A ptrace-like guest whose first image inherited `blocked` and nothing
-    /// ignored, seeded through `at_exec` from the scripted kernel.
+    /// A guest on the ptrace backend, whose first image inherited `blocked`
+    /// and nothing ignored, seeded through `at_exec` from the scripted
+    /// kernel. Its kernel signal state is the guest's own, and it reports
+    /// each `rt_sigreturn`.
     fn seeded(kernel: &Kernel, blocked: KernelSigset) -> ShadowGuest {
-        // The ptrace backend's capabilities: its kernel signal state is the
-        // guest's own.
+        seeded_on(kernel, blocked, reverie::BackendCapabilities::PTRACE)
+    }
+
+    /// As [`seeded`], with the capabilities of a backend that runs
+    /// `rt_sigreturn` without reporting it, so the copy infers handler
+    /// returns: Reverie's `E9PATCH` value, ptrace's facts without sigreturn
+    /// reports. No Hermit run has these capabilities (Hermit runs e9patch
+    /// preprocessing as a ptrace run, which reports), so this exercises the
+    /// inference that a backend without reports would need.
+    fn seeded_inferring(kernel: &Kernel, blocked: KernelSigset) -> ShadowGuest {
+        seeded_on(kernel, blocked, reverie::BackendCapabilities::E9PATCH)
+    }
+
+    /// As [`seeded`], on a backend with capabilities `backend`.
+    fn seeded_on(
+        kernel: &Kernel,
+        blocked: KernelSigset,
+        backend: reverie::BackendCapabilities,
+    ) -> ShadowGuest {
         let config = Config {
             sequentialize_threads: true,
-            backend: reverie::BackendCapabilities::PTRACE,
+            backend,
+            inherited_seccomp: detcore_model::config::InheritedSeccomp::Disabled,
             ..Config::default()
         };
         let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
@@ -1168,7 +1321,7 @@ mod tests {
     fn a_match_with_an_outer_frame_is_ambiguous_and_gives_the_copy_up() {
         let kernel = Kernel::default();
         let _seam = kernel.install();
-        let mut guest = seeded(&kernel, 0);
+        let mut guest = seeded_inferring(&kernel, 0);
         let action = |mask| KernelSigaction {
             handler: 0x4000,
             flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
@@ -1384,7 +1537,7 @@ mod tests {
     fn an_unreported_return_is_recognised_at_the_next_syscall() {
         let kernel = Kernel::default();
         let _seam = kernel.install();
-        let mut guest = seeded(&kernel, 0);
+        let mut guest = seeded_inferring(&kernel, 0);
         let action = KernelSigaction {
             handler: 0x4000,
             flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
@@ -1542,7 +1695,7 @@ mod tests {
             mask: USR2,
         };
         // Seen first, then returned: kept.
-        let mut guest = seeded(&kernel, 0);
+        let mut guest = seeded_inferring(&kernel, 0);
         kernel.set(0, 0, USR1);
         record_rt_sigaction(&mut guest, libc::SIGUSR1, Some(action), None, &Ok(0));
         record_delivery(&mut guest, libc::SIGUSR1);
@@ -1562,6 +1715,236 @@ mod tests {
         assert_eq!(UNVERIFIED_ENTRIES.with(std::cell::Cell::get), before + 1);
         assert!(guest.thread.signal_shadow.is_none());
         assert_eq!(DIVERGENCES.with(std::cell::Cell::get), reported);
+    }
+
+    /// A handler for SIGUSR1 that also blocks SIGUSR2, installed and entered
+    /// on `backend`, with one frame open.
+    fn in_handler(kernel: &Kernel, backend: reverie::BackendCapabilities) -> ShadowGuest {
+        let mut guest = seeded_on(kernel, 0, backend);
+        let action = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: USR2,
+        };
+        kernel.set(0, 0, USR1);
+        record_rt_sigaction(&mut guest, libc::SIGUSR1, Some(action), None, &Ok(0));
+        record_delivery(&mut guest, libc::SIGUSR1);
+        assert_eq!(blocked(&guest), Some(USR1 | USR2));
+        guest
+    }
+
+    fn open_frames(guest: &ShadowGuest) -> usize {
+        guest
+            .thread
+            .signal_shadow
+            .as_ref()
+            .map_or(0, |shadow| shadow.thread.activations.len())
+    }
+
+    #[test]
+    fn sigreturns_are_observed_only_where_the_backend_reports_them() {
+        let config = |backend| Config {
+            backend,
+            sequentialize_threads: true,
+            inherited_seccomp: detcore_model::config::InheritedSeccomp::Disabled,
+            ..Config::default()
+        };
+        assert!(observes_sigreturns(&config(
+            reverie::BackendCapabilities::PTRACE
+        )));
+        // Unless the guest is known to inherit no seccomp filter.
+        for inherited in [
+            detcore_model::config::InheritedSeccomp::Unknown,
+            detcore_model::config::InheritedSeccomp::Strict,
+            detcore_model::config::InheritedSeccomp::Filter(Some(1)),
+        ] {
+            let config = Config {
+                inherited_seccomp: inherited,
+                ..config(reverie::BackendCapabilities::PTRACE)
+            };
+            assert!(!observes_sigreturns(&config), "{inherited:?}");
+        }
+        // Nor with a gdbserver attached, whose runs the backend does not
+        // report, nor without serialized threads, where no copy is kept.
+        let attached = Config {
+            gdbserver: true,
+            ..config(reverie::BackendCapabilities::PTRACE)
+        };
+        assert!(!observes_sigreturns(&attached));
+        let parallel = Config {
+            sequentialize_threads: false,
+            ..config(reverie::BackendCapabilities::PTRACE)
+        };
+        assert!(!observes_sigreturns(&parallel));
+        for backend in [
+            reverie::BackendCapabilities::E9PATCH,
+            reverie::BackendCapabilities::KVM,
+            reverie::BackendCapabilities::DBT,
+            reverie::BackendCapabilities::SABRE,
+            reverie::BackendCapabilities::LITEINST_IN_GUEST,
+        ] {
+            assert!(!observes_sigreturns(&config(backend)));
+        }
+    }
+
+    #[test]
+    fn a_reported_return_installs_the_frame_mask_the_handler_left() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = in_handler(&kernel, reverie::BackendCapabilities::PTRACE);
+        let (reported, matched, returns) = (
+            DIVERGENCES.with(std::cell::Cell::get),
+            CHECKS_MATCHED.with(std::cell::Cell::get),
+            REPORTED_RETURNS.with(std::cell::Cell::get),
+        );
+        // The handler rewrote its frame's uc_sigmask to SIGUSR2, which no
+        // frame saved; inference would have had to give the copy up.
+        let tid = guest.tid();
+        record_sigreturn_report(
+            &mut guest.thread,
+            reverie::SigreturnReport::new(
+                tid,
+                0x7fff_0000_0000,
+                reverie::SigreturnFrame::Readable { mask: USR2 },
+            ),
+        );
+        assert_eq!(REPORTED_RETURNS.with(std::cell::Cell::get), returns + 1);
+        assert_eq!(blocked(&guest), Some(USR2));
+        assert_eq!(open_frames(&guest), 0);
+        kernel.set(USR2, 0, USR1);
+        at_syscall_entry(&mut guest);
+        check_against_kernel(&mut guest, "a test check");
+        assert_eq!(blocked(&guest), Some(USR2), "the copy is kept");
+        assert_eq!(CHECKS_MATCHED.with(std::cell::Cell::get), matched + 1);
+        assert_eq!(DIVERGENCES.with(std::cell::Cell::get), reported);
+    }
+
+    #[test]
+    fn a_reported_return_whose_frame_mask_cannot_be_read_changes_nothing() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = in_handler(&kernel, reverie::BackendCapabilities::PTRACE);
+        let tid = guest.tid();
+        record_sigreturn_report(
+            &mut guest.thread,
+            reverie::SigreturnReport::new(tid, 0x7fff_0000_0000, reverie::SigreturnFrame::Unmapped),
+        );
+        assert_eq!(blocked(&guest), Some(USR1 | USR2));
+        assert_eq!(open_frames(&guest), 1);
+    }
+
+    #[test]
+    fn the_frame_range_rule_follows_linux() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let readable = reverie::SigreturnFrame::Readable { mask: USR2 };
+        // sp - 8 + 440 ends exactly at the limit: accepted.
+        let at_limit = USER_ADDRESS_LIMIT_4_LEVEL - RT_SIGFRAME_SIZE + 8;
+        let cases = [
+            (at_limit, readable, Some(Some(USR2))),
+            // One byte past the limit: the paging mode would decide.
+            (at_limit + 1, readable, None),
+            // sp - 8 underflows: access_ok refuses, no mask change.
+            (4, readable, Some(Some(USR1 | USR2))),
+            // A protected frame: its protection would decide.
+            (0x7fff_0000_0000, reverie::SigreturnFrame::Protected, None),
+        ];
+        for (sp, frame, expected) in cases {
+            let mut guest = in_handler(&kernel, reverie::BackendCapabilities::PTRACE);
+            let tid = guest.tid();
+            let reported = DIVERGENCES.with(std::cell::Cell::get);
+            record_sigreturn_report(
+                &mut guest.thread,
+                reverie::SigreturnReport::new(tid, sp, frame),
+            );
+            assert_eq!(
+                blocked(&guest).map(Some),
+                expected,
+                "sp {sp:#x}, {frame:?}: None means given up"
+            );
+            assert_eq!(DIVERGENCES.with(std::cell::Cell::get), reported);
+        }
+    }
+
+    #[test]
+    fn a_report_the_kernel_did_not_follow_fails_closed_at_the_next_entry() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = in_handler(&kernel, reverie::BackendCapabilities::PTRACE);
+        let tid = guest.tid();
+        // The report closes the last frame with SIGUSR2's mask, but the
+        // kernel kept the handler's (as a protection key could make it).
+        record_sigreturn_report(
+            &mut guest.thread,
+            reverie::SigreturnReport::new(
+                tid,
+                0x7fff_0000_0000,
+                reverie::SigreturnFrame::Readable { mask: USR2 },
+            ),
+        );
+        assert_eq!(open_frames(&guest), 0);
+        let reported = DIVERGENCES.with(std::cell::Cell::get);
+        kernel.set(USR1 | USR2, 0, USR1);
+        at_syscall_entry(&mut guest);
+        assert_eq!(blocked(&guest), None, "given up at the next entry, quietly");
+        assert_eq!(DIVERGENCES.with(std::cell::Cell::get), reported);
+        // Where the kernel followed the report, the check passes once and is
+        // not repeated.
+        let mut guest = in_handler(&kernel, reverie::BackendCapabilities::PTRACE);
+        record_sigreturn_report(
+            &mut guest.thread,
+            reverie::SigreturnReport::new(
+                tid,
+                0x7fff_0000_0000,
+                reverie::SigreturnFrame::Readable { mask: USR2 },
+            ),
+        );
+        kernel.set(USR2, 0, USR1);
+        at_syscall_entry(&mut guest);
+        assert_eq!(blocked(&guest), Some(USR2));
+        let verify_pending = |guest: &ShadowGuest| {
+            guest
+                .thread
+                .signal_shadow
+                .as_ref()
+                .is_some_and(|shadow| shadow.thread.verify_at_entry)
+        };
+        assert!(!verify_pending(&guest), "checked once");
+    }
+
+    #[test]
+    fn where_returns_are_reported_none_is_inferred_and_a_mismatch_fails_closed() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        for (backend, inferred) in [
+            (reverie::BackendCapabilities::PTRACE, false),
+            (reverie::BackendCapabilities::E9PATCH, true),
+        ] {
+            let mut guest = in_handler(&kernel, backend);
+            // A syscall inside the handler: the kernel holds its mask.
+            kernel.set(USR1 | USR2, 0, USR1);
+            at_syscall_entry(&mut guest);
+            assert_eq!(open_frames(&guest), 1, "{backend:?}");
+            // The kernel holds the mask the frame saved, as after a return.
+            let reported = DIVERGENCES.with(std::cell::Cell::get);
+            kernel.set(0, 0, USR1);
+            at_syscall_entry(&mut guest);
+            if inferred {
+                assert_eq!(blocked(&guest), Some(0), "the return is inferred");
+                assert_eq!(open_frames(&guest), 0);
+            } else {
+                // With reports, a return no report announced is a missed
+                // report or a frame never written: the copy fails closed,
+                // quietly.
+                assert_eq!(blocked(&guest), None, "the copy is given up");
+            }
+            assert_eq!(
+                DIVERGENCES.with(std::cell::Cell::get),
+                reported,
+                "{backend:?}"
+            );
+        }
     }
 
     #[test]

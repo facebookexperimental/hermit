@@ -37,17 +37,21 @@ const fn default_backend_capabilities() -> BackendCapabilities {
 
 /// The capabilities a [`Config`] has before the host prepares it for the
 /// backend that runs it: ptrace's, the backend Detcore's own tests use, except
-/// that three facts stay off (`supports_blocked_wait_signal_interruption`,
-/// `delivers_preemption_timer_events`, `runs_guest_code_between_injections`).
-/// Until they became backend capabilities they were `Config` fields that only
-/// the host set, for the backend it had selected, and were false otherwise;
-/// a configuration nobody prepared keeps that behaviour. The host copies the
-/// running backend's own answer over all of these before a run.
+/// that four facts stay off (`supports_blocked_wait_signal_interruption`,
+/// `delivers_preemption_timer_events`, `runs_guest_code_between_injections`,
+/// `reports_sigreturns`). Until the first three became backend capabilities
+/// they were `Config` fields that only the host set, for the backend it had
+/// selected, and were false otherwise; a configuration nobody prepared keeps
+/// that behaviour. A configuration nobody prepared cannot know that sigreturns
+/// are reported, so the fourth is off too (the DBT runtime's standalone
+/// fallback starts from these). The host copies the running backend's own
+/// answer over all of these before a run.
 pub const DEFAULT_BACKEND_CAPABILITIES: BackendCapabilities = {
     let mut backend = BackendCapabilities::PTRACE;
     backend.supports_blocked_wait_signal_interruption = false;
     backend.delivers_preemption_timer_events = false;
     backend.runs_guest_code_between_injections = false;
+    backend.reports_sigreturns = false;
     backend
 };
 
@@ -202,7 +206,8 @@ pub struct Config {
     /// capabilities. The host copies the running backend's answer into this
     /// field before the run starts. The default,
     /// [`DEFAULT_BACKEND_CAPABILITIES`], describes a ptrace-hosted guest, the
-    /// backend Detcore's own tests use, with the three host-set facts off.
+    /// backend Detcore's own tests use, with the three host-set facts and
+    /// `reports_sigreturns` off.
     ///
     /// JSON that the guest can see is written by [`to_legacy_backend_json`],
     /// which carries this field as the separate keys used before it existed;
@@ -2299,6 +2304,7 @@ impl LegacyBackendKeys {
         // legacy key that read back as false, and each is false for DBT, the
         // form's only reader, so a DBT configuration stays exact.
         backend.supports_blocked_wait_signal_interruption = false;
+        backend.reports_sigreturns = false;
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
         backend
@@ -2935,6 +2941,7 @@ mod tests {
         backend.supports_blocked_wait_signal_interruption = false;
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
+        backend.reports_sigreturns = false;
         // The legacy discover_live_file_metadata bit couples four facts.
         backend.rediscovers_descriptors_after_exec = backend.tool_shares_guest_descriptor_table;
         // The legacy form derives promotion from the thread-directed signal
@@ -3529,7 +3536,8 @@ mod tests {
     /// configuration reads back as false
     /// (`supports_blocked_wait_signal_interruption`,
     /// `delivers_preemption_timer_events`,
-    /// `runs_guest_code_between_injections`) never enter it, whatever their
+    /// `runs_guest_code_between_injections`, `reports_sigreturns`) never enter
+    /// it, whatever their
     /// value: the guest-visible string stays the legacy bytes, and they read
     /// back as false from both the object and the array form.
     #[test]
@@ -3542,12 +3550,14 @@ mod tests {
         on.backend.supports_blocked_wait_signal_interruption = true;
         on.backend.delivers_preemption_timer_events = true;
         on.backend.runs_guest_code_between_injections = true;
+        on.backend.reports_sigreturns = true;
         let json = to_legacy_backend_json(&on).unwrap();
         assert_eq!(json, to_legacy_backend_json(&off).unwrap());
         for key in [
             "supports_blocked_wait_signal_interruption",
             "delivers_preemption_timer_events",
             "runs_guest_code_between_injections",
+            "reports_sigreturns",
         ] {
             assert!(!json.contains(key), "{json}");
         }
@@ -3561,6 +3571,7 @@ mod tests {
             assert!(!backend.supports_blocked_wait_signal_interruption);
             assert!(!backend.delivers_preemption_timer_events);
             assert!(!backend.runs_guest_code_between_injections);
+            assert!(!backend.reports_sigreturns);
             assert_eq!(backend, legacy_expressible(BackendCapabilities::DBT));
         }
     }

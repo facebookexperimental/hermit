@@ -6850,7 +6850,9 @@ mod tests {
     /// can do, so it has exactly in-guest LiteInst's row.
     /// DBT now also shares the guest descriptor table and rediscovers it after
     /// exec (Reverie 15374907); its host-timed-turn and poller-yield
-    /// capabilities remain false.
+    /// capabilities remain false. `reports_sigreturns` (A5 step 2) is true
+    /// for ptrace, and so for e9patch preprocessing, whose guest Hermit runs
+    /// on ptrace.
     fn golden_backend_capabilities(backend: Backend) -> serde_json::Value {
         let sabre = backend == Backend::Sabre;
         let kvm = backend == Backend::Kvm;
@@ -6889,6 +6891,10 @@ mod tests {
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "runs_guest_code_between_injections": sabre || in_guest_liteinst,
             "promotes_open_files_before_native_lifecycle": dbt || in_guest_liteinst,
+            // Hermit runs e9patch preprocessing as a ptrace run (empty
+            // trampolines keep the original syscall instruction), whose
+            // rt_sigreturns reach the seccomp stop that reports them.
+            "reports_sigreturns": matches!(backend, Backend::Ptrace | Backend::E9patch),
         })
     }
 
