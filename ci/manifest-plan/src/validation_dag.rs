@@ -2900,9 +2900,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // must-qualify x86-64-v3 CLI cases, adds one more
     // (https://github.com/rrnewton/hermit/issues/4243).
     // test.pmu_integration_cases_2, the second PMU integration shard, adds one.
-    if expected.len() != 142 {
+    // 145 since the isolation matrix's three nodes joined as Conformance
+    // producers (2026-10-17).
+    if expected.len() != 145 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 142",
+            "structured result producer registry has {} entries, expected 145",
             expected.len()
         ));
     }
@@ -3004,6 +3006,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
                     "{tag} declares structured results but invokes no registered writer"
                 ));
             }
+            (None, None, None) if is_planned_test_node(step) => {
+                return Err(format!(
+                    "{tag} is a test node (scripts/validate.rs plans every test.*, *-test.* and *:test.* node and counts it executed only through its structured result file), but it invokes no registered structured result writer; register it, or a passing validation is never VALIDATED"
+                ));
+            }
             (None, None, None) => {}
         }
 
@@ -3072,12 +3079,20 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // privileged-cpuid.cpu_profile_v3 adds the 76th
     // (https://github.com/rrnewton/hermit/issues/4243).
     // The second PMU integration shard adds the 77th Nextest writer.
-    if actual_group_counts != [77, 56, 7, 2] {
+    // Conformance 3: the three isolation-matrix nodes (2026-10-17).
+    if actual_group_counts != [77, 56, 7, 2, 3] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
     }
     Ok(())
+}
+
+/// The node set scripts/validate.rs `test_nodes_of` plans as test nodes: its
+/// per-node coverage counts each one executed only through the structured
+/// result file it writes, so every one must be a registered producer.
+fn is_planned_test_node(step: &Step) -> bool {
+    step.group == "test" || step.group.ends_with("-test") || step.group.ends_with(":test")
 }
 
 fn result_identity(result: &DagManifest) -> String {
@@ -7461,6 +7476,31 @@ sys.exit(37)
             let error = assert_structured_result_producers(&changed_writer).unwrap_err();
             assert!(
                 error.contains(tag) && error.contains("no longer invokes"),
+                "{error}"
+            );
+        }
+
+        // A test node that writes no structured results is refused at plan
+        // time: validate's coverage would list it absent in every run, and no
+        // passing validation would be VALIDATED (2026-10-15 to 2026-10-17).
+        for group in ["test", "privileged-test", "lane:test"] {
+            let mut uncounted = committed.clone();
+            let mut step = uncounted
+                .steps
+                .iter()
+                .find(|step| step.tag() == "test.regular_crates")
+                .unwrap()
+                .clone();
+            step.group = group.into();
+            step.job = "uncounted_checker".into();
+            step.cmd = "./tests/some-checker.rs".into();
+            step.env.remove("NEXTEST_EXPECTED_EXECUTED");
+            step.result_manifests = None;
+            uncounted.steps.push(step);
+            let error = assert_structured_result_producers(&uncounted).unwrap_err();
+            assert!(
+                error.contains(&format!("{group}.uncounted_checker"))
+                    && error.contains("is a test node"),
                 "{error}"
             );
         }

@@ -243,7 +243,8 @@ LINT_CHECK_TARGETS := \
     lint-check-buck-e2e-stage \
     lint-check-buck-e2e-stages \
     lint-check-guest-preload-gate \
-    lint-check-reverie-dbt-budget
+    lint-check-reverie-dbt-budget \
+    lint-check-conformance-test-counts
 .PHONY: lint-checks $(LINT_CHECK_TARGETS)
 lint-checks: $(LINT_CHECK_TARGETS) ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
 
@@ -400,6 +401,9 @@ lint-check-reverie-dbt-budget:
 	./ci/run-with-reverie-dbt-budget-test.sh
 	./ci/retry-on-compiler-crash.sh --self-test
 	./ci/clean-stale-reverie-dbt.sh --self-test
+
+lint-check-conformance-test-counts:
+	./ci/conformance-test-counts.sh --self-test
 
 # The unit tests carried by rust-script entrypoints are their own CI node,
 # check.script_unit_tests, so they run beside lint-checks instead of inside its

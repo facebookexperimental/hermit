@@ -61,6 +61,7 @@ pub(super) enum StructuredResultProducerKind {
     TestHarness,
     Envelope,
     Applications,
+    Conformance,
 }
 
 impl StructuredResultProducerKind {
@@ -84,11 +85,12 @@ impl StructuredResultProducerKind {
         }
     }
 
-    pub(super) const ALL: [Self; 4] = [
+    pub(super) const ALL: [Self; 5] = [
         Self::Nextest,
         Self::TestHarness,
         Self::Envelope,
         Self::Applications,
+        Self::Conformance,
     ];
 
     pub(super) const fn command_marker(self) -> &'static str {
@@ -97,6 +99,7 @@ impl StructuredResultProducerKind {
             Self::TestHarness => "target/debug/test-harness run",
             Self::Envelope => "write-structured-test-counts.sh",
             Self::Applications => "tests/e2e/lib/applications/run_all.sh",
+            Self::Conformance => "ci/conformance-test-counts.sh",
         }
     }
 
@@ -106,6 +109,7 @@ impl StructuredResultProducerKind {
             Self::TestHarness => TEST_HARNESS_RESULT_PRODUCERS,
             Self::Envelope => ENVELOPE_RESULT_PRODUCERS,
             Self::Applications => APPLICATION_RESULT_PRODUCERS,
+            Self::Conformance => CONFORMANCE_RESULT_PRODUCERS,
         }
     }
 }
@@ -264,6 +268,13 @@ pub(super) const ENVELOPE_RESULT_PRODUCERS: &[&str] = &[
 ];
 pub(super) const APPLICATION_RESULT_PRODUCERS: &[&str] =
     &["test.applications_e2e", "test.applications_e2e_on_host"];
+/// Nodes that run the isolation matrix through
+/// `ci/conformance-test-counts.sh`, one row per cell checked.
+pub(super) const CONFORMANCE_RESULT_PRODUCERS: &[&str] = &[
+    "test.isolation_matrix_ptrace_runtime",
+    "test.isolation_matrix_dbt_in_guest",
+    "privileged-test.isolation_matrix_kvm",
+];
 
 pub(super) const PMU_MEMORY_FAILURE_FAMILY: &str = "super.Weekly PMU parallel memory diagnostic";
 pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
@@ -4701,6 +4712,10 @@ pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredRes
             APPLICATION_RESULT_PRODUCERS,
             StructuredResultProducerKind::Applications,
         ),
+        (
+            CONFORMANCE_RESULT_PRODUCERS,
+            StructuredResultProducerKind::Conformance,
+        ),
     ] {
         if tags.contains(&tag) {
             return Some(kind);
@@ -7379,9 +7394,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"isolation_matrix_ptrace_runtime"########,
         desc: r########"Isolation matrix on ptrace, e9patch and SaBRe, held to its expected-mismatch ledger"########,
-        description: r########"Runs the backend isolation matrix (tests/isolation/conformance.rs, the container contract of https://github.com/rrnewton/hermit/issues/4009) for every required cell of ptrace, e9patch preprocessing with ptrace and SaBRe (the backends on ptrace's runtime); measured 218 s serially in the pinned root: the probe tests/isolation/backend_isolation.c beside a native baseline, each command a bounded child of the local executor, up to HERMIT_ISOLATION_JOBS cells at once (the cells of one cohort, which share an input fixture across backends, one at a time; output and the ledger check keep the selection order), every assertion row checked by hermit-cli/tests/common/backend_isolation.rs. No cell fully matches on any backend yet, so the node holds the matrix to tests/isolation/expected-mismatches.tsv: every cell that collects no guest observations, and every assertion that does not match, must be a ledger row naming its backend and linking its issue, and a row that no longer describes a failure on a backend it names fails the node until it is deleted, so what now matches stays matched. The ledger was measured in this pinned root; two host runs agreed cell for cell. Artifacts (assertion rows, per-backend totals, the required-cell ledger) are kept in target/ci/isolation-matrix/ptrace-runtime."########,
+        description: r########"Runs the backend isolation matrix (tests/isolation/conformance.rs, the container contract of https://github.com/rrnewton/hermit/issues/4009) for every required cell of ptrace, e9patch preprocessing with ptrace and SaBRe (the backends on ptrace's runtime); measured 218 s serially in the pinned root: the probe tests/isolation/backend_isolation.c beside a native baseline, each command a bounded child of the local executor, up to HERMIT_ISOLATION_JOBS cells at once (the cells of one cohort, which share an input fixture across backends, one at a time; output and the ledger check keep the selection order), every assertion row checked by hermit-cli/tests/common/backend_isolation.rs. No cell fully matches on any backend yet, so the node holds the matrix to tests/isolation/expected-mismatches.tsv: every cell that collects no guest observations, and every assertion that does not match, must be a ledger row naming its backend and linking its issue, and a row that no longer describes a failure on a backend it names fails the node until it is deleted, so what now matches stays matched. The ledger was measured in this pinned root; two host runs agreed cell for cell. Artifacts (assertion rows, per-backend totals, the required-cell ledger) are kept in target/ci/isolation-matrix/ptrace-runtime. It publishes one structured result row per cell it checks, through ci/conformance-test-counts.sh, so validate's per-node coverage counts it as executed; until 2026-10-17 it wrote none, and every full validation that planned it was NOT-VALIDATED."########,
         labels: &[r########"full"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; rm -rf target/ci/isolation-matrix/ptrace-runtime && mkdir -p target/ci/isolation-matrix && ./tests/isolation/conformance.rs --hermit target/ci/hermit --executor local --expected tests/isolation/expected-mismatches.tsv --jobs "${HERMIT_ISOLATION_JOBS:-1}" --backends ptrace,e9patch,sabre --artifacts target/ci/isolation-matrix/ptrace-runtime"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; rm -rf target/ci/isolation-matrix/ptrace-runtime && mkdir -p target/ci/isolation-matrix && ./ci/conformance-test-counts.sh target/ci/isolation-matrix/ptrace-runtime -- ./tests/isolation/conformance.rs --hermit target/ci/hermit --executor local --expected tests/isolation/expected-mismatches.tsv --jobs "${HERMIT_ISOLATION_JOBS:-1}" --backends ptrace,e9patch,sabre --artifacts target/ci/isolation-matrix/ptrace-runtime"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -7408,9 +7423,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"isolation_matrix_dbt_in_guest"########,
         desc: r########"Isolation matrix on DBT, LiteInst and in-guest-trap, held to its expected-mismatch ledger"########,
-        description: r########"Runs the backend isolation matrix (tests/isolation/conformance.rs, the container contract of https://github.com/rrnewton/hermit/issues/4009) for every required cell of DBT, LiteInst and in-guest-trap; measured 219 s serially in the pinned root: the probe tests/isolation/backend_isolation.c beside a native baseline, each command a bounded child of the local executor, up to HERMIT_ISOLATION_JOBS cells at once (the cells of one cohort, which share an input fixture across backends, one at a time; output and the ledger check keep the selection order), every assertion row checked by hermit-cli/tests/common/backend_isolation.rs. No cell fully matches on any backend yet, so the node holds the matrix to tests/isolation/expected-mismatches.tsv: every cell that collects no guest observations, and every assertion that does not match, must be a ledger row naming its backend and linking its issue, and a row that no longer describes a failure on a backend it names fails the node until it is deleted, so what now matches stays matched. The ledger was measured in this pinned root; two host runs agreed cell for cell. Artifacts (assertion rows, per-backend totals, the required-cell ledger) are kept in target/ci/isolation-matrix/dbt-in-guest."########,
+        description: r########"Runs the backend isolation matrix (tests/isolation/conformance.rs, the container contract of https://github.com/rrnewton/hermit/issues/4009) for every required cell of DBT, LiteInst and in-guest-trap; measured 219 s serially in the pinned root: the probe tests/isolation/backend_isolation.c beside a native baseline, each command a bounded child of the local executor, up to HERMIT_ISOLATION_JOBS cells at once (the cells of one cohort, which share an input fixture across backends, one at a time; output and the ledger check keep the selection order), every assertion row checked by hermit-cli/tests/common/backend_isolation.rs. No cell fully matches on any backend yet, so the node holds the matrix to tests/isolation/expected-mismatches.tsv: every cell that collects no guest observations, and every assertion that does not match, must be a ledger row naming its backend and linking its issue, and a row that no longer describes a failure on a backend it names fails the node until it is deleted, so what now matches stays matched. The ledger was measured in this pinned root; two host runs agreed cell for cell. Artifacts (assertion rows, per-backend totals, the required-cell ledger) are kept in target/ci/isolation-matrix/dbt-in-guest. It publishes one structured result row per cell it checks, through ci/conformance-test-counts.sh, so validate's per-node coverage counts it as executed; until 2026-10-17 it wrote none, and every full validation that planned it was NOT-VALIDATED."########,
         labels: &[r########"full"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; rm -rf target/ci/isolation-matrix/dbt-in-guest && mkdir -p target/ci/isolation-matrix && ./tests/isolation/conformance.rs --hermit target/ci/hermit --executor local --expected tests/isolation/expected-mismatches.tsv --jobs "${HERMIT_ISOLATION_JOBS:-1}" --backends dbt,liteinst,in-guest-trap --artifacts target/ci/isolation-matrix/dbt-in-guest"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; rm -rf target/ci/isolation-matrix/dbt-in-guest && mkdir -p target/ci/isolation-matrix && ./ci/conformance-test-counts.sh target/ci/isolation-matrix/dbt-in-guest -- ./tests/isolation/conformance.rs --hermit target/ci/hermit --executor local --expected tests/isolation/expected-mismatches.tsv --jobs "${HERMIT_ISOLATION_JOBS:-1}" --backends dbt,liteinst,in-guest-trap --artifacts target/ci/isolation-matrix/dbt-in-guest"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -8594,9 +8609,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"privileged-test"########,
         job: r########"isolation_matrix_kvm"########,
         desc: r########"Isolation matrix on KVM, held to its expected-mismatch ledger"########,
-        description: r########"Runs the backend isolation matrix (tests/isolation/conformance.rs, the container contract of https://github.com/rrnewton/hermit/issues/4009) for every required cell of KVM, after requiring /dev/kvm; measured 61 s serially in the pinned root: the probe tests/isolation/backend_isolation.c beside a native baseline, each command a bounded child of the local executor, up to HERMIT_ISOLATION_JOBS cells at once (the cells of one cohort, which share an input fixture across backends, one at a time; output and the ledger check keep the selection order), every assertion row checked by hermit-cli/tests/common/backend_isolation.rs. No cell fully matches on any backend yet, so the node holds the matrix to tests/isolation/expected-mismatches.tsv: every cell that collects no guest observations, and every assertion that does not match, must be a ledger row naming its backend and linking its issue, and a row that no longer describes a failure on a backend it names fails the node until it is deleted, so what now matches stays matched. The ledger was measured in this pinned root; two host runs agreed cell for cell. Artifacts (assertion rows, per-backend totals, the required-cell ledger) are kept in target/ci/isolation-matrix/kvm."########,
+        description: r########"Runs the backend isolation matrix (tests/isolation/conformance.rs, the container contract of https://github.com/rrnewton/hermit/issues/4009) for every required cell of KVM, after requiring /dev/kvm; measured 61 s serially in the pinned root: the probe tests/isolation/backend_isolation.c beside a native baseline, each command a bounded child of the local executor, up to HERMIT_ISOLATION_JOBS cells at once (the cells of one cohort, which share an input fixture across backends, one at a time; output and the ledger check keep the selection order), every assertion row checked by hermit-cli/tests/common/backend_isolation.rs. No cell fully matches on any backend yet, so the node holds the matrix to tests/isolation/expected-mismatches.tsv: every cell that collects no guest observations, and every assertion that does not match, must be a ledger row naming its backend and linking its issue, and a row that no longer describes a failure on a backend it names fails the node until it is deleted, so what now matches stays matched. The ledger was measured in this pinned root; two host runs agreed cell for cell. Artifacts (assertion rows, per-backend totals, the required-cell ledger) are kept in target/ci/isolation-matrix/kvm. It publishes one structured result row per cell it checks, through ci/conformance-test-counts.sh, so validate's per-node coverage counts it as executed; until 2026-10-17 it wrote none, and every full validation that planned it was NOT-VALIDATED."########,
         labels: &[r########"full"########, r########"kvm"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf '%s: /dev/kvm is required\n' privileged-test.isolation_matrix_kvm >&2; exit 2; fi; exec 9>&-; rm -rf target/ci/isolation-matrix/kvm && mkdir -p target/ci/isolation-matrix && ./tests/isolation/conformance.rs --hermit target/ci/hermit --executor local --expected tests/isolation/expected-mismatches.tsv --jobs "${HERMIT_ISOLATION_JOBS:-1}" --backends kvm --artifacts target/ci/isolation-matrix/kvm"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf '%s: /dev/kvm is required\n' privileged-test.isolation_matrix_kvm >&2; exit 2; fi; exec 9>&-; rm -rf target/ci/isolation-matrix/kvm && mkdir -p target/ci/isolation-matrix && ./ci/conformance-test-counts.sh target/ci/isolation-matrix/kvm -- ./tests/isolation/conformance.rs --hermit target/ci/hermit --executor local --expected tests/isolation/expected-mismatches.tsv --jobs "${HERMIT_ISOLATION_JOBS:-1}" --backends kvm --artifacts target/ci/isolation-matrix/kvm"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,

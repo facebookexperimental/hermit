@@ -375,6 +375,24 @@ fn read_ledger(path: &Path) -> Result<Vec<Expected>, String> {
     Ok(rows)
 }
 
+/// One disagreement with the ledger, and the result row it fails: the cell's
+/// own row, or, for a ledger row that no longer describes anything on a
+/// backend, a row of its own (`ledger_row_id`).
+struct LedgerFailure {
+    id: String,
+    message: String,
+}
+
+/// The structured result row of one collected cell.
+fn cell_row_id(cell: &driver::Cell) -> String {
+    format!("isolation/{}", cell.name())
+}
+
+/// The structured result row of a ledger row judged stale on one backend.
+fn ledger_row_id(line: usize, backend: &str) -> String {
+    format!("isolation-ledger/line-{line}/{backend}")
+}
+
 /// Holds the collected cells to the ledger and returns every disagreement:
 /// a cell that collects nothing or an assertion that does not match where no
 /// row expects it, and, for each backend whose every required cell ran, a
@@ -384,7 +402,7 @@ fn check_ledger(
     ledger: &[Expected],
     collected: &[driver::Collected],
     complete: &BTreeSet<String>,
-) -> Vec<String> {
+) -> Vec<LedgerFailure> {
     use driver::conformance::Verdict;
 
     let mut failures = Vec::new();
@@ -404,19 +422,25 @@ fn check_ledger(
                 continue;
             }
             (false, None) => {
-                failures.push(format!(
-                    "UNEXPECTED: {} collected no guest observations ({}), and no ledger row expects that",
-                    cell.name(),
-                    guest.map_or("no guest.complete row", |row| row.detail.as_str()),
-                ));
+                failures.push(LedgerFailure {
+                    id: cell_row_id(cell),
+                    message: format!(
+                        "UNEXPECTED: {} collected no guest observations ({}), and no ledger row expects that",
+                        cell.name(),
+                        guest.map_or("no guest.complete row", |row| row.detail.as_str()),
+                    ),
+                });
                 continue;
             }
-            (true, Some(row)) => failures.push(format!(
-                "STALE: ledger line {} ({}) expects {} to collect nothing, but it now does; delete or narrow the row",
-                row.line,
-                row.issue,
-                cell.name()
-            )),
+            (true, Some(row)) => failures.push(LedgerFailure {
+                id: cell_row_id(cell),
+                message: format!(
+                    "STALE: ledger line {} ({}) expects {} to collect nothing, but it now does; delete or narrow the row",
+                    row.line,
+                    row.issue,
+                    cell.name()
+                ),
+            }),
             (true, None) => {}
         }
         for assertion in &result.assertions {
@@ -434,12 +458,15 @@ fn check_ledger(
                 Some(row) => {
                     used.insert((row.line, backend.to_owned()));
                 }
-                None => failures.push(format!(
-                    "UNEXPECTED: {} {} is {verdict} ({}), and no ledger row expects that",
-                    cell.name(),
-                    assertion.name,
-                    assertion.detail,
-                )),
+                None => failures.push(LedgerFailure {
+                    id: cell_row_id(cell),
+                    message: format!(
+                        "UNEXPECTED: {} {} is {verdict} ({}), and no ledger row expects that",
+                        cell.name(),
+                        assertion.name,
+                        assertion.detail,
+                    ),
+                }),
             }
         }
     }
@@ -450,10 +477,13 @@ fn check_ledger(
         }
         for backend in &row.backends {
             if complete.contains(backend) && !used.contains(&(row.line, backend.clone())) {
-                failures.push(format!(
-                    "STALE: ledger line {} ({}) names {backend}, but nothing on {backend} needs it any more; delete {backend} from the row",
-                    row.line, row.issue
-                ));
+                failures.push(LedgerFailure {
+                    id: ledger_row_id(row.line, backend),
+                    message: format!(
+                        "STALE: ledger line {} ({}) names {backend}, but nothing on {backend} needs it any more; delete {backend} from the row",
+                        row.line, row.issue
+                    ),
+                });
             }
         }
     }
@@ -643,6 +673,28 @@ fn write_summary(
     } else {
         Err(failures.join("; "))
     }
+}
+
+/// Writes `results.tsv`: one row per collected cell and one per stale ledger
+/// row, each `pass` or `fail`, which ci/conformance-test-counts.sh turns into
+/// the node's structured test results.
+fn write_results(
+    artifacts: &Path,
+    collected: &[driver::Collected],
+    ledger_rows: &[String],
+    failing: &BTreeSet<String>,
+) -> Result<(), String> {
+    let mut rows = String::from("# schema=backend-isolation-results-v1\nid\tresult\n");
+    let ids = collected
+        .iter()
+        .map(|result| cell_row_id(&result.cell))
+        .chain(ledger_rows.iter().cloned());
+    for id in ids {
+        let result = if failing.contains(&id) { "fail" } else { "pass" };
+        writeln!(rows, "{id}\t{result}").expect("String writes succeed");
+    }
+    fs::write(artifacts.join("results.tsv"), rows)
+        .map_err(|error| format!("results publication: results.tsv: {error}"))
 }
 
 fn run() -> Result<bool, String> {
@@ -883,6 +935,7 @@ fn run() -> Result<bool, String> {
         units
     };
     let mut results: Vec<Option<driver::Collected>> = cells.iter().map(|_| None).collect();
+    let mut accepted_cells = vec![false; cells.len()];
     let next = AtomicUsize::new(0);
     let (sender, receiver) = mpsc::channel();
     std::thread::scope(|workers| {
@@ -930,6 +983,7 @@ fn run() -> Result<bool, String> {
                     result.directory.join("assertions.json").display()
                 );
                 matches &= accepted;
+                accepted_cells[reported] = accepted;
                 reported += 1;
             }
         }
@@ -938,8 +992,27 @@ fn run() -> Result<bool, String> {
         .into_iter()
         .map(|result| result.ok_or("a cell's collection ended without a result"))
         .collect::<Result<_, _>>()?;
+    // Without a ledger a cell fails when it does not match; with one, when
+    // the ledger check names it.
+    let mut failing: BTreeSet<String> = collected
+        .iter()
+        .zip(&accepted_cells)
+        .filter(|(_, accepted)| !**accepted)
+        .map(|(result, _)| cell_row_id(&result.cell))
+        .collect();
+    let mut ledger_rows = Vec::new();
     if let Some(ledger) = &ledger {
         let failures = check_ledger(ledger, &collected, &complete);
+        failing = failures.iter().map(|failure| failure.id.clone()).collect();
+        let cell_ids: BTreeSet<String> = collected
+            .iter()
+            .map(|result| cell_row_id(&result.cell))
+            .collect();
+        ledger_rows = failing
+            .iter()
+            .filter(|id| !cell_ids.contains(*id))
+            .cloned()
+            .collect();
         let mut families: BTreeMap<&str, usize> = BTreeMap::new();
         for row in ledger {
             for backend in &row.backends {
@@ -947,7 +1020,7 @@ fn run() -> Result<bool, String> {
             }
         }
         for failure in &failures {
-            println!("{failure}");
+            println!("{}", failure.message);
         }
         println!(
             "expected-mismatch ledger: {} cells checked against {} rows ({families:?} per backend); stale rows judged for {complete:?}; disagreements={}",
@@ -957,6 +1030,7 @@ fn run() -> Result<bool, String> {
         );
         matches = failures.is_empty();
     }
+    write_results(&prepared.artifacts, &collected, &ledger_rows, &failing)?;
     write_summary(&prepared, &required, &collected, &scope).map_err(|error| {
         format!(
             "summary publication: {error}; checker verdict={}; emitted assertion verdicts are unchanged",
