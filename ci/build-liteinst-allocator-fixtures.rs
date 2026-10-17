@@ -164,7 +164,7 @@ fn build_leaf(
     )?;
     let target = own.join("target");
     fs::create_dir(&target).map_err(|e| format!("new dedicated target: {e}"))?;
-    let profile_name = if standalone { "release" } else { "validate" };
+    let profile_name = if standalone { "release" } else { "liteinst-runtime" };
     let profile = cargo_profile(!standalone);
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
     let rustc_verbose = runner.text(&rustc, &["--version", "--verbose"], root)?;

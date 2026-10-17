@@ -851,7 +851,7 @@ pub(crate) mod native {
                 "--features".into(),
                 "exec-native-injection".into(),
                 "--profile".into(),
-                "validate".into(),
+                "liteinst-runtime".into(),
                 "--target-dir".into(),
                 text(&nested),
                 "--message-format=json-render-diagnostics".into(),

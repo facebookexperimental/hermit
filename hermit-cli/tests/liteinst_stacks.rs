@@ -250,7 +250,11 @@ fn qualify(
             )?;
             let expected_profile = json!({"opt_level":"3", "debuginfo":0, "debug_assertions":!standalone,
                 "overflow_checks":!standalone, "test":false});
-            let profile_name = if standalone { "release" } else { "validate" };
+            let profile_name = if standalone {
+                "release"
+            } else {
+                "liteinst-runtime"
+            };
             require(
                 leaf.profile_name == profile_name && leaf.cargo_profile == expected_profile,
                 "leaf profile differs from required diagnostic producer",
