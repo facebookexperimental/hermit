@@ -6413,6 +6413,23 @@ impl RunOpts {
                         self,
                     );
                 }
+                // The coordinator runs in this process, so this is where its
+                // warnings print, the in-guest ones it receives included
+                // (detcore::guest_log). At WARN at most: DBT's own channel
+                // already prints the run's INFO and DEBUG records from the
+                // guest, and printing the coordinator's per-turn records too
+                // would put a stderr write on every scheduler turn, which
+                // slowed loaded runs past their bounds. `--log=error` still
+                // lowers it. A verification run keeps its log in the run's
+                // evidence instead.
+                let mut warnings = global.clone();
+                warnings.log = Some(
+                    global
+                        .log
+                        .unwrap_or(tracing::level_filters::LevelFilter::WARN)
+                        .min(tracing::level_filters::LevelFilter::WARN),
+                );
+                let _tracing = warnings.init_tracing_for_backend(backend);
                 return invocation.run(
                     self.summary,
                     self.backend_engagement_json.as_deref(),

@@ -2334,6 +2334,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Exit,
     ) -> Result<i64, Error> {
+        // This thread may be its process's last (`crate::guest_log`).
+        crate::guest_log::flush_unsent();
         // A raw `exit` of a process's last thread ends the process as an
         // `exit_group` does, and the scheduler then sends the parent's SIGCHLD
         // with Linux's siginfo, as for `handle_exit_group`. Only the exit grant
@@ -2404,6 +2406,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::ExitGroup,
     ) -> Result<i64, Error> {
+        // One of the last points where this process's unsent warnings can
+        // still be reported (`crate::guest_log`).
+        crate::guest_log::flush_unsent();
         // Where the kernel also notifies the parent, the scheduler sends the
         // parent's SIGCHLD itself and gives it the siginfo Linux would
         // (`scheduler::child_exit_sigchld`): CLD_EXITED and the exit code.

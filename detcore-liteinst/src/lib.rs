@@ -415,6 +415,11 @@ unsafe fn initialize_detcore(inputs: InitializationInputs) {
     let _ = detcore::install_shared_open_file_channel(Box::new(
         detcore::ChunkedOpenFileChannel::new(CoordinatorOpenFiles),
     ));
+    // Detcore's warnings reach the run's log through the coordinator, over the
+    // same connection. A forked child inherits the subscriber.
+    if !detcore::guest_log::install(guest_log_call, None) {
+        fail("Detcore's in-guest subscriber was not installed: the process already has one");
+    }
     #[cfg(feature = "exec-private-init")]
     if let Some(control) = initial_control
         && let Err(error) = unsafe { control.finish() }
@@ -445,8 +450,34 @@ pub unsafe extern "C" fn m3_constructor_stack_query(
     unsafe { reverie_inguest::guest::tool_region::reverie_inguest_constructor_stack_query(output) }
 }
 
+/// This process's synchronous request to Detcore's global state from inside a
+/// Tool callback, through `reverie_liteinst::blocking_global_rpc`. Shared open
+/// file control ([`CoordinatorOpenFiles`]) and Detcore's diagnostics
+/// (`detcore::guest_log`) both send through it.
+fn coordinator_call(
+    request: <detcore::GlobalState as reverie::GlobalTool>::Request,
+) -> std::io::Result<<detcore::GlobalState as reverie::GlobalTool>::Response> {
+    reverie_liteinst::blocking_global_rpc::<detcore::GlobalState>(request)
+}
+
+/// [`coordinator_call`] for Detcore's warnings, which can be raised anywhere:
+/// it sends only where the runtime marks a Tool callback as running
+/// (`tool_callback_active`), since outside one the runtime would refuse the
+/// connection's syscalls as the guest's and end the guest. Elsewhere the
+/// warning is refused, and `detcore::guest_log` counts it.
+fn guest_log_call(
+    request: <detcore::GlobalState as reverie::GlobalTool>::Request,
+) -> std::io::Result<<detcore::GlobalState as reverie::GlobalTool>::Response> {
+    if !reverie_inguest::guest::support::tool_callback_active() {
+        return Err(std::io::Error::other(
+            "a Detcore warning from outside a Tool callback",
+        ));
+    }
+    coordinator_call(request)
+}
+
 /// Carries shared open file control messages to Detcore's global state from
-/// inside a Tool callback, through `reverie_liteinst::blocking_global_rpc`.
+/// inside a Tool callback, through [`coordinator_call`].
 /// A `DetFd` method is synchronous code inside a callback's poll, so no other
 /// request of this process is in flight when it runs; if one is, the call is
 /// refused rather than interleaved.
@@ -457,15 +488,13 @@ impl detcore::OpenFileControlTransport for CoordinatorOpenFiles {
         &self,
         control: detcore::OpenFileControl,
     ) -> Result<detcore::OpenFileControlReply, detcore::SharedOpenFileError> {
-        let response = reverie_liteinst::blocking_global_rpc::<detcore::GlobalState>(
-            detcore::shared_open_file_request(control),
-        )
-        .map_err(|error| {
-            detcore::SharedOpenFileError(format!(
-                "the coordinator connection refused a shared open file message: {}",
-                describe_io_error(&error)
-            ))
-        })?;
+        let response =
+            coordinator_call(detcore::shared_open_file_request(control)).map_err(|error| {
+                detcore::SharedOpenFileError(format!(
+                    "the coordinator connection refused a shared open file message: {}",
+                    describe_io_error(&error)
+                ))
+            })?;
         detcore::shared_open_file_reply(response)
     }
 }

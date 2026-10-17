@@ -59,33 +59,45 @@ impl Drop for Scope {
     }
 }
 
+/// This process's synchronous request to Detcore's global state from inside a
+/// DBT callback, through the callback's application context. Shared open file
+/// control ([`Transport`]) and Detcore's diagnostics (`detcore::guest_log`)
+/// both send through it. Outside a callback there is no context to send
+/// through.
+pub(super) fn coordinator_call(
+    request: <GlobalState as reverie::GlobalTool>::Request,
+) -> std::io::Result<<GlobalState as reverie::GlobalTool>::Response> {
+    let callback = CALLBACK
+        .with(Cell::get)
+        .ok_or_else(|| std::io::Error::other("shared OFD access outside a DBT callback"))?;
+    let pid = unsafe { libc::syscall(libc::SYS_getpid) as i32 };
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+    if (pid, tid) != (callback.physical_pid, callback.physical_tid) {
+        return Err(std::io::Error::other(
+            "inherited or foreign OFD callback scope",
+        ));
+    }
+    if !reverie_dbt::sync_rpc::is_active() {
+        return Err(std::io::Error::other(
+            "shared OFDs require the external coordinator",
+        ));
+    }
+    let runtime = super::current_runtime();
+    Ok(reverie_dbt::sync_rpc::send_rpc_from_guest::<GlobalState>(
+        callback.context,
+        callback.invoke,
+        callback.tid,
+        &runtime.config,
+        request,
+    ))
+}
+
 struct Transport;
 
 impl OpenFileControlTransport for Transport {
     fn call(&self, request: OpenFileControl) -> Result<OpenFileControlReply, SharedOpenFileError> {
-        let callback = CALLBACK.with(Cell::get).ok_or_else(|| {
-            SharedOpenFileError("shared OFD access outside a DBT callback".into())
-        })?;
-        let pid = unsafe { libc::syscall(libc::SYS_getpid) as i32 };
-        let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
-        if (pid, tid) != (callback.physical_pid, callback.physical_tid) {
-            return Err(SharedOpenFileError(
-                "inherited or foreign OFD callback scope".into(),
-            ));
-        }
-        if !reverie_dbt::sync_rpc::is_active() {
-            return Err(SharedOpenFileError(
-                "shared OFDs require the external coordinator".into(),
-            ));
-        }
-        let runtime = super::current_runtime();
-        let response = reverie_dbt::sync_rpc::send_rpc_from_guest::<GlobalState>(
-            callback.context,
-            callback.invoke,
-            callback.tid,
-            &runtime.config,
-            detcore::shared_open_file_request(request),
-        );
+        let response = coordinator_call(detcore::shared_open_file_request(request))
+            .map_err(|error| SharedOpenFileError(error.to_string()))?;
         detcore::shared_open_file_reply(response)
     }
 }
