@@ -1374,8 +1374,13 @@ impl Scheduler {
     pub(crate) fn note_private_entries_retired(&mut self, entries: Vec<Entry>) {
         let now = self.committed_time;
         for entry in entries {
+            // Only an entry of the timer's current arming re-arms it: a
+            // `timer_settime` since the entry was queued started a newer
+            // generation, which waits for its own entry's dequeue (the Codex
+            // re-check of the in-flight-dequeue fix, P2-1).
             if let Entry::Timer(entry) = entry
                 && entry.periodic_at_send
+                && self.timer_entry_valid(&entry)
             {
                 self.blocked.timed_waiters.signal_timer_rearm_after(
                     SignalTimerId::Posix(entry.process, entry.timer),

@@ -1415,3 +1415,38 @@ fn an_early_popped_timer_entry_rearms_when_a_new_stop_replaces_its_dequeue() {
         "the timer re-armed"
     );
 }
+
+/// Retiring an early-popped entry of an older timer generation does not
+/// re-arm the newer one: after a `timer_settime`, the timer waits for its new
+/// generation's entry, queued behind the joined send, and a new stop that
+/// replaces the unfinished delivery leaves it waiting (the Codex re-check of
+/// the in-flight-dequeue fix, P2-1).
+#[test]
+fn retiring_an_old_generations_early_entry_keeps_the_new_generation_waiting() {
+    let mut f = family();
+    let pr = private(&f);
+    let bit = kernel_signal_bit(USR1);
+    f.arm(0, SignalTarget::Thread(f.leader), 10, 10);
+    f.pop(10);
+    f.queues(bit, 0);
+    f.sched
+        .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(15)));
+    f.queues(0, 0);
+    f.guest_send(pr, ordinary_siginfo(USR1, -6, 100, 1000));
+    // timer_settime: a new generation, first due at 40.
+    f.arm(0, SignalTarget::Thread(f.leader), 40, 10);
+    f.queues(bit, 0);
+    f.pop(40);
+    assert!(matches!(
+        f.entries(pr).as_slice(),
+        [Entry::Plain { .. }, Entry::Timer(_)]
+    ));
+    assert!(f.sched.blocked.timed_waiters.next_deadline().is_none());
+    // The unfinished delivery is replaced by a new stop of the same thread.
+    f.sched
+        .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(45)));
+    assert!(
+        f.sched.blocked.timed_waiters.next_deadline().is_none(),
+        "the new generation still waits for its own entry's dequeue"
+    );
+}
