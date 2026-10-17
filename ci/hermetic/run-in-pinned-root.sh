@@ -490,6 +490,25 @@ fi
 # ci/verify-submodules.sh already reads repositories this way.
 env_args+=(-e GIT_OPTIONAL_LOCKS=0)
 
+# Cargo decides a path crate is fresh by the checksums its dep-info records
+# (-Zchecksum-freshness), not by mtimes. Every validation builds in a fresh
+# checkout, whose files are all newer than the warm target's dep-info
+# (ci-hub/validate/warm_target.py), so by mtime every workspace crate rebuilt
+# on every run, changed or not. Set for EVERY pinned-root container, because
+# they share /src/target: a build without it after one with it marks each
+# unit dirty ("the prior compilation used checksum freshness and this one does
+# not") and rebuilds everything. A seed built without it lacks the checksums,
+# so its first run rebuilds in full; that is the fallback.
+# Measured 2026-10-16 (host, validate profile, the
+# build.workspace_compile_in_pinned_root cargo commands, 32 jobs): a warm build
+# reproduced every rlib, shared object and executable of a cold build byte for
+# byte (1,253 of 1,258 identical) for a pin bump (10a7b59d), a Detcore change
+# (6b9c57af) and a CI-only change (548b2db5). The 5 others differ between two
+# cold builds too: libmimalloc_sys's C objects and detcore-sabre, which this
+# node cleans and rebuilds every run. The CI-only build took 207 s warm
+# against 282 s cold.
+env_args+=(-e CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true)
+
 # `--network=none` is the point, not a precaution: if the run can reach the
 # network it can pick up something the lock does not describe, and the rebuild
 # guarantee is void. CARGO_NET_OFFLINE in the image makes that fail loudly.

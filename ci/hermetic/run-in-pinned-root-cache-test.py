@@ -337,6 +337,20 @@ class CargoCacheMounts(unittest.TestCase):
         )
         self.assertLess(argv.index("GIT_OPTIONAL_LOCKS=0"), image)
 
+    def test_payload_uses_cargo_checksum_freshness(self):
+        # Every pinned-root container shares /src/target, and Cargo marks a
+        # unit dirty when its prior build used checksum freshness and this
+        # one does not, so the setting must reach every container.
+        result, calls = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[1]
+        settings = [argv[index + 1] for index, arg in enumerate(argv) if arg == "-e"]
+        self.assertIn("CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true", settings)
+        image = argv.index(
+            "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        self.assertLess(argv.index("CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true"), image)
+
     def test_payload_keeps_caller_affinity_when_runtime_widens_it(self):
         available = sorted(os.sched_getaffinity(0))
         if len(available) < 2:
