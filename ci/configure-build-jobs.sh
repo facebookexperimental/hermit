@@ -1959,8 +1959,19 @@ fi
 # calibrated job width, CPU/wall limits and prior carry intervals remain.
 # Native client.c intentionally changes; fresh native and shared Tool evidence
 # remains separate from this SDK build-budget carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d1f198a6c5fa466a259a22d49ed80c1d40ba4960 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d1f198a6c5fa466a259a22d49ed80c1d40ba4960 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 25f8b656d468bf894147079b476b88cc92a65e68 (2026-10-17): from
+# d1f198a6c5fa466a259a22d49ed80c1d40ba4960. Six commits: be8af50f (reverie-sabre close
+# of stderr), cf83e82a (the ReservedSignal refusal variant), dc977455 (reverie-sabre
+# uses the shared LocalMemory), 528bf5d5 (provider step E2d-1), 774e9fd9 (tests
+# pinning the handler segment-base rule) and 25f8b656 (provider step E2e), touching
+# only experimental/reverie-sabre, reverie/src, reverie-memory/src and
+# reverie-kvm/src. git diff is empty under reverie-dbt/
+# (tree c01780c7 at both pins), and build.rs, vendor/dynamorio, native/,
+# third-party, the root Cargo.toml, Cargo.lock and rust-toolchain.toml have the
+# same object ids: all seven SDK inputs, DBT inventory 961, calibrated budget,
+# job width and limits are unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 25f8b656d468bf894147079b476b88cc92a65e68 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 25f8b656d468bf894147079b476b88cc92a65e68 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
