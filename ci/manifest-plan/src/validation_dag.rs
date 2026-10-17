@@ -469,20 +469,22 @@ fn exclusion_flags(excluded: &[&str]) -> String {
         .map(|backend| format!(" --exclude-backend {backend}"))
         .collect()
 }
+// The capacity column is the DAG's one resource_caps entry: a hosted run selects its
+// steps from the same validate.json, so it carries the same 12 slots as a local run.
 const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 13] = [
-    ("e2e.manifest_applications", "manifest_guest", 1, 8),
-    ("e2e.manifest_bin_c", "manifest_guest", 1, 8),
-    ("e2e.manifest_c_programs", "manifest_guest", 8, 8),
-    ("e2e.manifest_chaos_c", "manifest_guest", 1, 8),
-    ("e2e.manifest_compat", "manifest_guest", 8, 8),
-    ("e2e.manifest_data_handling", "manifest_guest", 1, 8),
-    ("e2e.manifest_debugger_c", "manifest_guest", 1, 8),
-    ("e2e.manifest_determinism_stress", "manifest_guest", 1, 8),
-    ("e2e.manifest_determinism_stress_c", "manifest_guest", 1, 8),
-    ("e2e.manifest_language_runtimes", "manifest_guest", 1, 8),
-    ("e2e.manifest_shared_futex_c", "manifest_guest", 1, 8),
-    ("e2e.manifest_system_utils", "manifest_guest", 1, 8),
-    ("e2e.manifest_util_c", "manifest_guest", 1, 8),
+    ("e2e.manifest_applications", "manifest_guest", 1, 12),
+    ("e2e.manifest_bin_c", "manifest_guest", 1, 12),
+    ("e2e.manifest_c_programs", "manifest_guest", 8, 12),
+    ("e2e.manifest_chaos_c", "manifest_guest", 1, 12),
+    ("e2e.manifest_compat", "manifest_guest", 8, 12),
+    ("e2e.manifest_data_handling", "manifest_guest", 1, 12),
+    ("e2e.manifest_debugger_c", "manifest_guest", 1, 12),
+    ("e2e.manifest_determinism_stress", "manifest_guest", 1, 12),
+    ("e2e.manifest_determinism_stress_c", "manifest_guest", 1, 12),
+    ("e2e.manifest_language_runtimes", "manifest_guest", 1, 12),
+    ("e2e.manifest_shared_futex_c", "manifest_guest", 1, 12),
+    ("e2e.manifest_system_utils", "manifest_guest", 1, 12),
+    ("e2e.manifest_util_c", "manifest_guest", 1, 12),
 ];
 const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.rust_scripts",
@@ -4325,10 +4327,15 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
             cfg.steps.len()
         ));
     }
+    // manifest_guest is 12 since 2026-10-17 (it was 8): e2e.manifest_c_programs and
+    // e2e.manifest_compat each reserve 8, so at 8 every other manifest bucket waited for
+    // them, and the Cargo route's buckets ran one after another (0328f30b: +325 to +637 s).
+    // Replayed with the slot count honoured, 12 ends that graph at +486 s; 16 gains 3 s
+    // more. The two 8-slot buckets still cannot overlap. See e2e.manifest_c_programs.
     if cfg.default_step_timeout != 600
         || cfg.resource_caps
             != BTreeMap::from([
-                ("manifest_guest".into(), 8),
+                ("manifest_guest".into(), 12),
                 ("integration_test_binaries.cli".into(), 1),
                 ("integration_test_binaries.hermit_modes".into(), 1),
             ])

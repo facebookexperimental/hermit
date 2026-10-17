@@ -671,7 +671,7 @@ pub fn validation_config(root: &Path) -> Result<DagConfig, String> {
 /// It used to be `DagConfig { steps, ..Default::default() }`, which loaded a DAG
 /// file, kept its steps, and threw its configuration away. That is not a
 /// hypothetical: it hung a full validate for 14 minutes at 0% CPU.
-/// `ci/dag/validate.json` declares `resource_caps {manifest_guest: 8}`;
+/// `ci/dag/validate.json` declared `resource_caps {manifest_guest: 8}` (12 since 2026-10-17);
 /// dropping it leaves `res_free` evaluating `unwrap_or(0) >= 1` for the 13
 /// steps demanding `manifest_guest`, so none can be admitted. The scheduler's
 /// only exit is `running.is_empty() && done + skipped >= steps.len()`, so with
