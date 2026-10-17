@@ -1634,16 +1634,28 @@ pub const HERMIT_INTEGRATION_SHARDS: &[Shard] = &[
     ("hermit_integration_3", Some("procfs_determinism"), 125.0),
 ];
 
-/// Buck import twins whose import is not about a second: the medians of 38
-/// full validations (2026-10-16 to 2026-10-17). The others take 1-2 s. At the
-/// former 1 s for every twin, the dispatch order ranked
-/// e2e.manifest_c_programs_buck (one worker importing 1,498 cells and a
-/// 1,415-cell parity pass), which full-scorecard.compatibility_buck waits for,
-/// below every ready test node.
-pub const BUCK_TWIN_MEASURED_ESTIMATES: &[(&str, f64)] = &[
-    ("e2e.manifest_c_programs_buck", 30.0),
-    ("e2e.manifest_compat_buck", 11.0),
-    ("e2e.manifest_system_utils_buck", 4.0),
+/// Buck import twins whose import is not about a second, as (tag, estimated
+/// seconds, workers). The others take 1-2 s at one worker. At the former 1 s
+/// for every twin, the dispatch order ranked e2e.manifest_c_programs_buck,
+/// which full-scorecard.compatibility_buck waits for, below every ready test
+/// node.
+///
+/// The width is the import's parity post-pass: one `hermit log-diff` per
+/// compared cell (1,415 for c-programs, 1,070 for compat), which runs as many
+/// at once as `--jobs` allows; the twins' counterparts already declare
+/// jobs_flag `--jobs`. Measured 2026-10-17 on the rows of
+/// validate-claude-coord-62374347d461-1792248733030795509-314424-be3b3567,
+/// whose ingest was rerun into a private import directory: c-programs took
+/// 28.8 s at --jobs 1 (30.5 s in that validation), 8.6 s at 8 and 7.1 s at
+/// 16; compat 11.1 s at 1 and 4.1 s at 8; system-utils 3.4 s at 1 and 1.8 s
+/// at 8. Every width published the same 1,498, 544 and 126 PASS rows and the
+/// same parity population and credit (c-programs 224 full, 946 partial, 245
+/// zero). The c-programs cgroup peaked at 0.60 GiB at one worker and 0.73 GiB
+/// at eight, inside the twin's 1-GiB baseline; it used 32.7 and 35.3 CPU-s.
+pub const BUCK_TWIN_MEASURED_ESTIMATES: &[(&str, f64, i64)] = &[
+    ("e2e.manifest_c_programs_buck", 9.0, 8),
+    ("e2e.manifest_compat_buck", 4.0, 8),
+    ("e2e.manifest_system_utils_buck", 4.0, 1),
 ];
 
 /// The authored PMU integration node, which runs in shards.
@@ -2065,14 +2077,17 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
         twin.timeout = crate::parity::PARITY_STEP_WALL_FLOOR.as_secs() as i64;
         twin.cpu_timeout = 600;
         twin.hint.resources.clear();
-        twin.hint.est_duration_s = BUCK_TWIN_MEASURED_ESTIMATES
+        let (seconds, workers) = BUCK_TWIN_MEASURED_ESTIMATES
             .iter()
-            .find_map(|(twin_tag, seconds)| (*twin_tag == tag).then_some(*seconds))
-            .unwrap_or(1.0);
+            .find_map(|(twin_tag, seconds, workers)| {
+                (*twin_tag == tag).then_some((*seconds, *workers))
+            })
+            .unwrap_or((1.0, 1));
+        twin.hint.est_duration_s = seconds;
         twin.hint.rss_baseline_bytes = Some(1 << 30);
         twin.hint.hard_mem_max_bytes = Some(3 << 30);
         twin.hint.classification = dagrun::model::StepClass::Light;
-        twin.hint.preferred_inner_jobs = None;
+        twin.hint.preferred_inner_jobs = (workers > 1).then_some(workers);
         twin.fail_fast_family = Some(tag.clone());
         for result in twin.result_manifests.iter_mut().flatten() {
             if let ResultManifest::StructuredTestResults(result) = result {
