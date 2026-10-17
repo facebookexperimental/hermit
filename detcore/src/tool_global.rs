@@ -2126,16 +2126,6 @@ impl GlobalState {
         if native_exec::is_native_exec_control(&gr.2) {
             return self.dispatch_native_exec_control(from, gr);
         }
-        // A Detcore warning from inside the guest (`crate::guest_log`) carries
-        // no logical time, changes no scheduler state, and its answer carries
-        // no time back. It is answered before the forwarded-record drain below,
-        // whose order state it must not touch: verification never compares a
-        // warning's place, and a run's ordered records must not depend on
-        // whether it warned. (`receive_rpc` takes no deadline hint for it.)
-        if let GlobalRequest::GuestLog(record, unsent_before) = &gr.2 {
-            crate::guest_log::emit(record.as_ref(), *unsent_before);
-            return (None, GlobalResponse::GuestLog(()));
-        }
         // Records an in-guest Tool forwarded before sending this request are queued,
         // and the sender's are written now if it runs alone (the order rule at
         // `detlog::set_forwarded_source`).
@@ -2523,9 +2513,6 @@ impl GlobalState {
             }
             GlobalRequest::SharedOpenFile(_) => {
                 unreachable!("shared open file control answered before clock accounting")
-            }
-            GlobalRequest::GuestLog(..) => {
-                unreachable!("a guest log record is answered before clock accounting")
             }
             GlobalRequest::Sigalrm(_) => {
                 unreachable!("SIGALRM ledger control answered before clock accounting")
@@ -5647,12 +5634,6 @@ pub enum GlobalRequest {
         u64,
         Option<crate::syscalls::signal_shadow::CopiedDispositions>,
     ),
-    /// A Detcore warning or error from inside the guest, which the coordinator
-    /// emits at the run's own log level (`crate::guest_log`), or none, and how
-    /// many of the sender's process could not be sent before it. Answered
-    /// before forwarded records are drained and before any clock or scheduler
-    /// accounting. Appended last.
-    GuestLog(Option<crate::guest_log::GuestLogRecord>, u64),
 }
 
 /// Responses from the global object
@@ -5841,8 +5822,6 @@ pub enum GlobalResponse {
     /// (`Scheduler::publish_signal_dispositions`), or `None` when it took
     /// nothing from this sender. Appended last.
     PublishSignalDispositions(Option<crate::syscalls::signal_shadow::PublicationAnswer>),
-    /// Appended last.
-    GuestLog(()),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -5868,32 +5847,6 @@ pub fn shared_open_file_request(control: OpenFileControl) -> (DetTime, MmId, Glo
         MmId::initial(DetTid::from_raw(0)),
         GlobalRequest::SharedOpenFile(control),
     )
-}
-
-/// The request [`crate::guest_log`] sends through a runtime's
-/// [`crate::guest_log::CoordinatorCall`]: like [`shared_open_file_request`], it
-/// carries no clock.
-pub(crate) fn guest_log_request(
-    record: Option<crate::guest_log::GuestLogRecord>,
-    unsent_before: u64,
-) -> (DetTime, MmId, GlobalRequest) {
-    (
-        DetTime::default(),
-        MmId::initial(DetTid::from_raw(0)),
-        GlobalRequest::GuestLog(record, unsent_before),
-    )
-}
-
-/// The answer to a [`guest_log_request`].
-pub(crate) fn guest_log_reply(
-    response: (Option<LogicalTime>, GlobalResponse),
-) -> std::io::Result<()> {
-    match response {
-        (None, GlobalResponse::GuestLog(())) => Ok(()),
-        other => Err(std::io::Error::other(format!(
-            "unexpected answer to a guest log record: {other:?}"
-        ))),
-    }
 }
 
 /// The answer to a [`shared_open_file_request`].
@@ -5950,10 +5903,6 @@ pub async fn prepare_exec<G, T>(
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    // An exec replaces the image holding this process's unsent warning count
-    // (`crate::guest_log`); every exec path, DBT's native one included, comes
-    // here first.
-    crate::guest_log::flush_unsent();
     let detpid = guest.thread_state().detpid.expect("detpid unset");
     let fd_state = ExecFdState {
         blocking: fd_blocking,
@@ -8576,8 +8525,6 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    // The process ends here (`crate::guest_log`).
-    crate::guest_log::flush_unsent();
     if cfg!(debug_assertions) {
         let mytime = guest.thread_state().thread_logical_time.clone();
         let mm = guest.thread_state().mm_id;

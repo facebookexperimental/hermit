@@ -69,8 +69,11 @@ use reverie_dbt::RegisterReader;
 use reverie_dbt::RegisterWriter;
 use reverie_dbt::SyscallInvoker;
 use tracing::Event;
+use tracing::Metadata;
+use tracing::Subscriber;
 use tracing::field::Field;
 use tracing::field::Visit;
+use tracing::span;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -148,33 +151,45 @@ static DBT_EVIDENCE_LOG_LEVEL: AtomicI32 = AtomicI32::new(0);
 static DBT_DIAGNOSTIC_EMITTER: OnceLock<Emitter> = OnceLock::new();
 /// The protected evidence channel, when this run asked for one.
 static DBT_EVIDENCE_EMITTER: OnceLock<Emitter> = OnceLock::new();
-/// Where DBT's own channel writes each event (its protected evidence, or its
-/// diagnostic channel when `HERMIT_LOG` sets a level), and whether each line
-/// carries the canonical prefix.
-static DBT_EVENT_SINK: OnceLock<(Emitter, bool)> = OnceLock::new();
+static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
+
+struct DbtSubscriber {
+    emit: Emitter,
+    level: DbtLogLevel,
+    canonical: bool,
+}
 
 const DBT_LOG_RECORD_PREFIX: &str = "1970-01-01T00:00:00.000000Z ";
 
-/// Writes one event to [`DBT_EVENT_SINK`], as one line.
-fn write_dbt_event(event: &Event<'_>) {
-    let Some(&(emit, canonical)) = DBT_EVENT_SINK.get() else {
-        return;
-    };
-    let line = format_dbt_event(event, canonical);
-    unsafe { emit(line.as_ptr(), line.len()) };
-}
+impl Subscriber for DbtSubscriber {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        self.level.enables(metadata.level())
+    }
 
-/// One event as one line of DBT's own channel.
-fn format_dbt_event(event: &Event<'_>, canonical: bool) -> String {
-    let metadata = event.metadata();
-    let mut visitor = DbtEventVisitor::default();
-    event.record(&mut visitor);
-    format_dbt_log_record(
-        metadata.level().as_str(),
-        metadata.target(),
-        &visitor.fields,
-        canonical,
-    )
+    fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
+        span::Id::from_u64(NEXT_SPAN_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let metadata = event.metadata();
+        let mut visitor = DbtEventVisitor::default();
+        event.record(&mut visitor);
+        let line = format_dbt_log_record(
+            metadata.level().as_str(),
+            metadata.target(),
+            &visitor.fields,
+            self.canonical,
+        );
+        unsafe { (self.emit)(line.as_ptr(), line.len()) };
+    }
+
+    fn enter(&self, _span: &span::Id) {}
+
+    fn exit(&self, _span: &span::Id) {}
 }
 
 #[derive(Default)]
@@ -231,13 +246,13 @@ enum DbtLogLevel {
 }
 
 impl DbtLogLevel {
-    fn max_level(self) -> tracing::Level {
+    fn enables(self, level: &tracing::Level) -> bool {
         match self {
-            Self::Error => tracing::Level::ERROR,
-            Self::Warn => tracing::Level::WARN,
-            Self::Info => tracing::Level::INFO,
-            Self::Debug => tracing::Level::DEBUG,
-            Self::Trace => tracing::Level::TRACE,
+            Self::Error => *level == tracing::Level::ERROR,
+            Self::Warn => matches!(*level, tracing::Level::ERROR | tracing::Level::WARN),
+            Self::Info => !matches!(*level, tracing::Level::DEBUG | tracing::Level::TRACE),
+            Self::Debug => *level != tracing::Level::TRACE,
+            Self::Trace => true,
         }
     }
 }
@@ -307,53 +322,38 @@ fn dbt_log_level() -> Option<DbtLogLevel> {
     dbt_log_level_from_code(effective_dbt_log_level())
 }
 
-/// Installs Detcore's in-guest subscriber (`detcore::guest_log`) through
-/// `install`, with DBT's own channel writing every event up to `own`'s level to
-/// its emitter.
-fn install_dbt_subscriber_with(
-    own: Option<(Emitter, DbtLogLevel, bool)>,
-    install: impl FnOnce(Option<detcore::guest_log::OwnChannel>) -> bool,
+fn install_dbt_subscriber_with<E>(
+    emit: Emitter,
+    level: DbtLogLevel,
+    canonical: bool,
+    install: impl FnOnce(DbtSubscriber) -> Result<(), E>,
 ) -> bool {
-    let own = own.map(|(emit, level, canonical)| {
-        let _ = DBT_EVENT_SINK.set((emit, canonical));
-        detcore::guest_log::OwnChannel {
-            max_level: level.max_level(),
-            write: write_dbt_event,
-        }
-    });
-    if !install(own) {
+    if install(DbtSubscriber {
+        emit,
+        level,
+        canonical,
+    })
+    .is_err()
+    {
         return false;
     }
     DBT_TRACING_ACTIVE.store(true, Ordering::Release);
     true
 }
 
-/// Detcore's warnings reach the run's log through the coordinator, as on every
-/// in-guest runtime (`detcore::guest_log`). When the run asked DBT to log, in
-/// its protected verification evidence (`canonical`) or at `HERMIT_LOG`'s
-/// level, DBT's own channel takes every event up to that level exactly as its
-/// subscriber did before, its DETLOG records included, and nothing is sent.
-/// With no coordinator and no level asked for, it takes warnings and errors on
-/// the diagnostic channel.
 fn init_dbt_tracing(emit: Emitter, canonical: bool) -> bool {
     if DBT_TRACING_ACTIVE.load(Ordering::Acquire) {
         return true;
     }
-    // With no coordinator to send to, warnings still print, on the diagnostic
-    // channel.
-    let level = dbt_log_level().or_else(|| {
-        (!canonical && !reverie_dbt::sync_rpc::is_active()).then_some(DbtLogLevel::Warn)
-    });
-    let own = level.map(|level| (emit, level, canonical));
-    let installed = install_dbt_subscriber_with(own, |own| {
-        detcore::guest_log::install(ofd_channel::coordinator_call, own)
-    });
-    if !installed {
-        emit_runtime_diagnostic(
-            "detcore-dbt: WARNING Detcore's in-guest subscriber was not installed: the process already has one\n",
-        );
-    }
-    installed
+    let Some(level) = dbt_log_level() else {
+        return false;
+    };
+    install_dbt_subscriber_with(
+        emit,
+        level,
+        canonical,
+        tracing::subscriber::set_global_default,
+    )
 }
 
 fn protected_evidence_capture_ready(protected_level: i32, tracing_active: bool) -> bool {
@@ -3543,22 +3543,18 @@ mod tests {
     #[test]
     fn protected_evidence_refuses_when_subscriber_installation_fails() {
         let previous = DBT_TRACING_ACTIVE.swap(false, Ordering::AcqRel);
-        let mut selected = None;
+        let mut selected_emitter = None;
         let installed = install_dbt_subscriber_with(
-            Some((test_emit_evidence, DbtLogLevel::Info, true)),
-            |own| {
-                selected = own.map(|own| own.max_level);
-                false
+            test_emit_evidence,
+            DbtLogLevel::Info,
+            true,
+            |subscriber| {
+                selected_emitter = Some(subscriber.emit as *const ());
+                Err::<(), ()>(())
             },
         );
         assert!(!installed);
-        assert_eq!(selected, Some(tracing::Level::INFO));
-        assert_eq!(
-            DBT_EVENT_SINK
-                .get()
-                .map(|&(emit, canonical)| (emit as *const (), canonical)),
-            Some((test_emit_evidence as *const (), true))
-        );
+        assert_eq!(selected_emitter, Some(test_emit_evidence as *const ()));
         assert!(!DBT_TRACING_ACTIVE.load(Ordering::Acquire));
         assert!(!protected_evidence_capture_ready(3, installed));
         DBT_TRACING_ACTIVE.store(previous, Ordering::Release);
@@ -3730,52 +3726,12 @@ mod tests {
 
     #[test]
     fn protected_evidence_level_selects_the_expected_filter() {
-        // Through the subscriber DBT installs (detcore::guest_log), with its
-        // own channel at the INFO evidence level: ERROR, WARN and INFO are
-        // written, in order, in canonical form; DEBUG and TRACE are not; and no
-        // event the channel takes goes to the coordinator.
-        static WRITTEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        fn write(event: &tracing::Event<'_>) {
-            WRITTEN.lock().unwrap().push(format_dbt_event(event, true));
-        }
-        fn call(
-            _request: <GlobalState as reverie::GlobalTool>::Request,
-        ) -> std::io::Result<<GlobalState as reverie::GlobalTool>::Response> {
-            panic!("an event DBT's own channel takes is not sent to the coordinator");
-        }
         let info = dbt_log_level_from_code(3).expect("INFO code");
-        let own = detcore::guest_log::OwnChannel {
-            max_level: info.max_level(),
-            write,
-        };
-        tracing::subscriber::with_default(detcore::guest_log::subscriber(call, Some(own)), || {
-            tracing::error!(target: "detcore::scheduler", "e");
-            tracing::warn!(target: "detcore::scheduler", "w");
-            tracing::info!(target: "detcore::scheduler", "DETLOG i");
-            tracing::debug!(target: "detcore::scheduler", "d");
-            tracing::trace!(target: "detcore::scheduler", "t");
-        });
-        assert_eq!(
-            *WRITTEN.lock().unwrap(),
-            [
-                "1970-01-01T00:00:00.000000Z ERROR detcore::scheduler: e\n",
-                "1970-01-01T00:00:00.000000Z WARN detcore::scheduler: w\n",
-                "1970-01-01T00:00:00.000000Z INFO detcore::scheduler: DETLOG i\n",
-            ]
-        );
-        let levels = (1..=5)
-            .map(|code| dbt_log_level_from_code(code).map(DbtLogLevel::max_level))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            levels,
-            [
-                Some(tracing::Level::ERROR),
-                Some(tracing::Level::WARN),
-                Some(tracing::Level::INFO),
-                Some(tracing::Level::DEBUG),
-                Some(tracing::Level::TRACE),
-            ]
-        );
+        assert!(info.enables(&tracing::Level::ERROR));
+        assert!(info.enables(&tracing::Level::WARN));
+        assert!(info.enables(&tracing::Level::INFO));
+        assert!(!info.enables(&tracing::Level::DEBUG));
+        assert!(!info.enables(&tracing::Level::TRACE));
         assert!(dbt_log_level_from_code(0).is_none());
         assert!(dbt_log_level_from_code(6).is_none());
     }
