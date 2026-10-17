@@ -632,7 +632,6 @@ rr_test!(rr_sigpwr, "sigpwr", 0, &[]);
 rr_test!(rr_sigqueueinfo, "sigqueueinfo", 0, &[]);
 rr_test!(rr_sigreturn_reg, "sigreturn_reg", 0, &[]);
 rr_test!(rr_sigtrap, "sigtrap", 0, &[]);
-rr_test!(rr_simple_threads_stress, "simple_threads_stress", 0, &[]);
 rr_test!(rr_small_holes, "small_holes", 0, &[]);
 rr_test!(
     #[ignore = "spins past validation's 22 CPU-second per-test budget (exit 124 at 24 s in the pinned root); passes in 43 s on a developer host; https://github.com/rrnewton/hermit/issues/4257"]

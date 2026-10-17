@@ -521,17 +521,13 @@ fn syscall_heavy_timer_delivers_each_period(period_us: i64, calls: &str) {
     );
 }
 
-/// [`syscall_heavy_timer_delivers_each_period`] at 2 ms, 150k calls.
+/// [`syscall_heavy_timer_delivers_each_period`] at 2 ms, 150k calls. A 5 ms,
+/// 250k-call case asserted the same bound in the same regime (above the 1 ms
+/// `fast_timer_period` exclusion, far below the maximum slice) and was deleted
+/// by the 2026-10-17 test audit.
 #[test]
 fn itimer_syscall_heavy_timer_delivers_each_2_ms_period() {
     syscall_heavy_timer_delivers_each_period(2_000, "150");
-}
-
-/// [`syscall_heavy_timer_delivers_each_period`] at 5 ms, 250k calls: about 15
-/// periods. Each case is its own test to stay inside the per-test CPU bound.
-#[test]
-fn itimer_syscall_heavy_timer_delivers_each_5_ms_period() {
-    syscall_heavy_timer_delivers_each_period(5_000, "250");
 }
 
 /// Two CPU-bound threads under a fast timer finish in about the time of their
