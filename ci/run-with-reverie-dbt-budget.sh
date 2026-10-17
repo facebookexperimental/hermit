@@ -1783,7 +1783,15 @@ fi
 # for the root Cargo.toml, Cargo.lock and rust-toolchain.toml, so all seven
 # SDK inputs, inventory 961, the calibrated budget, job width and limits are
 # unchanged.
-expected_pin=4021030b81acd342affafaab923b096636670df4
+# CARRY TO 51ecc8fb0c7b38ff03ce1596d765a9a0055e7d09 (2026-10-16): from
+# 4021030b81acd342affafaab923b096636670df4 through the descriptor pair.
+# The runtime waits for prototype bootstrap readiness and reserves the primary
+# RPC socket through shared A4 operations. Its source catalog binds the moved
+# policy and actual syscalls dependency. All seven SDK inputs, native client
+# source and DBT inventory 961 remain unchanged. The calibrated SDK budget,
+# job width and limits carry without increase; final runtime/source-closure
+# checks must bind this composition rather than older receipts.
+expected_pin=51ecc8fb0c7b38ff03ce1596d765a9a0055e7d09
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

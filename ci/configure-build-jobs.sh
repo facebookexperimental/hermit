@@ -1860,8 +1860,16 @@ fi
 # for the root Cargo.toml, Cargo.lock and rust-toolchain.toml, so all seven
 # SDK inputs, inventory 961, the calibrated budget, job width and limits are
 # unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4021030b81acd342affafaab923b096636670df4 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4021030b81acd342affafaab923b096636670df4 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 51ecc8fb0c7b38ff03ce1596d765a9a0055e7d09 (2026-10-16): from
+# 4021030b81acd342affafaab923b096636670df4 through the descriptor pair.
+# The runtime waits for prototype bootstrap readiness and reserves the primary
+# RPC socket through shared A4 operations. Its source catalog binds the moved
+# policy and actual syscalls dependency. All seven SDK inputs, native client
+# source and DBT inventory 961 remain unchanged. The calibrated SDK budget,
+# job width and limits carry without increase; final runtime/source-closure
+# checks must bind this composition rather than older receipts.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 51ecc8fb0c7b38ff03ce1596d765a9a0055e7d09 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 51ecc8fb0c7b38ff03ce1596d765a9a0055e7d09 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
