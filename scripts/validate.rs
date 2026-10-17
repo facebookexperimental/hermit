@@ -480,7 +480,9 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             || !unified.contains("--profile validate --workspace --all-targets")
             || !unified.contains("hermit/third-party-backends")
             || source.contains("--bin hermit")
-            || !source.contains("cargo clean --profile validate -p reverie-dbt -p detcore-sabre")
+            || !source.contains("./ci/clean-stale-reverie-dbt.sh validate")
+            || !source.contains("HERMIT_INSTALL_FORCE_RESTAGE=")
+            || source.contains("cargo clean")
             || source.contains("--release")
         {
             return Err(format!(
