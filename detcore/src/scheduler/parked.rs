@@ -798,7 +798,7 @@ impl Scheduler {
     /// - [`RealTimeFate::Deliverable`]: anything else, including whatever this
     ///   cannot decide; the run refuses as before.
     ///
-    /// Each mask is the one the schedule fixes (`thread_signal_mask`, or the
+    /// Each mask is the one the schedule fixes (`thread_signal_mask_for`, or the
     /// guest's own mask for a thread Detcore holds under a private one,
     /// `saved_guest_sigmasks`). A thread in a call outside the schedule makes
     /// the expiration deliverable: its live mask is host-timed, and its
@@ -840,7 +840,7 @@ impl Scheduler {
             }
             let mask = match self.saved_guest_sigmasks.get(&thread) {
                 Some(mask) => *mask,
-                None => match self.thread_signal_mask(thread) {
+                None => match self.thread_signal_mask_for(thread, signo) {
                     Some(mask) => mask,
                     None => return RealTimeFate::Deliverable,
                 },

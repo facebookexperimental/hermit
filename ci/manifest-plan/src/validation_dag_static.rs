@@ -2490,7 +2490,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // coordinator): 2045.
     // And the guest_log exit-hook flush test: 2046.
     // And +5 from 77350e52: 2051.
-    ("test.detcore_unit", 2051),
+    // And +5 from 2977da2b: 2056.
+    ("test.detcore_unit", 2056),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4327,7 +4328,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the five guest_log tests: 2045.
     // And the guest_log exit-hook flush test: 2046.
     // And +5 from 77350e52: 2051.
-    ("test.detcore_unit_on_host", 2051),
+    // And +5 from 2977da2b: 2056.
+    ("test.detcore_unit_on_host", 2056),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

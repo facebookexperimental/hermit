@@ -21,21 +21,33 @@ Where the copy is kept, some decisions read it in place of the kernel's
 - a thread's own decisions that need only its dispositions (which signals it
   ignores and which it catches);
 - whether a signal sent to another thread is discarded at the send, from the
-  dispositions each process publishes to the scheduler. A thread publishes
-  them, when they changed, in one extra message before its next scheduler
-  request. The message carries no logical time.
+  dispositions each process publishes to the scheduler;
+- where the scheduler reads another thread's mask for one signal: whether a
+  send discards it, which thread a process-directed signal the scheduler
+  sends goes to (a child's SIGCHLD, a timer's signal) and whether every
+  thread blocks it, which thread takes a SIGCHLD first, whether a real-time
+  timer's expiration is kept, and whether a restartable poll admits the
+  signal. Each thread publishes its mask, except inside a temporary-mask
+  wait, before a reported handler return or a handler entry has been
+  checked, and with a handler frame open whose return the backend would not
+  report. While Detcore holds a thread under a mask of its own, the kernel's
+  mask is read, as before.
+
+A thread publishes what changed before its next scheduler request, in at
+most three extra messages (its process's dispositions, at most twice, and its
+mask). They carry no logical time.
 
 The copy answers only for signals whose kernel state it holds exactly: not
 for the signals Linux can force-deliver (SIGTRAP, SIGSEGV, SIGBUS, SIGILL,
 SIGFPE, SIGSYS), not for Reverie's preemption signal, and not while a signal
-the backend passed on without reporting it may have changed the actions
-unseen. Since the copy is checked against the kernel and given up on any
+the backend passed on without reporting it may have changed the actions or
+the mask unseen. Since the copy is checked against the kernel and given up on any
 mismatch, where it answers it gives what `/proc` shows, except between a
 defect in the copy and the check that finds it (which logs
 `SIGNAL_STATE_COPY_DIVERGED`, below). One more exception: when
 the target's `/proc` file cannot be read (for example a thread the host has
-already removed), the published dispositions still decide, where the `/proc`
-read would have decided that nothing is discarded.
+already removed), the published state still decides, where the `/proc` read
+would have decided as if nothing were known.
 
 On ptrace, turning it on also asks the backend to report each guest
 `rt_sigreturn` before it runs, so the copy follows handler returns exactly

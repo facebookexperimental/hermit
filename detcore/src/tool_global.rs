@@ -2292,6 +2292,16 @@ impl GlobalState {
             );
             return (None, R::PublishSignalDispositions(held));
         }
+        // A thread's mask from Detcore's copy
+        // (`syscalls::signal_shadow::publish_mask`): the same kind of message.
+        if let GlobalRequest::PublishSignalMask(mask) = request {
+            let taken = self
+                .sched
+                .lock()
+                .unwrap()
+                .publish_signal_mask(dtid, request_mm, mask);
+            return (None, R::PublishSignalMask(taken));
+        }
         if let GlobalRequest::SignalDequeued {
             detpid,
             identity,
@@ -2541,6 +2551,9 @@ impl GlobalState {
             }
             GlobalRequest::PublishSignalDispositions(..) => {
                 unreachable!("published dispositions answered before clock accounting")
+            }
+            GlobalRequest::PublishSignalMask(_) => {
+                unreachable!("a published mask is answered before clock accounting")
             }
             GlobalRequest::ParkedRequest(rs, pid, capability) => {
                 let (response, _) = self
@@ -3972,8 +3985,10 @@ impl GlobalState {
                 .unwrap()
                 .count_incarnation(child_dettid.as_raw());
 
-            // A new thread on a reused tid has not exited.
+            // A new thread on a reused tid has not exited, and has published
+            // no mask.
             sched.forget_committed_exit(child_dettid);
+            sched.published_masks.remove(&child_dettid);
             // Don't fill in the request, as the child will do it:
             let _entry = sched
                 .next_turns
@@ -5653,6 +5668,10 @@ pub enum GlobalRequest {
     /// before forwarded records are drained and before any clock or scheduler
     /// accounting. Appended last.
     GuestLog(Option<crate::guest_log::GuestLogRecord>, u64),
+    /// The sender's mask as Detcore's copy holds it, or `None` to withdraw
+    /// it (`Scheduler::publish_signal_mask`). Answered before any clock or
+    /// scheduler accounting. Appended last.
+    PublishSignalMask(Option<u64>),
 }
 
 /// Responses from the global object
@@ -5843,6 +5862,9 @@ pub enum GlobalResponse {
     PublishSignalDispositions(Option<crate::syscalls::signal_shadow::PublicationAnswer>),
     /// Appended last.
     GuestLog(()),
+    /// Whether the scheduler took the mask (it takes nothing from a thread it
+    /// does not know). Appended last.
+    PublishSignalMask(bool),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -6292,6 +6314,26 @@ where
     }
 }
 
+/// Whether the scheduler took `mask` as the calling thread's
+/// (`Scheduler::publish_signal_mask`; `None` withdraws it). Sent like
+/// [`publish_signal_dispositions`].
+pub(crate) async fn publish_signal_mask<G, T>(guest: &mut G, mask: Option<u64>) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let state = guest.thread_state();
+    let message = (
+        state.thread_logical_time.clone(),
+        state.mm_id,
+        GlobalRequest::PublishSignalMask(mask),
+    );
+    matches!(
+        guest.send_rpc(message).await.1,
+        GlobalResponse::PublishSignalMask(true)
+    )
+}
+
 pub async fn send_and_update_time<G, T>(
     guest: &mut G,
     request: GlobalRequest,
@@ -6311,8 +6353,9 @@ where
         "replacement image must reconnect before ordinary RPCs"
     );
     // Any request may let another thread run, which may then decide from
-    // this thread's process's dispositions.
+    // this thread's process's dispositions or this thread's mask.
     crate::syscalls::signal_shadow::publish_dispositions(guest).await;
+    crate::syscalls::signal_shadow::publish_mask(guest).await;
     let mytime = guest.thread_state().thread_logical_time.clone();
     let mm = guest.thread_state().mm_id;
     let mut resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
@@ -11282,6 +11325,7 @@ mod tests {
             *guest.requests.lock().unwrap(),
             vec![
                 GlobalRequest::PublishSignalDispositions(1, Some(ignoring)),
+                GlobalRequest::PublishSignalMask(Some(0)),
                 mutation(1),
                 mutation(2),
             ],
@@ -11414,6 +11458,164 @@ mod tests {
                 mutation(7),
             ]
         );
+    }
+
+    /// A5 step 2b: an ordinary request first publishes the caller's mask
+    /// from Detcore's copy, through the real global RPC, when it differs
+    /// from what the scheduler holds, withdraws it inside a temporary-mask
+    /// wait, and is refused for a thread the scheduler does not know, which
+    /// publishes again once known. The scheduler's reader answers from it.
+    #[tokio::test]
+    async fn an_ordinary_request_first_publishes_a_changed_mask() {
+        use reverie::Tool;
+
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| backend.supports_blocked_wait_signal_interruption = true);
+        let state = GlobalState::initialize(&config, false);
+        let leader = DetTid::from_raw(17);
+        let process = DetPid::from_raw(17);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(leader, leader, true);
+        install_test_registration(&state, leader, Ivar::new());
+        let tool = <Detcore as Tool>::new(reverie::Pid::from_raw(leader.as_raw()), &config);
+        let mut thread = tool.init_thread_state(Tid::from_raw(leader.as_raw()), None);
+        thread.detpid = Some(process);
+        let usr1 = 1 << (libc::SIGUSR1 - 1);
+        thread.signal_shadow = Some(crate::signal_state::SignalShadow::seeded(0, usr1));
+        let mut guest = ExternalRegistrationGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            post_exec: false,
+        };
+        let mutation = |n: u32| GlobalRequest::RecordHostMutation {
+            path: format!("/a5-step-2b-mask/{n}"),
+        };
+        let masks = |guest: &ExternalRegistrationGuest<'_>| -> Vec<GlobalRequest> {
+            guest
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| !matches!(request, GlobalRequest::PublishSignalDispositions(..)))
+                .cloned()
+                .collect()
+        };
+        let held = |state: &GlobalState| {
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .published_masks
+                .get(&leader)
+                .copied()
+        };
+
+        super::send_and_update_time(&mut guest, mutation(1)).await;
+        super::send_and_update_time(&mut guest, mutation(2)).await;
+        // The whole stream: the process's dispositions, then the mask, then
+        // the request.
+        assert_eq!(
+            *guest.requests.lock().unwrap(),
+            vec![
+                GlobalRequest::PublishSignalDispositions(
+                    1,
+                    Some(crate::syscalls::signal_shadow::CopiedDispositions {
+                        ignored: 0,
+                        caught: 0,
+                    })
+                ),
+                GlobalRequest::PublishSignalMask(Some(usr1)),
+                mutation(1),
+                mutation(2),
+            ],
+            "published once, before the first request"
+        );
+        assert_eq!(held(&state), Some(usr1));
+        assert_eq!(guest.thread.published_mask, Some(Some(usr1)));
+        assert_eq!(
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .published_mask_for(leader, libc::SIGUSR1),
+            Some(usr1)
+        );
+
+        // Inside a temporary-mask wait the kernel may hold the wait's mask:
+        // withdrawn.
+        guest
+            .thread
+            .signal_shadow
+            .as_mut()
+            .unwrap()
+            .thread
+            .wait_mask = Some(0);
+        guest.requests.lock().unwrap().clear();
+        super::send_and_update_time(&mut guest, mutation(3)).await;
+        assert_eq!(
+            masks(&guest),
+            vec![GlobalRequest::PublishSignalMask(None), mutation(3)]
+        );
+        assert_eq!(held(&state), None);
+
+        // Refused while the scheduler does not know the thread; published
+        // again once it does.
+        guest
+            .thread
+            .signal_shadow
+            .as_mut()
+            .unwrap()
+            .thread
+            .wait_mask = None;
+        let mut turn = state.sched.lock().unwrap().next_turns.remove(&leader);
+        guest.requests.lock().unwrap().clear();
+        super::send_and_update_time(&mut guest, mutation(4)).await;
+        assert_eq!(held(&state), None, "refused");
+        assert_eq!(guest.thread.published_mask, Some(None));
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .next_turns
+            .insert(leader, turn.take().unwrap());
+        super::send_and_update_time(&mut guest, mutation(5)).await;
+        assert_eq!(
+            masks(&guest),
+            vec![
+                GlobalRequest::PublishSignalMask(Some(usr1)),
+                mutation(4),
+                GlobalRequest::PublishSignalMask(Some(usr1)),
+                mutation(5),
+            ]
+        );
+        assert_eq!(held(&state), Some(usr1));
+
+        // An exec that loses the copy: what the scheduler holds is unknown
+        // after an exec, so the next request withdraws the mask.
+        guest
+            .thread
+            .signal_shadow
+            .as_ref()
+            .unwrap()
+            .forget_dispositions();
+        crate::syscalls::signal_shadow::at_exec(&mut guest);
+        assert!(guest.thread.signal_shadow.is_none(), "the copy was lost");
+        guest.requests.lock().unwrap().clear();
+        super::send_and_update_time(&mut guest, mutation(6)).await;
+        assert_eq!(
+            masks(&guest),
+            vec![GlobalRequest::PublishSignalMask(None), mutation(6)]
+        );
+        assert_eq!(held(&state), None);
     }
 
     async fn check_external_child_tid_registration(

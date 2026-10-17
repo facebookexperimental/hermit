@@ -1011,7 +1011,7 @@ impl Scheduler {
         if !self.models_signal_targets || bit == 0 {
             return false;
         }
-        let Some(mask) = self.discard_mask(named) else {
+        let Some(mask) = self.discard_mask(named, signal) else {
             return false;
         };
         if mask & bit != 0 {
@@ -1046,8 +1046,10 @@ impl Scheduler {
     /// 3. the mask recorded for a thread asleep outside the schedule
     ///    (`out_of_scheduler_masks`), where an unknown one is `None`;
     /// 4. a filed `BlockingRtSigsuspend` request's temporary mask;
-    /// 5. `SigBlk`, for a live thread stopped at a request.
-    pub(crate) fn discard_mask(&self, named: DetTid) -> Option<u64> {
+    /// 5. the mask `named` published, where it decides about `signal`, or
+    ///    else `SigBlk`, for a live thread stopped at a request
+    ///    (`blocked_mask_for`).
+    pub(crate) fn discard_mask(&self, named: DetTid, signal: i32) -> Option<u64> {
         if let Some(saved) = self.saved_guest_sigmasks.get(&named) {
             return Some(*saved);
         }
@@ -1066,7 +1068,7 @@ impl Scheduler {
         if !self.next_turns.contains_key(&named) {
             return None;
         }
-        self.read_thread_blocked_mask(named)
+        self.blocked_mask_for(named, signal)
     }
 
     /// The temporary mask of `dettid`'s filed `BlockingRtSigsuspend` request.

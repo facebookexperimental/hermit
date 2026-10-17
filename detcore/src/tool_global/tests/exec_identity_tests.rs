@@ -938,6 +938,8 @@ async fn transferred_exec_publishes_the_new_images_dispositions_before_its_turn(
                 process: LEADER,
             },
             GlobalRequest::PublishSignalDispositions(2, Some(reset)),
+            // Published again under the leader's tid, which the exec took.
+            GlobalRequest::PublishSignalMask(Some(0)),
             GlobalRequest::ResumeExec(LEADER),
         ]
     );

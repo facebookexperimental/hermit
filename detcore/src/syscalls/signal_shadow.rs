@@ -524,6 +524,11 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    // A nonleader exec takes the leader's tid, whose entry the scheduler
+    // drops with the old leader, and the copy may not survive the exec: what
+    // the scheduler holds is unknown, so the mask, or its withdrawal, is
+    // published again.
+    guest.thread_state_mut().published_mask = None;
     if let Some(shadow) = guest.thread_state_mut().signal_shadow.as_mut() {
         if !shadow.exec() {
             drop_copy(guest);
@@ -1071,6 +1076,67 @@ where
 /// syscall and gives its copy up.
 pub(crate) fn published_dispositions_decide(signal: i32) -> bool {
     models(signal) && !any_notes()
+}
+
+/// The mask this thread publishes to the scheduler (A5 step 2b,
+/// [`publish_mask`]): the copy's `blocked`, where that is the mask the kernel
+/// holds for the thread whenever it is stopped at a request. `None` (nothing
+/// to publish) without a copy, and while it may not be:
+/// - inside a temporary-mask wait (`wait_mask`), whose mask the kernel may
+///   have installed, or with an interrupted wait's mask still to put back
+///   (`saved`);
+/// - before the next syscall entry verifies a mask a backend report set
+///   (`verify_at_entry`);
+/// - with a handler frame open where its return would go unseen
+///   (`observes_returns` false), or whose entry no check has seen yet (the
+///   kernel keeps the old mask when it cannot write the frame).
+///
+/// A mask Detcore installs privately is not this one either, but readers
+/// take the guest's mask from `Scheduler::saved_guest_sigmasks` first then.
+fn mask_to_publish<T>(
+    thread: &crate::tool_local::ThreadState<T>,
+    observes_returns: bool,
+) -> Option<KernelSigset> {
+    let masks = &thread.signal_shadow.as_ref()?.thread;
+    let uncertain = masks.wait_mask.is_some()
+        || masks.saved.is_some()
+        || masks.verify_at_entry
+        || (!masks.activations.is_empty() && !(observes_returns && masks.innermost_observed()));
+    (!uncertain).then_some(masks.blocked)
+}
+
+/// Publishes this thread's mask from Detcore's copy to the scheduler
+/// ([`mask_to_publish`]), or withdraws it, where that differs from what it
+/// last had taken or what the scheduler holds is unknown
+/// (`ThreadState::published_mask`), so that a decision about
+/// this thread reads it in place of the kernel's `SigBlk`
+/// (`Scheduler::published_mask_for`). Called with [`publish_dispositions`],
+/// before each request that can let another thread run. A mask is the
+/// thread's own and only the thread changes or publishes it, so its
+/// publications cannot overtake each other. A thread the scheduler has not
+/// registered yet is refused, and publishes again at its next request.
+pub(crate) async fn publish_mask<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !kernel_state_is_the_guests(guest) {
+        return;
+    }
+    let current = mask_to_publish(guest.thread_state(), observes_sigreturns(guest.config()));
+    if guest.thread_state().published_mask == Some(current) {
+        return;
+    }
+    let taken = crate::tool_global::publish_signal_mask(guest, current).await;
+    trace!(
+        "[dtid {}] signal-state copy: published its mask {:?} (taken: {})",
+        guest.thread_state().dettid,
+        current.map(|mask| format!("{mask:#x}")),
+        taken
+    );
+    if taken {
+        guest.thread_state_mut().published_mask = Some(current);
+    }
 }
 
 /// Before this thread runs a clone with `flags`: a child that shares the
@@ -2442,6 +2508,57 @@ mod tests {
         assert_eq!(due(&guest), Some(None), "withdrawn");
         published(&guest, None);
         assert_eq!(due(&guest), None);
+    }
+
+    /// A5 step 2b: a thread publishes its copy's mask only where it is what
+    /// the kernel holds whenever the thread is stopped at a request.
+    #[test]
+    fn the_mask_is_published_only_where_the_kernel_holds_it() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = seeded(&kernel, USR1);
+        let publish = |guest: &ShadowGuest, observes| mask_to_publish(&guest.thread, observes);
+        assert_eq!(publish(&guest, true), Some(USR1));
+        fn masks(guest: &mut ShadowGuest) -> &mut ThreadSignals {
+            &mut guest.thread.signal_shadow.as_mut().unwrap().thread
+        }
+        masks(&mut guest).wait_mask = Some(0);
+        assert_eq!(publish(&guest, true), None, "inside a temporary-mask wait");
+        masks(&mut guest).wait_mask = None;
+        masks(&mut guest).saved = Some(USR1);
+        assert_eq!(
+            publish(&guest, true),
+            None,
+            "an interrupted wait's mask to put back"
+        );
+        masks(&mut guest).saved = None;
+        masks(&mut guest).verify_at_entry = true;
+        assert_eq!(
+            publish(&guest, true),
+            None,
+            "a reported mask not yet verified"
+        );
+        masks(&mut guest).verify_at_entry = false;
+        masks(&mut guest).activations.push(0);
+        masks(&mut guest).observed.push(false);
+        assert_eq!(
+            publish(&guest, true),
+            None,
+            "a handler entry no check has seen"
+        );
+        *masks(&mut guest).observed.last_mut().unwrap() = true;
+        assert_eq!(
+            publish(&guest, true),
+            Some(USR1),
+            "a checked frame whose return is reported"
+        );
+        assert_eq!(
+            publish(&guest, false),
+            None,
+            "a frame whose return would go unseen"
+        );
+        guest.thread.signal_shadow = None;
+        assert_eq!(publish(&guest, true), None, "no copy");
     }
 
     /// Where no copy is kept nothing is published, even with the switch on.
