@@ -78,6 +78,10 @@ mod verify_run;
 #[path = "common/verify_inputs.rs"]
 mod verify_inputs;
 
+#[cfg(feature = "liteinst")]
+#[path = "common/startup_guards.rs"]
+mod startup_guards;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
