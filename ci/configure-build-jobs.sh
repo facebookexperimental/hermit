@@ -1850,8 +1850,18 @@ fi
 # (tree 17688ad5a2f6 at both pins), and the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml are unchanged. All seven SDK inputs, inventory 961,
 # calibrated budget, job width and limits are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 1e36924571bda44acd381e35a0d7c6f6f3a4894c ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 1e36924571bda44acd381e35a0d7c6f6f3a4894c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 4021030b81acd342affafaab923b096636670df4 (2026-10-16): from
+# 1e36924571bda44acd381e35a0d7c6f6f3a4894c. Three commits: 057c2f75 changes two
+# reverie-inguest test-support files; b68cc8b9 deletes reverie-kvm's copy of
+# /proc/cpuinfo (reverie-kvm/src/executor.rs only); 4021030b is vspeed's PMU
+# skid-margin table entry for AMD family 1Ah model 11h, 1,000 -> 2,000 RCBs
+# (reverie/src/pmu.rs and reverie-ptrace/src/timer.rs unit expectations).
+# git diff is empty under reverie-dbt/ (tree 17688ad5a2f6 at both pins) and
+# for the root Cargo.toml, Cargo.lock and rust-toolchain.toml, so all seven
+# SDK inputs, inventory 961, the calibrated budget, job width and limits are
+# unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4021030b81acd342affafaab923b096636670df4 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4021030b81acd342affafaab923b096636670df4 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
