@@ -980,6 +980,13 @@ pub(crate) fn default_action_ends_process(
         || ((ignored | caught | default_ignored_signals() | stops_or_continues) & bit) == 0
 }
 
+/// The signals a process with dispositions `ignored` and `caught` discards
+/// when they are generated and unblocked: those set to `SIG_IGN`, and the
+/// default-ignored ones with no handler (`sig_task_ignored`).
+pub(crate) fn ignored_at_generation(ignored: KernelSigset, caught: KernelSigset) -> KernelSigset {
+    ignored | (default_ignored_signals() & !caught)
+}
+
 impl KernelSignalState {
     /// Parse the five signal lines of a `/proc/<pid>/task/<tid>/status` file.
     pub(crate) fn parse(status: &str) -> Option<Self> {
@@ -1039,7 +1046,7 @@ impl KernelSignalState {
     /// ones with no handler. A caller that knows a better mask than `SigBlk`
     /// (`scheduler::discarded_at_send`) applies its own.
     pub(crate) fn ignored_at_generation(&self) -> KernelSigset {
-        self.ignored | (default_ignored_signals() & !self.caught)
+        ignored_at_generation(self.ignored, self.caught)
     }
 
     /// Whether delivering `signal` now ends the process: its disposition is
@@ -1870,6 +1877,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !flags.contains(CloneFlags::CLONE_THREAD) {
             self.promote_before_native_lifecycle(guest);
         }
+
+        // Actions shared with a new process are withdrawn from the
+        // scheduler before the child exists.
+        super::signal_shadow::before_clone(guest, flags.bits()).await;
 
         trace!("[detcore, dtid {}] parent invoking clone.", parent_dettid);
         let blocking_child_op_id =

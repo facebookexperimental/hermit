@@ -14,7 +14,9 @@
 //! committed, uses only values Detcore already holds for that operation, and
 //! issues no injection and no scheduler request: recording changes nothing the
 //! guest or the schedule can observe, and adds no log line at INFO or above
-//! while the copy matches (one TRACE line per check, for counting).
+//! while the copy matches (one TRACE line per check, for counting). The
+//! scheduler learns the copy's dispositions separately, from
+//! [`publish_dispositions`], a message that carries no logical time.
 //!
 //! Where the backend's kernel signal state is the guest's own
 //! ([`kernel_state_is_the_guests`]), the
@@ -30,6 +32,8 @@ use reverie::Pid;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
+use serde::Deserialize;
+use serde::Serialize;
 use tracing::debug;
 use tracing::trace;
 use tracing::warn;
@@ -47,8 +51,8 @@ use crate::signal_state::ThreadSignals;
 use crate::signal_state::sigbit;
 
 /// The environment variable that turns the copy on: `1` seeds, records and
-/// checks it; unset (the default) leaves every run as it was. The copy is a
-/// diagnostic until A5 step 2 relies on it. The ptrace backend reports
+/// checks it, and lets the decisions A5 step 2 converted read it; unset (the
+/// default) leaves every run as it was. The ptrace backend reports
 /// handler returns to it (`Tool::handle_sigreturn`), but not every delivery,
 /// and asking for the reports adds a stop at each handler return, so it is
 /// opt-in.
@@ -849,12 +853,43 @@ where
 
 /// The guest's dispositions as Detcore's copy holds them, in the kernel's bit
 /// layout: the signals it ignores and the signals it catches.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CopiedDispositions {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CopiedDispositions {
     /// Signals whose action is `SIG_IGN`.
     pub(crate) ignored: KernelSigset,
     /// Signals with a handler.
     pub(crate) caught: KernelSigset,
+}
+
+/// A process's record of its publications to the scheduler
+/// ([`publish_dispositions`]), shared by its threads. Each publication takes
+/// the next generation under this record's lock, with the copy read under the
+/// same lock, so a later generation always carries a later reading of the
+/// copy. The scheduler keeps the latest generation it received, in whatever
+/// order publications arrive, and stores this same type per process.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PublishedDispositions {
+    /// The latest generation a thread of the process used, or the scheduler
+    /// was found to hold; 0 before the first.
+    pub(crate) generation: u64,
+    /// The latest generation the scheduler held when it answered one of this
+    /// process's publications: the one `dispositions` came from. Unused in
+    /// the scheduler's own entry.
+    #[serde(default)]
+    pub(crate) accepted: u64,
+    /// The dispositions the scheduler holds; `None` when it holds none.
+    pub(crate) dispositions: Option<CopiedDispositions>,
+}
+
+/// The scheduler's answer to a publication
+/// (`Scheduler::publish_signal_dispositions`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PublicationAnswer {
+    /// The generation the scheduler holds for the process afterwards.
+    pub(crate) held: u64,
+    /// Whether this publication is what it holds now: its generation was
+    /// later than any the scheduler held.
+    pub(crate) taken: bool,
 }
 
 /// This thread's dispositions from Detcore's copy, for a decision that needs
@@ -877,7 +912,14 @@ where
     if any_notes() {
         return None;
     }
-    let shadow = guest.thread_state().signal_shadow.as_ref()?;
+    table_dispositions(guest.thread_state())
+}
+
+/// The dispositions `thread`'s copy holds for the actions it shares, whether
+/// or not an unreported signal is noted: `None` without a copy, or with the
+/// shared actions unknown.
+fn table_dispositions<T>(thread: &crate::tool_local::ThreadState<T>) -> Option<CopiedDispositions> {
+    let shadow = thread.signal_shadow.as_ref()?;
     let actions = shadow.dispositions.lock().unwrap();
     let dispositions = actions.as_ref()?;
     Some(CopiedDispositions {
@@ -894,10 +936,168 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if (forced() | reserved()) & sigbit(signal) != 0 {
+    if !models(signal) {
         return None;
     }
     copied_dispositions(guest)
+}
+
+/// Whether the copy holds `signal`'s state exactly: it is neither a signal
+/// Linux force-delivers ([`forced`]) nor Reverie's preemption signal
+/// ([`reserved`]), whose kernel state changes without the copy seeing it.
+fn models(signal: i32) -> bool {
+    (forced() | reserved()) & sigbit(signal) == 0
+}
+
+/// The publication this thread has to make for its process
+/// ([`publish_dispositions`]), with the next generation, taken under the
+/// record's lock with the copy read under the same lock: the copy's
+/// dispositions, or `None` to withdraw them, because it has no copy or the
+/// shared actions became unknown. Nothing when the scheduler already holds
+/// that for the process, and where no copy is kept.
+fn next_publication<G, T>(guest: &G) -> Option<(u64, Option<CopiedDispositions>)>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !kernel_state_is_the_guests(guest) {
+        return None;
+    }
+    let mut record = guest.thread_state().published_dispositions.lock().unwrap();
+    let current = table_dispositions(guest.thread_state());
+    if current == record.dispositions {
+        return None;
+    }
+    record.generation += 1;
+    Some((record.generation, current))
+}
+
+/// Applies the scheduler's `answer` to publication `generation` of `current`,
+/// and returns whether to publish again at once.
+/// - Taken, and no later answer was applied: the record takes its
+///   dispositions.
+/// - Not taken: the scheduler holds a generation at least as late, from a
+///   later publication of this process or from an entry this process never
+///   made. The record carries on after it, keeping its dispositions, and the
+///   thread publishes again at once, before its request can let another
+///   thread read the entry.
+/// - Refused (`None`, a thread the scheduler does not know): nothing changes,
+///   and the thread publishes again at its next request.
+fn settle_publication(
+    record: &mut PublishedDispositions,
+    generation: u64,
+    current: Option<CopiedDispositions>,
+    answer: Option<PublicationAnswer>,
+) -> bool {
+    let Some(answer) = answer else {
+        return false;
+    };
+    if answer.taken {
+        if generation > record.accepted {
+            record.accepted = generation;
+            record.dispositions = current;
+        }
+        return false;
+    }
+    if answer.held > record.generation {
+        record.generation = answer.held;
+    }
+    true
+}
+
+/// Publishes this thread's copied dispositions to the scheduler as its
+/// process's (A5 step 2b), where they differ from what the scheduler holds
+/// for it (`ThreadState::published_dispositions`), so that a decision about another thread reads them in
+/// place of the kernel's `/proc` view (`Scheduler::published_dispositions_for`).
+///
+/// Called before each of the thread's requests that can let another thread
+/// run (`tool_global::send_and_update_time`). Every change to the actions is
+/// recorded in the operations of the thread that makes it, which publishes it
+/// before its next request, so the scheduler holds the new actions before any
+/// other thread can read them. Threads that do not hold the turn publish too
+/// (a thread rejoining the schedule after a host call, a new thread's start,
+/// a control message at a signal stop), so publications can arrive out of
+/// order: each carries a generation ([`PublishedDispositions`]) and the
+/// scheduler keeps the latest. A thread the scheduler has not registered yet
+/// is refused, and publishes again at its next request
+/// ([`settle_publication`]).
+///
+/// Every thread sharing the actions holds them behind one reference, so a
+/// thread publishes them as they are now, whoever changed them. (After an
+/// exec, the old image's other threads keep the old actions until the kernel
+/// has killed them and their teardown runs; they make no request in
+/// between.) The scheduler keys them by process, which is right because the
+/// actions of a process are never shared with another one: [`before_clone`]
+/// makes them unknown first.
+///
+/// That the scheduler's entry is never older than the copy rests on two
+/// facts: where a copy is kept (ptrace), a publication is answered inline,
+/// within the sender's own call, so it cannot be delayed past its sender;
+/// and backends whose messages could be delayed keep no copy. The
+/// generations, the scheduler's refusal of retired incarnations, and the
+/// immediate republication after an answer that did not take it, guard
+/// against an entry that should not be there all the same.
+pub(crate) async fn publish_dispositions<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    // A publication that was not taken is made again once, with a
+    // generation past the one the scheduler holds, so it is taken.
+    for _ in 0..2 {
+        let Some((generation, current)) = next_publication(guest) else {
+            return;
+        };
+        let answer =
+            crate::tool_global::publish_signal_dispositions(guest, generation, current).await;
+        trace!(
+            "[dtid {}] signal-state copy: published its process's dispositions {:?} (generation {}, answer: {:?})",
+            guest.thread_state().dettid,
+            current,
+            generation,
+            answer
+        );
+        let mut record = guest.thread_state().published_dispositions.lock().unwrap();
+        if !settle_publication(&mut record, generation, current, answer) {
+            return;
+        }
+    }
+}
+
+/// Whether dispositions a process published ([`publish_dispositions`])
+/// decide about `signal` now: the copy holds it exactly ([`models`]), and no
+/// unreported signal is noted, whose handler may have changed the actions
+/// unseen (`SA_RESETHAND`) until its thread consumes the note at its next
+/// syscall and gives its copy up.
+pub(crate) fn published_dispositions_decide(signal: i32) -> bool {
+    models(signal) && !any_notes()
+}
+
+/// Before this thread runs a clone with `flags`: a child that shares the
+/// actions from another process (`CLONE_SIGHAND` without `CLONE_THREAD`)
+/// could change them where the scheduler, which keeps the published
+/// dispositions per process, would not see it for this one. The actions
+/// become unknown to every thread sharing them, and are withdrawn before the
+/// child exists, also for a clone that then fails. Such a child gets no copy
+/// (`SignalShadow::for_clone`).
+pub(crate) async fn before_clone<G, T>(guest: &mut G, flags: u64)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let shares_actions = flags & libc::CLONE_SIGHAND as u64 != 0;
+    let new_process = flags & libc::CLONE_THREAD as u64 == 0;
+    if shares_actions
+        && new_process
+        && let Some(shadow) = guest.thread_state().signal_shadow.as_ref()
+    {
+        debug!(
+            "[dtid {}] signal-state copy: the actions become unknown, a clone shares them with a new process",
+            guest.thread_state().dettid
+        );
+        shadow.forget_dispositions();
+    }
+    publish_dispositions(guest).await;
 }
 
 /// Whether this tool asks the backend to report every guest `rt_sigreturn`
@@ -2123,6 +2323,291 @@ mod tests {
         // No copy at all.
         guest.thread.signal_shadow = None;
         assert_eq!(copied_dispositions(&guest), None);
+    }
+
+    /// The publication `guest` has to make (`next_publication`), without its
+    /// generation. Each call that finds one uses a generation.
+    fn due(guest: &ShadowGuest) -> Option<Option<CopiedDispositions>> {
+        next_publication(guest).map(|(_, dispositions)| dispositions)
+    }
+
+    /// A5 step 2b: the scheduler's answers settle the record in whatever
+    /// order they arrive. Only the latest answered publication sets the
+    /// dispositions; a refusal leaves them, so the next request publishes
+    /// again; a generation the process never used moves its counter past.
+    #[test]
+    fn answers_settle_the_record_in_any_order() {
+        let one = Some(CopiedDispositions {
+            ignored: USR1,
+            caught: 0,
+        });
+        let two = Some(CopiedDispositions {
+            ignored: USR1 | USR2,
+            caught: 0,
+        });
+        let answer = |held, taken| Some(PublicationAnswer { held, taken });
+        // Generations 1 and 2 were used; 2's answer arrives first.
+        let mut record = PublishedDispositions {
+            generation: 2,
+            accepted: 0,
+            dispositions: None,
+        };
+        assert!(!settle_publication(&mut record, 2, two, answer(2, true)));
+        assert!(
+            settle_publication(&mut record, 1, one, answer(2, false)),
+            "superseded: publish again"
+        );
+        assert_eq!((record.accepted, record.dispositions), (2, two));
+        // In order, each answer applies.
+        let mut record = PublishedDispositions {
+            generation: 2,
+            accepted: 0,
+            dispositions: None,
+        };
+        assert!(!settle_publication(&mut record, 1, one, answer(1, true)));
+        assert_eq!((record.accepted, record.dispositions), (1, one));
+        assert!(!settle_publication(&mut record, 2, two, answer(2, true)));
+        assert_eq!((record.accepted, record.dispositions), (2, two));
+        // A refusal changes nothing and waits for the next request; the
+        // dispositions still differ from the copy's, so that request publishes.
+        let before = record;
+        record.generation = 3;
+        assert!(!settle_publication(&mut record, 3, None, None));
+        assert_eq!(record.dispositions, before.dispositions);
+        // A refused publication does not block a later one's answer.
+        record.generation = 4;
+        assert!(!settle_publication(&mut record, 4, None, answer(4, true)));
+        assert_eq!((record.accepted, record.dispositions), (4, None));
+        // The scheduler holds generation 50, which this process never used:
+        // the counter carries on after it, the dispositions stay, and the
+        // thread publishes again at once.
+        record.generation = 5;
+        assert!(settle_publication(&mut record, 5, one, answer(50, false)));
+        assert_eq!(record.generation, 50);
+        assert_eq!((record.accepted, record.dispositions), (4, None));
+        // The same with an entry of this very generation, the likeliest
+        // stale shape (every process starts at 1): not taken, so not
+        // mistaken for this publication.
+        record.generation = 51;
+        assert!(settle_publication(&mut record, 51, one, answer(51, false)));
+        assert_eq!(record.generation, 51);
+        assert_eq!((record.accepted, record.dispositions), (4, None));
+    }
+
+    /// A5 step 2b: a thread has its process's dispositions to publish
+    /// whenever the scheduler holds anything else for the process, and
+    /// withdraws them once the copy is given up. Recording sends nothing
+    /// (this guest fails any RPC): publication waits for the thread's next
+    /// request.
+    #[test]
+    fn a_publication_is_due_whenever_the_scheduler_holds_other_dispositions() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = seeded(&kernel, 0);
+        let published = |guest: &ShadowGuest, dispositions| {
+            guest
+                .thread
+                .published_dispositions
+                .lock()
+                .unwrap()
+                .dispositions = dispositions;
+        };
+        let nothing = CopiedDispositions {
+            ignored: 0,
+            caught: 0,
+        };
+        assert_eq!(due(&guest), Some(Some(nothing)), "seeded");
+        published(&guest, Some(nothing));
+        assert_eq!(due(&guest), None, "the scheduler holds them");
+        let ignore = KernelSigaction {
+            handler: libc::SIG_IGN as u64,
+            flags: 0x0400_0000,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        kernel.set(0, USR1, 0);
+        record_rt_sigaction(&mut guest, libc::SIGUSR1, Some(ignore), None, &Ok(0));
+        let ignoring = CopiedDispositions {
+            ignored: USR1,
+            caught: 0,
+        };
+        assert_eq!(due(&guest), Some(Some(ignoring)));
+        published(&guest, Some(ignoring));
+        // A noted unreported signal does not stop the publication: the
+        // scheduler consults the notes itself.
+        note_unreported(1, i32::MAX - 1, libc::SIGUSR1);
+        assert_eq!(due(&guest), None);
+        with_notes(|notes| notes.clear());
+        give_up(&mut guest, "a test");
+        assert_eq!(due(&guest), Some(None), "withdrawn");
+        published(&guest, None);
+        assert_eq!(due(&guest), None);
+    }
+
+    /// Where no copy is kept nothing is published, even with the switch on.
+    #[test]
+    fn nothing_is_published_where_no_copy_is_kept() {
+        let config = Config {
+            sequentialize_threads: true,
+            backend: reverie::BackendCapabilities::KVM,
+            ..Config::default()
+        };
+        let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let guest = ShadowGuest { config, thread };
+        guest
+            .thread
+            .published_dispositions
+            .lock()
+            .unwrap()
+            .dispositions = Some(CopiedDispositions {
+            ignored: USR1,
+            caught: 0,
+        });
+        assert_eq!(due(&guest), None);
+    }
+
+    /// Published dispositions decide only about a signal the copy holds
+    /// exactly, and only while no unreported signal is noted.
+    #[test]
+    fn published_dispositions_decide_where_the_copy_does() {
+        assert!(published_dispositions_decide(libc::SIGUSR1));
+        assert!(published_dispositions_decide(libc::SIGCHLD));
+        for signal in [
+            libc::SIGTRAP,
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGILL,
+            libc::SIGFPE,
+            libc::SIGSYS,
+            reverie::PERF_EVENT_SIGNAL as i32,
+        ] {
+            assert!(!published_dispositions_decide(signal), "{signal}");
+        }
+        note_unreported(1, i32::MAX - 1, libc::SIGUSR1);
+        assert!(!published_dispositions_decide(libc::SIGUSR1));
+        with_notes(|notes| notes.clear());
+    }
+
+    /// A clone that shares the actions with a new process makes them unknown
+    /// before it runs, so its child gets no copy and the scheduler, which
+    /// keys the published dispositions by process, holds none for them. A
+    /// thread shares them within its process and changes nothing.
+    #[test]
+    fn a_clone_sharing_the_actions_with_a_new_process_makes_them_unknown() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let sighand = (libc::CLONE_VM | libc::CLONE_SIGHAND) as u64;
+        let nothing = CopiedDispositions {
+            ignored: 0,
+            caught: 0,
+        };
+
+        let mut guest = seeded(&kernel, 0);
+        guest
+            .thread
+            .published_dispositions
+            .lock()
+            .unwrap()
+            .dispositions = Some(nothing);
+        let thread = sighand | libc::CLONE_THREAD as u64;
+        futures::executor::block_on(before_clone(&mut guest, thread));
+        assert_eq!(copied_dispositions(&guest), Some(nothing), "a thread");
+
+        // Withdrawing what the scheduler holds is an RPC, which this guest
+        // fails, so it starts with nothing published.
+        let mut guest = seeded(&kernel, 0);
+        futures::executor::block_on(before_clone(&mut guest, sighand));
+        assert_eq!(copied_dispositions(&guest), None);
+        let shadow = guest.thread.signal_shadow.as_ref().unwrap();
+        assert!(
+            shadow.for_clone(sighand).is_none(),
+            "the child gets no copy"
+        );
+    }
+
+    /// The threads of a process share the record of what the scheduler holds
+    /// for it; a new process starts with nothing published. A thread created
+    /// inside a handler gets no copy and makes the shared actions unknown, so
+    /// it has their withdrawal due at its first request, before it runs any
+    /// guest code.
+    #[test]
+    fn a_thread_shares_its_process_record_and_one_denied_a_copy_withdraws() {
+        use reverie::Tool;
+
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut parent = seeded(&kernel, 0);
+        let nothing = CopiedDispositions {
+            ignored: 0,
+            caught: 0,
+        };
+        parent
+            .thread
+            .published_dispositions
+            .lock()
+            .unwrap()
+            .dispositions = Some(nothing);
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &parent.config);
+        let child = |parent: &mut ShadowGuest, flags: u64| {
+            parent.thread.clone_flags = Some(crate::CloneFlags::from_bits_truncate(flags));
+            let thread = <Detcore as Tool>::init_thread_state(
+                &tool,
+                Pid::from_raw(2),
+                Some((Pid::from_raw(1), &parent.thread)),
+            );
+            parent.thread.clone_flags = None;
+            ShadowGuest {
+                config: parent.config.clone(),
+                thread,
+            }
+        };
+        let thread_flags = (libc::CLONE_VM | libc::CLONE_SIGHAND | libc::CLONE_THREAD) as u64;
+
+        let fork = child(&mut parent, libc::SIGCHLD as u64);
+        assert!(!std::sync::Arc::ptr_eq(
+            &fork.thread.published_dispositions,
+            &parent.thread.published_dispositions
+        ));
+        assert_eq!(
+            due(&fork),
+            Some(Some(nothing)),
+            "a new process publishes its own"
+        );
+
+        let sibling = child(&mut parent, thread_flags);
+        assert!(std::sync::Arc::ptr_eq(
+            &sibling.thread.published_dispositions,
+            &parent.thread.published_dispositions
+        ));
+        assert_eq!(due(&sibling), None, "already published");
+
+        // Inside a handler: the child gets no copy and the actions become
+        // unknown to every sharer.
+        let handler = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        kernel.set(0, 0, USR1);
+        record_rt_sigaction(&mut parent, libc::SIGUSR1, Some(handler), None, &Ok(0));
+        let caught = CopiedDispositions {
+            ignored: 0,
+            caught: USR1,
+        };
+        parent
+            .thread
+            .published_dispositions
+            .lock()
+            .unwrap()
+            .dispositions = Some(caught);
+        kernel.set(USR1, 0, USR1);
+        record_delivery(&mut parent, libc::SIGUSR1);
+        assert_eq!(open_frames(&parent), 1);
+        let denied = child(&mut parent, thread_flags);
+        assert!(denied.thread.signal_shadow.is_none());
+        assert_eq!(due(&denied), Some(None), "withdrawn first");
+        assert_eq!(due(&parent), Some(None));
     }
 
     #[test]

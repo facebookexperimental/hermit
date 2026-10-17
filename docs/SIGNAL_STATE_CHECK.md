@@ -1,9 +1,9 @@
 # Checking Detcore's signal-state copy
 
 Detcore can keep its own copy of every guest thread's signal dispositions and
-blocked mask, and check it against the kernel. This is step 1 of audit step A5
-(https://github.com/rrnewton/hermit/issues/4485): a diagnostic that no
-decision reads yet. It is off by default. Turn it on with:
+blocked mask, and check it against the kernel. This is audit step A5
+(https://github.com/rrnewton/hermit/issues/4485). It is off by default. Turn
+it on with:
 
 ```bash
 HERMIT_SIGNAL_STATE_CHECK=1 hermit run --strict --epoch=2026-01-01T00:00:00Z -- ./program
@@ -14,6 +14,28 @@ guest's own, which means the ptrace backend (and e9patch preprocessing,
 which Hermit runs on ptrace), with serialized threads. Elsewhere, and
 whenever the variable is not `1`, nothing is recorded or checked, and runs
 are exactly as they would be without it.
+
+Where the copy is kept, some decisions read it in place of the kernel's
+`/proc` view of the thread:
+
+- a thread's own decisions that need only its dispositions (which signals it
+  ignores and which it catches);
+- whether a signal sent to another thread is discarded at the send, from the
+  dispositions each process publishes to the scheduler. A thread publishes
+  them, when they changed, in one extra message before its next scheduler
+  request. The message carries no logical time.
+
+The copy answers only for signals whose kernel state it holds exactly: not
+for the signals Linux can force-deliver (SIGTRAP, SIGSEGV, SIGBUS, SIGILL,
+SIGFPE, SIGSYS), not for Reverie's preemption signal, and not while a signal
+the backend passed on without reporting it may have changed the actions
+unseen. Since the copy is checked against the kernel and given up on any
+mismatch, where it answers it gives what `/proc` shows, except between a
+defect in the copy and the check that finds it (which logs
+`SIGNAL_STATE_COPY_DIVERGED`, below). One more exception: when
+the target's `/proc` file cannot be read (for example a thread the host has
+already removed), the published dispositions still decide, where the `/proc`
+read would have decided that nothing is discarded.
 
 On ptrace, turning it on also asks the backend to report each guest
 `rt_sigreturn` before it runs, so the copy follows handler returns exactly
@@ -48,5 +70,5 @@ What it reports:
   much was actually checked.
 
 It stays opt-in because the backend does not report every delivery yet, and
-because of the timer cost above, which must be resolved before step 2 of A5
-lets decisions rely on the copy.
+because of the timer cost above, which must be resolved before the copy can
+be on by default.

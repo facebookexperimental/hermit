@@ -54,6 +54,7 @@ use super::signal_lists::siginfo_code;
 use crate::resources::ResourceID;
 use crate::scheduler::kernel_signal_bit;
 use crate::syscalls::KernelSignalState;
+use crate::syscalls::ignored_at_generation;
 use crate::syscalls::read_kernel_signal_state;
 use crate::types::DetPid;
 use crate::types::DetTid;
@@ -1016,14 +1017,14 @@ impl Scheduler {
         if mask & bit != 0 {
             return false;
         }
-        let Some(state) = self.named_signal_state(named) else {
+        let Some((ignored, caught)) = self.named_dispositions(named, signal) else {
             return false;
         };
-        if state.ignored_at_generation() & bit != 0 {
+        if ignored_at_generation(ignored, caught) & bit != 0 {
             return true;
         }
         let process = self.thread_tree.process_of(named).unwrap_or(named);
-        if !self.thread_tree.is_pid_namespace_init(process) || state.caught & bit != 0 {
+        if !self.thread_tree.is_pid_namespace_init(process) || caught & bit != 0 {
             return false;
         }
         if signal == libc::SIGKILL || signal == libc::SIGSTOP {
@@ -1080,6 +1081,28 @@ impl Scheduler {
             .any(|rid| matches!(rid, ResourceID::BlockingRtSigsuspend(_)))
             .then_some(request.blocked_signal_mask)
             .flatten()
+    }
+
+    /// The signals `named`'s process ignores and catches, as `signal`'s
+    /// discard needs them: the dispositions it published where they decide
+    /// about `signal` (`published_dispositions_for`), and otherwise the
+    /// kernel's (`named_signal_state`). `None` under the same condition as
+    /// there: `named` is not stopped at a request, or its state cannot be
+    /// read.
+    fn named_dispositions(&self, named: DetTid, signal: i32) -> Option<(u64, u64)> {
+        if !self.next_turns.contains_key(&named) {
+            return None;
+        }
+        if let Some(published) = self.published_dispositions_for(named, signal) {
+            tracing::trace!(
+                "[dtid {}] a send of signal {} reads its process's published dispositions",
+                named,
+                signal
+            );
+            return Some((published.ignored, published.caught));
+        }
+        let state = self.named_signal_state(named)?;
+        Some((state.ignored, state.caught))
     }
 
     /// `named`'s signal state (dispositions, queues), read from the kernel, or

@@ -691,6 +691,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// The caller must initialize the child's local thread state from the same
     /// parent state and clone flags before the child enters its start hook.
+    /// No backend that reaches this keeps a signal-state copy; one that does
+    /// must call `signal_shadow::before_clone` before its native clone, as
+    /// `handle_clone_family` does.
     // TODO-HUMAN-REVIEW(PR-743): Review the backend-neutral native child registration API.
     pub async fn register_external_child<G: Guest<Self>>(
         &self,
@@ -2921,6 +2924,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // again; a child denied a copy for a quiet reason is
                     // seeded at its exec.
                     signal_shadow_lost: pts.1.signal_shadow_lost,
+                    // The threads of a process share the record of what the
+                    // scheduler holds for it; a new process has nothing
+                    // published.
+                    published_dispositions: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        Arc::clone(&pts.1.published_dispositions)
+                    } else {
+                        Arc::default()
+                    },
                     sigalrm_blocked_published: pts.1.sigalrm_blocked_published,
                     handler_restore_rt_reported: pts.1.handler_restore_rt_reported,
                     signal_register_projection: None,
@@ -3082,6 +3093,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // The new image's table may hold placeholders it rediscovered before
         // this, the image's first guest callback.
         self.decide_cpuinfo_placeholders(guest)?;
+        // Exec resets caught signals to their defaults, on a private copy of
+        // the actions; a thread without a copy (the first image, or one given
+        // up quietly) is seeded instead. Before any request: a nonleader
+        // exec's reconnect asks for a turn, and every request first publishes
+        // the process's dispositions, which must be the new image's.
+        crate::syscalls::signal_shadow::at_exec(guest);
         // A nonleader exec preserves the survivor's state and PMU counter, but
         // Linux changes its TID. Bind that state before any image callback RPC.
         match tool_global::reconnect_exec(guest).await {
@@ -3135,10 +3152,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .load(std::sync::atomic::Ordering::SeqCst);
         guest.thread_state_mut().changed_root =
             Arc::new(std::sync::atomic::AtomicBool::new(changed_root));
-        // Exec resets caught signals to their defaults, on a private copy of
-        // the actions; a thread without a copy (the first image, or one given
-        // up quietly) is seeded instead.
-        crate::syscalls::signal_shadow::at_exec(guest);
         // The exec'ing thread is its process's only thread now, and leads
         // it, so the table it holds is the process's. (Where Detcore handles
         // the execve, `handle_execveat` already installed it; a backend that

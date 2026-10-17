@@ -864,6 +864,101 @@ async fn transferred_exec_waits_for_real_grant_and_preserves_clock_and_deadlines
     fixture.assert_final_cpu_and_reap();
 }
 
+/// A5 step 2b: a nonleader exec's continuation request publishes the new
+/// image's dispositions, not the old image's. Exec resets a caught handler;
+/// the post-exec callback applies that to Detcore's copy before the reconnect
+/// asks for a turn, which publishes first.
+#[tokio::test]
+async fn transferred_exec_publishes_the_new_images_dispositions_before_its_turn() {
+    use crate::syscalls::signal_shadow::CopiedDispositions;
+    use crate::syscalls::signal_shadow::PublishedDispositions;
+
+    let mut fixture = Fixture::prepared().await;
+    fixture
+        .state
+        .cfg
+        .backend
+        .supports_blocked_wait_signal_interruption = true;
+    let usr1 = 1 << (libc::SIGUSR1 - 1);
+    let caught = CopiedDispositions {
+        ignored: 0,
+        caught: usr1,
+    };
+    let reset = CopiedDispositions {
+        ignored: 0,
+        caught: 0,
+    };
+    // The old image caught SIGUSR1, and its process published that.
+    let shadow = crate::signal_state::SignalShadow::seeded(0, 0);
+    shadow
+        .dispositions
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .sigaction(
+            libc::SIGUSR1,
+            Some(crate::signal_state::Action {
+                handler: 0x4000,
+                flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+                restorer: 0x7000,
+                mask: 0,
+            }),
+        )
+        .unwrap();
+    let old = PublishedDispositions {
+        generation: 1,
+        accepted: 1,
+        dispositions: Some(caught),
+    };
+    fixture
+        .state
+        .sched
+        .lock()
+        .unwrap()
+        .published_dispositions
+        .insert(LEADER, old);
+    // The kernel shows the new image: SIGUSR1 at its default.
+    let _seam = crate::syscalls::signal_state_read_seam::install(|_, _| {
+        Some(Ok(crate::syscalls::KernelSignalState::default()))
+    });
+    let mut guest = fixture.guest(Gate::None);
+    guest.thread.signal_shadow = Some(shadow);
+    *guest.thread.published_dispositions.lock().unwrap() = old;
+    {
+        let mut post_exec = Box::pin(fixture.tool.handle_post_exec(&mut guest));
+        // Waiting for the continuation's grant, which this test never gives.
+        assert!(futures::poll!(&mut post_exec).is_pending());
+    }
+    assert_eq!(
+        *guest.rpc.requests.lock().unwrap(),
+        vec![
+            GlobalRequest::ReconnectExec {
+                former: WORKER,
+                process: LEADER,
+            },
+            GlobalRequest::PublishSignalDispositions(2, Some(reset)),
+            GlobalRequest::ResumeExec(LEADER),
+        ]
+    );
+    assert_eq!(
+        fixture.state.sched.lock().unwrap().published_dispositions[&LEADER],
+        PublishedDispositions {
+            generation: 2,
+            dispositions: Some(reset),
+            ..Default::default()
+        }
+    );
+    assert_eq!(
+        *guest.thread.published_dispositions.lock().unwrap(),
+        PublishedDispositions {
+            generation: 2,
+            accepted: 2,
+            dispositions: Some(reset),
+        }
+    );
+}
+
 #[tokio::test]
 async fn malformed_exec_transfer_never_accounts_clock_or_consumes_preparation() {
     let fixture = Fixture::prepared().await;

@@ -2267,6 +2267,21 @@ impl GlobalState {
                 .discarded_signal_control(dtid, control);
             return (None, R::DiscardedSignal(answer));
         }
+        // A thread's copied signal dispositions
+        // (`syscalls::signal_shadow::publish_dispositions`): like the control
+        // messages above, it carries no logical time and its answer carries
+        // none back. It replaces what the scheduler holds for the sender's
+        // process, which the sender's own operations changed while it held
+        // the turn.
+        if let GlobalRequest::PublishSignalDispositions(generation, dispositions) = request {
+            let held = self.sched.lock().unwrap().publish_signal_dispositions(
+                dtid,
+                request_mm,
+                generation,
+                dispositions,
+            );
+            return (None, R::PublishSignalDispositions(held));
+        }
         if let GlobalRequest::SignalDequeued {
             detpid,
             identity,
@@ -2510,6 +2525,9 @@ impl GlobalState {
             }
             GlobalRequest::RecordDeterminismLoss(_) => {
                 unreachable!("determinism loss answered before clock accounting")
+            }
+            GlobalRequest::PublishSignalDispositions(..) => {
+                unreachable!("published dispositions answered before clock accounting")
             }
             GlobalRequest::ParkedRequest(rs, pid, capability) => {
                 let (response, _) = self
@@ -5608,6 +5626,14 @@ pub enum GlobalRequest {
     /// Change or read the state Detcore keeps on a rendered per-process
     /// `/proc` file's inode (`InodePool::rendered_file_state`). Appended last.
     RenderedFileState(u64, crate::procfs::listing::RenderedFileChange),
+    /// The sender's process's signal dispositions as Detcore's copy holds
+    /// them, or `None` to withdraw them, with the publication's generation
+    /// (`Scheduler::publish_signal_dispositions`). Answered before any clock
+    /// or scheduler accounting. Appended last.
+    PublishSignalDispositions(
+        u64,
+        Option<crate::syscalls::signal_shadow::CopiedDispositions>,
+    ),
 }
 
 /// Responses from the global object
@@ -5791,6 +5817,11 @@ pub enum GlobalResponse {
     ProcfsTask(crate::procfs::listing::ProcfsTaskAnswer),
     /// Appended last.
     RenderedFileState(crate::procfs::listing::RenderedFileState),
+    /// The generation the scheduler holds for the sender's process afterwards
+    /// and whether this publication is what it holds
+    /// (`Scheduler::publish_signal_dispositions`), or `None` when it took
+    /// nothing from this sender. Appended last.
+    PublishSignalDispositions(Option<crate::syscalls::signal_shadow::PublicationAnswer>),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -6181,6 +6212,35 @@ where
     assert_eq!(response, GlobalResponse::SetChildTidAddress(()));
 }
 
+/// Publishes `dispositions`, publication `generation`, as the calling
+/// thread's process's (`Scheduler::publish_signal_dispositions`; `None`
+/// withdraws them), and returns the scheduler's answer: the generation it
+/// holds afterwards and whether this publication is what it holds, or `None`
+/// when it took nothing from this thread. Like the zero-time control messages it carries no logical time and
+/// its answer carries none back. It is sent from `send_and_update_time`, not
+/// through it, so it neither consumes a grant's deadline nor counts forwarded
+/// records.
+pub(crate) async fn publish_signal_dispositions<G, T>(
+    guest: &mut G,
+    generation: u64,
+    dispositions: Option<crate::syscalls::signal_shadow::CopiedDispositions>,
+) -> Option<crate::syscalls::signal_shadow::PublicationAnswer>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let state = guest.thread_state();
+    let message = (
+        state.thread_logical_time.clone(),
+        state.mm_id,
+        GlobalRequest::PublishSignalDispositions(generation, dispositions),
+    );
+    match guest.send_rpc(message).await.1 {
+        GlobalResponse::PublishSignalDispositions(answer) => answer,
+        _ => None,
+    }
+}
+
 pub async fn send_and_update_time<G, T>(
     guest: &mut G,
     request: GlobalRequest,
@@ -6199,6 +6259,9 @@ where
         guest.thread_state().dettid,
         "replacement image must reconnect before ordinary RPCs"
     );
+    // Any request may let another thread run, which may then decide from
+    // this thread's process's dispositions.
+    crate::syscalls::signal_shadow::publish_dispositions(guest).await;
     let mytime = guest.thread_state().thread_logical_time.clone();
     let mm = guest.thread_state().mm_id;
     let mut resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
@@ -11102,6 +11165,202 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A5 step 2b: an ordinary request first publishes the caller's process's
+    /// copied dispositions, through the real global RPC, when they differ
+    /// from what the scheduler holds, and not otherwise; the publication
+    /// carries the next generation, and a copy whose actions became unknown
+    /// withdraws them. A discard reads the result.
+    #[tokio::test]
+    async fn an_ordinary_request_first_publishes_changed_dispositions() {
+        use reverie::Tool;
+
+        use crate::syscalls::signal_shadow::CopiedDispositions;
+        use crate::syscalls::signal_shadow::PublishedDispositions;
+
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| backend.supports_blocked_wait_signal_interruption = true);
+        let state = GlobalState::initialize(&config, false);
+        let leader = DetTid::from_raw(17);
+        let process = DetPid::from_raw(17);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(leader, leader, true);
+        install_test_registration(&state, leader, Ivar::new());
+        let tool = <Detcore as Tool>::new(reverie::Pid::from_raw(leader.as_raw()), &config);
+        let mut thread = tool.init_thread_state(Tid::from_raw(leader.as_raw()), None);
+        thread.detpid = Some(process);
+        let usr1 = 1 << (libc::SIGUSR1 - 1);
+        thread.signal_shadow = Some(crate::signal_state::SignalShadow::seeded(usr1, 0));
+        let mut guest = ExternalRegistrationGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            post_exec: false,
+        };
+        let mutation = |n: u32| GlobalRequest::RecordHostMutation {
+            path: format!("/a5-step-2b/{n}"),
+        };
+        let ignoring = CopiedDispositions {
+            ignored: usr1,
+            caught: 0,
+        };
+        let held = |state: &GlobalState| {
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .published_dispositions
+                .get(&process)
+                .copied()
+        };
+
+        super::send_and_update_time(&mut guest, mutation(1)).await;
+        super::send_and_update_time(&mut guest, mutation(2)).await;
+        assert_eq!(
+            *guest.requests.lock().unwrap(),
+            vec![
+                GlobalRequest::PublishSignalDispositions(1, Some(ignoring)),
+                mutation(1),
+                mutation(2),
+            ],
+            "published once, before the first request"
+        );
+        // The scheduler's entry, and the process's record of it.
+        let entry = |generation, dispositions| PublishedDispositions {
+            generation,
+            dispositions,
+            ..Default::default()
+        };
+        let record = |generation, accepted, dispositions| PublishedDispositions {
+            generation,
+            accepted,
+            dispositions,
+        };
+        assert_eq!(held(&state), Some(entry(1, Some(ignoring))));
+        assert_eq!(
+            *guest.thread.published_dispositions.lock().unwrap(),
+            record(1, 1, Some(ignoring))
+        );
+        assert!(
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .published_dispositions_for(leader, libc::SIGUSR1)
+                .is_some()
+        );
+
+        // A clone that shares the actions with a new process withdraws them
+        // before it runs (`before_clone`).
+        guest.requests.lock().unwrap().clear();
+        crate::syscalls::signal_shadow::before_clone(
+            &mut guest,
+            (libc::CLONE_VM | libc::CLONE_SIGHAND) as u64,
+        )
+        .await;
+        assert_eq!(
+            *guest.requests.lock().unwrap(),
+            vec![GlobalRequest::PublishSignalDispositions(2, None)]
+        );
+        assert_eq!(held(&state), Some(entry(2, None)));
+        assert_eq!(
+            *guest.thread.published_dispositions.lock().unwrap(),
+            record(2, 2, None)
+        );
+        super::send_and_update_time(&mut guest, mutation(3)).await;
+        assert_eq!(
+            guest.requests.lock().unwrap().len(),
+            2,
+            "nothing more to withdraw"
+        );
+
+        // A thread the scheduler does not know is refused: the record keeps
+        // its dispositions, and once known, the next request publishes again.
+        guest.thread.signal_shadow = Some(crate::signal_state::SignalShadow::seeded(usr1, 0));
+        let mut turn = state.sched.lock().unwrap().next_turns.remove(&leader);
+        guest.requests.lock().unwrap().clear();
+        super::send_and_update_time(&mut guest, mutation(4)).await;
+        assert_eq!(held(&state), Some(entry(2, None)), "refused");
+        assert_eq!(
+            *guest.thread.published_dispositions.lock().unwrap(),
+            record(3, 2, None)
+        );
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .next_turns
+            .insert(leader, turn.take().unwrap());
+        super::send_and_update_time(&mut guest, mutation(5)).await;
+        assert_eq!(held(&state), Some(entry(4, Some(ignoring))));
+        assert_eq!(
+            *guest.thread.published_dispositions.lock().unwrap(),
+            record(4, 4, Some(ignoring))
+        );
+
+        // The scheduler holds a generation this process never used (a stale
+        // entry): the publication is not taken, the record carries on after
+        // that generation, and the thread publishes again at once, before its
+        // request goes out, and is taken.
+        let stale = entry(
+            50,
+            Some(CopiedDispositions {
+                ignored: 0,
+                caught: usr1,
+            }),
+        );
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .published_dispositions
+            .insert(process, stale);
+        *guest.thread.published_dispositions.lock().unwrap() = record(4, 4, None);
+        super::send_and_update_time(&mut guest, mutation(6)).await;
+        assert_eq!(held(&state), Some(entry(51, Some(ignoring))));
+        assert_eq!(
+            *guest.thread.published_dispositions.lock().unwrap(),
+            record(51, 51, Some(ignoring))
+        );
+        // The same with a stale entry of the very generation the process uses
+        // next, the likeliest shape: not taken, so not mistaken for it.
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .published_dispositions
+            .insert(process, entry(52, stale.dispositions));
+        *guest.thread.published_dispositions.lock().unwrap() = record(51, 51, None);
+        super::send_and_update_time(&mut guest, mutation(7)).await;
+        assert_eq!(held(&state), Some(entry(53, Some(ignoring))));
+        assert_eq!(
+            *guest.thread.published_dispositions.lock().unwrap(),
+            record(53, 53, Some(ignoring))
+        );
+        assert_eq!(
+            *guest.requests.lock().unwrap(),
+            vec![
+                GlobalRequest::PublishSignalDispositions(3, Some(ignoring)),
+                mutation(4),
+                GlobalRequest::PublishSignalDispositions(4, Some(ignoring)),
+                mutation(5),
+                GlobalRequest::PublishSignalDispositions(5, Some(ignoring)),
+                GlobalRequest::PublishSignalDispositions(51, Some(ignoring)),
+                mutation(6),
+                GlobalRequest::PublishSignalDispositions(52, Some(ignoring)),
+                GlobalRequest::PublishSignalDispositions(53, Some(ignoring)),
+                mutation(7),
+            ]
+        );
     }
 
     async fn check_external_child_tid_registration(

@@ -1712,6 +1712,16 @@ pub struct Scheduler {
     /// the kernel's.
     saved_guest_sigmasks: BTreeMap<DetTid, u64>,
 
+    /// Each process's signal dispositions as Detcore's signal-state copy
+    /// holds them, published by its threads before each request that can let
+    /// another thread run (A5 step 2b,
+    /// `syscalls::signal_shadow::publish_dispositions`), with the generation of
+    /// the latest publication taken. A process holds dispositions only while
+    /// its copy is known. Read in place of the kernel's `SigIgn` and `SigCgt`
+    /// (`published_dispositions_for`).
+    pub(crate) published_dispositions:
+        BTreeMap<DetPid, crate::syscalls::signal_shadow::PublishedDispositions>,
+
     /// The real-time signals of POSIX timers that expired while every live
     /// thread of their process blocked them, by process
     /// (<https://github.com/rrnewton/hermit/issues/4089>). Linux queues such a
@@ -3945,6 +3955,7 @@ impl Scheduler {
             delivery_mask_override: None,
             signal_control_caller: None,
             saved_guest_sigmasks: Default::default(),
+            published_dispositions: Default::default(),
             pending_real_time_expirations: Default::default(),
             sending_child_exit: None,
             sending_parent_death: false,
@@ -4856,6 +4867,11 @@ impl Scheduler {
             .all(|thread| thread == dtid)
         {
             self.shared_queue_scheduler_signals.remove(detpid);
+            // The generation stays, so that no publication older than one
+            // already taken can bring dispositions back.
+            if let Some(published) = self.published_dispositions.get_mut(detpid) {
+                published.dispositions = None;
+            }
         }
         // Its own queue goes with it; a later thread with its tid starts empty.
         self.thread_timer_copies
@@ -6152,6 +6168,62 @@ impl Scheduler {
             None => self.saved_guest_sigmasks.remove(&dettid),
         };
         true
+    }
+
+    /// Record (`Some`) or withdraw (`None`) the dispositions of `thread`'s
+    /// process as Detcore's copy holds them (`published_dispositions`), unless
+    /// a publication of a later `generation` was already taken: threads that
+    /// do not hold the turn publish too, so publications can arrive out of
+    /// order. Returns the generation held afterwards and whether this
+    /// publication is what is held; `None`, taking nothing, for a thread the
+    /// scheduler does not know, one logically killed, or a retired exec
+    /// incarnation of its tid (`rpc_incarnation_matches` with the request's
+    /// `mm`).
+    pub(crate) fn publish_signal_dispositions(
+        &mut self,
+        thread: DetTid,
+        mm: MmId,
+        generation: u64,
+        dispositions: Option<crate::syscalls::signal_shadow::CopiedDispositions>,
+    ) -> Option<crate::syscalls::signal_shadow::PublicationAnswer> {
+        if !self.next_turns.contains_key(&thread)
+            || self.thread_is_logically_killed(thread)
+            || !self.rpc_incarnation_matches(thread, mm)
+        {
+            return None;
+        }
+        let process = self.thread_tree.process_of(thread)?;
+        let entry = self.published_dispositions.entry(process).or_default();
+        let taken = generation > entry.generation;
+        if taken {
+            *entry = crate::syscalls::signal_shadow::PublishedDispositions {
+                generation,
+                dispositions,
+                ..Default::default()
+            };
+        }
+        Some(crate::syscalls::signal_shadow::PublicationAnswer {
+            held: entry.generation,
+            taken,
+        })
+    }
+
+    /// The dispositions `thread`'s process published
+    /// (`publish_signal_dispositions`), where they decide about `signal`
+    /// (`signal_shadow::published_dispositions_decide`). They are what the
+    /// kernel holds: the copy is checked against it after each change and
+    /// withdrawn when it cannot be. `None` sends the caller to the kernel's
+    /// `/proc` view.
+    pub(crate) fn published_dispositions_for(
+        &self,
+        thread: DetTid,
+        signal: i32,
+    ) -> Option<crate::syscalls::signal_shadow::CopiedDispositions> {
+        if !crate::syscalls::signal_shadow::published_dispositions_decide(signal) {
+            return None;
+        }
+        let process = self.thread_tree.process_of(thread)?;
+        self.published_dispositions.get(&process)?.dispositions
     }
 
     /// Record (`Some`) or clear (`None`) the set `dettid` waits for in
@@ -8526,9 +8598,11 @@ impl Scheduler {
     /// gone, so its holder was reaped automatically or by init, and the
     /// record that it exited (`exited_process_is_zombie`) would otherwise
     /// describe the new process (<https://github.com/rrnewton/hermit/issues/4266>).
+    /// Dispositions the old process published would describe it too.
     pub fn forget_previous_process_exit(&mut self, pid: DetPid) {
         self.logically_exited_processes.remove(&pid);
         self.autoreaped_exits.remove(&pid);
+        self.published_dispositions.remove(&pid);
     }
 
     /// The processes `/proc` lists, and, for `process`, the threads its
@@ -20532,6 +20606,136 @@ mod test {
         assert!(scheduler.set_saved_guest_sigmask(target, Some(usr1)));
         assert!(!discarded(&scheduler), "the guest's own mask first");
         assert!(!scheduler.discarded_when_sent_to(DetTid::from_raw(999), libc::SIGUSR1, None));
+    }
+
+    /// A5 step 2b: a discard reads the dispositions the target's process
+    /// published (`publish_signal_dispositions`) in place of the kernel's,
+    /// for a signal Detcore's copy holds exactly. A withdrawn entry, a signal
+    /// Linux force-delivers, and a noted unreported signal send it back to the
+    /// kernel's view. The entry is the process's, read for any thread of it,
+    /// and goes with the process's last thread and with a new process on its
+    /// pid.
+    #[test]
+    fn a_discard_reads_the_dispositions_the_process_published() {
+        use crate::syscalls::signal_shadow::CopiedDispositions;
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let segv = kernel_signal_bit(libc::SIGSEGV);
+        let mut scheduler = gated_scheduler();
+        let (target, _) = parked_futex_target(&mut scheduler);
+        let process = DetPid::from_raw(target.as_raw());
+        let sibling = DetTid::from_raw(101);
+        register_known_thread(&mut scheduler, sibling);
+        scheduler.thread_tree.add_child(target, target, true);
+        scheduler.thread_tree.add_child(target, sibling, false);
+        // The kernel shows nothing ignored, the published copy SIGUSR1 and
+        // SIGSEGV: only the source a discard reads can make it true.
+        scheduler
+            .test_kernel_signal_states
+            .insert(target, signal_state(0, 0));
+        let published = CopiedDispositions {
+            ignored: usr1 | segv,
+            caught: 0,
+        };
+        let discarded =
+            |scheduler: &Scheduler, signal| scheduler.discarded_when_sent_to(target, signal, None);
+        assert!(!discarded(&scheduler, libc::SIGUSR1), "the kernel's view");
+        let mm = MmId::initial(process);
+        let answer =
+            |held, taken| Some(crate::syscalls::signal_shadow::PublicationAnswer { held, taken });
+        assert_eq!(
+            scheduler.publish_signal_dispositions(DetTid::from_raw(999), mm, 1, Some(published)),
+            None,
+            "a thread the scheduler does not know"
+        );
+        assert_eq!(
+            scheduler.publish_signal_dispositions(sibling, mm, 2, Some(published)),
+            answer(2, true)
+        );
+        assert!(
+            discarded(&scheduler, libc::SIGUSR1),
+            "a sibling's publication is the process's"
+        );
+        assert!(
+            !discarded(&scheduler, libc::SIGSEGV),
+            "a signal Linux force-delivers reads the kernel's"
+        );
+        // A note of a thread that no longer exists (pid_max is far below this
+        // tid) counts until it is pruned.
+        crate::syscalls::signal_shadow::note_unreported(1, i32::MAX - 1, libc::SIGUSR2);
+        assert!(
+            !discarded(&scheduler, libc::SIGUSR1),
+            "a noted unreported signal"
+        );
+        assert!(!crate::syscalls::signal_shadow::unreported_pending());
+        assert!(discarded(&scheduler, libc::SIGUSR1));
+        // A publication older than the one taken changes nothing, in either
+        // direction.
+        assert_eq!(
+            scheduler.publish_signal_dispositions(target, mm, 1, None),
+            answer(2, false),
+            "the generation held is the later one"
+        );
+        assert!(discarded(&scheduler, libc::SIGUSR1), "an older withdrawal");
+        assert_eq!(
+            scheduler.publish_signal_dispositions(target, mm, 3, None),
+            answer(3, true)
+        );
+        assert!(!discarded(&scheduler, libc::SIGUSR1), "withdrawn");
+        assert_eq!(
+            scheduler.publish_signal_dispositions(target, mm, 2, Some(published)),
+            answer(3, false)
+        );
+        assert!(
+            !discarded(&scheduler, libc::SIGUSR1),
+            "an older publication"
+        );
+
+        assert_eq!(
+            scheduler.publish_signal_dispositions(target, mm, 4, Some(published)),
+            answer(4, true)
+        );
+        scheduler.forget_previous_process_exit(process);
+        assert!(
+            !discarded(&scheduler, libc::SIGUSR1),
+            "a new process on the pid"
+        );
+        assert_eq!(
+            scheduler.publish_signal_dispositions(target, mm, 1, Some(published)),
+            answer(1, true),
+            "a new process's generations start again"
+        );
+        assert!(discarded(&scheduler, libc::SIGUSR1));
+        scheduler.logically_kill_thread(&sibling, &process, MmId::initial(process));
+        assert_eq!(
+            scheduler.publish_signal_dispositions(sibling, mm, 9, None),
+            None,
+            "a thread logically killed publishes nothing"
+        );
+        assert!(
+            discarded(&scheduler, libc::SIGUSR1),
+            "a thread of the process remains"
+        );
+        // A retired exec incarnation of the tid publishes nothing.
+        scheduler.install_test_exec_incarnation(target, MmId::initial(DetPid::from_raw(555)));
+        assert_eq!(
+            scheduler.publish_signal_dispositions(target, mm, 9, None),
+            None,
+            "a retired incarnation"
+        );
+        assert!(
+            discarded(&scheduler, libc::SIGUSR1),
+            "the entry is unchanged"
+        );
+        scheduler.logically_kill_thread(&target, &process, MmId::initial(process));
+        assert_eq!(
+            scheduler.published_dispositions[&process],
+            crate::syscalls::signal_shadow::PublishedDispositions {
+                generation: 1,
+                dispositions: None,
+                ..Default::default()
+            },
+            "the process's last thread took its dispositions with it, not the generation"
+        );
     }
 
     /// A send of SIGCONT flushes the stop signals from every queue of the

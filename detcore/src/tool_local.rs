@@ -3559,9 +3559,9 @@ pub struct ThreadState<T> {
     pub(crate) sigalrm_handled: bool,
 
     /// Detcore's own copy of this thread's signal dispositions and masks
-    /// (audit step A5, step 1: recorded from the calls that change them and
-    /// checked against the kernel where it can be read, but read by no
-    /// decision yet). `None` until the first image seeds it, and wherever it
+    /// (audit step A5: recorded from the calls that change them, checked
+    /// against the kernel where it can be read, and read by the decisions
+    /// step 2 converted). `None` until the first image seeds it, and wherever it
     /// cannot be seeded: `None` means unknown, never default actions.
     #[serde(default)]
     pub(crate) signal_shadow: Option<crate::signal_state::SignalShadow>,
@@ -3570,6 +3570,14 @@ pub struct ThreadState<T> {
     /// state copy after a divergence: a lost copy is never seeded again.
     #[serde(default)]
     pub(crate) signal_shadow_lost: bool,
+
+    /// The process's record of its dispositions publications (A5 step 2b,
+    /// `signal_shadow::publish_dispositions`): what the scheduler holds, the
+    /// latest generation used, and the latest one the scheduler took. Shared
+    /// by the threads of a process, which publish one entry.
+    #[serde(default)]
+    pub(crate) published_dispositions:
+        Arc<Mutex<crate::syscalls::signal_shadow::PublishedDispositions>>,
 
     /// The SIGALRM blocked bit this thread last published to the scheduler's
     /// ledger (signal phase 1). A handler's return changes the virtual mask
@@ -4354,6 +4362,7 @@ impl<T> ThreadState<T> {
             sigalrm_handled: false,
             signal_shadow: None,
             signal_shadow_lost: false,
+            published_dispositions: Arc::default(),
             sigalrm_blocked_published: false,
             handler_restore_rt_reported: 0,
             signal_register_projection: None,
