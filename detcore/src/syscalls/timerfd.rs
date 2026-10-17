@@ -38,11 +38,14 @@
 //! and interval, never rounded.
 //!
 //! Scope: only where Detcore's model of an open file description is the one
-//! copy every process sees -- Detcore outside the guest (ptrace, KVM), where a
-//! fork shares the description's model and exec keeps it, as Linux shares the
-//! timer. A tool inside the guest (SaBRe, DBT, in-guest LiteInst) copies its
-//! state into a forked child, and SaBRe and DBT rediscover descriptors after
-//! exec, so timerfds stay with the host there, unchanged. Also not under record/replay,
+//! copy every process sees. Detcore outside the guest (ptrace, KVM) shares the
+//! description's model across a fork and keeps it across exec, as Linux
+//! shares the timer. A tool inside the guest copies its state into a forked
+//! child, so there the runtime must promote the description to Detcore's
+//! global state before each native fork or exec and carry it across exec as a
+//! survivor (`promotes_open_files_before_native_lifecycle`): DBT does. SaBRe
+//! and in-guest LiteInst do not yet, so there a strict run's timerfd is
+//! refused by name ([`refuse_unshared_model`]) rather than left on host time. Also not under record/replay,
 //! whose recordings keep the host's answers, or without sequentialized
 //! threads. `TFD_TIMER_CANCEL_ON_SET` is accepted and never fires, because
 //! Hermit's virtual clock is never set; an absolute deadline is read on the
@@ -113,9 +116,21 @@ pub(crate) fn detcore_runs_outside_the_guest(backend: &reverie::BackendCapabilit
     !backend.tool_shares_guest_descriptor_table && !backend.process_exits_complete_asynchronously
 }
 
+/// Whether Detcore's model of an open file description is the one copy every
+/// guest process sharing it reaches: Detcore runs outside the guest, or the
+/// runtime inside it promotes such descriptions before every native fork or
+/// exec and carries them across exec.
+pub(crate) fn models_are_shared(backend: &reverie::BackendCapabilities) -> bool {
+    detcore_runs_outside_the_guest(backend) || backend.promotes_open_files_before_native_lifecycle
+}
+
 /// Whether Detcore keeps timerfds on virtual time (see the module comment
 /// for the scope): virtual time under sequentialized threads, outside
-/// record/replay, where Detcore runs outside the guest.
+/// record/replay, where Detcore's model of a description is the one copy
+/// every process sees. That holds where Detcore runs outside the guest, and
+/// where the runtime inside it promotes timerfd descriptions before each
+/// native fork or exec and carries them across exec (see
+/// [`models_are_shared`]).
 pub(crate) fn enabled<T, G>(guest: &G) -> bool
 where
     T: RecordOrReplay,
@@ -125,7 +140,31 @@ where
     config.virtualize_time
         && config.sequentialize_threads
         && !config.recordreplay_modes
-        && detcore_runs_outside_the_guest(&config.backend)
+        && models_are_shared(&config.backend)
+}
+
+/// Refuses a timerfd that Detcore would otherwise leave on the host clock in
+/// a run whose time it virtualizes: virtual time under sequentialized threads,
+/// outside record/replay, on a backend whose runtime does not share one model
+/// of the description ([`models_are_shared`]). The timer's expirations would
+/// follow host time there, so the run ends by name instead.
+pub(crate) fn refuse_unshared_model<T, G>(guest: &G)
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let config = guest.config();
+    if config.virtualize_time
+        && config.sequentialize_threads
+        && !config.recordreplay_modes
+        && !models_are_shared(&config.backend)
+    {
+        refuse(format_args!(
+            "timerfd_create on a backend whose runtime does not keep one model of an open \
+             file description across fork and exec (it does not promote them before a \
+             native fork or exec), so the timer would follow the host clock"
+        ));
+    }
 }
 
 /// Ends the run on a refusal that names `what`.
@@ -850,24 +889,29 @@ mod tests {
     use reverie::BackendCapabilities;
 
     use super::detcore_runs_outside_the_guest;
+    use super::models_are_shared;
 
-    /// Virtual timerfds are served only where Detcore runs outside the guest:
-    /// the ptrace family and KVM, not SaBRe, DBT or in-guest LiteInst.
+    /// Detcore runs outside the guest on the ptrace family and KVM, not on
+    /// SaBRe, DBT or in-guest LiteInst. Its timerfd models are shared there,
+    /// and on DBT, whose runtime promotes them before a native fork or exec;
+    /// SaBRe and in-guest LiteInst share none, so a timerfd is refused there.
     #[test]
-    fn detcore_runs_outside_the_guest_per_backend() {
-        for (name, backend, outside) in [
-            ("ptrace", BackendCapabilities::PTRACE, true),
-            ("e9patch", BackendCapabilities::E9PATCH, true),
-            ("kvm", BackendCapabilities::KVM, true),
-            ("sabre", BackendCapabilities::SABRE, false),
-            ("dbt", BackendCapabilities::DBT, false),
+    fn timerfd_models_are_shared_per_backend() {
+        for (name, backend, outside, shared) in [
+            ("ptrace", BackendCapabilities::PTRACE, true, true),
+            ("e9patch", BackendCapabilities::E9PATCH, true, true),
+            ("kvm", BackendCapabilities::KVM, true, true),
+            ("sabre", BackendCapabilities::SABRE, false, false),
+            ("dbt", BackendCapabilities::DBT, false, true),
             (
                 "liteinst in-guest",
                 BackendCapabilities::LITEINST_IN_GUEST,
                 false,
+                false,
             ),
         ] {
             assert_eq!(detcore_runs_outside_the_guest(&backend), outside, "{name}");
+            assert_eq!(models_are_shared(&backend), shared, "{name}");
         }
     }
 }

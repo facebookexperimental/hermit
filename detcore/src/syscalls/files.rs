@@ -9474,6 +9474,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // is, so a logically blocking read retries in scheduler turns
         // (internal IO polling) instead of blocking in the host until a
         // host-timed moment (`crate::syscalls::timerfd`).
+        crate::syscalls::timerfd::refuse_unshared_model(guest);
         let internally_nonblocking = crate::syscalls::timerfd::enabled(guest);
         let injected = if internally_nonblocking {
             call.with_flags(call.flags() | syscalls::TimerFlags::TFD_NONBLOCK)

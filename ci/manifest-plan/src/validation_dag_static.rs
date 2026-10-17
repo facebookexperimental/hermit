@@ -3487,7 +3487,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Strict copied scheduler-query named refusal: +1; final listing pending.
     // A6 adds 4 explicit-refusal/configuration/timer controls; combined source count, listing pending.
     // And +4 from 2447c8e8: 492.
-    ("test.cli", 492),
+    // And the eight run_dbt_timerfd_virtual_* tests (B3 step 1): 500.
+    ("test.cli", 500),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3523,7 +3524,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4380) retains all 27: 28.
     // sabre_exe_link_names_the_guest_image_as_natively retains all 28: 29.
     // sabre_refuses_exe_links_it_cannot_answer_by_name retains all 29: 30.
-    ("test.sabre_examples", 30),
+    // sabre_refuses_a_timerfd_by_name (B3) retains all 30: 31.
+    ("test.sabre_examples", 31),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -3911,7 +3913,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Strict copied scheduler-query named refusal: +1; final listing pending.
     // A6 adds 4 explicit-refusal/configuration/timer controls; combined source count, listing pending.
     // And +4 from 2447c8e8: 427.
-    ("test.cli_on_host", 427),
+    // And the same eight run_dbt_timerfd_virtual_* tests: 435.
+    ("test.cli_on_host", 435),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4672,7 +4675,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // same stack-limit and early limit-change tests: 26, and the same marker
     // limit-read test: 27. And the same --pipe-wake-latency exec test: 28.
     // And the same exe-link test: 29, and the same refusal test: 30.
-    ("test.sabre_examples_on_host", 30),
+    // And the same timerfd refusal test: 31.
+    ("test.sabre_examples_on_host", 31),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {

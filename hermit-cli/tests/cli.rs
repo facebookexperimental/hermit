@@ -27465,6 +27465,67 @@ fn run_kvm_timerfd_virtual_masked_waits_is_refused_by_name() {
     );
 }
 
+// DBT keeps timerfds on virtual time too: its runtime promotes them before a
+// native fork or exec (`promotes_open_files_before_native_lifecycle`). The
+// modes below reach L2 there. abstime, waits, epoll-pwait2 and exec fail on
+// DBT exactly as on ptrace with `--max-timeslice=disabled`: without a
+// preemption timer each syscall advances the virtual clock by milliseconds,
+// so the guest's "5 ms before the deadline" checks see the deadline pass.
+// For the same reason epollet reports its three timers in another order
+// (0 1 2, as ptrace without a timer does, against 1 2 0 with one).
+#[test]
+fn run_dbt_timerfd_virtual_catchup() {
+    timerfd_virtual_time::verify("dbt", "catchup", timerfd_virtual_time::CATCHUP);
+}
+
+#[test]
+fn run_dbt_timerfd_virtual_nonblock() {
+    timerfd_virtual_time::verify("dbt", "nonblock", timerfd_virtual_time::NONBLOCK);
+}
+
+#[test]
+fn run_dbt_timerfd_virtual_zero_timeout() {
+    timerfd_virtual_time::verify("dbt", "zero-timeout", timerfd_virtual_time::ZERO_TIMEOUT);
+}
+
+#[test]
+fn run_dbt_timerfd_virtual_masked_ppoll_expired() {
+    timerfd_virtual_time::verify(
+        "dbt",
+        "masked-ppoll-expired",
+        timerfd_virtual_time::MASKED_PPOLL_EXPIRED,
+    );
+}
+
+/// The forked child and its parent share one timer: the model was promoted
+/// before the native fork.
+#[test]
+fn run_dbt_timerfd_virtual_dup_fork() {
+    timerfd_virtual_time::verify("dbt", "dup-fork", timerfd_virtual_time::DUP_FORK);
+}
+
+#[test]
+fn run_dbt_timerfd_virtual_readv() {
+    timerfd_virtual_time::verify("dbt", "readv", timerfd_virtual_time::READV);
+}
+
+#[test]
+fn run_dbt_timerfd_virtual_sigchld_storm() {
+    timerfd_virtual_time::verify("dbt", "sigchld-storm", timerfd_virtual_time::SIGCHLD_STORM);
+}
+
+/// As on KVM, a masked wait that may wait would wait in the host: refused by
+/// name.
+#[test]
+fn run_dbt_timerfd_virtual_masked_waits_is_refused_by_name() {
+    timerfd_virtual_time::refused(
+        "dbt",
+        "masked-waits",
+        None,
+        "epoll_pwait with a signal mask would wait in the host",
+    );
+}
+
 /// A timerfd the host never makes readable ends the run on a named refusal,
 /// not an errno.
 #[test]

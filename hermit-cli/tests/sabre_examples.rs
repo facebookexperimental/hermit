@@ -1004,6 +1004,50 @@ int main(void) {
     assert_eq!(report["bitwise_parity"], false, "{report}");
 }
 
+/// SaBRe's runtime does not promote open-file descriptions before a native
+/// fork or exec, so Detcore cannot keep one model of a timerfd there. A strict
+/// run's timerfd is refused by name instead of following the host clock (B3,
+/// `promotes_open_files_before_native_lifecycle`).
+#[test]
+fn sabre_refuses_a_timerfd_by_name() {
+    const GUEST: &str = r#"
+#include <stdio.h>
+#include <sys/timerfd.h>
+#include <time.h>
+
+int main(void) {
+  int fd = timerfd_create(CLOCK_MONOTONIC, 0);
+  printf("timerfd %d\n", fd);
+  return 0;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-timerfd-refused-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest(dir.path(), "timerfd", GUEST);
+    let mut command = Command::new(hermit_binary());
+    command
+        .env("HERMIT_SABRE_BINARY", &loader)
+        .args(["--backend", "sabre", "run", "--strict", COMPARISON_EPOCH])
+        .arg("--")
+        .arg(&guest);
+    let (status, stderr) = run_expecting_failure(command, "SaBRe guest that creates a timerfd");
+    assert_eq!(
+        status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("timerfd_create on a backend whose runtime does not keep one model")
+            && stderr.contains("https://github.com/rrnewton/hermit/issues/1923"),
+        "the refusal does not name the timerfd:\n{stderr}"
+    );
+}
+
 /// A guest whose preinit code (which runs before the plugin can adopt the
 /// forwarding socket) closes the socket and points its own stderr at a file of
 /// its own. The plugin was asked for the socket and could not adopt it, so it

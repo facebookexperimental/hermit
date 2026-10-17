@@ -6723,7 +6723,6 @@ mod tests {
         assert!(sabre.tracks_process_children);
         assert!(!sabre.runs_exit_robust_list);
         assert!(!sabre.requires_thread_directed_process_signals);
-        assert!(!sabre.virtualizes_capability_prctls);
         assert!(!sabre.defers_vfork_child_registration);
         let ptrace = prepare_backend_config(config, Backend::Ptrace).backend;
         assert!(!ptrace.tool_shares_guest_descriptor_table);
@@ -6738,7 +6737,6 @@ mod tests {
         assert!(ptrace.tracks_process_children);
         assert!(ptrace.runs_exit_robust_list);
         assert!(!ptrace.requires_thread_directed_process_signals);
-        assert!(!ptrace.virtualizes_capability_prctls);
         assert!(!ptrace.defers_vfork_child_registration);
     }
 
@@ -6793,7 +6791,6 @@ mod tests {
         assert!(kvm.backend.tracks_process_children);
         assert!(!kvm.backend.runs_exit_robust_list);
         assert!(!kvm.backend.requires_thread_directed_process_signals);
-        assert!(kvm.backend.virtualizes_capability_prctls);
         assert!(kvm.backend.defers_vfork_child_registration);
 
         // A controlled run needs both the backend's process-signal control and
@@ -6878,7 +6875,6 @@ mod tests {
             "supports_parked_write_signal_interruption":
                 matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Kvm),
             "defers_vfork_child_registration": kvm,
-            "virtualizes_capability_prctls": kvm,
             "supports_madvise": !kvm,
             "supports_madv_dontneed": true,
             "reports_child_exit_publication":
@@ -6892,6 +6888,7 @@ mod tests {
             "delivers_preemption_timer_events":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "runs_guest_code_between_injections": sabre || in_guest_liteinst,
+            "promotes_open_files_before_native_lifecycle": dbt,
         })
     }
 
@@ -7088,7 +7085,9 @@ mod tests {
     /// this lossy projection. LiteInst's row is its in-guest runtime. KVM's
     /// first two digits are the capabilities `run_kvm` formerly set itself; the
     /// first, `cpuid_virtualized_by_backend`, is written false for every
-    /// backend now that no backend installs a CPUID profile of its own.
+    /// backend now that no backend installs a CPUID profile of its own, and so
+    /// is the fourteenth, `backend_virtualizes_capability_prctls`, now that
+    /// the capability prctls reach the kernel on every backend.
     #[test]
     fn every_backend_encodes_its_current_legacy_projection() {
         for (backend, unsequenced, sequential) in [
@@ -7098,7 +7097,7 @@ mod tests {
             (Backend::InGuestTrap, "010001010000000", "010001010000000"),
             (Backend::Sabre, "011111110000000", "011111110000000"),
             (Backend::Dbt, "011001000100000", "011001000100000"),
-            (Backend::Kvm, "000001010010111", "000001010011111"),
+            (Backend::Kvm, "000001010010101", "000001010011101"),
         ] {
             for (sequentialize_threads, expected) in [(false, unsequenced), (true, sequential)] {
                 let config = prepare_backend_config(

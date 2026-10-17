@@ -87,10 +87,12 @@ pub struct FileMetadata {
     /// Socket-only sequence used for backend-independent socket cookies.
     #[serde(default)]
     next_socket_open_file_sequence: u64,
-    /// A random-device OFD from this table has been promoted. Retain this
-    /// history after its final close so exec cannot reuse a canonical identity.
-    #[serde(default)]
-    has_promoted_random_files: bool,
+    /// A random-device or timerfd OFD from this table has been promoted.
+    /// Retain this history after its final close so exec cannot reuse a
+    /// canonical identity. (Serialized under its earlier name, which the
+    /// field had while only random devices were promoted.)
+    #[serde(default, rename = "has_promoted_random_files")]
+    has_promoted_shared_files: bool,
     /// Track what file handles actually point to (e.g. after dup2).
     /// This includes both the identifying resource (usually inode) and the deterministic file handle.
     /// Deserialization restores aliasing (`crate::fd::intern_open_files`).
@@ -753,7 +755,7 @@ impl FileMetadata {
             files_id: FilesId::initial(owner),
             next_open_file_sequence: 0,
             next_socket_open_file_sequence: 0,
-            has_promoted_random_files: false,
+            has_promoted_shared_files: false,
             file_handles: HashMap::new(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
@@ -888,7 +890,7 @@ impl FileMetadata {
             files_id: FilesId::forked(child),
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
-            has_promoted_random_files: self.has_promoted_random_files,
+            has_promoted_shared_files: self.has_promoted_shared_files,
             file_handles: self.file_handles.clone(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
@@ -902,7 +904,7 @@ impl FileMetadata {
             files_id: self.files_id.for_exec(task),
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
-            has_promoted_random_files: self.has_promoted_random_files,
+            has_promoted_shared_files: self.has_promoted_shared_files,
             file_handles: self
                 .file_handles
                 .iter()
@@ -1149,11 +1151,11 @@ impl FileMetadata {
                 handles.insert(fd, DetFd::shared_survivor(fd, survivor.id));
             }
             crate::fd::intern_open_files(&mut handles);
-            // Replace only the authenticated random-device survivors. Pipes,
+            // Replace only the authenticated random-device and timerfd survivors. Pipes,
             // sockets and other descriptors retain the legacy restoration above;
             // in particular, do not reconnect an old socket's port association.
             self.file_handles.extend(handles);
-            self.has_promoted_random_files = true;
+            self.has_promoted_shared_files = true;
         }
         // Last, so that no restoration above can replace a description after
         // its channel is set: every carried channel end, discovering a
@@ -1750,7 +1752,7 @@ mod file_metadata_tests {
         let high_socket = parent
             .metadata()
             .allocate_open_file_id(creator, FdType::Socket);
-        parent.promote_random_open_files().unwrap();
+        parent.promote_shared_open_files().unwrap();
         assert!(!parent.metadata().file_handles[&socket_fd].is_shared());
         let transfer = parent.shared_open_files_for_exec().unwrap().unwrap();
         assert_eq!(transfer.creator, creator);
@@ -1856,7 +1858,7 @@ mod file_metadata_tests {
                 .allocate_open_file_id(creator, FdType::Socket),
             high_socket
         );
-        successor.promote_random_open_files().unwrap();
+        successor.promote_shared_open_files().unwrap();
         let second = successor.shared_open_files_for_exec().unwrap().unwrap();
         assert_eq!(
             second.creator, creator,
@@ -1909,7 +1911,7 @@ mod file_metadata_tests {
             OpenFileId::new(creator, next_sequence)
         );
         // The canonical store still owns all old models: reusing an ID refuses.
-        after_close.promote_random_open_files().unwrap();
+        after_close.promote_shared_open_files().unwrap();
     }
 
     #[test]
@@ -1929,7 +1931,7 @@ mod file_metadata_tests {
             .iter()
             .map(|(&fd, handle)| (fd, handle.open_file_id()))
             .collect();
-        state.promote_random_open_files().unwrap();
+        state.promote_shared_open_files().unwrap();
         assert!(state.shared_open_files_for_exec().unwrap().is_none());
         for (fd, id) in before {
             let metadata = state.metadata();
@@ -1951,7 +1953,7 @@ mod file_metadata_tests {
         parent
             .add_fd(fd, OFlag::O_RDONLY, FdType::Rng, None)
             .unwrap();
-        parent.promote_random_open_files().unwrap();
+        parent.promote_shared_open_files().unwrap();
         let transfer = parent.shared_open_files_for_exec().unwrap().unwrap();
         let random_id = transfer.handles[&fd].id;
         let old_next = transfer.next_sequence;
@@ -4963,22 +4965,24 @@ impl<T> ThreadState<T> {
         self.metadata().exec_blocking_overrides()
     }
 
-    /// Promote random-device OFDs before a backend physically copies or
-    /// replaces its in-process Tool. The existing shared model owns their full
-    /// state, including the cursor; this does not promote sockets or other OFDs.
-    /// Call only while this task owns its serial grant, before the native
-    /// lifecycle operation can expose a child/new image. Ptrace's host-side Arc
-    /// needs no promotion. See <https://github.com/rrnewton/hermit/issues/4381>.
-    pub fn promote_random_open_files(&self) -> Result<(), crate::fd::SharedOpenFileError> {
+    /// Promote the OFDs whose model must stay one copy -- random devices
+    /// (their cursor) and timerfds (their virtual-time expirations,
+    /// `crate::fd::VirtualTimerfd`) -- before a backend physically copies or
+    /// replaces its in-process Tool. The shared model owns their full state;
+    /// this does not promote sockets or other OFDs. Call only while this task
+    /// owns its serial grant, before the native lifecycle operation can expose
+    /// a child/new image. Ptrace's host-side Arc needs no promotion. See
+    /// <https://github.com/rrnewton/hermit/issues/4381>.
+    pub fn promote_shared_open_files(&self) -> Result<(), crate::fd::SharedOpenFileError> {
         let mut metadata = self.metadata();
         let mut fds: Vec<_> = metadata.file_handles.keys().copied().collect();
         fds.sort_unstable();
         for fd in fds {
             let handle = &metadata.file_handles[&fd];
-            if handle.ty() == FdType::Rng {
+            if matches!(handle.ty(), FdType::Rng | FdType::Timerfd) {
                 handle.promote()?;
                 // Keep history even if every promoted descriptor later closes.
-                metadata.has_promoted_random_files = true;
+                metadata.has_promoted_shared_files = true;
             }
         }
         Ok(())
@@ -5019,7 +5023,7 @@ impl<T> ThreadState<T> {
 
     pub(crate) fn shared_open_files_for_exec(&self) -> Result<Option<ExecOpenFiles>, Errno> {
         let metadata = self.metadata();
-        if !metadata.has_promoted_random_files {
+        if !metadata.has_promoted_shared_files {
             return Ok(None);
         }
         let mut handles = BTreeMap::new();
@@ -5027,10 +5031,9 @@ impl<T> ThreadState<T> {
             if !handle.is_shared() || handle.is_cloexec() {
                 continue;
             }
-            assert_eq!(
-                handle.ty(),
-                FdType::Rng,
-                "only random OFDs are promoted here"
+            assert!(
+                matches!(handle.ty(), FdType::Rng | FdType::Timerfd),
+                "only random and timerfd OFDs are promoted here"
             );
             handles.insert(fd, ExecOpenFile::capture(fd, handle.open_file_id())?);
         }
@@ -7607,7 +7610,7 @@ mod native_main_state_tests {
         let high_socket = thread
             .metadata()
             .allocate_open_file_id(creator, FdType::Socket);
-        thread.promote_random_open_files().unwrap();
+        thread.promote_shared_open_files().unwrap();
         let expected = thread.shared_open_files_for_exec().unwrap().unwrap();
         assert_eq!(expected.creator, creator);
         assert_eq!(expected.handles[&fd].id, expected.handles[&alias_fd].id);

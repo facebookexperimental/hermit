@@ -97,12 +97,22 @@ fn matches(expected: &str, actual: &str) -> bool {
 
 /// Run `mode` under strict verification and require a bitwise match with
 /// stdout matching `expected`.
+/// A private tmpfs working directory, except on DBT, which refuses `--mount`
+/// until a DBT run has been tested with one. The guest writes no file.
+fn private_workdir(backend: &str) -> &'static [&'static str] {
+    if backend == "dbt" {
+        &[]
+    } else {
+        &["--mount=type=tmpfs,target=/test", "--workdir=/test"]
+    }
+}
+
 pub(super) fn verify(backend: &str, mode: &str, expected: &str) {
     let _lock = super::hermit_run_guard();
     require_kvm(backend);
     let directory = run_dir(backend, mode);
     let report_path = directory.join("verification.json");
-    let args = [
+    let mut args = vec![
         "--log=info",
         "--backend",
         backend,
@@ -113,12 +123,9 @@ pub(super) fn verify(backend: &str, mode: &str, expected: &str) {
         "--verify",
         "--verify-json",
         report_path.to_str().unwrap(),
-        "--mount=type=tmpfs,target=/test",
-        "--workdir=/test",
-        "--",
-        guest().to_str().unwrap(),
-        mode,
     ];
+    args.extend(private_workdir(backend));
+    args.extend(["--", guest().to_str().unwrap(), mode]);
     let mut command = super::hermit_command(&args);
     command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
     let status = bounded_command_with_timeout(&mut command, &directory, Duration::from_secs(57));
@@ -151,18 +158,15 @@ pub(super) fn refused(backend: &str, mode: &str, env: Option<(&str, &str)>, reas
     let _lock = super::hermit_run_guard();
     require_kvm(backend);
     let directory = run_dir(backend, mode);
-    let args = [
+    let mut args = vec![
         "--backend",
         backend,
         "run",
         "--base-env=minimal",
         "--strict",
-        "--mount=type=tmpfs,target=/test",
-        "--workdir=/test",
-        "--",
-        guest().to_str().unwrap(),
-        mode,
     ];
+    args.extend(private_workdir(backend));
+    args.extend(["--", guest().to_str().unwrap(), mode]);
     let mut command = super::hermit_command(&args);
     if let Some((name, value)) = env {
         command.env(name, value);

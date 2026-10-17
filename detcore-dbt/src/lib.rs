@@ -2875,8 +2875,8 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         {
             unsafe { &*scratch.runtime_state }
                 .state
-                .promote_random_open_files()
-                .expect("could not publish random-device OFDs before native lifecycle");
+                .promote_shared_open_files()
+                .expect("could not publish shared OFDs before native lifecycle");
         }
         if sysnum == libc::SYS_execve {
             // Linux permits a nonleader thread to exec. Detcore's PrepareExec

@@ -115,6 +115,12 @@
       "why": "tests/c/cachestat_refusal.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/c/capability_set_prctls.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/capability_set_prctls.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: The centralized manifest declares its program build and complete per-mode and per-backend execution policy."
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/c/chaos_last_band_admission.c",
       "runner": "hermit-cli/tests/cli.rs",

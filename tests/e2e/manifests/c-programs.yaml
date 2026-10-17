@@ -6434,6 +6434,78 @@ test:
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
         ci_disabled_reason: Off because no custom arguments exist. The guest takes no arguments; there is no edge-case variant to calibrate.
+  - id: c-programs/capability-set-prctls
+    description: Strict verification for tests/c/capability_set_prctls.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/capability_set_prctls.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - sabre
+          - kvm
+          - dbt
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled, as c-programs/prctl-option-policy does (https://github.com/rrnewton/hermit/issues/3745); the guest is single-threaded and makes no timing-dependent call
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: Native is the uninstrumented baseline; the contract is the hermit run
+        ci_disabled_reason: 'NOT-EXERCISED (by design): this entry asserts the Linux answers under Hermit on every backend and nothing about native nondeterminism, so there is no naked oracle to run. The guest exits 0 natively under any credentials.'
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this cell's strict-verification contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+        ci_disabled_reason: Off pending its own qualification. This cell's contract is the capability-set prctls under strict verification; record/replay of that contract has not been measured and asserting it untested would be a false claim.
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle; this guest is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+        ci_disabled_reason: Off by design. The guest is single-threaded with no schedule-diversity oracle, so chaos scheduling exercises nothing this cell asserts.
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+        ci_disabled_reason: Off because no custom arguments exist. The guest takes no arguments; there is no edge-case variant to calibrate.
   - id: c-programs/pread64-nostdlib
     description: Strict verification for tests/c/simple/pread64_nostdlib.c
     lane: portable

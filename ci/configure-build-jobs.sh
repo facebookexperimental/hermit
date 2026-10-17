@@ -1884,8 +1884,15 @@ fi
 # /proc/self/exe readlink emulation deleted; the loader's mallopt moved
 # ahead of read_launch_spec). reverie-dbt tree, root Cargo.toml, Cargo.lock
 # and rust-toolchain.toml are unchanged, so the budget carries unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f818f0b4fa105fbe1a5d9aad077a5ea5691bdc4d ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie f818f0b4fa105fbe1a5d9aad077a5ea5691bdc4d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 638ee64ae72b819ef12aa90321423e38117c50a1 (2026-10-16): from
+# f818f0b4fa105fbe1a5d9aad077a5ea5691bdc4d. The interval is two commits, a70862eb and 638ee64a, which remove
+# BackendCapabilities::virtualizes_capability_prctls and add
+# promotes_open_files_before_native_lifecycle (reverie/src/capabilities.rs
+# only). git diff is empty under reverie-dbt/, and the root Cargo.toml,
+# Cargo.lock and rust-toolchain.toml are unchanged. All seven SDK inputs,
+# inventory 961, calibrated budget, job width and limits are unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 638ee64ae72b819ef12aa90321423e38117c50a1 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 638ee64ae72b819ef12aa90321423e38117c50a1 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

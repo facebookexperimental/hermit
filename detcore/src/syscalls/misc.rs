@@ -153,13 +153,22 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
             // "set parent death signal failed: Function not implemented".
             | libc::PR_SET_PDEATHSIG
             | libc::PR_GET_PDEATHSIG
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-1125): Review KVM capability-control prctl forwarding.
+            //
+            // PR_CAPBSET_DROP and PR_CAP_AMBIENT change and read the calling
+            // thread's capability bounding and ambient sets. They reach the
+            // kernel on every backend (the host's, or KVM's provider), as
+            // PR_CAPBSET_READ and capget already do, so each backend answers as
+            // native Linux does for the same credentials: a drop or a raise
+            // the caller is not entitled to fails with EPERM, an unknown
+            // capability with EINVAL. The result is a function of the
+            // container's initial credentials and the guest's own earlier
+            // calls. They used to reach the kernel on KVM only, and fail with
+            // ENOSYS everywhere else.
+            | libc::PR_CAPBSET_DROP
+            | libc::PR_CAP_AMBIENT
     )
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1125): Review KVM capability-control prctl forwarding.
-fn is_backend_virtualized_capability_prctl(option: libc::c_int) -> bool {
-    matches!(option, libc::PR_CAPBSET_DROP | libc::PR_CAP_AMBIENT)
 }
 
 /// Whether Detcore can admit `PR_SET_CHILD_SUBREAPER`: threads are
@@ -596,12 +605,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ) =>
             {
                 Ok(guest.inject(call).await?)
-            }
-            option
-                if guest.config().backend.virtualizes_capability_prctls
-                    && is_backend_virtualized_capability_prctl(option) =>
-            {
-                self.passthrough(guest, call.into()).await
             }
             option if is_supported_prctl_option(option) => {
                 self.passthrough(guest, call.into()).await
@@ -1621,13 +1624,11 @@ mod tests {
     }
 
     #[test]
-    fn backend_virtualized_prctl_support_is_capability_scoped() {
+    fn capability_set_prctls_are_supported_on_every_backend() {
         for option in [libc::PR_CAPBSET_DROP, libc::PR_CAP_AMBIENT] {
-            assert!(is_backend_virtualized_capability_prctl(option));
+            assert!(is_supported_prctl_option(option));
         }
-        for option in [libc::PR_SET_KEEPCAPS, libc::PR_SET_SECUREBITS] {
-            assert!(!is_backend_virtualized_capability_prctl(option));
-        }
+        assert!(!is_supported_prctl_option(libc::PR_SET_SECUREBITS));
     }
 
     #[test]
