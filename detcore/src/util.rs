@@ -673,6 +673,157 @@ mod shared_stderr_origin_tests {
     }
 }
 
+/// A descriptor opened with a raw syscall, closed with one when dropped.
+pub struct RawFd(u64);
+
+impl RawFd {
+    /// `path` opened with `flags` (`O_CLOEXEC` added) by a raw `openat`, never
+    /// through libc's `open` wrapper (see `raw_syscall`).
+    pub fn open(path: &std::path::Path, flags: libc::c_int) -> std::io::Result<Self> {
+        let path = raw_path(path)?;
+        // SAFETY: a NUL-terminated path.
+        let fd = raw_result(unsafe {
+            raw_syscall(
+                libc::SYS_openat,
+                [
+                    libc::AT_FDCWD as u64,
+                    path.as_ptr() as u64,
+                    (flags | libc::O_CLOEXEC) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        })?;
+        Ok(Self(fd))
+    }
+
+    /// The descriptor's number.
+    pub fn raw(&self) -> u64 {
+        self.0
+    }
+
+    /// The open file's status, by a raw `fstat`.
+    pub fn stat(&self) -> std::io::Result<libc::stat> {
+        // SAFETY: an all-zero `stat` is a valid value, and the kernel writes
+        // at most its size.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        raw_zero_result(unsafe {
+            raw_syscall(
+                libc::SYS_fstat,
+                [self.0, &mut stat as *mut libc::stat as u64, 0, 0, 0, 0],
+            )
+        })?;
+        Ok(stat)
+    }
+
+    /// Up to `buffer.len()` bytes at `offset`, by a raw `pread64`.
+    pub fn read_at(&self, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        // SAFETY: the buffer is writable for its length.
+        raw_result(unsafe {
+            raw_syscall(
+                libc::SYS_pread64,
+                [
+                    self.0,
+                    buffer.as_mut_ptr() as u64,
+                    buffer.len() as u64,
+                    offset,
+                    0,
+                    0,
+                ],
+            )
+        })
+        .map(|read| read as usize)
+    }
+}
+
+impl Drop for RawFd {
+    fn drop(&mut self) {
+        // SAFETY: a descriptor this value opened and owns.
+        unsafe { raw_syscall(libc::SYS_close, [self.0, 0, 0, 0, 0, 0]) };
+    }
+}
+
+fn raw_path(path: &std::path::Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+}
+
+/// The status of the file at `path`, following links, by a raw `newfstatat`.
+pub fn raw_stat(path: &std::path::Path) -> std::io::Result<libc::stat> {
+    let path = raw_path(path)?;
+    // SAFETY: a NUL-terminated path; an all-zero `stat` is a valid value.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    raw_zero_result(unsafe {
+        raw_syscall(
+            libc::SYS_newfstatat,
+            [
+                libc::AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                &mut stat as *mut libc::stat as u64,
+                0,
+                0,
+                0,
+            ],
+        )
+    })?;
+    Ok(stat)
+}
+
+/// The target of the link at `path`, by a raw `readlinkat`.
+pub fn raw_read_link(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = raw_path(path)?;
+    let mut target = vec![0_u8; libc::PATH_MAX as usize];
+    // SAFETY: a NUL-terminated path and a buffer writable for its length.
+    let read = raw_result(unsafe {
+        raw_syscall(
+            libc::SYS_readlinkat,
+            [
+                libc::AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                target.as_mut_ptr() as u64,
+                target.len() as u64,
+                0,
+                0,
+            ],
+        )
+    })? as usize;
+    target.truncate(read);
+    Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        &target,
+    )))
+}
+
+/// The whole contents of the file at `path`, read with raw syscalls. Meant
+/// for small files such as procfs entries.
+pub fn raw_read_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let file = RawFd::open(path, libc::O_RDONLY)?;
+    let mut contents = Vec::new();
+    let mut chunk = vec![0_u8; 4096];
+    loop {
+        // SAFETY: the buffer is writable for its length.
+        let read = raw_result(unsafe {
+            raw_syscall(
+                libc::SYS_read,
+                [
+                    file.raw(),
+                    chunk.as_mut_ptr() as u64,
+                    chunk.len() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        })? as usize;
+        if read == 0 {
+            return Ok(contents);
+        }
+        contents.extend_from_slice(&chunk[..read]);
+    }
+}
+
 /// Calls `visit` with each name in directory `path`, without `.` and `..`,
 /// in the kernel's order, until it returns `Some`, and returns that value
 /// (`None` when every name was visited).

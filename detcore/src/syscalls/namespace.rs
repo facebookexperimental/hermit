@@ -14,7 +14,6 @@ mod own_getters_tests;
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -506,7 +505,9 @@ pub(crate) fn guest_task_procfs(
         return Some(PathBuf::from("/proc/thread-self"));
     }
     let task = PathBuf::from(format!("/proc/{tid}"));
-    let namespace = |path: &Path| std::fs::metadata(path).ok().map(|meta| meta.ino());
+    // Raw syscalls: in-guest Detcore must not call libc's wrappers
+    // (`crate::util::raw_syscall`).
+    let namespace = |path: &Path| crate::util::raw_stat(path).ok().map(|stat| stat.st_ino);
     (namespace(&task.join("ns/mnt"))? == namespace(Path::new("/proc/self/ns/mnt"))?).then_some(task)
 }
 
@@ -1249,7 +1250,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// The calling thread's root directory as the tool sees it, read from its
     /// procfs directory ([`Self::guest_task_directory`]).
     pub(crate) fn guest_root<G: Guest<Self>>(&self, guest: &G) -> Option<PathBuf> {
-        std::fs::read_link(self.guest_task_directory(guest)?.join("root")).ok()
+        crate::util::raw_read_link(&self.guest_task_directory(guest)?.join("root")).ok()
     }
 
     /// The absolute spelling of an `exe` link the caller names by `path`
@@ -1572,9 +1573,6 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// read from the exec record's file, checked to be the recorded inode) at
     /// the load bias the process's `AT_PHDR` shows, or why there is none.
     fn modeled_start_brk<G: Guest<Self>>(&self, guest: &G) -> Result<u64, &'static str> {
-        use std::os::unix::fs::MetadataExt;
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::io::AsRawFd;
         let exe = guest.thread_state().exe.clone().ok_or("no exec record")?;
         let root = self
             .guest_root(guest)
@@ -1587,25 +1585,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Pin the object at the path without opening it for I/O (`O_PATH`, no
         // link followed), and read it only once it is the recorded regular
         // file: a FIFO or device put at the path since the exec is never
-        // opened.
-        let pinned = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
-            .open(path)
+        // opened. Raw syscalls throughout: in-guest Detcore must not call
+        // libc's wrappers (`crate::util::raw_syscall`).
+        let pinned = crate::util::RawFd::open(&path, libc::O_PATH | libc::O_NOFOLLOW)
             .map_err(|_| "the image is unreadable")?;
-        let metadata = pinned.metadata().map_err(|_| "the image is unreadable")?;
-        if !metadata.is_file() || (metadata.dev(), metadata.ino()) != exe.identity() {
+        let stat = pinned.stat().map_err(|_| "the image is unreadable")?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+            || (stat.st_dev, stat.st_ino) != exe.identity()
+        {
             return Err("the image's path names another file since the exec");
         }
         // Reopening the pinned descriptor's own procfs link opens the same
         // inode, whatever the path names by now.
-        let mut file = std::fs::File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
-            .map_err(|_| "the image is unreadable")?;
-        let layout = crate::exec_record::ElfLayout::read_file(&mut file)
+        let file = crate::util::RawFd::open(
+            Path::new(&format!("/proc/self/fd/{}", pinned.raw())),
+            libc::O_RDONLY,
+        )
+        .map_err(|_| "the image is unreadable")?;
+        let layout = crate::exec_record::ElfLayout::read_file(&file)
             .ok_or("the image is not an ELF64 executable")?;
         let auxv = self
             .guest_task_directory(guest)
-            .and_then(|directory| std::fs::read(directory.join("auxv")).ok())
+            .and_then(|directory| crate::util::raw_read_file(&directory.join("auxv")).ok())
             .ok_or("the auxiliary vector is unreadable")?;
         let at_phdr = crate::exec_record::auxv_entry(&auxv, libc::AT_PHDR)
             .ok_or("the auxiliary vector has no AT_PHDR")?;
@@ -1670,21 +1671,32 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// 1. `None` where either cannot be read.
     fn break_randomized<G: Guest<Self>>(&self, guest: &G) -> Option<bool> {
         let personality =
-            std::fs::read_to_string(self.guest_task_directory(guest)?.join("personality")).ok()?;
-        let personality = u64::from_str_radix(personality.trim(), 16).ok()?;
+            crate::util::raw_read_file(&self.guest_task_directory(guest)?.join("personality"))
+                .ok()?;
+        let personality =
+            u64::from_str_radix(std::str::from_utf8(&personality).ok()?.trim(), 16).ok()?;
         if personality & libc::ADDR_NO_RANDOMIZE as u64 != 0 {
             return Some(false);
         }
-        let level = std::fs::read_to_string("/proc/sys/kernel/randomize_va_space").ok()?;
-        Some(level.trim().parse::<u32>().ok()? > 1)
+        let level =
+            crate::util::raw_read_file(Path::new("/proc/sys/kernel/randomize_va_space")).ok()?;
+        Some(
+            std::str::from_utf8(&level)
+                .ok()?
+                .trim()
+                .parse::<u32>()
+                .ok()?
+                > 1,
+        )
     }
 
     /// The kernel's `start_brk` for the calling thread's process, field 47 of
     /// its `/proc/<pid>/stat` ([`crate::exec_record::stat_start_brk`]), read
     /// where the tool reaches its procfs.
     fn kernel_start_brk<G: Guest<Self>>(&self, guest: &G) -> Option<u64> {
-        let stat = std::fs::read_to_string(self.guest_task_directory(guest)?.join("stat")).ok()?;
-        crate::exec_record::stat_start_brk(&stat)
+        let stat =
+            crate::util::raw_read_file(&self.guest_task_directory(guest)?.join("stat")).ok()?;
+        crate::exec_record::stat_start_brk(std::str::from_utf8(&stat).ok()?)
     }
 
     /// Detcore's pid for the calling thread's process.

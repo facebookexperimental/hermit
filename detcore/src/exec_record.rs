@@ -160,18 +160,18 @@ impl ElfLayout {
     /// `None` for any other file, one without a loadable segment, and one the
     /// caller cannot read.
     pub fn read(path: &Path) -> Option<Self> {
-        Self::read_file(&mut fs::File::open(path).ok()?)
+        Self::read_file(&crate::util::RawFd::open(path, libc::O_RDONLY).ok()?)
     }
 
-    /// [`Self::read`] of an open file.
-    pub fn read_file(file: &mut fs::File) -> Option<Self> {
+    /// [`Self::read`] of an open file, read with raw syscalls: in-guest
+    /// Detcore must not call libc's wrappers (`crate::util::raw_syscall`).
+    pub fn read_file(file: &crate::util::RawFd) -> Option<Self> {
+        let read_exact = |offset: u64, buffer: &mut [u8]| {
+            (file.read_at(buffer, offset).ok()? == buffer.len()).then_some(())
+        };
         let mut header = [0_u8; 64];
-        file.read_exact(&mut header).ok()?;
-        Self::parse(&header, |offset, buffer| {
-            use std::io::Seek;
-            file.seek(std::io::SeekFrom::Start(offset)).ok()?;
-            file.read_exact(buffer).ok()
-        })
+        read_exact(0, &mut header)?;
+        Self::parse(&header, read_exact)
     }
 
     /// [`Self::read`] of an image whose 64-byte file header is `header`,
