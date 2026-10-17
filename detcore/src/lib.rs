@@ -51,6 +51,7 @@ pub mod exit_dependencies;
 mod fatal_core;
 mod fd;
 mod fifo_peer;
+pub mod guest_log;
 mod host_inputs;
 pub mod in_guest_launch;
 pub mod in_guest_site_patching;
@@ -600,6 +601,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// guest's `atexit` handlers and ELF finalizers.
     async fn stop_after_sigalrm_loss<G: Guest<Self>>(&self, guest: &mut G) -> ! {
         tool_global::sigalrm_refuses(guest, tool_global::SigalrmControl::DeliveryLost).await;
+        guest_log::flush_unsent();
         match guest
             .tail_inject(
                 reverie::syscalls::ExitGroup::new()
@@ -1348,6 +1350,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest,
                 format!("ITIMER_REAL_SIGINFO_UNAVAILABLE: owned timer delivery cannot install Linux siginfo: {errno}"),
             ).await;
+            guest_log::flush_unsent();
             match guest
                 .tail_inject(
                     reverie::syscalls::ExitGroup::new()
@@ -3059,6 +3062,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             {
                 guest.thread_state_mut().mm_id = post_exec_mm;
             }
+        }
+        if new_dettid.as_raw() == detpid.as_raw() {
+            // A process's first thread, with its final address space: a forked
+            // child's copy of its parent's unsent warning count is not its own.
+            guest_log::starts_new_process(guest.thread_state().mm_id);
         }
 
         // Except for the root task, let's block until it's our turn to go:

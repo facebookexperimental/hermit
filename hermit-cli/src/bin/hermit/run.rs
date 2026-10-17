@@ -6413,6 +6413,12 @@ impl RunOpts {
                         self,
                     );
                 }
+                // The coordinator runs in this process, so this is where
+                // Detcore's events print, the in-guest ones it receives
+                // included (detcore::guest_log), as every other runtime's
+                // coordinator prints them. A verification run keeps its log
+                // in the run's evidence instead.
+                let _tracing = global.init_tracing_for_backend(backend);
                 return invocation.run(
                     self.summary,
                     self.backend_engagement_json.as_deref(),

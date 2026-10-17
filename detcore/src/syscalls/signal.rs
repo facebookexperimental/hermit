@@ -831,6 +831,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest.thread_state().dettid,
         );
         crate::tool_global::report_determinism_loss(guest, reason).await;
+        crate::guest_log::flush_unsent();
         match guest
             .tail_inject(
                 syscalls::ExitGroup::new().with_status(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),

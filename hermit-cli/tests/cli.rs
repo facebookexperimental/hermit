@@ -1891,6 +1891,87 @@ fn process_groups_and_sessions_answer_as_linux_on_every_backend() {
     eprintln!("compared {compared:?}");
 }
 
+/// A guest that executes CPUID once with a leaf outside Detcore's
+/// deterministic table, which Detcore answers with zeros and a warning.
+const CPUID_UNKNOWN_LEAF_GUEST: &str = r#"
+#include <stdio.h>
+
+int main(void) {
+  unsigned eax = 0x4ffffff0, ebx, ecx = 0, edx;
+  __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
+  printf("cpuid 0x4ffffff0 -> %08x %08x %08x %08x\n", eax, ebx, ecx, edx);
+  return 0;
+}
+"#;
+
+/// Detcore's warning for a CPUID leaf outside its table comes from the Tool,
+/// which runs inside the guest on DBT, LiteInst and in-guest-trap. Each such
+/// runtime sends its warnings to the coordinator (detcore::guest_log), which
+/// prints them at the run's own level: the warning appears exactly once at the
+/// default level on every backend, as on ptrace, and not at all under
+/// `--log=error`: the run's own level decides (the coordinator's filter, or
+/// on DBT, where `--log` sets `HERMIT_LOG`, DBT's own channel). Guest output is
+/// the same everywhere.
+#[test]
+fn detcore_warns_from_inside_the_guest_once_per_run_on_every_backend() {
+    let test = "detcore_warns_from_inside_the_guest_once_per_run_on_every_backend";
+    const WARNING: &str =
+        "cpuid leaf 0x4ffffff0 subleaf 0x0 not in deterministic table; returning zero result";
+    let build_root = process_build_root("cpuid-unknown-leaf");
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let source = build_root.join("cpuid_unknown_leaf.c");
+    fs::write(&source, CPUID_UNKNOWN_LEAF_GUEST).expect("failed to write the guest");
+    let guest = build_root.join("cpuid_unknown_leaf");
+    let compiled = Command::new("cc")
+        .args(["-O0", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the guest");
+    assert!(compiled.status.success(), "{compiled:?}");
+    let guest = guest.to_str().expect("guest path is UTF-8");
+    let backends: Vec<_> = procfs_backends(test)
+        .into_iter()
+        .filter(|backend| {
+            let sabre = *backend == "sabre";
+            if sabre {
+                eprintln!(
+                    "{test}: NOT YET: sabre: it has no blocking coordinator call inside a Tool \
+                     callback until it converges onto reverie-inguest, and it does not intercept \
+                     CPUID (https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/issue-drafts/\
+                     2026-10-17-sabre-in-guest-detcore-warnings.md, to be filed as an issue)"
+                );
+            }
+            !sabre
+        })
+        .collect();
+    let mut outputs = Vec::new();
+    for backend in &backends {
+        for (log, expected) in [(None, 1), (Some("--log=error"), 0)] {
+            let mut args = log.into_iter().collect::<Vec<_>>();
+            args.extend(["--backend", backend, "run", "--strict"]);
+            if *backend == "liteinst" || *backend == "in-guest-trap" {
+                args.push("--max-timeslice=disabled");
+            }
+            args.extend(["--", guest]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(
+                stderr(&output).matches(WARNING).count(),
+                expected,
+                "{backend} {log:?}: {output:?}"
+            );
+            outputs.push((backend, stdout(&output)));
+        }
+    }
+    let (_, first) = &outputs[0];
+    for (backend, output) in &outputs {
+        assert_eq!(output, first, "{backend}: guest output parity with ptrace");
+    }
+    eprintln!("{test} compared {backends:?}");
+}
+
 static SESSION_CONTAINMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn session_containment_guest() -> &'static Path {
