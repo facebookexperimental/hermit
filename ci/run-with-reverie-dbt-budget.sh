@@ -1875,7 +1875,14 @@ fi
 # BackendCapabilities::reports_sigreturns). reverie-dbt tree, root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml are unchanged, so the budget carries
 # unchanged.
-expected_pin=5aa3284d0202a9c69e2db20dfcf3ac314b3014e1
+# CARRY TO d1f198a6c5fa466a259a22d49ed80c1d40ba4960 (2026-10-17): from
+# 5aa3284d0202a9c69e2db20dfcf3ac314b3014e1 across the published2476 KVM A2 train. Remove only native sched_getaffinity
+# membership admission and extend the existing standalone getter witnesses.
+# All seven SDK recipe inputs and root Cargo.lock are unchanged; inventory961,
+# calibrated job width, CPU/wall limits and prior carry intervals remain.
+# Native client.c intentionally changes; fresh native and shared Tool evidence
+# remains separate from this SDK build-budget carry.
+expected_pin=d1f198a6c5fa466a259a22d49ed80c1d40ba4960
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

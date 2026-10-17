@@ -2249,6 +2249,18 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
         }
         return 1;
     }
+    // Detcore's shared Tool owns affinity masks. A copied child cannot
+    // enter that Tool to write its modeled CPU set; refuse the strict native
+    // escape without installing another affinity policy here.
+    if sysno == Sysno::sched_getaffinity && strict {
+        if let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get() {
+            emit_marker(
+                *emit,
+                b"detcore-dbt: unsupported syscall sched_getaffinity (204) in copied child\n",
+            );
+        }
+        return 1;
+    }
     // Ordinary priority queries belong to Detcore's shared policy. A copied
     // child cannot enter that Tool, so strict execution must refuse the native
     // answer rather than install a second priority model here.
@@ -4697,7 +4709,6 @@ mod tests {
         "rt_sigsuspend",
         "rt_sigtimedwait",
         "rt_tgsigqueueinfo",
-        "sched_getaffinity",
         "sched_getattr",
         "sched_rr_get_interval",
         "sched_setaffinity",
@@ -4856,6 +4867,24 @@ mod tests {
                 copied_child_action(Sysno::sched_getparam.id() as i64),
                 expected,
                 "sched_getparam in a copied child, strict={strict}"
+            );
+        }
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+    }
+
+    #[test]
+    fn copied_child_refuses_affinity_queries_only_in_strict_mode() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+        assert!(detcore::is_determinized_syscall(Sysno::sched_getaffinity));
+        for (strict, expected) in [(true, 1), (false, 0)] {
+            COPIED_PANIC_ON_UNSUPPORTED.store(strict, Ordering::Release);
+            assert_eq!(
+                copied_child_action(Sysno::sched_getaffinity.id() as i64),
+                expected,
+                "sched_getaffinity in a copied child, strict={strict}"
             );
         }
         COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);

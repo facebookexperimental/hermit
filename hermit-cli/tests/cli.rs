@@ -26294,6 +26294,108 @@ fn dbt_refuses_a_vfork_childs_scheduler_parameter_query_by_name() {
     );
 }
 
+/// A copied child must not expose the host affinity mask in strict mode.
+#[test]
+#[cfg(feature = "dbt")]
+fn dbt_refuses_a_vfork_childs_affinity_query_by_name() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&COPIED_SCHEDULER_QUERY_GUEST, "copied_scheduler_query")
+        .to_str()
+        .unwrap();
+    use nix::sched::CpuSet;
+    use nix::sched::sched_getaffinity;
+    use nix::sched::sched_setaffinity;
+    use nix::unistd::Pid;
+
+    // Hermit chooses one CPU from its inherited mask. Give both command
+    // children the same measured singleton so the full native mask is an
+    // independent oracle under identical launch affinity; the test parent
+    // and all guest syscall policies remain unchanged.
+    let inherited = sched_getaffinity(Pid::from_raw(0)).expect("read allowed CPU mask");
+    let cpu = (0..CpuSet::count())
+        .find(|&cpu| inherited.is_set(cpu).unwrap_or(false))
+        .expect("nonempty allowed CPU mask");
+    let mut singleton = CpuSet::new();
+    singleton.set(cpu).expect("allowed CPU fits CpuSet");
+    let same_cpu = |mut command: Command| {
+        // SAFETY: one async-signal-safe syscall with a mask built before fork;
+        // no allocation or mutation of the parent process.
+        unsafe {
+            command.pre_exec(move || {
+                sched_setaffinity(Pid::from_raw(0), &singleton).map_err(std::io::Error::from)
+            });
+        }
+        command
+    };
+    let mut native_command = Command::new(guest);
+    native_command.arg("affinity-vfork");
+    let native = same_cpu(native_command)
+        .output()
+        .expect("native sched_getaffinity vfork control");
+    assert!(native.status.success(), "{native:?}");
+    assert!(
+        stdout(&native).starts_with("after sched_getaffinity\nvfork sched_getaffinity: result="),
+        "{native:?}"
+    );
+    let run = |backend, strictness, mode| {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            strictness,
+            "--base-env=minimal",
+            "--",
+            guest,
+            mode,
+        ];
+        hermit_test::hermit_output(
+            "scheduler affinity query",
+            &mut same_cpu(hermit_command(&args)),
+        )
+    };
+    // This is the existing shared CPU0 policy, not the native Linux mask.
+    // Its ignored target-existence semantics are unchanged by this guard cut.
+    let mask = format!("01{}{}", "00".repeat(15), "7f".repeat(112));
+    let ordinary_output =
+        format!("ordinary sched_getaffinity: result=16 errno=0 mask={mask} canaries=1\n");
+    for backend in ["dbt", "ptrace"] {
+        let output = run(backend, "--strict", "affinity-ordinary");
+        assert!(output.status.success(), "{backend}: {output:?}");
+        assert_eq!(stdout(&output), ordinary_output);
+    }
+    let ptrace = run("ptrace", "--strict", "affinity-vfork");
+    assert!(ptrace.status.success(), "{ptrace:?}");
+    assert_eq!(
+        stdout(&ptrace),
+        format!(
+            "after sched_getaffinity\nvfork sched_getaffinity: result=16 errno=0 mask={mask} canaries=1\n"
+        )
+    );
+    // The complete measured native transcript includes the raw positive byte
+    // count, all 128 mask/suffix bytes and both canaries; do not hardcode CPU0.
+    let passthrough = run("dbt", "--allow-unsupported-syscalls", "affinity-vfork");
+    assert!(passthrough.status.success(), "{passthrough:?}");
+    assert_eq!(passthrough.stdout, native.stdout);
+
+    let refused = run("dbt", "--strict", "affinity-vfork");
+    assert_eq!(refused.status.code(), Some(101), "{refused:?}");
+    assert!(
+        stderr(&refused).contains("unsupported syscall sched_getaffinity (204) in copied child"),
+        "{refused:?}"
+    );
+    assert!(
+        stderr(&refused).contains(&format!(
+            "detcore-dbt: unsupported syscall {} in copied child",
+            libc::SYS_sched_getaffinity
+        )),
+        "{refused:?}"
+    );
+    assert!(
+        !stdout(&refused).contains("after sched_getaffinity"),
+        "{refused:?}"
+    );
+}
+
 /// A copied DBT child must refuse a priority query in strict mode.
 /// Its non-strict native path and the ordinary shared Detcore answer are distinct.
 #[test]

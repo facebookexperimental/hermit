@@ -1106,7 +1106,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's launch_image_never_enters_the_legacy_form: 1606.
     // Measured with copied_child_refuses_priority_queries_only_in_strict_mode: 1607.
     // Measured with copied_child_refuses_scheduler_parameter_queries_only_in_strict_mode: 1608.
-    ("test.regular_crates", 1608),
+    ("test.regular_crates", 1_609),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3546,7 +3546,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // detcore_renders_process_cgroup_under_relaxed_threads and
     // a_received_rendered_descriptor_is_refused_under_relaxed_threads
     // (https://github.com/rrnewton/hermit/issues/4213): 516.
-    ("test.cli", 516),
+    ("test.cli", 517),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3979,7 +3979,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 9d6182b5: 447.
     // And the received-directory lookup test: 448.
     // And the three 4213 process-cgroup tests: 451.
-    ("test.cli_on_host", 451),
+    ("test.cli_on_host", 452),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4736,7 +4736,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same launch-image legacy-form test: 1592.
     // Measured with copied_child_refuses_priority_queries_only_in_strict_mode: 1593.
     // Measured with copied_child_refuses_scheduler_parameter_queries_only_in_strict_mode: 1594.
-    ("test.regular_crates_on_host", 1594),
+    ("test.regular_crates_on_host", 1_595),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),

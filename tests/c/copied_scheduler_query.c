@@ -143,9 +143,112 @@ static int parameter_vfork(void) {
       observation[2] != 0 || observation[3] != 1;
 }
 
+
+#define AFFINITY_BYTES 128
+#define AFFINITY_SENTINEL 0x7f
+
+struct affinity_observation {
+  uint64_t before;
+  unsigned char mask[AFFINITY_BYTES];
+  uint64_t after;
+};
+
+static struct affinity_observation affinity_sentinel(void) {
+  struct affinity_observation value;
+  value.before = UINT64_C(0x2468ace02468ace0);
+  memset(value.mask, AFFINITY_SENTINEL, sizeof(value.mask));
+  value.after = UINT64_C(0xfdb97531fdb97531);
+  return value;
+}
+
+static int affinity_canaries(const struct affinity_observation* value) {
+  return value->before == UINT64_C(0x2468ace02468ace0) &&
+      value->after == UINT64_C(0xfdb97531fdb97531);
+}
+
+/* The raw native byte count and mask are observations, not the shared CPU0
+ * oracle. A host needing more than this bounded buffer fails the control. */
+static int affinity_success(long result, long error,
+                            const struct affinity_observation* value) {
+  if (result <= 0 || result > AFFINITY_BYTES || error != 0 || !affinity_canaries(value))
+    return 0;
+  int nonempty = 0;
+  for (long i = 0; i < result; ++i)
+    nonempty |= value->mask[i];
+  for (long i = result; i < AFFINITY_BYTES; ++i)
+    if (value->mask[i] != AFFINITY_SENTINEL)
+      return 0;
+  return nonempty != 0;
+}
+
+static void print_affinity(const char* mode, long result, long error,
+                           const struct affinity_observation* value) {
+  printf("%s sched_getaffinity: result=%ld errno=%ld mask=", mode, result, error);
+  for (unsigned int i = 0; i < sizeof(value->mask); ++i)
+    printf("%02x", value->mask[i]);
+  printf(" canaries=%d\n", affinity_canaries(value));
+}
+
+static int affinity_ordinary(void) {
+  struct affinity_observation output = affinity_sentinel();
+  errno = 0;
+  long result = syscall(SYS_sched_getaffinity, 0, sizeof(output.mask), output.mask);
+  int error = errno;
+  print_affinity("ordinary", result, error, &output);
+  return !affinity_success(result, error, &output);
+}
+
+static int affinity_vfork(void) {
+  int observation_pipe[2];
+  if (pipe(observation_pipe) != 0)
+    return 30;
+  pid_t child = vfork();
+  if (child < 0)
+    return 31;
+  if (child == 0) {
+    struct {
+      long result;
+      long error;
+      struct affinity_observation output;
+    } observation;
+    observation.output = affinity_sentinel();
+    errno = 0;
+    observation.result = syscall(
+        SYS_sched_getaffinity, 0, sizeof(observation.output.mask), observation.output.mask);
+    observation.error = errno;
+    static const char after[] = "after sched_getaffinity\n";
+    if (syscall(SYS_write, STDOUT_FILENO, after, sizeof(after) - 1) != (long)sizeof(after) - 1 ||
+        syscall(SYS_write, observation_pipe[1], &observation, sizeof(observation)) !=
+            (long)sizeof(observation))
+      syscall(SYS_exit, 32);
+    syscall(SYS_exit, 0);
+    __builtin_unreachable();
+  }
+
+  close(observation_pipe[1]);
+  int status = 0;
+  if (waitpid(child, &status, 0) != child)
+    return 33;
+  struct {
+    long result;
+    long error;
+    struct affinity_observation output;
+  } observation;
+  ssize_t count = read(observation_pipe[0], &observation, sizeof(observation));
+  close(observation_pipe[0]);
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || count != (ssize_t)sizeof(observation))
+    return 34;
+  print_affinity("vfork", observation.result, observation.error, &observation.output);
+  return !affinity_success(observation.result, observation.error, &observation.output);
+}
+
 int main(int argc, char** argv) {
   if (argc != 2)
     return 2;
+  if (strcmp(argv[1], "affinity-ordinary") == 0)
+    return affinity_ordinary();
+  if (strcmp(argv[1], "affinity-vfork") == 0)
+    return affinity_vfork();
   if (strcmp(argv[1], "param-targets") == 0)
     return parameter_targets();
   if (strcmp(argv[1], "param-vfork") == 0)
