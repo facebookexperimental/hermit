@@ -4766,8 +4766,8 @@ mod tests {
         ));
     }
 
-    /// A per-process file belongs to the guest's own identity, with Linux's
-    /// mode and an inode its path names.
+    /// A per-process file belongs to the guest's own identity, and the path
+    /// calls Detcore resolves itself include its name.
     #[test]
     fn a_process_file_is_owned_by_the_guest_and_named_by_path_calls() {
         assert_eq!(rendered_owner(Path::new("/proc/3/cgroup")), Ok((0, 0)));
@@ -4792,5 +4792,13 @@ mod tests {
             stat.inode,
             procfs_inode::rendered_inode(Path::new("/proc/3/task/3/cgroup"))
         );
+        assert!(could_name_rendered(
+            Path::new("/proc/self/cgroup"),
+            RenderedFiles::WITHOUT_CPUINFO
+        ));
+        assert!(could_name_rendered(
+            Path::new("cgroup"),
+            RenderedFiles::WITHOUT_CPUINFO
+        ));
     }
 }

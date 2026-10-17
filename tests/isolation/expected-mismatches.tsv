@@ -130,6 +130,5 @@ ptrace,e9patch	scratch.host_separation@host:replay-gdb-host:*	mismatch	https://g
 ptrace,e9patch	scratch.host_separation@host:replay-gdb-local-refusal:*	mismatch	https://github.com/rrnewton/hermit/issues/4461	record and replay give the guest the host's /tmp
 ptrace,dbt,liteinst,in-guest-trap,kvm,e9patch	sentinel.ipc.reachability	no_result	https://github.com/rrnewton/hermit/issues/4467	Detcore answers shmctl with ENOSYS, so IPC reachability cannot be observed
 kvm	verification.physical_phases	no_result	https://github.com/rrnewton/hermit/issues/4466	the driver emits these evidence rows as no_result by construction
-kvm	view.cgroup.complete	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
 kvm	view.net_dev.complete	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
 kvm	view.net_route.complete	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation

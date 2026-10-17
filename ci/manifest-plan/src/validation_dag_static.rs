@@ -2469,7 +2469,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler::tests::procfs_task_answers_from_the_process_table and
     // procfs_inode::tests::a_task_generation_fits_its_inode_field_up_to_its_bound
     // (https://github.com/rrnewton/hermit/issues/4213): 2004, executed.
-    ("test.detcore_unit", 2004),
+    // And procfs::tests::{a_process_cgroup_is_rendered_for_the_task_its_path_names,
+    // a_rendered_process_cgroup_is_the_root_cgroup_and_only_once_opened_so,
+    // a_process_cgroup_placeholder_names_its_task,
+    // a_process_cgroup_inode_is_its_tasks_identity,
+    // a_process_cgroup_inode_refuses_a_pid_beyond_its_field,
+    // a_process_cgroup_inode_refuses_an_incarnation_beyond_its_field}
+    // (https://github.com/rrnewton/hermit/issues/4213): 2010, executed.
+    ("test.detcore_unit", 2010),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3532,7 +3539,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 9d6182b5: 512.
     // And a_name_below_a_received_directory_is_looked_up_on_ptrace_dbt_and_kvm
     // (a relative name below a descriptor received over SCM_RIGHTS): 513.
-    ("test.cli", 513),
+    // And detcore_renders_process_cgroup_on_every_backend,
+    // detcore_renders_process_cgroup_under_relaxed_threads and
+    // a_received_rendered_descriptor_is_refused_under_relaxed_threads
+    // (https://github.com/rrnewton/hermit/issues/4213): 516.
+    ("test.cli", 516),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3963,7 +3974,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the nine run_liteinst_timerfd_virtual_* tests (B3 step 2): 446.
     // And +1 from 9d6182b5: 447.
     // And the received-directory lookup test: 448.
-    ("test.cli_on_host", 448),
+    // And the three 4213 process-cgroup tests: 451.
+    ("test.cli_on_host", 451),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4273,7 +4285,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same ten in-flight-dequeue units: 1992.
     // And the 4213 received-directory task-position test: 1993, executed.
     // And the eleven 4213 per-process mechanism tests: 2004, executed.
-    ("test.detcore_unit_on_host", 2004),
+    // And the six 4213 process-cgroup tests: 2010, executed.
+    ("test.detcore_unit_on_host", 2010),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

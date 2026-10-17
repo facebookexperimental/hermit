@@ -1280,10 +1280,11 @@ impl ProcfsFile {
     }
 
     /// The per-process files Detcore renders, and their names.
-    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 0] = [];
+    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 1] =
+        [(ProcfsKind::ProcessCgroup, "cgroup")];
 
     /// The names of the per-process files Detcore renders.
-    pub(crate) const PER_PROCESS_NAMES: [&'static str; 0] = [];
+    pub(crate) const PER_PROCESS_NAMES: [&'static str; 1] = ["cgroup"];
 
     /// Bind the caller's spellings (`self`, `thread-self`) of a per-process
     /// file's task to the caller's process `pid` and thread `tid`, as Linux
@@ -1450,6 +1451,11 @@ impl ProcfsFile {
             ProcfsKind::Uptime => b"0.00 0.00\n",
             ProcfsKind::SystemStat => SYSTEM_STAT_TEMPLATE,
             ProcfsKind::Cpuinfo | ProcfsKind::Fixed(_) => b"",
+            // Linux's `proc_cgroup_show` for a task in the root cgroup of
+            // the cgroup v2 hierarchy, the only one Hermit's machine has
+            // (`/proc/cgroups` lists every controller on the unified hierarchy, 0);
+            // the sanitizer keeps it.
+            ProcfsKind::ProcessCgroup => b"0::/\n",
             _ => unreachable!("{:?} has no rendered path", self.kind),
         }
     }
@@ -7780,5 +7786,259 @@ total_commit_ms 0\n"
             sanitize_process_cgroup(b"0::/user.slice/\xff\xfe.scope\n"),
             b"0::/\n"
         );
+    }
+
+    /// A process's cgroup file is named, for rendering, by the task its path
+    /// names: `self` and `thread-self` bind to the caller's numbers at the
+    /// lookup, a number names itself, and a number Linux's `name_to_int`
+    /// refuses names no task. Every spelling of one task's file has one path,
+    /// the one its descriptor link shows, and so one inode; a thread's
+    /// `task/<tid>` file is another file.
+    #[test]
+    fn a_process_cgroup_is_rendered_for_the_task_its_path_names() {
+        let bound = |spelling: &str| {
+            let mut file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            assert_eq!(file.per_process_name(), Some("cgroup"), "{spelling}");
+            file.bind_task(3, 5);
+            file.rendered_path(RenderedFiles::WITHOUT_CPUINFO)
+        };
+        for (spelling, path) in [
+            ("/proc/self/cgroup", Some("/proc/3/cgroup")),
+            ("/proc/3/cgroup", Some("/proc/3/cgroup")),
+            ("/proc/7/cgroup", Some("/proc/7/cgroup")),
+            ("/proc/thread-self/cgroup", Some("/proc/3/task/5/cgroup")),
+            ("/proc/self/task/5/cgroup", Some("/proc/3/task/5/cgroup")),
+            ("/proc/3/task/5/cgroup", Some("/proc/3/task/5/cgroup")),
+            ("/proc/7/task/9/cgroup", Some("/proc/7/task/9/cgroup")),
+            ("/proc/self/./cgroup", Some("/proc/3/cgroup")),
+            ("/proc/03/cgroup", None),
+            ("/proc/3/task/05/cgroup", None),
+            ("/proc/99999999999/cgroup", None),
+        ] {
+            assert_eq!(bound(spelling), path.map(Path::new), "{spelling}");
+        }
+        // Before the caller's spellings are bound there is no path.
+        let unbound = ProcfsFile::from_path(Path::new("/proc/self/cgroup")).unwrap();
+        assert_eq!(unbound.rendered_path(RenderedFiles::ALL), None);
+        assert_eq!(unbound.bound_task(), None);
+        // `thread-self` has no `task` below it, and other names are not the
+        // file.
+        assert!(ProcfsFile::from_path(Path::new("/proc/thread-self/task/5/cgroup")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/cgroups")).is_none());
+        // The two tables of per-process files agree.
+        assert_eq!(
+            ProcfsFile::PER_PROCESS_KINDS.map(|(_, name)| name),
+            ProcfsFile::PER_PROCESS_NAMES
+        );
+        // One interned path per task.
+        let first = bound("/proc/self/cgroup").unwrap();
+        let second = bound("/proc/3/cgroup").unwrap();
+        assert!(std::ptr::eq(first, second));
+        assert!(rendered_path_is_per_process(first));
+        assert!(!rendered_path_is_per_process(Path::new("/proc/stat")));
+        assert!(!rendered_path_is_per_process(Path::new(
+            "/proc/sys/kernel/pty/nr"
+        )));
+    }
+
+    /// The bytes are the root cgroup of the cgroup v2 hierarchy, rendered
+    /// with no kernel object; a file the kernel opened (under record and
+    /// replay, after `chroot`) keeps being served from the kernel's bytes,
+    /// sanitized, even where its path names a task by number.
+    #[test]
+    fn a_rendered_process_cgroup_is_the_root_cgroup_and_only_once_opened_so() {
+        let kernel_opened = ProcfsFile::from_path(Path::new("/proc/3/cgroup")).unwrap();
+        assert_eq!(
+            kernel_opened.rendered_path(RenderedFiles::ALL),
+            Some(Path::new("/proc/3/cgroup"))
+        );
+        assert_eq!(kernel_opened.served_rendered_path(RenderedFiles::ALL), None);
+        assert_eq!(kernel_opened.opened_path(), None);
+        let mut rendered = kernel_opened.into_rendered();
+        assert_eq!(
+            rendered.served_rendered_path(RenderedFiles::WITHOUT_CPUINFO),
+            Some(Path::new("/proc/3/cgroup"))
+        );
+        assert_eq!(rendered.opened_path(), Some(Path::new("/proc/3/cgroup")));
+        let template = rendered.rendering_template().to_vec();
+        rendered.initialize(template, ProcfsSnapshotContext::default());
+        assert_eq!(rendered.rendered_snapshot(), Some(&b"0::/\n"[..]));
+        assert!(rendered.seeks_only_from_start_or_position());
+        // A system-wide file is served from its rendering whichever opened it.
+        let stat = ProcfsFile::from_path(Path::new("/proc/stat")).unwrap();
+        assert_eq!(
+            stat.served_rendered_path(RenderedFiles::ALL),
+            Some(Path::new("/proc/stat"))
+        );
+    }
+
+    /// A placeholder's name carries a per-process file's task by number and
+    /// identity, as Detcore names every one it makes, and is read back as the
+    /// same file of the same task; a name with `self`, or without the task's
+    /// identity, names no file Detcore made.
+    #[test]
+    fn a_process_cgroup_placeholder_names_its_task() {
+        let file = |spelling: &str, incarnation| {
+            let mut file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            file.bind_task(3, 5);
+            file.set_task_incarnation(incarnation);
+            file.into_rendered().opened_path().unwrap()
+        };
+        let process = file(
+            "/proc/self/cgroup",
+            TaskIncarnation {
+                process: 1,
+                thread: None,
+            },
+        );
+        let name = placeholder_name(process, b"");
+        assert_eq!(name, "hermit-procfs:/proc/3/cgroup#1@");
+        let link = format!("/memfd:{name} (deleted)");
+        let (path, snapshot) =
+            placeholder_link(link.as_bytes(), RenderedFiles::WITHOUT_CPUINFO).unwrap();
+        assert!(
+            std::ptr::eq(path, process),
+            "the same file of the same task"
+        );
+        assert!(snapshot.is_empty());
+        let thread = file(
+            "/proc/thread-self/cgroup",
+            TaskIncarnation {
+                process: 1,
+                thread: Some(2),
+            },
+        );
+        let name = placeholder_name(thread, b"");
+        assert_eq!(name, "hermit-procfs:/proc/3/task/5/cgroup#1.2@");
+        let read = placeholder_link_path(
+            format!("/memfd:{name} (deleted)").as_bytes(),
+            RenderedFiles::ALL,
+        )
+        .unwrap();
+        assert!(std::ptr::eq(read, thread));
+        for forged in [
+            "hermit-procfs:/proc/self/cgroup#1@",
+            "hermit-procfs:/proc/3/cgroup@",
+            "hermit-procfs:/proc/3/cgroup#1.2@",
+            "hermit-procfs:/proc/3/task/5/cgroup#1@",
+            "hermit-procfs:/proc/3/cgroup#x@",
+            "hermit-procfs:/proc/stat#1@",
+            "hermit-procfs:/proc/3/cgroup#256@",
+            "hermit-procfs:/proc/3/task/5/cgroup#1.256@",
+        ] {
+            assert_eq!(
+                placeholder_link_path(
+                    format!("/memfd:{forged} (deleted)").as_bytes(),
+                    RenderedFiles::ALL
+                ),
+                None,
+                "{forged}"
+            );
+        }
+    }
+
+    /// Two tasks that held the same pid have cgroup files with one text but
+    /// two paths and two inode numbers, and the number lays out the file's
+    /// identity: no two files of different tasks can share one (the 28-bit
+    /// hash of the text, which system-wide files keep, could: the paths of
+    /// 19899 and 172794 collided). A system-wide file keeps its number.
+    #[test]
+    fn a_process_cgroup_inode_is_its_tasks_identity() {
+        let file = |spelling: &str, pid, tid, incarnation| {
+            let mut file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            file.bind_task(pid, tid);
+            file.set_task_incarnation(incarnation);
+            file.into_rendered().opened_path().unwrap()
+        };
+        let once = TaskIncarnation {
+            process: 1,
+            thread: None,
+        };
+        let twice = TaskIncarnation {
+            process: 2,
+            thread: None,
+        };
+        let first = file("/proc/self/cgroup", 3, 3, once);
+        let second = file("/proc/self/cgroup", 3, 3, twice);
+        assert_eq!(first, second, "one text");
+        assert!(!std::ptr::eq(first, second), "two files");
+        let inode = crate::procfs_inode::rendered_inode;
+        assert_ne!(inode(first), inode(second));
+        assert_eq!(inode(first), 1 << 63 | 1 << 60 | 3 << 38 | 1 << 8);
+        assert_eq!(inode(second), 1 << 63 | 1 << 60 | 3 << 38 | 2 << 8);
+        let thread = file(
+            "/proc/thread-self/cgroup",
+            3,
+            5,
+            TaskIncarnation {
+                process: 1,
+                thread: Some(1),
+            },
+        );
+        assert_eq!(
+            inode(thread),
+            1 << 63 | 1 << 60 | 3 << 38 | 5 << 16 | 1 << 8 | 1
+        );
+        // The last incarnation an inode number tells apart, for the process
+        // and the thread, and the greatest pid and tid Linux gives.
+        let last = file(
+            "/proc/4194303/task/4194303/cgroup",
+            3,
+            3,
+            TaskIncarnation {
+                process: crate::procfs_inode::MAX_INCARNATION,
+                thread: Some(crate::procfs_inode::MAX_INCARNATION),
+            },
+        );
+        assert_eq!(
+            inode(last),
+            1 << 63 | 1 << 60 | 4194303 << 38 | 4194303 << 16 | 255 << 8 | 255
+        );
+        let a = file("/proc/19899/cgroup", 3, 3, once);
+        let b = file("/proc/172794/cgroup", 3, 3, once);
+        assert_ne!(inode(a), inode(b));
+        assert_eq!(
+            crate::procfs_inode::rendered_inode(Path::new("/proc/19899/cgroup")) & 0x0fff_ffff,
+            crate::procfs_inode::rendered_inode(Path::new("/proc/172794/cgroup")) & 0x0fff_ffff,
+            "the text hash the structured number replaces does collide"
+        );
+        assert!(crate::procfs_inode::rendered_inode(Path::new("/proc/stat")) < 1 << 32);
+        // A rendered file read back from its path is the same task's file.
+        let reread = ProcfsFile::from_rendered_path(second).unwrap();
+        assert_eq!(reread.task_incarnation(), Some(twice));
+    }
+
+    /// A pid beyond Linux's `PID_MAX_LIMIT` does not fit an inode number's
+    /// field, and is refused rather than wrapped into another file's number.
+    #[test]
+    #[should_panic(expected = "does not fit")]
+    fn a_process_cgroup_inode_refuses_a_pid_beyond_its_field() {
+        let mut file = ProcfsFile::from_path(Path::new("/proc/4194304/cgroup")).unwrap();
+        file.bind_task(1, 1);
+        file.set_task_incarnation(TaskIncarnation {
+            process: 1,
+            thread: None,
+        });
+        let path = file.into_rendered().opened_path().unwrap();
+        crate::procfs_inode::rendered_inode(path);
+    }
+
+    /// The 256th task to hold a number has no inode number of its own:
+    /// Detcore refuses to bind a file to it (`Detcore::bind_task_identity`,
+    /// `procfs_inode::incarnation_fits`), and numbering one anyway is a
+    /// defect that panics rather than wraps into another task's number.
+    #[test]
+    #[should_panic(expected = "pid incarnation 256")]
+    fn a_process_cgroup_inode_refuses_an_incarnation_beyond_its_field() {
+        let mut file = ProcfsFile::from_path(Path::new("/proc/3/cgroup")).unwrap();
+        file.bind_task(3, 3);
+        let beyond = TaskIncarnation {
+            process: crate::procfs_inode::MAX_INCARNATION + 1,
+            thread: None,
+        };
+        assert!(!crate::procfs_inode::incarnation_fits(beyond));
+        file.set_task_incarnation(beyond);
+        let path = file.into_rendered().opened_path().unwrap();
+        crate::procfs_inode::rendered_inode(path);
     }
 }
