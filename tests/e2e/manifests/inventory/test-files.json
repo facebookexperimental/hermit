@@ -236,6 +236,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/copied_priority_query.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/copied_priority_query.c is owned by hermit-cli/tests/cli.rs: dbt_refuses_a_vfork_childs_priority_query_by_name checks the shared priority model and exact named strict copied-child refusal, including guest status and stderr."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/copied_scheduler_query.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/copied_scheduler_query.c is owned by hermit-cli/tests/cli.rs: the CLI test dbt_refuses_a_vfork_childs_scheduler_policy_query_by_name runs it on DBT and requires a strict copied (vfork) child's native scheduler-policy query to stop with the named refusal. It stays a fixture because a generic manifest cannot assert the refusal's exit status and stderr."

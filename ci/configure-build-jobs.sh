@@ -1908,8 +1908,15 @@ fi
 # src/lib.rs (two imports gated on prototype-runtime); no file is added
 # (inventory 961), and build.rs, vendor/, native/, the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml are unchanged, so the budget carries.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bc301d042d8f871326c2b7d6168919aa99f0fa2d ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie bc301d042d8f871326c2b7d6168919aa99f0fa2d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 9a6c76c6e784b9e38e47485b3df0d32b8ea5c844 (2026-10-17): from
+# bc301d042d8f871326c2b7d6168919aa99f0fa2d, replay only native getpriority target admission
+# removal and its original/tail/returning regression cases. All seven SDK
+# recipe inputs remain object-identical; native client source equals the
+# reviewed73cc repair and is source-bound separately. Preserve incoming
+# realtime-signal/e2e carries, SDK budget, parallel width and limits.
+# The paired Hermit strict copied-child refusal remains required.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 9a6c76c6e784b9e38e47485b3df0d32b8ea5c844 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 9a6c76c6e784b9e38e47485b3df0d32b8ea5c844 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

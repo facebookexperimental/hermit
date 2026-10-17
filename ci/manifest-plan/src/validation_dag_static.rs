@@ -1092,7 +1092,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // A6 adds 3 explicit-refusal/configuration/timer controls; combined source count, listing pending.
     // And +3 from 2447c8e8: 1605.
     // And detcore-model's launch_image_never_enters_the_legacy_form: 1606.
-    ("test.regular_crates", 1606),
+    // Measured with copied_child_refuses_priority_queries_only_in_strict_mode: 1607.
+    ("test.regular_crates", 1607),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3488,7 +3489,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // A6 adds 4 explicit-refusal/configuration/timer controls; combined source count, listing pending.
     // And +4 from 2447c8e8: 492.
     // And the eight run_dbt_timerfd_virtual_* tests (B3 step 1): 500.
-    ("test.cli", 500),
+    // Measured with dbt_refuses_a_vfork_childs_priority_query_by_name: 501.
+    ("test.cli", 501),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3914,7 +3916,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // A6 adds 4 explicit-refusal/configuration/timer controls; combined source count, listing pending.
     // And +4 from 2447c8e8: 427.
     // And the same eight run_dbt_timerfd_virtual_* tests: 435.
-    ("test.cli_on_host", 435),
+    // Measured with dbt_refuses_a_vfork_childs_priority_query_by_name: 436.
+    ("test.cli_on_host", 436),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4659,7 +4662,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // A6 adds 3 explicit-refusal/configuration/timer controls; combined source count, listing pending.
     // And +3 from 2447c8e8: 1591.
     // And the same launch-image legacy-form test: 1592.
-    ("test.regular_crates_on_host", 1592),
+    // Measured with copied_child_refuses_priority_queries_only_in_strict_mode: 1593.
+    ("test.regular_crates_on_host", 1593),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),

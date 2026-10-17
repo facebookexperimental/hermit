@@ -202,6 +202,8 @@ static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_RLIMIT_PARITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "dbt")]
 static COPIED_SCHEDULER_QUERY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+#[cfg(feature = "dbt")]
+static COPIED_PRIORITY_QUERY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_RT_SIGNAL_PENDING_OBSERVED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -25681,6 +25683,103 @@ fn dbt_refuses_a_vfork_childs_scheduler_policy_query_by_name() {
     );
     assert!(
         !stdout(&refused).contains("after sched_getscheduler"),
+        "{refused:?}"
+    );
+}
+
+/// A copied DBT child must refuse a priority query in strict mode.
+/// Its non-strict native path and the ordinary shared Detcore answer are distinct.
+#[test]
+#[cfg(feature = "dbt")]
+fn dbt_refuses_a_vfork_childs_priority_query_by_name() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&COPIED_PRIORITY_QUERY_GUEST, "copied_priority_query")
+        .to_str()
+        .unwrap();
+    let nice19 = |mut command: Command| {
+        // SAFETY: the raw syscall only changes this child before exec; it does
+        // not allocate, acquire locks, or alter the test process's policy.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::syscall(libc::SYS_setpriority, libc::PRIO_PROCESS, 0, 19) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+    };
+    let mut native = Command::new(guest);
+    native.arg("vfork");
+    let native = nice19(native)
+        .output()
+        .expect("native nice19 vfork control");
+    assert!(native.status.success(), "{native:?}");
+    assert_eq!(
+        stdout(&native),
+        "after getpriority\nvfork getpriority: raw=1 errno=0 exit=0\n"
+    );
+    let run = |backend, strictness, mode| {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            strictness,
+            "--base-env=minimal",
+            "--",
+            guest,
+            mode,
+        ];
+        hermit_test::hermit_output("priority query", &mut nice19(hermit_command(&args)))
+    };
+    // The ordinary shared Tool retains raw20 even when native nice19 returns1.
+    for backend in ["dbt", "ptrace"] {
+        let output = run(backend, "--strict", "ordinary");
+        assert!(output.status.success(), "{backend}: {output:?}");
+        assert_eq!(stdout(&output), "ordinary getpriority: raw=20 errno=0\n");
+        let targets = run(backend, "--strict", "ordinary-targets");
+        assert!(targets.status.success(), "{backend}: {targets:?}");
+        assert_eq!(
+            stdout(&targets),
+            "targets identities: child=1 parent=1\n\
+             getpriority zero: raw=20 errno=0\n\
+             getpriority self: raw=20 errno=0\n\
+             getpriority live: raw=20 errno=0\n\
+             getpriority absent: raw=20 errno=0\n\
+             getpriority negative: raw=20 errno=0\n\
+             getpriority invalid-negative: raw=-1 errno=22\n\
+             getpriority invalid-live: raw=-1 errno=22\n\
+             getpriority invalid-absent: raw=-1 errno=22\n\
+             targets wait: exit=37\ngetpriority-targets=ok\n"
+        );
+    }
+    let ptrace = run("ptrace", "--strict", "vfork");
+    assert!(ptrace.status.success(), "{ptrace:?}");
+    assert_eq!(
+        stdout(&ptrace),
+        "after getpriority\nvfork getpriority: raw=20 errno=0 exit=0\n"
+    );
+    // This full transcript proves the copied child actually inherited nice19;
+    // do not assume that launch configuration alone establishes its raw value.
+    let passthrough = run("dbt", "--allow-unsupported-syscalls", "vfork");
+    assert!(passthrough.status.success(), "{passthrough:?}");
+    assert_eq!(passthrough.stdout, native.stdout);
+
+    let refused = run("dbt", "--strict", "vfork");
+    assert_eq!(refused.status.code(), Some(101), "{refused:?}");
+    assert!(
+        stderr(&refused).contains("unsupported syscall getpriority (140) in copied child"),
+        "{refused:?}"
+    );
+    assert!(
+        stderr(&refused).contains(&format!(
+            "detcore-dbt: unsupported syscall {} in copied child",
+            libc::SYS_getpriority
+        )),
+        "{refused:?}"
+    );
+    assert!(
+        !stdout(&refused).contains("after getpriority"),
         "{refused:?}"
     );
 }
