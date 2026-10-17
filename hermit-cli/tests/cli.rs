@@ -26874,6 +26874,14 @@ fn dbt_rdtsc_is_answered_by_detcore_as_under_ptrace() {
 ///   because it uses no guest stack; the refusal is Reverie's.
 /// - `time(tloc)` with `tloc` four bytes before a read-only page fails with
 ///   EFAULT and writes none of the eight bytes, as Linux's `put_user` does.
+/// - `time(tloc)` with `tloc` wholly inside a read-only page, and wholly inside
+///   an executable read-only page, fails the same way, as on Linux. No page
+///   boundary is crossed, so Reverie's straddle pre-check does not apply and
+///   only the write itself refuses (the Claude review of
+///   https://github.com/rrnewton/hermit/pull/4502: a write through
+///   PTRACE_POKEDATA passed every other case).
+/// - Under Hermit the private-page case must find the page already mapped
+///   (`preexisting=1`), so it really aims at Reverie's private page.
 ///
 /// Before Reverie 4c20795a the pushed mask went through PTRACE_POKEDATA and
 /// overwrote both pages with zeros, and `time` wrote all eight bytes.
@@ -26888,9 +26896,14 @@ fn tool_output_respects_page_protection_and_the_private_page() {
         ("stack", "stack target=rx result=-14 unchanged=1\n"),
         (
             "private-stack",
-            "stack target=private result=-14 unchanged=1\n",
+            "stack target=private preexisting=1 result=-14 unchanged=1\n",
         ),
         ("scalar", "scalar result=-1 errno=14 unchanged=1\n"),
+        (
+            "aligned-scalar",
+            "aligned-scalar target=ro result=-1 errno=14 unchanged=1\n\
+             aligned-scalar target=rx result=-1 errno=14 unchanged=1\n",
+        ),
     ] {
         for strict in [true, false] {
             let mut args = vec!["run"];
