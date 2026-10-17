@@ -1647,12 +1647,19 @@ pub const PMU_INTEGRATION_TAG: &str = "test.pmu_integration_cases";
 /// names up to deadline_slice_cap (chaos and deadline, ~120 s), the second
 /// the rest (external_signal_interrupt, ~78 s). It is selected by the same
 /// rule as [`HERMIT_INTEGRATION_SHARDS`].
+///
+/// The estimates are the medians of 38 full validations from 2026-10-16 to
+/// 2026-10-17 (141 s and 98 s; the shards gained cases since e9473c43).
+/// With 120 s, the first shard tied five nodes whose own 120 s estimates hid
+/// medians of 24 to 96 s, and in the validation of 40c58818 it lost all five
+/// ties: ready at +335 s, it waited for a slot until +384 s and ended the DAG
+/// at +527 s.
 pub const PMU_INTEGRATION_SHARDS: &[Shard] = &[
-    ("pmu_integration_cases", None, 120.0),
+    ("pmu_integration_cases", None, 141.0),
     (
         "pmu_integration_cases_2",
         Some("dentry_state_determinism"),
-        78.0,
+        98.0,
     ),
 ];
 

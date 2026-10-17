@@ -7049,7 +7049,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         env: &[],
         hint: HintSpec {
             resources: &[],
-            est_duration_s: 120.0,
+            // Median of 38 full validations, 2026-10-16 to 2026-10-17: the
+            // dispatch order ranks ready nodes by these estimates.
+            est_duration_s: 96.0,
             rss_baseline_bytes: Some(5368709120),
             hard_mem_max_bytes: Some(7516192768),
             classification: StepClass::CpuBound,
@@ -7085,7 +7087,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         env: &[],
         hint: HintSpec {
             resources: &[],
-            est_duration_s: 120.0,
+            // Median of 38 full validations, 2026-10-16 to 2026-10-17: the
+            // dispatch order ranks ready nodes by these estimates.
+            est_duration_s: 30.0,
             rss_baseline_bytes: Some(1932735283),
             hard_mem_max_bytes: Some(3758096384),
             classification: StepClass::CpuBound,
@@ -7157,7 +7161,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         env: &[],
         hint: HintSpec {
             resources: &[],
-            est_duration_s: 120.0,
+            // Median of 38 full validations, 2026-10-16 to 2026-10-17: the
+            // dispatch order ranks ready nodes by these estimates.
+            est_duration_s: 24.0,
             rss_baseline_bytes: Some(2147483648),
             hard_mem_max_bytes: Some(4294967296),
             classification: StepClass::CpuBound,
@@ -7492,7 +7498,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         env: &[],
         hint: HintSpec {
             resources: &[],
-            est_duration_s: 120.0,
+            // Median of 38 full validations, 2026-10-16 to 2026-10-17: the
+            // dispatch order ranks ready nodes by these estimates.
+            est_duration_s: 24.0,
             rss_baseline_bytes: Some(2147483648),
             hard_mem_max_bytes: Some(4294967296),
             classification: StepClass::LatencyBound,
@@ -7985,7 +7993,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         env: &[("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)],
         hint: HintSpec {
             resources: &[],
-            est_duration_s: 120.0,
+            // Median of 38 full validations, 2026-10-16 to 2026-10-17: the
+            // dispatch order ranks ready nodes by these estimates.
+            est_duration_s: 25.0,
             rss_baseline_bytes: Some(134217728),
             hard_mem_max_bytes: Some(1073741824),
             classification: StepClass::LatencyBound,
