@@ -1450,3 +1450,46 @@ fn retiring_an_old_generations_early_entry_keeps_the_new_generation_waiting() {
         "the new generation still waits for its own entry's dequeue"
     );
 }
+
+/// On a shared queue, a delivery resumed blocked after an early pop whose
+/// joined copy another thread's stop already took: the kernel queues the
+/// requeue (`legacy_queue` finds the signal absent), which no list can hold,
+/// so the run is refused by name rather than the front retired (the Claude
+/// re-check of the in-flight-dequeue fix, B1).
+#[test]
+#[should_panic(expected = "another delivery had already taken that send's copy")]
+fn a_blocked_resume_after_the_joined_copy_was_taken_is_refused() {
+    let mut f = family();
+    let sh = shared(&f);
+    let bit = kernel_signal_bit(USR1);
+    f.guest_send(sh, ordinary_siginfo(USR1, 0, 100, 1000));
+    f.queues(0, bit);
+    f.sched
+        .timer_signal_dequeue(f.leader, USR1, Some(LogicalTime::from_nanos(10)));
+    f.queues(0, 0);
+    f.guest_send(sh, ordinary_siginfo(USR1, 0, 101, 1000));
+    f.queues(0, bit);
+    f.sched
+        .timer_signal_dequeue(f.sibling, USR1, Some(LogicalTime::from_nanos(20)));
+    f.queues(0, 0);
+    let sibling = f.sibling;
+    f.sched.discarded_signal_control(
+        sibling,
+        DiscardedSignalControl::Consumed {
+            signal: USR1,
+            how: Consumption::KeptResume { blocked: false },
+            thread_holds: false,
+            process_holds: false,
+        },
+    );
+    // The leader's read finds the shared queue clear; it is resumed blocked.
+    f.sched.discarded_signal_control(
+        f.leader,
+        DiscardedSignalControl::Consumed {
+            signal: USR1,
+            how: Consumption::KeptResume { blocked: true },
+            thread_holds: false,
+            process_holds: false,
+        },
+    );
+}

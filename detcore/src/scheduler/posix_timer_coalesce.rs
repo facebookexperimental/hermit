@@ -1140,12 +1140,29 @@ impl Scheduler {
     ) -> Option<PendingDequeue> {
         let mut pending = self.pending_timer_dequeues.remove(&thread)?;
         // A delivery resumed blocked requeues its copy (`ptrace_signal`'s
-        // `send_signal_locked`). After an early pop the joined send's copy is
-        // pending, so `legacy_queue` drops that requeue, and the kernel holds
-        // exactly the joined send, as the list does; natively the blocked
-        // signal would have stayed pending and coalesced the same way. The
-        // early-popped front is retired below with the other unfinished
-        // dequeues (the Claude re-check of the in-flight-dequeue fix, R4).
+        // `send_signal_locked`). After an early pop, while the joined send's
+        // copy is still pending in the identified queue, `legacy_queue` drops
+        // that requeue, and the kernel holds exactly the joined send, as the
+        // list does; natively the blocked signal would have stayed pending and
+        // coalesced the same way. The early-popped front is then retired below
+        // with the other unfinished dequeues (the Claude re-check of the
+        // in-flight-dequeue fix, R4). If another thread's stop already took
+        // the joined copy (a shared queue), the kernel queues the requeue,
+        // which the list cannot hold, so the run is refused (B1).
+        if pending.signal == signal
+            && pending.early.is_some()
+            && how == (Consumption::KeptResume { blocked: true })
+            && !(if pending.queue == QueueId::Thread(thread) {
+                thread_holds
+            } else {
+                process_holds
+            })
+        {
+            refuse(format_args!(
+                "hermit: thread {thread}'s delivery of signal {signal} was resumed blocked after a send had taken the place of its front in {:?}, and another delivery had already taken that send's copy: the kernel queues the requeued copy, which the model of pending entries cannot hold, so the run is refused (https://github.com/rrnewton/hermit/issues/4262)",
+                pending.queue
+            ));
+        }
         if pending.signal != signal || how == (Consumption::KeptResume { blocked: true }) {
             self.retire_unfinished_dequeue(pending);
             return None;
