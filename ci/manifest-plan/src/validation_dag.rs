@@ -519,7 +519,6 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.inherited_terminal_read",
     "test.isolation_matrix_ptrace_runtime",
     "test.isolation_matrix_dbt_in_guest",
-    "test.syscall_conformance_ptrace",
     "test.isolated_detcore_workdir",
     "test.sabre_examples",
     "test.hermit_modes",
@@ -546,7 +545,6 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.pmu_integration_cases_2",
     "privileged-test.cli_kvm",
     "privileged-test.isolation_matrix_kvm",
-    "privileged-test.syscall_conformance_kvm",
     "privileged-only-cpuid.faulting",
     "privileged-only-pmu.preemption",
     "privileged-only-test.pmu_buck_chaos_cases",
@@ -661,12 +659,14 @@ const PROFILES: [Profile; 11] = [
         // The backend isolation matrix adds three full-only nodes
         // (test.isolation_matrix_ptrace_runtime, test.isolation_matrix_dbt_in_guest
         // and privileged-test.isolation_matrix_kvm): 98/99 before.
-        // The syscall conformance check adds two full-only nodes
+        // The syscall conformance check added two full-only nodes
         // (test.syscall_conformance_ptrace and
-        // privileged-test.syscall_conformance_kvm): 101/102 before.
+        // privileged-test.syscall_conformance_kvm), 101/102 before, and they
+        // left when the check moved to Reverie's own validate and CI
+        // (reverie-examples/e2e/run.sh): 103/104 before.
         label: "full",
-        direct_steps: 103,
-        selected_steps: 104,
+        direct_steps: 101,
+        selected_steps: 102,
     },
     Profile {
         label: "portable",
@@ -4248,10 +4248,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // test.isolation_matrix_dbt_in_guest and privileged-test.isolation_matrix_kvm
     // (438 + 3; https://github.com/rrnewton/hermit/issues/4009).
     // 443 with the syscall conformance check: test.syscall_conformance_ptrace
-    // and privileged-test.syscall_conformance_kvm (441 + 2).
-    if cfg.steps.len() != 443 {
+    // and privileged-test.syscall_conformance_kvm (441 + 2), and 441 again since
+    // that check runs in Reverie's own validate and CI instead
+    // (reverie-examples/e2e/run.sh).
+    if cfg.steps.len() != 441 {
         return Err(format!(
-            "superset has {} steps, expected 443",
+            "superset has {} steps, expected 441",
             cfg.steps.len()
         ));
     }
@@ -6804,8 +6806,10 @@ sys.exit(37)
         // https://github.com/rrnewton/hermit/issues/4243), and 96 since
         // test.pmu_integration_cases runs as two shards (99 full nodes),
         // and 99 with the three backend isolation matrix nodes (102 full
-        // nodes), and 101 with the two syscall conformance nodes (104).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 101);
+        // nodes), and 101 with the two syscall conformance nodes (104), and
+        // 99 again since that check runs in Reverie's own validate and CI
+        // (102 full nodes).
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 99);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps
