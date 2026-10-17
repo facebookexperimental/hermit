@@ -8524,13 +8524,24 @@ mod tests {
 
     #[test]
     fn run_summary_records_the_effective_shared_preemption_configuration() {
+        // Config::default() is unprepared: launch installs the timer capability.
+        // Specify that mechanism fact here independently of the maximum.
         for (config, expected_maximum, expected_timer) in [
-            (Config::default(), Some(200_000_000), true),
+            (
+                Config::default().with_backend(|backend| {
+                    backend.delivers_preemption_timer_events = true;
+                }),
+                Some(200_000_000),
+                true,
+            ),
             (
                 Config {
                     max_timeslice: None,
                     ..Config::default()
-                },
+                }
+                .with_backend(|backend| {
+                    backend.delivers_preemption_timer_events = true;
+                }),
                 None,
                 false,
             ),
@@ -8538,7 +8549,10 @@ mod tests {
                 Config {
                     max_timeslice: std::num::NonZeroU64::new(12_340),
                     ..Config::default()
-                },
+                }
+                .with_backend(|backend| {
+                    backend.delivers_preemption_timer_events = true;
+                }),
                 Some(12_340),
                 true,
             ),
