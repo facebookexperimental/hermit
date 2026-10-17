@@ -21321,8 +21321,8 @@
           "manifest_guest": 1
         },
         "est_duration_s": 5.0,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
+        "rss_baseline_bytes": 6442450944,
+        "hard_mem_max_bytes": 8589934592,
         "classification": "latency-bound",
         "preferred_inner_jobs": null,
         "measured_effective_cores": null,
@@ -21453,8 +21453,8 @@
           "manifest_guest": 1
         },
         "est_duration_s": 150.0,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
+        "rss_baseline_bytes": 6442450944,
+        "hard_mem_max_bytes": 8589934592,
         "classification": "latency-bound",
         "preferred_inner_jobs": null,
         "measured_effective_cores": null,
@@ -22846,8 +22846,8 @@
           "manifest_guest": 1
         },
         "est_duration_s": 120.0,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
+        "rss_baseline_bytes": 6442450944,
+        "hard_mem_max_bytes": 8589934592,
         "classification": "latency-bound",
         "preferred_inner_jobs": 1,
         "measured_effective_cores": null,

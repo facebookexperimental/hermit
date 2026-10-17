@@ -6660,8 +6660,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         hint: HintSpec {
             resources: &[(r########"manifest_guest"########, 1)],
             est_duration_s: 5.0,
-            rss_baseline_bytes: Some(1073741824),
-            hard_mem_max_bytes: Some(3221225472),
+            // Its shared-memory cells (mmap-fork-shared, shm-coherency-identity)
+            // map gigabytes of MAP_SHARED guest memory, run twice by verify: in
+            // 2026-10-17 host runs of the whole bucket at --jobs 1 the cgroup peaked
+            // at 6.26-6.27 GiB (shmem 5.5-6.1 GiB, anon under 200 MiB). At 3 GiB it
+            // was OOM-killed in every Cargo-runner full validation since 2026-10-16.
+            rss_baseline_bytes: Some(6442450944),
+            hard_mem_max_bytes: Some(8589934592),
             classification: StepClass::LatencyBound,
             preferred_inner_jobs: None,
             measured_effective_cores: None,
@@ -6705,8 +6710,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         hint: HintSpec {
             resources: &[(r########"manifest_guest"########, 1)],
             est_duration_s: 150.0,
-            rss_baseline_bytes: Some(1073741824),
-            hard_mem_max_bytes: Some(3221225472),
+            // Its shared-memory cells (mmap-fork-shared, shm-coherency-identity)
+            // map gigabytes of MAP_SHARED guest memory, run twice by verify: in
+            // 2026-10-17 host runs of the whole bucket at --jobs 1 the cgroup peaked
+            // at 6.26-6.27 GiB (shmem 5.5-6.1 GiB, anon under 200 MiB). At 3 GiB it
+            // was OOM-killed in every Cargo-runner full validation since 2026-10-16.
+            rss_baseline_bytes: Some(6442450944),
+            hard_mem_max_bytes: Some(8589934592),
             classification: StepClass::LatencyBound,
             preferred_inner_jobs: None,
             measured_effective_cores: None,
@@ -6843,8 +6853,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         hint: HintSpec {
             resources: &[(r########"manifest_guest"########, 1)],
             est_duration_s: 120.0,
-            rss_baseline_bytes: Some(1073741824),
-            hard_mem_max_bytes: Some(3221225472),
+            // Its shared-memory cells (mmap-fork-shared, shm-coherency-identity)
+            // map gigabytes of MAP_SHARED guest memory, run twice by verify: in
+            // 2026-10-17 host runs of the whole bucket at --jobs 1 the cgroup peaked
+            // at 6.26-6.27 GiB (shmem 5.5-6.1 GiB, anon under 200 MiB). At 3 GiB it
+            // was OOM-killed in every Cargo-runner full validation since 2026-10-16.
+            rss_baseline_bytes: Some(6442450944),
+            hard_mem_max_bytes: Some(8589934592),
             classification: StepClass::LatencyBound,
             preferred_inner_jobs: Some(1),
             measured_effective_cores: None,
