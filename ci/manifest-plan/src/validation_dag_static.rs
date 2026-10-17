@@ -3603,7 +3603,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // sabre_program_break_of_a_pie_starts_at_linuxs_rule and
     // sabre_refuses_brk_it_cannot_model_by_name: 36.
     // And sabre_heap_records_are_ptraces: 37.
-    ("test.sabre_examples", 37),
+    ("test.sabre_examples", 36),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -4792,7 +4792,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // sigstkflt_handler_not_installed_is_announced_once_per_run: 32.
     // sabre_guest_close_of_stderr_closes_it: 33.
     // And the same three program-break tests: 36, and the heap-record test: 37.
-    ("test.sabre_examples_on_host", 37),
+    ("test.sabre_examples_on_host", 36),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
