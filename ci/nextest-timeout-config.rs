@@ -64,9 +64,11 @@ const DETCORE_CONSTRUCTOR_WALL_SECONDS: u64 = 3 * DETCORE_CONSTRUCTOR_CPU_SECOND
 // Use 33 conservatively after the concurrent CPU22 timeout at 22.799306s;
 // that censored failure has unknown completion cost. Wall and cleanup stay unchanged.
 const STANDALONE_ALLOCATOR_CPU_SECONDS: u64 = 33;
-// Detcore stack completed maximum 27.542858s: ceil(1.5 * max) = 42.
+// Detcore stack completed maximum 27.542858s gave ceil(1.5 * max) = 42 at one test at a time.
+// With the node at five tests at once (2026-10-17), its completed maximum is 33.721186s
+// (validation of c63f1d21): ceil(1.5 * max) = 51.
 // Earlier CPU22 timeouts stay censored, not successful completion samples.
-const DETCORE_STACK_CPU_SECONDS: u64 = 42;
+const DETCORE_STACK_CPU_SECONDS: u64 = 51;
 const RENDERED_PROCFS_WRAPPER_NAME: &str = "hermit-rendered-procfs-cpu";
 // hermit::cli detcore_renders_its_procfs_files_on_every_backend runs a
 // --verify of one guest on every backend this build has, DBT's among them, plus
@@ -204,12 +206,12 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 19] = [
     MeasuredCpuAllowance::stack(
         "hermit-stack-standalone-altstack-cpu",
         "genuine_standalone_registers_fixed_guarded_altstack_without_continuation",
-        36,
+        47,
     ),
     MeasuredCpuAllowance::stack(
         "hermit-stack-inert-preload-cpu",
         "inert_preload_does_not_reserve_or_register_runtime_stacks",
-        31,
+        49,
     ),
     MeasuredCpuAllowance::stack(
         "hermit-stack-foreign-callback-cpu",
@@ -224,7 +226,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 19] = [
     MeasuredCpuAllowance::stack(
         "hermit-stack-disabled-altstack-cpu",
         "standalone_altstack_disabled_receives_no_owned_stack_credit",
-        30,
+        46,
     ),
     MeasuredCpuAllowance {
         wrapper_name: CPU_PROFILE_V3_LOADER_WRAPPER_NAME,
@@ -1803,7 +1805,7 @@ mod tests {
                 "hermit::liteinst_stacks",
                 "genuine_detcore_reaches_fixed_guarded_callback_and_altstack",
                 DETCORE_STACK_WRAPPER_NAME,
-                "42000000",
+                "51000000",
             ),
         ] {
             let target = nextest_cpu::AttemptIdentity {
@@ -1869,16 +1871,16 @@ mod tests {
                 {
                     match identity.test.as_str() {
                         "genuine_detcore_reaches_fixed_guarded_callback_and_altstack" => {
-                            Some((DETCORE_STACK_WRAPPER_NAME, "42000000"))
+                            Some((DETCORE_STACK_WRAPPER_NAME, "51000000"))
                         }
                         "genuine_standalone_registers_fixed_guarded_altstack_without_continuation" => {
-                            Some(("hermit-stack-standalone-altstack-cpu", "36000000"))
+                            Some(("hermit-stack-standalone-altstack-cpu", "47000000"))
                         }
                         "standalone_altstack_disabled_receives_no_owned_stack_credit" => {
-                            Some(("hermit-stack-disabled-altstack-cpu", "30000000"))
+                            Some(("hermit-stack-disabled-altstack-cpu", "46000000"))
                         }
                         "inert_preload_does_not_reserve_or_register_runtime_stacks" => {
-                            Some(("hermit-stack-inert-preload-cpu", "31000000"))
+                            Some(("hermit-stack-inert-preload-cpu", "49000000"))
                         }
                         "cold_constructor::caller_stack_samples_never_receive_constructor_placement_credit" => {
                             Some(("hermit-stack-caller-stack-cpu", "22000000"))
@@ -2063,19 +2065,19 @@ mod tests {
                     1.0,
                     1.0,
                     "22000000",
-                    ["32000000", "55000000", "33000000", "36000000", "42000000"],
+                    ["32000000", "55000000", "33000000", "36000000", "51000000"],
                     "57s",
                     "165s",
-                    "126s",
+                    "153s",
                 ),
                 (
                     1.25,
                     1.5,
                     "28000000",
-                    ["40000000", "69000000", "42000000", "45000000", "53000000"],
+                    ["40000000", "69000000", "42000000", "45000000", "64000000"],
                     "86s",
                     "248s",
-                    "189s",
+                    "230s",
                 ),
                 (
                     0.01,
@@ -2084,16 +2086,16 @@ mod tests {
                     ["1000000", "1000000", "1000000", "1000000", "1000000"],
                     "6s",
                     "17s",
-                    "13s",
+                    "16s",
                 ),
                 (
                     1.0,
                     1.01,
                     "22000000",
-                    ["32000000", "55000000", "33000000", "36000000", "42000000"],
+                    ["32000000", "55000000", "33000000", "36000000", "51000000"],
                     "58s",
                     "167s",
-                    "128s",
+                    "155s",
                 ),
             ] {
                 let rendered = scaled_config_with_allowances(
@@ -2235,18 +2237,18 @@ mod tests {
             ),
             (
                 "genuine_detcore_reaches_fixed_guarded_callback_and_altstack",
-                42,
-                126,
+                51,
+                153,
             ),
             (
                 "genuine_standalone_registers_fixed_guarded_altstack_without_continuation",
-                36,
-                108,
+                47,
+                141,
             ),
             (
                 "inert_preload_does_not_reserve_or_register_runtime_stacks",
-                31,
-                93,
+                49,
+                147,
             ),
             (
                 "stack_observation::tests::rejects_foreign_and_unreached_callback_records",
@@ -2260,8 +2262,8 @@ mod tests {
             ),
             (
                 "standalone_altstack_disabled_receives_no_owned_stack_credit",
-                30,
-                90,
+                46,
+                138,
             ),
         ];
         let identities = expected
@@ -2596,7 +2598,7 @@ mod tests {
         );
         assert_eq!(
             DETCORE_STACK_CPU_SECONDS,
-            timeouts::cpu_bound_from_p90_usec(27_542_858)
+            timeouts::cpu_bound_from_p90_usec(33_721_186)
         );
     }
 

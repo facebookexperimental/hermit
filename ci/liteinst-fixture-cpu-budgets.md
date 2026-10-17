@@ -1,5 +1,38 @@
 # LiteInst fixture CPU and wall budgets
 
+## Five tests at a time, October 17
+
+Since c6c91e59 (2026-10-17) the node runs five stacks tests at once
+(NEXTEST_TEST_THREADS=5). The five long tests then run side by side, and their
+cgroup CPU grows with host contention: the same test measured 14.6 CPU seconds
+in one full validation and 28.9 in another at the same head (033b1d55). In the
+validation of c63f1d21 the inert-preload and disabled-altstack tests hit their
+31- and 30-second caps (exit 124 from the CPU wrapper at 41.5 s and 37.9 s of
+wall, far inside their 93- and 90-second wall backstops), so the binding limit
+was CPU, not wall.
+
+The retained receipts of the 15 full validations at width 5 (7a5b0f15 through
+c63f1d21, 225 attempts, two CPU-censored) give the caps below, each
+`ceil(1.5 * max)` over completions and censored failures alike. The wall
+backstop stays three times the cap. The ten short tests' maxima (3.69 s at
+most) keep the 22-second cap with more than 50% headroom, and the
+constructor's 55 already exceeds 1.5 times its width-5 maximum.
+
+| Test | Completed (width 5) | CPU range (seconds) | Censored | Old cap | CPU cap | Wall backstop |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack` | 15 | 13.770215–35.115861 | — | 55 | 55 | 165 |
+| `genuine_detcore_reaches_fixed_guarded_callback_and_altstack` | 15 | 13.722306–33.721186 | — | 42 | 51 | 153 |
+| `genuine_standalone_registers_fixed_guarded_altstack_without_continuation` | 15 | 11.131885–30.907684 | — | 36 | 47 | 141 |
+| `inert_preload_does_not_reserve_or_register_runtime_stacks` | 14 | 10.881525–28.854773 | 32.216597 | 31 | 49 | 147 |
+| `standalone_altstack_disabled_receives_no_owned_stack_credit` | 14 | 11.145251–27.992446 | 30.381779 | 30 | 46 | 138 |
+
+The inert-preload and disabled-altstack caps come from their censored
+observations (`ceil(1.5 * 32.216597) = 49`, `ceil(1.5 * 30.381779) = 46`): their
+completion cost under that load is unknown, so these are conservative
+allowances, not measured headroom over a completion. No assertion, selection,
+retry or wrapper behaviour changes. The sections below are the earlier
+measurements at one test at a time.
+
 ## Complete stacks node, October 16 evening
 
 All 15 `hermit::liteinst_stacks` tests now have an independent CPU allowance
