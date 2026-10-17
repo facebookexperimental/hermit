@@ -444,8 +444,20 @@ def main():
                          f"delete that directory's files")
     os.makedirs(work, exist_ok=True)  # testx needs the parent of --output-dir to exist
     executions = []  # (cell, end, test id, test run id, marker run id, result)
-    for rid in a.run_ids:
-        for t in json.loads(testx("--as-json", "results", "list", rid))["results"]["test_results"]:
+    def listed(rid):
+        # TestX's listing, not the local work below, is most of the ingest: the local part of a
+        # 2,314-cell hybrid run takes about 5 s, and its ingest took 76 s. The invocations'
+        # listings are independent queries, so they overlap; the order of the rows below is
+        # still the order of the run ids, and the time each took is printed.
+        started = time.monotonic()
+        results = json.loads(testx("--as-json", "results", "list", rid))["results"]["test_results"]
+        print(f"ingest: testx listed {len(results)} results of test run {rid} in "
+              f"{time.monotonic() - started:.1f} s", file=sys.stderr)
+        return results
+    with cf.ThreadPoolExecutor(len(a.run_ids)) as ex:
+        listings = list(ex.map(listed, a.run_ids))
+    for rid, results in zip(a.run_ids, listings):
+        for t in results:
             name = t["test_details"]["name"]
             # Each target also reports an "unmanaged" twin of the same execution.
             if " - " in name and not name.endswith(" - unmanaged"):
