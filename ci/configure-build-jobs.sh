@@ -1937,8 +1937,17 @@ fi
 # inventory remains 961. Cargo.lock adds only the inguest-to-existing-syscalls
 # edge. Preserve the new base's calibration, widths, bounds and prior carries.
 # Fresh locked Rust consumers, fixtures and ptrace checks remain required.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 3da25ef38b2b2ba1784fdbc6aface1610dc0c74a ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 3da25ef38b2b2ba1784fdbc6aface1610dc0c74a (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO bb86c5d9801493eddd4089b8b34091b40603ef87 (2026-10-17): from
+# 3da25ef38b2b2ba1784fdbc6aface1610dc0c74a. One commit, bb86c5d9 (provider step E2d:
+# a successful call that stages a process action reports it as a provider
+# outcome carrying a token; the action stays in the executor), touching only
+# reverie-core, reverie-linux-provider and reverie-kvm. git diff is empty under
+# reverie-dbt/ (tree bb913edb at both pins), and build.rs, vendor/dynamorio,
+# native/, third-party, the root Cargo.toml, Cargo.lock and rust-toolchain.toml
+# have the same object ids: all seven SDK inputs, DBT inventory 961, calibrated
+# budget, job width and limits are unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bb86c5d9801493eddd4089b8b34091b40603ef87 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie bb86c5d9801493eddd4089b8b34091b40603ef87 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
