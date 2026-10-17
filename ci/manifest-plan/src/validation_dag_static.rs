@@ -3561,7 +3561,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore_warns_from_inside_the_guest_once_per_run_on_every_backend:
     // 518.
     // And +3 from 77350e52: 521.
-    ("test.cli", 521),
+    // Three inherited-stdin regressions retain the prior selection: 521 -> 524, freshly listed.
+    ("test.cli", 524),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4007,7 +4008,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore_warns_from_inside_the_guest_once_per_run_on_every_backend:
     // 453.
     // And +3 from 77350e52: 456.
-    ("test.cli_on_host", 456),
+    // Three inherited-stdin regressions retain the prior selection: 456 -> 459, freshly listed.
+    ("test.cli_on_host", 459),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

@@ -1053,14 +1053,13 @@ impl DbtInvocation {
                 &self.config,
             )?)
         } else {
-            let output = run_once(
+            let output = run_once_with_inherited_input(
                 &self.execution,
                 &self.runner,
                 &self.guest,
                 &self.drrun,
                 &self.config,
                 None,
-                std::io::stdin(),
             )?;
             write_output(&output)?;
             output_status(&output)
@@ -1159,7 +1158,7 @@ impl DbtVerification {
         });
         let deadlock_recording = record_terminal_deadlock(verify_json, run);
         let output = if self.terminal {
-            run_once_with_terminal_input(
+            run_once_with_inherited_input(
                 &invocation.execution,
                 &runner,
                 &invocation.guest,
@@ -1347,7 +1346,7 @@ fn dbt_verify_run(
 
     eprintln!(":: DBT run...");
     let raw = if terminal_stdin {
-        run_once_with_terminal_input(execution, &runner, guest, drrun, config, run_evidence)
+        run_once_with_inherited_input(execution, &runner, guest, drrun, config, run_evidence)
     } else {
         match verification_stdin {
             Some(input) => run_once(
@@ -1903,7 +1902,7 @@ fn run_once<R: Read + Send + 'static>(
 }
 
 #[cfg(feature = "dbt")]
-fn run_once_with_terminal_input(
+fn run_once_with_inherited_input(
     execution: &DbtExecution,
     runner: &DbtRunner,
     guest: &StdCommand,

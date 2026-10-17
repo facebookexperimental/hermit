@@ -4611,15 +4611,6 @@ const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
          (liteinst_in_guest_refuses_verify_without_reading_stdin)",
     ),
     (
-        "a_guest_takes_only_the_stdin_it_reads_on_every_backend",
-        "dbt",
-        "Hermit's DBT launch pumps its stdin into a pipe of the launcher's own \
-         (output_with_detached_reader_and_global), and the pump reads ahead, so the \
-         input after the guest's one byte is gone when the guest exits (measured \
-         2026-10-17 on hermit main 782ab33e; recorded with \
-         https://github.com/rrnewton/hermit/issues/4447, owned by the dbt lane)",
-    ),
-    (
         "detcore_renders_process_cgroup_on_every_backend",
         "sabre",
         "the guest's second thread ends in SIGSEGV at its exit; a program that only \
@@ -7693,6 +7684,214 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
             "strict DBT {mode} omitted unsupported-syscall diagnostic:\n{}",
             stderr(&output)
         );
+    }
+}
+
+// Keep the launcher's original descriptor available to a later reader. These
+// are ordinary runs: verification deliberately supplies replayable input.
+#[test]
+fn run_dbt_inherits_stdin_without_read_ahead() {
+    if dbt_unavailable("run_dbt_inherits_stdin_without_read_ahead") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let input = b"first\0line\nlast-without-newline\xff";
+    let mut observations = Vec::new();
+    for backend in ["ptrace", "dbt"] {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(input).unwrap();
+        drop(writer);
+        let backend_arg = format!("--backend={backend}");
+        let args = [
+            backend_arg.as_str(),
+            "run",
+            "--strict",
+            "--",
+            "/usr/bin/head",
+            "-c1",
+        ];
+        let mut command = hermit_command(&args);
+        command.stdin(reader.try_clone().unwrap());
+        let first = hermit_test::hermit_output_attempts(&format!("{command:?}"), 1, &mut command);
+        let rest = Command::new("/bin/cat").stdin(reader).output().unwrap();
+        eprintln!("stdin-no-read-ahead {backend}: first={first:?}; remainder={rest:?}");
+        observations.push((backend, first, rest));
+    }
+    for (backend, first, rest) in observations {
+        assert!(first.status.success(), "{backend}: {first:?}");
+        assert!(rest.status.success(), "{backend}: {rest:?}");
+        assert_eq!(first.stdout, &input[..1], "{backend}: {first:?}");
+        assert_eq!(
+            rest.stdout,
+            &input[1..],
+            "{backend} consumed unread stdin: {first:?}"
+        );
+    }
+}
+
+#[test]
+fn run_dbt_inherited_pipe_reads_bytes_and_eof() {
+    if dbt_unavailable("run_dbt_inherited_pipe_reads_bytes_and_eof") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let input = b"first\0line\nlast-without-newline\xff";
+    let mut observations = Vec::new();
+    for backend in ["ptrace", "dbt"] {
+        let backend_arg = format!("--backend={backend}");
+        let args = [backend_arg.as_str(), "run", "--strict", "--", "/bin/cat"];
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(input).unwrap();
+        drop(writer);
+        let mut command = hermit_command(&args);
+        command.stdin(reader);
+        let output = hermit_test::hermit_output_attempts(&format!("{command:?}"), 1, &mut command);
+        eprintln!("stdin-bytes-and-eof {backend}: {output:?}");
+        observations.push((backend, output));
+    }
+    for (backend, output) in observations {
+        assert!(output.status.success(), "{backend}: {output:?}");
+        assert_eq!(output.stdout, input, "{backend}: {output:?}");
+    }
+}
+
+#[test]
+fn run_dbt_preserves_inherited_stdin_descriptor_types() {
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    if dbt_unavailable("run_dbt_preserves_inherited_stdin_descriptor_types") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    static GUEST: OnceLock<PathBuf> = OnceLock::new();
+    let guest = futex_c_guest(&GUEST, "inherited_stdin").to_str().unwrap();
+    let mut observations = Vec::new();
+    let mut socket_flags = Vec::new();
+    for backend in ["native", "ptrace", "dbt"] {
+        let backend_arg = format!("--backend={backend}");
+        let args = [backend_arg.as_str(), "run", "--strict", "--", guest];
+        let make_command = || {
+            if backend == "native" {
+                Command::new(guest)
+            } else {
+                hermit_command(&args)
+            }
+        };
+        let observe = |command: &mut Command| {
+            if backend == "native" {
+                command.output().unwrap()
+            } else {
+                hermit_test::hermit_output_attempts(&format!("{command:?}"), 1, command)
+            }
+        };
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"abcdef").unwrap();
+        file.seek(SeekFrom::Start(2)).unwrap();
+        let mut command = make_command();
+        command.arg("read").stdin(file.try_clone().unwrap());
+        let output = observe(&mut command);
+        let parent_offset = file.stream_position().unwrap();
+        observations.push((backend, "file", output, Some(parent_offset)));
+
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(b"abcdef").unwrap();
+        drop(writer);
+        let mut command = make_command();
+        command.arg("read").stdin(reader);
+        let output = observe(&mut command);
+        observations.push((backend, "fifo", output, None));
+
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let mut command = make_command();
+        let flags_before = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags_before, -1);
+        command.stdin(Stdio::from(OwnedFd::from(socket.try_clone().unwrap())));
+        let output = observe(&mut command);
+        let flags_after = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFL) };
+        socket_flags.push((backend, flags_before, flags_after));
+        observations.push((backend, "socket", output, None));
+
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: openpty initializes the two owned descriptors; no terminal
+        // settings or process group are changed in the parent.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        // SAFETY: both descriptors were returned by openpty and are owned here.
+        let (_master, slave) =
+            unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        let mut command = make_command();
+        command.stdin(Stdio::from(slave));
+        let output = observe(&mut command);
+        observations.push((backend, "terminal", output, None));
+
+        let mut command = make_command();
+        // SAFETY: close only the child's stdin immediately before exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::close(libc::STDIN_FILENO) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let output = observe(&mut command);
+        observations.push((backend, "closed", output, None));
+    }
+    for (backend, kind, output, parent_offset) in &observations {
+        eprintln!("stdin-descriptor {backend}/{kind}: parent_offset={parent_offset:?}; {output:?}");
+    }
+    for (backend, before, after) in socket_flags {
+        eprintln!("stdin-socket-native-flags {backend}: before={before} after={after}");
+        assert_eq!(
+            before, after,
+            "{backend}: launcher changed the original OFD flags"
+        );
+        assert_ne!(after & libc::O_NONBLOCK, 0);
+    }
+    for (backend, kind, output, parent_offset) in observations {
+        assert!(output.status.success(), "{backend}/{kind}: {output:?}");
+        // Keep the measured existing gaps separate from this open-input fix:
+        // ptrace masks the guest O_NONBLOCK bit; both ordinary launch paths
+        // sanitize closed stdin. Their raw observations remain above, but are
+        // not credited as Linux conformance. Native closed stdin must be EBADF.
+        if (backend == "ptrace" && kind == "socket") || (backend != "native" && kind == "closed") {
+            continue;
+        }
+        let expected = match kind {
+            "file" => {
+                "kind=file access=2 nonblock=0 tty=0 seek=2 error=0\nread=1 byte=99 error=0 seek=3 seek_error=0\n"
+            }
+            "fifo" => {
+                "kind=fifo access=0 nonblock=0 tty=0 seek=-1 error=29\nread=1 byte=97 error=0 seek=-1 seek_error=29\n"
+            }
+            "socket" => "kind=socket access=2 nonblock=1 tty=0 seek=-1 error=29\n",
+            "terminal" => "kind=character access=2 nonblock=0 tty=1 seek=-1 error=29\n",
+            "closed" => "kind=closed access=-1 nonblock=-1 tty=0 seek=-1 error=9\n",
+            _ => unreachable!(),
+        };
+        assert_eq!(stdout(&output), expected, "{backend}/{kind}: {output:?}");
+        if let Some(offset) = parent_offset {
+            assert_eq!(
+                offset, 3,
+                "{backend}: stdin must share the inherited file offset"
+            );
+        }
     }
 }
 

@@ -871,6 +871,12 @@
       "why": "tests/c/host_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify mode; ci=true on ptrace and dbi): Host-identity contract guest emitting the OBSERVED virtualized uname/gethostname/sysinfo/CPU values so cross-backend parity is checkable and a backend leaking the real host identity is caught; runs in blocking CI on the two backends that execute it"
     },
     {
+      "disposition": "support-data",
+      "path": "tests/c/inherited_stdin.c",
+      "runner": "hermit-cli/tests/cli.rs::run_dbt_preserves_inherited_stdin_descriptor_types",
+      "why": "Minimal inherited fd0 probe for ptrace/DBT descriptor type, access/status flags, terminal identity, seekability, and shared regular-file offset. The CLI test owns its regular-file/socket/PTY/closed descriptor setup; generic manifest execution would not provide that contract."
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/c/inherited_terminal_peer_flags.c",
       "runner": "hermit-cli/tests/inherited_terminal_read.rs via test.inherited_terminal_read",
