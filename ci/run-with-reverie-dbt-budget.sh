@@ -1900,7 +1900,18 @@ fi
 # rust-toolchain.toml are byte-identical to 25f8b656. Inventory 961,
 # calibrated job width and CPU/wall limits carry unchanged. Fresh runtime
 # and native artifact qualification remain separate from this budget carry.
-expected_pin=e53cc6f4a20318730eacfb10804acf5fee80e077
+# CARRY TO 7230ef91248b2a42ad212c5b991cea75cfa29c26 (2026-10-17): from
+# e53cc6f4a20318730eacfb10804acf5fee80e077. Four commits: fd45d650 and 0b583715 (reverie-sabre:
+# a rewritten site's frame adapts to the shared saved-register entry; a
+# prefixed SYSCALL's marker goes on its final two bytes; experimental/
+# reverie-sabre only), 8b6991ef (provider step E3a-0: E2e review follow-ups,
+# reverie-kvm tests and comments) and 7230ef91 (provider step E3a: ptrace's
+# injections run through LinuxProvider; reverie-ptrace only). git diff is empty
+# under reverie-dbt/ (tree c01780c7 at both pins), and build.rs,
+# vendor/dynamorio, native/, third-party, the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml have the same object ids: all seven SDK inputs, DBT
+# inventory 961, calibrated budget, job width and limits are unchanged.
+expected_pin=7230ef91248b2a42ad212c5b991cea75cfa29c26
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
