@@ -7853,6 +7853,18 @@ fn run_dbt_verify_replays_stdin_bytes_and_eof() {
     }
 }
 
+/// `program`'s resolved path, as every backend's guest can run it: e9patch
+/// refuses a program reached through a symbolic link across the guest's mounts,
+/// and in validate's pinned root `/bin/cat` and `/usr/bin/head` are links into
+/// the Nix store.
+fn resolved_guest_program(program: &str) -> String {
+    fs::canonicalize(program)
+        .unwrap_or_else(|error| panic!("resolve {program}: {error}"))
+        .into_os_string()
+        .into_string()
+        .expect("guest program path is UTF-8")
+}
+
 /// `hermit --backend=<backend> run`, with the in-guest backends' one required
 /// relaxation: their Tool host cannot deliver the preemption timer yet.
 fn piped_stdin_run_args<'a>(backend: &'a str, program: &[&'a str]) -> Vec<&'a str> {
@@ -7875,8 +7887,9 @@ fn piped_stdin_is_read_to_eof_on_every_backend() {
     let test = "piped_stdin_is_read_to_eof_on_every_backend";
     let _guard = hermit_run_guard();
     let input = b"first\0line\nlast-without-newline\xff";
+    let cat = resolved_guest_program("/bin/cat");
     for backend in procfs_backends(test) {
-        let args = piped_stdin_run_args(backend, &["/bin/cat"]);
+        let args = piped_stdin_run_args(backend, &[cat.as_str()]);
         let output = hermit_with_stdin(&args, input);
         assert_success(&output, &args);
         assert_eq!(output.stdout, input, "{backend}: {}", stderr(&output));
@@ -7892,6 +7905,7 @@ fn piped_stdin_verifies_at_bitwise_parity_on_every_backend() {
     let _guard = hermit_run_guard();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let input = b"first\0line\nlast-without-newline\xff";
+    let cat = resolved_guest_program("/bin/cat");
     for backend in procfs_backends(test) {
         let report = directory.path().join(format!("{backend}.json"));
         let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
@@ -7905,7 +7919,7 @@ fn piped_stdin_verifies_at_bitwise_parity_on_every_backend() {
             "--verify-json",
             &report_arg,
             "--",
-            "/bin/cat",
+            cat.as_str(),
         ];
         let output = hermit_with_stdin(&args, input);
         assert_success(&output, &args);
@@ -7947,14 +7961,15 @@ fn a_guest_takes_only_the_stdin_it_reads_on_every_backend() {
         std::io::Read::read_to_end(&mut &ours, &mut rest).unwrap();
         (output, rest)
     };
-    let (native, rest) = remainder(Command::new("/usr/bin/head").arg("-c1"));
+    let head = resolved_guest_program("/usr/bin/head");
+    let (native, rest) = remainder(Command::new(&head).arg("-c1"));
     assert!(native.status.success(), "native: {native:?}");
     assert_eq!(
         (native.stdout.as_slice(), rest.as_slice()),
         (&b"a"[..], &b"bc"[..])
     );
     for backend in procfs_backends(test) {
-        let args = piped_stdin_run_args(backend, &["/usr/bin/head", "-c1"]);
+        let args = piped_stdin_run_args(backend, &[head.as_str(), "-c1"]);
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
         append_hermit_args(&mut command, &args);
         let (output, rest) = remainder(&mut command);
