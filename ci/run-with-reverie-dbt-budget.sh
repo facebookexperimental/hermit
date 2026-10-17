@@ -1796,13 +1796,18 @@ fi
 # source and DBT inventory 961 remain unchanged. The calibrated SDK budget,
 # job width and limits carry without increase; final runtime/source-closure
 # checks must bind this composition rather than older receipts.
-# CARRY TO c313920fd73ceb63b52038b595846d608efa31b2 (2026-10-16): from
+# CARRY TO f818f0b4fa105fbe1a5d9aad077a5ea5691bdc4d (2026-10-16): from
 # 3137866aa09275237db3715eadeca3c756751c1c through kvm E2a (async LinuxProvider::execute) and liteinst's
 # callback-RPC private syscall gate plus native-exec fixture alignment.
 # The reverie-dbt tree (61bc6e93), root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml are the same objects at both pins, so the seven SDK
 # inputs, inventory 961, budget, job width and limits carry unchanged.
-expected_pin=c313920fd73ceb63b52038b595846d608efa31b2
+# CARRY TO f818f0b4fa105fbe1a5d9aad077a5ea5691bdc4d (2026-10-16): from
+# c313920fd73ceb63b52038b595846d608efa31b2 through test-unify's SaBRe-only pair (the plugin's partial
+# /proc/self/exe readlink emulation deleted; the loader's mallopt moved
+# ahead of read_launch_spec). reverie-dbt tree, root Cargo.toml, Cargo.lock
+# and rust-toolchain.toml are unchanged, so the budget carries unchanged.
+expected_pin=f818f0b4fa105fbe1a5d9aad077a5ea5691bdc4d
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
