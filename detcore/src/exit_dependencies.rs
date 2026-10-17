@@ -115,45 +115,57 @@ pub fn device_exit_dependency(rdev: u64) -> Option<&'static str> {
 /// its holder serve, or `None`. A descriptor that cannot be read is not
 /// refused.
 pub fn descriptor_exit_dependency(fd_link: &Path) -> Option<&'static str> {
-    use std::os::unix::ffi::OsStrExt;
-
-    use crate::util::raw_syscall;
     // Raw readlinkat and newfstatat (see crate::util::raw_syscall): the
     // in-guest runtime runs this inside the guest before Detcore installs.
+    descriptor_exit_dependency_with(fd_link, |number, args| {
+        // SAFETY: the shared inspection below supplies its live Tool buffers
+        // for these synchronous read-only calls.
+        let result =
+            unsafe { crate::util::raw_syscall(number as libc::c_long, args.map(|arg| arg as u64)) };
+        reverie::Errno::from_ret(result as usize)
+    })
+}
+
+/// The same inspection for startup and callbacks. Only the instruction used
+/// for the two Tool-side syscalls differs; neither is a guest injection.
+fn descriptor_exit_dependency_with(
+    fd_link: &Path,
+    mut execute: impl FnMut(Sysno, [usize; 6]) -> Result<usize, reverie::Errno>,
+) -> Option<&'static str> {
+    use std::os::unix::ffi::OsStrExt;
+
     let link = std::ffi::CString::new(fd_link.as_os_str().as_bytes()).ok()?;
     let mut target = [0_u8; 64];
-    let length = unsafe {
-        raw_syscall(
-            libc::SYS_readlinkat,
-            [
-                libc::AT_FDCWD as u64,
-                link.as_ptr() as u64,
-                target.as_mut_ptr() as u64,
-                target.len() as u64,
-                0,
-                0,
-            ],
-        )
-    };
-    if length >= 0 && &target[..length as usize] == SECCOMP_NOTIFY_LINK.as_bytes() {
+    let length = execute(
+        Sysno::readlinkat,
+        [
+            libc::AT_FDCWD as usize,
+            link.as_ptr() as usize,
+            target.as_mut_ptr() as usize,
+            target.len(),
+            0,
+            0,
+        ],
+    );
+    if let Ok(length) = length
+        && &target[..length] == SECCOMP_NOTIFY_LINK.as_bytes()
+    {
         return Some("a seccomp user-notification listener");
     }
     // Follows the descriptor to the file it refers to.
     let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
-    let status = unsafe {
-        raw_syscall(
-            libc::SYS_newfstatat,
-            [
-                libc::AT_FDCWD as u64,
-                link.as_ptr() as u64,
-                (&raw mut metadata) as u64,
-                0,
-                0,
-                0,
-            ],
-        )
-    };
-    if status != 0 || metadata.st_mode & libc::S_IFMT != libc::S_IFCHR {
+    let status = execute(
+        Sysno::newfstatat,
+        [
+            libc::AT_FDCWD as usize,
+            link.as_ptr() as usize,
+            (&raw mut metadata) as usize,
+            0,
+            0,
+            0,
+        ],
+    );
+    if status != Ok(0) || metadata.st_mode & libc::S_IFMT != libc::S_IFCHR {
         return None;
     }
     device_exit_dependency(metadata.st_rdev)
@@ -249,8 +261,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let pid = guest.pid().as_raw();
         for fd in arrived {
-            let Some(what) = descriptor_exit_dependency(Path::new(&format!("/proc/{pid}/fd/{fd}")))
-            else {
+            let Some(what) = descriptor_exit_dependency_with(
+                Path::new(&format!("/proc/{pid}/fd/{fd}")),
+                |number, args| {
+                    // SAFETY: readlinkat/newfstatat borrow only this inspection's
+                    // live Tool-owned path and output buffers. Their operands
+                    // name the same native procfs entry as the startup path;
+                    // they retain no pointers and return on the original stack.
+                    unsafe { guest.tool_syscall(number, args) }
+                },
+            ) else {
                 continue;
             };
             eprintln!("{}", refusal(what, fd, how));
@@ -268,6 +288,159 @@ mod tests {
     /// glibc's `makedev`.
     fn makedev(major: u64, minor: u64) -> u64 {
         ((major & 0xfff) << 8) | ((major & !0xfff) << 32) | (minor & 0xff) | ((minor & !0xff) << 12)
+    }
+
+    /// A transport error does not change the inspection policy: a failed
+    /// readlink still permits the stat check, and neither call is retried.
+    #[test]
+    fn descriptor_inspection_keeps_operands_results_and_failure_order() {
+        use reverie::Errno;
+
+        let cases = [
+            (
+                Ok(SECCOMP_NOTIFY_LINK.as_bytes()),
+                Ok(0),
+                libc::S_IFCHR,
+                makedev(10, 229),
+                Some("a seccomp user-notification listener"),
+                1,
+            ),
+            (
+                Ok(b"/dev/ordinary".as_slice()),
+                Ok(0),
+                libc::S_IFCHR,
+                makedev(10, 229),
+                Some("a FUSE device (/dev/fuse)"),
+                2,
+            ),
+            (
+                Ok(b"/dev/ordinary".as_slice()),
+                Ok(0),
+                libc::S_IFCHR,
+                makedev(10, 203),
+                Some("a CUSE device (/dev/cuse)"),
+                2,
+            ),
+            (
+                Err(Errno::EACCES),
+                Ok(0),
+                libc::S_IFCHR,
+                makedev(10, 229),
+                Some("a FUSE device (/dev/fuse)"),
+                2,
+            ),
+            (
+                Err(Errno::EINTR),
+                Ok(0),
+                libc::S_IFREG,
+                makedev(10, 229),
+                None,
+                2,
+            ),
+            (
+                Ok(b"anon_inode:seccomp notify suffix".as_slice()),
+                Ok(0),
+                libc::S_IFCHR,
+                makedev(10, 232),
+                None,
+                2,
+            ),
+            (
+                Ok(b"".as_slice()),
+                Err(Errno::EINTR),
+                libc::S_IFCHR,
+                makedev(10, 229),
+                None,
+                2,
+            ),
+            (
+                Err(Errno::ENOENT),
+                Err(Errno::EBADF),
+                libc::S_IFCHR,
+                makedev(10, 229),
+                None,
+                2,
+            ),
+            (
+                Ok(b"/dev/ordinary".as_slice()),
+                Ok(1),
+                libc::S_IFCHR,
+                makedev(10, 229),
+                None,
+                2,
+            ),
+            (
+                Ok(&[b'x'; 64]),
+                Ok(0),
+                libc::S_IFCHR,
+                makedev(10, 203),
+                Some("a CUSE device (/dev/cuse)"),
+                2,
+            ),
+        ];
+        for (link_result, stat_result, mode, device, expected, expected_calls) in cases {
+            let mut calls = 0;
+            let mut path_address = None;
+            let actual =
+                descriptor_exit_dependency_with(Path::new("/proc/123/fd/456"), |number, args| {
+                    calls += 1;
+                    assert_eq!(args[0], libc::AT_FDCWD as usize);
+                    assert_eq!(&args[4..], &[0, 0]);
+                    // SAFETY: the helper lends a live NUL-terminated path to
+                    // this synchronous executor, just as to the kernel.
+                    let path = unsafe { std::ffi::CStr::from_ptr(args[1] as *const libc::c_char) };
+                    assert_eq!(path.to_bytes(), b"/proc/123/fd/456");
+                    if let Some(address) = path_address {
+                        assert_eq!(args[1], address);
+                    } else {
+                        path_address = Some(args[1]);
+                    }
+                    match number {
+                        Sysno::readlinkat => {
+                            assert_eq!(calls, 1);
+                            assert_eq!(args[3], 64);
+                            let bytes = link_result?;
+                            // SAFETY: the helper lends its 64-byte output,
+                            // and every case fits. No pointer is retained.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    bytes.as_ptr(),
+                                    args[2] as *mut u8,
+                                    bytes.len(),
+                                );
+                            }
+                            Ok(bytes.len())
+                        }
+                        Sysno::newfstatat => {
+                            assert_eq!(calls, 2);
+                            assert_eq!(args[3], 0, "follow the descriptor's target");
+                            // Also fill on failure: a failed stat must not
+                            // accidentally classify stale output as success.
+                            // SAFETY: the helper lends a valid aligned stat.
+                            unsafe {
+                                let output = &mut *(args[2] as *mut libc::stat);
+                                output.st_mode = mode;
+                                output.st_rdev = device;
+                            }
+                            stat_result
+                        }
+                        other => panic!("unexpected Tool syscall {other:?}"),
+                    }
+                });
+            assert_eq!(actual, expected);
+            assert_eq!(calls, expected_calls);
+        }
+    }
+
+    #[test]
+    fn an_invalid_descriptor_path_executes_no_inspection() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/proc/self/fd/1\0suffix"));
+        assert_eq!(
+            descriptor_exit_dependency_with(path, |_, _| panic!("invalid path reached executor")),
+            None
+        );
     }
 
     #[test]
