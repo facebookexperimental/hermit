@@ -1893,7 +1893,14 @@ fi
 # third-party, the root Cargo.toml, Cargo.lock and rust-toolchain.toml have the
 # same object ids: all seven SDK inputs, DBT inventory 961, calibrated budget,
 # job width and limits are unchanged.
-expected_pin=25f8b656d468bf894147079b476b88cc92a65e68
+# CARRY TO e53cc6f4a20318730eacfb10804acf5fee80e077 (2026-10-17): from
+# 25f8b656d468bf894147079b476b88cc92a65e68 for default-off SaBRe post-arm loader routing,
+# the shared installed Tool entry, and the bounded native artifact qualifier.
+# The complete reverie-dbt tree and root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml are byte-identical to 25f8b656. Inventory 961,
+# calibrated job width and CPU/wall limits carry unchanged. Fresh runtime
+# and native artifact qualification remain separate from this budget carry.
+expected_pin=e53cc6f4a20318730eacfb10804acf5fee80e077
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
