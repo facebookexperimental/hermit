@@ -135,8 +135,14 @@ if [[ $phase == cells ]]; then
 fi
 
 runner=${HERMIT_VALIDATE_E2E_RUNNER:-}
+# Each mode names its Buck mode file. buck-local needs shim/modes/meta-local, not the bare
+# .buckconfig: the Meta buck2 the validation host runs refuses `buck2 test` without
+# test.v2_test_executor ("Cannot use internal test runner. Config value must be provided
+# for test.v2_test_executor"), and ci/buck-e2e/ingest.py reads the results through TestX
+# either way. With no mode file, e2e.buck_cells in buck-local failed 9 s after it started
+# (validate-claude-coord-685023149cde-1792253229043517790-2205237-22189032).
 case $runner in
-    buck-local) mode=local; buck_args=() ;;
+    buck-local) mode=local; buck_args=(@shim/modes/meta-local) ;;
     buck-hybrid) mode=hybrid; buck_args=(@shim/modes/hybrid) ;;
     *)
         echo "validate-node: HERMIT_VALIDATE_E2E_RUNNER is '${runner}', not buck-local or buck-hybrid; run scripts/validate.rs --e2e-runner buck-local|buck-hybrid --buck2 PATH" >&2
