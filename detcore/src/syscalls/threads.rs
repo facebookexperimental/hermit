@@ -958,6 +958,28 @@ pub(crate) struct KernelSignalState {
     pub(crate) caught: KernelSigset,
 }
 
+/// [`KernelSignalState::default_action_ends_process`] given only the
+/// thread's ignored and caught sets, from wherever they come (the kernel's
+/// `/proc` view or Detcore's copy, `signal_shadow::copied_dispositions`).
+pub(crate) fn default_action_ends_process(
+    ignored: KernelSigset,
+    caught: KernelSigset,
+    signal: i32,
+) -> bool {
+    let bit = kernel_sigset_bit(signal);
+    let stops_or_continues = [
+        libc::SIGSTOP,
+        libc::SIGTSTP,
+        libc::SIGTTIN,
+        libc::SIGTTOU,
+        libc::SIGCONT,
+    ]
+    .into_iter()
+    .fold(0, |set, signal| set | kernel_sigset_bit(signal));
+    signal == libc::SIGKILL
+        || ((ignored | caught | default_ignored_signals() | stops_or_continues) & bit) == 0
+}
+
 impl KernelSignalState {
     /// Parse the five signal lines of a `/proc/<pid>/task/<tid>/status` file.
     pub(crate) fn parse(status: &str) -> Option<Self> {
@@ -1024,19 +1046,7 @@ impl KernelSignalState {
     /// `SIG_DFL` and its default action terminates or dumps core, not ignores,
     /// stops or continues. `SIGKILL` always does.
     pub(crate) fn default_action_ends_process(&self, signal: i32) -> bool {
-        let bit = kernel_sigset_bit(signal);
-        let stops_or_continues = [
-            libc::SIGSTOP,
-            libc::SIGTSTP,
-            libc::SIGTTIN,
-            libc::SIGTTOU,
-            libc::SIGCONT,
-        ]
-        .into_iter()
-        .fold(0, |set, signal| set | kernel_sigset_bit(signal));
-        signal == libc::SIGKILL
-            || ((self.ignored | self.caught | default_ignored_signals() | stops_or_continues) & bit)
-                == 0
+        default_action_ends_process(self.ignored, self.caught, signal)
     }
 
     /// The job-control stop signals `SIGTSTP`, `SIGTTIN`, and `SIGTTOU` whose
@@ -2579,6 +2589,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_old_action(None)
             .with_sigsetsize(std::mem::size_of::<u64>());
         guest.inject_with_retry(call).await?;
+        // Detcore's own change, which the signal-state copy does not record:
+        // the copy, and the actions it shares, are unknown now.
+        super::signal_shadow::give_up(
+            guest,
+            "Detcore reset an action to the default before a fatal delivery",
+        );
         Ok(())
     }
 

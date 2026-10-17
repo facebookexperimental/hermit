@@ -1205,8 +1205,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                         && [libc::SIGCONT, libc::SIGCHLD, libc::SIGWINCH, libc::SIGURG]
                             .contains(&call.signum()))
             })
-            && crate::syscalls::threads::read_kernel_signal_state(guest.pid(), guest.tid())
-                .is_ok_and(|state| state.ignored & kernel_sigset_bit(call.signum()) != 0);
+            && match crate::syscalls::signal_shadow::copied_dispositions_for(guest, call.signum()) {
+                Some(copied) => copied.ignored & kernel_sigset_bit(call.signum()) != 0,
+                None => {
+                    crate::syscalls::threads::read_kernel_signal_state(guest.pid(), guest.tid())
+                        .is_ok_and(|state| state.ignored & kernel_sigset_bit(call.signum()) != 0)
+                }
+            };
         let result = if let Some(kernel_action) = kernel_action {
             // The kernel treats `action` as input. Sanitize a private copy instead
             // of writing through the guest pointer: the input may be read-only,
@@ -3616,8 +3621,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         // are the process's, so they say that whatever mask the delivery
         // interrupted; a signal acted on by default (the teardown's own
         // termination signals among them) records nothing.
-        if let Ok(state) = read_thread_wait_signal_state(guest.pid(), guest.tid())
-            && state.caught & kernel_sigset_bit(signal.raw()) == 0
+        let caught =
+            match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal.raw()) {
+                Some(copied) => Ok(copied.caught),
+                None => read_thread_wait_signal_state(guest.pid(), guest.tid())
+                    .map(|state| state.caught),
+            };
+        if let Ok(caught) = caught
+            && caught & kernel_sigset_bit(signal.raw()) == 0
         {
             return;
         }

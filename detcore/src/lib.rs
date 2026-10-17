@@ -1166,8 +1166,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             // dooms its threads at this committed turn, before their
             // host-timed removal (`scheduler::pipe_wake`).
             if self.cfg.pipe_wake_latency_in_effect().is_some()
-                && crate::syscalls::read_kernel_signal_state(guest.pid(), guest.tid())
-                    .is_ok_and(|state| state.default_action_ends_process(signal.raw()))
+                && match crate::syscalls::signal_shadow::copied_dispositions_for(
+                    guest,
+                    signal.raw(),
+                ) {
+                    Some(copied) => crate::syscalls::default_action_ends_process(
+                        copied.ignored,
+                        copied.caught,
+                        signal.raw(),
+                    ),
+                    None => crate::syscalls::read_kernel_signal_state(guest.pid(), guest.tid())
+                        .is_ok_and(|state| state.default_action_ends_process(signal.raw())),
+                }
             {
                 tool_global::record_fatal_signal(guest).await;
             }

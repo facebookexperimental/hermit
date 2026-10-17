@@ -3053,8 +3053,17 @@ pub(crate) fn unblocked_by(
     state: &KernelSignalState,
     mask: KernelSigset,
 ) -> (KernelSigset, KernelSigset) {
+    unblocked_by_ignored(state.ignored, mask)
+}
+
+/// [`unblocked_by`] given only the thread's ignored set, from wherever it
+/// comes (the kernel's `/proc` view or Detcore's copy).
+pub(crate) fn unblocked_by_ignored(
+    ignored: KernelSigset,
+    mask: KernelSigset,
+) -> (KernelSigset, KernelSigset) {
     let unblocked = !mask;
-    (unblocked & !state.ignored, unblocked & state.ignored)
+    (unblocked & !ignored, unblocked & ignored)
 }
 
 /// The real-time timer expirations among `candidates` (a kernel sigset) that
@@ -3119,8 +3128,11 @@ where
 {
     let pending = pending_real_time_among(guest, !mask).await;
     if pending != 0 {
-        let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
-        let (observable, discarded) = unblocked_by(&state, mask);
+        let ignored = match crate::syscalls::signal_shadow::copied_dispositions(guest) {
+            Some(copied) => copied.ignored,
+            None => read_thread_wait_signal_state(guest.pid(), guest.tid())?.ignored,
+        };
+        let (observable, discarded) = unblocked_by_ignored(ignored, mask);
         act_on_pending_real_time(guest, pending, observable, discarded).await;
     }
     Ok(())

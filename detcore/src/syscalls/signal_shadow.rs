@@ -79,44 +79,68 @@ fn reserved() -> KernelSigset {
     sigbit(reverie::PERF_EVENT_SIGNAL as i32)
 }
 
-/// SIGTRAP, whose kernel state the ptrace backend itself changes: when it
-/// single-steps the guest, the kernel force-delivers the step trap, which
-/// unblocks SIGTRAP and resets an ignored, or caught but blocked, SIGTRAP to
-/// its default (`force_sig_info_to_task`; Reverie characterizes this in
-/// `sigtrap_profile_follows_each_handler_shape`). The copy cannot see a step,
-/// so a difference in SIGTRAP alone makes the copy unknown (it is given up
-/// quietly) rather than reported, and never passes as a match.
-fn trap() -> KernelSigset {
-    sigbit(libc::SIGTRAP)
+/// The signals Linux force-delivers (`force_sig_info_to_task`): forcing one
+/// that is blocked or ignored, or caught but blocked, unblocks it and resets
+/// its action to the default, for the whole group sharing the actions,
+/// before any ptrace stop. The copy sees none of these:
+/// - SIGTRAP from the ptrace backend's single-step (Reverie characterizes it
+///   in `sigtrap_profile_follows_each_handler_shape`);
+/// - SIGSEGV from the backend's own trapped `rdtsc` or `cpuid`, which it
+///   emulates and suppresses;
+/// - a guest's own fault (SIGSEGV, SIGBUS, SIGILL, SIGFPE), and SIGSYS from a
+///   guest's seccomp `RET_TRAP` filter.
+///
+/// So a difference confined to these signals makes the copy unknown (it is
+/// given up quietly) rather than reported, and never passes as a match.
+fn forced() -> KernelSigset {
+    [
+        libc::SIGTRAP,
+        libc::SIGSEGV,
+        libc::SIGBUS,
+        libc::SIGILL,
+        libc::SIGFPE,
+        libc::SIGSYS,
+    ]
+    .into_iter()
+    .fold(0, |set, signal| set | sigbit(signal))
 }
 
 /// What comparing one of the copy's sets with the kernel's found.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Compared {
     Same,
-    /// Only SIGTRAP differs ([`trap`]).
-    TrapOnly,
+    /// Only signals Linux force-delivers differ ([`forced`]).
+    ForcedOnly,
     Different,
 }
 
+/// A forced delivery only ever clears a signal's bit (it unblocks the
+/// signal and resets its action to the default), so a difference is
+/// [`Compared::ForcedOnly`] only when every differing bit is a signal Linux
+/// force-delivers and the kernel holds none the copy lacks. Anything else is
+/// a real difference.
 fn compare(kernel: KernelSigset, copy: KernelSigset) -> Compared {
     match (kernel ^ copy) & !reserved() {
         0 => Compared::Same,
-        difference if difference == trap() => Compared::TrapOnly,
+        difference if difference & !forced() == 0 && kernel & !copy & !reserved() == 0 => {
+            Compared::ForcedOnly
+        }
         _ => Compared::Different,
     }
 }
 
-/// Gives the copy up quietly: the kernel's SIGTRAP state differs from it in a
-/// way only the backend's single-step explains.
-fn trap_changed<G, T>(guest: &mut G, at: &str)
+/// Gives the copy up quietly: the kernel's state of a signal Linux
+/// force-delivers differs from it in a way only a forced delivery explains
+/// ([`forced`]).
+fn forced_changed<G, T>(guest: &mut G, at: &str)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
     debug!(
-        "[dtid {}] signal-state copy dropped at {at}: SIGTRAP's kernel state differs, as a \
-         ptrace single-step leaves it",
+        "[dtid {}] signal-state copy dropped at {at}: a force-delivered signal's kernel state \
+         differs (SIGTRAP from a ptrace single-step, SIGSEGV from a trapped rdtsc or cpuid, \
+         or a fault)",
         guest.thread_state().dettid
     );
     drop_copy(guest);
@@ -390,18 +414,14 @@ where
             return;
         };
         shadow.thread.verify_at_entry = false;
-        let ignore = reserved() | trap();
-        if kernel.blocked & !ignore == shadow.thread.blocked & !ignore {
-            shadow.thread.observe_handler_mask();
-            if compare(kernel.blocked, shadow.thread.blocked) == Compared::TrapOnly {
-                trap_changed(guest, before);
-            }
-        } else {
-            give_up(
+        match compare(kernel.blocked, shadow.thread.blocked) {
+            Compared::Same => shadow.thread.observe_handler_mask(),
+            Compared::ForcedOnly => forced_changed(guest, before),
+            Compared::Different => give_up(
                 guest,
                 "the kernel's mask is not the one the copy predicts after a reported return or \
                  for an open handler frame",
-            );
+            ),
         }
         return;
     }
@@ -413,7 +433,7 @@ where
     let innermost_observed = shadow.thread.innermost_observed();
     if shadow
         .thread
-        .reconcile_returns(kernel.blocked, reserved() | trap())
+        .reconcile_returns(kernel.blocked, reserved() | forced())
     {
         let closed = open - shadow.thread.activations.len();
         if closed > 1 {
@@ -453,10 +473,16 @@ where
                 .signal_shadow
                 .as_ref()
                 .map(|shadow| shadow.thread.blocked);
-            if let Some(blocked) = blocked
-                && compare(kernel.blocked, blocked) == Compared::TrapOnly
-            {
-                trap_changed(guest, before);
+            // The frames were matched with the forced signals left out; the
+            // whole mask must still be the copy's, or differ only as a forced
+            // delivery leaves it.
+            match blocked.map(|blocked| compare(kernel.blocked, blocked)) {
+                Some(Compared::ForcedOnly) => forced_changed(guest, before),
+                Some(Compared::Different) => give_up(
+                    guest,
+                    "the kernel's mask holds a force-delivered signal the copy's mask does not",
+                ),
+                Some(Compared::Same) | None => {}
             }
         }
     } else if open > 0 {
@@ -582,8 +608,18 @@ pub(super) fn record_rt_sigaction<G, T>(
         && Action::from(written) != old
         && !unreported_elsewhere(guest.tid().as_raw())
     {
-        if signum == libc::SIGTRAP {
-            return trap_changed(guest, "rt_sigaction");
+        // A forced delivery changes only the handler, to the default. Whether
+        // the signal was blocked when it was forced is not knowable here (see
+        // `check_against_kernel`).
+        if forced() & sigbit(signum) != 0
+            && Action::from(written)
+                == (Action {
+                    handler: libc::SIG_DFL as u64,
+                    ..old
+                })
+            && old.handler != libc::SIG_DFL as u64
+        {
+            return forced_changed(guest, "rt_sigaction");
         }
         return diverged(
             guest,
@@ -686,7 +722,7 @@ pub(super) fn record_rt_sigprocmask<G, T>(
     if let Some(written) = written {
         match compare(written, old) {
             Compared::Same => {}
-            Compared::TrapOnly => return trap_changed(guest, "rt_sigprocmask"),
+            Compared::ForcedOnly => return forced_changed(guest, "rt_sigprocmask"),
             Compared::Different => {
                 return diverged(
                     guest,
@@ -788,7 +824,7 @@ where
     let Some(shadow) = guest.thread_state_mut().signal_shadow.as_mut() else {
         return;
     };
-    let compared = !(reserved() | trap());
+    let compared = !(reserved() | forced());
     let same = |a: KernelSigset, b: KernelSigset| a & compared == b & compared;
     // A temporary-mask restore no handler took has happened if the kernel
     // already shows the restored mask (the wait returned to the guest).
@@ -803,6 +839,65 @@ where
     {
         shadow.thread.interrupted_under_temporary_mask(wait_mask);
     }
+    // The outcome was chosen with the forced signals left out. A forced
+    // delivery's clear gives the copy up now; any other difference is left to
+    // the next check, which reports it.
+    if compare(kernel.blocked, shadow.thread.blocked) == Compared::ForcedOnly {
+        forced_changed(guest, "signal delivery");
+    }
+}
+
+/// The guest's dispositions as Detcore's copy holds them, in the kernel's bit
+/// layout: the signals it ignores and the signals it catches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CopiedDispositions {
+    /// Signals whose action is `SIG_IGN`.
+    pub(crate) ignored: KernelSigset,
+    /// Signals with a handler.
+    pub(crate) caught: KernelSigset,
+}
+
+/// This thread's dispositions from Detcore's copy, for a decision that needs
+/// only them (A5 step 2a). `None` where the copy cannot answer: none is kept,
+/// the actions it shares are unknown, or an unreported signal is noted
+/// anywhere (a handler may have changed the actions unseen). The caller then
+/// reads the kernel's `/proc` view as before. Where the copy answers, it holds
+/// what the kernel holds: it is checked against the kernel after each
+/// recorded call and gives itself up on any mismatch.
+///
+/// The bits of the signals Linux force-delivers ([`forced`]) and of the
+/// preemption signal are not modelled exactly (their kernel state changes
+/// unseen), so a decision about one of those signals uses
+/// [`copied_dispositions_for`].
+pub(crate) fn copied_dispositions<G, T>(guest: &G) -> Option<CopiedDispositions>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if any_notes() {
+        return None;
+    }
+    let shadow = guest.thread_state().signal_shadow.as_ref()?;
+    let actions = shadow.dispositions.lock().unwrap();
+    let dispositions = actions.as_ref()?;
+    Some(CopiedDispositions {
+        ignored: dispositions.ignored(),
+        caught: dispositions.caught(),
+    })
+}
+
+/// [`copied_dispositions`] for a decision about `signal` alone: also `None`
+/// for a signal Linux force-delivers ([`forced`]) and for Reverie's
+/// preemption signal, whose kernel state changes without the copy seeing it.
+pub(crate) fn copied_dispositions_for<G, T>(guest: &G, signal: i32) -> Option<CopiedDispositions>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if (forced() | reserved()) & sigbit(signal) != 0 {
+        return None;
+    }
+    copied_dispositions(guest)
 }
 
 /// Whether this tool asks the backend to report every guest `rt_sigreturn`
@@ -947,12 +1042,17 @@ where
     // A sibling's unreported handler may have changed the shared actions
     // unseen; that sibling gives the copy up at its own next operation.
     let shared_unsure = unreported_elsewhere(guest.tid().as_raw());
+    // Linux resets a caught action only for a signal that was blocked when it
+    // was forced. That mask is not this check's: the guest may have blocked or
+    // unblocked the signal since, unseen by the reset, and a sibling sharing
+    // the actions may have taken it. So a caught bit the kernel cleared counts
+    // as forced on its direction alone (`compare`).
     let fields = [
         ("SigBlk", kernel.blocked, blocked, true),
         ("SigIgn", kernel.ignored, ignored, !shared_unsure),
         ("SigCgt", kernel.caught, caught, !shared_unsure),
     ];
-    let mut trap_only = false;
+    let mut forced_only = false;
     let mut mismatches = Vec::new();
     for (field, kernel, copy, checked) in fields {
         if !checked {
@@ -960,7 +1060,7 @@ where
         }
         match compare(kernel, copy) {
             Compared::Same => {}
-            Compared::TrapOnly => trap_only = true,
+            Compared::ForcedOnly => forced_only = true,
             Compared::Different => mismatches.push(format!(
                 "{field} kernel {:#018x} copy {:#018x}",
                 kernel & !reserved(),
@@ -970,8 +1070,8 @@ where
     }
     if !mismatches.is_empty() {
         diverged(guest, after, &mismatches.join(", "));
-    } else if trap_only {
-        trap_changed(guest, after);
+    } else if forced_only {
+        forced_changed(guest, after);
     } else if shared_unsure {
         trace!(
             "[dtid {}] signal-state copy matches the kernel's mask at {after} (actions not \
@@ -1590,6 +1690,223 @@ mod tests {
     }
 
     #[test]
+    fn a_forced_sigsegv_reset_gives_the_copy_up_quietly() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let segv = 1 << (libc::SIGSEGV - 1);
+        let handler = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        let mut guest = seeded(&kernel, segv);
+        kernel.set(segv, 0, segv);
+        record_rt_sigaction(&mut guest, libc::SIGSEGV, Some(handler), None, &Ok(0));
+        assert_eq!(
+            copied_dispositions(&guest).map(|copied| copied.caught),
+            Some(segv)
+        );
+        let reported = DIVERGENCES.with(std::cell::Cell::get);
+        // A forced SIGSEGV (the backend's trapped rdtsc, say) found it caught
+        // but blocked: the kernel unblocked it and reset it to the default.
+        kernel.set(0, 0, 0);
+        let mut old: KernelSigset = 0;
+        let oldset = AddrMut::from_raw(&mut old as *mut KernelSigset as usize);
+        record_rt_sigprocmask(&mut guest, libc::SIG_BLOCK, SetInput::None, oldset, &Ok(0));
+        assert!(
+            guest.thread.signal_shadow.is_none(),
+            "the copy is unknown now"
+        );
+        assert_eq!(
+            DIVERGENCES.with(std::cell::Cell::get),
+            reported,
+            "and nothing was reported"
+        );
+    }
+
+    /// A query of the mask, which checks the copy against the kernel. The old
+    /// mask the kernel writes back is `kernel_blocked`.
+    fn query_mask_written(guest: &mut ShadowGuest, kernel_blocked: KernelSigset) {
+        let mut old: KernelSigset = kernel_blocked;
+        let oldset = AddrMut::from_raw(&mut old as *mut KernelSigset as usize);
+        record_rt_sigprocmask(guest, libc::SIG_BLOCK, SetInput::None, oldset, &Ok(0));
+    }
+
+    /// [`query_mask_written`] where the kernel's mask is empty.
+    fn query_mask(guest: &mut ShadowGuest) {
+        let mut old: KernelSigset = 0;
+        let oldset = AddrMut::from_raw(&mut old as *mut KernelSigset as usize);
+        record_rt_sigprocmask(guest, libc::SIG_BLOCK, SetInput::None, oldset, &Ok(0));
+    }
+
+    #[test]
+    fn a_forced_reset_of_an_ignored_sigsegv_is_quiet() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let segv = 1 << (libc::SIGSEGV - 1);
+        let ignore = KernelSigaction {
+            handler: libc::SIG_IGN as u64,
+            flags: 0x0400_0000,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        let reported = DIVERGENCES.with(std::cell::Cell::get);
+        // Only SigIgn changes: an ignored, unblocked SIGSEGV reset to the
+        // default.
+        let mut guest = seeded(&kernel, 0);
+        kernel.set(0, segv, 0);
+        record_rt_sigaction(&mut guest, libc::SIGSEGV, Some(ignore), None, &Ok(0));
+        kernel.set(0, 0, 0);
+        query_mask(&mut guest);
+        assert!(guest.thread.signal_shadow.is_none(), "given up");
+        // The old action the kernel writes back is the copy's with the
+        // handler reset to the default.
+        let mut guest = seeded(&kernel, 0);
+        kernel.set(0, segv, 0);
+        record_rt_sigaction(&mut guest, libc::SIGSEGV, Some(ignore), None, &Ok(0));
+        kernel.set(0, 0, 0);
+        let mut written = KernelSigaction {
+            handler: libc::SIG_DFL as u64,
+            ..ignore
+        };
+        let old_action = AddrMut::from_raw(&mut written as *mut KernelSigaction as usize);
+        record_rt_sigaction(&mut guest, libc::SIGSEGV, None, old_action, &Ok(0));
+        assert!(guest.thread.signal_shadow.is_none(), "given up");
+        assert_eq!(
+            DIVERGENCES.with(std::cell::Cell::get),
+            reported,
+            "nothing reported"
+        );
+    }
+
+    #[test]
+    fn forced_signal_differences_a_reset_cannot_make_are_divergences() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let segv = 1 << (libc::SIGSEGV - 1);
+        let reported = || DIVERGENCES.with(std::cell::Cell::get);
+        // The kernel gained SIGSEGV in SigIgn: a reset only clears.
+        let mut guest = seeded(&kernel, 0);
+        let before = reported();
+        kernel.set(0, segv, 0);
+        query_mask(&mut guest);
+        assert!(reported() > before, "the kernel ignores more than the copy");
+        // SIGSEGV and SIGUSR1 both differ.
+        let mut guest = seeded(&kernel, segv | USR1);
+        let before = reported();
+        kernel.set(0, 0, 0);
+        query_mask(&mut guest);
+        assert!(
+            reported() > before,
+            "a difference beyond the forced signals"
+        );
+        // The kernel wrote a different handler for SIGSEGV.
+        let mut guest = seeded(&kernel, 0);
+        let before = reported();
+        let mut written = KernelSigaction {
+            handler: 0x5000,
+            flags: 0x0400_0000,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        let old_action = AddrMut::from_raw(&mut written as *mut KernelSigaction as usize);
+        record_rt_sigaction(&mut guest, libc::SIGSEGV, None, old_action, &Ok(0));
+        assert!(reported() > before, "a handler a reset cannot install");
+        // The kernel wrote the default, but with other flags than the
+        // copy's handler had.
+        let mut guest = seeded(&kernel, 0);
+        let handler = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        kernel.set(0, 0, segv);
+        record_rt_sigaction(&mut guest, libc::SIGSEGV, Some(handler), None, &Ok(0));
+        let before = reported();
+        kernel.set(0, 0, 0);
+        let mut written = KernelSigaction {
+            handler: libc::SIG_DFL as u64,
+            flags: 0x0400_0000,
+            ..handler
+        };
+        let old_action = AddrMut::from_raw(&mut written as *mut KernelSigaction as usize);
+        record_rt_sigaction(&mut guest, libc::SIGSEGV, None, old_action, &Ok(0));
+        assert!(reported() > before, "flags a reset does not change");
+    }
+
+    #[test]
+    fn a_caught_signal_reset_counts_as_forced_whatever_the_mask_is_now() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let trap = 1 << (libc::SIGTRAP - 1);
+        let handler = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        let reported = || DIVERGENCES.with(std::cell::Cell::get);
+        // As on the ptrace e2e corpus: SIGTRAP caught and blocked, a
+        // single-step resets and unblocks it unseen, and the guest blocks
+        // every signal again before its next recorded call. The kernel and
+        // the copy then both have SIGTRAP blocked, and only SigCgt differs.
+        let mut guest = seeded(&kernel, trap);
+        kernel.set(trap, 0, trap);
+        record_rt_sigaction(&mut guest, libc::SIGTRAP, Some(handler), None, &Ok(0));
+        let before = reported();
+        kernel.set(trap, 0, 0);
+        query_mask_written(&mut guest, trap);
+        assert!(guest.thread.signal_shadow.is_none(), "given up");
+        assert_eq!(reported(), before, "quietly");
+        // The kernel catching a signal the copy does not is still reported.
+        let mut guest = seeded(&kernel, 0);
+        let before = reported();
+        kernel.set(0, 0, 1 << (libc::SIGSEGV - 1));
+        query_mask(&mut guest);
+        assert!(reported() > before, "the kernel catches more than the copy");
+    }
+
+    #[test]
+    fn reconciliation_follows_the_forced_rule() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let segv = 1 << (libc::SIGSEGV - 1);
+        let reported = || DIVERGENCES.with(std::cell::Cell::get);
+        let before = reported();
+        // Where returns are reported: the kernel gained a forced signal while a
+        // frame is open, which no forced delivery explains.
+        let mut guest = in_handler(&kernel, reverie::BackendCapabilities::PTRACE);
+        kernel.set(USR1 | USR2 | segv, 0, USR1);
+        at_syscall_entry(&mut guest);
+        assert_eq!(blocked(&guest), None, "given up");
+        // A forced clear while the frame is open.
+        let mut guest = seeded(&kernel, segv);
+        let handler = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        kernel.set(segv, 0, USR1);
+        record_rt_sigaction(&mut guest, libc::SIGUSR1, Some(handler), None, &Ok(0));
+        record_delivery(&mut guest, libc::SIGUSR1);
+        kernel.set(USR1, 0, USR1);
+        at_syscall_entry(&mut guest);
+        assert_eq!(blocked(&guest), None, "given up");
+        // Where returns are inferred: the frame matched with the forced signals
+        // left out, but the kernel holds one the copy does not.
+        let mut guest = in_handler(&kernel, reverie::BackendCapabilities::E9PATCH);
+        kernel.set(USR1 | USR2, 0, USR1);
+        at_syscall_entry(&mut guest);
+        kernel.set(segv, 0, USR1);
+        at_syscall_entry(&mut guest);
+        assert_eq!(blocked(&guest), None, "given up");
+        assert_eq!(reported(), before, "none of these is a divergence");
+    }
+
+    #[test]
     fn the_preemption_signal_is_left_out_of_old_values() {
         let kernel = Kernel::default();
         let _seam = kernel.install();
@@ -1740,6 +2057,72 @@ mod tests {
             .signal_shadow
             .as_ref()
             .map_or(0, |shadow| shadow.thread.activations.len())
+    }
+
+    #[test]
+    fn copied_dispositions_answer_only_where_the_copy_can() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = seeded(&kernel, 0);
+        let handler = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        let ignore = KernelSigaction {
+            handler: libc::SIG_IGN as u64,
+            flags: 0x0400_0000,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        kernel.set(0, 0, USR1);
+        record_rt_sigaction(&mut guest, libc::SIGUSR1, Some(handler), None, &Ok(0));
+        kernel.set(0, USR2, USR1);
+        record_rt_sigaction(&mut guest, libc::SIGUSR2, Some(ignore), None, &Ok(0));
+        let expected = Some(CopiedDispositions {
+            ignored: USR2,
+            caught: USR1,
+        });
+        assert_eq!(
+            copied_dispositions(&guest),
+            expected,
+            "what the kernel holds"
+        );
+        assert_eq!(copied_dispositions_for(&guest, libc::SIGUSR1), expected);
+        // Linux can force-deliver these, resetting their kernel state
+        // unseen.
+        for signal in [
+            libc::SIGTRAP,
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGILL,
+            libc::SIGFPE,
+            libc::SIGSYS,
+        ] {
+            assert_eq!(copied_dispositions_for(&guest, signal), None, "{signal}");
+        }
+        assert_eq!(
+            copied_dispositions_for(&guest, reverie::PERF_EVENT_SIGNAL as i32),
+            None
+        );
+        // An unreported signal noted anywhere: a handler may have changed the
+        // actions unseen.
+        note_unreported(1, i32::MAX - 1, libc::SIGUSR1);
+        assert_eq!(copied_dispositions(&guest), None);
+        with_notes(|notes| notes.clear());
+        assert_eq!(copied_dispositions(&guest), expected);
+        // Shared actions another thread lost are unknown.
+        guest
+            .thread
+            .signal_shadow
+            .as_ref()
+            .unwrap()
+            .forget_dispositions();
+        assert_eq!(copied_dispositions(&guest), None);
+        // No copy at all.
+        guest.thread.signal_shadow = None;
+        assert_eq!(copied_dispositions(&guest), None);
     }
 
     #[test]
