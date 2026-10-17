@@ -7365,7 +7365,8 @@ fn thread_rng_from_parent_entropy_labeled(
 /// The fixed procfs file the kernel opened at `fd`, if its descriptor link
 /// names one (`ProcfsFile::snapshot_is_fixed`).
 fn fixed_procfs_behind(fd: RawFd) -> Option<crate::procfs::ProcfsFile> {
-    let link = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).ok()?;
+    // The calling thread's own table: `/proc/self/fd` is the leader's.
+    let link = std::ffi::CString::new(format!("/proc/thread-self/fd/{fd}")).ok()?;
     let mut target = [0_u8; 256];
     // SAFETY: the path is NUL-terminated and `target` is writable.
     let length = unsafe {
@@ -7406,7 +7407,8 @@ fn placeholder_behind(
     if seals != -i64::from(libc::EBADF) && (seals < 0 || seals & wanted != wanted) {
         return None;
     }
-    let link = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).ok()?;
+    // The calling thread's own table: `/proc/self/fd` is the leader's.
+    let link = std::ffi::CString::new(format!("/proc/thread-self/fd/{fd}")).ok()?;
     let mut target = [0_u8; crate::procfs::PLACEHOLDER_LINK_CAPACITY];
     // SAFETY: the path is NUL-terminated and `target` is writable.
     let length = unsafe {

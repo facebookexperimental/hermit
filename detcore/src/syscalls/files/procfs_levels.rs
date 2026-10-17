@@ -389,23 +389,69 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut values = [
             args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
         ];
-        let numbers = self.parent_numbers(guest, &lookups, &values).await;
+        // A relative spelling below a descriptor Detcore has no record of (one
+        // received over `SCM_RIGHTS`) is judged as the name the kernel will
+        // look up: the directory the descriptor is open on, joined with it
+        // (`Detcore::unrecorded_procfs_directory`). Otherwise a received
+        // `/proc` descriptor would reach a name the level omits. Recovered
+        // first, so that the task numbers the recovered directory names are
+        // translated with the rest (DBT, `parent_numbers`): a received
+        // `/proc/self` directory names its task by the guest's number.
+        let mut recovered = Vec::new();
+        if let Lookups::Paths(operands) = &lookups {
+            for (dirfd, path) in operands {
+                let spelling = PathPtr::from_ptr(values[*path] as *const libc::c_char)
+                    .and_then(|address| address.read(&guest.memory()).ok());
+                let directory = match (dirfd, &spelling) {
+                    (Some(position), Some(spelling)) if !spelling.is_absolute() => {
+                        self.unrecorded_procfs_directory(guest, values[*position] as i32)
+                            .await
+                    }
+                    _ => None,
+                };
+                recovered.push(directory);
+            }
+        }
+        let recovered_paths = match &lookups {
+            Lookups::Paths(operands) => operands
+                .iter()
+                .zip(&recovered)
+                .filter_map(|((_, path), directory)| {
+                    let spelling = PathPtr::from_ptr(values[*path] as *const libc::c_char)
+                        .and_then(|address| address.read(&guest.memory()).ok())?;
+                    Some(directory.as_ref()?.join(spelling))
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        let numbers = self
+            .parent_numbers(guest, &lookups, &values, &recovered_paths)
+            .await;
         // Whether a refusal for permission can only be the KVM executor's.
         let mut confined = true;
         let replacements = match lookups {
             Lookups::Paths(operands) => {
                 let mut replacements = Vec::new();
-                for (dirfd, path) in operands {
+                for (index, (dirfd, path)) in operands.into_iter().enumerate() {
                     let decision = match PathPtr::from_ptr(values[path] as *const libc::c_char)
                         .and_then(|address| address.read(&guest.memory()).ok())
                     {
-                        Some(spelling) => self.decide(
-                            guest,
-                            dirfd.map(|p| values[p] as i32),
-                            &spelling,
-                            &root,
-                            numbers.as_ref(),
-                        ),
+                        Some(spelling) => match recovered.get(index).cloned().flatten() {
+                            Some(directory) => self.decide(
+                                guest,
+                                None,
+                                &directory.join(&spelling),
+                                &root,
+                                numbers.as_ref(),
+                            ),
+                            None => self.decide(
+                                guest,
+                                dirfd.map(|p| values[p] as i32),
+                                &spelling,
+                                &root,
+                                numbers.as_ref(),
+                            ),
+                        },
                         None => Decision::default(),
                     };
                     confined &= decision.decided;
@@ -509,19 +555,25 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The kernel's number for each guest process or thread number in the
     /// paths `lookups` names, as [`Self::decide`] places them (DBT;
-    /// `procfs_numbers`): the tool looks at an omitted name's directory by
-    /// them ([`Self::parent_in_tool_view`]). `None` where numbers are not
-    /// translated.
+    /// `procfs_numbers`), and in `recovered`, the absolute spellings of
+    /// relative names below received procfs directories
+    /// (`Detcore::unrecorded_procfs_directory`): the tool looks at an omitted
+    /// name's directory by them ([`Self::parent_in_tool_view`]). `None` where
+    /// numbers are not translated.
     async fn parent_numbers<G: Guest<Self>>(
         &self,
         guest: &mut G,
         lookups: &Lookups,
         values: &[usize; 6],
+        recovered: &[PathBuf],
     ) -> Option<BTreeMap<i32, Option<i32>>> {
         if !Self::translates_procfs_numbers(guest) {
             return None;
         }
-        let mut spellings = Vec::new();
+        let mut spellings = recovered
+            .iter()
+            .map(|path| (libc::AT_FDCWD, path.clone()))
+            .collect::<Vec<_>>();
         match lookups {
             Lookups::Paths(operands) => {
                 for (dirfd, path) in operands {

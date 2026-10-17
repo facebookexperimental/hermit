@@ -1771,6 +1771,12 @@
       "why": "tests/c/realtime_signals.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test realtime_signals_are_delivered_with_their_values_and_verify compiles this guest, which queues realtime signals to itself with sigqueue values and wakes a thread asleep in sigsuspend with SIGRTMIN+1, then cancels a thread with glibc pthread_cancel (signal 32), and requires the exact handler order, values and SI_QUEUE codes Linux gives together with --verify-strict bitwise parity (https://github.com/rrnewton/reverie/issues/207); it remains a guest fixture because a generic manifest cannot assert this exact output."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/received_directory_openat.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/received_directory_openat.c is owned by hermit-cli/tests/cli.rs: the CLI test a_name_below_a_received_directory_is_looked_up_on_ptrace_dbt_and_kvm runs it natively and at bitwise parity on ptrace, DBT and KVM, and requires openat, fstatat, statx, faccessat and readlinkat to look a name up below a /tmp directory and a /proc directory the guest received over SCM_RIGHTS, which failed with EBADF on ptrace and KVM where Detcore keeps no record of a received descriptor; that a name the --proc level omits stays absent there; and that namespace, socket and pipe links below a received /proc/self/ns and /proc/self/fd read as their absolute, canonicalized spellings. It stays a fixture because a generic manifest cannot compare stdout across backends."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/record_lock.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

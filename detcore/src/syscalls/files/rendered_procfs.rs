@@ -1053,7 +1053,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<Option<&'static Path>, Error> {
         const TARGET_CAPACITY: usize = crate::procfs::PLACEHOLDER_LINK_CAPACITY;
         let mut stack = guest.stack().await;
-        let link = stack.push(c_string::<32>(format!("/proc/self/fd/{fd}").as_bytes()));
+        // The calling thread's descriptor, by its own table: `/proc/self/fd`
+        // is the thread group leader's, another table once a thread made
+        // without CLONE_FILES has its own.
+        let link = stack.push(c_string::<32>(
+            format!("/proc/thread-self/fd/{fd}").as_bytes(),
+        ));
         let target = stack.reserve::<[u8; TARGET_CAPACITY]>();
         let stack_guard = stack.commit()?;
         let length = guest
@@ -1487,9 +1492,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_cmd(syscalls::FcntlCmd::F_ADD_SEALS(PLACEHOLDER_SEALS)),
             )
             .await;
+        // By the calling thread's own table (`/proc/thread-self/fd`): the
+        // leader's (`/proc/self/fd`) lacks the memfd in a thread made without
+        // CLONE_FILES, and the reopen then failed with ENOENT.
         guest.memory().write_exact(
             link.cast::<u8>(),
-            &c_string::<32>(format!("/proc/self/fd/{memfd}").as_bytes()),
+            &c_string::<32>(format!("/proc/thread-self/fd/{memfd}").as_bytes()),
         )?;
         // Reopening through the descriptor link gives a description with the
         // guest's flags, which then takes the memfd's number.
@@ -1665,7 +1673,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if path.as_os_str().is_empty() {
                     return Ok(None);
                 }
-                let observed = Self::observed_path(guest, dirfd, &path)?;
+                let observed = self.procfs_spelling_at(guest, dirfd, &path).await?;
                 match self.rendered_procfs_at(guest, &observed).await? {
                     // A link's own metadata is not its target's: `lstat` of
                     // `/proc/self/fd/N` describes the link, which the kernel has.
@@ -2476,7 +2484,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // file's name or a descriptor number.
             let files = self.rendered_files(guest);
             let lexical = if could_name_rendered(&text, files) {
-                let observed = Self::observed_path(guest, dirfd, &text)?;
+                let observed = self.procfs_spelling_at(guest, dirfd, &text).await?;
                 match self.rendered_procfs_at(guest, &observed).await? {
                     // A call that does not follow a descriptor link acts on
                     // the link itself, which the kernel has.

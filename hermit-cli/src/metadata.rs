@@ -664,7 +664,13 @@ impl RecordVersion {
 // at 0x163. A vectored read of it records a capture where an older binary
 // refused it with ENOSYS, so an older recording containing one would replay
 // out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x169);
+// 0x169 -> 0x16a (reserved as 0x16a): a relative name below a directory
+// descriptor Detcore has no record of (one received over SCM_RIGHTS on
+// ptrace or KVM) is the kernel's lookup where Detcore answered EBADF before
+// the recorder (https://github.com/rrnewton/hermit/issues/4213, K1-0), so an
+// openat, stat, access or readlinkat through such a descriptor is now
+// recorded, and an older recording containing one would replay out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16a);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -689,7 +695,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x169);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x169;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x16a;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1687,6 +1693,21 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_replaced_read_descriptors_block_the_claim() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15b)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x16a answered EBADF, unrecorded, for a relative
+    /// name below a directory descriptor received over SCM_RIGHTS, where the
+    /// kernel's lookup is now recorded (K1-0 of
+    /// https://github.com/rrnewton/hermit/issues/4213).
+    #[test]
+    fn record_version_rejects_streams_from_before_received_directory_lookups() {
+        for older in 0x163..=0x169 {
+            assert!(
+                !RECORD_VERSION.compatible_with(&RecordVersion(older)),
+                "{older:#x}"
+            );
+        }
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 

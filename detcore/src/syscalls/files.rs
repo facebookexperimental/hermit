@@ -1468,6 +1468,50 @@ fn path_to_record_for_open(
     .unwrap_or_else(|| observed.to_path_buf())
 }
 
+/// The components below `/proc` of the kernel's name for a procfs directory
+/// (a descriptor link), and the positions among them of the task numbers it
+/// names: `/proc/<pid>` and its `task/<tid>`. `None` for a name outside
+/// `/proc`, a deleted or anonymous object, a relative name, or a task number
+/// procfs would not have (a leading zero).
+fn procfs_directory_task_positions(link: &str) -> Option<(Vec<String>, Vec<usize>)> {
+    if link.ends_with(" (deleted)") {
+        return None;
+    }
+    let below = link.strip_prefix("/proc")?;
+    if !(below.is_empty() || below.starts_with('/')) {
+        return None;
+    }
+    let names = below
+        .split('/')
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if names.iter().any(|name| name == "." || name == "..") {
+        return None;
+    }
+    let number = |name: &str| {
+        !name.is_empty() && !name.starts_with('0') && name.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    let mut positions = Vec::new();
+    if let Some(first) = names.first()
+        && first.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        if !number(first) {
+            return None;
+        }
+        positions.push(0);
+        if names.get(1).map(String::as_str) == Some("task")
+            && let Some(thread) = names.get(2)
+        {
+            if !number(thread) {
+                return None;
+            }
+            positions.push(2);
+        }
+    }
+    Some((names, positions))
+}
+
 /// Whether `link`, the kernel's name for a descriptor (its
 /// `/proc/thread-self/fd/N` link), names a procfs directory path Detcore
 /// may record for it: `/proc`, or a path below it that names no process or
@@ -2930,6 +2974,102 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// [`Self::observed_path`], with a descriptor Detcore has no record of
+    /// (one received over `SCM_RIGHTS`, which a fresh discovery leaves
+    /// without one) named as the kernel names the directory it is open on,
+    /// where that is on procfs ([`Self::unrecorded_procfs_directory`]): Linux
+    /// looks a relative name up below the directory the descriptor is open on,
+    /// whoever holds it. Detcore's own decisions about procfs names (the
+    /// files it renders, the `--proc` level, the links it canonicalizes) use
+    /// this spelling.
+    pub(crate) async fn procfs_spelling_at<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        dirfd: i32,
+        path: &Path,
+    ) -> Result<PathBuf, Error> {
+        if !path.is_absolute()
+            && let Some(directory) = self.unrecorded_procfs_directory(guest, dirfd).await
+        {
+            return Ok(directory.join(path));
+        }
+        Self::observed_path(guest, dirfd, path)
+    }
+
+    /// The procfs directory descriptor `dirfd` is open on, where Detcore has
+    /// no record of the descriptor, as the guest names it: the kernel's name
+    /// for it (its `/proc/thread-self/fd/N` link, one injected `readlinkat`),
+    /// if that is `/proc` or a path below it, with the kernel's numbers of
+    /// the task it names taken back to the guest's where the two differ (DBT,
+    /// `Self::translates_procfs_numbers`). Every backend's kernel beneath
+    /// answers that link for the calling thread's own table: the host kernel
+    /// on ptrace and DBT, KVM's provider (`guest_fd_path`), which has one
+    /// table per process. `None` for a descriptor Detcore has a record of, any
+    /// other object, a task number no task of the guest's holds, and where
+    /// Detcore does not render procfs files (record and replay, after
+    /// `chroot`). Only with sequentialized threads, so that no other guest
+    /// thread can replace the descriptor before its link is read.
+    pub(crate) async fn unrecorded_procfs_directory<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        dirfd: i32,
+    ) -> Option<PathBuf> {
+        if dirfd < 0 || !self.renders_procfs(guest) || !guest.config().sequentialize_threads {
+            return None;
+        }
+        let recorded = guest
+            .thread_state()
+            .with_detfd(dirfd, |detfd| detfd.path())
+            .unwrap_or(None);
+        if recorded.is_some() {
+            return None;
+        }
+        const LINK_CAPACITY: usize = 40;
+        const TARGET_CAPACITY: usize = 256;
+        let mut stack = guest.stack().await;
+        let link = stack.push(rendered_procfs::c_string::<LINK_CAPACITY>(
+            format!("/proc/thread-self/fd/{dirfd}").as_bytes(),
+        ));
+        let target = stack.reserve::<[u8; TARGET_CAPACITY]>();
+        let stack_guard = stack.commit().ok()?;
+        let length = guest
+            .inject(
+                syscalls::Readlinkat::new()
+                    .with_dirfd(libc::AT_FDCWD)
+                    .with_path(PathPtr::from_ptr(link.as_raw() as *const libc::c_char))
+                    .with_buf(Some(target.cast::<libc::c_char>()))
+                    .with_buf_len(TARGET_CAPACITY),
+            )
+            .await;
+        let bytes = match length.map(|length| length as usize) {
+            Ok(length) if length < TARGET_CAPACITY => {
+                let mut bytes = vec![0; length];
+                guest
+                    .memory()
+                    .read_exact(target.cast::<u8>(), &mut bytes)
+                    .ok()
+                    .map(|()| bytes)
+            }
+            _ => None,
+        };
+        drop(stack_guard);
+        let text = String::from_utf8(bytes?).ok()?;
+        let (mut names, positions) = procfs_directory_task_positions(&text)?;
+        if Self::translates_procfs_numbers(guest) && !positions.is_empty() {
+            let kernel = positions
+                .iter()
+                .map(|position| names[*position].parse::<i32>().ok())
+                .collect::<Option<Vec<_>>>()?;
+            let translated = crate::tool_global::procfs_ids(guest, false, kernel).await;
+            for (position, number) in positions.iter().zip(translated) {
+                names[*position] = number?.to_string();
+            }
+        }
+        let mut directory = PathBuf::from("/proc");
+        directory.extend(names);
+        Some(directory)
+    }
+
     /// `path`, as a guest syscall named it relative to `dirfd`, made
     /// absolute in the guest's view. A relative spelling is not the object:
     /// absolute paths are already bound, a dirfd supplies its own prefix, and
@@ -2942,9 +3082,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else if dirfd == libc::AT_FDCWD {
             resolved_at_fdcwd_path(guest.pid().as_raw(), path).unwrap_or_else(|| path.to_path_buf())
         } else {
+            // A descriptor Detcore has no state for (one received over
+            // `SCM_RIGHTS` under a backend whose tool does not discover
+            // descriptors as they are used) keeps the relative spelling, which
+            // the kernel looks up from it; the kernel, not this lookup,
+            // decides whether the descriptor is open. Before, such an `openat`
+            // failed with EBADF though the descriptor was open.
             guest
                 .thread_state()
-                .with_detfd(dirfd, |detfd| detfd.path())?
+                .with_detfd(dirfd, |detfd| detfd.path())
+                .unwrap_or(None)
                 .map_or_else(|| path.to_path_buf(), |directory| directory.join(path))
         })
     }
@@ -3300,6 +3447,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // are resolved through the guest's root and cwd before the open so the
         // result does not depend on Replayer's placeholder descriptor.
         let observed_path = Self::observed_path(guest, call.dirfd(), &path)?;
+        // The spelling Detcore's own lookups of the files it renders see.
+        let procfs_spelling = self.procfs_spelling_at(guest, call.dirfd(), &path).await?;
         if guest.config().record_host_inputs && call.flags().contains(OFlag::O_CREAT) {
             // It may create the file it opens. Reported before the open runs,
             // as `record_host_namespace_change` reports the other changes.
@@ -3319,7 +3468,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let rendered = match if path.as_os_str().is_empty() {
             Ok(None)
         } else {
-            self.rendered_procfs_at(guest, &observed_path).await
+            self.rendered_procfs_at(guest, &procfs_spelling).await
         } {
             Ok(rendered) => rendered,
             Err(error) => {
@@ -12512,6 +12661,50 @@ mod test {
             "/memfd:x (deleted)",
         ] {
             assert!(!procfs_directory_link(Path::new(refused)), "{refused}");
+        }
+    }
+
+    /// The kernel's name for a received procfs directory gives its components
+    /// below `/proc` and the positions of the task numbers among them, which
+    /// DBT translates to the guest's: a process's directory and a thread's
+    /// below its `task`, nothing for the system directories, and no name
+    /// procfs would not give.
+    #[test]
+    fn a_received_procfs_directory_names_its_task_positions() {
+        use super::procfs_directory_task_positions;
+        let parsed = |link: &str| procfs_directory_task_positions(link);
+        let owned = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect();
+        assert_eq!(parsed("/proc"), Some((Vec::new(), Vec::new())));
+        assert_eq!(
+            parsed("/proc/sys/kernel"),
+            Some((owned(&["sys", "kernel"]), Vec::new()))
+        );
+        assert_eq!(parsed("/proc/12"), Some((owned(&["12"]), vec![0])));
+        assert_eq!(parsed("/proc/12/ns"), Some((owned(&["12", "ns"]), vec![0])));
+        assert_eq!(parsed("/proc/12/fd"), Some((owned(&["12", "fd"]), vec![0])));
+        assert_eq!(
+            parsed("/proc/12/task/14"),
+            Some((owned(&["12", "task", "14"]), vec![0, 2]))
+        );
+        assert_eq!(
+            parsed("/proc/12/task/14/ns"),
+            Some((owned(&["12", "task", "14", "ns"]), vec![0, 2]))
+        );
+        assert_eq!(
+            parsed("/proc/irq/5"),
+            Some((owned(&["irq", "5"]), Vec::new()))
+        );
+        for refused in [
+            "/proc/012",
+            "/proc/12/task/014",
+            "/procfs",
+            "/tmp/12",
+            "proc/12",
+            "/proc/12 (deleted)",
+            "socket:[1]",
+            "/proc/12/../13",
+        ] {
+            assert_eq!(parsed(refused), None, "{refused}");
         }
     }
 

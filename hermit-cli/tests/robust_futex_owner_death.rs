@@ -1563,11 +1563,12 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // open through a descriptor link records its target's path, 0x168 POSIX
     // timer SI_TIMER records for https://github.com/rrnewton/hermit/issues/4262,
     // 0x169 /proc/cpuinfo rendered by Detcore for
-    // https://github.com/rrnewton/hermit/issues/4213),
+    // https://github.com/rrnewton/hermit/issues/4213, 0x16a a relative name
+    // below a received directory descriptor is the kernel's recorded lookup),
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x169,
+        metadata["version"], 0x16a,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);
