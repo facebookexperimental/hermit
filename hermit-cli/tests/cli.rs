@@ -25687,6 +25687,86 @@ fn dbt_refuses_a_vfork_childs_scheduler_policy_query_by_name() {
     );
 }
 
+/// A copied child has no shared Tool memory writer for scheduler parameters.
+#[test]
+#[cfg(feature = "dbt")]
+fn dbt_refuses_a_vfork_childs_scheduler_parameter_query_by_name() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&COPIED_SCHEDULER_QUERY_GUEST, "copied_scheduler_query")
+        .to_str()
+        .unwrap();
+    let native = Command::new(guest)
+        .arg("param-vfork")
+        .output()
+        .expect("native sched_getparam vfork control");
+    assert!(native.status.success(), "{native:?}");
+    let vfork_output = "after sched_getparam\n\
+        vfork sched_getparam: result=0 errno=0 priority=0 canaries=1 exit=0\n";
+    assert_eq!(stdout(&native), vfork_output);
+    let run = |backend, strictness, mode| {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            strictness,
+            "--base-env=minimal",
+            "--",
+            guest,
+            mode,
+        ];
+        hermit_test::hermit_output("scheduler parameter query", &mut hermit_command(&args))
+    };
+    // A zero priority alone does not prove Tool mediation. These complete
+    // target/null transcripts characterize the shared handler's existing
+    // PID-existence and null-pointer limitations, not native Linux semantics.
+    for backend in ["dbt", "ptrace"] {
+        let output = run(backend, "--strict", "param-ordinary");
+        assert!(output.status.success(), "{backend}: {output:?}");
+        assert_eq!(
+            stdout(&output),
+            "ordinary sched_getparam: result=0 errno=0 priority=0 canaries=1\n"
+        );
+        let targets = run(backend, "--strict", "param-targets");
+        assert!(targets.status.success(), "{backend}: {targets:?}");
+        assert_eq!(
+            stdout(&targets),
+            "parameter identities: child=1 parent=1\n\
+             sched_getparam zero: result=0 errno=0 priority=0 canaries=1\n\
+             sched_getparam self: result=0 errno=0 priority=0 canaries=1\n\
+             sched_getparam live: result=0 errno=0 priority=0 canaries=1\n\
+             sched_getparam absent: result=0 errno=0 priority=0 canaries=1\n\
+             sched_getparam negative: result=0 errno=0 priority=0 canaries=1\n\
+             sched_getparam null: result=0 errno=0 priority=324508639 canaries=1\n\
+             sched_getparam bad: result=-1 errno=14 priority=324508639 canaries=1\n\
+             parameter wait: exit=37\nsched-getparam-targets=ok\n"
+        );
+    }
+    let ptrace = run("ptrace", "--strict", "param-vfork");
+    assert!(ptrace.status.success(), "{ptrace:?}");
+    assert_eq!(stdout(&ptrace), vfork_output);
+    let passthrough = run("dbt", "--allow-unsupported-syscalls", "param-vfork");
+    assert!(passthrough.status.success(), "{passthrough:?}");
+    assert_eq!(passthrough.stdout, native.stdout);
+
+    let refused = run("dbt", "--strict", "param-vfork");
+    assert_eq!(refused.status.code(), Some(101), "{refused:?}");
+    assert!(
+        stderr(&refused).contains("unsupported syscall sched_getparam (143) in copied child"),
+        "{refused:?}"
+    );
+    assert!(
+        stderr(&refused).contains(&format!(
+            "detcore-dbt: unsupported syscall {} in copied child",
+            libc::SYS_sched_getparam
+        )),
+        "{refused:?}"
+    );
+    assert!(
+        !stdout(&refused).contains("after sched_getparam"),
+        "{refused:?}"
+    );
+}
+
 /// A copied DBT child must refuse a priority query in strict mode.
 /// Its non-strict native path and the ordinary shared Detcore answer are distinct.
 #[test]

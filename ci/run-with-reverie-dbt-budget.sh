@@ -1838,7 +1838,14 @@ fi
 # reviewed73cc repair and is source-bound separately. Preserve incoming
 # realtime-signal/e2e carries, SDK budget, parallel width and limits.
 # The paired Hermit strict copied-child refusal remains required.
-expected_pin=9a6c76c6e784b9e38e47485b3df0d32b8ea5c844
+# CARRY TO 01e05bef246244466710d07d6e85442f64303f48 (2026-10-17): from
+# 9a6c76c6e784b9e38e47485b3df0d32b8ea5c844, remove only native sched_getparam
+# membership admission and extend existing original/tail/returning witnesses.
+# All seven SDK recipe inputs are object-identical; native client.c changes
+# outside the measured SDK region and requires fresh runtime validation.
+# Preserve existing carries, budget values, parallel width and limits.
+# The paired strict copied-child named refusal remains required.
+expected_pin=01e05bef246244466710d07d6e85442f64303f48
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

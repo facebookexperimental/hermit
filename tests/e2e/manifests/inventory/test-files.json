@@ -244,7 +244,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/copied_scheduler_query.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/copied_scheduler_query.c is owned by hermit-cli/tests/cli.rs: the CLI test dbt_refuses_a_vfork_childs_scheduler_policy_query_by_name runs it on DBT and requires a strict copied (vfork) child's native scheduler-policy query to stop with the named refusal. It stays a fixture because a generic manifest cannot assert the refusal's exit status and stderr."
+      "why": "tests/c/copied_scheduler_query.c is owned by hermit-cli/tests/cli.rs: the CLI tests dbt_refuses_a_vfork_childs_scheduler_policy_query_by_name and dbt_refuses_a_vfork_childs_scheduler_parameter_query_by_name run it on DBT and require strict copied (vfork) scheduler-policy and parameter queries to stop with their named refusals; ordinary DBT/ptrace parameter modes characterize the existing shared output and PID/null limitations. It stays a fixture because a generic manifest cannot assert the refusal's exit status and stderr."
     },
     {
       "disposition": "manifest-test",
