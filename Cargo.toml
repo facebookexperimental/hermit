@@ -102,6 +102,18 @@ overflow-checks = false
 inherits = "release"
 debug-assertions = true
 overflow-checks = true
+# No thin-local LTO. Release's default (`lto = false`) still runs ThinLTO
+# across each crate's codegen units, and in build.workspace_compile_in_pinned_root
+# that was the serial tail: the `hermit` library spent 59 s of its 139 s in
+# LLVM_thinlto (-Z time-passes), and that crate is the critical path of the
+# workspace build (hermit-detcore -> detcore-dbt -> hermit -> the cli test).
+# Measured 2026-10-17 at b5d3f0f0, the node's workspace cargo command, 32 jobs:
+# 228 s -> 166 s; hermit 139 -> 96 s, detcore-dbt 37 -> 25 s, hermit-detcore
+# 44 -> 36 s. Hermit's run time: no wall difference on a timer-stepping guest
+# or a 200,000-syscall loop, and +2.4% and +1.4% CPU for the whole run
+# (Hermit, guest and kernel). More codegen units do not help: 64 or 256 for
+# hermit left it at 96-132 s. Release builds keep their LTO.
+lto = "off"
 
 # The Rust guest programs keep the unoptimised code generation they had when the
 # prepared tests were built in the dev profile, so an optimiser cannot change
