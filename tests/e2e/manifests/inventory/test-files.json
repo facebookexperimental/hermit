@@ -1573,6 +1573,12 @@
       "why": "tests/c/printf_with_threads.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "support-data",
+      "path": "tests/c/probe_family.h",
+      "runner": "C guests that include probe_family.h",
+      "why": "tests/c/probe_family.h is owned by C guests that include probe_family.h: The `probe_family.h` header runs each member of a merged probe family in its own child process and fails the family if any member fails. It has no translation unit or main function, so its behavior is covered through the manifest entries that compile its consumers."
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/c/proc_directory_alias_level.c",
       "runner": "hermit-cli/tests/procfs_determinism.rs",
@@ -2737,28 +2743,16 @@
       "why": "tests/c/uname_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/c/unix_autobind.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/c/unix_autobind.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): c-programs/unix-autobind strict-verifies unix-socket autobind for the stream, dgram and seqpacket socket types, each in a fresh child process (tests/c/probe_family.h), replacing the three per-type rows the 2026-10-17 test audit merged."
+    },
+    {
       "disposition": "support-data",
       "path": "tests/c/unix_autobind_common.h",
       "runner": "C guests that include unix_autobind_common.h",
       "why": "tests/c/unix_autobind_common.h is owned by C guests that include unix_autobind_common.h: The `unix_autobind_common.h` header provides shared declarations or inline helpers to related C probes. It has no translation unit or main function, so its behavior is covered through the manifest entries that compile its consumers."
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/unix_autobind_dgram.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/unix_autobind_dgram.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/unix_autobind_seqpacket.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/unix_autobind_seqpacket.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/unix_autobind_stream.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/unix_autobind_stream.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
       "disposition": "guest-fixture",
