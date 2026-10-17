@@ -36,6 +36,15 @@ const SUPER_REPETITIONS: &str = "20";
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
 const DAGRUN_PREPARE_COMMAND: &str = "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun && ";
+/// The rust-script producer invocation, and its pinned-root form. No pinned-root node
+/// runs a script's test harness (check.script_unit_tests runs them on the host), and
+/// the host producer runs clippy over the same sources with the same compiler, so the
+/// pinned-root twin builds the release executables alone. Measured 2026-10-17, cold at
+/// CARGO_BUILD_JOBS=8: clippy 106 CPU-s, release plus harnesses 1,138 CPU-s (roughly a
+/// third of it the debug harness build), of the producer's 1,184-1,287 CPU-s per run.
+const RUST_SCRIPT_PRODUCER_INVOCATION: &str = "./ci/prepare-rust-scripts.sh";
+const RUST_SCRIPT_PRODUCER_RELEASE_ONLY_INVOCATION: &str =
+    "./ci/prepare-rust-scripts.sh --release-only";
 pub(super) const PIN_GATE_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; hermit_run_pin_check() { if command -v with-proxy >/dev/null 2>&1; then with-proxy "$@"; else "$@"; fi; }; hermit_run_pin_check ./ci/run-reverie-pin-check.sh --repo "$PWD""#;
 const LINT_CHECKS_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/lint-checks-node.sh"#;
 
@@ -2474,6 +2483,17 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
                 );
             }
             twin.cmd = twin.cmd.replacen(DAGRUN_PREPARE_COMMAND, "", 1);
+            if twin.cmd.matches(RUST_SCRIPT_PRODUCER_INVOCATION).count() != 1 {
+                return Err("rust-script producer lost its one prepare-rust-scripts.sh call".into());
+            }
+            twin.cmd = twin.cmd.replacen(
+                RUST_SCRIPT_PRODUCER_INVOCATION,
+                RUST_SCRIPT_PRODUCER_RELEASE_ONLY_INVOCATION,
+                1,
+            );
+            twin.description.push_str(
+                " RELEASE-ONLY IN THE PINNED ROOT 2026-10-17: this twin runs ci/prepare-rust-scripts.sh --release-only, which publishes the release executables alone, without the clippy pass or the test harnesses. No pinned-root node runs a script's test harness (check.script_unit_tests runs them on the host, against build.rust_scripts), the host producer already runs clippy over the same sources with the same compiler, and ci/rust-script-bin refuses a test-harness request against a release-only publication by name. Measured cold at CARGO_BUILD_JOBS=8: clippy 106 CPU-s; release plus harnesses 1,138 CPU-s, roughly a third of it the debug harness build.",
+            );
         }
         if producer.tag() == "compatprep.hermit_release" {
             twin.deps.push("gate.manifest".into());
@@ -3716,11 +3736,13 @@ fn assert_rust_script_producer_contract(cfg: &DagConfig) -> Result<(), String> {
             *tag,
             "build.rust_scripts_in_pinned_root" | "quick-super-build.rust_scripts_in_pinned_root"
         ) {
-            crate::validation_dag_static::RUST_SCRIPT_PRODUCER_COMMAND.replacen(
-                DAGRUN_PREPARE_COMMAND,
-                "",
-                1,
-            )
+            crate::validation_dag_static::RUST_SCRIPT_PRODUCER_COMMAND
+                .replacen(DAGRUN_PREPARE_COMMAND, "", 1)
+                .replacen(
+                    RUST_SCRIPT_PRODUCER_INVOCATION,
+                    RUST_SCRIPT_PRODUCER_RELEASE_ONLY_INVOCATION,
+                    1,
+                )
         } else {
             crate::validation_dag_static::RUST_SCRIPT_PRODUCER_COMMAND.to_string()
         };
