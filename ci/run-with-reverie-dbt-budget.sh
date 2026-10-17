@@ -1911,8 +1911,9 @@ fi
 # vendor/dynamorio, native/, third-party, the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml have the same object ids: all seven SDK inputs, DBT
 # inventory 961, calibrated budget, job width and limits are unchanged.
-# CARRY TO 9c6069d7f9da68dcd15253a7c70891b27714015f (2026-10-17): from
-# 7230ef91248b2a42ad212c5b991cea75cfa29c26. Five commits: the sabre 5c prep chain
+# CARRY TO 5a38b0f755652b59179a6e8d5ac9e590045d1301 (2026-10-17): from
+# 7230ef91248b2a42ad212c5b991cea75cfa29c26. Seven commits: 329c7f66 (reverie-ptrace test
+# reaping) and 5a38b0f7 (reverie-inguest records refused signal controls), and five commits: the sabre 5c prep chain
 # (06cdc058, 3ea100d7, 42694c54, 4ef07bba; experimental/reverie-sabre loader only)
 # and 9c6069d7 (Guest::initial_stack_pointer reports the image's initial stack
 # pointer to a Tool; reverie, reverie-ptrace and reverie-kvm only; replayed from
@@ -1921,7 +1922,7 @@ fi
 # Cargo.toml, Cargo.lock and rust-toolchain.toml have the same object ids: all
 # seven SDK inputs, DBT inventory 961, calibrated budget, job width and limits
 # are unchanged.
-expected_pin=9c6069d7f9da68dcd15253a7c70891b27714015f
+expected_pin=5a38b0f755652b59179a6e8d5ac9e590045d1301
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

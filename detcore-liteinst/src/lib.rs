@@ -420,6 +420,10 @@ unsafe fn initialize_detcore(inputs: InitializationInputs) {
     if !detcore::guest_log::install(guest_log_call, None) {
         fail("Detcore's in-guest subscriber was not installed: the process already has one");
     }
+    // Detcore reports the guest signal controls this runtime refuses before
+    // Detcore sees them, once per run (`detcore::refused_signal_controls`). A
+    // forked child inherits the source.
+    let _ = detcore::refused_signal_controls::install(refused_signal_controls);
     #[cfg(feature = "exec-private-init")]
     if let Some(control) = initial_control
         && let Err(error) = unsafe { control.finish() }
@@ -458,6 +462,14 @@ fn coordinator_call(
     request: <detcore::GlobalState as reverie::GlobalTool>::Request,
 ) -> std::io::Result<<detcore::GlobalState as reverie::GlobalTool>::Response> {
     reverie_liteinst::blocking_global_rpc::<detcore::GlobalState>(request)
+}
+
+/// The guest signal controls this runtime refused since the last call
+/// (`reverie_inguest::guest::protect::take_refused_signal_controls`), as
+/// Detcore takes them.
+fn refused_signal_controls() -> detcore::refused_signal_controls::RefusedSignalControls {
+    let refused = reverie_inguest::guest::protect::take_refused_signal_controls();
+    (refused.actions, refused.alternate_stack)
 }
 
 /// [`coordinator_call`] for Detcore's warnings, which can be raised anywhere:

@@ -2493,7 +2493,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +5 from 2977da2b: 2056.
     // And the nine 4213 process-auxv units (procfs, tool_global,
     // rendered_procfs and files tests of /proc/<pid>/auxv): 2065, listed.
-    ("test.detcore_unit", 2065),
+    // And the refused_signal_controls warning-text test: 2066.
+    ("test.detcore_unit", 2066),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3566,7 +3567,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three inherited-stdin regressions retain the prior selection: 521 -> 524, freshly listed.
     // And detcore_renders_process_auxv_on_every_backend
     // (https://github.com/rrnewton/hermit/issues/4213): 525.
-    ("test.cli", 525),
+    // And a_refused_guest_signal_handler_is_announced_once_per_run: 526.
+    ("test.cli", 526),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4014,7 +4016,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +3 from 77350e52: 456.
     // Three inherited-stdin regressions retain the prior selection: 456 -> 459, freshly listed.
     // And the 4213 process-auxv test: 460.
-    ("test.cli_on_host", 460),
+    // And a_refused_guest_signal_handler_is_announced_once_per_run: 461.
+    ("test.cli_on_host", 461),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4337,7 +4340,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +5 from 77350e52: 2051.
     // And +5 from 2977da2b: 2056.
     // And the nine 4213 process-auxv units: 2065, listed.
-    ("test.detcore_unit_on_host", 2065),
+    // And the refused_signal_controls warning-text test: 2066.
+    ("test.detcore_unit_on_host", 2066),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

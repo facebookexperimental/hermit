@@ -1998,6 +1998,116 @@ fn detcore_warns_from_inside_the_guest_once_per_run_on_every_backend() {
     eprintln!("{test} compared {backends:?}");
 }
 
+/// A guest that asks for handlers for SIGUSR1 (twice, and again in a forked
+/// child), SIGUSR2, and SIGTERM (in the child only), and for an alternate
+/// signal stack, and prints what each call returned.
+const SIGNAL_CONTROLS_GUEST: &str = r#"
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static void handler(int signo) { (void)signo; }
+
+static void ask(const char *what, int result) {
+  printf("%s: %s\n", what, result == 0 ? "ok" : strerror(errno));
+  fflush(stdout);
+}
+
+int main(void) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = handler;
+  ask("SIGUSR1", sigaction(SIGUSR1, &action, NULL));
+  ask("SIGUSR1 again", sigaction(SIGUSR1, &action, NULL));
+  ask("SIGUSR2", sigaction(SIGUSR2, &action, NULL));
+  static char stack[1 << 16];
+  stack_t alternate = {.ss_sp = stack, .ss_size = sizeof stack, .ss_flags = 0};
+  ask("sigaltstack", sigaltstack(&alternate, NULL));
+  pid_t child = fork();
+  if (child == 0) {
+    ask("child SIGUSR1", sigaction(SIGUSR1, &action, NULL));
+    ask("child SIGTERM", sigaction(SIGTERM, &action, NULL));
+    _exit(0);
+  }
+  int status;
+  waitpid(child, &status, 0);
+  return 0;
+}
+"#;
+
+/// On the in-guest backends the runtime refuses a guest's handler and
+/// alternate stack with EPERM before Detcore sees the call (until A5 step 3c).
+/// Each refusal is announced by name exactly once per run, whichever process
+/// makes it (the child's SIGTERM is announced from the child, its SIGUSR1 is
+/// not announced again), at the default level, and not under `--log=error`;
+/// on ptrace, where the handlers are installed, nothing is announced.
+#[test]
+fn a_refused_guest_signal_handler_is_announced_once_per_run() {
+    let test = "a_refused_guest_signal_handler_is_announced_once_per_run";
+    const SIGUSR1: &str = "HERMIT_SIGNAL_HANDLER_REFUSED signum=10 (SIGUSR1): ";
+    const SIGUSR2: &str = "HERMIT_SIGNAL_HANDLER_REFUSED signum=12 (SIGUSR2): ";
+    const SIGTERM: &str = "HERMIT_SIGNAL_HANDLER_REFUSED signum=15 (SIGTERM): ";
+    const STACK: &str = "HERMIT_SIGNAL_ALTSTACK_REFUSED: ";
+    let build_root = process_build_root("signal-controls");
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let source = build_root.join("signal_controls.c");
+    fs::write(&source, SIGNAL_CONTROLS_GUEST).expect("failed to write the guest");
+    let guest = build_root.join("signal_controls");
+    let compiled = Command::new("cc")
+        .args(["-O0", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the guest");
+    assert!(compiled.status.success(), "{compiled:?}");
+    let guest = guest.to_str().expect("guest path is UTF-8");
+    let mut backends = vec!["ptrace"];
+    if cfg!(feature = "liteinst") {
+        backends.extend(["liteinst", "in-guest-trap"]);
+    } else {
+        eprintln!("{test}: NOT COMPARED: liteinst and in-guest-trap are not in this build");
+    }
+    for backend in &backends {
+        let in_guest = *backend != "ptrace";
+        for (log, expected) in [(None, usize::from(in_guest)), (Some("--log=error"), 0)] {
+            let mut args = log.into_iter().collect::<Vec<_>>();
+            args.extend(["--backend", backend, "run", "--strict"]);
+            if in_guest {
+                args.push("--max-timeslice=disabled");
+            }
+            args.extend(["--", guest]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            let stderr = stderr(&output);
+            for warning in [SIGUSR1, SIGUSR2, SIGTERM, STACK] {
+                assert_eq!(
+                    stderr.matches(warning).count(),
+                    expected,
+                    "{backend} {log:?} {warning}: {output:?}"
+                );
+            }
+            let refused = if in_guest {
+                "Operation not permitted"
+            } else {
+                "ok"
+            };
+            assert_eq!(
+                stdout(&output),
+                format!(
+                    "SIGUSR1: {refused}\nSIGUSR1 again: {refused}\nSIGUSR2: {refused}\n\
+                     sigaltstack: {refused}\nchild SIGUSR1: {refused}\nchild SIGTERM: {refused}\n"
+                ),
+                "{backend} {log:?}"
+            );
+        }
+    }
+    eprintln!("{test} compared {backends:?}");
+}
+
 static SESSION_CONTAINMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn session_containment_guest() -> &'static Path {

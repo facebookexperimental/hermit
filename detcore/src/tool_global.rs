@@ -1150,6 +1150,10 @@ pub struct GlobalState {
     // Signals whose requested disposition Detcore did not install, already
     // announced in this run (`GlobalRequest::AnnounceSignalHandlerNotInstalled`).
     announced_handlers_not_installed: Mutex<BTreeSet<i32>>,
+    /// The signal controls an in-guest runtime refused that this run has
+    /// announced (`GlobalRequest::AnnounceRefusedSignalControls`): the signals,
+    /// bit `n - 1` for signal `n`, and whether an alternate stack.
+    announced_refused_signal_controls: Mutex<(u64, bool)>,
 
     // Why the fail-closed policy ended the run, from the Tool image that
     // refused (`GlobalRequest::PolicyRefusal`); the first report is kept.
@@ -1545,6 +1549,7 @@ impl GlobalState {
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
             announced_handlers_not_installed: Mutex::new(BTreeSet::new()),
+            announced_refused_signal_controls: Mutex::new((0, false)),
             policy_refusal: Mutex::new(None),
             host_inputs: Mutex::new(Vec::new()),
             host_mutations: Mutex::new(BTreeSet::new()),
@@ -2229,6 +2234,30 @@ impl GlobalTool for GlobalState {
 }
 
 impl GlobalState {
+    /// Prints, once per run, a WARN for each signal whose handler an in-guest
+    /// runtime refused and one for a refused alternate stack
+    /// (`crate::refused_signal_controls`), whichever process reports it.
+    fn announce_refused_signal_controls(&self, actions: u64, alternate_stack: bool) {
+        let mut announced = self.announced_refused_signal_controls.lock().unwrap();
+        let new_actions = actions & !announced.0;
+        announced.0 |= actions;
+        let new_stack = alternate_stack && !announced.1;
+        announced.1 |= alternate_stack;
+        drop(announced);
+        for signum in (1..=64).filter(|signum| new_actions & (1 << (signum - 1)) != 0) {
+            warn!(
+                "{}",
+                crate::refused_signal_controls::handler_refused_warning(signum)
+            );
+        }
+        if new_stack {
+            warn!(
+                "{}",
+                crate::refused_signal_controls::alternate_stack_refused_warning()
+            );
+        }
+    }
+
     async fn dispatch_rpc(
         &self,
         from: Tid,
@@ -2248,6 +2277,14 @@ impl GlobalState {
         if let GlobalRequest::GuestLog(record, unsent_before) = &gr.2 {
             crate::guest_log::emit(record.as_ref(), *unsent_before);
             return (None, GlobalResponse::GuestLog(()));
+        }
+        // Signal controls an in-guest runtime refused
+        // (`crate::refused_signal_controls`): announced once per run, and,
+        // like a warning, answered before the forwarded-record drain, with no
+        // time either way.
+        if let GlobalRequest::AnnounceRefusedSignalControls(actions, alternate_stack) = &gr.2 {
+            self.announce_refused_signal_controls(*actions, *alternate_stack);
+            return (None, GlobalResponse::AnnounceRefusedSignalControls(()));
         }
         // Records an in-guest Tool forwarded before sending this request are queued,
         // and the sender's are written now if it runs alone (the order rule at
@@ -2649,6 +2686,11 @@ impl GlobalState {
             }
             GlobalRequest::GuestLog(..) => {
                 unreachable!("a guest log record is answered before clock accounting")
+            }
+            GlobalRequest::AnnounceRefusedSignalControls(..) => {
+                unreachable!(
+                    "refused signal controls are answered before the forwarded-record drain"
+                )
             }
             GlobalRequest::Sigalrm(_) => {
                 unreachable!("SIGALRM ledger control answered before clock accounting")
@@ -5821,6 +5863,11 @@ pub enum GlobalRequest {
     /// Answers whether this is the run's first such image for that reason,
     /// which the sender warns of. Appended last.
     AuxvFromKernel(AuxvFromKernel),
+    /// The signals whose new action an in-guest runtime refused, bit `n - 1`
+    /// for signal `n`, and whether it refused an alternate signal stack
+    /// (`crate::refused_signal_controls`). Answered before the forwarded-record
+    /// drain and any clock or scheduler accounting. Appended last.
+    AnnounceRefusedSignalControls(u64, bool),
 }
 
 /// Responses from the global object
@@ -6020,6 +6067,8 @@ pub enum GlobalResponse {
     ProcessAuxv(Option<ProcessAuxv>),
     /// Whether this is the run's first. Appended last.
     AuxvFromKernel(bool),
+    /// Appended last.
+    AnnounceRefusedSignalControls(()),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -6326,6 +6375,30 @@ pub(crate) fn signal_handler_not_installed_warning(signum: i32) -> String {
          answers success on purpose so that programs that register it routinely, such as the \
          Go runtime, still start."
     )
+}
+
+/// Tells the coordinator the signal controls an in-guest runtime refused
+/// (`GlobalRequest::AnnounceRefusedSignalControls`). Like the publications of
+/// Detcore's signal-state copy, it is sent directly, not through
+/// `send_and_update_time`, and carries no logical time either way.
+pub(crate) async fn announce_refused_signal_controls<G, T>(
+    guest: &mut G,
+    actions: u64,
+    alternate_stack: bool,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    // Answered before any clock accounting, so the clock and address-space
+    // fields are placeholders, as `shared_open_file_request`'s are.
+    let (_, response) = guest
+        .send_rpc((
+            DetTime::default(),
+            MmId::initial(DetTid::from_raw(0)),
+            GlobalRequest::AnnounceRefusedSignalControls(actions, alternate_stack),
+        ))
+        .await;
+    debug_assert_eq!(response, GlobalResponse::AnnounceRefusedSignalControls(()));
 }
 
 /// Tells the coordinator a guest's disposition for `signum` was answered with

@@ -72,6 +72,7 @@ mod procmaps;
 pub mod race_probe;
 pub mod random;
 mod record_or_replay;
+pub mod refused_signal_controls;
 mod resources;
 mod scheduler;
 mod shared_open_files;
@@ -3417,6 +3418,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // that was waiting returns).
         Self::unmap_orphaned_staging_pages(guest).await;
         crate::syscalls::signal_shadow::at_syscall_entry(guest);
+        // Signal controls an in-guest runtime refused since this process's
+        // last report, which Detcore did not see as calls.
+        crate::refused_signal_controls::report(guest).await;
         // Signal phase 1: before this syscall's first scheduler request. A
         // delivery prepared here runs the guest's handler before the syscall,
         // which then starts again; what this returns is discarded.
