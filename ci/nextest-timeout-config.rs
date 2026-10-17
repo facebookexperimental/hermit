@@ -79,6 +79,20 @@ const RENDERED_PROCFS_WRAPPER_NAME: &str = "hermit-rendered-procfs-cpu";
 // completed-sample formula would give 23. At that run's 0.72 CPU per wall
 // second, 36 CPU seconds take 50 s, inside the unchanged 57-second wall.
 const RENDERED_PROCFS_CPU_SECONDS: u64 = 36;
+const CPU_PROFILE_V3_LOADER_WRAPPER_NAME: &str = "hermit-cpu-profile-v3-loader-cpu";
+// hermit::cli cpu_profile_v3_host_loader_sees_exactly_x86_64_v3 runs the host
+// glibc loader under `--cpu-profile x86-64-v3` several times
+// (--list-diagnostics, --help and more). Recorded cgroup attempts under
+// ignored/validate on 2026-10-15/17: 110 completed at 3.01 to 17.22 CPU
+// seconds, median 3.91, at most 18.5 s wall (17.22 in a buck-cargo repro
+// validation, 13.10 at 2f0d048a, 12.85 at 81cccd55). 9eb80258's full
+// validation, at a host load around 330, was stopped by the 22-second cap at
+// 23.995 (35.5 s wall); c59f758a's then completed it at 4.86, and six
+// --only runs of the node at 9eb80258 at loads of 260 to 300 at 3.11 to 6.07.
+// ceil(1.5 * 23.995) = 36 covers that censored run with half again; the
+// completed-sample formula would give 26. Its wall backstop is three times
+// the cap, as for the liteinst_stacks identities: a host-load policy.
+const CPU_PROFILE_V3_LOADER_CPU_SECONDS: u64 = 36;
 const CPU_TERMINATION_GRACE_SECONDS: u64 = 2;
 
 #[derive(Clone, Copy)]
@@ -111,7 +125,7 @@ impl MeasuredCpuAllowance {
     }
 }
 
-const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 18] = [
+const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 19] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
         binary: "hermit::liteinst_allocator",
@@ -212,6 +226,13 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 18] = [
         "standalone_altstack_disabled_receives_no_owned_stack_credit",
         30,
     ),
+    MeasuredCpuAllowance {
+        wrapper_name: CPU_PROFILE_V3_LOADER_WRAPPER_NAME,
+        binary: "hermit::cli",
+        test: "cpu_profile_v3_host_loader_sees_exactly_x86_64_v3",
+        cpu_seconds: CPU_PROFILE_V3_LOADER_CPU_SECONDS,
+        wall_seconds: Some(3 * CPU_PROFILE_V3_LOADER_CPU_SECONDS),
+    },
 ];
 
 fn usage() -> &'static str {
@@ -926,7 +947,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity gets a separate base wall backstop of three times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity, and the CPU-profile v3 host loader, gets a separate base wall backstop of three times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -1955,6 +1976,62 @@ mod tests {
     }
 
     #[test]
+    fn cpu_profile_v3_loader_has_its_measured_cap_and_wall_backstop() {
+        let identity = nextest_cpu::AttemptIdentity {
+            package: "hermit".into(),
+            binary: "hermit::cli".into(),
+            test: "cpu_profile_v3_host_loader_sees_exactly_x86_64_v3".into(),
+            attempt: 1,
+        };
+        let inventory = measured_inventory(std::slice::from_ref(&identity));
+        let selected =
+            prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(&inventory).unwrap()))
+                .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            (selected[0].cpu_seconds, selected[0].wall_seconds),
+            (36, Some(108))
+        );
+        for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5)] {
+            let rendered = scaled_config_with_allowances(
+                include_str!("../.config/nextest.toml"),
+                wall_multiplier,
+                Some((Path::new("/fixture/wrapper"), cpu_multiplier)),
+                &selected,
+            )
+            .unwrap();
+            let doc = rendered.parse::<DocumentMut>().unwrap();
+            let cpu_seconds =
+                timeouts::scale_timeout_seconds(36, cpu_multiplier, "CPU multiplier").unwrap();
+            assert_eq!(
+                wrapper_argv(&doc, CPU_PROFILE_V3_LOADER_WRAPPER_NAME)[2],
+                (cpu_seconds * 1_000_000).to_string()
+            );
+            let filter = exact_filter(&identity);
+            let walls = doc["profile"]["default"]["overrides"]
+                .as_array_of_tables()
+                .unwrap()
+                .iter()
+                .filter(|r| r.contains_key("slow-timeout") && r["filter"].as_str() == Some(&filter))
+                .collect::<Vec<_>>();
+            assert_eq!(walls.len(), 1);
+            let wall_seconds =
+                timeouts::scale_timeout_seconds(108, wall_multiplier, "wall multiplier").unwrap();
+            assert_eq!(
+                walls[0]["slow-timeout"]["period"].as_str(),
+                Some(format!("{wall_seconds}s").as_str())
+            );
+            assert!(wall_seconds > cpu_seconds + CPU_TERMINATION_GRACE_SECONDS);
+        }
+        // Without prepared admission the test keeps the ordinary 22-second cap.
+        assert!(
+            prepared_selected_cpu_allowances(false, || Ok(serde_json::to_vec(&inventory).unwrap()))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn original_five_allowance_subsets_partition_once_and_scale_independently() {
         let names = [
             DETCORE_ALLOCATOR_WRAPPER_NAME,
@@ -2201,7 +2278,7 @@ mod tests {
             prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(&inventory).unwrap()))
                 .unwrap();
         assert_eq!(selected.len(), 15);
-        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 18);
+        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 19);
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5), (0.01, 0.1)] {
             let rendered = scaled_config_with_allowances(
                 include_str!("../.config/nextest.toml"),
