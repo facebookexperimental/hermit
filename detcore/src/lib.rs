@@ -3117,6 +3117,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         tool_global::mark_past_first_execve(guest).await;
+        // The new image's program-break model, checked against the kernel's
+        // once its exec record is in place.
+        self.check_brk_model(guest);
         // Linux discards every queued POSIX timer signal at exec
         // (`flush_itimer_signals`), and Hermit's are ordinary signals it sent:
         // take them back before the new image runs

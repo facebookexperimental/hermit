@@ -131,6 +131,219 @@ impl ExecRecord {
     }
 }
 
+/// The page size Linux aligns the program break to (`ELF_PAGEALIGN`) on
+/// x86_64, where Hermit runs.
+const PAGE_SIZE: u64 = 4096;
+
+/// What decides where Linux starts a process's program break after it execs
+/// an ELF image (`load_elf_binary`, fs/binfmt_elf.c), from the image's file
+/// header and program headers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ElfLayout {
+    /// Whether the image is `ET_DYN` (position-independent) rather than
+    /// `ET_EXEC`.
+    pub position_independent: bool,
+    /// Whether the image names a program interpreter (`PT_INTERP`).
+    pub interpreter: bool,
+    /// The virtual address of the image's program headers before the load
+    /// bias, as Linux finds it for `AT_PHDR` (since Linux 5.18): `e_phoff` in
+    /// the last `PT_LOAD` segment whose file range holds it, or 0 where none
+    /// does (`AT_PHDR` is then the bias itself).
+    pub phdr: u64,
+    /// The end of the highest `PT_LOAD` segment in memory, `p_vaddr +
+    /// p_memsz`, before the load bias: the end of its bss.
+    pub end: u64,
+}
+
+impl ElfLayout {
+    /// The layout of the ELF64 image at `path` (`ET_EXEC` or `ET_DYN`), or
+    /// `None` for any other file, one without a loadable segment, and one the
+    /// caller cannot read.
+    pub fn read(path: &Path) -> Option<Self> {
+        Self::read_file(&mut fs::File::open(path).ok()?)
+    }
+
+    /// [`Self::read`] of an open file.
+    pub fn read_file(file: &mut fs::File) -> Option<Self> {
+        let mut header = [0_u8; 64];
+        file.read_exact(&mut header).ok()?;
+        Self::parse(&header, |offset, buffer| {
+            use std::io::Seek;
+            file.seek(std::io::SeekFrom::Start(offset)).ok()?;
+            file.read_exact(buffer).ok()
+        })
+    }
+
+    /// [`Self::read`] of an image whose 64-byte file header is `header`,
+    /// reading its program headers through `read_at(offset, buffer)`.
+    fn parse(
+        header: &[u8; 64],
+        mut read_at: impl FnMut(u64, &mut [u8]) -> Option<()>,
+    ) -> Option<Self> {
+        let u16_at = |at: usize| u16::from_le_bytes([header[at], header[at + 1]]);
+        let u64_at = |at: usize| u64::from_le_bytes(header[at..at + 8].try_into().unwrap());
+        // ELF magic, 64-bit class, little-endian data, ET_EXEC or ET_DYN.
+        if header[..4] != *b"\x7fELF" || header[4] != 2 || header[5] != 1 {
+            return None;
+        }
+        let position_independent = match u16_at(16) {
+            2 => false, // ET_EXEC
+            3 => true,  // ET_DYN
+            _ => return None,
+        };
+        let (phoff, phentsize, phnum) = (u64_at(32), usize::from(u16_at(54)), u16_at(56));
+        if phentsize < 56 {
+            return None;
+        }
+        let mut entry = vec![0_u8; phentsize];
+        let (mut phdr, mut end, mut interpreter) = (0, None::<u64>, false);
+        for index in 0..u64::from(phnum) {
+            read_at(phoff.checked_add(index * phentsize as u64)?, &mut entry)?;
+            let field = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
+            match u32::from_le_bytes(entry[..4].try_into().unwrap()) {
+                1 => {} // PT_LOAD
+                3 => {
+                    // PT_INTERP
+                    interpreter = true;
+                    continue;
+                }
+                _ => continue,
+            }
+            let (offset, vaddr, filesz, memsz) = (field(8), field(16), field(32), field(40));
+            if offset <= phoff && phoff < offset.checked_add(filesz)? {
+                phdr = (phoff - offset).checked_add(vaddr)?;
+            }
+            let segment_end = vaddr.checked_add(memsz)?;
+            end = Some(end.map_or(segment_end, |end| end.max(segment_end)));
+        }
+        Some(Self {
+            position_independent,
+            interpreter,
+            phdr,
+            end: end?,
+        })
+    }
+
+    /// Where Linux starts the program break of a process that exec'd this
+    /// image, given the `AT_PHDR` its exec reported, with address
+    /// randomization off: the end of the highest loaded segment at the load
+    /// bias, page-aligned up (`mm->start_brk = mm->brk =
+    /// ELF_PAGEALIGN(elf_brk)`), or why there is no answer.
+    pub fn start_brk(&self, at_phdr: u64) -> Result<u64, &'static str> {
+        if self.position_independent && !self.interpreter {
+            // Recent kernels (6.17's load_elf_binary) move it to
+            // ELF_ET_DYN_BASE even without randomization, unless built with
+            // CONFIG_COMPAT_BRK.
+            return Err(
+                "a position-independent image without an interpreter, whose break depends on the kernel's build",
+            );
+        }
+        let bias = at_phdr
+            .checked_sub(self.phdr)
+            .ok_or("AT_PHDR below the image's program headers")?;
+        bias.checked_add(self.end)
+            .and_then(|end| end.checked_add(PAGE_SIZE - 1))
+            .map(|end| end & !(PAGE_SIZE - 1))
+            .ok_or("an image ending past the address space")
+    }
+}
+
+/// The kernel's `start_brk` in a `/proc/<pid>/stat` line: field 47, counted
+/// past the command, which may hold spaces and parentheses.
+pub fn stat_start_brk(stat: &str) -> Option<u64> {
+    stat[stat.rfind(')')? + 1..]
+        .split_ascii_whitespace()
+        .nth(47 - 3)?
+        .parse()
+        .ok()
+}
+
+/// What Detcore found when it checked its model of a process's program break
+/// ([`ElfLayout::start_brk`]) against the kernel's `start_brk`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrkCheck {
+    /// The model equals the kernel's start.
+    Equal(u64),
+    /// The model differs from the kernel's start: a Detcore defect.
+    Differs {
+        /// Detcore's start.
+        model: u64,
+        /// The kernel's start.
+        kernel: u64,
+    },
+    /// No model, for the reason given.
+    Unmodeled(&'static str),
+    /// Not compared: the kernel randomized the break, which Linux's rule then
+    /// does not give.
+    Randomized(u64),
+    /// Not compared: whether the kernel randomized the break is unknown.
+    RandomizationUnknown(u64),
+    /// Not compared: the kernel's start cannot be read.
+    KernelUnread(u64),
+}
+
+impl BrkCheck {
+    /// The outcome for a model (or why there is none), whether the kernel
+    /// randomized the break (`None`: unknown), and the kernel's start (`None`:
+    /// unread).
+    pub fn of(
+        model: Result<u64, &'static str>,
+        randomized: Option<bool>,
+        kernel: Option<u64>,
+    ) -> Self {
+        let model = match model {
+            Ok(model) => model,
+            Err(reason) => return Self::Unmodeled(reason),
+        };
+        match (randomized, kernel) {
+            (Some(true), _) => Self::Randomized(model),
+            (None, _) => Self::RandomizationUnknown(model),
+            (Some(false), None) => Self::KernelUnread(model),
+            (Some(false), Some(kernel)) if kernel == model => Self::Equal(model),
+            (Some(false), Some(kernel)) => Self::Differs { model, kernel },
+        }
+    }
+}
+
+impl std::fmt::Display for BrkCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Equal(model) => write!(f, "model {model:#x} equals the kernel's start_brk"),
+            Self::Differs { model, kernel } => write!(
+                f,
+                "model {model:#x} differs from the kernel's start_brk {kernel:#x}"
+            ),
+            Self::Unmodeled(reason) => write!(f, "not modeled: {reason}"),
+            Self::Randomized(model) => write!(
+                f,
+                "model {model:#x} not compared: the kernel randomized the break"
+            ),
+            Self::RandomizationUnknown(model) => write!(
+                f,
+                "model {model:#x} not compared: whether the kernel randomized the break is unknown"
+            ),
+            Self::KernelUnread(model) => write!(
+                f,
+                "model {model:#x} not compared: the kernel's start_brk is unreadable"
+            ),
+        }
+    }
+}
+
+/// The value of entry `key` in an auxiliary vector read from
+/// `/proc/<pid>/auxv` as `auxv`, native-endian pairs ended by `AT_NULL`.
+pub fn auxv_entry(auxv: &[u8], key: u64) -> Option<u64> {
+    auxv.as_chunks::<16>()
+        .0
+        .iter()
+        .map(|pair| {
+            let word = |at: usize| u64::from_ne_bytes(pair[at..at + 8].try_into().unwrap());
+            (word(0), word(8))
+        })
+        .take_while(|&(entry, _)| entry != 0)
+        .find_map(|(entry, value)| (entry == key).then_some(value))
+}
+
 /// `path`, absolute in a root directory the caller sees at `root`, as the
 /// caller spells it.
 fn below(root: &Path, path: &Path) -> Option<PathBuf> {
@@ -206,6 +419,198 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn an_elf_layout_gives_linuxs_start_of_the_program_break() {
+        // A real image: this test binary, linked by the toolchain.
+        let layout = ElfLayout::read(&std::env::current_exe().unwrap()).unwrap();
+        assert!(layout.end > layout.phdr);
+        // A non-ELF file and a 32-bit or big-endian header have none.
+        assert_eq!(ElfLayout::read(Path::new("/proc/self/status")), None);
+        let mut header = [0_u8; 64];
+        header[..4].copy_from_slice(b"\x7fELF");
+        header[4] = 1;
+        header[5] = 1;
+        assert_eq!(ElfLayout::parse(&header, |_, _| None), None);
+
+        // A synthetic ET_EXEC image with two loads: text at 0x400000 holding
+        // the program headers at file offset 64, and data at 0x403e10 whose
+        // bss runs to 0x4050b0.
+        let mut header = [0_u8; 64];
+        header[..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 1;
+        header[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        header[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        header[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        header[56..58].copy_from_slice(&3_u16.to_le_bytes());
+        let program_header = |kind: u32, offset: u64, vaddr: u64, filesz: u64, memsz: u64| {
+            let mut entry = [0_u8; 56];
+            entry[..4].copy_from_slice(&kind.to_le_bytes());
+            entry[8..16].copy_from_slice(&offset.to_le_bytes());
+            entry[16..24].copy_from_slice(&vaddr.to_le_bytes());
+            entry[32..40].copy_from_slice(&filesz.to_le_bytes());
+            entry[40..48].copy_from_slice(&memsz.to_le_bytes());
+            entry
+        };
+        let entries = [
+            program_header(6, 64, 0x400040, 0xa8, 0xa8), // PT_PHDR, not loaded
+            program_header(1, 0, 0x400000, 0x1000, 0x1000),
+            program_header(1, 0x2e10, 0x403e10, 0x290, 0x12a0),
+        ];
+        let read_at = |offset: u64, buffer: &mut [u8]| {
+            let index = usize::try_from((offset - 64) / 56).ok()?;
+            buffer.copy_from_slice(entries.get(index)?);
+            Some(())
+        };
+        let layout = ElfLayout::parse(&header, read_at).unwrap();
+        assert_eq!(
+            layout,
+            ElfLayout {
+                position_independent: false,
+                interpreter: false,
+                phdr: 0x400040,
+                end: 0x4050b0,
+            }
+        );
+        assert_eq!(layout.start_brk(0x400040), Ok(0x406000));
+        assert!(layout.start_brk(0x400000).is_err());
+        // An end already on a page boundary stays there, at any bias.
+        let aligned = ElfLayout {
+            end: 0x406000,
+            ..layout
+        };
+        assert_eq!(aligned.start_brk(0x400040), Ok(0x406000));
+        // A position-independent image with an interpreter at its bias.
+        let dynamic = ElfLayout {
+            position_independent: true,
+            interpreter: true,
+            ..aligned
+        };
+        assert_eq!(
+            dynamic.start_brk(0x5555_5555_4000 + 0x400040),
+            Ok(0x5555_5595_a000)
+        );
+        // Without an interpreter (a static PIE, or the dynamic loader run
+        // directly), the kernel's build decides: no model.
+        let static_pie = ElfLayout {
+            interpreter: false,
+            ..dynamic
+        };
+        assert!(static_pie.start_brk(0x5555_5555_4000 + 0x400040).is_err());
+        // Program headers outside every load: Linux's AT_PHDR is the bias.
+        let unloaded = ElfLayout { phdr: 0, ..layout };
+        assert_eq!(unloaded.start_brk(0), Ok(0x406000));
+        // A PT_INTERP entry and ET_DYN are read from the headers.
+        header[16..18].copy_from_slice(&3_u16.to_le_bytes());
+        header[56..58].copy_from_slice(&4_u16.to_le_bytes());
+        let with_interp = [
+            entries[0],
+            program_header(3, 0x2a8, 0x4002a8, 0x1c, 0x1c), // PT_INTERP
+            entries[1],
+            entries[2],
+        ];
+        let read_at = |offset: u64, buffer: &mut [u8]| {
+            let index = usize::try_from((offset - 64) / 56).ok()?;
+            buffer.copy_from_slice(with_interp.get(index)?);
+            Some(())
+        };
+        assert_eq!(
+            ElfLayout::parse(&header, read_at).unwrap(),
+            ElfLayout {
+                position_independent: true,
+                interpreter: true,
+                ..layout
+            }
+        );
+    }
+
+    /// The kernel's own `start_brk` for a real image, a shell exec'd without
+    /// address randomization, is what its layout and `AT_PHDR` give.
+    #[test]
+    fn the_kernels_start_of_the_break_is_what_the_layout_gives() {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped());
+        // SAFETY: personality(2) is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::personality(libc::ADDR_NO_RANDOMIZE as libc::c_ulong) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        // `spawn` returns once the exec has happened.
+        let mut child = command.spawn().unwrap();
+        let process = PathBuf::from(format!("/proc/{}", child.id()));
+        let image = fs::read_link(process.join("exe")).unwrap();
+        let at_phdr = auxv_entry(&fs::read(process.join("auxv")).unwrap(), libc::AT_PHDR).unwrap();
+        let start_brk = stat_start_brk(&fs::read_to_string(process.join("stat")).unwrap()).unwrap();
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        let layout = ElfLayout::read(&image).unwrap();
+        assert_eq!(layout.start_brk(at_phdr), Ok(start_brk), "{image:?}");
+    }
+
+    #[test]
+    fn the_start_of_the_break_is_field_47_past_the_command() {
+        let fields: Vec<String> = (3..=52).map(|field| field.to_string()).collect();
+        let stat = format!("12 (a) b) (c) {}\n", fields.join(" "));
+        assert_eq!(stat_start_brk(&stat), Some(47));
+        assert_eq!(stat_start_brk("12 (a) S 1 2"), None);
+        assert_eq!(stat_start_brk("12 a S"), None);
+    }
+
+    #[test]
+    fn a_break_check_compares_only_where_linuxs_rule_gives_the_kernels_start() {
+        assert_eq!(
+            BrkCheck::of(Ok(0x406000), Some(false), Some(0x406000)),
+            BrkCheck::Equal(0x406000)
+        );
+        let differs = BrkCheck::of(Ok(0x406000), Some(false), Some(0x407000));
+        assert_eq!(
+            differs,
+            BrkCheck::Differs {
+                model: 0x406000,
+                kernel: 0x407000
+            }
+        );
+        assert_eq!(
+            differs.to_string(),
+            "model 0x406000 differs from the kernel's start_brk 0x407000"
+        );
+        assert_eq!(
+            BrkCheck::of(Ok(0x406000), Some(true), Some(0x1234000)),
+            BrkCheck::Randomized(0x406000)
+        );
+        assert_eq!(
+            BrkCheck::of(Ok(0x406000), None, Some(0x406000)),
+            BrkCheck::RandomizationUnknown(0x406000)
+        );
+        assert_eq!(
+            BrkCheck::of(Ok(0x406000), Some(false), None),
+            BrkCheck::KernelUnread(0x406000)
+        );
+        assert_eq!(
+            BrkCheck::of(Err("no exec record"), Some(false), Some(0x406000)),
+            BrkCheck::Unmodeled("no exec record")
+        );
+    }
+
+    #[test]
+    fn an_auxiliary_vector_entry_is_read_up_to_its_end() {
+        let auxv: Vec<u8> = [(3_u64, 0x400040_u64), (6, 4096), (0, 0), (9, 1)]
+            .iter()
+            .flat_map(|(key, value)| [key.to_ne_bytes(), value.to_ne_bytes()].concat())
+            .collect();
+        assert_eq!(auxv_entry(&auxv, 3), Some(0x400040));
+        assert_eq!(auxv_entry(&auxv, 6), Some(4096));
+        assert_eq!(auxv_entry(&auxv, 9), None);
+        assert_eq!(auxv_entry(&auxv[..20], 6), None);
+    }
 
     #[test]
     fn a_script_line_names_its_interpreter_as_the_kernel_reads_it() {

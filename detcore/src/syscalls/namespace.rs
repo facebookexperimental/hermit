@@ -1302,15 +1302,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         let inside = |path: &Path| -> Option<PathBuf> {
             Some(Path::new("/").join(path.strip_prefix(&root).ok()?))
         };
-        // The caller's pid as its procfs numbers it: Detcore's, or in a
-        // nested PID namespace the namespace's, read from its own
-        // `thread-self` (the tool shares the guest's process where it
-        // resolves these, under a launcher).
-        let pid = if guest.thread_state().nested_pid_namespace {
-            if !self.cfg.backend.tool_shares_guest_descriptor_table {
-                // A tracer's own `thread-self` is not the guest's.
-                return None;
+        // Where the tool reads the guest's procfs by number rather than
+        // through its own `thread-self` (`guest_task_procfs`), name the
+        // guest's directory by its pid: a tracer's own `self` and
+        // `thread-self` are not the guest's. In-guest tools take the same
+        // path, where the numbered directory is their own.
+        let numbered_procfs = !self.cfg.backend.tool_shares_guest_descriptor_table;
+        let spelled = if numbered_procfs {
+            let (pid, tid) = (guest.pid().as_raw(), guest.tid().as_raw());
+            let mut parts = spelled.components();
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(Component::RootDir), Some(proc), Some(own)) if proc.as_os_str() == "proc" => {
+                    let own = match own.as_os_str().to_str() {
+                        Some("self") => PathBuf::from(format!("/proc/{pid}")),
+                        Some("thread-self") => PathBuf::from(format!("/proc/{pid}/task/{tid}")),
+                        _ => spelled.to_path_buf(),
+                    };
+                    if own.as_path() == spelled {
+                        own
+                    } else {
+                        own.join(parts.as_path())
+                    }
+                }
+                _ => spelled.to_path_buf(),
             }
+        } else {
+            spelled.to_path_buf()
+        };
+        let spelled = spelled.as_path();
+        // The caller's pid as its procfs numbers it: a tracer's view of it,
+        // Detcore's, or in a nested PID namespace the namespace's, read from
+        // its own `thread-self` (the tool shares the guest's process there).
+        let pid = if numbered_procfs {
+            guest.pid().as_raw()
+        } else if guest.thread_state().nested_pid_namespace {
             let own = std::fs::canonicalize(root.join("proc/thread-self")).ok()?;
             let own = inside(&own)?;
             let mut parts = own.components().skip(2);
@@ -1540,6 +1565,126 @@ impl<T: RecordOrReplay> Detcore<T> {
             .map_err(|_| Errno::EFAULT)?;
         restore_link_tail(guest, buffer, written, kernel_len, saved)?;
         Ok(written as i64)
+    }
+
+    /// Linux's start of the program break for the image the calling thread's
+    /// exec ran: load_elf_binary's rule ([`crate::exec_record::ElfLayout`],
+    /// read from the exec record's file, checked to be the recorded inode) at
+    /// the load bias the process's `AT_PHDR` shows, or why there is none.
+    fn modeled_start_brk<G: Guest<Self>>(&self, guest: &G) -> Result<u64, &'static str> {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let exe = guest.thread_state().exe.clone().ok_or("no exec record")?;
+        let root = self
+            .guest_root(guest)
+            .ok_or("the guest's root is unreadable")?;
+        let path = root.join(
+            exe.exe
+                .strip_prefix("/")
+                .map_err(|_| "a relative image path")?,
+        );
+        // Pin the object at the path without opening it for I/O (`O_PATH`, no
+        // link followed), and read it only once it is the recorded regular
+        // file: a FIFO or device put at the path since the exec is never
+        // opened.
+        let pinned = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|_| "the image is unreadable")?;
+        let metadata = pinned.metadata().map_err(|_| "the image is unreadable")?;
+        if !metadata.is_file() || (metadata.dev(), metadata.ino()) != exe.identity() {
+            return Err("the image's path names another file since the exec");
+        }
+        // Reopening the pinned descriptor's own procfs link opens the same
+        // inode, whatever the path names by now.
+        let mut file = std::fs::File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+            .map_err(|_| "the image is unreadable")?;
+        let layout = crate::exec_record::ElfLayout::read_file(&mut file)
+            .ok_or("the image is not an ELF64 executable")?;
+        let auxv = self
+            .guest_task_directory(guest)
+            .and_then(|directory| std::fs::read(directory.join("auxv")).ok())
+            .ok_or("the auxiliary vector is unreadable")?;
+        let at_phdr = crate::exec_record::auxv_entry(&auxv, libc::AT_PHDR)
+            .ok_or("the auxiliary vector has no AT_PHDR")?;
+        layout.start_brk(at_phdr)
+    }
+
+    /// Check Detcore's model of the program break for the image an exec just
+    /// ran (`Self::modeled_start_brk`) against the kernel's `start_brk`
+    /// (`/proc/<pid>/stat` field 47), and log the outcome
+    /// ([`crate::exec_record::BrkCheck`]). A model that differs is a Detcore
+    /// defect, reported as an error. The model is compared only where Linux's
+    /// rule gives the kernel's start: not where the kernel randomized the
+    /// break (`Self::break_randomized`), nor where that is unknown. The
+    /// personality read is the process's current one. Every launcher Hermit
+    /// execs a guest through sets `ADDR_NO_RANDOMIZE` before the exec, and a
+    /// ptrace guest's own exec is checked at its exec stop, before any of the
+    /// new image's code. The in-guest backends check only the image they
+    /// launched: they refuse a guest's exec today. So a guest can only clear
+    /// the flag before the check (a skipped comparison), not set it after a
+    /// randomized exec. Should an in-guest backend come to follow an exec, its
+    /// check would run after the new image's constructors, which could set
+    /// the flag after a randomized exec; that case would need the exec-time
+    /// personality.
+    ///
+    /// Where the run declares a launcher there is no model: the kernel exec'd
+    /// the launcher, so the process's auxiliary vector (its `AT_PHDR`) and its
+    /// break are the launcher's. Detcore does not service brk there either:
+    /// SaBRe's tool shares the guest's C library, and a C library call that
+    /// allocates from the tool (a `realpath`, an `opendir`) grows the guest's
+    /// heap through the kernel's break, which a serviced break would then
+    /// contradict.
+    pub(crate) fn check_brk_model<G: Guest<Self>>(&self, guest: &G) {
+        use crate::exec_record::BrkCheck;
+        let check = if self
+            .cfg
+            .launch_image
+            .as_ref()
+            .is_some_and(|image| image.launcher.is_some())
+        {
+            BrkCheck::Unmodeled("the run declares a launcher")
+        } else {
+            match self.modeled_start_brk(guest) {
+                Err(reason) => BrkCheck::Unmodeled(reason),
+                model => BrkCheck::of(
+                    model,
+                    self.break_randomized(guest),
+                    self.kernel_start_brk(guest),
+                ),
+            }
+        };
+        let dettid = guest.thread_state().dettid;
+        if let BrkCheck::Differs { .. } = check {
+            tracing::error!("[detcore, dtid {}] program break {}", dettid, check);
+        } else {
+            tracing::debug!("[detcore, dtid {}] program break {}", dettid, check);
+        }
+    }
+
+    /// Whether the kernel randomized the calling thread's program break at
+    /// its exec: it does where its process runs without `ADDR_NO_RANDOMIZE`
+    /// (`/proc/<pid>/personality`) and `kernel.randomize_va_space` is above
+    /// 1. `None` where either cannot be read.
+    fn break_randomized<G: Guest<Self>>(&self, guest: &G) -> Option<bool> {
+        let personality =
+            std::fs::read_to_string(self.guest_task_directory(guest)?.join("personality")).ok()?;
+        let personality = u64::from_str_radix(personality.trim(), 16).ok()?;
+        if personality & libc::ADDR_NO_RANDOMIZE as u64 != 0 {
+            return Some(false);
+        }
+        let level = std::fs::read_to_string("/proc/sys/kernel/randomize_va_space").ok()?;
+        Some(level.trim().parse::<u32>().ok()? > 1)
+    }
+
+    /// The kernel's `start_brk` for the calling thread's process, field 47 of
+    /// its `/proc/<pid>/stat` ([`crate::exec_record::stat_start_brk`]), read
+    /// where the tool reaches its procfs.
+    fn kernel_start_brk<G: Guest<Self>>(&self, guest: &G) -> Option<u64> {
+        let stat = std::fs::read_to_string(self.guest_task_directory(guest)?.join("stat")).ok()?;
+        crate::exec_record::stat_start_brk(&stat)
     }
 
     /// Detcore's pid for the calling thread's process.

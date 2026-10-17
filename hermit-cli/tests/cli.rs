@@ -12303,6 +12303,80 @@ fn run_ptrace_virtual_clock_across_execve_is_deterministic() {
     );
 }
 
+/// At every exec, Detcore's model of the image's program break equals the
+/// kernel's `start_brk` on ptrace. The shell case includes a self-exec
+/// through `/proc/self/exe`, whose exec record the tracer must resolve in the
+/// guest's procfs, not its own: the shell execs itself again by that link,
+/// and then `/bin/true`, three images and three checks. The second case is
+/// an `ET_EXEC` image (linked without PIE), whose break follows its own
+/// addresses with no load bias.
+#[test]
+fn run_ptrace_models_the_program_break_of_each_image() {
+    let checks_of = |args: &[&str], images: usize| {
+        let output = hermit(args);
+        assert_success(&output, args);
+        let stderr = stderr(&output);
+        let checks: Vec<String> = stderr
+            .lines()
+            .filter_map(|line| line.split_once("] program break ").map(|(_, check)| check))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(checks.len(), images, "one check per image: {checks:?}");
+        assert!(
+            checks
+                .iter()
+                .all(|check| check.ends_with("equals the kernel's start_brk")),
+            "{checks:?}"
+        );
+    };
+    checks_of(
+        &[
+            "--log",
+            "debug",
+            "run",
+            "--strict",
+            "--max-timeslice=disabled",
+            "--",
+            "/bin/sh",
+            "-c",
+            "exec /proc/self/exe -c /bin/true",
+        ],
+        3,
+    );
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = process_build_root("program-break-no-pie");
+    fs::create_dir_all(&build_root).expect("failed to create the non-PIE guest directory");
+    let guest = build_root.join("print_memaddrs_no_pie");
+    let compiled = Command::new("cc")
+        .args(["-O0", "-no-pie", "-D_GNU_SOURCE"])
+        .arg(repository.join("tests/c/print_memaddrs.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the non-PIE guest");
+    assert!(
+        compiled.status.success(),
+        "non-PIE guest compilation failed:\n{}",
+        String::from_utf8_lossy(&compiled.stderr),
+    );
+    let guest = guest.to_str().expect("guest path should be UTF-8");
+    checks_of(
+        &[
+            "--log",
+            "debug",
+            "run",
+            "--strict",
+            "--max-timeslice=disabled",
+            "--",
+            guest,
+        ],
+        1,
+    );
+}
+
 #[test]
 fn run_ptrace_nonleader_exec_preserves_identity_and_time() {
     nonleader_exec::run();

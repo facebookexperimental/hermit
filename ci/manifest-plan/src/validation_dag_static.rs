@@ -2444,7 +2444,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 24 signal_state::tests of audit step A5's shadow signal state
     // (https://github.com/rrnewton/hermit/issues/4485): 1956, listed.
     // And its 21 syscalls::signal_shadow::tests: 1977, listed.
-    ("test.detcore_unit", 1977),
+    // And the five program-break model and check tests in exec_record::tests
+    // (an_elf_layout_gives_linuxs_start_of_the_program_break,
+    // the_kernels_start_of_the_break_is_what_the_layout_gives,
+    // an_auxiliary_vector_entry_is_read_up_to_its_end,
+    // the_start_of_the_break_is_field_47_past_the_command and
+    // a_break_check_compares_only_where_linuxs_rule_gives_the_kernels_start): 1982, listed.
+    // And +5 from 9d6182b5: 1982.
+    ("test.detcore_unit", 1982),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3504,7 +3511,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Measured with dbt_refuses_a_vfork_childs_priority_query_by_name: 501.
     // Measured with dbt_refuses_a_vfork_childs_scheduler_parameter_query_by_name: 502.
     // And the nine run_liteinst_timerfd_virtual_* tests (B3 step 2): 511.
-    ("test.cli", 511),
+    // And +1 from 9d6182b5: 512.
+    ("test.cli", 512),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3933,7 +3941,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Measured with dbt_refuses_a_vfork_childs_priority_query_by_name: 436.
     // Measured with dbt_refuses_a_vfork_childs_scheduler_parameter_query_by_name: 437.
     // And the nine run_liteinst_timerfd_virtual_* tests (B3 step 2): 446.
-    ("test.cli_on_host", 446),
+    // And +1 from 9d6182b5: 447.
+    ("test.cli_on_host", 447),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4238,7 +4247,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five exec-record tests: 1932, executed.
     // And the same 24 A5 signal_state tests: 1956, listed.
     // And the same 21 signal_shadow tests: 1977, listed.
-    ("test.detcore_unit_on_host", 1977),
+    // And the same five program-break model and check tests: 1982, listed.
+    // And +5 from 9d6182b5: 1982.
+    ("test.detcore_unit_on_host", 1982),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
