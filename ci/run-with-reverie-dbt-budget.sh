@@ -1845,7 +1845,15 @@ fi
 # outside the measured SDK region and requires fresh runtime validation.
 # Preserve existing carries, budget values, parallel width and limits.
 # The paired strict copied-child named refusal remains required.
-expected_pin=01e05bef246244466710d07d6e85442f64303f48
+# CARRY TO 586d929ed48607c751606552593241eabeca047e (2026-10-17): from
+# 01e05bef246244466710d07d6e85442f64303f48. One commit, 586d929e (B3 step 2: LITEINST_IN_GUEST
+# reports promotes_open_files_before_native_lifecycle, and the field's
+# documentation names both ways a backend satisfies it), touching only
+# reverie/src/capabilities.rs. git diff is empty under reverie-dbt/ (tree
+# bb913edb at both pins), and the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml are unchanged: all seven SDK inputs, DBT inventory 961,
+# calibrated budget, job width and limits are unchanged.
+expected_pin=586d929ed48607c751606552593241eabeca047e
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

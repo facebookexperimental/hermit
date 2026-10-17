@@ -27705,6 +27705,82 @@ fn run_dbt_timerfd_virtual_masked_waits_is_refused_by_name() {
     );
 }
 
+// In-guest LiteInst keeps timerfds on virtual time too: it performs every
+// fork, process-copying clone and exec only from Detcore's handler for that
+// call, which promotes the description first
+// (`promotes_open_files_before_native_lifecycle`). LiteInst runs without
+// time slices (it cannot deliver a preemption timer yet), so, as on DBT,
+// abstime, waits and epoll-pwait2 fail exactly as on ptrace with
+// `--max-timeslice=disabled`, and epollet reports its timers in that
+// configuration's order. exec is refused by LiteInst itself (the in-guest
+// backend does not forward execve yet).
+#[test]
+fn run_liteinst_timerfd_virtual_catchup() {
+    timerfd_virtual_time::verify("liteinst", "catchup", timerfd_virtual_time::CATCHUP);
+}
+
+#[test]
+fn run_liteinst_timerfd_virtual_nonblock() {
+    timerfd_virtual_time::verify("liteinst", "nonblock", timerfd_virtual_time::NONBLOCK);
+}
+
+#[test]
+fn run_liteinst_timerfd_virtual_zero_timeout() {
+    timerfd_virtual_time::verify(
+        "liteinst",
+        "zero-timeout",
+        timerfd_virtual_time::ZERO_TIMEOUT,
+    );
+}
+
+#[test]
+fn run_liteinst_timerfd_virtual_masked_ppoll_expired() {
+    timerfd_virtual_time::verify(
+        "liteinst",
+        "masked-ppoll-expired",
+        timerfd_virtual_time::MASKED_PPOLL_EXPIRED,
+    );
+}
+
+/// One timer shared by a parent and its forked child: both reach the one
+/// model the parent promoted before the fork.
+#[test]
+fn run_liteinst_timerfd_virtual_dup_fork() {
+    timerfd_virtual_time::verify("liteinst", "dup-fork", timerfd_virtual_time::DUP_FORK);
+}
+
+#[test]
+fn run_liteinst_timerfd_virtual_readv() {
+    timerfd_virtual_time::verify("liteinst", "readv", timerfd_virtual_time::READV);
+}
+
+#[test]
+fn run_liteinst_timerfd_virtual_sigchld_storm() {
+    timerfd_virtual_time::verify(
+        "liteinst",
+        "sigchld-storm",
+        timerfd_virtual_time::SIGCHLD_STORM,
+    );
+}
+
+/// As on KVM and DBT, a masked wait that may wait would wait in the host:
+/// refused by name.
+#[test]
+fn run_liteinst_timerfd_virtual_masked_waits_is_refused_by_name() {
+    timerfd_virtual_time::refused(
+        "liteinst",
+        "masked-waits",
+        None,
+        "epoll_pwait with a signal mask would wait in the host",
+    );
+}
+
+/// A timerfd passed over `SCM_RIGHTS` is refused by name, as on ptrace.
+#[test]
+fn run_liteinst_timerfd_virtual_scm_rights_is_refused_by_name() {
+    timerfd_virtual_time::refused("liteinst", "scm-rights", None, "a message passes timerfd");
+}
+
 /// A timerfd the host never makes readable ends the run on a named refusal,
 /// not an errno.
 #[test]

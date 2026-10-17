@@ -3503,7 +3503,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the eight run_dbt_timerfd_virtual_* tests (B3 step 1): 500.
     // Measured with dbt_refuses_a_vfork_childs_priority_query_by_name: 501.
     // Measured with dbt_refuses_a_vfork_childs_scheduler_parameter_query_by_name: 502.
-    ("test.cli", 502),
+    // And the nine run_liteinst_timerfd_virtual_* tests (B3 step 2): 511.
+    ("test.cli", 511),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3931,7 +3932,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same eight run_dbt_timerfd_virtual_* tests: 435.
     // Measured with dbt_refuses_a_vfork_childs_priority_query_by_name: 436.
     // Measured with dbt_refuses_a_vfork_childs_scheduler_parameter_query_by_name: 437.
-    ("test.cli_on_host", 437),
+    // And the nine run_liteinst_timerfd_virtual_* tests (B3 step 2): 446.
+    ("test.cli_on_host", 446),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

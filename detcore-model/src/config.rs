@@ -2289,9 +2289,10 @@ impl LegacyBackendKeys {
         backend.supports_madv_dontneed = self.backend_supports_madvise || self.backend_is_kvm;
         backend.provides_process_signal_control = self.backend_is_kvm;
         backend.emulates_child_waits = self.backend_is_kvm;
-        // A legacy encoding predates this key. Only DBT's runtime promotes
-        // shared open-file descriptions before a native fork or exec, and
-        // DBT alone requires thread-directed process signals.
+        // A legacy encoding predates this key. DBT, the form's only reader,
+        // promotes shared open-file descriptions before a native fork or exec
+        // and alone requires thread-directed process signals (DBT's runtime
+        // also states it from any source, `assert_dbt_execution_model`).
         backend.promotes_open_files_before_native_lifecycle =
             self.backend_requires_thread_directed_process_signals;
         // Added after the legacy form froze. Each was a `Config` field with no
@@ -2936,6 +2937,10 @@ mod tests {
         backend.runs_guest_code_between_injections = false;
         // The legacy discover_live_file_metadata bit couples four facts.
         backend.rediscovers_descriptors_after_exec = backend.tool_shares_guest_descriptor_table;
+        // The legacy form derives promotion from the thread-directed signal
+        // bit, which only DBT, the form's only reader, sets.
+        backend.promotes_open_files_before_native_lifecycle =
+            backend.requires_thread_directed_process_signals;
         backend.internal_pipe_turns_are_host_timed = backend.tool_shares_guest_descriptor_table;
         backend.loopback_pollers_yield_to_peers = backend.tool_shares_guest_descriptor_table;
         backend

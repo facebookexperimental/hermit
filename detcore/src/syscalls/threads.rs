@@ -1744,6 +1744,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Promotes the open file descriptions whose model must stay one copy
+    /// (random devices and timerfds, `ThreadState::promote_shared_open_files`)
+    /// before this handler's native fork, process-copying clone or exec, on a
+    /// backend whose tool runs inside the guest and whose runtime routes those
+    /// operations through this handler (in-guest LiteInst). DBT runs them
+    /// natively and its runtime promotes there; ptrace and KVM keep the one
+    /// copy outside the guest. It runs inside the caller's turn, before the
+    /// operation can expose a child or a new image
+    /// (<https://github.com/rrnewton/hermit/issues/4381>).
+    fn promote_before_native_lifecycle<G: Guest<Self>>(&self, guest: &G) {
+        let backend = &guest.config().backend;
+        if self.cfg.sequentialize_threads
+            && backend.promotes_open_files_before_native_lifecycle
+            && !crate::syscalls::timerfd::detcore_runs_outside_the_guest(backend)
+        {
+            guest.thread_state().promote_shared_open_files().expect(
+                "could not publish shared open file descriptions before a native fork or exec",
+            );
+        }
+    }
+
     /// Clone, clone3, fork, vfork system calls
     pub async fn handle_clone_family<G: Guest<Self>>(
         &self,
@@ -1834,6 +1855,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .supports_blocked_wait_signal_interruption
         {
             record_host_timed_signals(guest, HostTimedSignalScope::Caller, exit_signals).await;
+        }
+
+        if !flags.contains(CloneFlags::CLONE_THREAD) {
+            self.promote_before_native_lifecycle(guest);
         }
 
         trace!("[detcore, dtid {}] parent invoking clone.", parent_dettid);
@@ -3271,6 +3296,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Execveat,
     ) -> Result<i64, Error> {
+        self.promote_before_native_lifecycle(guest);
         let (old_metadata, old_memory_metadata, table_is_shared, dettid, detpid, old_mm_id) = {
             let thread_state = guest.thread_state();
             (

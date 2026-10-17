@@ -43,9 +43,11 @@
 //! shares the timer. A tool inside the guest copies its state into a forked
 //! child, so there the runtime must promote the description to Detcore's
 //! global state before each native fork or exec and carry it across exec as a
-//! survivor (`promotes_open_files_before_native_lifecycle`): DBT does. SaBRe
-//! and in-guest LiteInst do not yet, so there a strict run's timerfd is
-//! refused by name ([`refuse_unshared_model`]) rather than left on host time. Also not under record/replay,
+//! survivor (`promotes_open_files_before_native_lifecycle`). DBT's runtime
+//! does, for the calls it performs natively; on in-guest LiteInst every such
+//! call goes through Detcore's own handler, which promotes first. SaBRe does
+//! not yet, so there a strict run's timerfd is refused by name
+//! ([`refuse_unshared_model`]) rather than left on host time. Also not under record/replay,
 //! whose recordings keep the host's answers, or without sequentialized
 //! threads. `TFD_TIMER_CANCEL_ON_SET` is accepted and never fires, because
 //! Hermit's virtual clock is never set; an absolute deadline is read on the
@@ -117,9 +119,10 @@ pub(crate) fn detcore_runs_outside_the_guest(backend: &reverie::BackendCapabilit
 }
 
 /// Whether Detcore's model of an open file description is the one copy every
-/// guest process sharing it reaches: Detcore runs outside the guest, or the
-/// runtime inside it promotes such descriptions before every native fork or
-/// exec and carries them across exec.
+/// guest process sharing it reaches: Detcore runs outside the guest, or such
+/// descriptions are promoted before every native fork or exec inside it and
+/// survive exec (by the backend's runtime, or by Detcore's own handler where
+/// the backend performs those calls only from it).
 pub(crate) fn models_are_shared(backend: &reverie::BackendCapabilities) -> bool {
     detcore_runs_outside_the_guest(backend) || backend.promotes_open_files_before_native_lifecycle
 }
@@ -893,8 +896,9 @@ mod tests {
 
     /// Detcore runs outside the guest on the ptrace family and KVM, not on
     /// SaBRe, DBT or in-guest LiteInst. Its timerfd models are shared there,
-    /// and on DBT, whose runtime promotes them before a native fork or exec;
-    /// SaBRe and in-guest LiteInst share none, so a timerfd is refused there.
+    /// on DBT, whose runtime promotes them before a native fork or exec, and
+    /// on in-guest LiteInst, where Detcore's fork and exec handlers do; SaBRe
+    /// shares none, so a timerfd is refused there.
     #[test]
     fn timerfd_models_are_shared_per_backend() {
         for (name, backend, outside, shared) in [
@@ -907,7 +911,7 @@ mod tests {
                 "liteinst in-guest",
                 BackendCapabilities::LITEINST_IN_GUEST,
                 false,
-                false,
+                true,
             ),
         ] {
             assert_eq!(detcore_runs_outside_the_guest(&backend), outside, "{name}");
