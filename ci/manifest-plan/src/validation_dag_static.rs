@@ -3587,7 +3587,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // sabre_refuses_exe_links_it_cannot_answer_by_name retains all 29: 30.
     // sabre_refuses_a_timerfd_by_name (B3) retains all 30: 31.
     // sigstkflt_handler_not_installed_is_announced_once_per_run: 32.
-    ("test.sabre_examples", 32),
+    // sabre_guest_close_of_stderr_closes_it: 33.
+    ("test.sabre_examples", 33),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -4760,7 +4761,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same exe-link test: 29, and the same refusal test: 30.
     // And the same timerfd refusal test: 31.
     // sigstkflt_handler_not_installed_is_announced_once_per_run: 32.
-    ("test.sabre_examples_on_host", 32),
+    // sabre_guest_close_of_stderr_closes_it: 33.
+    ("test.sabre_examples_on_host", 33),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {

@@ -1048,6 +1048,40 @@ int main(void) {
     );
 }
 
+/// A guest's close(2) of its stderr closes it, as on ptrace: the next open
+/// takes descriptor 2, and a write to the closed descriptor fails with EBADF.
+/// (SaBRe used to answer 0 without closing, so the open took 3.)
+#[test]
+fn sabre_guest_close_of_stderr_closes_it() {
+    const GUEST: &str = r#"
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
+  if (close(2) != 0) {
+    printf("close failed errno=%d\n", errno);
+    return 1;
+  }
+  ssize_t written = write(2, "x", 1);
+  printf("write after close %zd errno=%d\n", written, written < 0 ? errno : 0);
+  int fd = open("/dev/null", O_WRONLY);
+  printf("reopened as %d\n", fd);
+  return fd == 2 ? 0 : 2;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-close-stderr-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest(dir.path(), "close_stderr", GUEST);
+    assert_backend_parity_and_sabre_verify(&guest, &[], &loader, "close of stderr");
+}
+
 /// Detcore answers a SIGSTKFLT handler with success but does not install it
 /// (the backends reserve that signal; refusing would break the Go runtime). It
 /// announces that once per run, in Hermit's own diagnostics: here a parent
