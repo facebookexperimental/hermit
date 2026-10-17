@@ -194,6 +194,7 @@ static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCFS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCESS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static RENDERED_PROCESS_AUXV_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DIRECTORY_OPENAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LISTINGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1463,6 +1464,31 @@ fn rendered_process_files_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "rendered-process-files guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn rendered_process_auxv_guest() -> &'static Path {
+    RENDERED_PROCESS_AUXV_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("rendered-process-auxv");
+        fs::create_dir_all(&build_root).expect("failed to create rendered-process-auxv directory");
+        let guest = build_root.join("rendered_process_auxv");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/rendered_process_auxv.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile rendered-process-auxv guest");
+        assert!(
+            output.status.success(),
+            "rendered-process-auxv guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -4611,6 +4637,14 @@ const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
          (liteinst_in_guest_refuses_verify_without_reading_stdin)",
     ),
     (
+        "detcore_renders_process_auxv_on_every_backend",
+        AUXV_FROM_THE_KERNEL,
+        "the backend does not report the image's initial stack pointer \
+         (Guest::initial_stack_pointer returns None), so Detcore renders no \
+         /proc/<pid>/auxv there and the file stays the kernel's, which the test checks \
+         instead (package K, https://github.com/rrnewton/hermit/issues/4213)",
+    ),
+    (
         "detcore_renders_process_cgroup_on_every_backend",
         "sabre",
         "the guest's second thread ends in SIGSEGV at its exit; a program that only \
@@ -6758,6 +6792,237 @@ fn detcore_renders_process_cgroup_on_every_backend() {
             .map(|(backend, _)| *backend)
             .collect::<Vec<_>>()
     );
+}
+
+/// The backends that report no initial stack pointer to the post-exec
+/// callback, on which Detcore renders no `/proc/<pid>/auxv` and the file is
+/// the kernel's (`detcore_renders_process_auxv_on_every_backend`).
+const AUXV_FROM_THE_KERNEL: &str = "dbt, sabre, liteinst, in-guest-trap";
+
+/// The lines of `detcore_renders_process_auxv_on_every_backend` that differ
+/// on KVM, as Linux prints them and as KVM does. KVM's provider refuses
+/// every `/proc` file (EACCES), so the kernel beneath cannot decide another
+/// process's open there, and Detcore's fallback asks only for the caller's
+/// own CAP_SYS_PTRACE, where Linux allows two of these opens without it. The
+/// provider also refuses `clone(CLONE_NEWUSER)` and `clone(CLONE_VM)` without
+/// `CLONE_THREAD`.
+const KVM_KNOWN_DIFFERENCES: [(&str, &str); 4] = [
+    (
+        "access: without CAP_SYS_PTRACE, dumpable: dumpable 1, creator opened, helper without \
+         CAP_SYS_PTRACE opened, own opened\n",
+        "access: without CAP_SYS_PTRACE, dumpable: dumpable 1, creator opened, helper without \
+         CAP_SYS_PTRACE EACCES, own opened\n",
+    ),
+    (
+        "access: without CAP_SYS_PTRACE in its bounding set, then exec: dumpable 1, creator \
+         opened, helper without CAP_SYS_PTRACE opened, own opened\n",
+        "access: without CAP_SYS_PTRACE in its bounding set, then exec: dumpable 1, creator \
+         opened, helper without CAP_SYS_PTRACE EACCES, own opened\n",
+    ),
+    (
+        "userns: the creator opens its CLONE_NEWUSER child's file (opened), and so does a helper \
+         without CAP_SYS_PTRACE (opened); the child is refused its creator's (EACCES) and opens \
+         its own (opened)\n",
+        "userns: clone(CLONE_NEWUSER) is refused (Operation not supported)\n",
+    ),
+    (
+        "clone_vm: a CLONE_VM child's PR_SET_DUMPABLE(0) makes its creator's shared map not \
+         dumpable (0), and a helper without CAP_SYS_PTRACE is refused the creator's file \
+         (EACCES)\n",
+        "clone_vm: clone(CLONE_VM) is refused (Operation not supported)\n",
+    ),
+];
+
+/// Detcore renders a process's auxv file, `/proc/<pid>/auxv`, from the
+/// auxiliary vector each new image finds on its initial stack, without the
+/// backend opening a kernel object (package K slice K2 of
+/// https://github.com/rrnewton/hermit/issues/4213), on the backends that
+/// report that stack's address (`Guest::initial_stack_pointer`): ptrace, KVM
+/// and e9patch preprocessing with ptrace. Before this, KVM refused every open
+/// of the file with EACCES and ptrace read the kernel's file, whose CPU
+/// entries are the host's where the guest's stack has the canonical ones.
+///
+/// On those backends the guest compares the file with the vector it walks off
+/// its own stack past `environ` (what its `getauxval` reads) and checks
+/// Linux's answers: mode 0400 and owner, a plain file's reads and seeks, the
+/// write family under `CAP_DAC_OVERRIDE`, fork, a descriptor kept past its
+/// process's reap and across exec (the old image's vector), a zombie's file
+/// (EACCES in Hermit's user namespace), another process's open as
+/// `ptrace_may_access` decides it (a non-dumpable target, one dumpable again,
+/// one that dropped `CAP_SYS_PTRACE` from its permitted set, one that dropped
+/// it from its bounding set and exec'd, each opened by a helper without
+/// `CAP_SYS_PTRACE`), a `CLONE_NEWUSER` child and its creator, and a
+/// `CLONE_VM` child that makes the shared map not dumpable. Each reaches
+/// bitwise parity; ptrace and e9patch print the same lines, and KVM differs
+/// in the lines `KVM_KNOWN_DIFFERENCES` names (its provider refuses every
+/// `/proc` file, so the caller's own CAP_SYS_PTRACE decides there, and it
+/// refuses `clone(CLONE_NEWUSER)` and a `CLONE_VM` process).
+/// The guest checks the same relations natively first.
+///
+/// DBT, SaBRe, LiteInst and in-guest-trap report no initial stack pointer, so
+/// there is no rendered file (`PROCFS_NOT_YET`): the test checks that the file
+/// is the kernel's, a whole vector, never one Detcore took from another stack
+/// address, and on DBT, LiteInst and in-guest-trap that the run warns once at
+/// Hermit's default level (SaBRe's in-guest Tool does not yet forward its
+/// warnings, a gap shared by every Detcore WARN there). A backend not
+/// available here is named as not compared.
+#[test]
+fn detcore_renders_process_auxv_on_every_backend() {
+    let test = "detcore_renders_process_auxv_on_every_backend";
+    let guest = rendered_process_auxv_guest();
+    let native = Command::new(guest)
+        .output()
+        .expect("run rendered-process-auxv natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut outputs = Vec::new();
+    for backend in procfs_backends(test) {
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            "--hermit",
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                .expect("parse the verification report");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+        let compared = &verdict["compared_log_messages"];
+        assert!(
+            compared["left"].as_u64().is_some_and(|count| count > 0)
+                && compared["left"] == compared["right"],
+            "{backend} compared no INFO messages: {verdict}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("auxv: backend gives no initial"),
+            "{backend} kept the kernel's auxv"
+        );
+        outputs.push((backend, stdout(&output)));
+    }
+    assert!(
+        outputs.len() > 1 || !cfg!(feature = "dbt"),
+        "only ptrace was compared: {outputs:?}"
+    );
+    let (first_backend, first) = &outputs[0];
+    for line in [
+        "capabilities: dac_override=1 sys_ptrace=1\n",
+        "exit: a zombie's file cannot be opened, read-probed or have a user. attribute read \
+         (EACCES); a descriptor opened before the exit reads the vector after the reap, and the \
+         reaped process has no file\n",
+        "access: not dumpable: dumpable 0, creator opened, helper without CAP_SYS_PTRACE \
+         EACCES, own opened\n",
+        "access: dumpable again: dumpable 1, creator opened, helper without CAP_SYS_PTRACE \
+         EACCES, own opened\n",
+        KVM_KNOWN_DIFFERENCES[0].0,
+        "access: without CAP_SYS_PTRACE, not dumpable: dumpable 0, creator opened, helper \
+         without CAP_SYS_PTRACE EACCES, own opened\n",
+        KVM_KNOWN_DIFFERENCES[1].0,
+        KVM_KNOWN_DIFFERENCES[2].0,
+        KVM_KNOWN_DIFFERENCES[3].0,
+        "exec: a descriptor opened before exec reads the old image's vector, also after a \
+         rewind; the new image reads its own, another\n",
+    ] {
+        assert!(
+            first.contains(line),
+            "{first_backend} lacks {line:?}: {first}"
+        );
+    }
+    for (backend, output) in &outputs[1..] {
+        if *backend == "kvm" {
+            // KVM's provider refuses every /proc file, so the kernel beneath
+            // cannot decide another process's open there, and the fallback
+            // asks only for the caller's own CAP_SYS_PTRACE, refusing two
+            // opens Linux allows without it; and the provider refuses
+            // clone(CLONE_NEWUSER) and a CLONE_VM process.
+            let mut expected = first.clone();
+            for (linux, kvm) in KVM_KNOWN_DIFFERENCES {
+                eprintln!("{test}: kvm: KNOWN DIFFERENCE: {kvm:?} where Linux gives {linux:?}");
+                expected = expected.replace(linux, kvm);
+            }
+            assert_eq!(output, &expected, "{backend} differs from {first_backend}");
+        } else {
+            assert_eq!(output, first, "{backend} differs from {first_backend}");
+        }
+    }
+    eprintln!(
+        "{test} compared {:?}",
+        outputs
+            .iter()
+            .map(|(backend, _)| *backend)
+            .collect::<Vec<_>>()
+    );
+    // Where Detcore renders no auxv, the file is the kernel's, a whole
+    // vector, and never a vector Detcore took from the wrong stack; the run
+    // warns of it once. A listed gap (`PROCFS_NOT_YET`), not a pass.
+    for backend in AUXV_FROM_THE_KERNEL.split(", ") {
+        let unavailable = match backend {
+            "dbt" => dbt_unavailable(test),
+            "sabre" => !cfg!(feature = "sabre"),
+            _ => !cfg!(feature = "liteinst"),
+        };
+        if unavailable {
+            eprintln!("{test}: kernel file: NOT CHECKED: {backend} is not available here");
+            continue;
+        }
+        // At Hermit's default log level: the in-guest Tool's warnings reach
+        // the run's output through the coordinator on DBT, LiteInst and
+        // in-guest-trap.
+        let mut args = vec!["--backend", backend, "run", "--strict"];
+        if backend == "liteinst" || backend == "in-guest-trap" {
+            args.push("--max-timeslice=disabled");
+        }
+        args.extend([
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            "--kernel-file",
+        ]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            "kernel: /proc/self/auxv is the kernel's procfs file, 0400, a whole vector with \
+             AT_PAGESZ ending in AT_NULL\n",
+            "{backend}"
+        );
+        // Not silently: the run names the gap once. SaBRe's in-guest Tool
+        // does not yet send its warnings to the coordinator (measured
+        // 2026-10-17: none reaches the run's output even at --log=warn), so
+        // there only the kernel's file is checked.
+        if backend == "sabre" {
+            eprintln!(
+                "{test}: {backend}: NOT YET: the file is the kernel's; the run's WARN is NOT \
+                 CHECKED: SaBRe's in-guest Tool prints no Detcore WARN to the run's output"
+            );
+            continue;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr
+                .matches(
+                    "auxv: backend gives no initial stack pointer; guest auxv is the kernel \
+                     beneath's"
+                )
+                .count(),
+            1,
+            "{backend} did not warn once: {stderr}"
+        );
+        eprintln!("{test}: {backend}: NOT YET: the file is the kernel's, and the run warns so");
+    }
 }
 
 /// DBT launches through the same container as ptrace

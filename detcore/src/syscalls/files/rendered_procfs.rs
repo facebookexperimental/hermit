@@ -555,6 +555,11 @@ fn rendered_stat(path: &Path, epoch: Timespec, owner: (u32, u32)) -> DetStat {
         .to_str()
         .and_then(FixedProcfsFile::from_path)
         .map_or(0o444, FixedProcfsFile::permissions);
+    let permissions = if rendered_path_is_owner_only(path) {
+        0o400
+    } else {
+        permissions
+    };
     DetStat {
         // What a procfs file's `statx` reports.
         mask: StatxMask::STATX_BASIC_STATS | StatxMask::STATX_MNT_ID,
@@ -577,6 +582,47 @@ fn rendered_stat(path: &Path, epoch: Timespec, owner: (u32, u32)) -> DetStat {
         btime: epoch,
         ctime: epoch,
         mtime: epoch,
+    }
+}
+
+/// Whether the rendered file `path` is readable by its owner only (0400): a
+/// process's `auxv` (`proc_pid_auxv`'s `S_IRUSR`).
+pub(super) fn rendered_path_is_owner_only(path: &Path) -> bool {
+    crate::procfs::per_process_name(path).is_some_and(|name| name.filename == "auxv")
+}
+
+/// What decides another process's open of a rendered `/proc/<pid>/auxv`
+/// ([`auxv_access_answer`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AuxvAccess {
+    /// The open's answer, as the kernel beneath gave it.
+    Answer(Result<(), Errno>),
+    /// The kernel beneath serves no `/proc` here: `CAP_SYS_PTRACE` in the
+    /// caller's own effective set decides.
+    CallerCapability,
+}
+
+/// What decides another process's open of a rendered `/proc/<pid>/auxv`
+/// ([`Detcore::ptrace_read_allowed`]), from the caller's own opens of the
+/// kernel's files: `target`, its open of the kernel's `/proc/<pid>/auxv`, and
+/// `serves`, its open of its own `/proc/thread-self/stat` (mode 0444, which
+/// no credential or dumpability refuses on a real kernel).
+/// - The target's opens: allowed.
+/// - It is refused while `serves` opens: the kernel beneath serves this
+///   caller's `/proc` and applied Linux's whole rule; its errno is the answer.
+/// - `serves` is refused with EACCES, the provider's backstop for every
+///   `/proc` file (KVM): the caller's `CAP_SYS_PTRACE` decides.
+/// - Any other errno of `serves` (EMFILE, ENFILE, ENOMEM, ...): the open's
+///   answer, as Linux's own open would fail with it.
+pub(super) fn auxv_access_answer(
+    target: Result<(), Errno>,
+    serves: Result<(), Errno>,
+) -> AuxvAccess {
+    match (target, serves) {
+        (Ok(()), _) => AuxvAccess::Answer(Ok(())),
+        (Err(refused), Ok(())) => AuxvAccess::Answer(Err(refused)),
+        (Err(_), Err(Errno::EACCES)) => AuxvAccess::CallerCapability,
+        (Err(_), Err(errno)) => AuxvAccess::Answer(Err(errno)),
     }
 }
 
@@ -610,6 +656,10 @@ fn rendered_owner(path: &Path) -> Result<(u32, u32), Errno> {
 pub(super) struct FileAccess {
     /// The caller owns the file.
     owner: bool,
+    /// The caller may read the file: every rendered file's mode lets anyone
+    /// read it (0444) but a process's `auxv`'s (0400), which only its owner
+    /// may ([`rendered_path_is_owner_only`]).
+    readable: bool,
     /// `CAP_DAC_OVERRIDE`: write access despite the mode.
     dac_override: bool,
     /// `CAP_SYS_ADMIN`: a `security.` attribute may be changed.
@@ -620,6 +670,7 @@ impl FileAccess {
     /// A system-wide rendered file, owned by global root.
     pub(super) const GLOBAL_ROOT: Self = Self {
         owner: false,
+        readable: true,
         dac_override: false,
         sys_admin: false,
     };
@@ -629,6 +680,7 @@ impl FileAccess {
     fn owned_with(capabilities: u64) -> Self {
         Self {
             owner: true,
+            readable: true,
             dac_override: capabilities & (1 << CAP_DAC_OVERRIDE) != 0,
             sys_admin: capabilities & (1 << CAP_SYS_ADMIN) != 0,
         }
@@ -648,6 +700,9 @@ const CAP_DAC_OVERRIDE: u32 = 1;
 
 /// `CAP_SYS_ADMIN`'s bit in a capability set.
 const CAP_SYS_ADMIN: u32 = 21;
+
+/// `CAP_SYS_PTRACE`'s bit in a capability set.
+const CAP_SYS_PTRACE: u32 = 19;
 
 /// `_LINUX_CAPABILITY_VERSION_3`, whose `capget` reports two 32-bit words of
 /// each set.
@@ -708,9 +763,13 @@ fn rendered_open_flags(flags: OFlag, access: FileAccess) -> Result<OFlag, Errno>
     if flags.contains(OFlag::O_DIRECTORY) {
         return Err(Errno::ENOTDIR);
     }
-    // No mode bit allows writing; `O_TRUNC` asks for write access.
-    let writes = flags & OFlag::O_ACCMODE != OFlag::O_RDONLY || flags.contains(OFlag::O_TRUNC);
-    if writes && !access.may_write() {
+    // No mode bit allows writing; `O_TRUNC` asks for write access. Reading
+    // an owner-only file (`auxv`) needs its owner (`FileAccess::readable`).
+    let accmode = flags & OFlag::O_ACCMODE;
+    let reads =
+        accmode == OFlag::O_RDONLY || accmode == OFlag::O_RDWR || accmode == OFlag::O_ACCMODE;
+    let writes = accmode != OFlag::O_RDONLY || flags.contains(OFlag::O_TRUNC);
+    if (writes && !access.may_write()) || (reads && !access.readable) {
         return Err(Errno::EACCES);
     }
     // `O_NOATIME` needs the file's owner.
@@ -1015,12 +1074,17 @@ fn posix_acl_parser_refuses(value: &[u8]) -> bool {
 
 /// Linux's answer to reading the extended attribute `name` of a procfs file,
 /// which has no attribute handlers: a `trusted.` attribute is invisible
-/// without the global capability.
-fn xattr_get_answer(name: &[u8]) -> Result<i64, Errno> {
+/// without the global capability; a `security.` or `system.` one is left to
+/// the file system; any other name first needs read permission on the file
+/// (`xattr_permission`), which a `readable` of false (a zombie's owner-only
+/// file) refuses. Measured natively against a zombie's `/proc/<pid>/auxv`.
+fn xattr_get_answer(name: &[u8], readable: bool) -> Result<i64, Errno> {
     if name.is_empty() || name.len() > 255 {
         Err(Errno::ERANGE)
     } else if name.starts_with(b"trusted.") {
         Err(Errno::ENODATA)
+    } else if !readable && !name.starts_with(b"security.") && !name.starts_with(b"system.") {
+        Err(Errno::EACCES)
     } else {
         Err(Errno::EOPNOTSUPP)
     }
@@ -1088,7 +1152,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// again (`get_proc_task`), and a task that is gone, or whose pid another
     /// task now holds, is ESRCH. Linux takes a snapshot at a read with no
     /// buffered bytes from the start, and at a read or seek to a position the
-    /// buffer does not hold (`traverse`).
+    /// buffer does not hold (`traverse`). Only a file whose `show` runs at a
+    /// read (`ProcfsFile::shows_at_read`): a process's `auxv` reads the
+    /// memory map its open pinned, whatever became of the task since.
     pub(crate) async fn require_rendered_task<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1102,6 +1168,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         else {
             return Ok(());
         };
+        if !ProcfsFile::from_rendered_path(path).is_some_and(|file| file.shows_at_read()) {
+            return Ok(());
+        }
         match self.rendered_task_state(guest, path).await {
             Some((_, false)) => Err(Errno::ESRCH),
             _ => Ok(()),
@@ -1194,7 +1263,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if !answer.exists {
                     return Err(Errno::ENOENT.into());
                 }
+                let without_mm = answer.without_mm;
                 self.bind_task_identity(guest, &mut procfs, answer).await?;
+                if Self::auxv_kept_by_kernel(guest, &procfs, without_mm).await {
+                    return Ok(None);
+                }
             }
             if procfs.rendered_path(self.rendered_files(guest)).is_none() {
                 return Ok(None);
@@ -1495,51 +1568,167 @@ impl<T: RecordOrReplay> Detcore<T> {
         path: &Path,
         needed: bool,
         set: CapabilitySet,
-    ) -> FileAccess {
+    ) -> Result<FileAccess, Error> {
         if !crate::procfs::rendered_path_is_per_process(path) {
-            return FileAccess::GLOBAL_ROOT;
+            return Ok(FileAccess::GLOBAL_ROOT);
         }
         // A task that has exited (a zombie), or is gone, has no memory map,
         // and Linux gives its files to global root (`task_dump_owner`): then
-        // the caller owns nothing and no capability of its namespace applies.
+        // the caller owns nothing and no capability of its namespace applies,
+        // so it reads an owner-only file (`auxv`, 0400) no more than it
+        // writes any (EACCES).
         match self.rendered_task_state(guest, path).await {
             Some((answer, true)) if !answer.without_mm => {}
-            _ => return FileAccess::GLOBAL_ROOT,
+            _ => {
+                return Ok(FileAccess {
+                    readable: !rendered_path_is_owner_only(path),
+                    ..FileAccess::GLOBAL_ROOT
+                });
+            }
         }
+        // A set that cannot be read overrides nothing; scratch that cannot be
+        // put back is the failure policy's (`inject_capget`).
         let capabilities = if needed {
-            Self::inject_capget(guest, set).await.unwrap_or(0)
+            Self::inject_capget(guest, set).await?.unwrap_or(0)
         } else {
             0
         };
-        FileAccess::owned_with(capabilities)
+        Ok(FileAccess::owned_with(capabilities))
     }
 
     /// The caller's capability set `set` (its low 64 bits), as `capget`
-    /// reports it for the calling thread.
-    async fn inject_capget<G: Guest<Self>>(guest: &mut G, set: CapabilitySet) -> Option<u64> {
-        let mut stack = guest.stack().await;
-        let header = stack.push([LINUX_CAPABILITY_VERSION_3, 0_u32]);
-        let data = stack.reserve::<[u32; 6]>();
-        let stack_guard = stack.commit().ok()?;
-        let result = guest
-            .inject(
-                syscalls::Capget::new()
-                    .with_header(AddrMut::from_raw(header.as_raw()))
-                    .with_data(AddrMut::from_raw(data.as_raw())),
-            )
-            .await;
-        let words = match result {
-            Ok(_) => guest.memory().read_value(data).ok(),
-            Err(_) => None,
+    /// reports it for the calling thread. `Ok(None)` where it cannot be read
+    /// with nothing changed: no stack scratch to borrow, or `capget` refused.
+    /// `Err` where the borrowed scratch could not be put back; the failure
+    /// policy has then been applied (`scratch_failure`), so the caller
+    /// returns it as it is, never as an ordinary answer.
+    pub(super) async fn inject_capget<G: Guest<Self>>(
+        guest: &mut G,
+        set: CapabilitySet,
+    ) -> Result<Option<u64>, Error> {
+        // The header (8 bytes) and the data (two 12-byte words) in borrowed
+        // stack scratch, whose original bytes go back on every path.
+        let (scratch, original, stack_guard) = match Self::borrow_scratch::<G, 32>(guest).await {
+            Ok(Some(borrowed)) => borrowed,
+            Ok(None) => return Ok(None),
+            Err(reason) => {
+                return Err(
+                    Self::scratch_failure(guest, reverie::syscalls::Sysno::capget, reason).await,
+                );
+            }
         };
+        // Moved into the block by value: a borrowed address would make the
+        // future not `Send`.
+        let caller = &mut *guest;
+        let words = async move {
+            let guest = caller;
+            let header = scratch;
+            let data = AddrMut::<u8>::from_raw(scratch.as_raw() + 8)?;
+            let mut bytes = [0_u8; 32];
+            bytes[..4].copy_from_slice(&LINUX_CAPABILITY_VERSION_3.to_ne_bytes());
+            guest.memory().write_exact(header, &bytes).ok()?;
+            guest
+                .inject(
+                    syscalls::Capget::new()
+                        .with_header(AddrMut::from_raw(header.as_raw()))
+                        .with_data(AddrMut::from_raw(data.as_raw())),
+                )
+                .await
+                .ok()?;
+            let mut read = [0_u8; 24];
+            guest.memory().read_exact(data, &mut read).ok()?;
+            Some(read)
+        }
+        .await;
+        let restored = guest.memory().write_exact(scratch, &original);
         drop(stack_guard);
+        if let Err(errno) = restored {
+            let reason = format!(
+                "the guest stack scratch under an injected capget could not be restored: {errno}"
+            );
+            return Err(
+                Self::scratch_failure(guest, reverie::syscalls::Sysno::capget, reason).await,
+            );
+        }
         // Each 32-bit word holds `effective`, `permitted`, `inheritable`.
-        let words = words?;
-        let word = match set {
+        let Some(words) = words else {
+            return Ok(None);
+        };
+        let word =
+            |index: usize| u32::from_ne_bytes(words[index * 4..index * 4 + 4].try_into().unwrap());
+        let index = match set {
             CapabilitySet::Effective => 0,
             CapabilitySet::Permitted => 1,
         };
-        Some(u64::from(words[word]) | (u64::from(words[word + 3]) << 32))
+        Ok(Some(
+            u64::from(word(index)) | (u64::from(word(index + 3)) << 32),
+        ))
+    }
+
+    /// `N` bytes of the guest's stack scratch (below the red zone), borrowed
+    /// for an injected call: the scratch address, the bytes it held before,
+    /// which the borrower must write back on every path, error paths
+    /// included, and the stack guard, which the borrower keeps until it has.
+    /// `Ok(None)` where the scratch cannot be used and nothing is left
+    /// changed: it cannot be read and written through the guest's own
+    /// protections (a stack pointer just above a guard page), or its commit
+    /// failed and what it wrote was put back. `Err` where a failed commit's
+    /// partial write could not be put back.
+    pub(super) async fn borrow_scratch<G: Guest<Self>, const N: usize>(
+        guest: &mut G,
+    ) -> Result<
+        Option<(
+            AddrMut<'static, u8>,
+            [u8; N],
+            <G::Stack as Stack>::StackGuard,
+        )>,
+        String,
+    > {
+        let mut stack = guest.stack().await;
+        let scratch = stack.reserve::<[u8; N]>().cast::<u8>();
+        let mut original = [0_u8; N];
+        // `commit` writes the reserved bytes, so save them before it.
+        if !super::save_procfs_scratch(&mut guest.memory(), scratch, &mut original) {
+            return Ok(None);
+        }
+        match stack.commit() {
+            Ok(guard) => Ok(Some((scratch, original, guard))),
+            // A commit that failed part way may have written some of them.
+            Err(_) => match guest.memory().write_exact(scratch, &original) {
+                Ok(()) => Ok(None),
+                Err(errno) => Err(format!(
+                    "a failed stack commit's partial write to the guest stack scratch could not \
+                     be put back: {errno}"
+                )),
+            },
+        }
+    }
+
+    /// Apply the failure policy to an injected call Detcore could not finish
+    /// cleanly (`reason`): guest stack scratch it could not put back, or a
+    /// probe descriptor it could not close. Logged by name; a fail-closed run
+    /// stops with the policy's exit, and a run with
+    /// `--allow-unsupported-syscalls` gives the guest's call EOPNOTSUPP.
+    /// Never an ordinary answer such as EACCES.
+    async fn scratch_failure<G: Guest<Self>>(
+        guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
+        reason: String,
+    ) -> Error {
+        error!("Detcore refuses {sysno}: {reason}");
+        let panic_on_unsupported = guest.config().panic_on_unsupported_syscalls;
+        match crate::syscalls::helpers::refuse_unserviceable_operation_with(
+            guest,
+            panic_on_unsupported,
+            sysno,
+            Errno::EOPNOTSUPP,
+            Some(&reason),
+        )
+        .await
+        {
+            Ok(_) => Errno::EOPNOTSUPP.into(),
+            Err(error) => error,
+        }
     }
 
     /// Open the rendered procfs file `target` names with the guest's `flags`.
@@ -1572,8 +1761,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         let writes = flags & OFlag::O_ACCMODE != OFlag::O_RDONLY || flags.contains(OFlag::O_TRUNC);
         let access = self
             .rendered_file_access(guest, path, writes, CapabilitySet::Effective)
-            .await;
+            .await?;
         let reopen = rendered_open_flags(flags, access)?;
+        // A process's `auxv`: its snapshot is the process's auxiliary vector
+        // now, which the open pins (`open_process_auxv`).
+        // Boxed: the access check's injected calls would otherwise grow every
+        // open's future, which some backends poll on a small stack.
+        let auxv = if procfs.is_process_auxv() && !flags.contains(OFlag::O_PATH) {
+            Some(Box::pin(self.open_process_auxv(guest, &procfs)).await?)
+        } else {
+            None
+        };
         GuestProcfs::remember();
         // Read before the placeholder exists, so that a failure leaves the
         // guest nothing open.
@@ -1584,16 +1782,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (`ProcfsFile::snapshot_is_rerendered`). A file Linux renders when it
         // is read takes none until its first read
         // (`ProcfsFile::snapshot_at_first_read`).
-        let snapshot =
-            (!procfs.snapshot_at_first_read()).then(|| self.render_snapshot(guest, &procfs));
-        let carried: &[u8] = match &snapshot {
-            Some(snapshot) if !procfs.snapshot_is_rerendered() => snapshot,
-            _ => &[],
+        let snapshot = match auxv {
+            Some(bytes) => Some(bytes),
+            None if procfs.is_process_auxv() => None,
+            None => {
+                (!procfs.snapshot_at_first_read()).then(|| self.render_snapshot(guest, &procfs))
+            }
+        };
+        // A process's `auxv`'s snapshot does not fit a memfd name: it stays
+        // with the open file description (and `PLACEHOLDER_OPENS`).
+        let carried: Vec<u8> = match &snapshot {
+            Some(snapshot) if !procfs.snapshot_is_rerendered() && !procfs.is_process_auxv() => {
+                snapshot.clone()
+            }
+            _ => Vec::new(),
         };
         let (fd, identity) = self
-            .inject_placeholder(guest, path, carried, reopen)
+            .inject_placeholder(guest, path, &carried, reopen)
             .await?;
-        let carried = carried.to_vec();
+        // What a descriptor rebuilt from the placeholder's identity reads
+        // (`adopt_received_placeholder`): a process's `auxv` keeps its whole
+        // snapshot there, which its name cannot carry.
+        let registered = match &snapshot {
+            Some(snapshot) if procfs.is_process_auxv() => snapshot.clone(),
+            _ => carried,
+        };
         // The status flags Linux keeps, which include `O_NOFOLLOW`: the
         // placeholder cannot be reopened with it through its link.
         guest.thread_state().add_fd(
@@ -1611,8 +1824,204 @@ impl<T: RecordOrReplay> Detcore<T> {
             detfd.set_procfs(procfs.clone());
             detfd.open_file_handle()
         })?;
-        register_placeholder_open(identity, handle, carried);
+        register_placeholder_open(identity, handle, registered);
         Ok(fd as i64)
+    }
+
+    /// What Linux's `auxv_open` does for the rendered `/proc/<pid>/auxv`
+    /// `procfs` names, after the open's permission check: it looks for the
+    /// task's memory map (`proc_mem_open`, `mm_access`) and pins it, so the
+    /// file reads that map's `saved_auxv` for as long as it is open, through
+    /// any later exec or the task's exit. Another thread group's map needs
+    /// `ptrace_may_access` ([`Self::ptrace_read_allowed`]). Returns the
+    /// auxiliary vector the open snapshots.
+    ///
+    /// A zombie's map is gone (ESRCH in Linux), but its file is global
+    /// root's, which no guest in Hermit's user namespace can read
+    /// (`rendered_file_access`), so that open has already failed with EACCES.
+    async fn open_process_auxv<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        procfs: &ProcfsFile,
+    ) -> Result<Vec<u8>, Error> {
+        let task = procfs.bound_task().ok_or(Errno::ENOENT)?;
+        let target = detcore_model::pid::DetPid::from_raw(task.process);
+        let entry = crate::tool_global::process_auxv(guest, target)
+            .await
+            .ok_or(Errno::ESRCH)?;
+        // The caller's own thread group needs no permission
+        // (`__ptrace_may_access`'s `same_thread_group`).
+        if self.own_detpid(guest) != entry.process {
+            Self::ptrace_read_allowed(guest, task).await??;
+        }
+        Ok(entry.bytes)
+    }
+
+    /// Linux's `ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)` for the
+    /// caller and `task`, the task a `/proc/<pid>/auxv` path names (the
+    /// thread below `task/`, else the number at the top of `/proc`), in
+    /// another thread group: `Ok(Ok(()))` where the caller may open the file,
+    /// `Ok(Err(errno))` where the open fails with `errno`.
+    ///
+    /// Where the kernel beneath serves the caller's `/proc` (ptrace), the
+    /// kernel decides, by the caller's own open of the kernel's
+    /// `/proc/<pid>/auxv` ([`Self::kernel_procfs_open_answer`], by the
+    /// kernel's number, `kernel_procfs_number`): Linux's whole rule,
+    /// credentials, user namespaces (a guest may make one with
+    /// `clone(CLONE_NEWUSER)`), the memory map's namespace and its
+    /// dumpability, applied by Linux itself. Whether the kernel beneath
+    /// serves this caller's `/proc` is a fact the kernel reports, not a
+    /// backend switch: a refused probe is followed by the caller's open of
+    /// its own `/proc/thread-self/stat` (mode 0444, which no credential or
+    /// dumpability refuses). Where that is refused with EACCES too (KVM's
+    /// provider refuses every `/proc` file with EACCES, its backstop), the
+    /// answer is `CAP_SYS_PTRACE` in the caller's own effective set
+    /// (`capget`), else EACCES: KVM's named difference from Linux, which also
+    /// asks about the target's dumpability and capabilities. Any other errno
+    /// from either probe (EMFILE, ENFILE, ENOMEM, ...) is the open's answer,
+    /// as Linux's own open would fail with it ([`auxv_access_answer`]).
+    ///
+    /// With sequentialized threads every call runs in the caller's turn, so
+    /// the answer is the guest's own history's. Without them
+    /// (`--no-sequentialize-threads`, a declared relaxation) a target's
+    /// thread may change its credentials, dumpability or namespace
+    /// concurrently, and the answer is host-timed; and the probe's
+    /// descriptor briefly takes the lowest free number, so a concurrent open
+    /// by another guest thread may be given a higher number than in another
+    /// run.
+    ///
+    /// `Err` is a probe Detcore could not finish cleanly (no stack scratch
+    /// for its path, scratch it could not put back, a descriptor it could
+    /// not close, the caller's capabilities unreadable), after the failure
+    /// policy (`scratch_failure`): never an access answer.
+    // TODO-HUMAN-REVIEW(#4213): Review the access check of another process's
+    // open of its rendered /proc/<pid>/auxv by the kernel beneath's answer.
+    pub(crate) async fn ptrace_read_allowed<G: Guest<Self>>(
+        guest: &mut G,
+        task: crate::procfs::BoundTask,
+    ) -> Result<Result<(), Errno>, Error> {
+        let named = task.thread.unwrap_or(task.process);
+        let target = match Self::kernel_procfs_number(guest, named).await {
+            Some(kernel) => Self::probe(guest, format!("/proc/{kernel}/auxv").as_bytes()).await?,
+            None => Err(Errno::ESRCH),
+        };
+        if target.is_ok() {
+            return Ok(Ok(()));
+        }
+        let serves = Self::probe(guest, b"/proc/thread-self/stat").await?;
+        match auxv_access_answer(target, serves) {
+            AuxvAccess::Answer(answer) => Ok(answer),
+            AuxvAccess::CallerCapability => {
+                match Self::inject_capget(guest, CapabilitySet::Effective).await? {
+                    Some(effective) if effective & (1 << CAP_SYS_PTRACE) != 0 => Ok(Ok(())),
+                    Some(_) => Ok(Err(Errno::EACCES)),
+                    None => Err(Self::scratch_failure(
+                        guest,
+                        reverie::syscalls::Sysno::openat,
+                        "the caller's capabilities, which decide another process's \
+                         /proc/<pid>/auxv where the kernel beneath serves no /proc, could \
+                         not be read"
+                            .to_string(),
+                    )
+                    .await),
+                }
+            }
+        }
+    }
+
+    /// [`Self::kernel_procfs_open_answer`], with the failure policy applied
+    /// to a probe Detcore could not finish cleanly.
+    async fn probe<G: Guest<Self>>(guest: &mut G, path: &[u8]) -> Result<Result<(), Errno>, Error> {
+        match Self::kernel_procfs_open_answer(guest, path).await {
+            Ok(answer) => Ok(answer),
+            Err(reason) => {
+                Err(Self::scratch_failure(guest, reverie::syscalls::Sysno::openat, reason).await)
+            }
+        }
+    }
+
+    /// The kernel beneath's answer to the caller opening `path` (a kernel
+    /// `/proc` file) for reading: `Ok(Ok(()))` where it opens, `Ok(Err(errno))`
+    /// where it fails with `errno`. An open Reverie reports did not run
+    /// (ERESTARTSYS) is retried, so that errno never reaches the guest. The
+    /// probe's descriptor is closed: a close Reverie reports did not run
+    /// (ERESTARTSYS) is retried; EINTR is not, since Linux has released the
+    /// descriptor before close returns it, and a retry could close a number
+    /// another thread was given. The path lives in borrowed stack scratch
+    /// whose original bytes go back on every path ([`Self::borrow_scratch`]).
+    /// `Err` (no scratch for the path, scratch not put back, any other close
+    /// error) is a probe that could not be finished cleanly.
+    pub(super) async fn kernel_procfs_open_answer<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+    ) -> Result<Result<(), Errno>, String> {
+        const PATH_CAPACITY: usize = 32;
+        let (scratch, original, stack_guard) =
+            match Self::borrow_scratch::<G, PATH_CAPACITY>(guest).await? {
+                Some(borrowed) => borrowed,
+                None => {
+                    return Err(format!(
+                        "no guest stack scratch can hold the path of the access probe of {}",
+                        String::from_utf8_lossy(path)
+                    ));
+                }
+            };
+        // Moved into the block by value: a borrowed address would make the
+        // future not `Send`.
+        let probe = &mut *guest;
+        let answer: Result<Result<(), Errno>, String> = async move {
+            let guest = probe;
+            let bytes = c_string::<PATH_CAPACITY>(path);
+            if let Err(errno) = guest.memory().write_exact(scratch, &bytes) {
+                return Err(format!(
+                    "the path of the access probe of {} could not be written to the guest \
+                     stack scratch: {errno}",
+                    String::from_utf8_lossy(path)
+                ));
+            }
+            let opened = loop {
+                match guest
+                    .inject(
+                        syscalls::Openat::new()
+                            .with_dirfd(libc::AT_FDCWD)
+                            .with_path(PathPtr::from_ptr(scratch.as_raw() as *const libc::c_char))
+                            .with_flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC),
+                    )
+                    .await
+                {
+                    Err(Errno::ERESTARTSYS) => continue,
+                    opened => break opened,
+                }
+            };
+            let fd = match opened {
+                Ok(fd) => fd as RawFd,
+                Err(errno) => return Ok(Err(errno)),
+            };
+            loop {
+                match guest.inject(syscalls::Close::new().with_fd(fd)).await {
+                    Ok(_) | Err(Errno::EINTR) => return Ok(Ok(())),
+                    Err(Errno::ERESTARTSYS) => continue,
+                    Err(errno) => {
+                        return Err(format!(
+                            "the descriptor {fd} of the access probe of {} could not be closed: \
+                             {errno}",
+                            String::from_utf8_lossy(path)
+                        ));
+                    }
+                }
+            }
+        }
+        .await;
+        let restored = guest.memory().write_exact(scratch, &original);
+        drop(stack_guard);
+        if let Err(errno) = restored {
+            return Err(format!(
+                "the guest stack scratch under the access probe of {} could not be restored: \
+                 {errno}",
+                String::from_utf8_lossy(path)
+            ));
+        }
+        answer
     }
 
     /// The snapshot of the rendered file `procfs` an open takes, from
@@ -1900,7 +2309,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             if !answer.exists {
                 return Ok(None);
             }
+            let without_mm = answer.without_mm;
             self.bind_task_identity(guest, &mut file, answer).await?;
+            // A process whose `auxv` the kernel serves lists the kernel's
+            // entry, as a path to it opens the kernel's file.
+            if Self::auxv_kept_by_kernel(guest, &file, without_mm).await {
+                return Ok(None);
+            }
             return Ok(file.rendered_path(files).map(procfs_inode::rendered_inode));
         }
         // By kernel identity only for an entry named as a rendered file is,
@@ -1910,6 +2325,33 @@ impl<T: RecordOrReplay> Detcore<T> {
             let named = rendered_paths(files).filter(|path| rendered_name(path) == name);
             rendered_path_among(inodes.device(), host_ino, named).map(procfs_inode::rendered_inode)
         }))
+    }
+
+    /// Whether `file` is a process's `auxv` that the kernel serves: Detcore
+    /// recorded no auxiliary vector for the process's image (the backend
+    /// reports no initial stack pointer, or the vector there is implausible;
+    /// `Detcore::record_process_auxv`), so every spelling of it, and its
+    /// listing, is the kernel's file.
+    ///
+    /// Never a zombie's (`without_mm`): its file is served on the rendered
+    /// path, whose access check refuses it (EACCES, global root's), whether
+    /// or not its vector is still kept, so the host-timed moment the global
+    /// tool forgets an exited process's vector changes nothing the guest
+    /// sees.
+    async fn auxv_kept_by_kernel<G: Guest<Self>>(
+        guest: &mut G,
+        file: &ProcfsFile,
+        without_mm: bool,
+    ) -> bool {
+        let Some(task) = file
+            .bound_task()
+            .filter(|_| file.is_process_auxv() && !without_mm)
+        else {
+            return false;
+        };
+        crate::tool_global::process_auxv(guest, detcore_model::pid::DetPid::from_raw(task.process))
+            .await
+            .is_none()
     }
 
     /// Bind the per-process file `file` to the identity of the task the
@@ -2534,6 +2976,75 @@ impl<T: RecordOrReplay> Detcore<T> {
         Err(Errno::EINVAL)
     }
 
+    /// Record the auxiliary vector the calling process's new image finds on
+    /// its initial stack, before its first instruction, for its
+    /// `/proc/<pid>/auxv` (`ProcessAuxvTable`): the pairs past `argc`, the
+    /// argument and environment pointers, read through guest memory at the
+    /// stack pointer the image starts with, as the backend reports it
+    /// (`Guest::initial_stack_pointer`; `procfs::initial_stack_auxv`, which
+    /// refuses an implausible vector). They are what the guest's own
+    /// `getauxval` reads: a backend that gives the guest the canonical values
+    /// of the CPU and kernel entries (ptrace's `canonicalize_new_image`, KVM's
+    /// loader) has written them there before this callback, and Detcore takes
+    /// them as they are, never from the backend's `Guest::auxv`, which is
+    /// sorted and, on ptrace, the kernel's own file.
+    ///
+    /// A backend that reports no initial stack pointer (DBT, SaBRe, LiteInst),
+    /// or a vector that fails the check, records nothing and drops the
+    /// process's stale vector: the image's file is left to the kernel beneath
+    /// (the host kernel's file on ptrace and DBT, the provider's EACCES
+    /// backstop on KVM), and the run warns of each reason once, by name
+    /// (`tool_global::auxv_from_kernel`).
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#4213): Review the auxiliary vector Detcore takes from
+    // each new image's initial stack, which its rendered /proc/<pid>/auxv
+    // serves in place of the kernel's saved_auxv.
+    pub(crate) async fn record_process_auxv<G: Guest<Self>>(&self, guest: &mut G) {
+        use crate::tool_global::AuxvFromKernel;
+        // Only a stack pointer the backend observed at the image's first
+        // instruction: in the post-exec callback the registers' need not be
+        // (DBT runs it at the image's first syscall). Without one, or with an
+        // implausible vector there, the file is left to the kernel beneath:
+        // the host kernel's file on ptrace and DBT, the provider's refusal on
+        // KVM.
+        let found = match guest.initial_stack_pointer() {
+            Some(stack) => {
+                let memory = guest.memory();
+                crate::procfs::initial_stack_auxv(stack, |at| {
+                    let address =
+                        reverie::syscalls::Addr::<u64>::from_raw(usize::try_from(at).ok()?)?;
+                    memory.read_value(address).ok()
+                })
+                .ok_or(AuxvFromKernel::Implausible)
+            }
+            None => Err(AuxvFromKernel::NoInitialStackPointer),
+        };
+        let bytes = match found {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                // The process's vector from before the exec (its own earlier
+                // image's, or its creator's) is stale: the global tool drops
+                // it (`ProcessAuxvTable::clear`). The run says once, by name,
+                // what the guest sees instead; the global tool's per-run flag
+                // decides the first, so a second run in one process warns too.
+                if crate::tool_global::auxv_from_kernel(guest, why).await {
+                    match why {
+                        AuxvFromKernel::NoInitialStackPointer => warn!(
+                            "auxv: backend gives no initial stack pointer; guest auxv is the \
+                             kernel beneath's"
+                        ),
+                        AuxvFromKernel::Implausible => warn!(
+                            "auxv: the initial stack did not hold a plausible auxiliary vector; \
+                             guest auxv is the kernel beneath's"
+                        ),
+                    }
+                }
+                return;
+            }
+        };
+        crate::tool_global::record_process_auxv(guest, bytes).await;
+    }
+
     /// Adopt, before `call` runs, each descriptor it names that Detcore has
     /// no record of and that is a placeholder this tool process made: a
     /// rendered procfs descriptor that reached this table by a route Detcore
@@ -2776,13 +3287,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                     || (command == libc::F_SETFL
                         && args.arg2 as libc::c_int & libc::O_NOATIME != 0)));
         let access = if needs_access {
-            self.rendered_file_access(
-                guest,
-                path,
-                matches!(sysno, Sysno::fsetxattr | Sysno::fremovexattr),
-                CapabilitySet::Effective,
-            )
-            .await
+            match self
+                .rendered_file_access(
+                    guest,
+                    path,
+                    matches!(sysno, Sysno::fsetxattr | Sysno::fremovexattr),
+                    CapabilitySet::Effective,
+                )
+                .await
+            {
+                Ok(access) => access,
+                Err(error) => return Some(Err(error)),
+            }
         } else {
             FileAccess::GLOBAL_ROOT
         };
@@ -2790,6 +3306,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A sysctl file's placeholder refuses a positioned write as the
             // sysctl does: it is read-only (EBADF), or the position is
             // negative (EINVAL).
+            // A process's `auxv` keeps its positioned writes (`FMODE_PWRITE`):
+            // a negative position is EINVAL first (`pwritev2` at -1, which
+            // writes at the file position, is `writev`'s EBADF on a
+            // read-only description; a writable one is answered by
+            // `answer_rendered_procfs_write`); then a description that cannot
+            // write is EBADF, and one that can the EINVAL of a file with no
+            // write method. Answered here, as its placeholder may be writable.
+            Syscall::Pwrite64(_) | Syscall::Pwritev(_) | Syscall::Pwritev2(_)
+                if !seq_file && per_process =>
+            {
+                let position = args.arg3 as i64;
+                if sysno == Sysno::pwritev2 && position == -1 {
+                    Err(Errno::EBADF)
+                } else if position < 0 || writable {
+                    Err(Errno::EINVAL)
+                } else {
+                    Err(Errno::EBADF)
+                }
+            }
             Syscall::Pwrite64(_) | Syscall::Pwritev(_) | Syscall::Pwritev2(_) if !seq_file => {
                 return None;
             }
@@ -2800,7 +3335,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             Syscall::Fsync(_) | Syscall::Fdatasync(_) => Err(Errno::EINVAL),
             Syscall::Fchmod(_) => Err(Errno::EPERM),
             Syscall::Fgetxattr(c) => match c.name().map(|name| name.read(&guest.memory())) {
-                Some(Ok(name)) => xattr_get_answer(name.as_bytes()),
+                // The description was opened by a caller that could read the
+                // file, so read permission holds.
+                Some(Ok(name)) => xattr_get_answer(name.as_bytes(), true),
                 Some(Err(errno)) => Err(errno),
                 None => Err(Errno::EFAULT),
             },
@@ -2999,6 +3536,7 @@ fn path_request_answer(
                 Err(Errno::EINVAL)
             } else if mode & libc::X_OK as u64 != 0
                 || (mode & libc::W_OK as u64 != 0 && !access.may_write())
+                || (mode & libc::R_OK as u64 != 0 && !access.readable)
             {
                 // No execute bit, which even CAP_DAC_OVERRIDE needs one of.
                 Err(Errno::EACCES)
@@ -3006,7 +3544,7 @@ fn path_request_answer(
                 Ok(0)
             }
         }
-        PathRequest::GetXattr => xattr_get_answer(name.ok_or(Errno::EFAULT)?),
+        PathRequest::GetXattr => xattr_get_answer(name.ok_or(Errno::EFAULT)?, access.readable),
         PathRequest::ListXattr => Ok(0),
         PathRequest::ChangeXattr { size, flags, .. } => {
             if flags & !(libc::XATTR_CREATE | libc::XATTR_REPLACE) as u64 != 0 {
@@ -3397,7 +3935,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let access = self
             .rendered_file_access(guest, rendered, needs_capabilities, set)
-            .await;
+            .await?;
         let answer = path_request_answer(request, name.as_deref(), value.as_deref(), access);
         // A time set on a per-process file stays on its inode (`proc_setattr`
         // keeps what `setattr_copy` copies), which every alias of the file
@@ -4421,9 +4959,17 @@ mod tests {
             255,
         ];
         assert!(posix_acl_parser_refuses(&named), "user ID -1");
-        assert_eq!(xattr_get_answer(b""), Err(Errno::ERANGE));
-        assert_eq!(xattr_get_answer(b"trusted.x"), Err(Errno::ENODATA));
-        assert_eq!(xattr_get_answer(b"user.x"), Err(Errno::EOPNOTSUPP));
+        assert_eq!(xattr_get_answer(b"", true), Err(Errno::ERANGE));
+        assert_eq!(xattr_get_answer(b"trusted.x", true), Err(Errno::ENODATA));
+        assert_eq!(xattr_get_answer(b"user.x", true), Err(Errno::EOPNOTSUPP));
+        assert_eq!(xattr_get_answer(b"", false), Err(Errno::ERANGE));
+        assert_eq!(xattr_get_answer(b"trusted.x", false), Err(Errno::ENODATA));
+        assert_eq!(xattr_get_answer(b"user.x", false), Err(Errno::EACCES));
+        assert_eq!(
+            xattr_get_answer(b"security.x", false),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(xattr_get_answer(b"system.x", false), Err(Errno::EOPNOTSUPP));
     }
 
     /// Measured natively against /proc/sys/kernel/random/uuid as a user the
@@ -4764,6 +5310,110 @@ mod tests {
             None,
             &without_init
         ));
+    }
+
+    /// A process's `auxv` is mode 0400, readable by its owner only, measured
+    /// natively on Linux 7.1: its owner opens it to read; a zombie's (global
+    /// root's) cannot be opened, `access(R_OK)` and a `user.` attribute read
+    /// are EACCES, a `security.` one is the file system's EOPNOTSUPP, and a
+    /// `trusted.` one is invisible (ENODATA); with CAP_DAC_OVERRIDE its owner
+    /// may open it to write.
+    #[test]
+    fn a_process_auxv_is_readable_by_its_owner_only() {
+        let mut file = crate::procfs::ProcfsFile::from_path(Path::new("/proc/self/auxv")).unwrap();
+        file.bind_task(3, 3);
+        let path = file.into_rendered().opened_path().unwrap();
+        assert!(rendered_path_is_owner_only(path));
+        let mut cgroup =
+            crate::procfs::ProcfsFile::from_path(Path::new("/proc/self/cgroup")).unwrap();
+        cgroup.bind_task(3, 3);
+        assert!(!rendered_path_is_owner_only(
+            cgroup.into_rendered().opened_path().unwrap()
+        ));
+        assert!(!rendered_path_is_owner_only(Path::new("/proc/stat")));
+        let epoch = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            rendered_stat(path, epoch, (0, 0)).mode,
+            libc::S_IFREG | 0o400
+        );
+        let owner = FileAccess::owned_with(ALL_CAPABILITIES);
+        assert_eq!(
+            rendered_open_flags(OFlag::O_RDONLY, owner),
+            Ok(OFlag::O_RDONLY)
+        );
+        assert_eq!(rendered_open_flags(OFlag::O_RDWR, owner), Ok(OFlag::O_RDWR));
+        let zombie = FileAccess {
+            readable: false,
+            ..FileAccess::GLOBAL_ROOT
+        };
+        for flags in [
+            OFlag::O_RDONLY,
+            OFlag::O_WRONLY,
+            OFlag::O_RDWR,
+            OFlag::O_ACCMODE,
+        ] {
+            assert_eq!(rendered_open_flags(flags, zombie), Err(Errno::EACCES));
+        }
+        // An `O_PATH` descriptor asks for no access.
+        assert_eq!(
+            rendered_open_flags(OFlag::O_PATH, zombie),
+            Ok(OFlag::O_PATH)
+        );
+        let probe = |mode: i32| {
+            path_request_answer(
+                PathRequest::Access {
+                    mode: mode as u64,
+                    flags: 0,
+                },
+                None,
+                None,
+                zombie,
+            )
+        };
+        assert_eq!(probe(libc::F_OK), Ok(0));
+        assert_eq!(probe(libc::R_OK), Err(Errno::EACCES));
+        let get =
+            |name: &[u8]| path_request_answer(PathRequest::GetXattr, Some(name), None, zombie);
+        assert_eq!(get(b"user.x"), Err(Errno::EACCES));
+        assert_eq!(get(b"security.x"), Err(Errno::EOPNOTSUPP));
+        assert_eq!(get(b"trusted.x"), Err(Errno::ENODATA));
+    }
+
+    /// What decides another process's open of a rendered `auxv`: the
+    /// target's probe opens (allowed); it is refused while the caller's own
+    /// `/proc/thread-self/stat` opens (the kernel beneath decided: its errno);
+    /// that is refused with EACCES too (no `/proc` beneath: the caller's
+    /// `CAP_SYS_PTRACE` decides); any other errno is the open's answer.
+    #[test]
+    fn another_process_opens_auxv_as_the_kernel_beneath_answers() {
+        use AuxvAccess::Answer;
+        use AuxvAccess::CallerCapability;
+        for serves in [Ok(()), Err(Errno::EACCES), Err(Errno::EMFILE)] {
+            assert_eq!(auxv_access_answer(Ok(()), serves), Answer(Ok(())));
+        }
+        for refused in [Errno::EACCES, Errno::EPERM, Errno::ESRCH, Errno::EMFILE] {
+            assert_eq!(
+                auxv_access_answer(Err(refused), Ok(())),
+                Answer(Err(refused))
+            );
+        }
+        assert_eq!(
+            auxv_access_answer(Err(Errno::EACCES), Err(Errno::EACCES)),
+            CallerCapability
+        );
+        for operational in [Errno::EMFILE, Errno::ENFILE, Errno::ENOMEM] {
+            assert_eq!(
+                auxv_access_answer(Err(operational), Err(operational)),
+                Answer(Err(operational))
+            );
+            assert_eq!(
+                auxv_access_answer(Err(Errno::EACCES), Err(operational)),
+                Answer(Err(operational))
+            );
+        }
     }
 
     /// A per-process file belongs to the guest's own identity, and the path

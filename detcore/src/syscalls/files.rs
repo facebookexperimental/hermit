@@ -4003,7 +4003,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // eventfd, which resolves to no procfs file, so both runs must
                 // classify the open by the link the recording read
                 // (`recorded_open_path`).
-                let mut procfs = ProcfsFile::from_path(&observed_path);
+                // A process's `auxv` the kernel opened keeps the kernel's
+                // bytes, unclassified, as before Detcore rendered the file
+                // (`ProcfsFile::kernel_served`): by its spelling here, and by
+                // its link below.
+                let mut procfs =
+                    ProcfsFile::from_path(&observed_path).filter(ProcfsFile::kernel_served);
                 // Under record and replay the link is read for every open,
                 // also one whose spelling classifies: a spelling through `..`
                 // (`/proc/self/../self/io`) classifies as the file it reaches,
@@ -4041,7 +4046,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if procfs.is_none() {
                         procfs = resolved
                             .filter(|resolved| resolved != &observed_path)
-                            .and_then(|resolved| ProcfsFile::from_path(&resolved));
+                            .and_then(|resolved| ProcfsFile::from_path(&resolved))
+                            .filter(ProcfsFile::kernel_served);
                     }
                 }
                 // A process's cgroup file bind-mounted at another path, or
@@ -14211,6 +14217,12 @@ mod inject_fstat_scratch {
         writable: bool,
         arena: usize,
         guard_live: Arc<AtomicBool>,
+        /// A failing commit first overwrites the scratch's first word, as a
+        /// commit that faults part way does.
+        partial: bool,
+        /// A page that a failing commit makes read-only after its partial
+        /// write, so the borrower cannot put the bytes back.
+        protect_on_failure: Option<usize>,
     }
 
     struct ScriptedStackGuard {
@@ -14241,6 +14253,18 @@ mod inject_fstat_scratch {
         }
         fn commit(self) -> Result<Self::StackGuard, Errno> {
             if !self.writable {
+                if self.partial {
+                    // SAFETY: the arena (or scratch page) is this guest's,
+                    // writable until protected below.
+                    unsafe { (self.arena as *mut u64).write(0) };
+                }
+                if let Some(page) = self.protect_on_failure {
+                    // SAFETY: the page is the test's own mapping.
+                    assert_eq!(
+                        unsafe { libc::mprotect(page as *mut _, 4096, libc::PROT_READ) },
+                        0
+                    );
+                }
                 return Err(Errno::EFAULT);
             }
             self.guard_live.store(true, Ordering::SeqCst);
@@ -14270,6 +14294,30 @@ mod inject_fstat_scratch {
         closed: Vec<RawFd>,
         runtime_fd: Option<RawFd>,
         directory_batches: std::collections::VecDeque<Result<Vec<u8>, Errno>>,
+        /// Scripted refusals of injected opens, in order; an open with none
+        /// left opens a real file.
+        open_errors: std::collections::VecDeque<Errno>,
+        /// The paths of injected opens, as the guest's memory held them.
+        opened_paths: Vec<Vec<u8>>,
+        /// The real descriptors injected opens returned.
+        opened_fds: Vec<RawFd>,
+        /// Scripted errors of injected closes, in order, before any real
+        /// close.
+        close_errors: std::collections::VecDeque<Errno>,
+        /// Every injected close's descriptor, a scripted failure included.
+        close_attempts: Vec<RawFd>,
+        /// The effective set an injected capget reports (the permitted set is
+        /// every capability).
+        capget_effective: u64,
+        /// A page of its own for the stack scratch, in place of the arena.
+        scratch_page: Option<usize>,
+        /// A failing commit's partial write, and whether it then makes the
+        /// scratch page read-only.
+        commit_partial: bool,
+        protect_page_on_commit_failure: bool,
+        /// The injected syscall at which the scratch page becomes read-only,
+        /// so that putting its bytes back fails.
+        protect_page_on: Option<Sysno>,
     }
 
     impl ScriptedGuest {
@@ -14297,8 +14345,51 @@ mod inject_fstat_scratch {
                 closed: Vec::new(),
                 runtime_fd: None,
                 directory_batches: Default::default(),
+                open_errors: Default::default(),
+                opened_paths: Vec::new(),
+                opened_fds: Vec::new(),
+                close_errors: Default::default(),
+                close_attempts: Vec::new(),
+                capget_effective: (1 << 41) - 1,
+                scratch_page: None,
+                commit_partial: false,
+                protect_page_on_commit_failure: false,
+                protect_page_on: None,
             };
             (tool, guest)
+        }
+
+        /// A guest whose stack scratch is a page of its own, holding a
+        /// pattern, and whose failure policy returns EOPNOTSUPP rather than
+        /// stopping (as with --allow-unsupported-syscalls).
+        fn with_scratch_page(stack_writable: bool) -> (Detcore, Self) {
+            let (tool, mut guest) = Self::new(stack_writable, false);
+            guest.config.panic_on_unsupported_syscalls = false;
+            // SAFETY: a fresh private anonymous page, unmapped by the test.
+            let page = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(page, libc::MAP_FAILED);
+            // SAFETY: the page is 4096 writable bytes.
+            unsafe { std::ptr::write_bytes(page as *mut u8, 0xa5, 4096) };
+            guest.scratch_page = Some(page as usize);
+            (tool, guest)
+        }
+
+        /// The scratch page's bytes, and the page unmapped.
+        fn take_scratch_page(&mut self) -> Vec<u8> {
+            let page = self.scratch_page.take().unwrap();
+            // SAFETY: the page is the test's mapping, readable throughout.
+            let bytes = unsafe { std::slice::from_raw_parts(page as *const u8, 4096) }.to_vec();
+            assert_eq!(unsafe { libc::munmap(page as *mut _, 4096) }, 0);
+            bytes
         }
     }
 
@@ -14347,8 +14438,14 @@ mod inject_fstat_scratch {
         async fn stack(&mut self) -> Self::Stack {
             ScriptedStack {
                 writable: self.stack_writable,
-                arena: self.arena.as_mut_ptr() as usize,
+                arena: self
+                    .scratch_page
+                    .unwrap_or(self.arena.as_mut_ptr() as usize),
                 guard_live: self.guard_live.clone(),
+                partial: self.commit_partial,
+                protect_on_failure: self
+                    .scratch_page
+                    .filter(|_| self.protect_page_on_commit_failure),
             }
         }
         async fn daemonize(&mut self) {
@@ -14357,6 +14454,16 @@ mod inject_fstat_scratch {
         async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
             let (number, args) = syscall.into_parts();
             self.injected.push(number);
+            if let Some(page) = self
+                .scratch_page
+                .filter(|_| self.protect_page_on == Some(number))
+            {
+                // SAFETY: the page is the test's own mapping.
+                assert_eq!(
+                    unsafe { libc::mprotect(page as *mut _, 4096, libc::PROT_READ) },
+                    0
+                );
+            }
             if matches!(number, Sysno::getdents | Sysno::getdents64) {
                 let bytes = self
                     .directory_batches
@@ -14415,8 +14522,41 @@ mod inject_fstat_scratch {
                     raw
                 }
                 Syscall::Close(call) => {
+                    self.close_attempts.push(call.fd());
+                    if let Some(errno) = self.close_errors.pop_front() {
+                        return Err(errno);
+                    }
                     self.closed.push(call.fd());
                     i64::from(unsafe { libc::close(call.fd()) })
+                }
+                Syscall::Openat(call) => {
+                    let path = call.path().expect("openat without a path");
+                    let path = path.read(&self.memory()).unwrap();
+                    self.opened_paths
+                        .push(path.as_os_str().as_encoded_bytes().to_vec());
+                    if let Some(errno) = self.open_errors.pop_front() {
+                        return Err(errno);
+                    }
+                    let (fd, _) = open_file();
+                    self.opened_fds.push(fd);
+                    i64::from(fd)
+                }
+                Syscall::Capget(call) => {
+                    // Every capability, in the effective and permitted sets.
+                    let data = call.data().expect("capget without data").as_raw();
+                    let effective = self.capget_effective;
+                    let words: [u32; 6] = [
+                        effective as u32,
+                        u32::MAX,
+                        0,
+                        (effective >> 32) as u32,
+                        0x1ff,
+                        0,
+                    ];
+                    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_ne_bytes()).collect();
+                    self.memory()
+                        .write_exact(AddrMut::<u8>::from_raw(data).unwrap(), &bytes)?;
+                    0
                 }
                 other => panic!("unexpected injected syscall {other:?}"),
             };
@@ -14573,6 +14713,190 @@ mod inject_fstat_scratch {
             .thread
             .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.inode))
             .unwrap()
+    }
+
+    /// The errno of a call the failure policy answered, which a guest run
+    /// with --allow-unsupported-syscalls sees.
+    fn policy_errno(error: Error) -> Errno {
+        error.into_errno().unwrap()
+    }
+
+    /// The task whose `/proc/3/auxv` the access tests open.
+    const TARGET: crate::procfs::BoundTask = crate::procfs::BoundTask {
+        process: 3,
+        thread: None,
+    };
+
+    /// Another process's open of a rendered `/proc/<pid>/auxv`, decided
+    /// through `ptrace_read_allowed` by the caller's probe opens, as the
+    /// kernel beneath answers them:
+    /// - the target's probe opens: allowed, one probe;
+    /// - it is refused while the caller's `/proc/thread-self/stat` opens: the
+    ///   refusal's errno;
+    /// - both are refused with EACCES (the provider's backstop): the caller's
+    ///   CAP_SYS_PTRACE decides, with and without it;
+    /// - both fail with EMFILE (a full descriptor table): EMFILE, never the
+    ///   fallback's EACCES;
+    /// - an open Reverie reports did not run (ERESTARTSYS) is retried.
+    #[tokio::test]
+    async fn the_auxv_access_check_follows_the_kernel_beneaths_answers() {
+        let paths = |guest: &ScriptedGuest| guest.opened_paths.clone();
+        let target = b"/proc/3/auxv".to_vec();
+        let serves = b"/proc/thread-self/stat".to_vec();
+        let all = (1_u64 << 41) - 1;
+        let without_ptrace = all & !(1 << 19);
+        for (errors, effective, answer, probes, capget) in [
+            (vec![], all, Ok(()), vec![target.clone()], false),
+            (
+                vec![Errno::EACCES],
+                all,
+                Err(Errno::EACCES),
+                vec![target.clone(), serves.clone()],
+                false,
+            ),
+            (
+                vec![Errno::EACCES, Errno::EACCES],
+                all,
+                Ok(()),
+                vec![target.clone(), serves.clone()],
+                true,
+            ),
+            (
+                vec![Errno::EACCES, Errno::EACCES],
+                without_ptrace,
+                Err(Errno::EACCES),
+                vec![target.clone(), serves.clone()],
+                true,
+            ),
+            (
+                vec![Errno::EMFILE, Errno::EMFILE],
+                without_ptrace,
+                Err(Errno::EMFILE),
+                vec![target.clone(), serves.clone()],
+                false,
+            ),
+            (
+                vec![Errno::ERESTARTSYS],
+                without_ptrace,
+                Ok(()),
+                vec![target.clone(), target.clone()],
+                false,
+            ),
+        ] {
+            let (_tool, mut guest) = ScriptedGuest::with_scratch_page(true);
+            guest.open_errors.extend(errors.clone());
+            guest.capget_effective = effective;
+            let result = Detcore::ptrace_read_allowed(&mut guest, TARGET).await;
+            assert_eq!(result.unwrap(), answer, "{errors:?}");
+            assert_eq!(paths(&guest), probes, "{errors:?}");
+            assert_eq!(
+                guest.injected.contains(&Sysno::capget),
+                capget,
+                "{errors:?}"
+            );
+            assert_eq!(guest.closed, guest.opened_fds, "every probe is closed");
+            assert!(
+                guest.take_scratch_page().iter().all(|byte| *byte == 0xa5),
+                "{errors:?}: the scratch is left modified"
+            );
+        }
+    }
+
+    /// Guest stack scratch that cannot be used, or cannot be put back, is
+    /// the failure policy's (EOPNOTSUPP under --allow-unsupported-syscalls,
+    /// a named stop otherwise), never an access answer:
+    /// - a commit that fails, its partial write put back: no probe runs,
+    ///   and the scratch is as it was;
+    /// - a commit that fails part way and whose partial write cannot be put
+    ///   back;
+    /// - a probe, and a capget (K1's), whose scratch becomes read-only
+    ///   before it is put back.
+    /// And a capget that succeeds puts its scratch back.
+    #[tokio::test]
+    async fn guest_stack_scratch_failures_go_to_the_failure_policy() {
+        // A commit that fails, put back.
+        let (_tool, mut guest) = ScriptedGuest::with_scratch_page(false);
+        guest.commit_partial = true;
+        let result = Detcore::ptrace_read_allowed(&mut guest, TARGET).await;
+        assert_eq!(policy_errno(result.unwrap_err()), Errno::EOPNOTSUPP);
+        assert!(guest.injected.is_empty());
+        assert!(guest.take_scratch_page().iter().all(|byte| *byte == 0xa5));
+        // A partial write that cannot be put back.
+        let (_tool, mut guest) = ScriptedGuest::with_scratch_page(false);
+        guest.commit_partial = true;
+        guest.protect_page_on_commit_failure = true;
+        let result = Detcore::ptrace_read_allowed(&mut guest, TARGET).await;
+        assert_eq!(policy_errno(result.unwrap_err()), Errno::EOPNOTSUPP);
+        assert!(guest.injected.is_empty());
+        guest.take_scratch_page();
+        let (_tool, mut guest) = ScriptedGuest::with_scratch_page(false);
+        guest.commit_partial = true;
+        guest.protect_page_on_commit_failure = true;
+        let result =
+            Detcore::inject_capget(&mut guest, rendered_procfs::CapabilitySet::Effective).await;
+        assert_eq!(policy_errno(result.unwrap_err()), Errno::EOPNOTSUPP);
+        guest.take_scratch_page();
+        // A probe whose scratch cannot be put back: its descriptor is still
+        // closed.
+        let (_tool, mut guest) = ScriptedGuest::with_scratch_page(true);
+        guest.protect_page_on = Some(Sysno::openat);
+        let result = Detcore::ptrace_read_allowed(&mut guest, TARGET).await;
+        assert_eq!(policy_errno(result.unwrap_err()), Errno::EOPNOTSUPP);
+        assert_eq!(guest.closed, guest.opened_fds);
+        guest.take_scratch_page();
+        // A capget whose scratch cannot be put back.
+        let (_tool, mut guest) = ScriptedGuest::with_scratch_page(true);
+        guest.protect_page_on = Some(Sysno::capget);
+        let result =
+            Detcore::inject_capget(&mut guest, rendered_procfs::CapabilitySet::Effective).await;
+        assert_eq!(policy_errno(result.unwrap_err()), Errno::EOPNOTSUPP);
+        guest.take_scratch_page();
+        // A capget that succeeds.
+        let (_tool, mut guest) = ScriptedGuest::with_scratch_page(true);
+        let result =
+            Detcore::inject_capget(&mut guest, rendered_procfs::CapabilitySet::Effective).await;
+        assert_eq!(result.unwrap(), Some((1 << 41) - 1));
+        assert!(guest.take_scratch_page().iter().all(|byte| *byte == 0xa5));
+    }
+
+    /// The probe's close, as Linux's close allows: a close Reverie reports
+    /// did not run (ERESTARTSYS) is retried; EINTR is not (Linux released
+    /// the descriptor before returning it); any other error is the failure
+    /// policy's, never a silent leak.
+    #[tokio::test]
+    async fn the_auxv_access_probe_closes_its_descriptor_as_linux_close_allows() {
+        let (_tool, mut guest) = ScriptedGuest::with_scratch_page(true);
+        guest.close_errors.push_back(Errno::ERESTARTSYS);
+        let result = Detcore::ptrace_read_allowed(&mut guest, TARGET).await;
+        assert_eq!(result.unwrap(), Ok(()));
+        let [fd] = guest.opened_fds[..] else { panic!() };
+        assert_eq!(
+            guest.close_attempts,
+            [fd, fd],
+            "a close that did not run is retried"
+        );
+        assert_eq!(guest.closed, [fd]);
+        guest.take_scratch_page();
+        for (errno, failed) in [(Errno::EINTR, false), (Errno::EBADF, true)] {
+            let (_tool, mut guest) = ScriptedGuest::with_scratch_page(true);
+            guest.close_errors.push_back(errno);
+            let result = Detcore::ptrace_read_allowed(&mut guest, TARGET).await;
+            let [fd] = guest.opened_fds[..] else { panic!() };
+            assert_eq!(guest.close_attempts, [fd], "{errno} is not retried");
+            match result {
+                Ok(answer) => {
+                    assert!(!failed, "{errno}");
+                    assert_eq!(answer, Ok(()));
+                }
+                Err(error) => {
+                    assert!(failed, "{errno}");
+                    assert_eq!(policy_errno(error), Errno::EOPNOTSUPP);
+                }
+            }
+            // The scripted error left the real descriptor open.
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+            assert!(guest.take_scratch_page().iter().all(|byte| *byte == 0xa5));
+        }
     }
 
     #[tokio::test]

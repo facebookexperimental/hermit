@@ -3218,6 +3218,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         tool_global::mark_past_first_execve(guest).await;
+        // The new image's auxiliary vector, as it finds it on its initial
+        // stack, for its `/proc/<pid>/auxv` (package K slice K2 of
+        // https://github.com/rrnewton/hermit/issues/4213). Not under record
+        // and replay, where Detcore renders no procfs file.
+        // Boxed, so its injected calls do not grow the post-exec future,
+        // which a backend may poll on a small stack.
+        if !self.cfg.recordreplay_modes {
+            Box::pin(self.record_process_auxv(guest)).await;
+        }
         // The new image's program-break model, checked against the kernel's
         // once its exec record is in place.
         self.check_brk_model(guest).await;

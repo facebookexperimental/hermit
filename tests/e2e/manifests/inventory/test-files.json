@@ -2030,6 +2030,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/rendered_process_auxv.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/rendered_process_auxv.c is owned by hermit-cli/tests/cli.rs: the CLI test detcore_renders_process_auxv_on_every_backend runs it natively and at bitwise parity on every backend procfs_backends compares, and requires /proc/<pid>/auxv, which Detcore renders per process from the auxiliary vector on each new image's initial stack, to read that vector, to answer Linux's calls on the file, and to admit another process's open as ptrace_may_access does across dumpability, capabilities and exec, with the same lines on every backend (https://github.com/rrnewton/hermit/issues/4213). It stays a fixture because a generic manifest cannot compare stdout across backends."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/rendered_process_files.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/rendered_process_files.c is owned by hermit-cli/tests/cli.rs: the CLI test detcore_renders_process_cgroup_on_every_backend runs it natively and at bitwise parity on ptrace, DBT, KVM and e9patch preprocessing with ptrace (SaBRe, LiteInst and in-guest-trap are named as not yet, with their issues), and requires every spelling of /proc/<pid>/cgroup, which Detcore renders per process without the backend opening it, to reach the file Linux reaches and read 0::/, the same lines on every backend, and the owner's answers to the calls that write it (https://github.com/rrnewton/hermit/issues/4213). It stays a fixture because a generic manifest cannot pass the KVM-only option or compare stdout across backends."

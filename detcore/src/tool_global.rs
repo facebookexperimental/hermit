@@ -1210,6 +1210,9 @@ pub struct GlobalState {
     /// another process's `/proc/<pid>/exe`. A new process starts with its
     /// creator's; the record goes with the process.
     exec_images: Arc<Mutex<BTreeMap<DetPid, crate::exec_record::ExecRecord>>>,
+    /// The auxiliary vector of each guest process's current image, for its
+    /// `/proc/<pid>/auxv` ([`ProcessAuxvTable`]).
+    process_auxv: Arc<Mutex<ProcessAuxvTable>>,
     /// The registered root thread, whose first image
     /// `Config::launch_image` names, and whether that image was completed.
     root_dettid: OnceLock<DetTid>,
@@ -1255,6 +1258,103 @@ struct ProcessExitCleanup {
     completed_exec_transfers: Arc<Mutex<BTreeMap<DetPid, exec_identity::ExecTransferReceipt>>>,
     post_exec_fd_blocking: Arc<Mutex<BTreeMap<DetTid, ExecFdState>>>,
     exec_images: Arc<Mutex<BTreeMap<DetPid, crate::exec_record::ExecRecord>>>,
+    process_auxv: Arc<Mutex<ProcessAuxvTable>>,
+}
+
+/// What `/proc/<pid>/auxv` reads for each guest process, on every backend
+/// that reports an initial stack pointer (package K slice K2,
+/// <https://github.com/rrnewton/hermit/issues/4213>): the auxiliary vector its
+/// current image found on its initial stack when it was exec'd
+/// (`Detcore::record_process_auxv`), as Linux's `saved_auxv`. Another
+/// process's access to it is decided by the kernel beneath at the open
+/// (`Detcore::ptrace_read_allowed`), so nothing about access is kept here.
+///
+/// One entry per live process, at most `procfs::MAX_AUXV_BYTES` (Linux's
+/// `saved_auxv`, 52 words), forgotten at the process's exit. A descriptor
+/// keeps the snapshot its open took, through any later exec or exit.
+///
+/// Not kept: the vectors of earlier images for a descriptor that a backend
+/// rebuilds from its placeholder's name after an exec. Only backends that
+/// rebuild descriptors that way (DBT, SaBRe, LiteInst) would need them, and
+/// none of them reports an initial stack pointer, so none renders this file.
+/// That path returns, with end-to-end tests, when DBT implements
+/// `Guest::initial_stack_pointer`.
+#[derive(Debug, Default)]
+pub(crate) struct ProcessAuxvTable {
+    /// Each live process's current image's auxiliary vector.
+    processes: BTreeMap<DetPid, Vec<u8>>,
+    /// Whether this run has warned that a backend reports no initial stack
+    /// pointer, and that an initial stack held no plausible vector
+    /// ([`ProcessAuxvTable::first_kernel_file`]).
+    kernel_file_warned: [bool; 2],
+}
+
+/// A process's `/proc/<pid>/auxv` ([`ProcessAuxvTable::current`]).
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub struct ProcessAuxv {
+    /// The process, which a thread's number names too.
+    pub process: DetPid,
+    /// Its current image's auxiliary vector.
+    pub bytes: Vec<u8>,
+}
+
+/// Why an image's `/proc/<pid>/auxv` is left to the kernel beneath
+/// ([`ProcessAuxvTable::first_kernel_file`]).
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+pub enum AuxvFromKernel {
+    /// The backend reports no initial stack pointer.
+    NoInitialStackPointer,
+    /// The initial stack held no plausible auxiliary vector.
+    Implausible,
+}
+
+impl ProcessAuxvTable {
+    /// Record `bytes`, the auxiliary vector `process`'s new image found on its
+    /// initial stack, as its current vector.
+    pub(crate) fn record(&mut self, process: DetPid, bytes: Vec<u8>) {
+        self.processes.insert(process, bytes);
+    }
+
+    /// `process`'s current image's auxiliary vector.
+    pub(crate) fn current(&self, process: DetPid) -> Option<ProcessAuxv> {
+        Some(ProcessAuxv {
+            process,
+            bytes: self.processes.get(&process)?.clone(),
+        })
+    }
+
+    /// A new process `child` runs its creator `parent`'s image until it
+    /// execs.
+    pub(crate) fn inherit(&mut self, parent: DetPid, child: DetPid) {
+        match self.processes.get(&parent).cloned() {
+            Some(bytes) => self.processes.insert(child, bytes),
+            None => self.processes.remove(&child),
+        };
+    }
+
+    /// `process` is gone, or its new image has no vector Detcore recorded
+    /// (whatever it held before the exec, its own earlier image's or its
+    /// creator's, is stale), so its file is the kernel's. Descriptors already
+    /// open keep their snapshots.
+    pub(crate) fn forget(&mut self, process: DetPid) {
+        self.processes.remove(&process);
+    }
+
+    /// How many processes have a current vector.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.processes.len()
+    }
+
+    /// Whether this is the run's first image whose `/proc/<pid>/auxv` is left
+    /// to the kernel beneath for `why`, which the run warns of once.
+    pub(crate) fn first_kernel_file(&mut self, why: AuxvFromKernel) -> bool {
+        let index = match why {
+            AuxvFromKernel::NoInitialStackPointer => 0,
+            AuxvFromKernel::Implausible => 1,
+        };
+        !std::mem::replace(&mut self.kernel_file_warned[index], true)
+    }
 }
 
 impl ProcessExitCleanup {
@@ -1297,6 +1397,7 @@ impl ProcessExitCleanup {
             .remove(&process);
         self.post_exec_fd_blocking.lock().unwrap().remove(&process);
         self.exec_images.lock().unwrap().remove(&process);
+        self.process_auxv.lock().unwrap().forget(process);
         if consume_unreported {
             let consumed = sched.consume_unreported_exit(process);
             debug_assert_eq!(consumed, loss.is_some());
@@ -1459,6 +1560,7 @@ impl GlobalState {
             completed_exec_transfers: process_exit_cleanup.completed_exec_transfers,
             post_exec_fd_blocking: process_exit_cleanup.post_exec_fd_blocking,
             exec_images: process_exit_cleanup.exec_images,
+            process_auxv: process_exit_cleanup.process_auxv,
             root_dettid: OnceLock::new(),
             root_image_marked: AtomicBool::new(false),
             launcher_identity: OnceLock::new(),
@@ -1606,6 +1708,7 @@ impl GlobalState {
             completed_exec_transfers: self.completed_exec_transfers.clone(),
             post_exec_fd_blocking: self.post_exec_fd_blocking.clone(),
             exec_images: self.exec_images.clone(),
+            process_auxv: self.process_auxv.clone(),
         }
     }
 
@@ -1683,6 +1786,7 @@ impl GlobalState {
         self.completed_exec_transfers.lock().unwrap().clear();
         self.post_exec_fd_blocking.lock().unwrap().clear();
         self.exec_images.lock().unwrap().clear();
+        *self.process_auxv.lock().unwrap() = ProcessAuxvTable::default();
         let released = self
             .sched
             .lock()
@@ -2015,6 +2119,15 @@ impl GlobalTool for GlobalState {
                 .lock()
                 .unwrap()
                 .complete_child_exit_publication(DetPid::from_raw(pid));
+            // This branch bypasses `ProcessExitCleanup::complete_locked`: the
+            // process's `/proc/<pid>/auxv` vector goes here. A zombie's file
+            // is served on the rendered path whether or not its vector is
+            // still kept (`Detcore::auxv_kept_by_kernel`), so the host-timed
+            // moment of this report changes nothing the guest sees.
+            self.process_auxv
+                .lock()
+                .unwrap()
+                .forget(DetPid::from_raw(pid));
             if released {
                 trace!("[detcore, dpid {}] backend published the child exit", pid);
             }
@@ -3509,6 +3622,27 @@ impl GlobalState {
                         .map(Box::new),
                 )
             }
+            GlobalRequest::RecordProcessAuxv(bytes) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let process = sched.registered_process(dtid).unwrap_or(dtid);
+                self.process_auxv.lock().unwrap().record(process, bytes);
+                R::RecordProcessAuxv(())
+            }
+            GlobalRequest::ProcessAuxv(process) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                // `/proc/<tid>/auxv` is a thread's process's.
+                let process = sched
+                    .registered_process(DetTid::from_raw(process.as_raw()))
+                    .unwrap_or(process);
+                R::ProcessAuxv(self.process_auxv.lock().unwrap().current(process))
+            }
+            GlobalRequest::AuxvFromKernel(why) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let process = sched.registered_process(dtid).unwrap_or(dtid);
+                let mut table = self.process_auxv.lock().unwrap();
+                table.forget(process);
+                R::AuxvFromKernel(table.first_kernel_file(why))
+            }
             GlobalRequest::GroupOrSession(pid, session) => R::GroupOrSession(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -4066,6 +4200,10 @@ impl GlobalState {
                         None => images.remove(&child_dettid),
                     };
                     drop(images);
+                    self.process_auxv
+                        .lock()
+                        .unwrap()
+                        .inherit(parent_detpid, child_dettid);
                     sched.inherit_real_time_records(parent_detpid, child_dettid);
                 }
             }
@@ -5672,6 +5810,17 @@ pub enum GlobalRequest {
     /// it (`Scheduler::publish_signal_mask`). Answered before any clock or
     /// scheduler accounting. Appended last.
     PublishSignalMask(Option<u64>),
+    /// The auxiliary vector the sender's process's new image found on its
+    /// initial stack (`ProcessAuxvTable::record`). Appended last.
+    RecordProcessAuxv(Vec<u8>),
+    /// A process's image's auxiliary vector (`ProcessAuxvTable::current`), for
+    /// `/proc/<pid>/auxv`. Appended last.
+    ProcessAuxv(DetPid),
+    /// The sender's process's new image's `/proc/<pid>/auxv` is left to the
+    /// kernel beneath (`ProcessAuxvTable::forget`), for the reason given.
+    /// Answers whether this is the run's first such image for that reason,
+    /// which the sender warns of. Appended last.
+    AuxvFromKernel(AuxvFromKernel),
 }
 
 /// Responses from the global object
@@ -5865,6 +6014,12 @@ pub enum GlobalResponse {
     /// Whether the scheduler took the mask (it takes nothing from a thread it
     /// does not know). Appended last.
     PublishSignalMask(bool),
+    /// Appended last.
+    RecordProcessAuxv(()),
+    /// Appended last.
+    ProcessAuxv(Option<ProcessAuxv>),
+    /// Whether this is the run's first. Appended last.
+    AuxvFromKernel(bool),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -8262,6 +8417,54 @@ where
     }
 }
 
+/// Record the auxiliary vector the sender's process's new image found on
+/// its initial stack (`ProcessAuxvTable::record`).
+pub(crate) async fn record_process_auxv<G, T>(guest: &mut G, bytes: Vec<u8>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::RecordProcessAuxv(bytes))
+        .await
+        .1;
+    assert_eq!(response, GlobalResponse::RecordProcessAuxv(()));
+}
+
+/// The process whose image `/proc/<process>/auxv` describes (a thread's
+/// number names its process), and that image's auxiliary vector
+/// (`ProcessAuxvTable::current`).
+pub(crate) async fn process_auxv<G, T>(guest: &mut G, process: DetPid) -> Option<ProcessAuxv>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::ProcessAuxv(process))
+        .await
+        .1
+    {
+        GlobalResponse::ProcessAuxv(answer) => answer,
+        _ => unreachable!(),
+    }
+}
+
+/// Report that the sender's process's new image's `/proc/<pid>/auxv` is left
+/// to the kernel beneath for `why`, and learn whether it is the run's first
+/// for that reason, which the caller warns of: the guest's tool prints where
+/// the run's output shows it, which the global tool's log does not on DBT.
+pub(crate) async fn auxv_from_kernel<G, T>(guest: &mut G, why: AuxvFromKernel) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::AuxvFromKernel(why))
+        .await
+        .1
+    {
+        GlobalResponse::AuxvFromKernel(first) => first,
+        _ => unreachable!(),
+    }
+}
+
 /// Change or read the state Detcore keeps on the rendered per-process `/proc`
 /// file numbered `inode` (`InodePool::rendered_file_state`).
 pub async fn rendered_file_state<G, T>(
@@ -8653,6 +8856,43 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// A process reads its current image's vector; a forked child its
+    /// creator's until it execs; an exec replaces it; a forgotten process
+    /// (gone, or an exec with no recorded vector) has none.
+    #[test]
+    fn process_auxv_follows_exec_and_fork() {
+        use super::ProcessAuxv;
+        use super::ProcessAuxvTable;
+        use crate::types::DetPid;
+        let (parent, child) = (DetPid::from_raw(3), DetPid::from_raw(4));
+        let mut table = ProcessAuxvTable::default();
+        assert_eq!(table.current(parent), None);
+        table.record(parent, vec![1; 16]);
+        table.inherit(parent, child);
+        assert_eq!(
+            table.current(child),
+            Some(ProcessAuxv {
+                process: child,
+                bytes: vec![1; 16]
+            })
+        );
+        table.record(child, vec![2; 32]);
+        assert_eq!(
+            table.current(child).map(|entry| entry.bytes),
+            Some(vec![2; 32])
+        );
+        assert_eq!(
+            table.current(parent).map(|entry| entry.bytes),
+            Some(vec![1; 16])
+        );
+        table.forget(parent);
+        assert_eq!(table.current(parent), None);
+        // A creator with no vector gives its child none.
+        table.inherit(parent, child);
+        assert_eq!(table.current(child), None);
+        assert_eq!(table.len(), 0);
+    }
+
     /// Hermit's tasks are exactly its own thread group, named from its own PID
     /// namespace (<https://github.com/rrnewton/hermit/issues/4066>). The test
     /// process stands in for Hermit.
@@ -9853,6 +10093,119 @@ mod tests {
             replay.provenance().unwrap().unwrap().assignment_order,
             provenance.assignment_order
         );
+    }
+
+    /// The global tool's `/proc/<pid>/auxv` rows, driven through its RPC
+    /// handlers and the backend's exit reports as a ptrace run drives them:
+    /// a forked child (and a CLONE_VM child, sharing the creator's memory
+    /// map) inherit the creator's vector; an exec whose vector could not be
+    /// recorded drops the child's stale one (`AuxvFromKernel`), and the run
+    /// warns only of the first; the exit reports a ptrace backend sends
+    /// (child-exit publication, which bypasses the physical-exit cleanup)
+    /// leave no row behind, the last process of the shared map included.
+    #[tokio::test]
+    async fn auxv_rows_follow_fork_failed_exec_and_exit_through_the_handlers() {
+        use super::AuxvFromKernel;
+        use super::ChildRegistration;
+
+        let config = Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        }
+        .with_backend(|backend| backend.reports_child_exit_publication = true);
+        let state = GlobalState::initialize(&config, false);
+        let root = DetTid::from_raw(3);
+        let (forked, shared) = (DetTid::from_raw(4), DetTid::from_raw(5));
+        let root_mm = MmId::initial(root);
+        assert!(matches!(
+            state
+                .recv_create_child_thread(
+                    Tid::from_raw(root.as_raw()),
+                    root_mm,
+                    ChildRegistration {
+                        parent_dettid: root,
+                        parent_detpid: root,
+                        child_dettid: root,
+                        child_tid_addr: 0,
+                        flags: None,
+                        exit_signal: libc::SIGCHLD,
+                        physical_ids: None,
+                        maybe_priority: Some(DEFAULT_PRIORITY),
+                        parent_is_kernel_blocked: false,
+                    },
+                )
+                .await,
+            SchedulerRpcResult::Continue(())
+        ));
+        let rpc = |task: DetTid, mm: MmId, request: GlobalRequest| {
+            state.receive_rpc(
+                Tid::from_raw(task.as_raw()),
+                (DetTime::new(&config), mm, request),
+            )
+        };
+        let response = rpc(root, root_mm, GlobalRequest::RecordProcessAuxv(vec![7; 32]))
+            .await
+            .1;
+        assert_eq!(response, GlobalResponse::RecordProcessAuxv(()));
+        for (task, flags) in [
+            (forked, CloneFlags::empty()),
+            (shared, CloneFlags::CLONE_VM),
+        ] {
+            assert!(matches!(
+                state
+                    .recv_create_child_thread(
+                        Tid::from_raw(root.as_raw()),
+                        root_mm,
+                        ChildRegistration {
+                            parent_dettid: root,
+                            parent_detpid: root,
+                            child_dettid: task,
+                            child_tid_addr: 0,
+                            flags: Some(flags),
+                            exit_signal: libc::SIGCHLD,
+                            physical_ids: None,
+                            maybe_priority: Some(DEFAULT_PRIORITY),
+                            parent_is_kernel_blocked: false,
+                        },
+                    )
+                    .await,
+                SchedulerRpcResult::Continue(())
+            ));
+        }
+        let current = |task: DetTid| {
+            rpc(
+                root,
+                root_mm,
+                GlobalRequest::ProcessAuxv(DetPid::from_raw(task.as_raw())),
+            )
+        };
+        for task in [root, forked, shared] {
+            let GlobalResponse::ProcessAuxv(Some(entry)) = current(task).await.1 else {
+                panic!("{task} has no vector");
+            };
+            assert_eq!(entry.bytes, vec![7; 32], "{task}");
+        }
+        assert_eq!(state.process_auxv.lock().unwrap().len(), 3);
+        // The forked child's exec finds no plausible vector: its creator's is
+        // stale and goes; only the first such exec of the run warns.
+        let forked_mm = MmId::initial(forked);
+        for first in [true, false] {
+            let response = rpc(
+                forked,
+                forked_mm,
+                GlobalRequest::AuxvFromKernel(AuxvFromKernel::Implausible),
+            )
+            .await
+            .1;
+            assert_eq!(response, GlobalResponse::AuxvFromKernel(first));
+        }
+        assert_eq!(current(forked).await.1, GlobalResponse::ProcessAuxv(None));
+        assert_eq!(state.process_auxv.lock().unwrap().len(), 2);
+        // The exits as a ptrace backend reports them.
+        for task in [forked, shared, root] {
+            state.on_backend_process_exited(task.as_raw());
+        }
+        assert_eq!(state.process_auxv.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]

@@ -76,6 +76,12 @@ enum ProcfsKind {
     /// `/proc/<pid>/cgroup`: every line's path becomes `/`, as for a process
     /// in the root cgroup (https://github.com/rrnewton/hermit/issues/4378).
     ProcessCgroup,
+    /// `/proc/<pid>/auxv`: the auxiliary vector on the process's initial stack
+    /// when its image was exec'd, as Detcore read it there
+    /// (`Detcore::record_process_auxv`): Linux's `saved_auxv`, binary pairs
+    /// through `AT_NULL`. Only rendered; a file the kernel opens keeps the
+    /// kernel's bytes, unclassified (`ProcfsFile::kernel_served`).
+    ProcessAuxv,
     CpuidleCounter,
     Smaps,
     /// `/proc/*/maps`. Its per-mapping line carries a DEVICE and an INODE for
@@ -334,7 +340,60 @@ fn sysfs_rtc_kind(path: &Path) -> Option<ProcfsKind> {
 /// `proc_reg_mmap`, which has no method behind it (`EIO`); a sysctl file has
 /// none of these, so a mapping is `ENODEV` and `SEEK_END` lands at its size, 0.
 pub(crate) fn rendered_path_is_seq_file(path: &Path) -> bool {
+    // A process's `auxv` is a plain file of the memory map's `saved_auxv`
+    // (`auxv_read`, `generic_file_llseek` on size 0).
     !path.starts_with("/proc/sys")
+        && !per_process_name(path).is_some_and(|name| name.filename == "auxv")
+}
+
+/// The most bytes a process's `auxv` holds: Linux's `saved_auxv` is
+/// `AT_VECTOR_SIZE` words, 52 on x86_64 (`2 * (AT_VECTOR_SIZE_ARCH 3 +
+/// AT_VECTOR_SIZE_BASE 22 + 1)`), 26 pairs with the `AT_NULL` that ends them.
+pub(crate) const MAX_AUXV_BYTES: usize = 52 * 8;
+
+/// The auxiliary vector on a new image's initial stack at `stack`, its stack
+/// pointer before its first instruction, read with `read` (a guest memory
+/// word at an address): past `argc`, the `argc` argument pointers and their
+/// NULL, and the environment pointers and their NULL, the key and value
+/// pairs through the `AT_NULL` pair, which Linux's `/proc/<pid>/auxv`
+/// includes, as native-endian bytes. `None` where a word cannot be read, the
+/// layout is implausible (more than 2^20 arguments or environment entries),
+/// no `AT_NULL` comes within [`MAX_AUXV_BYTES`], or the vector has no
+/// `AT_PAGESZ`, which Linux always gives an image: a walk from an address
+/// that is not an image's initial stack pointer is refused, not served.
+pub(crate) fn initial_stack_auxv(
+    stack: u64,
+    mut read: impl FnMut(u64) -> Option<u64>,
+) -> Option<Vec<u8>> {
+    const MAX_ENTRIES: u64 = 1 << 20;
+    let argc = read(stack)?;
+    if argc > MAX_ENTRIES {
+        return None;
+    }
+    let mut at = stack.checked_add(8 * (argc + 2))?;
+    let mut environment = 0;
+    while read(at)? != 0 {
+        environment += 1;
+        if environment > MAX_ENTRIES {
+            return None;
+        }
+        at = at.checked_add(8)?;
+    }
+    at = at.checked_add(8)?;
+    let mut bytes = Vec::new();
+    let mut page_size = false;
+    while bytes.len() < MAX_AUXV_BYTES {
+        let key = read(at)?;
+        let value = read(at.checked_add(8)?)?;
+        bytes.extend_from_slice(&key.to_ne_bytes());
+        bytes.extend_from_slice(&value.to_ne_bytes());
+        if key == libc::AT_NULL {
+            return page_size.then_some(bytes);
+        }
+        page_size |= key == libc::AT_PAGESZ;
+        at = at.checked_add(16)?;
+    }
+    None
 }
 
 /// What the name of the memfd standing in for a procfs file Detcore renders
@@ -1135,6 +1194,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-944): Review AVX-512 elapsed-time normalization.
             other if is_process_file_path(other, "arch_status") => ProcfsKind::ArchStatus,
             other if is_process_file_path(other, "cgroup") => ProcfsKind::ProcessCgroup,
+            other if is_process_file_path(other, "auxv") => ProcfsKind::ProcessAuxv,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-949): Review per-mapping memory accounting normalization.
             other if is_process_file_path(other, "smaps") => ProcfsKind::Smaps,
@@ -1280,11 +1340,37 @@ impl ProcfsFile {
     }
 
     /// The per-process files Detcore renders, and their names.
-    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 1] =
-        [(ProcfsKind::ProcessCgroup, "cgroup")];
+    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 2] = [
+        (ProcfsKind::ProcessCgroup, "cgroup"),
+        (ProcfsKind::ProcessAuxv, "auxv"),
+    ];
 
     /// The names of the per-process files Detcore renders.
-    pub(crate) const PER_PROCESS_NAMES: [&'static str; 1] = ["cgroup"];
+    pub(crate) const PER_PROCESS_NAMES: [&'static str; 2] = ["cgroup", "auxv"];
+
+    /// Whether a descriptor the kernel opened on this file (under record and
+    /// replay, after `chroot`, through `..`) is classified as this file, so
+    /// that Detcore serves its bytes sanitized: every file but a process's
+    /// `auxv`, whose bytes Detcore takes only from the guest's own stack, and
+    /// which a descriptor the kernel opened keeps reading from the kernel, as
+    /// before Detcore rendered it.
+    pub(crate) fn kernel_served(&self) -> bool {
+        self.kind != ProcfsKind::ProcessAuxv
+    }
+
+    /// Whether this is a per-process file whose `show` Linux runs when it is
+    /// read (`single_open`: the first read, a rewind, a read at another
+    /// position), which finds its task again: a process's `cgroup`. Not
+    /// `auxv`, whose snapshot Linux takes at the open (`auxv_open` pins the
+    /// memory map, and `auxv_read` reads its `saved_auxv`).
+    pub(crate) fn shows_at_read(&self) -> bool {
+        self.per_process_name().is_some() && self.kind != ProcfsKind::ProcessAuxv
+    }
+
+    /// Whether this is a process's `auxv`.
+    pub(crate) fn is_process_auxv(&self) -> bool {
+        self.kind == ProcfsKind::ProcessAuxv
+    }
 
     /// Bind the caller's spellings (`self`, `thread-self`) of a per-process
     /// file's task to the caller's process `pid` and thread `tid`, as Linux
@@ -1391,6 +1477,8 @@ impl ProcfsFile {
     pub(crate) fn has_read_iter(&self) -> bool {
         match self.kind {
             ProcfsKind::Fixed(file) => file.has_read_iter(),
+            // `auxv_read` is a plain `read` (RWF_NOWAIT is EOPNOTSUPP).
+            ProcfsKind::ProcessAuxv => false,
             _ => true,
         }
     }
@@ -1409,7 +1497,7 @@ impl ProcfsFile {
     /// method at the first read, which finds the task again (ESRCH once it is
     /// gone), and again after a rewind (`set_offset`).
     pub(crate) fn snapshot_at_first_read(&self) -> bool {
-        self.snapshot_carries_uptime() || self.per_process_name().is_some()
+        self.snapshot_carries_uptime() || self.shows_at_read()
     }
 
     /// Whether the snapshot of this file a first read takes is a function of
@@ -1456,6 +1544,10 @@ impl ProcfsFile {
             // (`/proc/cgroups` lists every controller on the unified hierarchy, 0);
             // the sanitizer keeps it.
             ProcfsKind::ProcessCgroup => b"0::/\n",
+            // The bytes are the process's recorded auxiliary vector, which the
+            // open (or, for a descriptor rebuilt from its placeholder, its
+            // exec generation) supplies; nothing else is rendered.
+            ProcfsKind::ProcessAuxv => b"",
             _ => unreachable!("{:?} has no rendered path", self.kind),
         }
     }
@@ -1716,6 +1808,8 @@ impl ProcfsFile {
             ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
             ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
             ProcfsKind::ProcessCgroup => sanitize_process_cgroup(&contents),
+            // Binary, and Detcore's own record: kept as it is.
+            ProcfsKind::ProcessAuxv => contents.to_vec(),
             ProcfsKind::CpuidleCounter => sanitize_cpuidle_counter(&contents),
             ProcfsKind::Smaps => sanitize_smaps(&contents, mapping_identities),
             ProcfsKind::Maps => sanitize_maps(&contents, mapping_identities),
@@ -1895,7 +1989,7 @@ impl ProcfsFile {
     /// is no rewind and keeps the snapshot.
     pub(crate) fn seek_to(&mut self, offset: usize) {
         self.set_offset(offset);
-        if offset == 0 && self.rendered && self.per_process_name().is_some() {
+        if offset == 0 && self.rendered && self.shows_at_read() {
             self.contents = None;
         }
     }
@@ -7935,6 +8029,139 @@ total_commit_ms 0\n"
                 "{forged}"
             );
         }
+    }
+
+    /// A process's `auxv` is a per-process file Detcore renders from its own
+    /// record, never from the kernel: a descriptor the kernel opened stays
+    /// unclassified. Linux snapshots it at the open (`auxv_open` pins the
+    /// memory map), so no read looks for the task again, and it is a plain
+    /// file, not a `seq_file`, read through `read`, not `read_iter`. Its
+    /// placeholder's name carries nothing: the snapshot stays with the open
+    /// file description.
+    #[test]
+    fn a_process_auxv_is_pinned_at_its_open() {
+        let mut file = ProcfsFile::from_path(Path::new("/proc/self/auxv")).unwrap();
+        assert_eq!(file.per_process_name(), Some("auxv"));
+        assert!(file.is_process_auxv());
+        assert!(!file.kernel_served());
+        assert!(!file.shows_at_read());
+        assert!(!file.snapshot_at_first_read());
+        assert!(!file.has_read_iter());
+        assert!(!file.seeks_only_from_start_or_position());
+        file.bind_task(3, 5);
+        file.set_task_incarnation(TaskIncarnation {
+            process: 1,
+            thread: None,
+        });
+        let rendered = file.into_rendered();
+        assert!(!rendered.snapshot_is_rerendered());
+        let path = rendered.opened_path().unwrap();
+        assert_eq!(path, Path::new("/proc/3/auxv"));
+        assert!(rendered_path_is_per_process(path));
+        assert!(!rendered_path_is_seq_file(path));
+        // A placeholder's name carries no `auxv` snapshot (it would not fit
+        // a memfd name): the snapshot stays with the open file description.
+        let name = placeholder_name(path, b"");
+        assert_eq!(name, "hermit-procfs:/proc/3/auxv#1@");
+        let (read, snapshot) = placeholder_link(
+            format!("/memfd:{name} (deleted)").as_bytes(),
+            RenderedFiles::WITHOUT_CPUINFO,
+        )
+        .unwrap();
+        assert!(std::ptr::eq(read, path), "the same file of the same task");
+        assert!(snapshot.is_empty());
+        let rebuilt = ProcfsFile::from_rendered_path(read)
+            .unwrap()
+            .into_rendered();
+        assert_eq!(rebuilt.rendered_snapshot(), None);
+        assert!(rebuilt.rendering_template().is_empty());
+        // A process's `cgroup` is shown at its reads.
+        let cgroup = ProcfsFile::from_path(Path::new("/proc/self/cgroup")).unwrap();
+        assert!(cgroup.kernel_served());
+        assert!(cgroup.shows_at_read());
+    }
+
+    /// The auxiliary vector on a new image's initial stack: past `argc`, its
+    /// arguments and their NULL, and the environment and its NULL, the pairs
+    /// through `AT_NULL`, which the file includes. A stack whose words cannot
+    /// be read, with an implausible `argc`, with no `AT_NULL` within Linux's
+    /// `saved_auxv`, or whose vector has no `AT_PAGESZ` (a walk from a stack
+    /// pointer that was not the image's first, as DBT's post-exec gave one),
+    /// gives nothing.
+    #[test]
+    fn the_initial_stack_auxv_is_the_pairs_through_at_null() {
+        let stack = 0x7ffe_0000_u64;
+        let words = |values: &[u64]| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (stack + 8 * index as u64, *value))
+                .collect::<std::collections::BTreeMap<u64, u64>>()
+        };
+        let read = |memory: &std::collections::BTreeMap<u64, u64>| {
+            let memory = memory.clone();
+            move |at: u64| memory.get(&at).copied()
+        };
+        // argc 2, two arguments, NULL, one environment entry, NULL, then
+        // AT_PAGESZ 4096, AT_RANDOM, AT_NULL.
+        let memory = words(&[
+            2,
+            0x1000,
+            0x1008,
+            0,
+            0x1010,
+            0,
+            libc::AT_PAGESZ,
+            4096,
+            libc::AT_RANDOM,
+            0x2000,
+            libc::AT_NULL,
+            0,
+            0xdead,
+        ]);
+        let expected: Vec<u8> = [
+            libc::AT_PAGESZ,
+            4096,
+            libc::AT_RANDOM,
+            0x2000,
+            libc::AT_NULL,
+            0,
+        ]
+        .iter()
+        .flat_map(|word| word.to_ne_bytes())
+        .collect();
+        assert_eq!(initial_stack_auxv(stack, read(&memory)), Some(expected));
+        // No arguments and no environment: the vector follows two NULLs.
+        let empty = words(&[0, 0, 0, libc::AT_PAGESZ, 4096, libc::AT_NULL, 0]);
+        assert_eq!(
+            initial_stack_auxv(stack, read(&empty)).map(|bytes| bytes.len()),
+            Some(32),
+            "AT_PAGESZ and AT_NULL"
+        );
+        // AT_NULL alone, as a walk from a stack pointer deep in the image's
+        // stack found it under DBT (16 bytes where the vector had 368): no
+        // AT_PAGESZ, so refused.
+        let lone = words(&[0, 0, 0, libc::AT_NULL, 0]);
+        assert_eq!(initial_stack_auxv(stack, read(&lone)), None);
+        // An unreadable word.
+        let short = words(&[0, 0, 0, libc::AT_PAGESZ, 4096]);
+        assert_eq!(initial_stack_auxv(stack, read(&short)), None);
+        // An implausible argc.
+        let huge = words(&[1 << 21, 0, 0, libc::AT_PAGESZ, 4096, libc::AT_NULL, 0]);
+        assert_eq!(initial_stack_auxv(stack, read(&huge)), None);
+        // No AT_NULL within MAX_AUXV_BYTES.
+        let mut endless = vec![0, 0, 0];
+        endless.extend(std::iter::repeat_n([libc::AT_PAGESZ, 4096], 30).flatten());
+        endless.extend([libc::AT_NULL, 0]);
+        assert_eq!(initial_stack_auxv(stack, read(&words(&endless))), None);
+        // Exactly MAX_AUXV_BYTES, the last pair AT_NULL.
+        let mut full = vec![0, 0, 0];
+        full.extend(std::iter::repeat_n([libc::AT_PAGESZ, 4096], 25).flatten());
+        full.extend([libc::AT_NULL, 0]);
+        assert_eq!(
+            initial_stack_auxv(stack, read(&words(&full))).map(|bytes| bytes.len()),
+            Some(MAX_AUXV_BYTES)
+        );
     }
 
     /// Two tasks that held the same pid have cgroup files with one text but
