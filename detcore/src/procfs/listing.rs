@@ -114,6 +114,116 @@ pub struct ListingFacts {
     pub threads: Vec<i32>,
 }
 
+/// Whether the task `task` exists, as Linux's lookup of `/proc/<process>` and
+/// its `task/<thread>` finds it: `leader` is the thread group `task.process`
+/// names (itself for a process, its group for a live thread, `None` for an id
+/// that names neither), and `facts` the scheduler's listing for that group
+/// (`Scheduler::procfs_listing`), whose processes count a zombie until it is
+/// reaped. Pid 1, the namespace's init, is Hermit's own process unless a guest
+/// holds it, and has the one thread 1, as `/proc` lists it ([`entries`]).
+pub(crate) fn task_exists(
+    task: crate::procfs::BoundTask,
+    leader: Option<i32>,
+    facts: &ListingFacts,
+) -> bool {
+    let listed = |process: i32| facts.processes.binary_search(&process).is_ok();
+    match leader {
+        Some(leader) if listed(leader) => task
+            .thread
+            .is_none_or(|thread| facts.threads.contains(&thread)),
+        _ => task.process == 1 && task.thread.is_none_or(|thread| thread == 1),
+    }
+}
+
+/// What Detcore's process table says of the task a per-process `/proc` file
+/// names (`Scheduler::procfs_task`), with the incarnation of each of its
+/// numbers (`InodePool::count_incarnation`).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub struct ProcfsTaskAnswer {
+    /// Linux's lookup finds the task: a live task, or a zombie not yet
+    /// reaped.
+    pub exists: bool,
+    /// The task the file describes (the thread below `task`, else the task the
+    /// top-level number names) has exited and is not reaped: Linux has freed
+    /// its memory map, so its files belong to global root
+    /// (`task_dump_owner`).
+    pub without_mm: bool,
+    /// How many tasks of the run have held the process number.
+    pub process_incarnation: u32,
+    /// How many tasks of the run have held the thread number, if one is named.
+    pub thread_incarnation: Option<u32>,
+}
+
+impl ProcfsTaskAnswer {
+    /// The identity of the task holding the numbers now
+    /// ([`crate::procfs::TaskIncarnation`]).
+    pub(crate) fn incarnation(&self) -> crate::procfs::TaskIncarnation {
+        crate::procfs::TaskIncarnation {
+            process: self.process_incarnation,
+            thread: self.thread_incarnation,
+        }
+    }
+
+    /// Whether this answer is about the very task a file or a directory was
+    /// bound to with identity `bound`: it still exists, and no other task
+    /// has taken its numbers since (each number's incarnation is the one it
+    /// had). A pid Detcore gives out again names a new task
+    /// (`Scheduler::forget_previous_process_exit`), whose numbers have a
+    /// higher incarnation, so a file or directory of the old task is stale.
+    pub(crate) fn still_names(&self, bound: crate::procfs::TaskIncarnation) -> bool {
+        self.exists && self.incarnation() == bound
+    }
+}
+
+/// A change to the state Linux keeps on a per-process `/proc` file's inode
+/// that Detcore keeps in its global tool, ordered by the scheduler
+/// (`InodePool::rendered_file_state`), or none, to read it.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub enum RenderedFileChange {
+    /// Read the state.
+    Read,
+    /// Set the modification time to these seconds and nanoseconds
+    /// (`utimensat`, `utime`, `utimes`).
+    Mtime(i64, i64),
+    /// Set the write-life hint (`F_SET_RW_HINT`).
+    WriteHint(u64),
+}
+
+/// The state of a per-process `/proc` file's inode that Detcore keeps.
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub struct RenderedFileState {
+    /// The modification time an owner set, if any; the epoch otherwise.
+    pub mtime: Option<(i64, i64)>,
+    /// The write-life hint (`RWH_WRITE_LIFE_*`), 0 until set.
+    pub write_hint: u64,
+}
+
 /// The entries of `directory` at `level`, given `facts`, each a name and its
 /// `d_type`, with `.` and `..` first. `None` when the level hides the
 /// directory itself (a standard-level directory at minimal).

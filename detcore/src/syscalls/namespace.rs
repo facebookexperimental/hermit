@@ -2022,28 +2022,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Readlinkat,
         path: PathBuf,
     ) -> Result<i64, Error> {
-        // A relative name below a descriptor Detcore has no record of (one
-        // received over `SCM_RIGHTS`) is spelled below the procfs directory the
-        // kernel names for it (`Detcore::unrecorded_procfs_directory`), so a
-        // namespace or descriptor link there is modeled and canonicalized as
-        // the same link spelled absolutely; any other such name stays relative,
-        // and the kernel decides.
-        let recovered = if path.is_absolute() || path.as_os_str().is_empty() {
+        // A relative name below a directory descriptor is spelled as Linux
+        // looks it up (`Detcore::procfs_spelling_at`): below a `/proc/self`
+        // or `/proc/<pid>` directory, the task the directory was opened on
+        // (ESRCH once that task is gone), and below a descriptor Detcore has
+        // no record of (one received over `SCM_RIGHTS`), the procfs directory
+        // the kernel names for it; so a namespace or descriptor link there is
+        // modeled and canonicalized as the same link spelled absolutely. Any
+        // other such name stays relative, and the kernel decides.
+        let below_directory =
+            !path.is_absolute() && !path.as_os_str().is_empty() && call.dirfd() != libc::AT_FDCWD;
+        let recorded = if path.is_absolute() || call.dirfd() == libc::AT_FDCWD {
             None
-        } else {
-            self.unrecorded_procfs_directory(guest, call.dirfd()).await
-        };
-        let observed_path = if path.is_absolute() || call.dirfd() == libc::AT_FDCWD {
-            path.clone()
-        } else if let Some(directory) = &recovered {
-            directory.join(&path)
         } else {
             guest
                 .thread_state()
                 .with_detfd(call.dirfd(), |detfd| detfd.path())
                 .unwrap_or(None)
+        };
+        let lexical = if path.is_absolute() || call.dirfd() == libc::AT_FDCWD {
+            path.clone()
+        } else {
+            recorded
+                .as_ref()
                 .map_or(path.clone(), |directory| directory.join(&path))
         };
+        let observed_path = if below_directory {
+            self.procfs_spelling_at(guest, call.dirfd(), &path).await?
+        } else {
+            lexical.clone()
+        };
+        // The directory names a task or a kernel path Detcore knows.
+        let named_by_directory = below_directory && observed_path != lexical;
         if let Some(result) = self
             .readlink_rendered_procfs(guest, &observed_path, call.buf(), call.buf_len())
             .await?
@@ -2051,20 +2061,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(result);
         }
         // A relative pathname is decided only below a descriptor on `/proc`
-        // itself, a directory: one on `/proc/self` may be the link (an
-        // `O_PATH | O_NOFOLLOW` open), and an empty pathname reads the
-        // descriptor's own link, which the kernel answers (an inherited one
-        // keeps its opener's binding). A descriptor the kernel names as a
-        // procfs directory is one, whatever directory it is.
+        // itself, a directory, or one whose task or kernel path Detcore knows
+        // (a selector's directory records its task only where the open
+        // followed the selector, not for the link itself, an
+        // `O_PATH | O_NOFOLLOW` open of `/proc/self`). An empty pathname reads
+        // the descriptor's own link, which the kernel answers (an inherited
+        // one keeps its opener's binding).
         let decidable = path.is_absolute()
-            || recovered.is_some()
-            || (!path.as_os_str().is_empty()
-                && call.dirfd() != libc::AT_FDCWD
-                && guest
-                    .thread_state()
-                    .with_detfd(call.dirfd(), |detfd| detfd.path())
-                    .ok()
-                    .flatten()
+            || named_by_directory
+            || (below_directory
+                && recorded
+                    .as_deref()
                     .is_some_and(|directory| directory == Path::new("/proc")));
         if decidable
             && let Some(result) = self

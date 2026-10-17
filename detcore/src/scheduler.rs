@@ -8575,6 +8575,33 @@ impl Scheduler {
         crate::procfs::listing::ListingFacts { processes, threads }
     }
 
+    /// Whether the task a per-process `/proc` file names exists, and whether
+    /// the task it describes has exited without being reaped, for the
+    /// top-level number `named` and the thread `thread` below its `task`, as
+    /// the container's PID namespace numbers them: the lookup Linux makes of
+    /// `/proc/<named>` (a listed process, a zombie until it is reaped, or a
+    /// live thread of a listed process) and of its `task/<thread>`
+    /// (`procfs::listing::task_exists`). The task the file describes is the
+    /// thread, else the task `named` is; one that has exited (it has no turn
+    /// left, `thread_is_live`) while its file exists has no memory map in
+    /// Linux. Hermit's own init, pid 1 where no guest holds it, is live.
+    pub fn procfs_task(&self, named: DetTid, thread: Option<DetTid>) -> (bool, bool) {
+        let leader = self.signal_target_process(named);
+        let facts = self.procfs_listing(leader);
+        let task = crate::procfs::BoundTask {
+            process: named.as_raw(),
+            thread: thread.map(|thread| thread.as_raw()),
+        };
+        let exists =
+            crate::procfs::listing::task_exists(task, leader.map(|leader| leader.as_raw()), &facts);
+        if !exists {
+            return (false, false);
+        }
+        let described = thread.unwrap_or(named);
+        let hermit_init = described.as_raw() == 1 && leader.is_none();
+        (true, !hermit_init && !self.thread_is_live(described))
+    }
+
     /// The kernel's number for each of `ids`, a guest process or thread
     /// number as `/proc` spells it (`to_kernel`), or the guest's for each
     /// kernel number (`!to_kernel`), where the backend's host threads
@@ -15754,6 +15781,50 @@ mod test {
             .procfs_kernel_ids
             .insert(DetTid::from_raw(2), (2, 2));
         assert_eq!(agreeing.procfs_ids(false, &[2, 9]), [Some(2), Some(9)]);
+    }
+
+    /// The process table's answer for a per-process `/proc` file
+    /// (`procfs_task`): a live process's file exists and its task has its
+    /// memory map; a zombie's exists without one; a reaped process's and an
+    /// unused number's do not; a live thread's below its process's `task`
+    /// exists, and not below another process's; Hermit's init, pid 1 with
+    /// no guest holding it, is live.
+    #[test]
+    fn procfs_task_answers_from_the_process_table() {
+        let mut scheduler = process_chain();
+        let [_, inner, middle, orphan] = [1, 2, 3, 4].map(DetPid::from_raw);
+        let thread = DetTid::from_raw(5);
+        scheduler.thread_tree.add_child(inner, thread, false);
+        register_known_thread(&mut scheduler, thread);
+        assert_eq!(scheduler.procfs_task(orphan, None), (true, false));
+        assert_eq!(scheduler.procfs_task(inner, Some(thread)), (true, false));
+        assert_eq!(
+            scheduler.procfs_task(thread, None),
+            (true, false),
+            "/proc/<tid>"
+        );
+        assert_eq!(scheduler.procfs_task(middle, Some(thread)), (false, false));
+        assert_eq!(
+            scheduler.procfs_task(DetTid::from_raw(9), None),
+            (false, false)
+        );
+        // A zombie: its file exists, owned as a task without a memory map.
+        exit_process(&mut scheduler, orphan);
+        assert_eq!(scheduler.procfs_task(orphan, None), (true, true));
+        // Reaped: gone.
+        assert!(scheduler.consume_child_wait(middle, orphan));
+        assert_eq!(scheduler.procfs_task(orphan, None), (false, false));
+        // A process that takes the pid again is live.
+        scheduler.thread_tree.add_child(middle, orphan, true);
+        scheduler.forget_previous_process_exit(orphan);
+        register_known_thread(&mut scheduler, orphan);
+        assert_eq!(scheduler.procfs_task(orphan, None), (true, false));
+        // Hermit's own init, where no guest holds pid 1.
+        let empty = Scheduler::new(&Config::default());
+        assert_eq!(
+            empty.procfs_task(DetTid::from_raw(1), Some(DetTid::from_raw(1))),
+            (true, false)
+        );
     }
 
     /// `/proc` lists every process from its creation until it is reaped,

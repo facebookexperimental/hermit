@@ -2457,7 +2457,19 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the ten in-flight-dequeue units of https://github.com/rrnewton/hermit/pull/4499: 1992, listed.
     // And syscalls::files::test::a_received_procfs_directory_names_its_task_positions
     // (https://github.com/rrnewton/hermit/issues/4213): 1993, executed.
-    ("test.detcore_unit", 1993),
+    // And syscalls::files::test::a_proc_selector_leads_to_the_openers_task,
+    // syscalls::files::rendered_procfs::tests::{open_flags_follow_linux_for_a_process_file_its_owner_opens,
+    // path_calls_follow_linux_for_a_process_file_its_owner_names,
+    // a_process_file_maps_as_a_file_without_mmap,
+    // a_process_file_exists_for_exactly_the_tasks_the_table_lists,
+    // a_process_file_is_owned_by_the_guest_and_named_by_path_calls,
+    // the_256th_task_generation_is_refused_by_name},
+    // tool_global::tests::{a_reused_pid_is_a_new_incarnation_for_procfs_files,
+    // a_read_of_rendered_file_state_keeps_nothing},
+    // scheduler::tests::procfs_task_answers_from_the_process_table and
+    // procfs_inode::tests::a_task_generation_fits_its_inode_field_up_to_its_bound
+    // (https://github.com/rrnewton/hermit/issues/4213): 2004, executed.
+    ("test.detcore_unit", 2004),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4260,7 +4272,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +5 from 9d6182b5: 1982.
     // And the same ten in-flight-dequeue units: 1992.
     // And the 4213 received-directory task-position test: 1993, executed.
-    ("test.detcore_unit_on_host", 1993),
+    // And the eleven 4213 per-process mechanism tests: 2004, executed.
+    ("test.detcore_unit_on_host", 2004),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

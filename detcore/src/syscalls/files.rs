@@ -1300,7 +1300,8 @@ impl<'a> StatTarget<'a> {
 
 /// The rendered procfs file that a stat result describes, if it is one: by
 /// the name Detcore gave it, or by its kernel identity where Detcore names no
-/// procfs files. `files` are the files the session renders
+/// procfs files. Never a per-process file, whose kernel-reached instances
+/// keep the kernel's identity. `files` are the files the session renders
 /// (`Detcore::rendered_files`).
 fn rendered_entry(
     procfs: &ProcfsEntry,
@@ -1311,13 +1312,18 @@ fn rendered_entry(
     if cfg.recordreplay_modes {
         return None;
     }
-    match procfs {
+    let found = match procfs {
         ProcfsEntry::At(within) => rendered_procfs::rendered_path_within(within, files),
         ProcfsEntry::NotProcfs | ProcfsEntry::Unknown => {
             rendered_procfs::rendered_path_of_raw(stat, files)
         }
         ProcfsEntry::Unnamed => None,
-    }
+    };
+    // A per-process file the kernel reached (through `..`, after `chroot`,
+    // in a nested PID namespace) is served from the kernel's bytes
+    // (`ProcfsFile::served_rendered_path`), so it keeps the kernel's metadata
+    // too: its identity is the kernel's file's, not the rendered file's.
+    found.filter(|path| !crate::procfs::rendered_path_is_per_process(path))
 }
 
 /// Whether `statx` accepts these `flags` and `mask` (`vfs_statx`'s and the
@@ -1386,6 +1392,9 @@ struct LinkSource {
     path: Option<PathBuf>,
     /// `N`'s open file description.
     open_file: OpenFileId,
+    /// Where `N`'s `/proc/self` or `/proc/thread-self` spelling led, and the
+    /// identity of the task it led to (`DetFd::procfs_reached`).
+    reached: Option<(PathBuf, Option<crate::procfs::TaskIncarnation>)>,
 }
 
 impl LinkSource {
@@ -1400,6 +1409,87 @@ impl LinkSource {
             .then(|| self.path.clone())
             .flatten()
     }
+
+    /// Where `N`'s selector spelling led, for a new descriptor opened through
+    /// the link to `N` (`fd`), only if `fd` is `N` and `N` still holds its
+    /// description: the new open file is that task's directory too.
+    fn reached_if_unchanged(
+        &self,
+        fd: RawFd,
+        current: Option<OpenFileId>,
+    ) -> Option<(PathBuf, Option<crate::procfs::TaskIncarnation>)> {
+        (fd == self.fd && current == Some(self.open_file))
+            .then(|| self.reached.clone())
+            .flatten()
+    }
+}
+
+/// Where the spelling `recorded` led, if it names a task's directory: through
+/// a `/proc` selector, `/proc/self`, `/proc/self/task`,
+/// `/proc/self/task/<tid>` or `/proc/thread-self`, with the selector replaced
+/// by the opener's numbers (`own`, its pid and tid as `/proc` spells them), as
+/// Linux resolved it at the open; or by number, `/proc/<pid>`,
+/// `/proc/<pid>/task` or `/proc/<pid>/task/<tid>`, itself
+/// (`DetFd::procfs_reached`). Linux binds the directory to the task it named
+/// at the open, not to the number, so either is that task while it lives.
+/// Nothing for any other path, such as a descriptor link (`fd/N`), which
+/// leads to another file, and nothing where Detcore does not know the
+/// caller's numbers (`own` is `None` in a nested PID namespace).
+fn procfs_selector_reached(recorded: &Path, own: Option<(i32, i32)>) -> Option<PathBuf> {
+    let (pid, tid) = own?;
+    let below = recorded.strip_prefix("/proc").ok()?;
+    let names = below
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let number = |name: &str| {
+        (!name.starts_with('0') && !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| name.parse::<i32>().ok())
+            .flatten()
+    };
+    Some(PathBuf::from(match names.as_slice() {
+        ["self"] => format!("/proc/{pid}"),
+        ["self", "task"] => format!("/proc/{pid}/task"),
+        ["self", "task", thread] => format!("/proc/{pid}/task/{}", number(thread)?),
+        ["thread-self"] => format!("/proc/{pid}/task/{tid}"),
+        [process] => format!("/proc/{}", number(process)?),
+        [process, "task"] => format!("/proc/{}/task", number(process)?),
+        [process, "task", thread] => {
+            format!("/proc/{}/task/{}", number(process)?, number(thread)?)
+        }
+        _ => return None,
+    }))
+}
+
+/// The task whose directory `reached` (where a `/proc` selector led,
+/// `procfs_selector_reached`) is or is below: `/proc/<pid>`, and the thread of
+/// `/proc/<pid>/task/<tid>`.
+fn procfs_reached_task(reached: &Path) -> Option<crate::procfs::BoundTask> {
+    let names = reached
+        .strip_prefix("/proc")
+        .ok()?
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()?;
+    let number = |name: &str| name.parse::<i32>().ok().filter(|number| *number > 0);
+    let process = number(names.first()?)?;
+    let thread = match names.as_slice() {
+        [_, "task", thread, ..] => Some(number(thread)?),
+        _ => None,
+    };
+    Some(crate::procfs::BoundTask { process, thread })
+}
+
+/// Whether `spelling` names a `/proc` selector link itself: `/proc/self` or
+/// `/proc/thread-self`, which are symbolic links to a task's directory.
+fn names_a_selector_link(spelling: &Path) -> bool {
+    spelling.parent() == Some(Path::new("/proc"))
+        && spelling
+            .file_name()
+            .is_some_and(|name| name == "self" || name == "thread-self")
 }
 
 /// Whether an open of the absolute spelling `observed` with `flags` opens a
@@ -1833,6 +1923,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             self.initialize_procfs_snapshot(guest, syscalls::Read::new().with_fd(fd))
                 .await?;
+        } else if let Some(offset) = offset
+            && guest.thread_state().with_detfd(fd, |detfd| {
+                detfd
+                    .procfs_position()
+                    .is_some_and(|(position, _)| position as i64 != offset)
+            })?
+        {
+            // A read at a position the buffered snapshot does not start at
+            // runs a per-process file's `show` again (`traverse`).
+            self.require_rendered_task(guest, fd).await?;
         }
         let start = match offset {
             Some(offset) => offset as usize,
@@ -2974,24 +3074,60 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// [`Self::observed_path`], with a descriptor Detcore has no record of
-    /// (one received over `SCM_RIGHTS`, which a fresh discovery leaves
-    /// without one) named as the kernel names the directory it is open on,
-    /// where that is on procfs ([`Self::unrecorded_procfs_directory`]): Linux
-    /// looks a relative name up below the directory the descriptor is open on,
-    /// whoever holds it. Detcore's own decisions about procfs names (the
-    /// files it renders, the `--proc` level, the links it canonicalizes) use
-    /// this spelling.
+    /// [`Self::observed_path`], with a `/proc` directory that `dirfd` names
+    /// taken as the directory it is open on, as Linux looks a relative name up
+    /// below that directory whoever holds the descriptor: a `/proc/self` or
+    /// `/proc/thread-self` directory is the task the selector reached when it
+    /// was opened (`DetFd::procfs_reached`), and a descriptor Detcore has no
+    /// record of (one received over `SCM_RIGHTS`, which a fresh discovery
+    /// leaves without one) is named as the kernel names the directory it is
+    /// open on, where that is on procfs ([`Self::unrecorded_procfs_directory`]).
+    /// Detcore's own decisions about procfs names (the files it renders, the
+    /// `--proc` level, the links it canonicalizes) use this spelling. A name
+    /// below the recorded directory of a task that is gone is ESRCH, and one
+    /// below a selector link opened as the link itself ENOTDIR, as Linux
+    /// answers them.
     pub(crate) async fn procfs_spelling_at<G: Guest<Self>>(
         &self,
         guest: &mut G,
         dirfd: i32,
         path: &Path,
     ) -> Result<PathBuf, Error> {
-        if !path.is_absolute()
-            && let Some(directory) = self.unrecorded_procfs_directory(guest, dirfd).await
-        {
-            return Ok(directory.join(path));
+        if !path.is_absolute() && !path.as_os_str().is_empty() && dirfd != libc::AT_FDCWD {
+            let (reached, link_itself) = guest
+                .thread_state()
+                .with_detfd(dirfd, |detfd| {
+                    (detfd.procfs_reached(), detfd.procfs_link_itself())
+                })
+                .unwrap_or((None, false));
+            // A selector link itself is no directory.
+            if link_itself {
+                return Err(Errno::ENOTDIR.into());
+            }
+            if let Some((reached, incarnation)) = reached {
+                // The directory's task, while it lives: Linux checks the
+                // task a pid directory was opened on at every lookup below it
+                // (`proc_pid_permission`), and a task that is gone, whose
+                // number another task may hold by now, fails every name with
+                // ESRCH (measured on Linux 7.1: `cgroup`, `status`, `exe` and
+                // a name no task has alike).
+                // TODO-HUMAN-REVIEW(#4213): Review the stale task-directory
+                // decision: a directory bound to a task identity at its open
+                // answers ESRCH for every name once that identity no longer
+                // holds its numbers (`ProcfsTaskAnswer::still_names`).
+                if let Some(incarnation) = incarnation
+                    && let Some(task) = procfs_reached_task(&reached)
+                {
+                    let answer = crate::tool_global::procfs_task(guest, task).await;
+                    if !answer.still_names(incarnation) {
+                        return Err(Errno::ESRCH.into());
+                    }
+                }
+                return Ok(reached.join(path));
+            }
+            if let Some(directory) = self.unrecorded_procfs_directory(guest, dirfd).await {
+                return Ok(directory.join(path));
+            }
         }
         Self::observed_path(guest, dirfd, path)
     }
@@ -3535,6 +3671,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     fd: link.fd,
                     path: detfd.path(),
                     open_file: detfd.open_file_id(),
+                    reached: detfd.procfs_reached(),
                 })
                 .ok()
         });
@@ -3601,7 +3738,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         Ok(None) => None,
                         Ok(Some(path)) => {
                             let target = rendered_procfs::RenderedTarget {
-                                procfs: ProcfsFile::from_path(path)
+                                procfs: ProcfsFile::from_rendered_path(path)
                                     .expect("a rendered path is a procfs file"),
                                 via_link: true,
                             };
@@ -3696,7 +3833,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     guest.thread_state().remove_fd(fd);
                     let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
                     let target = rendered_procfs::RenderedTarget {
-                        procfs: ProcfsFile::from_path(path)
+                        procfs: ProcfsFile::from_rendered_path(path)
                             .expect("a rendered path is a procfs file"),
                         via_link: false,
                     };
@@ -4060,8 +4197,91 @@ impl<T: RecordOrReplay> Detcore<T> {
                         )
                     }
                 };
+                // A `/proc/self` or `/proc/thread-self` directory, opened by
+                // that spelling or through a descriptor link to one, is the
+                // task the selector reached at its first open; a name below it
+                // is that task's file whoever looks it up (a fork's child, a
+                // thread). Recorded only where Detcore renders per-process
+                // files, which read it.
+                let link_itself = self.renders_procfs(guest)
+                    && opens_the_link_itself(&procfs_spelling, call.flags())
+                    && names_a_selector_link(&procfs_spelling);
+                let reached = if self.renders_procfs(guest) {
+                    let linked = {
+                        let state = guest.thread_state();
+                        crate::syscalls::namespace::own_descriptor_link(&observed_path, opener.own)
+                            .filter(|link| {
+                                !opens_the_link_itself(&observed_path, call.flags())
+                                    && (link.table
+                                        == crate::syscalls::namespace::DescriptorTable::Thread
+                                        || opener.holds_process_table)
+                            })
+                            .and_then(|link| {
+                                link_source.as_ref().and_then(|source| {
+                                    source.reached_if_unchanged(
+                                        link.fd,
+                                        state
+                                            .with_detfd(link.fd, |detfd| detfd.open_file_id())
+                                            .ok(),
+                                    )
+                                })
+                            })
+                    };
+                    match linked {
+                        Some(reached) => Some(reached),
+                        // An `O_PATH | O_NOFOLLOW` open of `/proc/self` or
+                        // `/proc/thread-self` is the link itself, no
+                        // directory: nothing is below it (ENOTDIR,
+                        // `procfs_link_itself` below).
+                        None if link_itself => None,
+                        None => match procfs_selector_reached(&procfs_spelling, opener.own) {
+                            // The caller's own task, as the process table
+                            // identifies it now.
+                            Some(selected) => {
+                                let incarnation = match procfs_reached_task(&selected) {
+                                    Some(task) => {
+                                        let answer =
+                                            crate::tool_global::procfs_task(guest, task).await;
+                                        answer.exists.then(|| answer.incarnation())
+                                    }
+                                    None => None,
+                                };
+                                Some((selected, incarnation))
+                            }
+                            // Below a directory Detcore named: a selector's
+                            // keeps its task's identity, and one the kernel
+                            // named (received over SCM_RIGHTS) is named again
+                            // at each use.
+                            None if procfs_spelling != observed_path => {
+                                let inherited = (!path.is_absolute()
+                                    && call.dirfd() != libc::AT_FDCWD)
+                                    .then(|| {
+                                        guest
+                                            .thread_state()
+                                            .with_detfd(call.dirfd(), |detfd| {
+                                                detfd.procfs_reached()
+                                            })
+                                            .ok()
+                                            .flatten()
+                                    })
+                                    .flatten()
+                                    .and_then(|(_, incarnation)| incarnation);
+                                Some((procfs_spelling.clone(), inherited))
+                            }
+                            None => None,
+                        },
+                    }
+                } else {
+                    None
+                };
                 guest.thread_state().with_detfd(fd, |detfd| {
                     detfd.set_path(&recorded_path);
+                    if let Some((reached, incarnation)) = reached.clone() {
+                        detfd.set_procfs_reached(reached, incarnation);
+                    }
+                    if link_itself {
+                        detfd.set_procfs_link_itself();
+                    }
                     if let Some(procfs) = procfs.clone() {
                         detfd.set_procfs(procfs);
                     }
@@ -4793,7 +5013,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             {
                 return Err(Errno::EBADF.into());
             }
-            Some(template) => template.to_vec(),
+            Some(template) => {
+                // A per-process file's `show` finds its task again: a task
+                // that is gone, or whose pid another task now holds, is ESRCH.
+                // At position 0 only: a description that has no snapshot at
+                // another position is one rebuilt from a placeholder whose
+                // first read happened in another process
+                // (`adopt_received_placeholder`, `adopt_placeholder`), where
+                // Linux reads on from the buffer that read filled, without
+                // looking for the task.
+                let position = guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| detfd.procfs_position())?
+                    .map_or(0, |(offset, _)| offset);
+                if position == 0 {
+                    self.require_rendered_task(guest, call.fd()).await?;
+                }
+                template.to_vec()
+            }
             None => self.snapshot_procfs(guest, call).await?,
         };
         // The guest mount view is the launch namespace (guest mount/unshare/
@@ -5646,6 +5883,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_buf(call.buf())
                 .with_len(call.len());
             self.initialize_procfs_snapshot(guest, read).await?;
+        } else if serves_procfs_snapshot
+            && guest.thread_state().with_detfd(call.fd(), |detfd| {
+                detfd
+                    .procfs_position()
+                    .is_some_and(|(position, _)| position != offset)
+            })?
+        {
+            // A read at a position the buffered snapshot does not start at
+            // runs a per-process file's `show` again (`traverse`).
+            self.require_rendered_task(guest, call.fd()).await?;
         }
 
         let procfs_bytes = guest
@@ -5897,9 +6144,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             let new_offset = usize::try_from(new_offset).map_err(|_| Errno::EINVAL)?;
             let result = i64::try_from(new_offset).map_err(|_| Errno::EOVERFLOW)?;
+            // seq_lseek to another positive position traverses the file,
+            // which runs a per-process file's `show` (ESRCH once its task is
+            // gone); a rewind or a no-op does not.
+            if new_offset != 0 && new_offset != current {
+                self.require_rendered_task(guest, call.fd()).await?;
+            }
             guest
                 .thread_state()
-                .with_detfd(call.fd(), |detfd| detfd.set_procfs_offset(new_offset))?;
+                .with_detfd(call.fd(), |detfd| detfd.seek_procfs(new_offset))?;
             self.sync_rendered_procfs_position(guest, call.fd()).await?;
             return Ok(result);
         }
@@ -7554,7 +7807,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             && !cfg.recordreplay_modes
             && let Some(path) = rendered_procfs::placeholder_identity(stat.dev, stat.inode)
         {
-            return rendered_procfs::placeholder_stat(path, cfg.epoch);
+            return self.rendered_metadata(guest, path).await;
         }
         let (d_ino, global_mtime) = match inode_override {
             // The container's stdio streams have fixed inodes and always
@@ -10698,12 +10951,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let mut names = Vec::with_capacity(batch.len());
                 for (index, entry) in batch.iter().enumerate() {
                     let (host, path) = inodes.entry_inode(&entry.name, entry.ino);
-                    let d_ino = match self.rendered_listed_inode(
-                        &inodes,
-                        &entry.name,
-                        entry.ino,
-                        self.rendered_files(guest),
-                    ) {
+                    let files = self.rendered_files(guest);
+                    let d_ino = match self
+                        .rendered_listed_inode(guest, &inodes, &entry.name, entry.ino, files)
+                        .await?
+                    {
                         Some(inode) => DetInode::mint(inode),
                         None => determinize_listed_inode(guest, host, path, mark).await.0,
                     };
@@ -11339,12 +11591,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 continue;
             };
             let (host, path) = inodes.entry_inode(&entry.name, entry.ino);
-            let d_ino = match self.rendered_listed_inode(
-                inodes,
-                &entry.name,
-                entry.ino,
-                self.rendered_files(guest),
-            ) {
+            let files = self.rendered_files(guest);
+            let d_ino = match self
+                .rendered_listed_inode(guest, inodes, &entry.name, entry.ino, files)
+                .await?
+            {
                 Some(inode) => DetInode::mint(inode),
                 None => determinize_named_inode(guest, host, path).await.0,
             };
@@ -12362,6 +12613,86 @@ mod test {
     use crate::test_pages::PAGE;
     use crate::test_pages::Pages;
 
+    /// A `/proc/self` or `/proc/thread-self` spelling leads to the opener's
+    /// task, which a name relative to the descriptor is then looked up below,
+    /// whoever looks it up.
+    #[test]
+    fn a_proc_selector_leads_to_the_openers_task() {
+        use std::path::Path;
+
+        use super::procfs_selector_reached;
+
+        let own = Some((3, 5));
+        for (spelling, reached) in [
+            ("/proc/self", Some("/proc/3")),
+            ("/proc/self/", Some("/proc/3")),
+            ("/proc/self/task", Some("/proc/3/task")),
+            ("/proc/self/task/5", Some("/proc/3/task/5")),
+            ("/proc/thread-self", Some("/proc/3/task/5")),
+            ("/proc/self/fd/7", None),
+            ("/proc/self/task/05", None),
+            ("/proc/thread-self/fd/7", None),
+            ("/proc/self/cwd", None),
+            ("/proc/3", Some("/proc/3")),
+            ("/proc/7/", Some("/proc/7")),
+            ("/proc/7/task", Some("/proc/7/task")),
+            ("/proc/7/task/9", Some("/proc/7/task/9")),
+            ("/proc/07", None),
+            ("/proc/7/task/09", None),
+            ("/proc/7/fd", None),
+            ("/proc/7/task/9/fd/1", None),
+            ("/proc/sys", None),
+            ("/proc", None),
+            ("/proc/selfish", None),
+            ("/dev/fd", None),
+            ("self", None),
+        ] {
+            assert_eq!(
+                procfs_selector_reached(Path::new(spelling), own).as_deref(),
+                reached.map(Path::new),
+                "{spelling}"
+            );
+        }
+        // In a nested PID namespace Detcore does not know the caller's numbers.
+        assert_eq!(procfs_selector_reached(Path::new("/proc/self"), None), None);
+        assert_eq!(procfs_selector_reached(Path::new("/proc/3"), None), None);
+        // The selector links themselves, which an `O_PATH | O_NOFOLLOW` open
+        // opens rather than the directory they lead to.
+        for (spelling, link) in [
+            ("/proc/self", true),
+            ("/proc/thread-self", true),
+            // A trailing slash follows the link (`opens_the_link_itself`).
+            ("/proc/self/", true),
+            ("/proc/self/task", false),
+            ("/proc/3", false),
+            ("/proc/selfish", false),
+        ] {
+            assert_eq!(
+                super::names_a_selector_link(Path::new(spelling)),
+                link,
+                "{spelling}"
+            );
+        }
+        // The task each reached directory is, or is below.
+        let task = |process, thread| crate::procfs::BoundTask { process, thread };
+        for (reached, expected) in [
+            ("/proc/3", Some(task(3, None))),
+            ("/proc/3/task", Some(task(3, None))),
+            ("/proc/3/task/5", Some(task(3, Some(5)))),
+            ("/proc/3/task/5/ns", Some(task(3, Some(5)))),
+            ("/proc/3/ns", Some(task(3, None))),
+            ("/proc", None),
+            ("/proc/sys", None),
+            ("/proc/0", None),
+        ] {
+            assert_eq!(
+                super::procfs_reached_task(Path::new(reached)),
+                expected,
+                "{reached}"
+            );
+        }
+    }
+
     /// A descriptor opened through one of the caller's descriptor links
     /// records the path of the descriptor the link names, so a name relative
     /// to it is the file Linux finds below that file: `/proc/stat` through a
@@ -12505,6 +12836,7 @@ mod test {
             fd: 5,
             path: Some(PathBuf::from("/tmp/dir/fifo")),
             open_file: crate::types::OpenFileId::new(creator, 7),
+            reached: None,
         };
         let replaced = Some(crate::types::OpenFileId::new(creator, 8));
         let unchanged = Some(fifo.open_file);

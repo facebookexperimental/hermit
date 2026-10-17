@@ -358,9 +358,26 @@ pub(crate) const PLACEHOLDER_LINK_CAPACITY: usize = 288;
 /// placeholder for a file whose every snapshot is the same carries none
 /// (`ProcfsFile::snapshot_is_rerendered`): the new image renders the same
 /// bytes, which for a table would not fit.
+///
+/// A per-process file's name also carries the identity of its task
+/// ([`TaskIncarnation`]) after a `#`, its process's incarnation and, for a
+/// thread's file, `.` and the thread's: `/proc/3/cgroup#1@`. A backend that
+/// rediscovers the placeholder after `exec` so finds the same file of the
+/// same task (`placeholder_link`).
 pub(crate) fn placeholder_name(path: &Path, snapshot: &[u8]) -> String {
     use std::fmt::Write as _;
-    let mut name = format!("{PLACEHOLDER_NAME_PREFIX}{}@", path.display());
+    let mut name = format!("{PLACEHOLDER_NAME_PREFIX}{}", path.display());
+    if let Some(PerProcessName {
+        incarnation: Some(incarnation),
+        ..
+    }) = per_process_name(path)
+    {
+        let _ = write!(name, "#{}", incarnation.process);
+        if let Some(thread) = incarnation.thread {
+            let _ = write!(name, ".{thread}");
+        }
+    }
+    name.push('@');
     for byte in snapshot {
         let _ = write!(name, "{byte:02x}");
     }
@@ -394,10 +411,41 @@ pub(crate) fn placeholder_link(
         .chunks(2)
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
         .collect::<Option<Vec<u8>>>()?;
-    let path = ProcfsFile::from_path(Path::new(
+    // A per-process file's task identity follows its path after `#`.
+    let (path, identity) = match path.iter().rposition(|byte| *byte == b'#') {
+        Some(hash) => (&path[..hash], Some(&path[hash + 1..])),
+        None => (path, None),
+    };
+    let mut file = ProcfsFile::from_path(Path::new(
         <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path),
-    ))?
-    .rendered_path(files)?;
+    ))?;
+    match (file.per_process_name().is_some(), identity) {
+        (true, Some(identity)) => {
+            let identity = std::str::from_utf8(identity).ok()?;
+            let (process, thread) = match identity.split_once('.') {
+                Some((process, thread)) => (process, Some(thread.parse().ok()?)),
+                None => (identity, None),
+            };
+            let incarnation = TaskIncarnation {
+                process: process.parse().ok()?,
+                thread,
+            };
+            // A name no placeholder Detcore made carries: an incarnation that
+            // has no inode number (`procfs_inode::incarnation_fits`), or a
+            // thread's where the path names none.
+            if incarnation.thread.is_some() != file.bound_task()?.thread.is_some()
+                || !crate::procfs_inode::incarnation_fits(incarnation)
+            {
+                return None;
+            }
+            file.set_task_incarnation(incarnation);
+        }
+        (false, None) => {}
+        // A per-process file's placeholder always carries its task's
+        // identity, and no other file's carries one.
+        _ => return None,
+    }
+    let path = file.rendered_path(files)?;
     Some((path, snapshot))
 }
 
@@ -438,10 +486,236 @@ impl RenderedFiles {
     }
 }
 
+/// How a `/proc` path names the process or thread a per-process file belongs
+/// to: the caller (`self` for its process, `thread-self` for its thread), a
+/// number, or something that names no task (a number with a leading zero, or
+/// one too large, which Linux's `name_to_int` refuses).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum TaskName {
+    Caller,
+    Number(i32),
+    Nothing,
+}
+
+impl TaskName {
+    fn parse(name: &str) -> Self {
+        match name.parse::<i32>() {
+            Ok(number) if number > 0 && !name.starts_with('0') => TaskName::Number(number),
+            _ => TaskName::Nothing,
+        }
+    }
+}
+
+/// The task a per-process procfs file's path names, before and after Detcore
+/// binds the caller's spellings to numbers: `/proc/<process>/<file>` or
+/// `/proc/<process>/task/<thread>/<file>`, where `thread-self` is the caller's
+/// process and thread (<https://github.com/rrnewton/hermit/issues/4213>).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ProcfsTask {
+    process: TaskName,
+    thread: Option<TaskName>,
+}
+
+/// The task a per-process procfs file belongs to, as the guest numbers it:
+/// the process (or, at `/proc/<tid>`, the thread) named at the top of
+/// `/proc`, and the thread named below its `task` directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct BoundTask {
+    pub(crate) process: i32,
+    pub(crate) thread: Option<i32>,
+}
+
+/// Which task holding a [`BoundTask`]'s numbers a per-process file belongs
+/// to: for each number, how many tasks of the run have held it, the one
+/// holding it now included (`InodePool::count_incarnation` in the global
+/// tool). Linux reuses a pid once its last holder is gone, and Detcore
+/// admits a task on a reused id (`Scheduler::forget_previous_process_exit`),
+/// so a number alone does not name one task for the whole run; the number
+/// and its incarnation do. 0 for an id no guest task has held (pid 1, the
+/// namespace's init, when no guest holds it).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub(crate) struct TaskIncarnation {
+    pub(crate) process: u32,
+    pub(crate) thread: Option<u32>,
+}
+
+impl ProcfsTask {
+    /// The task `path`, normalized, names for a per-process file called
+    /// `filename`, if it names that file.
+    fn parse(path: &str, filename: &str) -> Option<Self> {
+        let relative = path.strip_prefix("/proc/")?;
+        let components = relative.split('/').collect::<Vec<_>>();
+        let name = |text: &str, caller: &str| {
+            if text == caller {
+                Some(TaskName::Caller)
+            } else if is_numeric_id(text) {
+                Some(TaskName::parse(text))
+            } else {
+                None
+            }
+        };
+        match components.as_slice() {
+            ["thread-self", candidate] if *candidate == filename => Some(Self {
+                process: TaskName::Caller,
+                thread: Some(TaskName::Caller),
+            }),
+            [process, candidate] if *candidate == filename => Some(Self {
+                process: name(process, "self")?,
+                thread: None,
+            }),
+            [process, "task", thread, candidate] if *candidate == filename => Some(Self {
+                process: name(process, "self")?,
+                thread: Some(name(thread, "")?),
+            }),
+            _ => None,
+        }
+    }
+
+    /// This spelling with the caller's process `pid` and thread `tid` in
+    /// place of `self` and `thread-self`, as Linux resolves them at lookup.
+    fn bound_to(self, pid: i32, tid: i32) -> Self {
+        let process = match self.process {
+            TaskName::Caller => TaskName::Number(pid),
+            other => other,
+        };
+        let thread = self.thread.map(|thread| match thread {
+            TaskName::Caller => TaskName::Number(tid),
+            other => other,
+        });
+        Self { process, thread }
+    }
+
+    /// The task, once every name is a number; `None` while a name is the
+    /// caller's, and for a spelling that names no task.
+    fn bound(&self) -> Option<BoundTask> {
+        let number = |name: TaskName| match name {
+            TaskName::Number(number) => Some(number),
+            TaskName::Caller | TaskName::Nothing => None,
+        };
+        Some(BoundTask {
+            process: number(self.process)?,
+            thread: match self.thread {
+                Some(thread) => Some(number(thread)?),
+                None => None,
+            },
+        })
+    }
+}
+
+/// A per-process file Detcore renders, as its interned path names it: the
+/// task it belongs to, the incarnation of that task's numbers when Detcore
+/// bound it, and the file's name in the task's directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PerProcessName {
+    pub(crate) task: BoundTask,
+    pub(crate) incarnation: Option<TaskIncarnation>,
+    pub(crate) filename: &'static str,
+}
+
+/// The interned names of the per-process files Detcore has rendered, by the
+/// address and length of the path each was given (a prefix of one, such as
+/// its parent directory, starts at the same address and is not that file).
+static PER_PROCESS_NAMES_BY_PATH: std::sync::Mutex<
+    std::collections::BTreeMap<(usize, usize), PerProcessName>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The interned path of a per-process file Detcore renders,
+/// `/proc/<process>/<file>` or `/proc/<process>/task/<thread>/<file>`, for
+/// one task identity (`incarnation`). Rendered files are named by
+/// `&'static Path` throughout (the placeholder registry, descriptor links,
+/// inode keys); each (path, identity) is given its own path, made once and
+/// kept for the life of the tool process, so the path a descriptor holds
+/// carries the identity of the
+/// task its file belongs to ([`per_process_name`]), from which its inode
+/// is numbered (`procfs_inode::rendered_inode`). Two tasks that held the
+/// same pid have files with the same text but different paths. The table is
+/// not pruned: a descriptor or directory of a reaped task can still name its
+/// file, and a `&'static Path` cannot be taken back. It holds one path per
+/// per-process file, task generations and spelling the guest named. A thread
+/// group of N threads has N numbers that each name a `/proc/<n>` directory
+/// (Linux keeps a non-leader thread's, unlisted), and each of those has a
+/// `task` directory listing all N threads, so it can be named by up to N
+/// process spellings and N² thread spellings (`/proc/<n>/task/<m>`): at most
+/// `(N + N²) × PER_PROCESS_NAMES.len()` paths per group of task generations,
+/// each a few dozen bytes, and only those the guest named.
+fn per_process_path(
+    task: BoundTask,
+    filename: &'static str,
+    incarnation: Option<TaskIncarnation>,
+) -> &'static Path {
+    type Key = (BoundTask, &'static str, Option<TaskIncarnation>);
+    static PATHS: std::sync::Mutex<std::collections::BTreeMap<String, Vec<(Key, &'static str)>>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let text = match task.thread {
+        Some(thread) => format!("/proc/{}/task/{thread}/{filename}", task.process),
+        None => format!("/proc/{}/{filename}", task.process),
+    };
+    let key = (task, filename, incarnation);
+    let mut paths = PATHS.lock().expect("per-process path table poisoned");
+    let entries = paths.entry(text.clone()).or_default();
+    if let Some(interned) = entries
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .map(|(_, interned)| *interned)
+    {
+        return Path::new(interned);
+    }
+    let leaked: &'static str = Box::leak(text.into_boxed_str());
+    entries.push((key, leaked));
+    PER_PROCESS_NAMES_BY_PATH
+        .lock()
+        .expect("per-process name table poisoned")
+        .insert(
+            (leaked.as_ptr() as usize, leaked.len()),
+            PerProcessName {
+                task,
+                incarnation,
+                filename,
+            },
+        );
+    Path::new(leaked)
+}
+
+/// The per-process file a rendered path names, if Detcore gave it that path
+/// ([`per_process_path`]).
+pub(crate) fn per_process_name(path: &Path) -> Option<PerProcessName> {
+    use std::os::unix::ffi::OsStrExt;
+    PER_PROCESS_NAMES_BY_PATH
+        .lock()
+        .expect("per-process name table poisoned")
+        .get(&(
+            path.as_os_str().as_bytes().as_ptr() as usize,
+            path.as_os_str().len(),
+        ))
+        .copied()
+}
+
+/// Whether `path`, a rendered file's, is a per-process file's, which Linux
+/// opens with the file operations of its `pid_entry` directly
+/// (`proc_single_file_operations` and the like), not through `proc_reg`: it
+/// has no `mmap` method, so a mapping is `ENODEV` as for a sysctl file, and
+/// it belongs to its process's owner, not to global root.
+pub(crate) fn rendered_path_is_per_process(path: &Path) -> bool {
+    path.strip_prefix("/proc")
+        .ok()
+        .and_then(|rest| rest.components().next())
+        .is_some_and(|first| first.as_os_str().to_str().is_some_and(is_numeric_id))
+}
+
 /// State for a procfs file whose volatile fields require normalization.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ProcfsFile {
     kind: ProcfsKind,
+    /// The task a per-process file Detcore renders belongs to
+    /// ([`ProcfsFile::per_process_name`]), as its path named it; bound to
+    /// numbers at open ([`ProcfsFile::bind_task`]).
+    #[serde(default)]
+    task: Option<ProcfsTask>,
+    /// The identity of the task a per-process file belongs to
+    /// ([`TaskIncarnation`]), learned from Detcore's process table when it
+    /// was opened ([`ProcfsFile::set_task_incarnation`]).
+    #[serde(default)]
+    incarnation: Option<TaskIncarnation>,
     target_fd: Option<i32>,
     bound_thread_identity: Option<(i32, i32, i32)>,
     #[serde(default)]
@@ -940,8 +1214,12 @@ impl ProcfsFile {
             _ if is_irq_per_cpu_count_path(&path) => ProcfsKind::IrqPerCpuCount,
             _ => sysfs_rtc_kind(&path)?,
         };
+        let task = Self::per_process_name_of(&kind)
+            .and_then(|filename| ProcfsTask::parse(path_text, filename));
         Some(Self {
             kind,
+            task,
+            incarnation: None,
             target_fd,
             bound_thread_identity: None,
             timer_slack_identity: None,
@@ -960,8 +1238,88 @@ impl ProcfsFile {
     ///
     /// `/proc/cpuinfo` is one only in a session that renders it (`files`),
     /// and always once Detcore opened it so.
+    ///
+    /// A per-process file ([`Self::per_process_name`]) is one once its path
+    /// names its task by number ([`Self::bind_task`]); its path is then the
+    /// task's, `/proc/<pid>/<file>` or `/proc/<pid>/task/<tid>/<file>`, as
+    /// Linux names the file in descriptor links.
     pub(crate) fn rendered_path(&self, files: RenderedFiles) -> Option<&'static Path> {
         self.rendered_path_where(self.rendered || files.cpuinfo)
+    }
+
+    /// The path of this file where the reads of a descriptor open on it are
+    /// served from Detcore's rendering ([`Self::rendered_path`]), whichever
+    /// opened it. A per-process file only once Detcore opened it as rendered:
+    /// one the kernel opened (under record and replay, after `chroot`, in a
+    /// nested PID namespace, through `..`) keeps the kernel's bytes, sanitized,
+    /// as before per-process files were rendered.
+    pub(crate) fn served_rendered_path(&self, files: RenderedFiles) -> Option<&'static Path> {
+        if self.task.is_some() && !self.rendered {
+            return None;
+        }
+        self.rendered_path(files)
+    }
+
+    /// The name of a per-process file Detcore renders, as it appears in a
+    /// process's and a thread's directory: one whose bytes depend on no
+    /// kernel object, so Detcore decides that it exists, from its own process
+    /// table, and what it holds, on every backend
+    /// (<https://github.com/rrnewton/hermit/issues/4213>).
+    pub(crate) fn per_process_name(&self) -> Option<&'static str> {
+        self.task
+            .and_then(|_| Self::per_process_name_of(&self.kind))
+    }
+
+    /// The per-process files Detcore renders, by their name in a process's
+    /// directory.
+    fn per_process_name_of(kind: &ProcfsKind) -> Option<&'static str> {
+        Self::PER_PROCESS_KINDS
+            .iter()
+            .find(|(candidate, _)| candidate == kind)
+            .map(|(_, name)| *name)
+    }
+
+    /// The per-process files Detcore renders, and their names.
+    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 0] = [];
+
+    /// The names of the per-process files Detcore renders.
+    pub(crate) const PER_PROCESS_NAMES: [&'static str; 0] = [];
+
+    /// Bind the caller's spellings (`self`, `thread-self`) of a per-process
+    /// file's task to the caller's process `pid` and thread `tid`, as Linux
+    /// resolves them when the path is looked up. Nothing for any other file.
+    pub(crate) fn bind_task(&mut self, pid: i32, tid: i32) {
+        if let Some(task) = self.task.as_mut() {
+            *task = task.bound_to(pid, tid);
+        }
+    }
+
+    /// The task a per-process file belongs to, once bound to numbers.
+    pub(crate) fn bound_task(&self) -> Option<BoundTask> {
+        self.task.as_ref().and_then(ProcfsTask::bound)
+    }
+
+    /// Record which task holding the bound numbers this per-process file
+    /// belongs to ([`TaskIncarnation`]), as Detcore's process table answers.
+    pub(crate) fn set_task_incarnation(&mut self, incarnation: TaskIncarnation) {
+        self.incarnation = Some(incarnation);
+    }
+
+    /// The identity of the task a per-process file belongs to, once known.
+    #[cfg(test)]
+    pub(crate) fn task_incarnation(&self) -> Option<TaskIncarnation> {
+        self.incarnation
+    }
+
+    /// This file as Detcore rendered it at `path`, one of its rendered paths:
+    /// the file's kind and task from the path, and for a per-process file the
+    /// task identity the path carries ([`per_process_name`]).
+    pub(crate) fn from_rendered_path(path: &Path) -> Option<Self> {
+        let mut file = Self::from_path(path)?;
+        if let Some(name) = per_process_name(path) {
+            file.incarnation = name.incarnation;
+        }
+        Some(file)
     }
 
     /// The path of this file if Detcore opened it without a kernel object
@@ -982,6 +1340,9 @@ impl ProcfsFile {
             ProcfsKind::SystemStat => Some(Path::new("/proc/stat")),
             ProcfsKind::Cpuinfo if cpuinfo_rendered => Some(Path::new("/proc/cpuinfo")),
             ProcfsKind::Fixed(file) => Some(file.path()),
+            _ if let Some(name) = Self::per_process_name_of(&self.kind) => {
+                Some(per_process_path(self.bound_task()?, name, self.incarnation))
+            }
             _ => None,
         }
     }
@@ -1042,7 +1403,18 @@ impl ProcfsFile {
     /// seconds on the placeholder (`syscalls::files::rendered_procfs`), where
     /// a process that shares the open file, or the image after `exec`, finds
     /// them on a backend that keeps Detcore's state per process.
+    ///
+    /// A per-process file too: Linux's `single_open` file runs its `show`
+    /// method at the first read, which finds the task again (ESRCH once it is
+    /// gone), and again after a rewind (`set_offset`).
     pub(crate) fn snapshot_at_first_read(&self) -> bool {
+        self.snapshot_carries_uptime() || self.per_process_name().is_some()
+    }
+
+    /// Whether the snapshot of this file a first read takes is a function of
+    /// that read's uptime, which its placeholder carries across `exec` and to
+    /// other processes sharing the open file (`Detcore::first_read_uptime`).
+    pub(crate) fn snapshot_carries_uptime(&self) -> bool {
         matches!(self.kind, ProcfsKind::Uptime | ProcfsKind::SystemStat)
     }
 
@@ -1504,6 +1876,20 @@ impl ProcfsFile {
         self.offset = offset;
         if matches!(self.kind, ProcfsKind::TimerSlack(_)) && offset == 0 {
             // seq_file regenerates its single-record snapshot after rewind.
+            self.contents = None;
+        }
+    }
+
+    /// Moves the shared cursor as the guest's `lseek` does: as
+    /// [`Self::set_offset`], and a rewind of a rendered per-process file
+    /// drops its snapshot, which the next read takes again, as Linux's
+    /// `single_open` file runs its `show` again after a rewind (and finds the
+    /// task gone, ESRCH, once it is). Adopting a position Detcore did not
+    /// choose (a placeholder's, after a backend rediscovers the descriptor)
+    /// is no rewind and keeps the snapshot.
+    pub(crate) fn seek_to(&mut self, offset: usize) {
+        self.set_offset(offset);
+        if offset == 0 && self.rendered && self.per_process_name().is_some() {
             self.contents = None;
         }
     }

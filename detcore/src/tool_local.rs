@@ -1396,7 +1396,7 @@ impl FileMetadata {
             )
         };
         let offset = usize::try_from(offset).unwrap_or(0);
-        let procfs = crate::procfs::ProcfsFile::from_path(path)
+        let procfs = crate::procfs::ProcfsFile::from_rendered_path(path)
             .expect("a rendered path is a procfs file")
             .into_rendered();
         let procfs = if snapshot.is_empty() {
@@ -5204,6 +5204,15 @@ impl<T> ThreadState<T> {
         flags: OFlag,
     ) -> Result<Option<OpenFileId>, CapturedDetFdInstallError> {
         self.metadata().install_captured_fd(captured, newfd, flags)
+    }
+
+    /// Install `detfd`, which refers to an open file description Detcore
+    /// models, as descriptor `detfd.fd` of this table: a descriptor that
+    /// reached the description by a route Detcore does not model
+    /// (`SCM_RIGHTS`), adopted when the guest first names it
+    /// (`Detcore::adopt_received_placeholders`).
+    pub(crate) fn install_alias(&self, detfd: DetFd) {
+        self.metadata().add_detfd(detfd);
     }
 
     /// Abandon an uninstalled capture and identify a deferred final-OFD release.

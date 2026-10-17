@@ -137,6 +137,31 @@ pub struct DetFd {
     open_file: Arc<Mutex<OpenFileState>>,
 }
 
+/// A handle on an open file description that Detcore models, which does not
+/// keep it alive: once no modeled descriptor refers to the description, the
+/// handle reaches nothing. Where one tool process serves every guest process
+/// (ptrace, KVM), a descriptor that reaches the same Linux `struct file` by a
+/// route Detcore does not model (`SCM_RIGHTS`) joins the description through
+/// it, as a `dup` would (`Detcore::adopt_received_placeholders`).
+#[derive(Clone, Debug)]
+pub(crate) struct OpenFileHandle(std::sync::Weak<Mutex<OpenFileState>>);
+
+impl OpenFileHandle {
+    /// Descriptor `fd` of the description, if any modeled descriptor still
+    /// refers to it: an alias, sharing its cursor, snapshot and status flags,
+    /// with `FD_CLOEXEC` as `cloexec` says.
+    pub(crate) fn descriptor(&self, fd: RawFd, cloexec: bool) -> Option<DetFd> {
+        let open_file = self.0.upgrade()?;
+        let mut detfd = DetFd {
+            fd,
+            fd_flags: 0,
+            open_file,
+        };
+        detfd.set_cloexec(cloexec);
+        Some(detfd)
+    }
+}
+
 /// A socket's receive timeout (`SO_RCVTIMEO`, socket(7)), as the guest set it.
 // TODO-HUMAN-REVIEW(PR-3908)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,6 +360,21 @@ struct OpenFileDescription {
     /// observe enough provenance to identify its target.
     #[serde(default)]
     pidfd_target: Option<DetPid>,
+    /// The task directory this open file is, where it was opened as one: a
+    /// `/proc/self` or `/proc/thread-self` spelling with the selector replaced
+    /// by the opener's numbers, or a `/proc/<pid>` or `/proc/<pid>/task/<tid>`
+    /// spelling itself, and the identity of the task it named then. A name
+    /// relative to it is looked up below that task's directory, whoever looks
+    /// it up, while that task lives, as Linux binds a task directory to its
+    /// task at the open (`Detcore::procfs_spelling_at`). The recorded `path`
+    /// keeps the spelling. Shared by descriptor aliases and a fork's copies.
+    #[serde(default)]
+    procfs_reached: Option<(PathBuf, Option<crate::procfs::TaskIncarnation>)>,
+    /// This open file is the `/proc/self` or `/proc/thread-self` link itself
+    /// (an `O_PATH | O_NOFOLLOW` open), not the directory it leads to, so no
+    /// name is below it (ENOTDIR), whatever its recorded `path` spells.
+    #[serde(default)]
+    procfs_link_itself: bool,
     /// File status flags shared by dup and fork aliases.
     status_flags: i32,
     /// File path associated with fd.
@@ -516,6 +556,7 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("ty", &self.ty);
         debug.field("inherited_external_read", &self.inherited_external_read);
         debug.field("pidfd_target", &self.pidfd_target);
+        debug.field("procfs_reached", &self.procfs_reached);
         debug.field("status_flags", &self.status_flags);
         debug.field("path", &self.path);
         debug.field("inode", &self.inode);
@@ -748,6 +789,8 @@ impl DetFd {
                 id,
                 ty,
                 pidfd_target: None,
+                procfs_reached: None,
+                procfs_link_itself: false,
                 inherited_external_read: None,
                 status_flags: bits & !OFlag::O_CLOEXEC.bits(),
                 path: None,
@@ -796,6 +839,12 @@ impl DetFd {
             OpenFileState::Local(description) => f(description),
             OpenFileState::Shared(shared) => with_shared_description(shared.id, f),
         }
+    }
+
+    /// A handle on this descriptor's open file description that does not
+    /// keep it alive ([`OpenFileHandle`]).
+    pub(crate) fn open_file_handle(&self) -> OpenFileHandle {
+        OpenFileHandle(Arc::downgrade(&self.open_file))
     }
 
     /// update fd
@@ -951,6 +1000,38 @@ impl DetFd {
         self.with_description(|d| d.pidfd_target)
     }
 
+    /// Record where the `/proc` selector spelling this open file was opened
+    /// by led (`OpenFileDescription::procfs_reached`).
+    /// `incarnation` is the identity of the task the selector reached, where
+    /// Detcore asked its process table (`procfs::TaskIncarnation`): a name
+    /// below it is that task's while no other task holds its numbers.
+    pub(crate) fn set_procfs_reached(
+        &self,
+        reached: PathBuf,
+        incarnation: Option<crate::procfs::TaskIncarnation>,
+    ) {
+        self.with_description(|d| d.procfs_reached = Some((reached, incarnation)))
+    }
+
+    /// Record that this open file is a `/proc` selector link itself
+    /// (`OpenFileDescription::procfs_link_itself`).
+    pub(crate) fn set_procfs_link_itself(&self) {
+        self.with_description(|d| d.procfs_link_itself = true)
+    }
+
+    /// Whether this open file is a `/proc` selector link itself.
+    pub(crate) fn procfs_link_itself(&self) -> bool {
+        self.with_description(|d| d.procfs_link_itself)
+    }
+
+    /// The task directory this open file is, if Detcore knows it
+    /// (`OpenFileDescription::procfs_reached`).
+    pub(crate) fn procfs_reached(
+        &self,
+    ) -> Option<(PathBuf, Option<crate::procfs::TaskIncarnation>)> {
+        self.with_description(|d| d.procfs_reached.clone())
+    }
+
     /// The pipe or FIFO this descriptor is an end of, when
     /// `--pipe-wake-latency` is on and Detcore knows it
     /// (`crate::pipe_wake`).
@@ -1045,7 +1126,7 @@ impl DetFd {
         self.with_description(|d| {
             d.procfs
                 .as_ref()
-                .and_then(|procfs| procfs.rendered_path(files))
+                .and_then(|procfs| procfs.served_rendered_path(files))
         })
     }
 
@@ -1108,14 +1189,14 @@ impl DetFd {
     }
 
     /// Whether Detcore opened this procfs file without a kernel object behind
-    /// it and its first read takes its snapshot
-    /// (`ProcfsFile::snapshot_at_first_read`), at an uptime the placeholder
-    /// carries (`Detcore::first_read_uptime`).
+    /// it and its first read takes its snapshot at an uptime the placeholder
+    /// carries (`ProcfsFile::snapshot_carries_uptime`,
+    /// `Detcore::first_read_uptime`).
     pub(crate) fn procfs_rendered_at_first_read(&self) -> bool {
         self.with_description(|d| {
             d.procfs
                 .as_ref()
-                .is_some_and(|procfs| procfs.is_rendered() && procfs.snapshot_at_first_read())
+                .is_some_and(|procfs| procfs.is_rendered() && procfs.snapshot_carries_uptime())
         })
     }
 
@@ -1401,6 +1482,17 @@ impl DetFd {
 
     pub(crate) fn procfs_target_fd(&self) -> Option<i32> {
         self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::target_fd))
+    }
+
+    /// Move the cursor shared by every alias of a procfs open file as the
+    /// guest's `lseek` does (`ProcfsFile::seek_to`).
+    pub(crate) fn seek_procfs(&self, offset: usize) {
+        self.with_description(|d| {
+            d.procfs
+                .as_mut()
+                .expect("procfs fd disappeared while seeking it")
+                .seek_to(offset)
+        });
     }
 
     /// Update the cursor shared by every alias of a procfs open file.

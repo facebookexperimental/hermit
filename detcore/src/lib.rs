@@ -3572,14 +3572,24 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // A `/proc` name outside the run's `--proc` level does not exist. A
         // procfs file Detcore renders answers, as Linux does, the calls that
         // would reach the placeholder standing in for it.
-        let rendered_procfs_answer = if sigalrm_refusal.is_none() {
+        // A rendered procfs descriptor that reached this table over
+        // SCM_RIGHTS is adopted as the file it is before anything answers a
+        // call through it.
+        let adoption = if sigalrm_refusal.is_none() {
+            self.adopt_received_placeholders(guest, &call).await
+        } else {
+            Ok(())
+        };
+        let rendered_procfs_answer = if let Err(error) = adoption {
+            Some(Err(error))
+        } else if sigalrm_refusal.is_none() {
             match self
                 .refuse_procfs_name_outside_level(guest, &call)
                 .await
                 .transpose()
             {
                 Some(refusal) => Some(refusal),
-                None => match self.answer_rendered_procfs_operation(guest, &call) {
+                None => match self.answer_rendered_procfs_operation(guest, &call).await {
                     Some(answer) => Some(answer),
                     None => match self.answer_rendered_procfs_mapping(guest, &call).await {
                         Some(answer) => Some(answer),

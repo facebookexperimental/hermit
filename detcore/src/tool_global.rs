@@ -196,6 +196,10 @@ struct InodePool {
     /// How many guest threads have been counted (see
     /// [`Self::count_incarnation`]).
     threads_counted: u64,
+    /// The state Linux keeps on a per-process `/proc` file's inode that
+    /// Detcore keeps for the files it renders, by their inode number (see
+    /// [`Self::rendered_file_state`]).
+    rendered_file_states: HashMap<u64, crate::procfs::listing::RenderedFileState>,
 }
 
 /// How a numbering request reached its file, which decides whether a retired
@@ -383,7 +387,80 @@ impl InodePool {
             procfs_keys: HashMap::new(),
             incarnations: HashMap::new(),
             threads_counted: 0,
+            rendered_file_states: HashMap::new(),
         }
+    }
+
+    /// How many guest threads have been given task ID `tid` in this run (see
+    /// [`Self::count_incarnation`]): the incarnation of the one holding it
+    /// now, 0 for an ID no guest thread has held.
+    fn incarnation(&self, tid: i32) -> u32 {
+        self.incarnations.get(&tid).map_or(0, |counted| {
+            u32::try_from(counted.len()).unwrap_or(u32::MAX)
+        })
+    }
+
+    /// What Detcore's process table says of the task `named` and its thread
+    /// `thread` (`existence`: `Scheduler::procfs_task`'s whether it exists
+    /// and whether it has exited), with the incarnation each number has now
+    /// ([`Self::incarnation`]).
+    fn procfs_task_answer(
+        &self,
+        named: DetTid,
+        thread: Option<DetTid>,
+        (exists, without_mm): (bool, bool),
+    ) -> crate::procfs::listing::ProcfsTaskAnswer {
+        crate::procfs::listing::ProcfsTaskAnswer {
+            exists,
+            without_mm,
+            process_incarnation: self.incarnation(named.as_raw()),
+            thread_incarnation: thread.map(|thread| self.incarnation(thread.as_raw())),
+        }
+    }
+
+    /// Apply `change` to the state of the rendered per-process `/proc` file
+    /// numbered `inode`, and return the state. Every change comes in its
+    /// guest thread's turn, so their order is the scheduler's.
+    ///
+    /// Only a file whose owner wrote its state (an mtime, a write hint) has
+    /// an entry; a read of any other inserts none. Entries are kept for the
+    /// run: a per-process inode names one task generation
+    /// (`procfs_inode::per_process_inode`), and a descriptor or a directory
+    /// of a task that is gone can still reach its file (an `fstat` of a
+    /// descriptor kept past a reap reads its mtime), so no entry can be
+    /// retired exactly. The table holds one entry per per-process inode whose
+    /// owner set a time or a hint, and an inode is a spelling's identity
+    /// (`procfs_inode::per_process_inode`): for a thread group of N threads,
+    /// up to `(N + N²) × PER_PROCESS_NAMES.len()` inodes per group of task
+    /// generations (N process spellings, N² `/proc/<n>/task/<m>` spellings,
+    /// `procfs::per_process_path`), and only those the guest wrote.
+    // TODO-HUMAN-REVIEW(#4213): Review the per-inode mtime and write-hint
+    // state Detcore keeps for its rendered per-process files, in the global
+    // tool, changed in the changing thread's turn.
+    fn rendered_file_state(
+        &mut self,
+        inode: u64,
+        change: crate::procfs::listing::RenderedFileChange,
+    ) -> crate::procfs::listing::RenderedFileState {
+        use crate::procfs::listing::RenderedFileChange;
+        let state = match change {
+            RenderedFileChange::Read => {
+                return self
+                    .rendered_file_states
+                    .get(&inode)
+                    .copied()
+                    .unwrap_or_default();
+            }
+            _ => self.rendered_file_states.entry(inode).or_default(),
+        };
+        match change {
+            RenderedFileChange::Read => {}
+            RenderedFileChange::Mtime(seconds, nanoseconds) => {
+                state.mtime = Some((seconds, nanoseconds));
+            }
+            RenderedFileChange::WriteHint(hint) => state.write_hint = hint,
+        }
+        *state
     }
 
     /// The key to pool the procfs entry at host inode `host` under, given the
@@ -3389,6 +3466,24 @@ impl GlobalState {
                     .setpgid_decision(caller, pid, pgid)
                     .map_err(|errno| errno.into_raw()),
             ),
+            GlobalRequest::ProcfsTask(named, thread) => {
+                let existence = self
+                    .lock_rpc_scheduler(false)
+                    .await
+                    .procfs_task(named, thread);
+                R::ProcfsTask(
+                    self.inodes
+                        .lock()
+                        .unwrap()
+                        .procfs_task_answer(named, thread, existence),
+                )
+            }
+            GlobalRequest::RenderedFileState(inode, change) => R::RenderedFileState(
+                self.inodes
+                    .lock()
+                    .unwrap()
+                    .rendered_file_state(inode, change),
+            ),
             GlobalRequest::LocalPid(caller, task) => R::LocalPid(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -5485,6 +5580,13 @@ pub enum GlobalRequest {
     /// process's exec (`crate::exec_record`), for its `/proc/<pid>/exe`
     /// link. Appended last.
     ProcessImage(DetPid),
+    /// Whether the task a per-process `/proc` file names exists, whether it
+    /// has exited unreaped, and the incarnation of its numbers
+    /// (`Scheduler::procfs_task`). Appended last.
+    ProcfsTask(DetTid, Option<DetTid>),
+    /// Change or read the state Detcore keeps on a rendered per-process
+    /// `/proc` file's inode (`InodePool::rendered_file_state`). Appended last.
+    RenderedFileState(u64, crate::procfs::listing::RenderedFileChange),
 }
 
 /// Responses from the global object
@@ -5663,6 +5765,10 @@ pub enum GlobalResponse {
     SetpgidDecision(Result<(DetPid, DetPid), i32>),
     /// Boxed, to keep the response small. Appended last.
     ProcessImage(Option<Box<crate::exec_record::ExecRecord>>),
+    /// Appended last.
+    ProcfsTask(crate::procfs::listing::ProcfsTaskAnswer),
+    /// Appended last.
+    RenderedFileState(crate::procfs::listing::RenderedFileState),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -7921,6 +8027,46 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ProcfsListing(process)).await;
     match response.1 {
         GlobalResponse::ProcfsListing(facts) => facts,
+        _ => unreachable!(),
+    }
+}
+
+/// What Detcore's process table says of the task a per-process `/proc` file
+/// names (`Scheduler::procfs_task`), with the incarnation of its numbers.
+pub async fn procfs_task<G, T>(
+    guest: &mut G,
+    task: crate::procfs::BoundTask,
+) -> crate::procfs::listing::ProcfsTaskAnswer
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let request = GlobalRequest::ProcfsTask(
+        DetTid::from_raw(task.process),
+        task.thread.map(DetTid::from_raw),
+    );
+    let response = send_and_update_time(guest, request).await;
+    match response.1 {
+        GlobalResponse::ProcfsTask(answer) => answer,
+        _ => unreachable!(),
+    }
+}
+
+/// Change or read the state Detcore keeps on the rendered per-process `/proc`
+/// file numbered `inode` (`InodePool::rendered_file_state`).
+pub async fn rendered_file_state<G, T>(
+    guest: &mut G,
+    inode: u64,
+    change: crate::procfs::listing::RenderedFileChange,
+) -> crate::procfs::listing::RenderedFileState
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response =
+        send_and_update_time(guest, GlobalRequest::RenderedFileState(inode, change)).await;
+    match response.1 {
+        GlobalResponse::RenderedFileState(state) => state,
         _ => unreachable!(),
     }
 }
@@ -14689,6 +14835,74 @@ mod tests {
         let before = pool.procfs_path_key(&thread);
         pool.count_incarnation(9);
         assert_ne!(pool.procfs_path_key(&thread), before);
+    }
+
+    /// A pid Detcore gives out again is a new task: each registration of a
+    /// task ID counts one more incarnation (`count_incarnation`), which the
+    /// `ProcfsTask` answer reports for the process and the thread, and a file
+    /// or directory bound to the earlier incarnation no longer names the
+    /// task holding the numbers (`ProcfsTaskAnswer::still_names`).
+    #[test]
+    fn a_reused_pid_is_a_new_incarnation_for_procfs_files() {
+        use crate::procfs::TaskIncarnation;
+        use crate::types::DetTid;
+        let mut pool = super::InodePool::new();
+        assert_eq!(pool.incarnation(7), 0, "an ID no task has held");
+        pool.count_incarnation(7);
+        pool.count_incarnation(9);
+        assert_eq!((pool.incarnation(7), pool.incarnation(9)), (1, 1));
+        let (seven, nine) = (DetTid::from_raw(7), DetTid::from_raw(9));
+        let first = pool.procfs_task_answer(seven, Some(nine), (true, false));
+        assert_eq!(
+            first.incarnation(),
+            TaskIncarnation {
+                process: 1,
+                thread: Some(1),
+            }
+        );
+        let bound = first.incarnation();
+        assert!(first.still_names(bound));
+        // The process exits and is reaped; a new process takes pid 7.
+        pool.count_incarnation(7);
+        let reused = pool.procfs_task_answer(seven, Some(nine), (true, false));
+        assert_eq!(reused.process_incarnation, 2);
+        assert_eq!(reused.thread_incarnation, Some(1));
+        assert!(!reused.still_names(bound), "the file of the old pid 7");
+        assert!(reused.still_names(reused.incarnation()));
+        // A thread ID given out again is a new thread of the same process.
+        pool.count_incarnation(9);
+        let thread_reused = pool.procfs_task_answer(seven, Some(nine), (true, false));
+        assert!(!thread_reused.still_names(reused.incarnation()));
+        // A task that is gone, or a zombie that was reaped, is no task,
+        // whatever its incarnation.
+        let gone = pool.procfs_task_answer(seven, None, (false, false));
+        assert!(!gone.still_names(gone.incarnation()));
+        // The process's own file names no thread.
+        assert_eq!(gone.thread_incarnation, None);
+    }
+
+    /// Reading a rendered file's state inserts nothing; a write keeps one
+    /// entry for that inode only.
+    #[test]
+    fn a_read_of_rendered_file_state_keeps_nothing() {
+        use crate::procfs::listing::RenderedFileChange;
+        let mut pool = super::InodePool::new();
+        let read = pool.rendered_file_state(5, RenderedFileChange::Read);
+        assert_eq!(read, Default::default());
+        assert!(pool.rendered_file_states.is_empty());
+        let written = pool.rendered_file_state(5, RenderedFileChange::Mtime(3, 4));
+        assert_eq!(written.mtime, Some((3, 4)));
+        let hinted = pool.rendered_file_state(5, RenderedFileChange::WriteHint(2));
+        assert_eq!((hinted.mtime, hinted.write_hint), (Some((3, 4)), 2));
+        assert_eq!(
+            pool.rendered_file_state(6, RenderedFileChange::Read),
+            Default::default()
+        );
+        assert_eq!(pool.rendered_file_states.len(), 1);
+        assert_eq!(
+            pool.rendered_file_state(5, RenderedFileChange::Read),
+            hinted
+        );
     }
 
     /// A directory snapshot returns its entries after it was taken, and a
