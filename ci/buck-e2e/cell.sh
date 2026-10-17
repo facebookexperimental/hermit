@@ -107,7 +107,8 @@ extra=()
 # applications/timed-progress-bar verify cell measured 2.4 s of CPU alone, 3.6 s with 8
 # running at once, 5.3 s with 16 and 16.6 s with 48, against its 24 s budget; Buck starts
 # every runnable local cell at once, while the cargo flow runs at most 8. Measured again
-# on 2026-10-17 (devbig014, 48 copies through test-harness as this script's host path
+# on 2026-10-17 (on the host named for this default in docs/TESTING_ENVIRONMENTS.md,
+# "Named measurement hosts"; 48 copies through test-harness as this script's host path
 # runs them), the same cell's harness CPU was 1.39 s at 8, 1.72 s at 16, 3.25 s at 24 and
 # 5.50 s at 48 (max 5.73 s), and 48 c-programs KVM verify cells ran 5.25 cells/s at 8 and
 # 9.16 at 16 at about 1.3 s of CPU each: the lock costs about a third of what it did.
