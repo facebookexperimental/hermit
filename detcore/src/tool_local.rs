@@ -1350,11 +1350,8 @@ impl FileMetadata {
         // it renders the file (`decide_cpuinfo_placeholders`); before that
         // answer, one waits for it as the ordinary descriptor it looks like.
         let decided = self.cpuinfo_placeholders;
-        // A process's `mountinfo` or `mounts` has a placeholder only in a
-        // session with a container mount table, the only one that renders it.
         let files = crate::procfs::RenderedFiles {
             cpuinfo: decided == Some(true),
-            mounts: true,
         };
         let found = may_be_placeholder
             .then(|| placeholder_behind(fd, files))

@@ -402,19 +402,6 @@ pub struct Config {
     #[clap(skip)]
     pub mount_id_assignment_order: Vec<u64>,
 
-    /// The guest's container mount table, which Detcore renders as every
-    /// spelling of `/proc/<pid>/mountinfo` and `/proc/<pid>/mounts` on every
-    /// backend (`crate::container_mounts`,
-    /// <https://github.com/rrnewton/hermit/issues/4213>). hermit-cli builds it
-    /// once, in the completed container namespace before the guest starts;
-    /// a recording carries it, so its replay renders the recorded table.
-    /// `None` (a run outside Hermit's container, such as `--no-namespace` or a
-    /// library caller, and every older configuration) leaves both files to
-    /// the kernel, sanitized as before. Runtime provenance, not a user option.
-    #[serde(default)]
-    #[clap(skip)]
-    pub container_mount_table: Option<crate::container_mounts::ContainerMountTable>,
-
     /// Sequentialize thread execution deterministically.
     #[clap(long)]
     pub sequentialize_threads: bool,
@@ -2413,11 +2400,7 @@ mod legacy_backend_json {
     /// `signal_state_copy` came after it too. The copy is never kept on DBT
     /// (its kernel signal state is not the guest's), so it is never written
     /// and reads as on, its serde default.
-    /// And `container_mount_table`. DBT's launcher encodes the
-    /// legacy form before the container exists, so it has no table to write;
-    /// it is never written and reads as absent. The coordinated startup's
-    /// typed configuration carries the table.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 16] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 15] = [
         "backend",
         "record_host_inputs",
         "guest_may_inherit_a_terminal",
@@ -2433,7 +2416,6 @@ mod legacy_backend_json {
         "cpu_profile",
         "cpu_profile_host",
         "signal_state_copy",
-        "container_mount_table",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -2576,8 +2558,7 @@ mod legacy_backend_json {
                     "in_guest_detlog_forward_policy"
                     | "launch_image"
                     | "scheduler_turn_cost"
-                    | "pipe_wake_latency"
-                    | "container_mount_table",
+                    | "pipe_wake_latency",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
@@ -2854,8 +2835,7 @@ mod legacy_backend_json {
                 | "inherited_seccomp"
                 | "cpu_profile"
                 | "cpu_profile_host"
-                | "signal_state_copy"
-                | "container_mount_table" => Ok(()),
+                | "signal_state_copy" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -3502,8 +3482,7 @@ mod tests {
                 | "inherited_seccomp"
                 | "cpu_profile"
                 | "cpu_profile_host"
-                | "signal_state_copy"
-                | "container_mount_table" => {}
+                | "signal_state_copy" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -3518,11 +3497,10 @@ mod tests {
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
         // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
         // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
-        // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`,
-        // `signal_state_copy` and `container_mount_table` none: fourteen more
-        // keys, and fifteen fewer.
+        // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host` and
+        // `signal_state_copy` none: fourteen more keys, and fourteen fewer.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 1);
+        assert_eq!(fields.len(), keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -4354,17 +4332,12 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("mount_id_assignment_order");
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("container_mount_table");
         let restored: Config = serde_json::from_value(value).unwrap();
         assert!(restored.mountinfo_root_rewrites.is_empty());
         assert!(restored.mountinfo_device_rewrites.is_empty());
         assert!(restored.mountinfo_mount_ids.is_empty());
         assert!(!restored.mountinfo_mount_ids_captured);
         assert!(restored.mount_id_assignment_order.is_empty());
-        assert!(restored.container_mount_table.is_none());
     }
 
     #[test]

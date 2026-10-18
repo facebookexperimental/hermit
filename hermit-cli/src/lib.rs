@@ -2919,40 +2919,13 @@ fn prepare_kvm_mountinfo_config(
     let order = capture().context("failed to capture the KVM backend mount namespace")?;
     if config.mountinfo_mount_ids_captured {
         if config.mountinfo_mount_ids != order {
-            // Name the rows that differ, so that a rare mismatch says which.
-            let only_producer = config
-                .mountinfo_mount_ids
-                .iter()
-                .filter(|id| !order.contains(id))
-                .collect::<Vec<_>>();
-            let only_backend = order
-                .iter()
-                .filter(|id| !config.mountinfo_mount_ids.contains(id))
-                .collect::<Vec<_>>();
             anyhow::bail!(
-                "KVM producer-captured mount identities do not match the backend namespace \
-                 ({} rows then, {} now; only then: {only_producer:?}; only now: {only_backend:?})",
-                config.mountinfo_mount_ids.len(),
-                order.len()
+                "KVM producer-captured mount identities do not match the backend namespace"
             );
         }
     } else {
         config.mountinfo_mount_ids = order;
         config.mountinfo_mount_ids_captured = true;
-    }
-    // The container mount table Detcore renders on KVM too names mounts of
-    // this same namespace: refuse one built in another.
-    if let Some(table) = &config.container_mount_table
-        && let Some(missing) = table
-            .mounts
-            .iter()
-            .map(|row| row.raw_mount_id)
-            .find(|id| !config.mountinfo_mount_ids.contains(id))
-    {
-        anyhow::bail!(
-            "KVM container mount table names mount {missing}, which the backend namespace does \
-             not have"
-        );
     }
     // The backend now exposes the actual namespace's devices. There is no
     // synthetic 0:1 root device to translate; stat and mountinfo use the same
@@ -2988,14 +2961,7 @@ async fn run_kvm(
     capture_output: bool,
 ) -> Result<Output, Error> {
     let dispatch_started = Instant::now();
-    let keep = config
-        .container_mount_table
-        .as_ref()
-        .map(detcore_model::container_mounts::ContainerMountTable::shown_mount_ids)
-        .unwrap_or_default();
-    prepare_kvm_mountinfo_config(&mut config, || {
-        capture_mountinfo_identity_order_keeping(&keep)
-    })?;
+    prepare_kvm_mountinfo_config(&mut config, capture_mountinfo_identity_order)?;
     let stdin = if capture_output {
         let (snapshot_reserved, snapshot) = output_backend_stdin_reservation()?;
         if snapshot_reserved {
@@ -4892,7 +4858,7 @@ impl HermitData {
             let exit_status = record_to_async(
                 command,
                 data.path(),
-                MountProvenance::default(),
+                Vec::new(),
                 None,
                 None,
                 None,
@@ -4924,10 +4890,7 @@ impl HermitData {
             let exit_status = record_to_async(
                 command,
                 data.path(),
-                MountProvenance {
-                    root_rewrites: mountinfo_root_rewrites,
-                    container_mount_table: None,
-                },
+                mountinfo_root_rewrites,
                 Some(mount_ids),
                 None,
                 None,
@@ -5088,33 +5051,10 @@ impl HermitData {
     }
 }
 
-/// What a recording takes from the completed recording container's mount
-/// namespace, which a caller without a Hermit container leaves empty.
-#[derive(Clone, Debug, Default)]
-pub struct MountProvenance {
-    /// The proven roots of Hermit's own mounts
-    /// (`detcore::Config::mountinfo_root_rewrites`).
-    pub root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
-    /// The guest's container mount table
-    /// (`detcore::Config::container_mount_table`), which the recording carries
-    /// for its replay.
-    pub container_mount_table: Option<detcore_model::container_mounts::ContainerMountTable>,
-}
-
 /// Capture the current mount namespace's raw IDs in the exact row/parent order
 /// used by Detcore's canonical mountinfo mapping.
 pub fn capture_mountinfo_identity_order() -> Result<Vec<u64>, Error> {
     mountinfo_identity_order_from_raw(&fs::read("/proc/self/mountinfo")?)
-}
-
-/// [`capture_mountinfo_identity_order`], keeping every row whose mount ID is
-/// in `keep` (the rows a container mount table shows) whatever its name: a
-/// mount Hermit installed is never dropped by the seed filter, so a table
-/// showing it validates against the captured order.
-pub fn capture_mountinfo_identity_order_keeping(
-    keep: &std::collections::BTreeSet<u64>,
-) -> Result<Vec<u64>, Error> {
-    mountinfo_identity_order_keeping_from_raw(&fs::read("/proc/self/mountinfo")?, keep)
 }
 
 /// Producer provenance follows the guest mount model: ephemeral host seed rows
@@ -5122,29 +5062,9 @@ pub fn capture_mountinfo_identity_order_keeping(
 /// enter the captured identity order. Detcore drops the same rows with the same
 /// filter when it captures the guest's mountinfo.
 fn mountinfo_identity_order_from_raw(raw: &[u8]) -> Result<Vec<u64>, Error> {
-    mountinfo_identity_order_keeping_from_raw(raw, &std::collections::BTreeSet::new())
-}
-
-/// [`mountinfo_identity_order_from_raw`], keeping a seed row whose mount ID is
-/// in `keep`.
-fn mountinfo_identity_order_keeping_from_raw(
-    raw: &[u8],
-    keep: &std::collections::BTreeSet<u64>,
-) -> Result<Vec<u64>, Error> {
-    let mut kept = Vec::with_capacity(raw.len());
-    for line in raw.split_inclusive(|byte| *byte == b'\n') {
-        let body = line.strip_suffix(b"\n").unwrap_or(line);
-        let id = body
-            .split(|byte| *byte == b' ')
-            .next()
-            .and_then(|field| std::str::from_utf8(field).ok()?.parse::<u64>().ok());
-        if !detcore_model::procfs::is_ephemeral_host_seed_mount(body)
-            || id.is_some_and(|id| keep.contains(&id))
-        {
-            kept.extend_from_slice(line);
-        }
-    }
-    mountinfo_identity_order_from(&kept)
+    mountinfo_identity_order_from(&detcore_model::procfs::exclude_ephemeral_host_seed_mounts(
+        raw,
+    ))
 }
 
 fn mountinfo_identity_order_from(contents: &[u8]) -> Result<Vec<u64>, Error> {
@@ -5188,7 +5108,7 @@ pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
         record_to_async(
             command,
             &dir,
-            MountProvenance::default(),
+            Vec::new(),
             None,
             None,
             None,
@@ -5209,7 +5129,7 @@ pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
 pub fn record_to_with_mountinfo(
     command: Command,
     dir: &Path,
-    mountinfo: MountProvenance,
+    mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     local_networking: bool,
     proc_level: detcore_model::config::ProcLevel,
     cpu_profile: detcore_model::cpu_profile::CpuProfile,
@@ -5218,17 +5138,11 @@ pub fn record_to_with_mountinfo(
     let command = tracer_thread::SendCommand::new(command);
     ptrace_completion::run_on_tracer_thread(None, move |control| async move {
         let command = command.into_inner();
-        let mount_ids = capture_mountinfo_identity_order_keeping(
-            &mountinfo
-                .container_mount_table
-                .as_ref()
-                .map(detcore_model::container_mounts::ContainerMountTable::shown_mount_ids)
-                .unwrap_or_default(),
-        )?;
+        let mount_ids = capture_mountinfo_identity_order()?;
         record_to_async(
             command,
             &dir,
-            mountinfo,
+            mountinfo_root_rewrites,
             Some(mount_ids),
             Some(local_networking),
             Some(proc_level),
@@ -5245,7 +5159,7 @@ pub fn record_to_with_mountinfo(
 async fn record_to_async(
     command: Command,
     dir: &Path,
-    mountinfo: MountProvenance,
+    mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     mountinfo_mount_ids: Option<Vec<u64>>,
     local_networking: Option<bool>,
     proc_level: Option<detcore_model::config::ProcLevel>,
@@ -5257,7 +5171,7 @@ async fn record_to_async(
         Record::spawn_with_mountinfo(
             command,
             dir,
-            mountinfo,
+            mountinfo_root_rewrites,
             mountinfo_mount_ids,
             local_networking,
             proc_level,
@@ -5284,7 +5198,7 @@ pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error>
         record_with_output_async(
             command,
             &dir,
-            MountProvenance::default(),
+            Vec::new(),
             None,
             None,
             None,
@@ -5303,7 +5217,7 @@ pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error>
 pub fn record_with_output_with_mountinfo(
     command: Command,
     dir: &Path,
-    mountinfo: MountProvenance,
+    mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     local_networking: bool,
     proc_level: detcore_model::config::ProcLevel,
     cpu_profile: detcore_model::cpu_profile::CpuProfile,
@@ -5312,17 +5226,11 @@ pub fn record_with_output_with_mountinfo(
     let command = tracer_thread::SendCommand::new(command);
     ptrace_completion::run_on_tracer_thread(None, move |control| async move {
         let command = command.into_inner();
-        let mount_ids = capture_mountinfo_identity_order_keeping(
-            &mountinfo
-                .container_mount_table
-                .as_ref()
-                .map(detcore_model::container_mounts::ContainerMountTable::shown_mount_ids)
-                .unwrap_or_default(),
-        )?;
+        let mount_ids = capture_mountinfo_identity_order()?;
         record_with_output_async(
             command,
             &dir,
-            mountinfo,
+            mountinfo_root_rewrites,
             Some(mount_ids),
             Some(local_networking),
             Some(proc_level),
@@ -5339,7 +5247,7 @@ pub fn record_with_output_with_mountinfo(
 async fn record_with_output_async(
     mut command: Command,
     dir: &Path,
-    mountinfo: MountProvenance,
+    mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     mountinfo_mount_ids: Option<Vec<u64>>,
     local_networking: Option<bool>,
     proc_level: Option<detcore_model::config::ProcLevel>,
@@ -5354,7 +5262,7 @@ async fn record_with_output_async(
         Record::spawn_with_mountinfo(
             command,
             dir,
-            mountinfo,
+            mountinfo_root_rewrites,
             mountinfo_mount_ids,
             local_networking,
             proc_level,
@@ -5662,36 +5570,6 @@ mod tests {
             assert!(error.to_string().contains("no producer-captured namespace"));
             assert_eq!(serde_json::to_value(&config).unwrap(), before);
         }
-    }
-
-    /// The container mount table Detcore renders on KVM must name mounts of
-    /// the namespace the backend captured
-    /// (https://github.com/rrnewton/hermit/issues/4213, K3a).
-    #[test]
-    fn kvm_mountinfo_config_refuses_a_mount_table_of_another_namespace() {
-        let namespace = b"10 1 8:1 / / rw - ext4 /dev/root rw\n\
-                          20 10 0:22 / /proc rw - proc proc rw\n\
-                          40 10 0:23 / /elsewhere rw - tmpfs tmpfs rw\n";
-        let rows = detcore_model::container_mounts::parse_container_mounts(namespace).unwrap();
-        let table = |installed: &[u64]| {
-            detcore_model::container_mounts::ContainerMountTable::select(
-                &rows,
-                &installed.iter().copied().collect(),
-                &[],
-                &std::collections::BTreeSet::new(),
-            )
-        };
-        let config = |table| DetConfig {
-            mountinfo_mount_ids: vec![10, 20, 1],
-            mountinfo_mount_ids_captured: true,
-            container_mount_table: Some(table),
-            ..DetConfig::default()
-        };
-        let mut matching = config(table(&[20]));
-        prepare_kvm_mountinfo_config(&mut matching, || Ok(vec![10, 20, 1])).unwrap();
-        let mut stale = config(table(&[40]));
-        let error = prepare_kvm_mountinfo_config(&mut stale, || Ok(vec![10, 20, 1])).unwrap_err();
-        assert!(error.to_string().contains("names mount 40"), "{error:#}");
     }
 
     #[test]

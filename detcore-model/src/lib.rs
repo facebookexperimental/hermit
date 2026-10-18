@@ -165,7 +165,6 @@ const _: () = assert!(
 
 pub mod collections;
 pub mod config;
-pub mod container_mounts;
 pub mod fd;
 pub mod futex;
 pub mod happens_before;

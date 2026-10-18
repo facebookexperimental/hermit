@@ -1268,20 +1268,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if Self::auxv_kept_by_kernel(guest, &procfs, without_mm).await {
                     return Ok(None);
                 }
-                // A process's `mountinfo` or `mounts` shows the mounts below
-                // its own root: where that process (a child that chrooted)
-                // changed its root, the kernel serves its view, and the open
-                // pins it (`Detcore::mount_view_is_kernel`). The caller's own
-                // root is checked above (`renders_procfs`).
-                if procfs.mount_table_rendering().is_some()
-                    && crate::tool_global::root_changed(
-                        guest,
-                        detcore_model::pid::DetPid::from_raw(task.thread.unwrap_or(task.process)),
-                    )
-                    .await
-                {
-                    return Ok(None);
-                }
             }
             if procfs.rendered_path(self.rendered_files(guest)).is_none() {
                 return Ok(None);
@@ -1289,10 +1275,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             if names_a_directory(path) {
                 return Err(Errno::ENOTDIR.into());
             }
-            // `/proc/mounts` is a symbolic link to the caller's `self/mounts`:
-            // its own metadata, `readlink` and `O_NOFOLLOW` are the link's.
-            let via_link = crate::procfs::is_proc_mounts_link(path);
-            return Ok(Some(RenderedTarget { procfs, via_link }));
+            return Ok(Some(RenderedTarget {
+                procfs,
+                via_link: false,
+            }));
         }
         // procfs names descriptors without leading zeros, so `fd/03` does not
         // exist even where descriptor 3 is a placeholder. Detcore answers so
@@ -1777,16 +1763,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             .rendered_file_access(guest, path, writes, CapabilitySet::Effective)
             .await?;
         let reopen = rendered_open_flags(flags, access)?;
-        // A process's `mountinfo` or `mounts` takes the task's mount namespace
-        // at its open (`mounts_open_common`), which a task that has exited no
-        // longer has: EINVAL, after the permission check.
-        if procfs.mount_table_rendering().is_some()
-            && !flags.contains(OFlag::O_PATH)
-            && let Some((answer, current)) = self.rendered_task_state(guest, path).await
-            && (!current || answer.without_mm)
-        {
-            return Err(Errno::EINVAL.into());
-        }
         // A process's `auxv`: its snapshot is the process's auxiliary vector
         // now, which the open pins (`open_process_auxv`).
         // Boxed: the access check's injected calls would otherwise grow every
@@ -2579,11 +2555,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !target.via_link {
             return Err(Errno::EINVAL.into());
         }
-        // `/proc/mounts`, a link the kernel's procfs has: its target is
-        // `self/mounts`, which the kernel reads.
-        let Some(link) = target.procfs.opened_path() else {
-            return Ok(None);
-        };
+        // A link names a placeholder, which Detcore opened as rendered.
+        let link = target
+            .procfs
+            .opened_path()
+            .expect("a descriptor link's target is opened as rendered");
         write_link(&mut guest.memory(), link, buffer, size).map(Some)
     }
 

@@ -2030,12 +2030,6 @@
     },
     {
       "disposition": "guest-fixture",
-      "path": "tests/c/rendered_mount_table.c",
-      "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/rendered_mount_table.c is owned by hermit-cli/tests/cli.rs: the CLI tests detcore_renders_the_mount_table_on_every_backend, the_guest_mount_table_ignores_a_host_mount_made_before_the_run and detcore_follows_the_target_processs_root_for_its_mount_table run it natively, at bitwise parity on every backend procfs_backends compares, under a host mount made before the run, and in its --chroot mode, and require every process's mountinfo and mounts, which Detcore renders from the container mount table hermit-cli builds before the guest starts, to read the same bytes through every spelling and on every backend, to agree with each other and with the fdinfo mnt_id and STATX_MNT_ID of a /tmp file, the program and a rendered file (each naming the nearest mount holding it), to answer Linux's size, seek, link and zombie answers, and to follow the target process's root as pinned at open across a later chroot (https://github.com/rrnewton/hermit/issues/4213). It stays a fixture because a generic manifest cannot compare stdout across backends."
-    },
-    {
-      "disposition": "guest-fixture",
       "path": "tests/c/rendered_process_auxv.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/rendered_process_auxv.c is owned by hermit-cli/tests/cli.rs: the CLI test detcore_renders_process_auxv_on_every_backend runs it natively and at bitwise parity on every backend procfs_backends compares, and requires /proc/<pid>/auxv, which Detcore renders per process from the auxiliary vector on each new image's initial stack, to read that vector, to answer Linux's calls on the file, and to admit another process's open as ptrace_may_access does across dumpability, capabilities and exec, with the same lines on every backend (https://github.com/rrnewton/hermit/issues/4213). It stays a fixture because a generic manifest cannot compare stdout across backends."

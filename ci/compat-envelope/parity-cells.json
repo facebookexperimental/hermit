@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 2955,
-      "applicable": 1868,
-      "selectable": 1617,
+      "applicable": 1867,
+      "selectable": 1616,
       "population": 2885,
-      "population_candidate_selected": 1617,
+      "population_candidate_selected": 1616,
       "population_candidate_not_selected": 240,
-      "population_candidate_disabled": 1028
+      "population_candidate_disabled": 1029
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 591,
-        "applicable": 549,
-        "selectable": 543,
+        "applicable": 548,
+        "selectable": 542,
         "population": 577,
-        "population_candidate_selected": 543,
+        "population_candidate_selected": 542,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 31
+        "population_candidate_disabled": 32
       },
       "liteinst": {
         "cells": 591,
@@ -2040,9 +2040,9 @@
     {"test_id":"compat/mktemp","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/mktemp","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/mktemp","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
-    {"test_id":"compat/mountpoint","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on kvm, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
+    {"test_id":"compat/mountpoint","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},
     {"test_id":"compat/mountpoint","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Did not pass 10 of 10 verify runs on in-guest-trap with the maximum timeslice disabled in the first local survey of 2026-10-08, which ran without the compat fixtures; the second survey did not run this sabre-compat-only row (https://github.com/rrnewton/hermit/issues/3745)"},
-    {"test_id":"compat/mountpoint","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"compat/mountpoint","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Diverged in 4 of 10 KVM verify runs on 2026-10-13: the size KVM reports for /proc/self/mountinfo follows the host's mount table, which changed between runs (https://github.com/rrnewton/hermit/issues/4213)"},
     {"test_id":"compat/mountpoint","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Did not pass 10 of 10 verify runs on liteinst with the maximum timeslice disabled in the first local survey of 2026-10-08, which ran without the compat fixtures; the second survey did not run this sabre-compat-only row (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/mountpoint","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
     {"test_id":"compat/mpstat-softirqs","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: A compat corpus row runs only its lane's verify cell on ptrace, a verify cell on liteinst and kvm, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace"},

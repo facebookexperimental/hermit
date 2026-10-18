@@ -1556,15 +1556,7 @@ struct DbtExecution {
 impl DbtExecution {
     fn new(options: &super::run::RunOpts, test_workdir: bool) -> Self {
         // A marked workdir gets the fresh tmpfs that `hermit_test_workdir`
-        // mounts on it, unless the caller already mounts a tmpfs there (as
-        // the CLI tests' `--mount=type=tmpfs,target=/test` does), which is as
-        // fresh: a second tmpfs stacked on the first would change nothing the
-        // guest can use. A caller's mount of another type there keeps DBT's
-        // fresh tmpfs on top. Either way the guest's mount table shows the
-        // caller's mount and leaves out DBT's, by its identity as a backend's
-        // own (https://github.com/rrnewton/hermit/issues/4213).
-        let test_workdir =
-            test_workdir && !options.mounts_tmpfs_at(Path::new(hermit_test_workdir::WORKDIR));
+        // mounts on it.
         let mounts = if test_workdir {
             vec![
                 reverie::process::Mount::tmpfs(hermit_test_workdir::WORKDIR)

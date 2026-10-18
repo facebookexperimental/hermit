@@ -214,11 +214,6 @@ fn dbt_stats_paths_are_private_in_plain_live_and_saved_runs() {
                 .env("TMPDIR", "/tmp"),
         )
     };
-    // The guest's mountinfo and mounts are its container mount table, which
-    // leaves out a backend's own mounts, so the stats bind is the same on
-    // every backend: absent (https://github.com/rrnewton/hermit/issues/4213,
-    // K3a). That the bind exists and carries the statistics is checked below,
-    // from the saved runs' dbt-stats.bin.
     let assert_mountinfo = |output: &[u8]| {
         let text = std::str::from_utf8(output).unwrap();
         assert!(!text.is_empty());
@@ -227,8 +222,13 @@ fn dbt_stats_paths_are_private_in_plain_live_and_saved_runs() {
             "host stats path leaked"
         );
         assert!(
-            !text.contains("/tmp/.hermit-dbt-stats-0"),
-            "the stats bind, a backend's own mount, is in the guest's mount table"
+            text.lines().any(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                fields.len() > 5
+                    && fields[3] == "/tmp/.hermit-dbt-stats-0"
+                    && fields[4] == "/tmp/.hermit-dbt-stats-0"
+            }),
+            "the real stats bind is missing its declared root and mountpoint"
         );
     };
     let assert_matched = |path: &Path, output: &Output| {
@@ -250,7 +250,7 @@ fn dbt_stats_paths_are_private_in_plain_live_and_saved_runs() {
         );
         value
     };
-    let guest = ["/bin/cat", "/proc/self/mountinfo", "/proc/self/mounts"];
+    let guest = ["/bin/cat", "/proc/self/mountinfo"];
 
     // Run the unchanged full strict oracle first: the old mapping fails with
     // an actual payload divergence, while both physical guests exit normally.
@@ -282,36 +282,6 @@ fn dbt_stats_paths_are_private_in_plain_live_and_saved_runs() {
             .is_some_and(|count| count > 0)
     );
     assert_mountinfo(&plain.stdout);
-
-    // After the guest's own chroot, mountinfo is the kernel's view, sanitized:
-    // there the stats bind is a row, and its root rewrite must still show the
-    // bind's target, never the host sink. (DBT cannot yet verify a chroot,
-    // https://github.com/rrnewton/hermit/issues/4233, so this run is plain.)
-    let chroot = [
-        "/usr/sbin/chroot",
-        "/usr/bin/chroot",
-        "/sbin/chroot",
-        "/bin/chroot",
-    ]
-    .into_iter()
-    .find(|path| Path::new(path).exists())
-    .expect("a chroot command");
-    let chrooted = run(&[], &[chroot, "/", "/bin/cat", "/proc/self/mountinfo"]);
-    assert!(chrooted.status.success(), "{}", stderr(&chrooted));
-    let kernel_view = std::str::from_utf8(&chrooted.stdout).unwrap();
-    assert!(
-        !kernel_view.contains("hermit-dbt-verify-stats-"),
-        "host stats path leaked after chroot:\n{kernel_view}"
-    );
-    assert!(
-        kernel_view.lines().any(|line| {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            fields.len() > 5
-                && fields[3] == "/tmp/.hermit-dbt-stats-0"
-                && fields[4] == "/tmp/.hermit-dbt-stats-0"
-        }),
-        "after chroot, the real stats bind is missing its declared root and mountpoint:\n{kernel_view}"
-    );
 
     let directories = [root.path().join("run1"), root.path().join("run2")];
     for directory in &directories {
