@@ -41808,7 +41808,7 @@ fn pipe_wake_rows_under_record_and_replay() {
 /// The rows of the R2b-2 stage 2 tests (`guest_restartable_two_signals`):
 /// arguments and the line Hermit prints. Natively (Linux 7.1.3, 3 of 3 each)
 /// a row's line is the same unless a comment says otherwise.
-const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 18] = [
+const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 19] = [
     (
         &["read", "chld", "winch"],
         "read: -1 EINTR, handlers before return: 28 17, after join: 28 17",
@@ -41898,6 +41898,16 @@ const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 18] = [
         &["maskvisfd"],
         "maskvisfd: 1 0, handlers before return: 17, after join: 17, sibling saw SigBlk 0000000000000800",
     ),
+    // Across processes: a child reads its parent's SigBlk through an
+    // inherited /proc/self/status descriptor the parent opened, while the
+    // parent's read waits with every signal blocked for the held SIGCHLD. The
+    // file describes the parent, which opened it, so it reports the parent's
+    // published mask, SIGUSR2 alone, as on Linux (Claude re-check of R2b-2
+    // stage 2 at eb370a57); taken from the reader, it read fffffffe7ffb7eef.
+    (
+        &["maskvisfork"],
+        "maskvisfork: child saw SigBlk 0000000000000800\nmaskvisfork: parent read 1",
+    ),
     (
         &["spinwake"],
         "spinwake: -1 EINTR, handlers before return: 17 10, after join: 17 10, returned during the spin: yes",
@@ -41981,7 +41991,13 @@ fn restartable_two_signal_rows_under_record_and_replay() {
         args.len() == 3
             || matches!(
                 args[0],
-                "twoturn" | "alarmheld" | "ignheld" | "spinwake" | "maskvis" | "maskvisfd"
+                "twoturn"
+                    | "alarmheld"
+                    | "ignheld"
+                    | "spinwake"
+                    | "maskvis"
+                    | "maskvisfd"
+                    | "maskvisfork"
             )
     }) {
         let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();

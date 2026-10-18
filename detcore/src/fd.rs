@@ -1329,15 +1329,11 @@ impl DetFd {
 
     /// The guest thread whose signal mask the status snapshot about to be
     /// taken reports (`ProcfsFile::status_mask_thread`).
-    pub(crate) fn procfs_status_mask_thread(
-        &self,
-        contents: &[u8],
-        virtual_pid: i32,
-    ) -> Option<i32> {
+    pub(crate) fn procfs_status_mask_thread(&self, contents: &[u8]) -> Option<i32> {
         self.with_description(|d| {
             d.procfs
                 .as_ref()
-                .and_then(|file| file.status_mask_thread(contents, virtual_pid))
+                .and_then(|file| file.status_mask_thread(contents))
         })
     }
 

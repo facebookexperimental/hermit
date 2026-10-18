@@ -43,6 +43,11 @@
  *   maskvisfd  As maskvis, but the worker opens /proc/thread-self/status
  *       before it reads, and main reads SigBlk through that shared
  *       descriptor: the file still describes the worker, which opened it.
+ *   maskvisfork  Across processes: process A blocks SIGUSR2, opens
+ *       /proc/self/status, forks B and reads an empty pipe; B sends A a
+ *       caught SIGCHLD (SA_RESTART), waits 50 ms, reads A's SigBlk through
+ *       the inherited descriptor and writes the byte. /proc/self resolved to
+ *       A when A opened it, so B must see A's mask, SIGUSR2 alone.
  *
  * The worker prints the call's result, the handlers that started before the
  * call returned, and, after main joins it, every handler that started:
@@ -62,6 +67,7 @@
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -102,10 +108,11 @@ static int sibling_read_sigblk;
 static volatile int worker_status_fd = -1;
 
 /* Natively the read returns at once. Under Hermit a prompt drain wake ends it
- * within one of the spinning thread's timeslices: 26,619,596 iterations of a
- * debug build, the same in every run, as the count is deterministic. Waiting
- * for the read's backed-off poll turn took 1,299,952,943. The bound is about
- * two and a half timeslices (Claude re-check of R2b-2 stage 2, N1). */
+ * within about one of the spinning thread's timeslices: 39,929,204 iterations
+ * of this fixture in a debug build, the same in every run, as the count is
+ * deterministic (a reviewer's smaller probe took 26,619,596). Waiting for the
+ * read's backed-off poll turn took about 1.3 billion. The bound is about 1.65
+ * times the prompt count (Claude re-checks of R2b-2 stage 2, N1). */
 #define SPIN_BOUND 66000000L
 static volatile pid_t worker_tid;
 
@@ -209,6 +216,56 @@ static void *worker(void *unused)
     return NULL;
 }
 
+/* `maskvisfork`: see the header. Returns the process exit status. */
+static int mask_visibility_across_fork(void)
+{
+    struct sigaction restart;
+    memset(&restart, 0, sizeof restart);
+    restart.sa_handler = handler;
+    restart.sa_flags = SA_RESTART;
+    if (sigaction(SIGCHLD, &restart, NULL) != 0)
+        die("sigaction");
+    sigset_t usr2;
+    sigemptyset(&usr2);
+    sigaddset(&usr2, SIGUSR2);
+    if (sigprocmask(SIG_BLOCK, &usr2, NULL) != 0)
+        die("sigprocmask");
+    int status_fd = open("/proc/self/status", O_RDONLY);
+    if (status_fd < 0 || pipe(fds) != 0)
+        die("open");
+    pid_t a = getpid();
+    pid_t b = fork();
+    if (b < 0)
+        die("fork");
+    if (b == 0) {
+        sleep_ms(50);
+        kill(a, SIGCHLD);
+        sleep_ms(50);
+        FILE *status = fdopen(status_fd, "r");
+        if (!status)
+            die("fdopen");
+        char line[512];
+        unsigned long long sigblk = 0;
+        while (fgets(line, sizeof line, status))
+            sscanf(line, "SigBlk: %llx", &sigblk);
+        printf("maskvisfork: child saw SigBlk %016llx\n", sigblk);
+        fflush(stdout);
+        if (write(fds[1], "x", 1) != 1)
+            die("write");
+        _exit(0);
+    }
+    char byte;
+    long ret;
+    do
+        ret = read(fds[0], &byte, 1);
+    while (ret < 0 && errno == EINTR);
+    int child;
+    if (waitpid(b, &child, 0) != b)
+        die("waitpid");
+    printf("maskvisfork: parent read %ld\n", ret);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2 && argc != 4) {
@@ -216,6 +273,8 @@ int main(int argc, char **argv)
         return 2;
     }
     mode = argv[1];
+    if (!strcmp(mode, "maskvisfork"))
+        return mask_visibility_across_fork();
     struct sigaction action;
     memset(&action, 0, sizeof action);
     action.sa_handler = handler;

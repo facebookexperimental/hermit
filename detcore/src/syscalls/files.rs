@@ -5597,7 +5597,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // R2b-2 stage 2, P2; https://github.com/rrnewton/hermit/issues/4273).
         // Masks are published only where the scheduler models signal targets.
         let mask_thread = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            detfd.procfs_status_mask_thread(&contents, virtual_pid)
+            detfd.procfs_status_mask_thread(&contents)
         })?;
         let published_sigblk = match mask_thread {
             Some(thread) if crate::scheduler::discarded_at_send::records(guest.config()) => {

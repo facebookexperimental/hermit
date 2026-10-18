@@ -1803,31 +1803,38 @@ impl ProcfsFile {
     }
 
     /// The guest thread whose signal mask this status snapshot reports as
-    /// `SigBlk`, given the kernel's `contents` and the calling process
-    /// (`virtual_pid`): the process's leader for the caller's own process
-    /// status, the thread that opened a `thread-self` status
-    /// (`bound_thread_identity`), which a sibling may read through a shared
-    /// descriptor while that thread waits (Codex re-check of R2b-2 stage 2,
-    /// P2), the thread its `Pid:` line names, in the guest's numbers, for
-    /// another process's or thread's, and none for a file that is not a
-    /// status.
-    pub(crate) fn status_mask_thread(&self, contents: &[u8], virtual_pid: i32) -> Option<i32> {
-        match self.kind {
-            ProcfsKind::Status => Some(virtual_pid),
-            ProcfsKind::ThreadStatus => self.bound_thread_identity.map(|(_, tid, _)| tid),
-            ProcfsKind::ProcessStatus => {
-                let pid = contents
-                    .split(|byte| *byte == b'\n')
-                    .find_map(|line| line.strip_prefix(b"Pid:"))
-                    .and_then(|value| std::str::from_utf8(value).ok())
-                    .and_then(|value| value.trim().parse::<i32>().ok())?;
-                Some(match &self.guest_numbers {
-                    Some(numbers) => numbers.get(&pid).copied().unwrap_or(pid),
-                    None => pid,
-                })
-            }
-            _ => None,
+    /// `SigBlk`: the thread its own `Pid:` line names, for every status view.
+    /// A `/proc/<pid>` view maps that number to the guest's through
+    /// `guest_numbers` when the caller filled it (a backend whose kernel
+    /// numbers processes otherwise, DBT); the `/proc/self` and
+    /// `/proc/thread-self` views get no table (`kernel_numbers_held` is empty
+    /// for them), so their `Pid:` is taken as the kernel shows it, the guest's
+    /// number under ptrace, the one backend that blocks in place. The kernel resolves
+    /// `/proc/self` and `/proc/thread-self` when the file is opened, so the
+    /// snapshot describes the opener's process or thread whoever reads it:
+    /// a sibling through a shared descriptor, or a child through an inherited
+    /// one. The reader's identity must not stand in for it (Codex and Claude
+    /// re-checks of R2b-2 stage 2, P2). `None` for a file that is not a
+    /// status. The status views are `/proc/self/status` (`Status`),
+    /// `/proc/thread-self/status` (`ThreadStatus`) and
+    /// `/proc/<pid>[/task/<tid>]/status` (`ProcessStatus`); `stat` renders no
+    /// mask (`sanitize_stat` zeroes its signal fields).
+    pub(crate) fn status_mask_thread(&self, contents: &[u8]) -> Option<i32> {
+        if !matches!(
+            self.kind,
+            ProcfsKind::Status | ProcfsKind::ThreadStatus | ProcfsKind::ProcessStatus
+        ) {
+            return None;
         }
+        let pid = contents
+            .split(|byte| *byte == b'\n')
+            .find_map(|line| line.strip_prefix(b"Pid:"))
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.trim().parse::<i32>().ok())?;
+        Some(match &self.guest_numbers {
+            Some(numbers) => numbers.get(&pid).copied().unwrap_or(pid),
+            None => pid,
+        })
     }
 
     /// Returns true when the procfs inode binds to the thread that opened it.
@@ -6680,18 +6687,17 @@ Rss:                   4 kB\n" as &[u8];
             "with nothing published, the kernel's mask stands"
         );
 
-        // Which thread's published mask a status reports.
+        // Which thread's published mask a status reports: the one its own
+        // `Pid:` line names, whoever reads it.
         let process = ProcfsFile::from_path(Path::new("/proc/3/task/5/status")).unwrap();
-        assert_eq!(process.status_mask_thread(status, 3), Some(5));
+        assert_eq!(process.status_mask_thread(status), Some(5));
         let own = ProcfsFile::from_path(Path::new("/proc/self/status")).unwrap();
-        assert_eq!(own.status_mask_thread(status, 3), Some(3));
-        // A thread-self status describes the thread that opened it, whoever
-        // reads it through a shared descriptor.
+        assert_eq!(own.status_mask_thread(status), Some(5));
         let mut thread_self = ProcfsFile::from_path(Path::new("/proc/thread-self/status")).unwrap();
-        thread_self.bind_thread_identity(3, 5, 1);
-        assert_eq!(thread_self.status_mask_thread(status, 3), Some(5));
+        thread_self.bind_thread_identity(3, 7, 1);
+        assert_eq!(thread_self.status_mask_thread(status), Some(5));
         let stat = ProcfsFile::from_path(Path::new("/proc/3/task/5/stat")).unwrap();
-        assert_eq!(stat.status_mask_thread(status, 3), None);
+        assert_eq!(stat.status_mask_thread(status), None);
     }
 
     #[test]
