@@ -69,12 +69,10 @@ cargo build --workspace
 ./target/debug/hermit --version
 ```
 
-An optimized workspace build stages the backend resources. Finalize the ordinary
-Detcore preload after Cargo finishes, before using or copying the installation:
+An optimized workspace build also stages the backend runtime resources:
 
 ```bash
 cargo build --release --workspace
-./target/release/stage-detcore-liteinst --git target
 ./target/install_pkg/hermit --version
 ```
 
@@ -85,11 +83,6 @@ source from rebuilding it. To stamp the revision, as a release build does, set
 `HERMIT_STAMP_GIT_SHA=1` when building; the version then reads
 `hermit 0.4.0 (2026-10-02, g0123456789ab)`, with a `-dirty` suffix when tracked
 files differed from that commit. `make release-core` sets it for you.
-
-Bare Cargo leaves the packaged Detcore preload absent: its build script cannot
-recursively build and qualify another profile in the same target. The finalizer
-uses the existing `liteinst-runtime` profile and constructor/source proof; a
-failed or missing finalization refuses complete-package publication.
 
 Staging resources does not enable optional backends in the CLI. See
 [Execution Backends](#execution-backends) for the feature-enabled build.

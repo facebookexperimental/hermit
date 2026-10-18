@@ -127,7 +127,6 @@ if [[ $mode == bundle ]]; then
     done
     cp -a --reflink=auto "$bundle/hermit/install" "$staged/install"
     cp -a --reflink=auto "$bundle/hermit/hermit" "$staged/hermit"
-    python3 "$root/ci/verify-packaged-detcore.py" "$staged/install"
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_sha"])' "$bundle/PROVENANCE.json" >"$staged/SOURCE_SHA"
     echo "staged $(du -sh "$staged" | cut -f1) from $bundle (source $(cat "$staged/SOURCE_SHA"))"
     exit 0
@@ -188,8 +187,8 @@ setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --pro
 hermit_build=$!
 "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p detcore-dbt -p detcore-dbt-cdylib --target-dir "$target_dir"
 # hermit-install's build script stages install_pkg/ next to the profile directories and
-# links libdetcore_sabre.so into it. The ordinary LiteInst resource is finalized
-# below, after the last Cargo invocation; publish-hermit-e2e-artifact.sh requires
+# links libdetcore_sabre.so and libdetcore_liteinst.so into it. The links resolve only
+# when this invocation also builds both cdylibs; publish-hermit-e2e-artifact.sh requires
 # every one of them. Its hermit link, to ../validate/hermit, resolves once the hermit
 # build is copied there below.
 "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-install -p detcore-sabre \
@@ -206,8 +205,6 @@ finish_build() { # finish_build WHAT PID-VARIABLE LOG
 }
 finish_build "release build of hermit-manifest-plan" release_build "$tmp/release-build.log"
 finish_build "validate-profile build of hermit" hermit_build "$tmp/hermit-build.log"
-# All outer Cargo commands have released the target before the one finalizer.
-"$target_dir/validate/stage-detcore-liteinst" --source-copy "$target_dir"
 install -m 755 "$hermit_target_dir/validate/hermit" "$target_dir/validate/hermit"
 mkdir -p "$staged/bin"
 for b in test-harness hermit-manifest-plan; do

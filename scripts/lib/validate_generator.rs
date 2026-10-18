@@ -301,7 +301,7 @@ pub(crate) fn generated_focused_compat_partition(
             &format!("{namespace}prep"),
             "release_resources",
             "Stage the release backend resources for the host e9patch cells",
-            "./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbt -p detcore-dbt-cdylib -p detcore-sabre -p hermit-install && target/release/stage-detcore-liteinst --git target && test -x target/install_pkg/rsrcs/e9patch && test -x target/install_pkg/rsrcs/e9tool".into(),
+            "./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbt -p detcore-dbt-cdylib -p detcore-sabre -p hermit-install && test -x target/install_pkg/rsrcs/e9patch && test -x target/install_pkg/rsrcs/e9tool".into(),
             vec!["compatprep.hermit_release".into()],
             1200,
             7200,
@@ -309,7 +309,7 @@ pub(crate) fn generated_focused_compat_partition(
         );
         install.labels = vec![label.into()];
         install.description = format!(
-            "Runs `cargo build --release --locked -p detcore-dbt`, then a release build of hermit with third-party-backends together with detcore-dbt, its shared object detcore-dbt-cdylib, detcore-sabre and hermit-install, both through ci/run-with-reverie-dbt-budget.sh (which sets Cargo's job count from the calibrated DBT build budget), then finalizes the ordinary Detcore preload with `target/release/stage-detcore-liteinst --git target` in the existing liteinst-runtime profile and unchanged constructor/source proof, and finally `test -x` on target/install_pkg/rsrcs/e9patch and e9tool. The {namespace} probes run the host release Hermit built by compatprep.hermit_release, which finds its packaged resources, the e9patch and e9tool binaries among them, through target/install_pkg; this node stages that tree for the e9patch-compat-only profile. If hermit-install stops staging e9tool, the final `test -x` fails here instead of in every probe."
+            "Runs `cargo build --release --locked -p detcore-dbt`, then a release build of hermit with third-party-backends together with detcore-dbt, its shared object detcore-dbt-cdylib, detcore-sabre and hermit-install, both through ci/run-with-reverie-dbt-budget.sh (which sets Cargo's job count from the calibrated DBT build budget), and finally `test -x` on target/install_pkg/rsrcs/e9patch and e9tool. The {namespace} probes run the host release Hermit built by compatprep.hermit_release, which finds its packaged resources, the e9patch and e9tool binaries among them, through target/install_pkg; this node stages that tree for the e9patch-compat-only profile. If hermit-install stops staging e9tool, the final `test -x` fails here instead of in every probe."
         );
         let mut nss = nsswitch_fixture_node(&nsswitch);
         nss.group = format!("{namespace}prep");

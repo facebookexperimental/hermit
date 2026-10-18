@@ -1559,7 +1559,7 @@ pub fn unified_prebuild_command(
         .map(|name| format!(" --profile {name}"))
         .unwrap_or_default();
     Ok(format!(
-        "cargo build --locked{cargo_profile} {} && ./ci/nextest-binaries.rs prepare {profile} && target/validate/stage-detcore-liteinst --git target",
+        "cargo build --locked{cargo_profile} {} && ./ci/nextest-binaries.rs prepare {profile}",
         unified.join(" ")
     ))
 }

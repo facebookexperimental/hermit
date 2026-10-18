@@ -8953,12 +8953,11 @@ fn native_exec_checks_its_declared_inputs_without_an_ordinary_preload() {
 /// it hashes it, so another node starting at that moment failed with "prepared
 /// input changed while hashing ... nlink 2 -> 3". The test checks that the
 /// Cargo-built Hermit's inode is untouched at the end. Nothing else can supply
-/// the runtime there initially: no `libdetcore_liteinst.so` sits beside that
-/// Hermit, and `HERMIT_LITEINST_TOOL_RUNTIME` and `HERMIT_INSTALL_DIR` are
-/// removed. An empty selected installation must also refuse when an adjacent
-/// runtime exists; only removing the installation permits that development
-/// fallback. Staging that runtime in `rsrcs/` then succeeds in-guest.
-/// Last, the Cargo-built Hermit, whose own
+/// the runtime there: no
+/// `libdetcore_liteinst.so` sits beside that Hermit, and
+/// `HERMIT_LITEINST_TOOL_RUNTIME` and `HERMIT_INSTALL_DIR` are removed. So the
+/// run fails while `rsrcs/` is empty, which is the control, and succeeds in-guest
+/// once the runtime is staged there. Last, the Cargo-built Hermit, whose own
 /// directory does hold the real runtime, is pointed at an installation whose
 /// packaged runtime is the inert fixture, and must refuse that fixture.
 #[test]
@@ -8988,25 +8987,13 @@ fn run_liteinst_finds_the_runtime_staged_as_an_installed_resource() {
         )
     };
     let built_before = inode_state(built);
-    let profile = built
+    let runtime = built
         .parent()
-        .expect("the Cargo-built Hermit has a profile directory");
-    let packaged_resources = profile
-        .parent()
-        .expect("the Cargo profile has a target directory")
-        .join("install_pkg/rsrcs");
-    // Release/validate producers finalize an installation; a plain dev build
-    // deliberately stages none. Exercise the real resource in the former and
-    // the existing development artifact in the latter. Never fall back from
-    // an incomplete selected installation, even for this fixture's input.
-    let runtime = if packaged_resources.is_dir() {
-        packaged_resources.join("libdetcore_liteinst.so")
-    } else {
-        profile.join("libdetcore_liteinst.so")
-    };
+        .expect("the Cargo-built Hermit has a profile directory")
+        .join("libdetcore_liteinst.so");
     assert!(
         runtime.is_file(),
-        "{} is missing; build the development runtime or finalize the selected installation",
+        "{} is missing; build it with `cargo build -p detcore-liteinst` in this profile",
         runtime.display()
     );
     let install = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -9042,38 +9029,13 @@ fn run_liteinst_finds_the_runtime_staged_as_an_installed_resource() {
     let missing_stderr = stderr(&missing);
     assert!(!missing.status.success(), "{missing:?}");
     assert!(
-        missing_stderr.contains("selected Hermit installation has no finalized"),
+        missing_stderr.contains("the in-guest Detcore runtime is unavailable"),
         "{missing_stderr}"
     );
     assert!(
         !stdout(&missing).contains("installed-liteinst-ok"),
         "the guest ran without a runtime: {missing:?}"
     );
-
-    let adjacent_runtime = install.path().join("libdetcore_liteinst.so");
-    copy(&runtime, &adjacent_runtime);
-    let incomplete = run_installed();
-    let incomplete_stderr = stderr(&incomplete);
-    assert!(!incomplete.status.success(), "{incomplete:?}");
-    assert!(
-        incomplete_stderr.contains("selected Hermit installation has no finalized"),
-        "an incomplete package must not fall back to an adjacent runtime: {incomplete_stderr}"
-    );
-    assert!(
-        incomplete_stderr.contains("make install-deps"),
-        "{incomplete_stderr}"
-    );
-    assert!(
-        !stdout(&incomplete).contains("installed-liteinst-ok"),
-        "the guest ran from an incomplete installation: {incomplete:?}"
-    );
-
-    fs::remove_dir(&resources).expect("failed to remove the empty installation resources");
-    let development = run_installed();
-    assert_success(&development, &args);
-    assert_eq!(stdout(&development), "installed-liteinst-ok\n");
-    fs::remove_file(adjacent_runtime).expect("failed to remove the development runtime");
-    fs::create_dir(&resources).expect("failed to restore the installation resources");
 
     copy(&runtime, &resources.join("libdetcore_liteinst.so"));
     let installed = run_installed();

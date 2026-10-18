@@ -69,7 +69,6 @@ install-deps: install-hooks check-submodules ## Build and stage all third-party 
 	@echo "make: cargo jobs=$(THIRD_PARTY_BUILD_JOBS) (host has $$(nproc) logical cores)"
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
 		-p detcore-dbt -p detcore-dbt-cdylib -p detcore-sabre -p detcore-liteinst -p hermit-install
-	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO_PROXY) target/release/stage-detcore-liteinst --git target
 	@echo 'make: backend runtimes OK (release profile: detcore-dbt, detcore-dbt-cdylib, detcore-sabre, detcore-liteinst, hermit-install)'
 
 # Install this clone's git pre-commit hooks (core.hooksPath -> .githooks) so a
@@ -397,7 +396,6 @@ lint-check-buck-e2e-stages:
 
 lint-check-guest-preload-gate:
 	python3 ./ci/test_guest_preload_gate.py
-	python3 ./ci/test_packaged_detcore.py
 
 lint-check-reverie-dbt-budget:
 	./ci/run-with-reverie-dbt-budget-test.sh

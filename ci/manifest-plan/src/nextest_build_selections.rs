@@ -659,28 +659,6 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
     Ok(())
 }
 
-// `prepare` is one fixed command; only its fixed, profile-matched packaging
-// finalizer may follow it. Never truncate an arbitrary shell command at `&&`.
-fn preparation_profile<'a>(tag: &str, command: &'a str) -> Result<Option<&'a str>, String> {
-    let marker = "./ci/nextest-binaries.rs prepare ";
-    let Some((_, rest)) = command.split_once(marker) else {
-        return Ok(None);
-    };
-    if command.matches(marker).count() != 1 {
-        return Err(format!("{tag} has duplicate prepared commands"));
-    }
-    let profile = rest.split_whitespace().next().unwrap_or("");
-    let finalized = crate::nextest_binaries::cargo_profile_for(profile).map(|directory| {
-        format!("{profile} && target/{directory}/stage-detcore-liteinst --git target")
-    });
-    if profile.is_empty() || (rest != profile && finalized.as_deref() != Some(rest)) {
-        return Err(format!(
-            "{tag} has an ambiguous prepared profile or finalizer"
-        ));
-    }
-    Ok(Some(profile))
-}
-
 /// A producer of a unifying profile (`nextest_binaries::unifies`) must end
 /// with that profile's unified workspace build followed by `prepare`. Any other
 /// build -- different features, or a second `-p hermit --bin hermit` link --
@@ -699,7 +677,7 @@ pub(super) fn assert_producers_build_the_unified_selection(
         } else {
             execution_command(step)?
         };
-        let Some(profile) = preparation_profile(&step.tag(), &command)? else {
+        let Some((_, profile)) = command.split_once("./ci/nextest-binaries.rs prepare ") else {
             continue;
         };
         if !crate::nextest_binaries::unifies(profile) {
@@ -742,7 +720,10 @@ pub(super) fn assert_preparation_dependencies(
     let mut producers = BTreeMap::new();
     for step in &cfg.steps {
         let command = execution_command(step)?;
-        if let Some(profile) = preparation_profile(&step.tag(), &command)? {
+        if let Some((_, profile)) = command.split_once("./ci/nextest-binaries.rs prepare ") {
+            if profile.is_empty() || profile.contains(char::is_whitespace) {
+                return Err(format!("{} has an ambiguous prepared profile", step.tag()));
+            }
             producers.insert(
                 step.tag(),
                 (
@@ -966,51 +947,6 @@ mod tests {
                 .insert(SELECTION_ENV.into(), serde_json::to_string(&args).unwrap());
             assert!(assert_command_selection(&omitted_preparation).is_err());
         }
-    }
-
-    #[test]
-    fn preparation_accepts_only_the_exact_profile_matched_finalizer() {
-        for profile in ["full", "hosted-portable"] {
-            let bare = format!("prefix && ./ci/nextest-binaries.rs prepare {profile}");
-            let finalized =
-                format!("{bare} && target/validate/stage-detcore-liteinst --git target");
-            for command in [&bare, &finalized] {
-                assert_eq!(
-                    preparation_profile("producer", command).unwrap(),
-                    Some(profile)
-                );
-            }
-            for refused in [
-                format!("{bare} && true"),
-                format!("{finalized} && true"),
-                format!("{bare} && target/debug/stage-detcore-liteinst --git target"),
-                format!("{finalized} --source-copy target"),
-                format!("{bare} && ./ci/nextest-binaries.rs prepare {profile}"),
-                format!("{bare} extra"),
-            ] {
-                assert!(
-                    preparation_profile("producer", &refused).is_err(),
-                    "{refused}"
-                );
-            }
-        }
-        for profile in ["quick", "super"] {
-            let bare = format!("./ci/nextest-binaries.rs prepare {profile}");
-            assert_eq!(
-                preparation_profile("producer", &bare).unwrap(),
-                Some(profile)
-            );
-            for directory in ["debug", "validate"] {
-                let refused =
-                    format!("{bare} && target/{directory}/stage-detcore-liteinst --git target");
-                assert!(
-                    preparation_profile("producer", &refused).is_err(),
-                    "{refused}"
-                );
-            }
-        }
-        assert!(preparation_profile("producer", "./ci/nextest-binaries.rs prepare ").is_err());
-        assert_eq!(preparation_profile("other", "cargo build").unwrap(), None);
     }
 
     #[test]
@@ -1254,7 +1190,7 @@ mod tests {
         assert!(
             hosted_producer
                 .cmd
-                .ends_with("./ci/nextest-binaries.rs prepare hosted-portable && target/validate/stage-detcore-liteinst --git target")
+                .ends_with("./ci/nextest-binaries.rs prepare hosted-portable")
         );
         let hosted_artifact = graph
             .steps
@@ -1287,10 +1223,10 @@ mod tests {
         assert!(
             execution_command(producer)
                 .unwrap()
-                .ends_with("./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target")
+                .ends_with("./ci/nextest-binaries.rs prepare full")
         );
         producer.cmd = producer.cmd.replace(
-            "./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target",
+            "./ci/nextest-binaries.rs prepare full",
             "./ci/nextest-binaries.rs prepare portable",
         );
         missing_hardware

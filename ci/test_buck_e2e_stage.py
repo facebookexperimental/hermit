@@ -271,29 +271,6 @@ time.sleep(float(os.environ.get(f"FAKE_CARGO_SECONDS_{label.replace('-', '_').re
 if label == "hermit":
     with open(os.path.join(target_dir, "validate", "hermit"), "w") as f:
         f.write("fake hermit built in " + target_dir + "\n")
-if label == "hermit-install+detcore-sabre+detcore-liteinst":
-    # An explicitly synthetic finalizer: exercise stage's ordering and failure
-    # propagation, without claiming to build or qualify any runtime bytes.
-    finalizer = os.path.join(target_dir, "validate", "stage-detcore-liteinst")
-    with open(finalizer, "w") as f:
-        f.write('''#!/usr/bin/env python3
-import json, os, sys, time
-args = sys.argv[1:]
-target = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-def note(event):
-    with open(os.environ["FAKE_CARGO_LOG"], "a") as log:
-        log.write(f"{event} finalizer {time.monotonic():.3f} {target}\\n")
-with open(os.environ["FAKE_CARGO_LOG"], "a") as log:
-    log.write("finalizer-argv " + json.dumps(args) + "\\n")
-note("start")
-status = int(os.environ.get("FAKE_FINALIZER_FAIL_STATUS", "0"))
-if status:
-    note("fail")
-    print(f"synthetic finalizer failure (exit {status})", file=sys.stderr)
-    sys.exit(status)
-note("end")
-''')
-    os.chmod(finalizer, 0o755)
 note("end")
 """
 
@@ -347,7 +324,6 @@ class StageCargoOverlapTest(unittest.TestCase):
         self.target_dirs = {}
         self.argv = {}
         self.env = {}
-        self.finalizer_argv = []
         for line in self.log.read_text().splitlines():
             parts = line.split()
             if parts[0] in ("strip", "install"):
@@ -356,32 +332,16 @@ class StageCargoOverlapTest(unittest.TestCase):
                 self.argv[parts[1]] = json.loads(line.split(" ", 2)[2])
             elif parts[0] == "env":
                 self.env[parts[1]] = json.loads(line.split(" ", 2)[2])
-            elif parts[0] == "finalizer-argv":
-                self.finalizer_argv.append(json.loads(line.split(" ", 1)[1]))
             else:
                 rows.append((parts[0], parts[1], float(parts[2])))
                 self.target_dirs[parts[1]] = parts[3]
         return rows
-
-    def assert_finalized_before_publication(self, events: list[tuple[str, str, float]]) -> None:
-        names = [(event, label) for event, label, _ in events]
-        target = str(self.stage.parent.parent.parent / "target")
-        self.assertEqual(self.finalizer_argv, [["--source-copy", target]])
-        self.assertEqual(names.count(("start", "finalizer")), 1, names)
-        self.assertEqual(names.count(("end", "finalizer")), 1, names)
-        for build in ("release", "hermit", "detcore-dbt+detcore-dbt-cdylib",
-                      "hermit-install+detcore-sabre+detcore-liteinst"):
-            self.assertLess(names.index(("end", build)), names.index(("start", "finalizer")), names)
-        publication = [i for i, (event, _) in enumerate(names) if event in ("install", "strip")]
-        self.assertTrue(publication, names)
-        self.assertLess(names.index(("end", "finalizer")), publication[0], names)
 
     def test_the_background_builds_overlap_the_validate_builds_and_finish_before_strip(self) -> None:
         # Each background build outlasts detcore-dbt and the install bundle (0.5 s each),
         # so strip waits for both.
         proc = self.run_stage(FAKE_CARGO_SECONDS_release="2.5", FAKE_CARGO_SECONDS_hermit="2.0")
         events = self.events()
-        self.assert_finalized_before_publication(events)
         names = [(event, label) for event, label, _ in events]
         times = {(event, label): t for event, label, t in events if event != "strip"}
         first_validate = "detcore-dbt+detcore-dbt-cdylib"
@@ -418,9 +378,7 @@ class StageCargoOverlapTest(unittest.TestCase):
         # In practice the hermit build (about 120 s) finishes long after the release build
         # (about 55 s); the copy must wait for it, not for the release build.
         proc = self.run_stage(FAKE_CARGO_SECONDS_release="0.5", FAKE_CARGO_SECONDS_hermit="3.0")
-        events = self.events()
-        self.assert_finalized_before_publication(events)
-        names = [(event, label) for event, label, _ in events]
+        names = [(event, label) for event, label, _ in self.events()]
         target = str(self.stage.parent.parent.parent / "target")
         copy = ("install", f"{target}/validate/hermit")
         self.assertIn(copy, names, proc.stderr)
@@ -439,30 +397,10 @@ class StageCargoOverlapTest(unittest.TestCase):
         # (Stage itself stops later, at the install bundle the fake cargo does not make.)
         self.assertNotIn("the validate-profile build of hermit failed", proc.stderr)
         self.assertNotIn("No such file or directory (os error 2)", proc.stderr)
-        events = self.events()
-        self.assert_finalized_before_publication(events)
-        names = [(event, label) for event, label, _ in events]
+        names = [(event, label) for event, label, _ in self.events()]
         self.assertNotIn(("checked", "release"), names, "the release build found target/ missing")
         self.assertEqual((target / "validate" / "hermit").read_text(),
                          f"fake hermit built in {target}/stage-hermit\n")
-
-    def test_a_failed_finalizer_stops_stage_with_its_status_before_publication(self) -> None:
-        proc = self.run_stage(FAKE_FINALIZER_FAIL_STATUS="23")
-        self.assertEqual(proc.returncode, 23, proc.stderr)
-        self.assertIn("synthetic finalizer failure (exit 23)", proc.stderr)
-        names = [(event, label) for event, label, _ in self.events()]
-        target = self.stage.parent.parent.parent / "target"
-        self.assertEqual(self.finalizer_argv, [["--source-copy", str(target)]])
-        self.assertEqual(names.count(("start", "finalizer")), 1, names)
-        self.assertEqual(names.count(("fail", "finalizer")), 1, names)
-        self.assertNotIn(("end", "finalizer"), names)
-        for build in ("release", "hermit", "detcore-dbt+detcore-dbt-cdylib",
-                      "hermit-install+detcore-sabre+detcore-liteinst"):
-            self.assertLess(names.index(("end", build)), names.index(("start", "finalizer")), names)
-        self.assertFalse(any(event in ("strip", "install") for event, _ in names), names)
-        self.assertFalse((target / "validate" / "hermit").exists())
-        for part in ("bin", "hermit", "install"):
-            self.assertFalse((self.stage.parent / "staged" / part).exists(), part)
 
     def test_the_fake_cargo_reproduces_the_replaced_target_directory(self) -> None:
         # Without the directories stage makes first, the same interleaving fails the
