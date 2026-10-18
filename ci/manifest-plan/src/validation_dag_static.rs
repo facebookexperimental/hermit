@@ -1112,7 +1112,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the validate of d4594afa, which also carried the 2 since-reverted
     // qualified-runtime tests.
     // Restore the two qualified-runtime preparation tests: 1623.
-    ("test.regular_crates", 1_626),
+    // And manifest-plan validation_dag::tests::
+    // dev_profile_pinned_consumers_do_not_wait_for_the_e2e_artifact: 1627.
+    ("test.regular_crates", 1_627),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4816,7 +4818,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 5 session-census tests (3920bf94): 1600.
     // And the same 7 Buck e2e cell tests (456dbc38, 5ebcb9dd, 1722f214): 1607.
     // Restore the two qualified-runtime preparation tests: 1609.
-    ("test.regular_crates_on_host", 1_612),
+    // And the same dev-profile consumer ordering test: 1613.
+    ("test.regular_crates_on_host", 1_613),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
@@ -6010,7 +6013,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/clean-stale-reverie-dbt.sh validate && export HERMIT_INSTALL_FORCE_RESTAGE="${DAGRUN_STEP_STARTED_MONOTONIC_NS:-$(date +%s%N)}" && ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate --workspace --all-targets --features hermit/kvm-execution-tests,hermit/kvm-native-test-support,hermit/third-party-backends && ./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/clean-stale-reverie-dbt.sh validate && export HERMIT_INSTALL_FORCE_RESTAGE="${DAGRUN_STEP_STARTED_MONOTONIC_NS:-$(date +%s%N)}" && HERMIT_CARGO_TIMINGS_DIR="${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}" ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate -p detcore-dbt && HERMIT_CARGO_TIMINGS_DIR="${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}" ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate --workspace --all-targets --features hermit/kvm-execution-tests,hermit/kvm-native-test-support,hermit/third-party-backends && ./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,

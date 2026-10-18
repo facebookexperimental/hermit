@@ -231,6 +231,64 @@ expect_exit "a wrapped generic failure (1)" 1 "" /bin/sh -c "exit 1"
 expect_exit "a wrapped success" 0 "$work/ran-0" \
     /bin/sh -c "printf ok > '$work/ran-0'"
 
+# HERMIT_CARGO_TIMINGS_DIR (diagnostics only): a `cargo build` gets --timings and its
+# report is copied into the directory; the build's status is the node's, unchanged;
+# unset, or for any other cargo command, nothing changes. A fake cargo first on PATH
+# records its argv and writes a report where cargo would.
+fakebin="$work/fakebin"
+mkdir -p "$fakebin"
+cat >"$fakebin/cargo" <<'FAKE'
+#!/bin/sh
+printf '%s\n' "$*" >>"$FAKE_CARGO_ARGV"
+case " $* " in *" --timings "*)
+    mkdir -p "$CARGO_TARGET_DIR/cargo-timings"
+    printf report >"$CARGO_TARGET_DIR/cargo-timings/cargo-timing-fake.html" ;;
+esac
+exit "${FAKE_CARGO_STATUS:-0}"
+FAKE
+chmod +x "$fakebin/cargo"
+timings_case() { # timings_case LABEL STATUS TIMINGS_DIR CARGO_ARGS...: run, then echo rc
+    local label=$1 status=$2 dir=$3
+    shift 3
+    rm -rf "${work:?}/target" "${work:?}/argv"
+    local rc=0
+    PATH="$fakebin:$PATH" FAKE_CARGO_ARGV="$work/argv" FAKE_CARGO_STATUS=$status \
+        CARGO_TARGET_DIR="$work/target" HERMIT_CARGO_TIMINGS_DIR=$dir \
+        "./$WRAPPER" cargo "$@" >/dev/null 2>&1 || rc=$?
+    echo "$rc"
+}
+for status in 0 101; do
+    rm -rf "${work:?}/kept"
+    rc=$(timings_case "build" "$status" "$work/kept" build --locked -p x)
+    if ((rc != status)); then
+        echo "FAIL: a timed cargo build exited $rc, expected its own $status" >&2
+        failures=$((failures + 1))
+    elif ! grep -qx -- 'build --locked -p x --timings' "$work/argv"; then
+        echo "FAIL: a timed cargo build was not given --timings: $(cat "$work/argv")" >&2
+        failures=$((failures + 1))
+    elif [ "$(cat "$work/kept/cargo-timing-fake.html" 2>/dev/null)" != report ]; then
+        echo "FAIL: a timed cargo build's report was not kept in HERMIT_CARGO_TIMINGS_DIR (status $status)" >&2
+        failures=$((failures + 1))
+    else
+        echo "PASS: a timed cargo build (exit $status) gets --timings, keeps its report and its status"
+    fi
+done
+rm -rf "${work:?}/kept"
+rc=$(timings_case "unset" 0 "" build --locked -p x)
+if ((rc != 0)) || ! grep -qx -- 'build --locked -p x' "$work/argv" || [ -e "$work/kept" ]; then
+    echo "FAIL: without HERMIT_CARGO_TIMINGS_DIR the build changed: rc=$rc argv=$(cat "$work/argv" 2>/dev/null)" >&2
+    failures=$((failures + 1))
+else
+    echo "PASS: without HERMIT_CARGO_TIMINGS_DIR a cargo build is unchanged"
+fi
+rc=$(timings_case "test" 0 "$work/kept" test --no-run)
+if ((rc != 0)) || ! grep -qx -- 'test --no-run' "$work/argv" || [ -e "$work/kept" ]; then
+    echo "FAIL: HERMIT_CARGO_TIMINGS_DIR changed a cargo command other than build: rc=$rc argv=$(cat "$work/argv" 2>/dev/null)" >&2
+    failures=$((failures + 1))
+else
+    echo "PASS: HERMIT_CARGO_TIMINGS_DIR leaves every other cargo command unchanged"
+fi
+
 # The caller-bug path stays LOUD. Supplying no command is not a node declining.
 rc=0
 "./$WRAPPER" >/dev/null 2>&1 || rc=$?

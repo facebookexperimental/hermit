@@ -499,6 +499,16 @@ const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 13] = [
     ("e2e.manifest_system_utils", "manifest_guest", 1, 12),
     ("e2e.manifest_util_c", "manifest_guest", 1, 12),
 ];
+/// Pinned-root consumers that run Cargo in its dev profile, each in a target
+/// directory of its own (lint.clippy in target/clippy, doc.doctests in
+/// target/doctests, doc.rustdoc in target/debug and target/doc), and so need
+/// nothing build.e2e_artifact_in_pinned_root or the validate-profile build
+/// writes: their dependency on it, kept from the host graph, only queued them
+/// behind the critical path. reverie-dbt's DynamoRIO cache is per profile
+/// directory and published by rename, so they never share the validate build's
+/// entry either. In the full validation of 9bf1b194, replaying the graph
+/// without this dependency moved its end from +525 s to +511 s.
+const DEV_PROFILE_PINNED_CONSUMERS: &[&str] = &["lint.clippy", "doc.doctests", "doc.rustdoc"];
 const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.rust_scripts",
     "setup.manifest_plan",
@@ -2427,6 +2437,15 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
         // The image supplies Nextest. Test execution consumes the metadata
         // prepared in that same root, not a host installation or Cargo cache.
         step.deps.retain(|dependency| dependency != "setup.nextest");
+        // The dev-profile consumers build in target directories of their own and
+        // read nothing the validate-profile build writes, so they do not wait for it
+        // (DEV_PROFILE_PINNED_CONSUMERS). Hosted variants are skipped above and keep
+        // their order: a hosted runner has too little memory for clippy beside the
+        // workspace build.
+        if DEV_PROFILE_PINNED_CONSUMERS.contains(&step.tag().as_str()) {
+            let e2e_artifact = pinned_root_twin_tag("build.e2e_artifact");
+            step.deps.retain(|dependency| *dependency != e2e_artifact);
+        }
         if step.group == "privileged-e2e"
             && producer_tags.contains("build.e2e_artifact")
             && !step
@@ -7858,6 +7877,40 @@ sys.exit(37)
             deps("gate.manifest"),
             ["build.rust_scripts", "setup.manifest_plan"]
         );
+    }
+
+    /// The dev-profile pinned-root consumers start without waiting for the
+    /// validate-profile build's e2e artifact; their hosted twins keep that order.
+    #[test]
+    fn dev_profile_pinned_consumers_do_not_wait_for_the_e2e_artifact() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let deps = |tag: &str| {
+            committed
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .unwrap_or_else(|| panic!("validation DAG lost {tag}"))
+                .deps
+                .clone()
+        };
+        for tag in DEV_PROFILE_PINNED_CONSUMERS {
+            let local = deps(tag);
+            assert!(
+                !local
+                    .iter()
+                    .any(|dep| dep.starts_with("build.e2e_artifact")),
+                "{tag} waits for the e2e artifact: {local:?}"
+            );
+            assert!(
+                local.iter().any(|dep| dep == "setup.pinned_root_fetch"),
+                "{tag}: {local:?}"
+            );
+            let hosted = deps(&format!("{tag}{HOSTED_VARIANT_SUFFIX}"));
+            assert!(
+                hosted.iter().any(|dep| dep == "build.e2e_artifact_on_host"),
+                "the hosted twin of {tag} lost its order behind the workspace build: {hosted:?}"
+            );
+        }
     }
 
     #[test]
