@@ -2011,8 +2011,18 @@ fi
 # Cargo.lock and rust-toolchain.toml have the same object ids: all seven SDK
 # inputs, DBT inventory 961, calibrated budget, job width and limits are
 # unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 5396f3c2f4db48a53329bb56b5b52b16fa5d449e ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 5396f3c2f4db48a53329bb56b5b52b16fa5d449e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO ce6433f83adfc3e666d1ebed175b869edaea3574 (2026-10-18): from
+# 5396f3c2f4db48a53329bb56b5b52b16fa5d449e. One commit, ce6433f8 (A5 step 2c: a reported
+# rt_sigreturn requests a timer event it would cancel again; replayed from
+# 9074ce43 with the same patch-id), touching only reverie-ptrace (timer.rs,
+# task.rs, plain_guest_regression_tests.rs and its C fixture).
+# git diff is empty under reverie-dbt/ (tree c01780c7 at both pins), and
+# build.rs, vendor/dynamorio, native/, third-party, the root Cargo.toml,
+# Cargo.lock and rust-toolchain.toml have the same object ids: all seven SDK
+# inputs, DBT inventory 961, calibrated budget, job width and limits are
+# unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ce6433f83adfc3e666d1ebed175b869edaea3574 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ce6433f83adfc3e666d1ebed175b869edaea3574 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

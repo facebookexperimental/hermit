@@ -60,17 +60,39 @@ On ptrace, turning it on also asks the backend to report each guest
 instead of guessing them. It asks only when Hermit measured that the guest
 inherits no seccomp filter and no gdbserver is attached (`--gdbserver`);
 without the reports the copy guesses returns from the kernel's mask, as it
-always did. The reports are not free, and they change
+always did. The reports cost something, and in a few cases they change
 the run:
 
 - Each handler return becomes one extra ptrace stop.
-- A preemption timer event due within 10005 retired branches of a handler
-  return is cancelled at that stop (Reverie's keep margin). The thread is
-  then preempted only at its next syscall. A thread that spins without
-  syscalls after its handler returns is never preempted, which can hang a
-  run whose progress depends on preemption.
-- So a run with the switch on can be scheduled differently from the same
-  run with it off. Each is deterministic, but the two are not the same run.
+- A precise preemption timer event due within 10005 retired branches of a
+  handler return (Reverie's keep margin) is cancelled at that stop and
+  requested again at the same target, so it fires where it fires without
+  the reports.
+- If a late notification has already let the thread reach or pass the
+  target, the event fires one branch after the return. Without the reports
+  it would fire after the return too, at a point host timing decides.
+  Either way the late notification is witnessed, and the run is refused as
+  a skid overshoot.
+- In these cases the stop still cancels the event without requesting it
+  again:
+  - the mask the handler's frame restores blocks the timer's signal, or
+    cannot be read;
+  - the run uses `--imprecise-timers`, whose events are cancelled past
+    their period;
+  - single steps toward the event failed to clean up, and the thread has
+    already reached the target (short of it, the event is requested again
+    as above);
+  - the event was requested before the guest's first exec and is still
+    held;
+  - an instruction-offset event whose offset is still ahead at its target
+    (Hermit requests none).
+
+  The thread is then preempted only at the next event Detcore sees, such as
+  its next syscall or signal. A thread that runs without any after its
+  handler returns is never preempted, which can hang a run whose progress
+  depends on preemption. In these cases a run with the switch on can be
+  scheduled differently from the same run with it off. The two are not the
+  same run.
 
 What it reports:
 
@@ -88,5 +110,5 @@ What it reports:
   much was actually checked.
 
 It stays opt-in because the backend does not report every delivery yet, and
-because of the timer cost above, which must be resolved before the copy can
-be on by default.
+because the timer cases above, `--imprecise-timers` first, must be handled
+or refused before the copy can be on by default.
