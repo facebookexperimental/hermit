@@ -2066,7 +2066,18 @@ fi
 # reverie-dbt file is added or removed (inventory 966), and the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml are unchanged. SDK and native inputs,
 # calibrated budget, job width and limits are unchanged.
-expected_pin=38a30d7a4912d046487d4a517ffad092cfb5d4c0
+# CARRY TO 3d4461d7af7a2895130b020c36411fc3fc81a287 (2026-10-18):
+# The JECXZ correction changes one vendored counter-branch predicate plus two
+# regression files; the separate native exit-classification repair leaves SDK
+# inputs unchanged. The a22f4adf restack has no DBT/vendor/SDK input delta.
+# Fresh maintained SDK miss 37d51116a9327239d5599d8fb9f2efb538cbc42837c69598e51a4699db24b0b2
+# measured 27.05s with 7 available jobs (NUM_JOBS=8), 189.38 job-seconds, below
+# the default native ratchet572. The portable1050 job-second budget and all
+# selectors/limits remain unchanged; this is one source-equivalent carry sample.
+# Actual producer: R38-based JECXZ source43df98d4, jecxz-cargo-r2 under
+# dbt-continuous-clock-main09ec59c4-20261018; restacked SDK inputs byte-identical.
+# Tracked DBT inventory is 968 after the two new JECXZ regression files.
+expected_pin=3d4461d7af7a2895130b020c36411fc3fc81a287
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
@@ -2131,7 +2142,7 @@ export REVERIE_DBT_BUDGET_BOUND_PIN
 # shellcheck source=ci/configure-build-jobs.sh
 source "$ROOT_DIR/ci/configure-build-jobs.sh" reverie-dbt-budget-child
 
-echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:existing-portable-budget,combined-sdk-key:f33cd1a46e8c962dc6af2a0cced1024ac65500a8ac4934962551a6535ab6e5b3,measured-current-source}" >&2
+echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:existing-portable-budget,combined-sdk-key:37d51116a9327239d5599d8fb9f2efb538cbc42837c69598e51a4699db24b0b2,source-equivalent-sdk-carry}" >&2
 
 # A cargo build, check, clippy, doc, rustc or test command reruns once if the
 # compiler itself crashed; every other command is exec'd unchanged

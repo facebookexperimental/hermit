@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+# CARRY TO 3d4461d7af7a2895130b020c36411fc3fc81a287 (2026-10-18):
+# The JECXZ correction changes one vendored counter-branch predicate plus two
+# regression files; the separate native exit-classification repair leaves SDK
+# inputs unchanged. The a22f4adf restack has no DBT/vendor/SDK input delta.
+# Fresh maintained SDK miss 37d51116a9327239d5599d8fb9f2efb538cbc42837c69598e51a4699db24b0b2
+# measured 27.05s with 7 available jobs (NUM_JOBS=8), 189.38 job-seconds, below
+# the default native ratchet572. The portable1050 job-second budget and all
+# selectors/limits remain unchanged; this is one source-equivalent carry sample.
+# Actual producer: R38-based JECXZ source43df98d4, jecxz-cargo-r2 under
+# dbt-continuous-clock-main09ec59c4-20261018; restacked SDK inputs byte-identical.
 # CARRY TO ae40c7f1 (2026-10-16): 51ecc8fb..ae40c7f1 adds a facts-only
 # Guest runtime-FD query and normalizes the existing RPC owner to physical PID.
 # Native C/CMake/vendor/SDK inputs and seven SDK object IDs are unchanged.
@@ -2143,8 +2153,8 @@ fi
 # reverie-dbt file is added or removed (inventory 966), and the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml are unchanged. SDK and native inputs,
 # calibrated budget, job width and limits are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 38a30d7a4912d046487d4a517ffad092cfb5d4c0 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 38a30d7a4912d046487d4a517ffad092cfb5d4c0 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 3d4461d7af7a2895130b020c36411fc3fc81a287 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 3d4461d7af7a2895130b020c36411fc3fc81a287 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
