@@ -1678,7 +1678,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (minibeads dh-dt0n): 1167.
     // And -83 from 883e2e52: 1084.
     // Less the 46 replay-tool tests that moved to hermit-replay: 1038.
-    ("test.hermit_unit", 1038),
+    // And metadata::tests::record_version_rejects_streams_from_before_restartable_calls_block_first
+    // (R2b-2 stage 2, https://github.com/rrnewton/hermit/issues/4273): 1039, listed.
+    ("test.hermit_unit", 1039),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2536,7 +2538,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4504): 2085, freshly listed.
     // And the_first_child_exit_sigchld_taken_stands_for_the_exit_without_publication
     // (dev-hermit minibeads dh-l1fk): 2086.
-    ("test.detcore_unit", 2086),
+    // And the eight R2b-2 stage 2 units
+    // (https://github.com/rrnewton/hermit/issues/4273): six in-place block
+    // units, the drain-filter scheduler unit and the procfs SigBlk unit: 2094, listed.
+    ("test.detcore_unit", 2094),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3632,7 +3637,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4504): 540, listed.
     // And each_child_exit_gives_its_parent_one_sigchld (dev-hermit minibeads
     // dh-l1fk, SaBRe's duplicate SIGCHLD): 541.
-    ("test.cli", 541),
+    // And restartable_calls_woken_by_two_signals_run_both_handlers and
+    // restartable_two_signal_rows_under_record_and_replay (R2b-2 stage 2,
+    // https://github.com/rrnewton/hermit/issues/4273): 543, listed.
+    ("test.cli", 543),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4090,7 +4098,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same captured-stderr/controller-diagnostics regression: 474, listed.
     // And the same repeated-signal polled-read test: 475, listed.
     // And the same one-SIGCHLD-per-child-exit regression: 476.
-    ("test.cli_on_host", 476),
+    // And the same two R2b-2 stage 2 tests: 478, listed.
+    ("test.cli_on_host", 478),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4423,7 +4432,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same already-woken poll unit: 2085, freshly listed.
     // And the_first_child_exit_sigchld_taken_stands_for_the_exit_without_publication
     // (dev-hermit minibeads dh-l1fk): 2086.
-    ("test.detcore_unit_on_host", 2086),
+    // And the same eight R2b-2 stage 2 units: 2094, listed.
+    ("test.detcore_unit_on_host", 2094),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4712,7 +4722,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two dh-dt0n KVM mount-snapshot tests: 1167.
     // And -83 from 883e2e52: 1084.
     // Less the same 46 replay-tool tests: 1038.
-    ("test.hermit_unit_on_host", 1038),
+    // And the same R2b-2 stage 2 record-version test: 1039, listed.
+    ("test.hermit_unit_on_host", 1039),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
