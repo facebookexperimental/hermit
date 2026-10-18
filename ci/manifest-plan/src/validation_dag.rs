@@ -88,6 +88,10 @@ pub const PINNED_WORKSPACE_COMPILE_TAG: &str = "build.workspace_compile_in_pinne
 pub const PINNED_WORKSPACE_PREPARE_TAG: &str = "build.workspace_in_pinned_root";
 const PINNED_WORKSPACE_COMPILE_JOB: &str = "workspace_compile_in_pinned_root";
 const PINNED_RUST_SCRIPTS_TAG: &str = "build.rust_scripts_in_pinned_root";
+/// The ordinary in-guest Detcore runtime's prebuild: the packaged-LiteInst
+/// finalizer's own Cargo command, run as a producer so its pinned-root twin
+/// compiles beside the workspace compile (see its static description).
+const LITEINST_RUNTIME_TAG: &str = "build.liteinst_runtime";
 /// The exact text at which the workspace payload is cut: everything before it
 /// is Cargo, everything after the ` && ` is preparation.
 const WORKSPACE_PREPARATION_BOUNDARY: &str = " && ./ci/nextest-binaries.rs prepare ";
@@ -501,6 +505,7 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.workspace",
     "build.e2e_artifact",
     "build.liteinst_allocator_fixtures",
+    "build.liteinst_runtime",
     "build.manifest_guests",
     "compatprep.hermit_release",
 ];
@@ -675,14 +680,17 @@ const PROFILES: [Profile; 11] = [
         // privileged-test.syscall_conformance_kvm), 101/102 before, and they
         // left when the check moved to Reverie's own validate and CI
         // (reverie-examples/e2e/run.sh): 103/104 before.
+        // full and portable each gained build.liteinst_runtime_in_pinned_root,
+        // the ordinary in-guest Detcore runtime's prebuild, which carries the
+        // same two labels: 101/102 and 80/81 before.
         label: "full",
-        direct_steps: 101,
-        selected_steps: 102,
+        direct_steps: 102,
+        selected_steps: 103,
     },
     Profile {
         label: "portable",
-        direct_steps: 80,
-        selected_steps: 81,
+        direct_steps: 81,
+        selected_steps: 82,
     },
     Profile {
         label: "quick",
@@ -731,15 +739,19 @@ const PROFILES: [Profile; 11] = [
     // build.workspace_compile_in_pinned_root and build.workspace_in_pinned_root:
     // 2/13 before. The strict and rr run types gained the same ancestor.
     Profile {
+        // Its closure gained build.liteinst_runtime_in_pinned_root through
+        // build.workspace_in_pinned_root: 2/14 before.
         label: "sabre-compat-only",
         direct_steps: 2,
-        selected_steps: 14,
+        selected_steps: 15,
     },
     // The rr run type: the same shape again.
     Profile {
+        // Its closure gained build.liteinst_runtime_in_pinned_root through
+        // build.workspace_in_pinned_root: 2/14 before.
         label: "rr-compat-only",
         direct_steps: 2,
-        selected_steps: 14,
+        selected_steps: 15,
     },
 ];
 
@@ -1178,7 +1190,10 @@ fn route_host_consumers_to_pinned_build(cfg: &mut DagConfig) -> Result<(), Strin
 fn builds_hermit(step: &Step) -> bool {
     matches!(
         step.tag().as_str(),
-        "build.workspace" | "build.e2e_artifact" | "build.liteinst_allocator_fixtures"
+        "build.workspace"
+            | "build.e2e_artifact"
+            | "build.liteinst_allocator_fixtures"
+            | LITEINST_RUNTIME_TAG
     ) || step.job == "privileged_tests"
 }
 
@@ -2466,7 +2481,12 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
             // before the network-disabled pinned root installs those bytes.
             twin.deps.push("build.buck_release_artifact".into());
         }
-        if producer.tag() != "build.rust_scripts" && has_rust_scripts {
+        // The ordinary-runtime prebuild runs no rust-script, so it starts beside
+        // the workspace compile rather than after the rust-script tools.
+        if producer.tag() != "build.rust_scripts"
+            && producer.tag() != LITEINST_RUNTIME_TAG
+            && has_rust_scripts
+        {
             twin.deps.push("build.rust_scripts_in_pinned_root".into());
         }
         if producer.job == "manifest_guests" && producer_tags.contains("setup.manifest_plan") {
@@ -2506,9 +2526,20 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
         twin.env
             .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
         // Only the trailing `nextest-binaries.rs prepare` needs the prebuilt
-        // rust-script tools, so the Cargo half starts without them.
+        // rust-script tools, so the Cargo half starts without them. The
+        // packaged-LiteInst finalizer in the prepare half reuses the ordinary
+        // runtime the prebuild twin compiled, so only that half waits for it.
         if producer.tag() == "build.workspace" {
-            twins.extend(split_pinned_workspace_twin(twin)?);
+            let mut halves = split_pinned_workspace_twin(twin)?;
+            if producer_tags.contains(LITEINST_RUNTIME_TAG) {
+                let prepare = &mut halves[1];
+                prepare
+                    .deps
+                    .push(pinned_root_twin_tag(LITEINST_RUNTIME_TAG));
+                prepare.deps.sort();
+                prepare.deps.dedup();
+            }
+            twins.extend(halves);
             continue;
         }
         twin.cmd = pinned_root_command(&twin);
@@ -4345,9 +4376,13 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // and privileged-test.syscall_conformance_kvm (441 + 2), and 441 again since
     // that check runs in Reverie's own validate and CI instead
     // (reverie-examples/e2e/run.sh).
-    if cfg.steps.len() != 441 {
+    // 442 with build.liteinst_runtime_in_pinned_root, the ordinary in-guest
+    // Detcore runtime's prebuild ahead of its packaging finalizer; its host
+    // original has no hosted label and no local consumer, so it is retired
+    // (441 + 1).
+    if cfg.steps.len() != 442 {
         return Err(format!(
-            "superset has {} steps, expected 441",
+            "superset has {} steps, expected 442",
             cfg.steps.len()
         ));
     }
@@ -6907,8 +6942,9 @@ sys.exit(37)
         // and 99 with the three backend isolation matrix nodes (102 full
         // nodes), and 101 with the two syscall conformance nodes (104), and
         // 99 again since that check runs in Reverie's own validate and CI
-        // (102 full nodes).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 99);
+        // (102 full nodes), and 100 with build.liteinst_runtime_in_pinned_root
+        // (103 full nodes).
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 100);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps

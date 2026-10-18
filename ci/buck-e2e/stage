@@ -149,13 +149,13 @@ dirty=$(git -C "$git_root" status --porcelain --untracked-files=no) ||
 [[ -z $dirty ]] ||
     { echo "ci/buck-e2e/stage: commit first; cells record SOURCE_SHA=$sha" >&2; exit 2; }
 tmp=$(mktemp -d)
-release_build= hermit_build=
+release_build= hermit_build= liteinst_build=
 # Each background build runs in a process group of its own (setsid), and stopping it
 # signals the whole group: cargo does not pass SIGTERM on, so killing cargo alone would
 # leave its rustc, build-script and cmake processes writing into target/.
 stop_background_builds() {
     local pid tries
-    for pid in $release_build $hermit_build; do
+    for pid in $release_build $hermit_build $liteinst_build; do
         kill -TERM -- "-$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
         for ((tries = 0; tries < 50; tries++)); do
@@ -193,6 +193,18 @@ release_build=$!
 setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit --bin hermit \
     --features hermit/third-party-backends --target-dir "$hermit_target_dir" >"$tmp/hermit-build.log" 2>&1 &
 hermit_build=$!
+# The ordinary in-guest Detcore runtime in the liteinst-runtime profile: the Cargo
+# command the packaging finalizer below runs, started here so it compiles beside the
+# other builds (Cargo locks each profile directory separately) instead of after them.
+# The finalizer is unchanged: it still runs last, its own invocation of the command is
+# answered from these artifacts (its receipt records cargo_artifact.fresh), and it
+# qualifies what Cargo reports. Unlike the finalizer, this build is not --offline: the
+# stage's other builds are still fetching the git dependencies when it starts, and
+# Cargo's fingerprints do not include --offline. A cold build of it took 97-100 s of
+# the finalizer's 107-110 s at eight jobs (main 359ab376).
+setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked -p detcore-liteinst --lib --profile liteinst-runtime \
+    --target-dir "$target_dir" >"$tmp/liteinst-runtime-build.log" 2>&1 &
+liteinst_build=$!
 "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p detcore-dbt -p detcore-dbt-cdylib --target-dir "$target_dir"
 # hermit-install's build script stages install_pkg/ next to the profile directories and
 # links libdetcore_sabre.so into it. The ordinary LiteInst resource is finalized
@@ -213,6 +225,7 @@ finish_build() { # finish_build WHAT PID-VARIABLE LOG
 }
 finish_build "release build of hermit-manifest-plan" release_build "$tmp/release-build.log"
 finish_build "validate-profile build of hermit" hermit_build "$tmp/hermit-build.log"
+finish_build "liteinst-runtime build of the ordinary Detcore runtime" liteinst_build "$tmp/liteinst-runtime-build.log"
 # All outer Cargo commands have released the target before the one finalizer.
 "$target_dir/validate/stage-detcore-liteinst" --source-copy "$target_dir"
 install -m 755 "$hermit_target_dir/validate/hermit" "$target_dir/validate/hermit"

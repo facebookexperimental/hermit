@@ -63828,6 +63828,7 @@
       "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target'",
       "result_manifests": [],
       "deps": [
+        "build.liteinst_runtime_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
         "build.workspace_compile_in_pinned_root",
         "pre.reverie_pin",
@@ -63853,6 +63854,42 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "build.workspace_in_pinned_root"
+    },
+    {
+      "group": "build",
+      "job": "liteinst_runtime_in_pinned_root",
+      "desc": "Build the ordinary in-guest Detcore runtime in the liteinst-runtime profile ahead of its packaging finalizer",
+      "description": "PREBUILD 2026-10-18 (liteinst contract, temp/liteinst-status.md \"Packaging prebuild contract\", 1:51 AM ET). Runs exactly the Cargo command the packaged-LiteInst finalizer (hermit-install/src/bin/stage-detcore-liteinst.rs) runs, `cargo build --locked --offline --manifest-path Cargo.toml -p detcore-liteinst --lib --profile liteinst-runtime --target-dir target`, so that its pinned-root twin compiles the ordinary runtime beside build.workspace_compile_in_pinned_root instead of after it. The finalizer is unchanged: it still runs after every producer, invokes the same command (which Cargo then answers from these artifacts, and the receipt records cargo_artifact.fresh), selects Cargo's reported artifact, and performs every qualification, identity, source-close and receipt step. Only build.workspace_in_pinned_root, which runs the finalizer, depends on the twin. The allocator fixtures keep their own dedicated target (build.liteinst_allocator_fixtures). WHY: the cold liteinst-runtime build is the finalizer's cost. At main 359ab376, eight CPUs (CPUQuota 800%, CARGO_BUILD_JOBS=8), the finalizer took 107 s and 456 CPU-s with target/liteinst-runtime absent (cargo build 97 s), 81 s and 195 CPU-s with only the path crates stale (cargo build 71 s; a warm seed leaves them so), and 9.8 s and 5.7 CPU-s when the runtime was already built; all three qualified the same bytes. In the full validations of 4dc66c9c and 359ab376 the finalizer lengthened build.workspace_in_pinned_root from 38-40 s to 135-153 s on the critical path. LOCKS: Cargo locks each profile directory (target/validate/.cargo-lock, target/liteinst-runtime/.cargo-lock); a validate-profile build and this command started together in one target directory logged no `Blocking waiting for file lock` line. MEMORY: cold peak 2.65 GiB (cgroup memory.peak) at eight jobs, so rss_baseline 3 GiB and the hard cap 5 GiB. The build is a chain of path crates (detcore-model, detcore, detcore-liteinst with ThinLTO), 2.7 cores busy on average when only they rebuild, so eight jobs are enough.",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'cargo build --locked --offline --manifest-path Cargo.toml -p detcore-liteinst --lib --profile liteinst-runtime --target-dir target'",
+      "result_manifests": [],
+      "deps": [
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 600,
+      "cpu_timeout": 2100,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {
+        "resources": {},
+        "est_duration_s": 110.0,
+        "rss_baseline_bytes": 3221225472,
+        "hard_mem_max_bytes": 5368709120,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 8,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.liteinst_runtime_in_pinned_root"
     },
     {
       "group": "build",
