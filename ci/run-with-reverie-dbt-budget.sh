@@ -1922,7 +1922,19 @@ fi
 # Cargo.toml, Cargo.lock and rust-toolchain.toml have the same object ids: all
 # seven SDK inputs, DBT inventory 961, calibrated budget, job width and limits
 # are unchanged.
-expected_pin=5a38b0f755652b59179a6e8d5ac9e590045d1301
+# CARRY TO 5396f3c2f4db48a53329bb56b5b52b16fa5d449e (2026-10-18): from
+# 5a38b0f755652b59179a6e8d5ac9e590045d1301. Two commits: 3f648f4d (a doc comment on reverie-kvm's
+# nice-inheritance test) and 5396f3c2 (provider step E3b: ProviderOutcome
+# gains Interrupted; reverie-ptrace reports it and decides restartable
+# injection from it; reverie-kvm treats it as an invariant error; replayed
+# from 284cbecd), touching only reverie-core, reverie-linux-provider,
+# reverie-kvm and reverie-ptrace.
+# git diff is empty under reverie-dbt/ (tree c01780c7 at both pins), and
+# build.rs, vendor/dynamorio, native/, third-party, the root Cargo.toml,
+# Cargo.lock and rust-toolchain.toml have the same object ids: all seven SDK
+# inputs, DBT inventory 961, calibrated budget, job width and limits are
+# unchanged.
+expected_pin=5396f3c2f4db48a53329bb56b5b52b16fa5d449e
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
