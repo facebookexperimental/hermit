@@ -896,7 +896,11 @@ mod tests {
             // Runtime-private maps target/alias/lifetime coverage adds one.
             // And the staged-bind kernel-path and install-time bind tests
             // (+2, K3a of https://github.com/rrnewton/hermit/issues/4213).
-            assert_eq!(population, 580);
+            // signal_determinism's eighteen ptrace_delivery_check_* tests (A5
+            // step 3.2) add eighteen, and six more add six, less the spin
+            // case, which test.pmu_integration_cases runs: 603. And
+            // forced-blocked: 604.
+            assert_eq!(population, 604);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
