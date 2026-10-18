@@ -22,7 +22,6 @@ pub mod build_info;
 pub mod canonical_verdict;
 mod chroot;
 use hermit_record_format::consts;
-mod desync;
 pub mod logdiff_report;
 // TODO-HUMAN-REVIEW(PR-594): Review the public e9patch preprocessing API.
 pub mod cpu_profile_admission;
@@ -30,7 +29,6 @@ pub mod e9patch;
 mod error;
 use hermit_record_format::event;
 use hermit_record_format::event_stream;
-use hermit_record_format::fd;
 pub mod happens_before;
 pub mod host_input_change;
 mod id;
@@ -367,7 +365,6 @@ const _: () = assert!(
 mod record;
 use hermit_record_format::record_replay_path;
 mod replay;
-mod replayer;
 #[cfg(feature = "sabre")]
 mod sabre_bootstrap;
 #[cfg(feature = "sabre")]
@@ -445,8 +442,6 @@ pub use error::SerializableError;
 use goblin::elf::Elf;
 use goblin::elf::header;
 use goblin::elf::section_header;
-use hermit_record_format::syscall_args::read_iovecs;
-use hermit_record_format::syscall_args::vectored_offset;
 pub use id::Id;
 use metadata::Metadata;
 pub use ptrace_completion::HermitCleanupStage;

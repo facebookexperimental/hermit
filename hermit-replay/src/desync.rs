@@ -13,10 +13,10 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
+use anyhow::Error;
 use reverie::Pid;
 use reverie::syscalls::SyscallInfo;
 
-use crate::error::Error;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventReader;
 use crate::event_stream::EventStreamId;

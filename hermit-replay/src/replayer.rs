@@ -132,13 +132,13 @@ fn replay_root_identity(pid: Pid) -> io::Result<ReplayFileIdentity> {
     )?))
 }
 
-pub(crate) struct ReplayMaterializationScope {
+pub struct ReplayMaterializationScope {
     identity: ReplayFileIdentity,
     _root: OwnedFd,
 }
 
 impl ReplayMaterializationScope {
-    pub(crate) fn new(root_fd: libc::c_int) -> io::Result<Self> {
+    pub fn new(root_fd: libc::c_int) -> io::Result<Self> {
         let root = duplicate_controller_fd(root_fd)?;
         Ok(Self {
             identity: identity_for_fd(root.as_raw_fd())?,
@@ -311,10 +311,7 @@ fn remember_materialized_file(pid: Pid, fd: libc::c_int) {
     }
 }
 
-pub(crate) fn remember_materialized_object(
-    root_fd: libc::c_int,
-    fd: libc::c_int,
-) -> io::Result<()> {
+pub fn remember_materialized_object(root_fd: libc::c_int, fd: libc::c_int) -> io::Result<()> {
     let metadata = std::fs::metadata(format!("/proc/self/fd/{fd}"))?;
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -325,8 +322,10 @@ pub(crate) fn remember_materialized_object(
     register_materialized(identity_for_fd(root_fd)?, duplicate_controller_fd(fd)?)
 }
 
-#[cfg(test)]
-pub(crate) fn registered_materialized_count(root_fd: libc::c_int) -> usize {
+/// How many materialized objects are registered under ROOT_FD. Test support
+/// only, for the replay tests here and in the hermit library.
+#[doc(hidden)]
+pub fn registered_materialized_count(root_fd: libc::c_int) -> usize {
     let Ok(root) = identity_for_fd(root_fd) else {
         return 0;
     };
@@ -377,17 +376,17 @@ pub struct ReplayerThreadState {
 /// wrote to the container's stdout through a descriptor its parent saved had
 /// its bytes written into that pipe instead, whose reader replay serves from
 /// the recording; once the pipe was full, the replayed write waited forever
-/// (https://github.com/rrnewton/hermit/issues/4006). Only the root thread's
+/// (<https://github.com/rrnewton/hermit/issues/4006>). Only the root thread's
 /// copy is used now, and every other thread shares it.
 #[derive(Default)]
-pub(crate) struct ReplayOutputs {
-    pub(crate) stdout: Option<std::os::fd::OwnedFd>,
-    pub(crate) stderr: Option<std::os::fd::OwnedFd>,
+pub struct ReplayOutputs {
+    pub stdout: Option<std::os::fd::OwnedFd>,
+    pub stderr: Option<std::os::fd::OwnedFd>,
     /// Preserve replayed write ordering independently for each captured stream.
-    pub(crate) stdout_output_lock: tokio::sync::Mutex<()>,
-    pub(crate) stderr_output_lock: tokio::sync::Mutex<()>,
-    pub(crate) stdout_error: Option<String>,
-    pub(crate) stderr_error: Option<String>,
+    pub stdout_output_lock: tokio::sync::Mutex<()>,
+    pub stderr_output_lock: tokio::sync::Mutex<()>,
+    pub stdout_error: Option<String>,
+    pub stderr_error: Option<String>,
 }
 
 impl ReplayOutputs {
@@ -487,9 +486,9 @@ impl Tool for Replayer {
         }
     }
 
-    fn subscriptions(config: &<Self::GlobalState as GlobalTool>::Config) -> Subscription {
+    fn subscriptions(_config: &<Self::GlobalState as GlobalTool>::Config) -> Subscription {
         // Subscribe to the exact same events as the recorder does.
-        hermit_record::Recorder::subscriptions(config)
+        hermit_record_format::subscriptions::record_and_replay()
     }
 
     async fn handle_syscall_event<G: Guest<Self>>(

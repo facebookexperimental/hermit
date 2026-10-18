@@ -813,7 +813,7 @@ on true external inputs.
   `RecordVersion`. Replay refuses a trace whose version is incompatible with the
   replayer's `RECORD_VERSION`;
 - a per-thread event stream written by the `EventWriter` and read back by the
-  `Replayer` (`hermit-cli/src/replayer/`) in the same deterministic order.
+  `Replayer` (crate `hermit-replay`, `hermit-replay/src/replayer/`) in the same deterministic order.
 
 **Replay environment.** `Replay::spawn` (`hermit-cli/src/replay.rs`) reconstructs
 the recorded process in a temporary chroot (`TempChroot`): it hard-links the
@@ -824,7 +824,7 @@ resolves the same paths it saw at record time.
 **Desync detection.** The recorder writes a raw-syscall debug stream alongside
 the result-event stream. The replayer compares each live syscall with that
 debug stream only when the `HERMIT_VERIFY` environment variable is set. A
-mismatch in that mode raises a `DesyncError` (`hermit-cli/src/desync.rs`)
+mismatch in that mode raises a `DesyncError` (`hermit-replay/src/desync.rs`)
 identifying the thread and event index. Ordinary `hermit replay` still consumes
 the recorded result events, but it does not enable this full argument-by-
 argument syscall comparison by default.
@@ -937,7 +937,7 @@ The main implementation entry points are:
 | CPUID table | `detcore/src/cpuid.rs` |
 | Syscall-family handlers | `detcore/src/syscalls/` |
 | Record (capture) sub-tool | `hermit-record/src/recorder/` (its own crate, so its Detcore instantiation compiles in parallel), `hermit-cli/src/record.rs` |
-| Replay sub-tool and desync detection | `hermit-cli/src/replayer/`, `hermit-cli/src/replay.rs`, `hermit-cli/src/desync.rs` |
+| Replay sub-tool and desync detection | `hermit-replay/src/replayer/` (its own crate, so its Detcore instantiation compiles in parallel), `hermit-cli/src/replay.rs`, `hermit-replay/src/desync.rs` |
 | Recording metadata and event stream | `hermit-cli/src/metadata.rs`, `hermit-record-format/src/event_stream.rs` |
 | Reverie tool contract | Reverie `reverie/src/tool.rs` and `reverie/src/guest.rs` |
 | Ptrace startup/filter | Reverie `reverie-ptrace/src/tracer.rs` |

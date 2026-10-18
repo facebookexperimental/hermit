@@ -4849,7 +4849,7 @@ fn recording_refuses_recvmmsg_on_an_accepted_connection() {
 
 /// Replay's refusal of a recording in which an accepted connection holds a
 /// different descriptor slot than it did during recording, as
-/// `hermit-cli/src/replayer.rs` prints it.
+/// `hermit-replay/src/replayer.rs` prints it.
 const ACCEPT_SLOT_REFUSAL: &str = "replay refused: an accepted connection's \
     descriptor slot differs from the recording, because record does not log where a \
     backgrounded accept took its slot (https://github.com/rrnewton/hermit/issues/3880)";

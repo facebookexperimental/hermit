@@ -20,6 +20,7 @@ pub mod fd;
 pub mod interp;
 pub mod record_replay_path;
 pub mod script;
+pub mod subscriptions;
 pub mod syscall_args;
 
 pub use script::Shebang;

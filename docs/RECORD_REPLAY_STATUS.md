@@ -171,7 +171,7 @@ SELECT group_concat(x, ',') FROM (SELECT x FROM t ORDER BY x);
 ```
 
 Record completed and printed `1,2,3`. Replay panicked in
-`hermit-cli/src/replayer/macros.rs` because the next event was an unexpected
+`hermit-replay/src/replayer/macros.rs` because the next event was an unexpected
 `SyscallEvent::Mmap`. The diagnostic serialized the entire mapping buffer,
 producing approximately 650 KiB of stderr before the non-unwinding abort.
 

@@ -57,6 +57,7 @@ fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rus
 goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
 hermit-record = { version = "0.4.1", path = "../hermit-record" }
 hermit-record-format = { version = "0.4.1", path = "../hermit-record-format" }
+hermit-replay = { version = "0.4.1", path = "../hermit-replay" }
 hermit-resources = { version = "0.4.1", path = "../hermit-resources" }
 hermit-test-workdir = { version = "0.4.1", path = "../common/test-workdir", optional = true }
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }

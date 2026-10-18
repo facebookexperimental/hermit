@@ -1,0 +1,23 @@
+[package]
+name = "hermit-replay"
+description = "Hermit's ptrace replay tool, compiled apart from the hermit library so its Detcore instantiation builds in parallel."
+version = "0.4.1"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/facebookexperimental/hermit"
+publish = false
+
+[dependencies]
+hermit-record-format = { version = "0.4.1", path = "../hermit-record-format" }
+anyhow = "1.0.103"
+detcore = { package = "hermit-detcore", version = "0.4.1", path = "../detcore" }
+libc = "0.2.186"
+reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "38a30d7a4912d046487d4a517ffad092cfb5d4c0" }
+reverie-ptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "38a30d7a4912d046487d4a517ffad092cfb5d4c0" }
+serde = { version = "1.0.219", features = ["derive", "rc"] }
+tempfile = "3.27.0"
+tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
+
+[dev-dependencies]
+nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }

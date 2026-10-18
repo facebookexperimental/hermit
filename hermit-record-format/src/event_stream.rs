@@ -250,7 +250,7 @@ impl fmt::Display for DebugEvent {
 ///
 /// Returns `None` for syscalls without an entry; callers then fall back to
 /// comparing all six registers (the conservative pre-existing behavior). Only
-/// syscalls that record/replay subscribes to (see `recorder::subscriptions`)
+/// syscalls that record/replay subscribes to (see [`crate::subscriptions::record_and_replay`])
 /// flow through the comparator, so those are the ones covered here.
 ///
 /// These are true kernel arities, which for a few syscalls exceed the number of

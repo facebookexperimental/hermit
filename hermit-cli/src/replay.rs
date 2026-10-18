@@ -39,9 +39,6 @@ use crate::event_stream::EventStreamId;
 use crate::metadata::Metadata;
 use crate::metadata::RECORD_VERSION;
 use crate::metadata::record_or_replay_config;
-use crate::replayer::Replayer;
-
-type ReplayTool = detcore::Detcore<Replayer>;
 type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
 
 /// Represents a replay that is currently running.
@@ -55,7 +52,7 @@ pub struct Replay {
 
     // Retires this replay root's physical-file trust entries on every exit
     // path, including cancellation or a spawn/wait error.
-    _materialization_scope: crate::replayer::ReplayMaterializationScope,
+    _materialization_scope: hermit_replay::ReplayMaterializationScope,
 }
 
 impl Replay {
@@ -180,16 +177,10 @@ impl Replay {
         command.chroot(chroot.path());
 
         crate::cpu_profile_admission::refuse_unadmitted_launch(&config, true)?;
-        let mut builder = reverie_ptrace::TracerBuilder::<ReplayTool>::new(command).config(config);
-        if let Some(port) = gdbserver {
-            builder = builder.gdbserver(port);
-        }
-        if sequentialize_threads {
-            // Inform gdbserver not to serialize guests because this is
-            // done by detcore already.
-            builder = builder.sequentialized_guest();
-        }
-        let tracer = builder.spawn().await?;
+        // A sequentialized replay tells gdbserver not to serialize guests,
+        // because Detcore already does.
+        let tracer =
+            hermit_replay::spawn_tracer(command, config, gdbserver, sequentialize_threads).await?;
         let proc_readonly = crate::proc_mount::guest_proc_readonly(tracer.guest_pid());
         crate::proc_mount::report_proc_mode(metadata.proc_readonly, proc_readonly);
 
@@ -282,7 +273,7 @@ fn prepare_chroot(
 ) -> io::Result<(
     TempChroot,
     PathBuf,
-    crate::replayer::ReplayMaterializationScope,
+    hermit_replay::ReplayMaterializationScope,
     Vec<Mount>,
 )> {
     let chroot = TempChroot::new_in(dir)?;
@@ -298,7 +289,7 @@ fn prepare_chroot(
     }
     let replay_root = crate::record_replay_path::open_directory_path(chroot.path())?;
     let materialization_scope =
-        crate::replayer::ReplayMaterializationScope::new(replay_root.as_raw_fd())?;
+        hermit_replay::ReplayMaterializationScope::new(replay_root.as_raw_fd())?;
 
     // These are replay-owned mount/alias points, so create them while the
     // chroot is still empty. No recorded symlink topology has been installed
@@ -577,10 +568,7 @@ fn stage_recorded_exec_image(
     )?;
     let staged =
         crate::record_replay_path::resolve_existing_path(replay_root, start, guest_path, false)?;
-    crate::replayer::remember_materialized_object(
-        replay_root.as_raw_fd(),
-        staged.object.as_raw_fd(),
-    )
+    hermit_replay::remember_materialized_object(replay_root.as_raw_fd(), staged.object.as_raw_fd())
 }
 
 #[cfg(test)]
@@ -711,7 +699,7 @@ mod tests {
         };
 
         let result: io::Result<()> = (|| {
-            let _scope = crate::replayer::ReplayMaterializationScope::new(replay_root.as_raw_fd())?;
+            let _scope = hermit_replay::ReplayMaterializationScope::new(replay_root.as_raw_fd())?;
             stage_recorded_exec_image(
                 &replay_root,
                 &replay_root,
@@ -722,7 +710,7 @@ mod tests {
                 false,
             )?;
             assert_eq!(
-                crate::replayer::registered_materialized_count(replay_root.as_raw_fd()),
+                hermit_replay::registered_materialized_count(replay_root.as_raw_fd()),
                 1
             );
             Err(io::Error::other("forced post-staging failure"))
@@ -730,7 +718,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(
-            crate::replayer::registered_materialized_count(replay_root.as_raw_fd()),
+            hermit_replay::registered_materialized_count(replay_root.as_raw_fd()),
             0
         );
     }
