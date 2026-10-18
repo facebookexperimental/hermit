@@ -1667,7 +1667,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and container::tests::installations_record_their_install_time_mountpoints
     // (https://github.com/rrnewton/hermit/issues/4213, K3a): 1160.
     // Five e9patch executable-publication inode and collision regressions: 1165.
-    ("test.hermit_unit", 1165),
+    // And tests::kvm_mountinfo_config_keeps_a_snapshot_whose_host_row_left_the_namespace
+    // and tests::kvm_mountinfo_config_refuses_provenance_of_another_namespace
+    // (minibeads dh-dt0n): 1167.
+    ("test.hermit_unit", 1167),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4691,7 +4694,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 4213 container-mount-table record-version, KVM table and
     // install-time mountpoint tests: 1160.
     // The same five e9patch executable-publication regressions: 1165.
-    ("test.hermit_unit_on_host", 1165),
+    // And the two dh-dt0n KVM mount-snapshot tests: 1167.
+    ("test.hermit_unit_on_host", 1167),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

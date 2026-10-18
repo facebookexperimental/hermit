@@ -10381,18 +10381,26 @@ pub(super) fn complete_container_config(
         .unwrap_or_default();
     // Each run of `--verify` is its own container, whose namespace numbers
     // its mounts afresh, so each builds its own table, from the same plan and
-    // the same host facts.
-    let table = identity_sources
-        .map(IdentityGuard::container_mount_table)
-        .transpose()?
-        .flatten();
-    config.mountinfo_mount_ids = identity_sources
-        .map(|identity| identity.mountinfo_identity_order(table.as_ref()))
-        .transpose()?
-        .unwrap_or_default();
-    config.mountinfo_mount_ids_captured = identity_sources.is_some();
+    // the same host facts. The table, the identity order and the namespace
+    // they name come from one read (`IdentityGuard::container_mount_view`),
+    // the snapshot a backend that checks its provenance keeps.
+    let view = identity_sources
+        .map(IdentityGuard::container_mount_view)
+        .transpose()?;
+    config.mountinfo_mount_ids_captured = view.is_some();
     config.mount_id_assignment_order.clear();
-    config.container_mount_table = table;
+    match view {
+        Some(view) => {
+            config.mountinfo_mount_ids = view.order;
+            config.mountinfo_mount_namespace = Some(view.namespace);
+            config.container_mount_table = view.table;
+        }
+        None => {
+            config.mountinfo_mount_ids = Vec::new();
+            config.mountinfo_mount_namespace = None;
+            config.container_mount_table = None;
+        }
+    }
     Ok(config)
 }
 

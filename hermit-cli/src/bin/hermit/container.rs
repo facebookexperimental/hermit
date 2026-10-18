@@ -41,7 +41,6 @@ use hermit::HERMIT_DEADLINE_EXIT;
 use hermit::HERMIT_LOG_CAP_EXIT;
 use hermit::SerializableError;
 use hermit::SkidOvershootError;
-use hermit::capture_mountinfo_identity_order_keeping;
 use nix::sched::CpuSet;
 use nix::sched::sched_getaffinity;
 use nix::sys::signal::SaFlags;
@@ -757,21 +756,64 @@ impl IdentityGuard {
         self.plan = MountPlan::Unrecorded;
     }
 
+    /// The container mount table ([`Self::container_mount_table_of`]) and the
+    /// namespace's identity order (the order Detcore validates guest
+    /// mountinfo views against), from ONE read of the namespace's rows, with
+    /// the namespace they were read in (`hermit::current_mount_namespace`).
+    /// Two reads need not agree: when a host process removes the directory a
+    /// host mount was on, Linux detaches the mounts on that dentry in every
+    /// mount namespace (`detach_mounts`, from `vfs_rmdir`, `vfs_unlink` and
+    /// rename), this private one included, so a copied host row can leave
+    /// between them. One read gives a table whose every row is in the order.
+    pub(super) fn container_mount_view(&self) -> Result<ContainerMountView, Error> {
+        let namespace = hermit::current_mount_namespace()?;
+        let contents = fs::read("/proc/self/mountinfo")
+            .context("Failed to read the guest mount table for its identity order")?;
+        let table = match &self.plan {
+            MountPlan::Unrecorded => None,
+            _ => {
+                let rows = detcore_model::container_mounts::parse_container_mounts(&contents)
+                    .ok_or_else(|| anyhow!("the guest mount table has a malformed row"))?;
+                self.container_mount_table_of(rows)?
+            }
+        };
+        let order = hermit::mountinfo_identity_order_keeping_from_raw(
+            &contents,
+            &table
+                .as_ref()
+                .map(ContainerMountTable::shown_mount_ids)
+                .unwrap_or_default(),
+        )
+        .context("Failed to capture guest mountinfo identity order")?;
+        if hermit::current_mount_namespace()? != namespace {
+            anyhow::bail!("the guest mount table was read across a change of mount namespace");
+        }
+        Ok(ContainerMountView {
+            table,
+            order,
+            namespace,
+        })
+    }
+
     /// The guest's container mount table
-    /// (`detcore_model::container_mounts::ContainerMountTable::select`), read
-    /// from this process's mount namespace, which must be the completed,
-    /// quiescent guest namespace (with the guest's root), after
+    /// (`detcore_model::container_mounts::ContainerMountTable::select`) over
+    /// `current`, the rows of this process's mount namespace, which must be
+    /// the completed, quiescent guest namespace (with the guest's root), after
     /// [`Self::record_plan`]. `None` where the plan has no record
     /// ([`MountPlan::Unrecorded`]).
     ///
     /// Rule 1's rows are those the installations recorded
-    /// (`detcore_model::container_mounts::owned_mounts`), a backend's own
-    /// excepted, and every row under an image root. Rule 2's are the top
-    /// mounts at the base mountpoints, proven by a descriptor held on each.
-    /// Host FUSE seed rows stay in the topology, for ancestry and for the
-    /// mount a file on one reports, and are only never shown
-    /// (`is_ephemeral_host_seed`), unless the plan installed one.
-    pub(super) fn container_mount_table(&self) -> Result<Option<ContainerMountTable>, Error> {
+    /// (`detcore_model::container_mounts::owned_mounts`, over the rows the
+    /// plan was recorded from), a backend's own excepted, and every row under
+    /// an image root. Rule 2's are the top mounts at the base mountpoints,
+    /// proven by a descriptor held on each. Host FUSE seed rows stay in the
+    /// topology, for ancestry and for the mount a file on one reports, and are
+    /// only never shown (`is_ephemeral_host_seed`), unless the plan installed
+    /// one. A row of the record that `current` no longer has is simply absent.
+    fn container_mount_table_of(
+        &self,
+        current: Vec<detcore_model::container_mounts::ContainerMount>,
+    ) -> Result<Option<ContainerMountTable>, Error> {
         let (rows, installed, backend) = match &self.plan {
             MountPlan::Unrecorded => return Ok(None),
             MountPlan::Recorded(_, _, None) => {
@@ -781,16 +823,11 @@ impl IdentityGuard {
             }
             MountPlan::Recorded(_, installations, Some(rows)) => {
                 let (installed, backend) = owned_mounts(rows, installations);
-                (std::borrow::Cow::Borrowed(rows), installed, backend)
+                (current, installed, backend)
             }
             MountPlan::ImageRoot => {
-                let rows = namespace_rows()?;
-                let installed = rows.iter().map(|row| row.raw_mount_id).collect();
-                (
-                    std::borrow::Cow::Owned(rows),
-                    installed,
-                    std::collections::BTreeSet::new(),
-                )
+                let installed = current.iter().map(|row| row.raw_mount_id).collect();
+                (current, installed, std::collections::BTreeSet::new())
             }
         };
         let never = rows
@@ -946,30 +983,28 @@ impl IdentityGuard {
 
     /// What a recording takes from the completed, quiescent recording
     /// namespace: the proven roots of Hermit's mounts
-    /// ([`Self::mountinfo_root_rewrites`]) and the guest's container mount
-    /// table ([`Self::container_mount_table`]).
+    /// ([`Self::mountinfo_root_rewrites`]), and the guest's container mount
+    /// table with the namespace's identity order, from one read
+    /// ([`Self::container_mount_view`]).
     pub(super) fn mount_provenance(&self) -> Result<hermit::MountProvenance, Error> {
+        let view = self.container_mount_view()?;
         Ok(hermit::MountProvenance {
             root_rewrites: self.mountinfo_root_rewrites()?,
-            container_mount_table: self.container_mount_table()?,
+            container_mount_table: view.table,
+            mount_ids: Some(view.order),
         })
     }
+}
 
-    /// Capture the exact raw mount-ID order used by Detcore's snapshot-local
-    /// canonicalizer. This runs in the completed, quiescent guest namespace.
-    /// A row `table` shows stays in it whatever its name
-    /// (`hermit::capture_mountinfo_identity_order_keeping`).
-    pub(super) fn mountinfo_identity_order(
-        &self,
-        table: Option<&ContainerMountTable>,
-    ) -> Result<Vec<u64>, Error> {
-        capture_mountinfo_identity_order_keeping(
-            &table
-                .map(ContainerMountTable::shown_mount_ids)
-                .unwrap_or_default(),
-        )
-        .context("Failed to capture guest mountinfo identity order")
-    }
+/// One read of a container's mount namespace
+/// ([`IdentityGuard::container_mount_view`]).
+pub(super) struct ContainerMountView {
+    /// The container mount table, if the plan was recorded.
+    pub(super) table: Option<ContainerMountTable>,
+    /// The namespace's identity order (`DetConfig::mountinfo_mount_ids`).
+    pub(super) order: Vec<u64>,
+    /// The namespace read (`DetConfig::mountinfo_mount_namespace`).
+    pub(super) namespace: (u64, u64),
 }
 
 /// Whether `mount` is a bind mount: `--mount` without a `type`, or of type

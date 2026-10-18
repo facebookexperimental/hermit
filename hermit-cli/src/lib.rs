@@ -2904,42 +2904,48 @@ fn kvm_cwd_resolution_error(requested_cwd: &Path, error: &std::io::Error) -> Err
 
 /// Bind KVM's raw mountinfo and fdinfo to the same filesystem namespace.
 ///
-/// The CLI supplies IdentityGuard provenance from the completed container.
-/// Recapture that full row/parent order before ELF installation, which snapshots
-/// the same namespace in the backend, and refuse stale producer provenance.
+/// The CLI supplies IdentityGuard provenance from the completed container: the
+/// namespace's row/parent order and the namespace it was captured in. The
+/// backend requires its own mount namespace to be that one and keeps the
+/// producer's order, the same snapshot the container mount table was built
+/// from; it does not take a second one. Two captures of one private namespace
+/// need not agree: when a host process removes the directory a host mount was
+/// on, Linux detaches the mounts on that dentry in every mount namespace
+/// (`vfs_rmdir`, `vfs_unlink` and rename call `detach_mounts`, and
+/// `__detach_mounts` in fs/namespace.c unmounts each mount on the dentry with
+/// `umount_tree`), so a copied host row can leave the container between two
+/// reads although nothing propagates into it. Such a row cannot name a file
+/// the guest can open afterwards, and later guest views stay ordered subsets
+/// of the snapshot, which Detcore's validation accepts.
 /// Library and no-namespace callers without provenance retain this capture.
-/// KVM does not permit guest namespace changes. Later guest-visible mountinfo
-/// views still use Detcore's existing ordered-subset validation.
+/// KVM does not permit guest namespace changes.
 fn prepare_kvm_mountinfo_config(
     config: &mut DetConfig,
+    namespace: impl FnOnce() -> Result<(u64, u64), Error>,
     capture: impl FnOnce() -> Result<Vec<u64>, Error>,
 ) -> Result<(), Error> {
     if !config.mountinfo_mount_ids_captured
-        && (!config.mountinfo_mount_ids.is_empty() || !config.mount_id_assignment_order.is_empty())
+        && (!config.mountinfo_mount_ids.is_empty()
+            || !config.mount_id_assignment_order.is_empty()
+            || config.mountinfo_mount_namespace.is_some())
     {
         anyhow::bail!("KVM mount identities have no producer-captured namespace");
     }
-    let order = capture().context("failed to capture the KVM backend mount namespace")?;
     if config.mountinfo_mount_ids_captured {
-        if config.mountinfo_mount_ids != order {
-            // Name the rows that differ, so that a rare mismatch says which.
-            let only_producer = config
-                .mountinfo_mount_ids
-                .iter()
-                .filter(|id| !order.contains(id))
-                .collect::<Vec<_>>();
-            let only_backend = order
-                .iter()
-                .filter(|id| !config.mountinfo_mount_ids.contains(id))
-                .collect::<Vec<_>>();
+        let Some(producer) = config.mountinfo_mount_namespace else {
             anyhow::bail!(
-                "KVM producer-captured mount identities do not match the backend namespace \
-                 ({} rows then, {} now; only then: {only_producer:?}; only now: {only_backend:?})",
-                config.mountinfo_mount_ids.len(),
-                order.len()
+                "KVM producer-captured mount identities do not name their mount namespace"
+            );
+        };
+        let backend = namespace().context("failed to identify the KVM backend mount namespace")?;
+        if producer != backend {
+            anyhow::bail!(
+                "KVM producer-captured mount identities name another mount namespace \
+                 (captured in {producer:?}, backend in {backend:?})"
             );
         }
     } else {
+        let order = capture().context("failed to capture the KVM backend mount namespace")?;
         config.mountinfo_mount_ids = order;
         config.mountinfo_mount_ids_captured = true;
     }
@@ -2996,7 +3002,7 @@ async fn run_kvm(
         .as_ref()
         .map(detcore_model::container_mounts::ContainerMountTable::shown_mount_ids)
         .unwrap_or_default();
-    prepare_kvm_mountinfo_config(&mut config, || {
+    prepare_kvm_mountinfo_config(&mut config, current_mount_namespace, || {
         capture_mountinfo_identity_order_keeping(&keep)
     })?;
     let stdin = if capture_output {
@@ -4944,6 +4950,7 @@ impl HermitData {
                 MountProvenance {
                     root_rewrites: mountinfo_root_rewrites,
                     container_mount_table: None,
+                    mount_ids: None,
                 },
                 Some(mount_ids),
                 None,
@@ -5116,6 +5123,22 @@ pub struct MountProvenance {
     /// (`detcore::Config::container_mount_table`), which the recording carries
     /// for its replay.
     pub container_mount_table: Option<detcore_model::container_mounts::ContainerMountTable>,
+    /// The namespace's identity order, read with the table
+    /// (`detcore::Config::mountinfo_mount_ids`). `None` asks the recorder to
+    /// capture it. A table and an order from two reads need not agree: a host
+    /// process that removes a host mount's directory detaches the copy of that
+    /// mount from the container too, so a row the table shows can be gone
+    /// from a later read.
+    pub mount_ids: Option<Vec<u64>>,
+}
+
+/// This process's mount namespace, as the device and inode numbers of
+/// `/proc/self/ns/mnt` (`DetConfig::mountinfo_mount_namespace`).
+pub fn current_mount_namespace() -> Result<(u64, u64), Error> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata("/proc/self/ns/mnt")
+        .context("failed to read this process's mount namespace")?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 /// Capture the current mount namespace's raw IDs in the exact row/parent order
@@ -5142,9 +5165,10 @@ fn mountinfo_identity_order_from_raw(raw: &[u8]) -> Result<Vec<u64>, Error> {
     mountinfo_identity_order_keeping_from_raw(raw, &std::collections::BTreeSet::new())
 }
 
-/// [`mountinfo_identity_order_from_raw`], keeping a seed row whose mount ID is
-/// in `keep`.
-fn mountinfo_identity_order_keeping_from_raw(
+/// The identity order of the mountinfo contents `raw` (seed rows dropped, as
+/// `mountinfo_identity_order_from_raw` drops them), keeping a seed row whose
+/// mount ID is in `keep`.
+pub fn mountinfo_identity_order_keeping_from_raw(
     raw: &[u8],
     keep: &std::collections::BTreeSet<u64>,
 ) -> Result<Vec<u64>, Error> {
@@ -5235,13 +5259,17 @@ pub fn record_to_with_mountinfo(
     let command = tracer_thread::SendCommand::new(command);
     ptrace_completion::run_on_tracer_thread(None, move |control| async move {
         let command = command.into_inner();
-        let mount_ids = capture_mountinfo_identity_order_keeping(
-            &mountinfo
-                .container_mount_table
-                .as_ref()
-                .map(detcore_model::container_mounts::ContainerMountTable::shown_mount_ids)
-                .unwrap_or_default(),
-        )?;
+        let mut mountinfo = mountinfo;
+        let mount_ids = match mountinfo.mount_ids.take() {
+            Some(mount_ids) => mount_ids,
+            None => capture_mountinfo_identity_order_keeping(
+                &mountinfo
+                    .container_mount_table
+                    .as_ref()
+                    .map(detcore_model::container_mounts::ContainerMountTable::shown_mount_ids)
+                    .unwrap_or_default(),
+            )?,
+        };
         record_to_async(
             command,
             &dir,
@@ -5329,13 +5357,17 @@ pub fn record_with_output_with_mountinfo(
     let command = tracer_thread::SendCommand::new(command);
     ptrace_completion::run_on_tracer_thread(None, move |control| async move {
         let command = command.into_inner();
-        let mount_ids = capture_mountinfo_identity_order_keeping(
-            &mountinfo
-                .container_mount_table
-                .as_ref()
-                .map(detcore_model::container_mounts::ContainerMountTable::shown_mount_ids)
-                .unwrap_or_default(),
-        )?;
+        let mut mountinfo = mountinfo;
+        let mount_ids = match mountinfo.mount_ids.take() {
+            Some(mount_ids) => mount_ids,
+            None => capture_mountinfo_identity_order_keeping(
+                &mountinfo
+                    .container_mount_table
+                    .as_ref()
+                    .map(detcore_model::container_mounts::ContainerMountTable::shown_mount_ids)
+                    .unwrap_or_default(),
+            )?,
+        };
         record_with_output_async(
             command,
             &dir,
@@ -5500,6 +5532,9 @@ mod tests {
         );
     }
 
+    /// The namespace a test's captured provenance names.
+    const NAMESPACE: (u64, u64) = (4, 4026531840);
+
     #[test]
     fn kvm_mountinfo_config_preserves_captured_provenance() {
         let rewrite = detcore_model::config::MountInfoRootRewrite {
@@ -5513,6 +5548,7 @@ mod tests {
         let mut config = DetConfig {
             mountinfo_mount_ids: vec![10, 20, 30],
             mountinfo_mount_ids_captured: true,
+            mountinfo_mount_namespace: Some(NAMESPACE),
             mount_id_assignment_order: vec![700, 701],
             mountinfo_root_rewrites: vec![rewrite],
             mountinfo_device_rewrites: vec![(libc::makedev(0, 1), libc::makedev(8, 1))],
@@ -5520,18 +5556,23 @@ mod tests {
         };
         let mut expected = config.clone();
         expected.mountinfo_device_rewrites.clear();
-        let mut captures = 0;
-        prepare_kvm_mountinfo_config(&mut config, || {
-            captures += 1;
-            mountinfo_identity_order_from(
-                b"10 30 8:1 / / rw - ext4 /dev/root rw\n\
-                  20 10 0:7 / /test rw - tmpfs tmpfs rw\n",
-            )
-        })
+        let (mut namespaces, mut captures) = (0, 0);
+        prepare_kvm_mountinfo_config(
+            &mut config,
+            || {
+                namespaces += 1;
+                Ok(NAMESPACE)
+            },
+            || {
+                captures += 1;
+                Ok(vec![10, 30])
+            },
+        )
         .unwrap();
+        assert_eq!(namespaces, 1, "the backend's namespace must be checked");
         assert_eq!(
-            captures, 1,
-            "captured provenance must be checked before any guest read"
+            captures, 0,
+            "the producer's snapshot is kept; the namespace is not read again"
         );
         assert_eq!(
             serde_json::to_value(&config).unwrap(),
@@ -5541,47 +5582,113 @@ mod tests {
 
         let mut empty = DetConfig {
             mountinfo_mount_ids_captured: true,
+            mountinfo_mount_namespace: Some(NAMESPACE),
             ..DetConfig::default()
         };
-        let mut captures = 0;
-        prepare_kvm_mountinfo_config(&mut empty, || {
-            captures += 1;
-            mountinfo_identity_order_from(b"")
-        })
+        prepare_kvm_mountinfo_config(
+            &mut empty,
+            || Ok(NAMESPACE),
+            || panic!("a captured empty snapshot is not read again"),
+        )
         .unwrap();
-        assert_eq!(captures, 1);
         assert!(empty.mountinfo_mount_ids.is_empty());
         assert!(empty.mountinfo_mount_ids_captured);
+    }
 
-        // Both captures describe the same completed namespace. An ordered
-        // subset is valid for some later guest views, but not this boundary.
-        for actual in [
-            vec![10, 20],
-            vec![10, 20, 30, 40],
-            vec![20, 10, 30],
-            vec![10, 20, 31],
-            vec![10, 20, 20, 30],
-            vec![],
+    /// A host mount copied into the container can leave it between the
+    /// producer's capture and the backend's start: Linux detaches the mounts on
+    /// a dentry in every mount namespace when a host process removes that
+    /// directory (`__detach_mounts`). The backend keeps the producer's order,
+    /// which still names the row, and does not refuse; the order Detcore later
+    /// validates guest views against is the producer's
+    /// (minibeads dh-dt0n).
+    #[test]
+    fn kvm_mountinfo_config_keeps_a_snapshot_whose_host_row_left_the_namespace() {
+        let producer = b"10 1 8:1 / / rw - ext4 /dev/root rw\n\
+                         20 10 0:22 / /proc rw - proc proc rw\n\
+                         30 10 0:50 / /data/a rw - tmpfs tmpfs rw\n";
+        let now = b"10 1 8:1 / / rw - ext4 /dev/root rw\n\
+                    20 10 0:22 / /proc rw - proc proc rw\n";
+        let order = mountinfo_identity_order_from(producer).unwrap();
+        let mut config = DetConfig {
+            mountinfo_mount_ids: order.clone(),
+            mountinfo_mount_ids_captured: true,
+            mountinfo_mount_namespace: Some(NAMESPACE),
+            ..DetConfig::default()
+        };
+        prepare_kvm_mountinfo_config(
+            &mut config,
+            || Ok(NAMESPACE),
+            || mountinfo_identity_order_from(now),
+        )
+        .unwrap();
+        assert_eq!(config.mountinfo_mount_ids, order);
+        assert_eq!(config.mountinfo_mount_ids, [10, 20, 30, 1]);
+        assert!(detcore_model::procfs::mount_ids_are_ordered_subset(
+            &mountinfo_identity_order_from(now).unwrap(),
+            &config.mountinfo_mount_ids
+        ));
+    }
+
+    #[test]
+    fn kvm_mountinfo_config_refuses_provenance_of_another_namespace() {
+        let config = DetConfig {
+            mountinfo_mount_ids: vec![10, 20, 1],
+            mountinfo_mount_ids_captured: true,
+            mountinfo_mount_namespace: Some(NAMESPACE),
+            mountinfo_device_rewrites: vec![(libc::makedev(0, 1), libc::makedev(8, 1))],
+            ..DetConfig::default()
+        };
+        for backend in [
+            (NAMESPACE.0, NAMESPACE.1 + 1),
+            (NAMESPACE.0 + 1, NAMESPACE.1),
         ] {
             let mut stale = config.clone();
-            stale.mountinfo_device_rewrites = vec![(libc::makedev(0, 1), libc::makedev(8, 1))];
             let before = serde_json::to_value(&stale).unwrap();
-            let error = prepare_kvm_mountinfo_config(&mut stale, || Ok(actual)).unwrap_err();
+            let error = prepare_kvm_mountinfo_config(
+                &mut stale,
+                || Ok(backend),
+                || panic!("captured provenance is not read again"),
+            )
+            .unwrap_err();
             assert!(
-                error
-                    .to_string()
-                    .contains("do not match the backend namespace")
+                error.to_string().contains("name another mount namespace"),
+                "{error:#}"
             );
             assert_eq!(serde_json::to_value(&stale).unwrap(), before);
         }
-        let before = serde_json::to_value(&empty).unwrap();
-        let error = prepare_kvm_mountinfo_config(&mut empty, || Ok(vec![10])).unwrap_err();
+        let mut unnamed = DetConfig {
+            mountinfo_mount_namespace: None,
+            ..config.clone()
+        };
+        let before = serde_json::to_value(&unnamed).unwrap();
+        let error = prepare_kvm_mountinfo_config(
+            &mut unnamed,
+            || panic!("provenance without a namespace is refused before any read"),
+            || panic!("provenance without a namespace is refused before any read"),
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("do not match the backend namespace")
+                .contains("do not name their mount namespace"),
+            "{error:#}"
         );
-        assert_eq!(serde_json::to_value(&empty).unwrap(), before);
+        assert_eq!(serde_json::to_value(&unnamed).unwrap(), before);
+        let mut unreadable = config;
+        let before = serde_json::to_value(&unreadable).unwrap();
+        let error = prepare_kvm_mountinfo_config(
+            &mut unreadable,
+            || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()),
+            || panic!("captured provenance is not read again"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(serde_json::to_value(&unreadable).unwrap(), before);
     }
 
     #[test]
@@ -5592,8 +5699,12 @@ mod tests {
         let mut expected = config.clone();
         expected.mountinfo_mount_ids = vec![80, 10, 20];
         expected.mountinfo_mount_ids_captured = true;
-        prepare_kvm_mountinfo_config(&mut config, || mountinfo_identity_order_from(contents))
-            .unwrap();
+        prepare_kvm_mountinfo_config(
+            &mut config,
+            || panic!("an ambient capture has no producer namespace to compare"),
+            || mountinfo_identity_order_from(contents),
+        )
+        .unwrap();
         assert_eq!(
             serde_json::to_value(&config).unwrap(),
             serde_json::to_value(&expected).unwrap(),
@@ -5617,7 +5728,12 @@ mod tests {
         ));
 
         let mut empty = DetConfig::default();
-        prepare_kvm_mountinfo_config(&mut empty, || mountinfo_identity_order_from(b"")).unwrap();
+        prepare_kvm_mountinfo_config(
+            &mut empty,
+            || panic!("an ambient capture has no producer namespace to compare"),
+            || mountinfo_identity_order_from(b""),
+        )
+        .unwrap();
         assert!(empty.mountinfo_mount_ids.is_empty());
         assert!(empty.mountinfo_mount_ids_captured);
     }
@@ -5625,56 +5741,62 @@ mod tests {
     #[test]
     fn kvm_mountinfo_config_refuses_missing_or_malformed_capture() {
         let valid = b"10 20 8:1 / / rw - ext4 /dev/root rw\n";
-        for captured in [false, true] {
-            let config = DetConfig {
-                mountinfo_mount_ids: if captured { vec![10, 20] } else { vec![] },
-                mountinfo_mount_ids_captured: captured,
-                mount_id_assignment_order: if captured { vec![700, 701] } else { vec![] },
-                mountinfo_device_rewrites: vec![(libc::makedev(0, 1), libc::makedev(8, 1))],
-                ..DetConfig::default()
-            };
-            for contents in [
-                b"malformed".as_slice(),
-                b"10 20 8:1 / / rw - ext4 /dev/root rw\n10 20 8:1 / / rw - ext4 /dev/root rw\n",
-                b"10 20 8:1 / / rw unknown:7 - ext4 /dev/root rw\n",
-            ] {
-                let mut candidate = config.clone();
-                let before = serde_json::to_value(&candidate).unwrap();
-                let error = prepare_kvm_mountinfo_config(&mut candidate, || {
-                    mountinfo_identity_order_from(contents)
-                })
-                .unwrap_err();
-                assert!(format!("{error:#}").contains("malformed /proc/self/mountinfo"));
-                assert_eq!(serde_json::to_value(&candidate).unwrap(), before);
-            }
-            let mut candidate = config;
+        let config = DetConfig {
+            mountinfo_device_rewrites: vec![(libc::makedev(0, 1), libc::makedev(8, 1))],
+            ..DetConfig::default()
+        };
+        for contents in [
+            b"malformed".as_slice(),
+            b"10 20 8:1 / / rw - ext4 /dev/root rw\n10 20 8:1 / / rw - ext4 /dev/root rw\n",
+            b"10 20 8:1 / / rw unknown:7 - ext4 /dev/root rw\n",
+        ] {
+            let mut candidate = config.clone();
             let before = serde_json::to_value(&candidate).unwrap();
-            let error = prepare_kvm_mountinfo_config(&mut candidate, || {
-                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
-            })
+            let error = prepare_kvm_mountinfo_config(
+                &mut candidate,
+                || panic!("an ambient capture has no producer namespace to compare"),
+                || mountinfo_identity_order_from(contents),
+            )
             .unwrap_err();
-            assert!(
-                error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
-            );
+            assert!(format!("{error:#}").contains("malformed /proc/self/mountinfo"));
             assert_eq!(serde_json::to_value(&candidate).unwrap(), before);
         }
+        let mut candidate = config;
+        let before = serde_json::to_value(&candidate).unwrap();
+        let error = prepare_kvm_mountinfo_config(
+            &mut candidate,
+            || panic!("an ambient capture has no producer namespace to compare"),
+            || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(serde_json::to_value(&candidate).unwrap(), before);
         assert_eq!(mountinfo_identity_order_from(valid).unwrap(), [10, 20]);
     }
 
     #[test]
     fn kvm_mountinfo_config_refuses_uncaptured_provenance_vectors() {
-        for (listed, assigned) in [(vec![10], vec![]), (vec![], vec![700])] {
+        for (listed, assigned, namespace) in [
+            (vec![10], vec![], None),
+            (vec![], vec![700], None),
+            (vec![], vec![], Some(NAMESPACE)),
+        ] {
             let mut config = DetConfig {
                 mountinfo_mount_ids: listed,
                 mount_id_assignment_order: assigned,
+                mountinfo_mount_namespace: namespace,
                 ..DetConfig::default()
             };
             let before = serde_json::to_value(&config).unwrap();
-            let error = prepare_kvm_mountinfo_config(&mut config, || {
-                panic!("must not overwrite incomplete provenance")
-            })
+            let error = prepare_kvm_mountinfo_config(
+                &mut config,
+                || panic!("must not overwrite incomplete provenance"),
+                || panic!("must not overwrite incomplete provenance"),
+            )
             .unwrap_err();
             assert!(error.to_string().contains("no producer-captured namespace"));
             assert_eq!(serde_json::to_value(&config).unwrap(), before);
@@ -5701,13 +5823,16 @@ mod tests {
         let config = |table| DetConfig {
             mountinfo_mount_ids: vec![10, 20, 1],
             mountinfo_mount_ids_captured: true,
+            mountinfo_mount_namespace: Some(NAMESPACE),
             container_mount_table: Some(table),
             ..DetConfig::default()
         };
+        let snapshot = || -> Result<Vec<u64>, Error> { panic!("the snapshot is kept") };
         let mut matching = config(table(&[20]));
-        prepare_kvm_mountinfo_config(&mut matching, || Ok(vec![10, 20, 1])).unwrap();
+        prepare_kvm_mountinfo_config(&mut matching, || Ok(NAMESPACE), snapshot).unwrap();
         let mut stale = config(table(&[40]));
-        let error = prepare_kvm_mountinfo_config(&mut stale, || Ok(vec![10, 20, 1])).unwrap_err();
+        let error =
+            prepare_kvm_mountinfo_config(&mut stale, || Ok(NAMESPACE), snapshot).unwrap_err();
         assert!(error.to_string().contains("names mount 40"), "{error:#}");
     }
 

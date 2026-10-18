@@ -974,6 +974,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         mountinfo_device_rewrites: Vec::new(),
         mountinfo_mount_ids: Vec::new(),
         mountinfo_mount_ids_captured: false,
+        mountinfo_mount_namespace: None,
         mount_id_assignment_order: Vec::new(),
         // The recorder and the replayer set the table from the recording.
         container_mount_table: None,

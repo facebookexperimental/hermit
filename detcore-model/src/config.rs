@@ -391,6 +391,18 @@ pub struct Config {
     #[clap(skip)]
     pub mountinfo_mount_ids_captured: bool,
 
+    /// The mount namespace `mountinfo_mount_ids` was captured in, as the
+    /// device and inode numbers of the producer's `/proc/self/ns/mnt`. A
+    /// backend that checks its provenance (KVM) requires its own namespace to
+    /// be this one, instead of recapturing the namespace's rows: a host can
+    /// detach a copied host mount from a private namespace at any time by
+    /// removing that mount's directory, so two captures of one namespace need
+    /// not agree. `None` when nothing was captured, and in recordings.
+    /// Runtime provenance, not a user option.
+    #[serde(default)]
+    #[clap(skip)]
+    pub mountinfo_mount_namespace: Option<(u64, u64)>,
+
     /// Raw mount IDs in the order Detcore numbered them for the guest.
     ///
     /// Detcore numbers a raw mount ID when the guest first observes it through
@@ -2419,7 +2431,9 @@ mod legacy_backend_json {
     /// legacy form before the container exists, so it has no table to write;
     /// it is never written and reads as absent. The coordinated startup's
     /// typed configuration carries the table.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 16] = [
+    /// `mountinfo_mount_namespace` too, for the same reason: it is never
+    /// written and reads as absent.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 17] = [
         "backend",
         "record_host_inputs",
         "guest_may_inherit_a_terminal",
@@ -2436,6 +2450,7 @@ mod legacy_backend_json {
         "cpu_profile_host",
         "signal_state_copy",
         "container_mount_table",
+        "mountinfo_mount_namespace",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -2579,7 +2594,8 @@ mod legacy_backend_json {
                     | "launch_image"
                     | "scheduler_turn_cost"
                     | "pipe_wake_latency"
-                    | "container_mount_table",
+                    | "container_mount_table"
+                    | "mountinfo_mount_namespace",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
@@ -2857,7 +2873,8 @@ mod legacy_backend_json {
                 | "cpu_profile"
                 | "cpu_profile_host"
                 | "signal_state_copy"
-                | "container_mount_table" => Ok(()),
+                | "container_mount_table"
+                | "mountinfo_mount_namespace" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -3505,7 +3522,8 @@ mod tests {
                 | "cpu_profile"
                 | "cpu_profile_host"
                 | "signal_state_copy"
-                | "container_mount_table" => {}
+                | "container_mount_table"
+                | "mountinfo_mount_namespace" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -3521,10 +3539,11 @@ mod tests {
         // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
         // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
         // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`,
-        // `signal_state_copy` and `container_mount_table` none: fourteen more
-        // keys, and fifteen fewer.
+        // `signal_state_copy`, `container_mount_table` and
+        // `mountinfo_mount_namespace` none: fourteen more keys, and sixteen
+        // fewer.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 1);
+        assert_eq!(fields.len(), keys.len() + 2);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -4360,6 +4379,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("container_mount_table");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("mountinfo_mount_namespace");
         let restored: Config = serde_json::from_value(value).unwrap();
         assert!(restored.mountinfo_root_rewrites.is_empty());
         assert!(restored.mountinfo_device_rewrites.is_empty());
@@ -4367,6 +4390,7 @@ mod tests {
         assert!(!restored.mountinfo_mount_ids_captured);
         assert!(restored.mount_id_assignment_order.is_empty());
         assert!(restored.container_mount_table.is_none());
+        assert!(restored.mountinfo_mount_namespace.is_none());
     }
 
     #[test]
