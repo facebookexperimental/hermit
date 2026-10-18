@@ -88,8 +88,10 @@ const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | l
 /// asks this runtime, which answers from Detcore. Version 11 preserves the
 /// controller-capture callback at offset 56 and appends private-memory facts
 /// at offset 64. The incompatible historical version-10 tables are refused.
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 11;
-const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 72;
+/// Version 12 appends optional internal branch facts at offset72.
+/// Installing the callback does not enable instrumentation or shared time.
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 12;
+const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 80;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the inherited DBT report descriptor.
@@ -123,6 +125,7 @@ fn upgrade_runtime_callbacks_v1(
         compare_exchange_u32: unsupported_compare_exchange,
         controller_capture_control: unsupported_controller_capture,
         runtime_private_memory: unavailable_private_memory,
+        branch_fact: unavailable_branch_fact,
     }
 }
 
@@ -157,6 +160,18 @@ unsafe extern "C" fn unavailable_private_memory(
 ) -> i32 {
     if !output.is_null() {
         // SAFETY: the callback contract supplies writable fixed-size storage.
+        unsafe { output.write(Default::default()) };
+    }
+    0
+}
+
+/// Legacy startup has no optional branch observation transport.
+unsafe extern "C" fn unavailable_branch_fact(
+    _context: usize,
+    output: *mut reverie_dbt::NativeBranchFact,
+) -> i32 {
+    if !output.is_null() {
+        // SAFETY: the native callback contract supplies fixed writable storage.
         unsafe { output.write(Default::default()) };
     }
     0
@@ -1282,6 +1297,7 @@ unsafe fn runtime_background_init(
     reverie_dbt::install_controller_capture_control(callbacks.controller_capture_control);
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
     reverie_dbt::install_runtime_private_memory(callbacks.runtime_private_memory);
+    reverie_dbt::install_branch_fact_query(callbacks.branch_fact);
     let (emit_diagnostic, emit_evidence, protected_level) = runtime_callback_channels(callbacks);
     let _ = DBT_DIAGNOSTIC_EMITTER.set(emit_diagnostic);
     DBT_EVIDENCE_LOG_LEVEL.store(protected_level, Ordering::Release);
@@ -3472,8 +3488,13 @@ mod tests {
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 11);
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE, 72);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 12);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE, 80);
+        assert_eq!(
+            std::mem::offset_of!(reverie_dbt::DbtRuntimeCallbacks, branch_fact),
+            72
+        );
+        assert_eq!(std::mem::size_of::<reverie_dbt::NativeBranchFact>(), 48);
         assert_eq!(
             std::mem::offset_of!(reverie_dbt::DbtRuntimeCallbacks, controller_capture_control),
             56,
@@ -3569,6 +3590,11 @@ mod tests {
             0,
         );
         assert_eq!(private, reverie_dbt::NativePrivateMemorySnapshot::default());
+        let mut branch = reverie_dbt::NativeBranchFact::default();
+        // SAFETY: the record has only integer fields and remains writable.
+        unsafe { std::ptr::write_bytes(&mut branch, 0xa5, 1) };
+        assert_eq!(unsafe { (current.branch_fact)(0, &mut branch) }, 0);
+        assert_eq!(branch, reverie_dbt::NativeBranchFact::default());
     }
 
     #[test]
@@ -3584,6 +3610,7 @@ mod tests {
             compare_exchange_u32: unsupported_compare_exchange,
             controller_capture_control: unsupported_controller_capture,
             runtime_private_memory: unavailable_private_memory,
+            branch_fact: unavailable_branch_fact,
         };
         let (diagnostic, evidence, level) = runtime_callback_channels(&callbacks);
 

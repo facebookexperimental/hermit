@@ -2230,8 +2230,35 @@ fi
 # git diff is empty under reverie-dbt/ (DBT inventory 973), and the root
 # Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged. All SDK
 # inputs, calibrated budget, job width and limits are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 63934937463458de93d43ed08038d256ae799c64 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 63934937463458de93d43ed08038d256ae799c64 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 2df22d5eb00ebfcf5fdecee67bbebbb1239d7081 (2026-10-18): from
+# 6bdd0533a38f68a5742b361df656e32b2237d78a. Default-off internal original-conditional facts
+# append ABI12/80, checked task births, and native cache-abandonment/guarded-return
+# support. Fourteen maintained source/test files are added (inventory973 -> 987).
+# Vendor/native inputs changed; neither the old SDK37 nor SDK497 is reused as
+# the candidate recipe. Fresh SDK MISS
+# a15e54f33b6693b6796540d3179389e897c30d7ee370a6bbf158c93fc5e6bc93 measured36.65s with7
+# available jobs (NUM_JOBS=8),256.52 job-seconds, below default native ratchet572.
+# This is one qualified source07 sample, not a recalibration campaign. The
+# existing portable1050 effective-job-second budget, jobs, limits and selections
+# stay unchanged. Collection is default off; shared clock/timer policy is unchanged.
+# CARRY TO 3a17e3d04777f8cfee445ddac285ae0815f0f9d9 (2026-10-19): replay the exact
+# 2df22d5e owned change onto published db0d0d92037af0a359589a301d41768eb26aa490.
+# The full reverie-dbt tree equals 2df22d5e (inventory987), including SDK/native
+# inputs. The a15e sample above remains the original measured sample, not a new
+# build measurement. Incoming ptrace/safeptrace changes do not alter that recipe.
+# CARRY TO 64f05984c8da7f9de8c7433e18a8214d69277d9a (2026-10-19): replay the same owned fact
+# change onto published 9ded00ff4ab82e48368e0113f65e954d3533bc3f. The DBT
+# tree and SDK/native inputs equal 3a17e3d (inventory987). The incoming
+# inguest/loader lock changes do not alter the locked DBT dependency closure.
+# The a15e timing above remains its original sample, not a fresh measurement.
+# CARRY TO 99def63a0dd7be7e994857709d4ecb403eb100d6 (2026-10-19): replay the same owned change
+# from 64f05984c8da7f9de8c7433e18a8214d69277d9a onto the K3b stack rooted at
+# published 63934937463458de93d43ed08038d256ae799c64. The owned DBT
+# tree and SDK/native recipe inputs are identical (inventory987).
+# Preserve the incoming K3b carry and the original a15e measurement above;
+# this source equality is not a new build or runtime-package receipt.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 99def63a0dd7be7e994857709d4ecb403eb100d6 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 99def63a0dd7be7e994857709d4ecb403eb100d6 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
