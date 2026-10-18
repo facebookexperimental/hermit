@@ -2685,11 +2685,12 @@ pub unsafe extern "C" fn reverie_dbt_runtime_cpuid(
 /// - A realtime signal (32 to 64): `reverie_dbt`'s signal runner names
 ///   signals with nix's `Signal`, which has no realtime numbers, and refuses
 ///   them.
-/// - A `SIGCHLD`, while the backend does not report child-exit publication
-///   (`BackendCapabilities::reports_child_exit_publication`). Detcore then
-///   cannot match the kernel's copy to the scheduler's own, so its turn would
-///   come at the host-timed point the kernel sent it, and a guest that forks
-///   would no longer verify (`determinism-stress-c/fork-tree`).
+/// - A `SIGCHLD`, while the backend's capabilities do not say the kernel's
+///   own child-exit copy reaches the Tool
+///   (`BackendCapabilities::reports_kernel_child_exit_signals`, false for DBT).
+///   Detcore then cannot match the kernel's copy to the scheduler's own, so its
+///   turn would come at the host-timed point the kernel sent it, and a guest
+///   that forks would no longer verify (`determinism-stress-c/fork-tree`).
 ///
 /// # Safety
 ///
@@ -2719,7 +2720,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_signal_event(
     let event = unsafe { &mut *event };
     let runtime = current_runtime();
     let bypasses_tool = match Signal::try_from(event.signal) {
-        Ok(Signal::SIGCHLD) => !runtime.config.backend.reports_child_exit_publication,
+        Ok(Signal::SIGCHLD) => !runtime.config.backend.reports_kernel_child_exit_signals,
         Ok(_) => false,
         Err(_) if (libc::SIGRTMIN()..=libc::SIGRTMAX()).contains(&event.signal) => true,
         Err(_) => return -1,

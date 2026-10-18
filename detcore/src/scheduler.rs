@@ -5024,6 +5024,9 @@ impl Scheduler {
             // A dying process discards its pending signals.
             self.pending_real_time_expirations.remove(detpid);
             self.child_exit_sigchld.forget_process(*detpid);
+            if !self.backend.reports_child_exit_publication {
+                self.child_exit_sigchld.forget_parent(*detpid);
+            }
             self.discarded_at_send
                 .retire(discarded_at_send::QueueId::Process(*detpid));
             self.posix_timer_arm_generations
@@ -12862,7 +12865,8 @@ impl Scheduler {
                             // two delivered stands for the exit, the other is
                             // dropped, and the scheduler's gets Linux's siginfo
                             // (`child_exit_sigchld`).
-                            if self.backend.reports_child_exit_publication && ends_named_process {
+                            if self.backend.reports_kernel_child_exit_signals && ends_named_process
+                            {
                                 self.child_exit_sigchld.own(parent, *process);
                             }
                             self.blocked.timed_waiters.insert_child_exit(
@@ -28192,6 +28196,7 @@ mod test {
     ) -> (Scheduler, DetPid, DetPid) {
         let config = Config::default().with_backend(|backend| {
             backend.reports_child_exit_publication = reports_publication;
+            backend.reports_kernel_child_exit_signals = reports_publication;
         });
         let mut scheduler = Scheduler::new(&config);
         let parent = DetPid::from_raw(100);
@@ -28312,6 +28317,176 @@ mod test {
         );
         assert!(scheduler.set_saved_guest_sigmask(parent, Option::None));
         assert!(!scheduler.set_saved_guest_sigmask(DetPid::from_raw(999), Some(0)));
+    }
+
+    /// The raw siginfo of a `SIGCHLD` with `si_code` `code` and `si_pid` `pid`.
+    fn sigchld_info(code: i32, pid: i32) -> [u8; 128] {
+        let mut info = [0; 128];
+        info[0..4].copy_from_slice(&libc::SIGCHLD.to_ne_bytes());
+        info[8..12].copy_from_slice(&code.to_ne_bytes());
+        info[16..20].copy_from_slice(&pid.to_ne_bytes());
+        info
+    }
+
+    /// The child-exit ledger delivers one SIGCHLD per exit wherever the
+    /// kernel's own copy reaches the tool with its siginfo
+    /// (`reports_kernel_child_exit_signals`), in every order the two copies of
+    /// one child's exit can be taken: the first taken stands for the exit, and
+    /// the other is dropped; when they merged in the kernel's queue, the one
+    /// taken is delivered. The scheduler, which sends its own copies, tells
+    /// them from the kernel's by their siginfo
+    /// (`ChildExitSigchldControl::Taken`). Without publication reports (SaBRe)
+    /// a kept kernel copy is delivered with the ledger's siginfo, never with
+    /// the host's CPU times. The parent's death forgets what a merge left.
+    /// Without the capability the grant owns nothing and both copies are kept,
+    /// as before.
+    #[test]
+    fn the_first_child_exit_sigchld_taken_stands_for_the_exit_without_publication() {
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
+        use crate::scheduler::child_exit_sigchld::ChildExitSiginfo;
+        use crate::scheduler::child_exit_sigchld::OwnCopy;
+        use crate::scheduler::child_exit_sigchld::TimerSend;
+        use crate::scheduler::child_exit_sigchld::taken_control;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Order {
+            KernelBeforeTimer,
+            KernelAfterTimer,
+            SchedulersFirst,
+            Merged,
+        }
+        let kernel = sigchld_info(libc::CLD_EXITED, 200);
+        let own = sigchld_info(libc::SI_USER, std::process::id() as i32);
+        // (publication, kernel copies reach the tool)
+        for (publication, kernel_signals) in [(false, true), (true, true), (false, false)] {
+            for order in [
+                Order::KernelBeforeTimer,
+                Order::KernelAfterTimer,
+                Order::SchedulersFirst,
+                Order::Merged,
+            ] {
+                let case =
+                    format!("publication={publication} kernel_signals={kernel_signals} {order:?}");
+                let (mut scheduler, parent, child) =
+                    child_exit_fixture(publication, libc::SIGCHLD, Some("read"), Option::None);
+                scheduler.backend.reports_kernel_child_exit_signals = kernel_signals;
+                let status = ChildExitSigchldControl::ExitStatus {
+                    code: libc::CLD_EXITED,
+                    status: 7,
+                    uid: 0,
+                };
+                assert_eq!(
+                    scheduler.child_exit_sigchld_control(child, status),
+                    ChildExitSigchldAnswer::Recorded,
+                    "{case}"
+                );
+                grant_group_exit(&mut scheduler, child);
+                assert!(child_exit_timer_armed(&scheduler, child), "{case}");
+                let take = |scheduler: &mut Scheduler, info: &[u8; 128]| {
+                    scheduler
+                        .child_exit_sigchld_control_for_receiver(parent, taken_control(info, true))
+                };
+                // A kept kernel copy: delivered as it is where publication is
+                // reported, and with the ledger's siginfo (no host CPU times)
+                // where it is not.
+                let kept = if publication {
+                    ChildExitSigchldAnswer::Claimed(false)
+                } else {
+                    ChildExitSigchldAnswer::ClaimedFor(ChildExitSiginfo {
+                        code: libc::CLD_EXITED,
+                        pid: 200,
+                        uid: 0,
+                        status: 7,
+                    })
+                };
+                let delivered_own = |answer| match answer {
+                    ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(info)) => {
+                        Some((info.code, info.pid, info.status))
+                    }
+                    _ => Option::None,
+                };
+                if !kernel_signals {
+                    assert_eq!(
+                        take(&mut scheduler, &kernel),
+                        ChildExitSigchldAnswer::Claimed(false),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        scheduler.child_exit_sigchld.timer(parent, child),
+                        Option::None,
+                        "{case}"
+                    );
+                    assert_eq!(
+                        take(&mut scheduler, &own),
+                        ChildExitSigchldAnswer::OwnCopy(OwnCopy::Unowned),
+                        "{case}"
+                    );
+                    continue;
+                }
+                match order {
+                    Order::KernelBeforeTimer => {
+                        // The kernel's copy is delivered (with the ledger's
+                        // siginfo where publication is not reported); the
+                        // timer then sends nothing.
+                        assert_eq!(take(&mut scheduler, &kernel), kept.clone(), "{case}");
+                        assert_eq!(
+                            scheduler.child_exit_sigchld.timer(parent, child),
+                            Some(TimerSend::Nothing),
+                            "{case}"
+                        );
+                    }
+                    Order::KernelAfterTimer => {
+                        assert_eq!(
+                            scheduler.child_exit_sigchld.timer(parent, child),
+                            Some(TimerSend::Send),
+                            "{case}"
+                        );
+                        assert_eq!(take(&mut scheduler, &kernel), kept.clone(), "{case}");
+                        assert_eq!(
+                            take(&mut scheduler, &own),
+                            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate),
+                            "{case}"
+                        );
+                    }
+                    Order::SchedulersFirst => {
+                        assert_eq!(
+                            scheduler.child_exit_sigchld.timer(parent, child),
+                            Some(TimerSend::Send),
+                            "{case}"
+                        );
+                        assert_eq!(
+                            delivered_own(take(&mut scheduler, &own)),
+                            Some((libc::CLD_EXITED, 200, 7)),
+                            "{case}"
+                        );
+                        assert_eq!(
+                            take(&mut scheduler, &kernel),
+                            ChildExitSigchldAnswer::Claimed(true),
+                            "{case}"
+                        );
+                    }
+                    Order::Merged => {
+                        // The scheduler's copy merged into the kernel's, which
+                        // was queued first: one SIGCHLD, with the kernel's
+                        // siginfo, and no second callback.
+                        assert_eq!(
+                            scheduler.child_exit_sigchld.timer(parent, child),
+                            Some(TimerSend::Send),
+                            "{case}"
+                        );
+                        assert_eq!(take(&mut scheduler, &kernel), kept.clone(), "{case}");
+                        // What the merge left is forgotten with the parent.
+                        scheduler.child_exit_sigchld.forget_parent(parent);
+                        assert_eq!(
+                            take(&mut scheduler, &own),
+                            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Unowned),
+                            "{case}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn child_exit_timer_armed(scheduler: &Scheduler, child: DetPid) -> bool {

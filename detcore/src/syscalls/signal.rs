@@ -3027,7 +3027,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             commit_sigkill(guest, reservation.token, result.is_ok()).await;
             return Ok(result?);
         }
-        if self.cfg.backend.reports_child_exit_publication {
+        if self.cfg.backend.reports_kernel_child_exit_signals {
             let uid = crate::syscalls::real_uid(guest.tid().as_raw())
                 .unwrap_or_else(|| unsafe { libc::getuid() });
             crate::tool_global::child_exit_sigchld(

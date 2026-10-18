@@ -2240,6 +2240,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/sigchld_once.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/sigchld_once.c is owned by hermit-cli/tests/cli.rs: the CLI test each_child_exit_gives_its_parent_one_sigchld runs it natively and at bitwise parity on ptrace and SaBRe, and requires one child exit to give its parent exactly one SIGCHLD with Linux's siginfo (CLD_EXITED, the child's pid and exit status). SaBRe delivered two, the scheduler's copy and the kernel's, the second at a host-timed point (dev-hermit minibeads dh-l1fk). It stays a fixture because a generic manifest cannot assert the guest's own SIGCHLD count and siginfo."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/sigchld_once_per_child_exit.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/sigchld_once_per_child_exit.c is owned by hermit-cli/tests/cli.rs: a child's exit must notify its parent with exactly one SIGCHLD carrying Linux's siginfo (CLD_EXITED, the child's pid, its status), although both the kernel and the scheduler send one (https://github.com/rrnewton/hermit/issues/3895); the integration test runs its exit-group and raw-exit modes under run --strict --verify --verify-strict, with default timeslices and with --max-timeslice=disabled. It remains a fixture because no generic manifest mode runs only one of its modes."

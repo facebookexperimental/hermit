@@ -1034,7 +1034,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.normalize_reported_itimer_real(guest).await;
             }
             if signal.signal() == Some(Signal::SIGCHLD)
-                && self.cfg.backend.reports_child_exit_publication
+                && self.cfg.backend.reports_kernel_child_exit_signals
                 && !self.child_exit_sigchld_delivers(guest).await
             {
                 // A claimed copy that is dropped has no delivery to place, but
@@ -1380,11 +1380,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return true;
         };
         // A delivery stop: a kept copy's `InboundSignal` request follows.
-        let Some(control) =
-            scheduler::child_exit_sigchld::control_for(&info, std::process::id(), true)
-        else {
-            return true;
-        };
+        let control = scheduler::child_exit_sigchld::taken_control(&info, true);
         match tool_global::child_exit_sigchld(guest, control).await {
             ChildExitSigchldAnswer::Claimed(dropped) => !dropped,
             ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate) => false,
@@ -2656,7 +2652,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 return false;
             }
             if unreported.signal() != Some(Signal::SIGCHLD)
-                || !self.cfg.backend.reports_child_exit_publication
+                || !self.cfg.backend.reports_kernel_child_exit_signals
             {
                 return true;
             }

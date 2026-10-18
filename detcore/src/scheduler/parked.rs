@@ -745,7 +745,16 @@ impl Scheduler {
                     super::child_exit_sigchld::ChildExitSend::NotOwned => {
                         self.fire_child_exit_alarm(parent, tid, None)
                     }
-                    super::child_exit_sigchld::ChildExitSend::Nothing => None,
+                    super::child_exit_sigchld::ChildExitSend::Nothing => {
+                        // No copy will take the process's mark set above.
+                        // Without publication, nothing would clear it before a
+                        // later, host-timed SIGCHLD delivery to the leader took
+                        // it and skipped its deferral.
+                        if leader_marked && !self.backend.reports_child_exit_publication {
+                            self.blocked.sigchld_ready.remove(&parent);
+                        }
+                        None
+                    }
                     super::child_exit_sigchld::ChildExitSend::Sent(receiver) => receiver,
                 };
                 // A receiver armed for the release barrier carries its own
@@ -768,7 +777,21 @@ impl Scheduler {
             } else if let SignalTimerId::Alarm(process) = id {
                 self.fire_itimer_real(deadline, process, tid, signal);
             } else {
-                self.fire_alarm(id.process(), tid, signal);
+                // Without publication reports, a timer dispatched here (an empty
+                // run queue's wake) takes the child-exit ledger's decision too:
+                // it records the scheduler's send, or sends nothing where the
+                // kernel's copy was delivered first.
+                let nothing_to_send = !self.backend.reports_child_exit_publication
+                    && match id {
+                        SignalTimerId::ChildExit { child, parent } => {
+                            self.child_exit_sigchld.timer(parent, child)
+                                == Some(super::child_exit_sigchld::TimerSend::Nothing)
+                        }
+                        _ => false,
+                    };
+                if !nothing_to_send {
+                    self.fire_alarm(id.process(), tid, signal);
+                }
             }
         }
     }
@@ -958,11 +981,13 @@ impl Scheduler {
         creator: DetTid,
     ) -> Option<DetTid> {
         if !self.models_signal_targets {
-            return self
-                .blocked
-                .sigchld_deferred
-                .contains(&process)
-                .then_some(process);
+            // A delivery the child-exit ledger matched to another child's exit
+            // stands for that one (`ChildExitSigchldLedger::attributed`),
+            // where publication is not reported (with it, as before).
+            return (self.blocked.sigchld_deferred.contains(&process)
+                && (self.backend.reports_child_exit_publication
+                    || !self.child_exit_sigchld.attributed.contains(&process)))
+            .then_some(process);
         }
         // A delivery the child-exit ledger matched to another child's exit
         // stands for that one, not this (`ChildExitSigchldLedger::attributed`).

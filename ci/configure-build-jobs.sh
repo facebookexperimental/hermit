@@ -2153,8 +2153,17 @@ fi
 # reverie-dbt file is added or removed (inventory 966), and the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml are unchanged. SDK and native inputs,
 # calibrated budget, job width and limits are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 3d4461d7af7a2895130b020c36411fc3fc81a287 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 3d4461d7af7a2895130b020c36411fc3fc81a287 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO c58a4137af163e3ebb35b41b3c48e478daeb0fcf (2026-10-18): from
+# 3d4461d7af7a2895130b020c36411fc3fc81a287. Two commits: c57b7a90 (reverie-ptrace keeps the
+# guest's SIGTRAP action and mask across Reverie's single-steps for a Tool that
+# declares serialized execution; reverie/src/tool.rs gains the default-false
+# enforces_serialized_execution) and c58a4137 (reverie-sabre gives the tool each
+# signal's siginfo and honours its answer; BackendCapabilities gains
+# reports_kernel_child_exit_signals). git diff is empty under reverie-dbt/ and for
+# the root Cargo.toml, Cargo.lock and rust-toolchain.toml, so the inventory (968),
+# SDK and native inputs, calibrated budget, job width and limits are unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c58a4137af163e3ebb35b41b3c48e478daeb0fcf ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c58a4137af163e3ebb35b41b3c48e478daeb0fcf (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

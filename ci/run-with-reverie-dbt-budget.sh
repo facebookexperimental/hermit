@@ -2077,7 +2077,16 @@ fi
 # Actual producer: R38-based JECXZ source43df98d4, jecxz-cargo-r2 under
 # dbt-continuous-clock-main09ec59c4-20261018; restacked SDK inputs byte-identical.
 # Tracked DBT inventory is 968 after the two new JECXZ regression files.
-expected_pin=3d4461d7af7a2895130b020c36411fc3fc81a287
+# CARRY TO c58a4137af163e3ebb35b41b3c48e478daeb0fcf (2026-10-18): from
+# 3d4461d7af7a2895130b020c36411fc3fc81a287. Two commits: c57b7a90 (reverie-ptrace keeps the
+# guest's SIGTRAP action and mask across Reverie's single-steps for a Tool that
+# declares serialized execution; reverie/src/tool.rs gains the default-false
+# enforces_serialized_execution) and c58a4137 (reverie-sabre gives the tool each
+# signal's siginfo and honours its answer; BackendCapabilities gains
+# reports_kernel_child_exit_signals). git diff is empty under reverie-dbt/ and for
+# the root Cargo.toml, Cargo.lock and rust-toolchain.toml, so the inventory (968),
+# SDK and native inputs, calibrated budget, job width and limits are unchanged.
+expected_pin=c58a4137af163e3ebb35b41b3c48e478daeb0fcf
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

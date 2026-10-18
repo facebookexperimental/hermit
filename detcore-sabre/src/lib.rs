@@ -543,7 +543,8 @@ impl reverie_sabre::Tool for Plugin {
         self.handle_vdso(Sysno::time, SyscallArgs::new(tloc as usize, 0, 0, 0, 0, 0))
     }
 
-    /// Tell Detcore a signal arrived, before the guest's handler runs.
+    /// Tell Detcore a signal arrived, with the siginfo the kernel delivered,
+    /// before the guest's handler runs, and apply its answer.
     ///
     /// Reverie's central handler delivers the signal, but nothing forwarded
     /// that fact to the tool: this method was the default empty one, and the
@@ -553,25 +554,27 @@ impl reverie_sabre::Tool for Plugin {
     /// (`detcore/src/lib.rs:1228`), and under this backend its model of the
     /// guest simply had no signals in it.
     ///
-    /// Detcore answers with the signal to deliver, or `None` to suppress it.
-    /// Suppression is not actionable from here -- Reverie's central handler has
-    /// already committed to running the guest action by the time it calls this
-    /// -- so a suppressed or failed forward is reported rather than dropped.
-    fn handle_signal_event(&self, signal: i32) {
+    /// Detcore answers with the signal to deliver, possibly with a rewritten
+    /// siginfo (`Guest::set_signal_info`), or `None` to suppress it: the
+    /// kernel's own copy of a child-exit `SIGCHLD` whose exit Detcore's
+    /// scheduler notifies itself is suppressed, so the guest gets one `SIGCHLD`
+    /// per child exit (`scheduler::child_exit_sigchld`). A suppressed signal's
+    /// guest action does not run. A failed forward delivers the signal as the
+    /// kernel gave it, and is reported.
+    fn handle_signal_event_with_info(&self, signal: i32, info: &mut libc::siginfo_t) -> bool {
         let Ok(signal) = Signal::try_from(signal) else {
-            return;
+            return true;
         };
-        match self.adapter.handle_signal(signal) {
-            Ok(Some(_)) => {}
-            Ok(None) => sabre::eprintln!(
-                "detcore-sabre: Detcore suppressed signal {}, but Reverie's central handler has already committed to the guest action",
-                signal
-            ),
-            Err(error) => sabre::eprintln!(
-                "detcore-sabre: forwarding signal {} to Detcore failed: {}",
-                signal,
-                error
-            ),
+        match self.adapter.handle_signal_with_info(signal, info) {
+            Ok(delivered) => delivered.is_some(),
+            Err(error) => {
+                sabre::eprintln!(
+                    "detcore-sabre: forwarding signal {} to Detcore failed: {}",
+                    signal,
+                    error
+                );
+                true
+            }
         }
     }
 

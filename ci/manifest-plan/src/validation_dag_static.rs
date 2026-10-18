@@ -2534,7 +2534,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4213, K3a): 2084.
     // And a_signal_to_an_already_woken_poll_keeps_its_place_in_the_run_queue
     // (https://github.com/rrnewton/hermit/issues/4504): 2085, freshly listed.
-    ("test.detcore_unit", 2085),
+    // And the_first_child_exit_sigchld_taken_stands_for_the_exit_without_publication
+    // (dev-hermit minibeads dh-l1fk): 2086.
+    ("test.detcore_unit", 2086),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3628,7 +3630,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the DBT captured-stderr/controller-diagnostics regression: 539, listed.
     // And a_polled_read_signaled_again_and_again_is_interrupted
     // (https://github.com/rrnewton/hermit/issues/4504): 540, listed.
-    ("test.cli", 540),
+    // And each_child_exit_gives_its_parent_one_sigchld (dev-hermit minibeads
+    // dh-l1fk, SaBRe's duplicate SIGCHLD): 541.
+    ("test.cli", 541),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4085,7 +4089,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three 4213 container-mount-table tests: 473.
     // And the same captured-stderr/controller-diagnostics regression: 474, listed.
     // And the same repeated-signal polled-read test: 475, listed.
-    ("test.cli_on_host", 475),
+    // And the same one-SIGCHLD-per-child-exit regression: 476.
+    ("test.cli_on_host", 476),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4416,7 +4421,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Shared unsupported-report ownership: 2081, freshly listed.
     // And the 4213 mount-table files, changed-root and filesystem-group tests: 2084.
     // And the same already-woken poll unit: 2085, freshly listed.
-    ("test.detcore_unit_on_host", 2085),
+    // And the_first_child_exit_sigchld_taken_stands_for_the_exit_without_publication
+    // (dev-hermit minibeads dh-l1fk): 2086.
+    ("test.detcore_unit_on_host", 2086),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

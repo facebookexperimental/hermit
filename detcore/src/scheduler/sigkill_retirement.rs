@@ -533,7 +533,7 @@ impl Scheduler {
                 } else {
                     parent
                 };
-                if self.backend.reports_child_exit_publication
+                if self.backend.reports_kernel_child_exit_signals
                     && self.child_exit_sigchld.own(parent, process)
                     && let Some(cohort) = cohort
                 {

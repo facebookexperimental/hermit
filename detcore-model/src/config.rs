@@ -44,8 +44,11 @@ const fn default_backend_capabilities() -> BackendCapabilities {
 /// selected, and were false otherwise; a configuration nobody prepared keeps
 /// that behaviour. A configuration nobody prepared cannot know that sigreturns
 /// are reported, so the fourth is off too (the DBT runtime's standalone
-/// fallback starts from these). The host copies the running backend's own
-/// answer over all of these before a run.
+/// fallback starts from these). `reports_kernel_child_exit_signals` keeps
+/// ptrace's value, as `reports_child_exit_publication` does: it took over the
+/// child-exit ledger's gates from that field, so such a configuration behaves
+/// as before. The host copies the running backend's own answer over all of
+/// these before a run.
 pub const DEFAULT_BACKEND_CAPABILITIES: BackendCapabilities = {
     let mut backend = BackendCapabilities::PTRACE;
     backend.supports_blocked_wait_signal_interruption = false;
@@ -2326,6 +2329,11 @@ impl LegacyBackendKeys {
         // child-exit publication, and it is the one backend that needs no
         // killed-thread RPC cancellation.
         backend.reports_child_exit_publication = !self.cancel_killed_thread_rpcs;
+        // Newer than the legacy form. It took over the child-exit ledger's gates
+        // from reports_child_exit_publication and has its value on every backend
+        // the form can express (true for ptrace and the default, false for DBT,
+        // the form's only reader), so it is read back the same way.
+        backend.reports_kernel_child_exit_signals = backend.reports_child_exit_publication;
         backend.reports_physical_process_exits = self.backend_reports_physical_process_exits;
         backend.signal_interrupts_external_syscalls = self.backend_reports_physical_process_exits;
         backend.tracks_process_children = self.backend_tracks_process_children;
@@ -3011,6 +3019,7 @@ mod tests {
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
         backend.reports_sigreturns = false;
+        backend.reports_kernel_child_exit_signals = backend.reports_child_exit_publication;
         // The legacy discover_live_file_metadata bit couples four facts.
         backend.rediscovers_descriptors_after_exec = backend.tool_shares_guest_descriptor_table;
         // The legacy form derives promotion from the thread-directed signal
@@ -3349,6 +3358,7 @@ mod tests {
                 "cancel_killed_thread_rpcs" => {
                     expected.needs_killed_thread_rpc_cancellation = true;
                     expected.reports_child_exit_publication = false;
+                    expected.reports_kernel_child_exit_signals = false;
                 }
                 "backend_reports_physical_process_exits" => {
                     expected.reports_physical_process_exits = true;

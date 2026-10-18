@@ -2340,7 +2340,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // with Linux's siginfo, as for `handle_exit_group`. Only the exit grant
         // knows whether this thread is the last, so every raw exit reports its
         // status, kept for this thread alone until that grant settles it.
-        if self.cfg.backend.reports_child_exit_publication {
+        if self.cfg.backend.reports_kernel_child_exit_signals {
             let uid = real_uid(guest.tid().as_raw()).unwrap_or_else(|| unsafe { libc::getuid() });
             crate::tool_global::child_exit_sigchld(
                 guest,
@@ -2411,7 +2411,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Where the kernel also notifies the parent, the scheduler sends the
         // parent's SIGCHLD itself and gives it the siginfo Linux would
         // (`scheduler::child_exit_sigchld`): CLD_EXITED and the exit code.
-        if self.cfg.backend.reports_child_exit_publication {
+        if self.cfg.backend.reports_kernel_child_exit_signals {
             let uid = real_uid(guest.tid().as_raw()).unwrap_or_else(|| unsafe { libc::getuid() });
             crate::tool_global::child_exit_sigchld(
                 guest,

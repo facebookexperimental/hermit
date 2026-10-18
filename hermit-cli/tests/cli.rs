@@ -196,6 +196,7 @@ static RENDERED_PROCFS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCESS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCESS_AUXV_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_MOUNT_TABLE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SIGCHLD_ONCE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DIRECTORY_OPENAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LISTINGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1491,6 +1492,33 @@ fn rendered_process_auxv_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "rendered-process-auxv guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// tests/c/sigchld_once.c: one child exit must give its parent one SIGCHLD,
+/// with Linux's siginfo.
+fn sigchld_once_guest() -> &'static Path {
+    SIGCHLD_ONCE_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("sigchld-once");
+        fs::create_dir_all(&build_root).expect("failed to create sigchld-once directory");
+        let guest = build_root.join("sigchld_once");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/sigchld_once.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile sigchld-once guest");
+        assert!(
+            output.status.success(),
+            "sigchld-once guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -7313,6 +7341,69 @@ fn detcore_renders_the_mount_table_on_every_backend() {
             .map(|(backend, _)| *backend)
             .collect::<Vec<_>>()
     );
+}
+
+/// One child exit gives its parent one SIGCHLD, CLD_EXITED from the child,
+/// on ptrace and SaBRe, under --strict --verify --verify-strict. Under SaBRe
+/// the parent got two: the scheduler's copy and the kernel's, which SaBRe's
+/// runtime hands the tool whatever the guest's disposition. The kernel's copy
+/// arrives when the real child exits, so it also entered the schedule at a
+/// host-chosen point, and detcore_follows_the_target_processs_root_for_its_mount_table
+/// diverged on SaBRe in about 1 run in 25 (dev-hermit minibeads dh-l1fk). The
+/// child-exit ledger now covers every backend whose capabilities say the
+/// kernel's copy reaches the tool with its siginfo
+/// (`reports_kernel_child_exit_signals`), and delivers one of the two.
+#[test]
+fn each_child_exit_gives_its_parent_one_sigchld() {
+    let guest = sigchld_once_guest();
+    let native = Command::new(guest)
+        .output()
+        .expect("run sigchld_once natively");
+    let expected = "OK one SIGCHLD per child exit\n";
+    assert!(native.status.success(), "native: {native:?}");
+    assert_eq!(String::from_utf8_lossy(&native.stdout), expected, "native");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let backends: &[&str] = if cfg!(feature = "sabre") {
+        &["ptrace", "sabre"]
+    } else {
+        eprintln!(
+            "each_child_exit_gives_its_parent_one_sigchld: NOT COMPARED: sabre is not in this build"
+        );
+        &["ptrace"]
+    };
+    for backend in backends {
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                .expect("parse the verification report");
+        // L2: the canonical comparison matched, over nonzero, equal INFO counts.
+        assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+        assert_eq!(verdict["verdict"], "matched", "{backend}: {verdict}");
+        let compared = &verdict["compared_log_messages"];
+        assert!(
+            compared["left"].as_u64().is_some_and(|left| left > 0)
+                && compared["left"] == compared["right"],
+            "{backend}: {verdict}"
+        );
+        assert_eq!(stdout(&output), expected, "{backend}");
+    }
 }
 
 /// A process's `mountinfo` follows its own root (K3a of

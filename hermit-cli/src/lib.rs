@@ -7254,7 +7254,9 @@ mod tests {
     /// exec (Reverie 15374907); its host-timed-turn and poller-yield
     /// capabilities remain false. `reports_sigreturns` (A5 step 2) is true
     /// for ptrace, and so for e9patch preprocessing, whose guest Hermit runs
-    /// on ptrace.
+    /// on ptrace. `reports_kernel_child_exit_signals` is true for ptrace,
+    /// e9patch and SaBRe, whose signal callbacks see the kernel's child-exit
+    /// SIGCHLD with its siginfo and can suppress or rewrite it.
     fn golden_backend_capabilities(backend: Backend) -> serde_json::Value {
         let sabre = backend == Backend::Sabre;
         let kvm = backend == Backend::Kvm;
@@ -7283,6 +7285,8 @@ mod tests {
             "supports_madv_dontneed": true,
             "reports_child_exit_publication":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "reports_kernel_child_exit_signals":
+                matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Sabre),
             "provides_process_signal_control": kvm,
             "emulates_child_waits": kvm,
             // A Config field Hermit set from the backend's name before it was
