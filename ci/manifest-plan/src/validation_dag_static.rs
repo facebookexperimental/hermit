@@ -3568,7 +3568,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore_renders_process_auxv_on_every_backend
     // (https://github.com/rrnewton/hermit/issues/4213): 525.
     // And a_refused_guest_signal_handler_is_announced_once_per_run: 526.
-    ("test.cli", 526),
+    // And tool_output_respects_page_protection_and_the_private_page (https://github.com/rrnewton/hermit/pull/4502): 527.
+    ("test.cli", 527),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4017,7 +4018,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three inherited-stdin regressions retain the prior selection: 456 -> 459, freshly listed.
     // And the 4213 process-auxv test: 460.
     // And a_refused_guest_signal_handler_is_announced_once_per_run: 461.
-    ("test.cli_on_host", 461),
+    // And the same tool-output protection test: 462.
+    ("test.cli_on_host", 462),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
