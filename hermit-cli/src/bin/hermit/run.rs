@@ -10375,10 +10375,6 @@ pub(super) fn complete_container_config(
     identity_sources: Option<&IdentityGuard>,
 ) -> Result<DetConfig, Error> {
     config.inherited_seccomp = detcore::InheritedSeccomp::measure();
-    config.mountinfo_root_rewrites = identity_sources
-        .map(IdentityGuard::mountinfo_root_rewrites)
-        .transpose()?
-        .unwrap_or_default();
     // Each run of `--verify` is its own container, whose namespace numbers
     // its mounts afresh, so each builds its own table, from the same plan and
     // the same host facts. The table, the identity order and the namespace
@@ -10391,11 +10387,13 @@ pub(super) fn complete_container_config(
     config.mount_id_assignment_order.clear();
     match view {
         Some(view) => {
+            config.mountinfo_root_rewrites = view.root_rewrites;
             config.mountinfo_mount_ids = view.order;
             config.mountinfo_mount_namespace = Some(view.namespace);
             config.container_mount_table = view.table;
         }
         None => {
+            config.mountinfo_root_rewrites = Vec::new();
             config.mountinfo_mount_ids = Vec::new();
             config.mountinfo_mount_namespace = None;
             config.container_mount_table = None;

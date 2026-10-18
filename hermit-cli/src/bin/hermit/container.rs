@@ -788,10 +788,12 @@ impl IdentityGuard {
         if hermit::current_mount_namespace()? != namespace {
             anyhow::bail!("the guest mount table was read across a change of mount namespace");
         }
+        let root_rewrites = rewrites_of_snapshot(self.mountinfo_root_rewrites()?, &order);
         Ok(ContainerMountView {
             table,
             order,
             namespace,
+            root_rewrites,
         })
     }
 
@@ -989,7 +991,7 @@ impl IdentityGuard {
     pub(super) fn mount_provenance(&self) -> Result<hermit::MountProvenance, Error> {
         let view = self.container_mount_view()?;
         Ok(hermit::MountProvenance {
-            root_rewrites: self.mountinfo_root_rewrites()?,
+            root_rewrites: view.root_rewrites,
             container_mount_table: view.table,
             mount_ids: Some(view.order),
         })
@@ -1004,7 +1006,27 @@ pub(super) struct ContainerMountView {
     /// The namespace's identity order (`DetConfig::mountinfo_mount_ids`).
     pub(super) order: Vec<u64>,
     /// The namespace read (`DetConfig::mountinfo_mount_namespace`).
-    pub(super) namespace: (u64, u64),
+    pub(super) namespace: detcore_model::config::MountNamespaceIdentity,
+    /// The proven roots of Hermit's mounts ([`IdentityGuard::mountinfo_root_rewrites`])
+    /// that name a mount of `order` (`rewrites_of_snapshot`).
+    pub(super) root_rewrites: Vec<MountInfoRootRewrite>,
+}
+
+/// `rewrites` less any that names a mount `order` does not have. The rewrites
+/// come from their own reads of the namespace (a user bind's rows, its
+/// recursive copies of host submounts included), and a host process that
+/// removes such a copy's directory detaches it from this namespace too
+/// (Linux's `detach_mounts`). A rewrite for a mount that left before the
+/// snapshot applies to no row any later view can show, and Detcore refuses a
+/// snapshot whose rewrites name a mount outside its order.
+fn rewrites_of_snapshot(
+    rewrites: Vec<MountInfoRootRewrite>,
+    order: &[u64],
+) -> Vec<MountInfoRootRewrite> {
+    rewrites
+        .into_iter()
+        .filter(|rewrite| order.contains(&rewrite.raw_mount_id))
+        .collect()
 }
 
 /// Whether `mount` is a bind mount: `--mount` without a `type`, or of type
@@ -5175,6 +5197,28 @@ mod readonly_proc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rewrite for a mount the snapshot lacks (a user bind's recursive copy
+    /// whose host directory was removed, detaching it) is dropped; every
+    /// other rewrite stays, in order (minibeads dh-dt0n).
+    #[test]
+    fn rewrites_of_snapshot_drop_a_mount_that_left_the_namespace() {
+        let rewrite = |raw_mount_id| MountInfoRootRewrite {
+            raw_mount_id,
+            deterministic_root: b"/".to_vec(),
+            raw_root_prefix: None,
+            deterministic_root_prefix: None,
+            raw_mountpoint_prefix: None,
+            deterministic_mountpoint_prefix: None,
+        };
+        let kept = rewrites_of_snapshot(vec![rewrite(30), rewrite(40), rewrite(10)], &[10, 30, 1]);
+        assert_eq!(
+            kept.iter()
+                .map(|rewrite| rewrite.raw_mount_id)
+                .collect::<Vec<_>>(),
+            [30, 10]
+        );
+    }
 
     /// Each installation's mountpoint is the one its target resolved to when
     /// the setup installed it, over the plan's earlier mounts: a bind at

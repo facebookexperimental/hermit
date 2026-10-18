@@ -24,6 +24,24 @@ pub struct MountInfoRow {
 // TODO-HUMAN-REVIEW(PR-873): Review private mount-root normalization.
 pub const MOUNT_PEER_PREFIXES: [&[u8]; 3] = [b"shared:", b"master:", b"propagate_from:"];
 
+/// Whether captured mount-identity provenance is well formed: the
+/// namespace order names each raw mount ID once, and the assignment order
+/// numbers each raw ID once and names raw 0 only where the namespace order
+/// does (an fdinfo zero is the anonymous class and is never numbered).
+/// Detcore's mount-ID pool accepts exactly these, and a producer that hands
+/// provenance to a backend without a second capture checks them first.
+pub fn mount_identity_provenance_is_well_formed(order: &[u64], assignment: &[u64]) -> bool {
+    let mut rows = std::collections::BTreeSet::new();
+    if !order.iter().all(|raw| rows.insert(*raw)) {
+        return false;
+    }
+    if assignment.contains(&0) && !rows.contains(&0) {
+        return false;
+    }
+    let mut numbered = std::collections::BTreeSet::new();
+    assignment.iter().all(|raw| numbered.insert(*raw))
+}
+
 /// True for one ephemeral host FUSE seed mount row in `/proc/<pid>/mountinfo`
 /// grammar: filesystem type `fuse.squashfuse_ll` and a mount point whose last
 /// path component is a host seed name, `<hex>-seed-<seed>-ns-<digits>`, where

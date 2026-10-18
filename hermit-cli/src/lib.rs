@@ -2874,23 +2874,36 @@ fn kvm_cwd_resolution_error(requested_cwd: &Path, error: &std::io::Error) -> Err
 /// Bind KVM's raw mountinfo and fdinfo to the same filesystem namespace.
 ///
 /// The CLI supplies IdentityGuard provenance from the completed container: the
-/// namespace's row/parent order and the namespace it was captured in. The
-/// backend requires its own mount namespace to be that one and keeps the
-/// producer's order, the same snapshot the container mount table was built
-/// from; it does not take a second one. Two captures of one private namespace
-/// need not agree: when a host process removes the directory a host mount was
-/// on, Linux detaches the mounts on that dentry in every mount namespace
-/// (`vfs_rmdir`, `vfs_unlink` and rename call `detach_mounts`, and
-/// `__detach_mounts` in fs/namespace.c unmounts each mount on the dentry with
-/// `umount_tree`), so a copied host row can leave the container between two
-/// reads although nothing propagates into it. Such a row cannot name a file
-/// the guest can open afterwards, and later guest views stay ordered subsets
-/// of the snapshot, which Detcore's validation accepts.
+/// namespace's row/parent order and the namespace it was captured in
+/// ([`detcore_model::config::MountNamespaceIdentity`], whose kernel ID Linux
+/// never reuses during a boot). The backend requires its own mount namespace
+/// to be that one and keeps the producer's order, the same snapshot the
+/// container mount table was built from; it does not take a second one, and
+/// it refuses provenance that is not well formed (a duplicate ID, an empty
+/// order, an assignment Detcore's pool would refuse, a root rewrite or table
+/// row outside the order).
+///
+/// Two captures of one private namespace need not agree. When a host process
+/// removes the directory a host mount was on, Linux detaches the mounts on that
+/// dentry in every mount namespace (`vfs_rmdir`, `vfs_unlink` and rename call
+/// `detach_mounts`, and `__detach_mounts` in fs/namespace.c unmounts each
+/// mount on the dentry with `umount_tree`), so a copied host row can leave the
+/// container between two reads although nothing propagates into it. The
+/// snapshot keeps naming that row. A detached mount stays usable through what
+/// still holds it (an open descriptor, a working directory, a directory
+/// descriptor), and fdinfo `mnt_id` and STATX_MNT_ID still number it through
+/// the order; later mountinfo views lack it and stay ordered subsets of the
+/// snapshot, which Detcore's validation accepts. A kernel automount (an autofs
+/// trigger reached by an ordinary path lookup) can add a row after the
+/// snapshot despite the private propagation: fdinfo and statx number its new
+/// ID on first observation, and a later kernel-view mountinfo that shows it is
+/// not an ordered subset and is refused. The container mount table never shows
+/// it.
 /// Library and no-namespace callers without provenance retain this capture.
 /// KVM does not permit guest namespace changes.
 fn prepare_kvm_mountinfo_config(
     config: &mut DetConfig,
-    namespace: impl FnOnce() -> Result<(u64, u64), Error>,
+    namespace: impl FnOnce() -> Result<detcore_model::config::MountNamespaceIdentity, Error>,
     capture: impl FnOnce() -> Result<Vec<u64>, Error>,
 ) -> Result<(), Error> {
     if !config.mountinfo_mount_ids_captured
@@ -2906,6 +2919,31 @@ fn prepare_kvm_mountinfo_config(
                 "KVM producer-captured mount identities do not name their mount namespace"
             );
         };
+        // Every mount namespace has its root, so a real one never yields an
+        // empty order; and Detcore's pool refuses a malformed one.
+        if config.mountinfo_mount_ids.is_empty()
+            || !detcore_model::procfs::mount_identity_provenance_is_well_formed(
+                &config.mountinfo_mount_ids,
+                &config.mount_id_assignment_order,
+            )
+        {
+            anyhow::bail!(
+                "KVM producer-captured mount identities are malformed ({} listed, {} assigned)",
+                config.mountinfo_mount_ids.len(),
+                config.mount_id_assignment_order.len()
+            );
+        }
+        if let Some(missing) = config
+            .mountinfo_root_rewrites
+            .iter()
+            .map(|rewrite| rewrite.raw_mount_id)
+            .find(|id| !config.mountinfo_mount_ids.contains(id))
+        {
+            anyhow::bail!(
+                "KVM mount root rewrite names mount {missing}, which the producer's snapshot does \
+                 not have"
+            );
+        }
         let backend = namespace().context("failed to identify the KVM backend mount namespace")?;
         if producer != backend {
             anyhow::bail!(
@@ -5101,13 +5139,43 @@ pub struct MountProvenance {
     pub mount_ids: Option<Vec<u64>>,
 }
 
-/// This process's mount namespace, as the device and inode numbers of
-/// `/proc/self/ns/mnt` (`DetConfig::mountinfo_mount_namespace`).
-pub fn current_mount_namespace() -> Result<(u64, u64), Error> {
+/// `NS_GET_MNTNS_ID`, `_IOR(NSIO, 5, __u64)` in Linux's uapi/linux/nsfs.h.
+const NS_GET_MNTNS_ID: libc::c_ulong = (2 << 30) | (8 << 16) | (0xb7 << 8) | 5;
+
+/// This process's mount namespace (`DetConfig::mountinfo_mount_namespace`):
+/// the kernel's namespace ID from `ioctl(NS_GET_MNTNS_ID)` on
+/// `/proc/self/ns/mnt`, and the descriptor's device and inode numbers. A
+/// kernel without the ioctl (ENOTTY or EINVAL) yields no ID; any other failure
+/// is an error.
+pub fn current_mount_namespace() -> Result<detcore_model::config::MountNamespaceIdentity, Error> {
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
-    let metadata = fs::metadata("/proc/self/ns/mnt")
+    let file = fs::File::open("/proc/self/ns/mnt")
+        .context("failed to open this process's mount namespace")?;
+    let metadata = file
+        .metadata()
         .context("failed to read this process's mount namespace")?;
-    Ok((metadata.dev(), metadata.ino()))
+    let mut id: u64 = 0;
+    // SAFETY: NS_GET_MNTNS_ID writes one u64 through the pointer, which
+    // points at `id` for the duration of the call.
+    let id =
+        if unsafe { libc::ioctl(file.as_raw_fd(), NS_GET_MNTNS_ID, &mut id as *mut u64) } == 0 {
+            Some(id)
+        } else {
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ENOTTY | libc::EINVAL) => None,
+                _ => {
+                    return Err(Error::new(error)
+                        .context("failed to read this process's mount namespace ID"));
+                }
+            }
+        };
+    Ok(detcore_model::config::MountNamespaceIdentity {
+        id,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
 }
 
 /// Capture the current mount namespace's raw IDs in the exact row/parent order
@@ -5502,7 +5570,12 @@ mod tests {
     }
 
     /// The namespace a test's captured provenance names.
-    const NAMESPACE: (u64, u64) = (4, 4026531840);
+    const NAMESPACE: detcore_model::config::MountNamespaceIdentity =
+        detcore_model::config::MountNamespaceIdentity {
+            id: Some(9001),
+            device: 4,
+            inode: 4026531840,
+        };
 
     #[test]
     fn kvm_mountinfo_config_preserves_captured_provenance() {
@@ -5548,20 +5621,98 @@ mod tests {
             serde_json::to_value(&expected).unwrap(),
             "root rewrites, listed and assignment orders and every other setting must remain intact"
         );
+    }
 
-        let mut empty = DetConfig {
+    /// Provenance the backend keeps without reading the namespace again must
+    /// be well formed by itself: these are the refusals a second, live capture
+    /// used to supply (Codex post-facto review of dh-dt0n).
+    #[test]
+    fn kvm_mountinfo_config_refuses_malformed_captured_provenance() {
+        let rewrite = |raw_mount_id| detcore_model::config::MountInfoRootRewrite {
+            raw_mount_id,
+            deterministic_root: b"/".to_vec(),
+            raw_root_prefix: None,
+            deterministic_root_prefix: None,
+            raw_mountpoint_prefix: None,
+            deterministic_mountpoint_prefix: None,
+        };
+        let valid = DetConfig {
+            mountinfo_mount_ids: vec![10, 20, 1],
             mountinfo_mount_ids_captured: true,
             mountinfo_mount_namespace: Some(NAMESPACE),
+            mount_id_assignment_order: vec![20],
+            mountinfo_root_rewrites: vec![rewrite(20)],
             ..DetConfig::default()
         };
         prepare_kvm_mountinfo_config(
-            &mut empty,
+            &mut valid.clone(),
             || Ok(NAMESPACE),
-            || panic!("a captured empty snapshot is not read again"),
+            || panic!("captured provenance is not read again"),
         )
         .unwrap();
-        assert!(empty.mountinfo_mount_ids.is_empty());
-        assert!(empty.mountinfo_mount_ids_captured);
+        let cases = [
+            (
+                "duplicate",
+                DetConfig {
+                    mountinfo_mount_ids: vec![10, 10],
+                    ..valid.clone()
+                },
+                "malformed",
+            ),
+            (
+                "empty",
+                DetConfig {
+                    mountinfo_mount_ids: vec![],
+                    ..valid.clone()
+                },
+                "malformed",
+            ),
+            (
+                "assigned twice",
+                DetConfig {
+                    mount_id_assignment_order: vec![20, 20],
+                    ..valid.clone()
+                },
+                "malformed",
+            ),
+            (
+                "zero assigned, unlisted",
+                DetConfig {
+                    mount_id_assignment_order: vec![0],
+                    ..valid.clone()
+                },
+                "malformed",
+            ),
+            (
+                "rewrite outside",
+                DetConfig {
+                    mountinfo_root_rewrites: vec![rewrite(30)],
+                    ..valid.clone()
+                },
+                "root rewrite names mount 30",
+            ),
+        ];
+        for (name, mut config, expected) in cases {
+            let before = serde_json::to_value(&config).unwrap();
+            let error = prepare_kvm_mountinfo_config(
+                &mut config,
+                || panic!("{name}: malformed provenance is refused before any read"),
+                || panic!("{name}: captured provenance is not read again"),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{name}: {error:#}");
+            assert_eq!(serde_json::to_value(&config).unwrap(), before, "{name}");
+        }
+    }
+
+    /// Two reads of this process's namespace name it identically, and a
+    /// kernel that reports a namespace ID reports a nonzero one.
+    #[test]
+    fn current_mount_namespace_is_stable_and_names_a_kernel_id_where_reported() {
+        let first = current_mount_namespace().unwrap();
+        assert_eq!(current_mount_namespace().unwrap(), first);
+        assert_ne!(first.inode, 0);
+        assert_ne!(first.id, Some(0));
     }
 
     /// A host mount copied into the container can leave it between the
@@ -5608,9 +5759,25 @@ mod tests {
             mountinfo_device_rewrites: vec![(libc::makedev(0, 1), libc::makedev(8, 1))],
             ..DetConfig::default()
         };
+        // The first is a recycled nsfs inode: device and inode match, the
+        // kernel's never-reused namespace ID does not.
         for backend in [
-            (NAMESPACE.0, NAMESPACE.1 + 1),
-            (NAMESPACE.0 + 1, NAMESPACE.1),
+            detcore_model::config::MountNamespaceIdentity {
+                id: Some(9002),
+                ..NAMESPACE
+            },
+            detcore_model::config::MountNamespaceIdentity {
+                inode: NAMESPACE.inode + 1,
+                ..NAMESPACE
+            },
+            detcore_model::config::MountNamespaceIdentity {
+                device: NAMESPACE.device + 1,
+                ..NAMESPACE
+            },
+            detcore_model::config::MountNamespaceIdentity {
+                id: None,
+                ..NAMESPACE
+            },
         ] {
             let mut stale = config.clone();
             let before = serde_json::to_value(&stale).unwrap();

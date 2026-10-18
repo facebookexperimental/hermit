@@ -936,15 +936,14 @@ impl MountIdPool {
         assignment_order: &[u64],
         allow_visible_subsets: bool,
     ) -> Option<Self> {
-        let mut seen_rows = BTreeSet::new();
-        if !mount_ids.iter().all(|raw| seen_rows.insert(*raw)) {
-            return None;
-        }
         // A recorded assignment may include IDs mountinfo does not list, such
         // as pipefs. It may include raw 0 only if the namespace order names 0
         // as a row or parent: an fdinfo zero is the anonymous class and is
         // never numbered, and a mountinfo zero must pass order validation.
-        if assignment_order.contains(&0) && !seen_rows.contains(&0) {
+        if !detcore_model::procfs::mount_identity_provenance_is_well_formed(
+            mount_ids,
+            assignment_order,
+        ) {
             return None;
         }
         let mut mappings = BTreeMap::new();

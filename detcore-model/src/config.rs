@@ -162,6 +162,25 @@ pub struct LaunchImage {
     pub launcher: Option<PathBuf>,
 }
 
+/// One mount namespace, as `DetConfig::mountinfo_mount_namespace` names it.
+///
+/// `id` is the kernel's 64-bit namespace ID (`ioctl(NS_GET_MNTNS_ID)` on a
+/// `/proc/<pid>/ns/mnt` descriptor, on kernels that have it). Linux draws it from
+/// one counter that only increases (`__ns_tree_gen_id` in kernel/nstree.c), so
+/// it names one namespace for the life of the boot. `device` and `inode` are
+/// the descriptor's nsfs device and inode numbers, which Linux recycles once a
+/// namespace is gone; they alone identify the namespace only on a kernel
+/// without the ioctl, where `id` is `None`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MountNamespaceIdentity {
+    /// The kernel's namespace ID, where the kernel reports one.
+    pub id: Option<u64>,
+    /// The nsfs device number of the namespace's descriptor.
+    pub device: u64,
+    /// The nsfs inode number of the namespace's descriptor.
+    pub inode: u64,
+}
+
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
 pub struct Config {
@@ -394,17 +413,17 @@ pub struct Config {
     #[clap(skip)]
     pub mountinfo_mount_ids_captured: bool,
 
-    /// The mount namespace `mountinfo_mount_ids` was captured in, as the
-    /// device and inode numbers of the producer's `/proc/self/ns/mnt`. A
-    /// backend that checks its provenance (KVM) requires its own namespace to
-    /// be this one, instead of recapturing the namespace's rows: a host can
-    /// detach a copied host mount from a private namespace at any time by
-    /// removing that mount's directory, so two captures of one namespace need
-    /// not agree. `None` when nothing was captured, and in recordings.
-    /// Runtime provenance, not a user option.
+    /// The mount namespace `mountinfo_mount_ids` was captured in
+    /// ([`MountNamespaceIdentity`]). A backend that checks its provenance
+    /// (KVM) requires its own namespace to be this one, instead of
+    /// recapturing the namespace's rows: a host can detach a copied host mount
+    /// from a private namespace at any time by removing that mount's
+    /// directory, so two captures of one namespace need not agree. `None`
+    /// when nothing was captured, and in recordings. Runtime provenance, not a
+    /// user option.
     #[serde(default)]
     #[clap(skip)]
-    pub mountinfo_mount_namespace: Option<(u64, u64)>,
+    pub mountinfo_mount_namespace: Option<MountNamespaceIdentity>,
 
     /// Raw mount IDs in the order Detcore numbered them for the guest.
     ///
