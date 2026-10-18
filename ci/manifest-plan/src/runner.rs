@@ -32,6 +32,9 @@ use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
 
+use crate::bundle_record::binary_digest;
+#[cfg(test)]
+use crate::bundle_record::file_digest;
 use crate::canonical_verdict::InfrastructureError;
 use crate::canonical_verdict::Verdict;
 pub use crate::canonical_verdict::VerificationReport;
@@ -8217,7 +8220,19 @@ fn run_cell_inner(
     let timeouts = cell_timeouts(context, cell)?;
     let preparation_deadline =
         execution_deadline_after_preparation(started, timeouts.wall_seconds)?;
-    let binary_before = file_digest(&context.hermit_bin);
+    // Hashed once per process while the file is unchanged (bundle_record.rs);
+    // a write or replacement is hashed afresh, here and after the cell.
+    let binary_before = binary_digest(&context.hermit_bin);
+    if let Some(recorded) = crate::bundle_record::recorded_hermit_sha256()? {
+        if binary_before.as_deref() != Some(recorded.as_str()) {
+            return Err(format!(
+                "Hermit binary {} has sha256 {}, but the bundle records {recorded}; \
+                 refusing to run a binary that is not the bundle's",
+                context.hermit_bin.display(),
+                binary_before.as_deref().unwrap_or("(unreadable)")
+            ));
+        }
+    }
     let (guest, preparation_cpu_usage_usec) = prepare_test_until(
         context,
         cell,
@@ -8522,7 +8537,7 @@ fn run_cell_inner(
         .map(|attempt| attempt.shell_command.clone())
         .unwrap_or_default();
     let test_sha = test_digest(&context.root, &cell.test)?;
-    let binary_sha = file_digest(&context.hermit_bin);
+    let binary_sha = binary_digest(&context.hermit_bin);
     if binary_before.is_some() && binary_before != binary_sha {
         outcome = "ERROR".into();
         error_kind = Some("infrastructure".into());
@@ -8640,7 +8655,7 @@ pub fn infrastructure_error_result(
         hermit_sha: context.source_sha.clone(),
         binary_build_sha: context.binary_build_sha.clone(),
         source_tree_dirty: context.source_dirty,
-        binary_sha256: file_digest(&context.hermit_bin),
+        binary_sha256: binary_digest(&context.hermit_bin),
         test_sha256: test_digest(&context.root, &cell.test).unwrap_or_default(),
         test: cell.id.test.clone(),
         category: cell.category.clone(),
@@ -9659,16 +9674,6 @@ pub(crate) fn test_digest(root: &Path, test: &TestRecipe) -> Result<String, Stri
 
 fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
-}
-
-/// The SHA-256 of the file at `path`, or `None` when it cannot be read.
-/// It streams the file rather than reading it whole: every cell hashes the
-/// Hermit binary three times, and a debug Hermit is about 450 MB, so
-/// `fs::read` held that much per concurrently running cell.
-fn file_digest(path: &Path) -> Option<String> {
-    let mut digest = Sha256::new();
-    std::io::copy(&mut fs::File::open(path).ok()?, &mut digest).ok()?;
-    Some(format!("{:x}", digest.finalize()))
 }
 
 fn xml(value: &str) -> String {

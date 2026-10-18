@@ -35,6 +35,7 @@ hermit_e2e_bundle(
     harness_bin = ":staged-bin",
     hermit = _HERMIT,
     install = ":staged-install",
+    recorder = "bundle-record",
     run_state = ":staged-run-state",
     source_sha = ":staged-SOURCE_SHA",
     src = ":staged-src",

@@ -17,6 +17,7 @@ use dagrun::TestAttemptOutcome;
 use dagrun::TestAttemptResult;
 use dagrun::TestResult;
 use dagrun::TestResults;
+use hermit_manifest_plan::bundle_record;
 use hermit_manifest_plan::cli_help::is_help_flag;
 use hermit_manifest_plan::imported_results;
 use hermit_manifest_plan::imported_results::IMPORT_RESULTS_ENV;
@@ -1272,9 +1273,35 @@ fn audit_cli_brackets(root: &Path) {
 /// Run the canonical manifest planner over `root`. A `source_sha` means the
 /// root is a source snapshot, so the planner takes the test population from the
 /// files present instead of from Git.
+///
+/// A Buck e2e cell's bundle record may already carry this planner's
+/// acceptance of this snapshot (hermit_manifest_plan::bundle_record); the
+/// verdict is taken from it only when it names this source SHA and this
+/// planner binary, and otherwise the planner runs here as always.
 fn run_manifest_plan(root: &Path, source_sha: Option<&str>) {
     let manifest_plan =
         sibling_manifest_plan().unwrap_or_else(|| root.join("target/debug/hermit-manifest-plan"));
+    if let Some(sha) = source_sha {
+        match bundle_record::record_from_env() {
+            Err(error) => fail(error),
+            Ok(None) => {}
+            Ok(Some((path, record))) => {
+                match bundle_record::manifest_plan_accepted(
+                    &path,
+                    &record,
+                    root,
+                    &manifest_plan,
+                    sha,
+                ) {
+                    Ok(()) => return,
+                    Err(why) => eprintln!(
+                        "test-harness: running {} because the bundle record's verdict does not apply: {why}",
+                        manifest_plan.display()
+                    ),
+                }
+            }
+        }
+    }
     let mut command = Command::new(&manifest_plan);
     command.args(["--format", "json", "--root"]).arg(root);
     if source_sha.is_some() {

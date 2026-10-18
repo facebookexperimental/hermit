@@ -160,9 +160,25 @@ hermit_e2e_cell_test = rule(
 )
 
 def _bundle_impl(ctx):
-    """The cell runner's input tree: hermit/{hermit,install}, bin/, src/, build/, run-state/."""
+    """The cell runner's input tree: hermit/{hermit,install}, bin/, src/, build/, run-state/,
+    SOURCE_SHA, and BUNDLE_RECORD.json (bundle-record: the Hermit digest and the manifest
+    planner's verdict on src/, computed here once instead of in every cell)."""
     hermit = ctx.attrs.hermit[DefaultInfo].default_outputs[0]
+    record = ctx.actions.declare_output("BUNDLE_RECORD.json")
+    ctx.actions.run(
+        cmd_args(
+            ctx.attrs.recorder,
+            hermit,
+            ctx.attrs.harness_bin,
+            ctx.attrs.src,
+            ctx.attrs.source_sha,
+            record.as_output(),
+        ),
+        category = "hermit_e2e_bundle_record",
+        local_only = True,
+    )
     entries = {
+        "BUNDLE_RECORD.json": record,
         "bin": ctx.attrs.harness_bin,
         "build": ctx.attrs.fixtures,
         "hermit/hermit": hermit,
@@ -180,6 +196,7 @@ hermit_e2e_bundle = rule(
         "harness_bin": attrs.source(allow_directory = True),
         "hermit": attrs.dep(),
         "install": attrs.source(allow_directory = True),
+        "recorder": attrs.source(),
         "run_state": attrs.source(allow_directory = True),
         "source_sha": attrs.source(),
         "src": attrs.source(allow_directory = True),

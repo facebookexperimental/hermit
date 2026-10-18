@@ -70,7 +70,8 @@ def host(path):
     return path
 keys = ("HERMIT_E2E_EMPTY_WORKDIR", "E2E_RESULT_ROOT", "E2E_BUILD_ROOT", "VALIDATE_RUN_STATE",
         "E2E_RUN_ID", "HERMIT_BIN", "HERMIT_INSTALL_DIR", "E2E_KEEP_VERIFY_LOGS", "E2E_PARITY_POST_PASS",
-        "HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN", "HERMIT_EPOCH")
+        "HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN", "HERMIT_EPOCH", "HERMIT_E2E_BUNDLE_RECORD",
+        "HERMIT_E2E_DIGEST_CACHE_DIR")
 # The client directory the DBT backend would load from: name -> link target, or None.
 rsrcs = os.path.join(host(os.environ.get("HERMIT_INSTALL_DIR", "/nonexistent")), "rsrcs")
 links = {n: os.readlink(os.path.join(rsrcs, n)) if os.path.islink(os.path.join(rsrcs, n)) else None
@@ -518,6 +519,49 @@ class CellTest(unittest.TestCase):
         self.assertEqual(done["status"], "passed", done)
         [harness] = self.calls_by("harness")
         self.assertIsNone(harness["env"]["HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN"])
+
+    # The bundle rule's record (bundle-record) reaches the harness wherever it runs; the
+    # per-host digest cache only on the host, and a caller's values never leak in.
+    def test_a_bundle_record_reaches_a_host_cell_with_the_digest_cache(self) -> None:
+        (self.bundle / "BUNDLE_RECORD.json").write_text("{}\n")
+        done, _ = self.run_cell(HERMIT_E2E_DIGEST_CACHE_DIR=str(self.tmp / "digests"))
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertEqual(harness["env"]["HERMIT_E2E_BUNDLE_RECORD"], str(self.bundle / "BUNDLE_RECORD.json"))
+        self.assertEqual(harness["env"]["HERMIT_E2E_DIGEST_CACHE_DIR"], str(self.tmp / "digests"))
+
+    def test_a_host_cell_digest_cache_defaults_to_a_per_user_directory(self) -> None:
+        done, _ = self.run_cell()
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertEqual(harness["env"]["HERMIT_E2E_DIGEST_CACHE_DIR"], f"/tmp/hermit-e2e-digests-{os.getuid()}")
+
+    def test_a_bundle_without_a_record_names_none(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_BUNDLE_RECORD=str(self.tmp / "elsewhere.json"))
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertIsNone(harness["env"]["HERMIT_E2E_BUNDLE_RECORD"])
+
+    def test_an_re_cell_gets_the_record_but_no_digest_cache(self) -> None:
+        (self.bundle / "BUNDLE_RECORD.json").write_text("{}\n")
+        done, _ = self.run_cell(HERMIT_E2E_ROUTE="re", HERMIT_E2E_DIGEST_CACHE_DIR=str(self.tmp / "digests"))
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertEqual(harness["env"]["HERMIT_E2E_BUNDLE_RECORD"], str(self.bundle / "BUNDLE_RECORD.json"))
+        self.assertIsNone(harness["env"]["HERMIT_E2E_DIGEST_CACHE_DIR"])
+
+    def test_a_pinned_root_cell_gets_its_private_copys_record_and_no_digest_cache(self) -> None:
+        (self.bundle / "BUNDLE_RECORD.json").write_text("{}\n")
+        done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",
+                                HERMIT_E2E_BUNDLE_RECORD=str(self.tmp / "elsewhere.json"),
+                                HERMIT_E2E_DIGEST_CACHE_DIR=str(self.tmp / "digests"))
+        self.assertEqual(done["status"], "passed", done)
+        [wrapper] = self.calls_by("wrapper")
+        self.assertIn("HERMIT_E2E_BUNDLE_RECORD=/src/bundle/BUNDLE_RECORD.json", wrapper["command"])
+        self.assertNotIn("HERMIT_E2E_BUNDLE_RECORD", wrapper["forwarded"])
+        [harness] = self.calls_by("harness")
+        self.assertEqual(harness["env"]["HERMIT_E2E_BUNDLE_RECORD"], "/src/bundle/BUNDLE_RECORD.json")
+        self.assertIsNone(harness["env"]["HERMIT_E2E_DIGEST_CACHE_DIR"])
 
     def test_pinned_root_cell_drops_a_callers_cpu_scan_marker(self) -> None:
         done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",

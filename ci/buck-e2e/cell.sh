@@ -4,7 +4,8 @@
 #
 # usage: cell.sh TEST MODE BACKEND [extra test-harness run flags...]
 # env:   HERMIT_E2E_BUNDLE         bundle dir (hermit/, bin/, src/, build/, run-state/,
-#                                  SOURCE_SHA): the :bundle target, or a prebuilt bundle
+#                                  SOURCE_SHA, and from the :bundle target BUNDLE_RECORD.json):
+#                                  the :bundle target, or a prebuilt bundle
 #        HERMIT_E2E_BUNDLE_SHA256  optional: BUNDLE.sha256 a prebuilt bundle must match
 #        HERMIT_E2E_ROUTE[_REASON] where the generator routed this cell, and why
 #        HERMIT_E2E_CONTAINER[_REASON]
@@ -19,6 +20,9 @@
 #                                  (default 16; see acquire_kvm_slot)
 #        HERMIT_E2E_KVM_SLOT_DIR   where their slot files live
 #                                  (default /tmp/hermit-e2e-kvm-slots-UID)
+#        HERMIT_E2E_DIGEST_CACHE_DIR
+#                                  where cells on this host share verified file digests
+#                                  (default /tmp/hermit-e2e-digests-UID; host cells only)
 # stdout: Tpx HPHP-JSON (`type = "json"`): the harness's test_done for the cell, turned
 #         into a failure if its evidence is incomplete, then all_done. Always exits 0.
 #         A cell the harness withholds as HOST-INAPPLICABLE on a local route is reported
@@ -95,6 +99,14 @@ if [[ ${HERMIT_E2E_ROUTE:-} == re ]]; then
 else
     cpu_scan_env=(-u HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN)
 fi
+# The bundle rule's BUNDLE_RECORD.json carries the Hermit digest and the manifest
+# planner's verdict on src/, computed once for every cell (bundle-record). The harness
+# still checks the binary against it, through a digest it hashes once per process and,
+# for a cell on this host, a per-host cache keyed by the file's identity (inode, size,
+# mtime, ctime); ci/manifest-plan/src/bundle_record.rs. A prebuilt bundle without a
+# record runs as before. Both are unset first, so a caller's values never leak in.
+bundle_env=()
+[[ -f $B/BUNDLE_RECORD.json ]] && bundle_env+=(HERMIT_E2E_BUNDLE_RECORD="$B/BUNDLE_RECORD.json")
 extra=()
 # The compat bucket node runs with --diagnostic-results; so does its Buck cell.
 [[ $TEST == compat/* ]] && extra+=(--diagnostic-results)
@@ -168,10 +180,13 @@ case $container in
     # What is left of the deadline after the setup above and any wait for a KVM slot.
     deadline=$((deadline - ($(date +%s%N) - t0) / 1000000000))
     ((deadline > 10)) || deadline=10
-    env -u HERMIT_E2E_EMPTY_WORKDIR "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
+    [[ ${HERMIT_E2E_ROUTE:-} == local ]] &&
+        bundle_env+=(HERMIT_E2E_DIGEST_CACHE_DIR="${HERMIT_E2E_DIGEST_CACHE_DIR:-/tmp/hermit-e2e-digests-$UID}")
+    env -u HERMIT_E2E_EMPTY_WORKDIR -u HERMIT_E2E_BUNDLE_RECORD -u HERMIT_E2E_DIGEST_CACHE_DIR \
+        "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_BUILD_ROOT="$B/build" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
-        HERMIT_BIN="$B/hermit/hermit" HERMIT_INSTALL_DIR="$B/hermit/install" \
+        HERMIT_BIN="$B/hermit/hermit" HERMIT_INSTALL_DIR="$B/hermit/install" "${bundle_env[@]}" \
         timeout --kill-after=10 "$deadline" \
         "$B/bin/test-harness" run --repo-root "$B/src" --source-sha "$SHA" \
         --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt --no-retry \
@@ -238,7 +253,11 @@ exec "$@"'
     outer=$((deadline - ($(date +%s%N) - t0) / 1000000000))
     ((outer > 25)) || outer=25
     deadline=$((outer - 15))
-    env -u HERMIT_E2E_EMPTY_WORKDIR "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
+    # Inside the container the record is the private copy's (paths under /src/bundle).
+    inner_bundle_env=()
+    ((${#bundle_env[@]})) && inner_bundle_env=(HERMIT_E2E_BUNDLE_RECORD=/src/bundle/BUNDLE_RECORD.json)
+    env -u HERMIT_E2E_EMPTY_WORKDIR -u HERMIT_E2E_BUNDLE_RECORD -u HERMIT_E2E_DIGEST_CACHE_DIR \
+        "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
         timeout --kill-after=10 "$outer" \
@@ -247,7 +266,7 @@ exec "$@"'
         --env E2E_RUN_ID --env E2E_KEEP_VERIFY_LOGS --env E2E_PARITY_POST_PASS \
         --env HERMIT_EPOCH -- \
         "${prologue[@]}" env E2E_BUILD_ROOT=/src/bundle/build \
-        HERMIT_BIN=/src/bundle/hermit/hermit HERMIT_INSTALL_DIR=/src/bundle/hermit/install \
+        HERMIT_BIN=/src/bundle/hermit/hermit HERMIT_INSTALL_DIR=/src/bundle/hermit/install "${inner_bundle_env[@]}" \
         timeout --kill-after=10 "$deadline" \
         /src/bundle/bin/test-harness run --repo-root /src/bundle/src --source-sha "$SHA" \
         --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt --no-retry \
