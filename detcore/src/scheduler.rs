@@ -10496,6 +10496,18 @@ impl Scheduler {
             | self.host_timed_signals.get(&process).copied().unwrap_or(0)
     }
 
+    /// `thread`'s host-timed signals (`host_timed_signals`) and the `SIGCHLD`
+    /// a guest sent it that the schedule recorded in its private queue
+    /// (`private_sigchld`), answered together, so that a gated wait's turn
+    /// reads both in one round trip, before any injection of its own (R2b-2
+    /// stage 3, <https://github.com/rrnewton/hermit/issues/4273>).
+    pub fn host_timed_and_private_sigchld(&self, thread: DetTid) -> (u64, u64) {
+        (
+            self.host_timed_signals(thread),
+            self.private_sigchld(thread),
+        )
+    }
+
     // `SIGCHLD` AND GATED WAITS
     // (https://github.com/rrnewton/hermit/issues/3146)
     //

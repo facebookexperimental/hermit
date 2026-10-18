@@ -5158,6 +5158,7 @@ impl<T> ThreadState<T> {
             in_guest_sleep_sigalrm: None,
             signal_state_task: None,
             decides_signal_interruption_itself: false,
+            private_sigchld_decides: false,
         }
     }
 
