@@ -782,6 +782,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/guest_restartable_two_signals.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/guest_restartable_two_signals.c is owned by hermit-cli/tests/cli.rs: the CLI tests restartable_calls_woken_by_two_signals_run_both_handlers and restartable_two_signal_rows_under_record_and_replay run it natively and under Hermit, and require that two caught signals sent to a thread parked in a restartable call run both handlers, higher-numbered first, and end the call as on Linux (R2b-2 stage 2, https://github.com/rrnewton/hermit/issues/4273). It stays a fixture because a generic manifest cannot assert the handler order and the call's result line."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/guest_sigchld.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/guest_sigchld.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_guests_sigchld_to_a_sleeping_sibling_ends_its_sleep_as_on_linux compiles this guest, in which one thread sends SIGCHLD to a sibling asleep in nanosleep or pause while a third spins, and requires each mode's native output (https://github.com/rrnewton/hermit/issues/4132); it remains a guest fixture because its CLI test checks the exact status and stdout of strict runs."
@@ -1052,8 +1058,8 @@
     },
     {
       "disposition": "manifest-test",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
       "path": "tests/c/lsm_refusals.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
       "why": "tests/c/lsm_refusals.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): c-programs/lsm-refusals strict-verifies the lsm_get_self_attr, lsm_set_self_attr and lsm_list_modules ENOSYS refusals, each member program included with its main renamed and run in a fresh child process (tests/c/probe_family.h), replacing the three per-syscall rows the 2026-10-17 test audit merged."
     },
     {
@@ -1400,8 +1406,8 @@
     },
     {
       "disposition": "manifest-test",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
       "path": "tests/c/perf_event_refusals.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
       "why": "tests/c/perf_event_refusals.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): c-programs/perf-event-refusals strict-verifies the hardware, software and watchpoint perf_event_open ENOSYS refusals, each member program included with its main renamed and run in a fresh child process (tests/c/probe_family.h), replacing the three per-event rows the 2026-10-17 test audit merged."
     },
     {
