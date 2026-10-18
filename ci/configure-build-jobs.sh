@@ -2065,8 +2065,19 @@ fi
 # changes. git diff is empty under reverie-dbt/, and the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml are unchanged. All seven SDK inputs,
 # inventory 963, calibrated budget, job width and limits are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ed29a09d102ffa3bf33c3efce9401025e80b7e4e ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ed29a09d102ffa3bf33c3efce9401025e80b7e4e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO b1e81ac276ccebe31d1a41e4c1f648bbcbd5e16f (2026-10-18): from
+# ed29a09d102ffa3bf33c3efce9401025e80b7e4e. Four commits, in-guest layering step 2
+# (10cd4cd4, b240b619, bcf633d1, b1e81ac2; replayed from 585d1eb7, ceee5a6d,
+# b7416bc5 and ed456a49 with the same patch-ids): reverie-inguest gains the
+# Patcher seam, the shared Tool-mode syscall path and the shared typed
+# installer, and LiteInst plugs in as a PatchHost. They touch only
+# reverie-inguest/, reverie-liteinst/ and reverie-liteinst-artifact/src/lib.rs
+# (its declared-content catalog). git diff is empty under reverie-dbt/, no
+# reverie-dbt file is added or removed, and the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml are unchanged. All seven SDK inputs, inventory 963,
+# calibrated budget, job width and limits are unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b1e81ac276ccebe31d1a41e4c1f648bbcbd5e16f ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie b1e81ac276ccebe31d1a41e4c1f648bbcbd5e16f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
