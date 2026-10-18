@@ -231,6 +231,10 @@ pub struct ExecFdState {
     /// Nonrandom descriptors retain their existing exec restoration paths.
     #[serde(default)]
     pub(crate) open_files: Option<ExecOpenFiles>,
+    /// Maps descriptions surviving a reload retain their opened target image,
+    /// aliases and any cached bytes. Kernel EOF must not erase this authority.
+    #[serde(default)]
+    pub(crate) maps: Option<ExecMapsFiles>,
     /// Under `--pipe-wake-latency`, on a backend that rediscovers its
     /// descriptors after exec: the channel end each surviving descriptor is,
     /// reattached after rediscovery (`crate::pipe_wake`).
@@ -266,6 +270,11 @@ impl std::fmt::Debug for ExecFdState {
             .field("initial_input", &self.initial_input)
             .field("robust_wakes", &self.robust_wakes)
             .field("open_files", &self.open_files);
+        if let Some(maps) = &self.maps {
+            // Native authority tokens and kernel descriptor identities are
+            // transport-only; they must not enter canonical guest logs.
+            debug.field("maps_survivors", &maps.handles.len());
+        }
         if !self.channels.is_empty() {
             debug.field("channels", &self.channels);
         }
@@ -285,6 +294,21 @@ pub(crate) struct ExecOpenFiles {
     next_sequence: u64,
     next_socket_sequence: u64,
     handles: BTreeMap<RawFd, ExecOpenFile>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExecMapsFiles {
+    creator: DetTid,
+    next_sequence: u64,
+    handles: BTreeMap<RawFd, ExecMapsFile>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ExecMapsFile {
+    identity: ExecOpenFile,
+    procfs: crate::procfs::ProcfsFile,
+    flags: i32,
+    path: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,12 +363,21 @@ impl ExecOpenFile {
 }
 
 impl ExecFdState {
+    pub(crate) fn open_file_creator(&self) -> Option<DetTid> {
+        self.open_files
+            .as_ref()
+            .map(|files| files.creator)
+            .or_else(|| self.open_file_namespace.map(|(creator, _)| creator))
+            .or_else(|| self.maps.as_ref().map(|maps| maps.creator))
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.blocking.is_empty()
             && self.inherited_reads.is_empty()
             && !self.initialize_inherited_stdio
             && self.initial_input.is_none()
             && self.open_files.is_none()
+            && self.maps.is_none()
             && self.channels.is_empty()
             && self.open_file_namespace.is_none()
             && self.exe.is_none()
@@ -1151,6 +1184,27 @@ impl FileMetadata {
         state: ExecFdState,
         shared_guest_table: bool,
     ) -> Result<(), Errno> {
+        if shared_guest_table && let Some(maps) = &state.maps {
+            // The existing exec exchange authorizes these survivors. Validate
+            // every slot before installing any carried maps authority, and
+            // reserve its old ID space before lazy discovery allocates IDs.
+            for (&fd, survivor) in &maps.handles {
+                if ExecOpenFile::capture(fd, survivor.identity.id)? != survivor.identity {
+                    return Err(Errno::EIO);
+                }
+            }
+            if state
+                .open_files
+                .as_ref()
+                .is_some_and(|files| files.creator != maps.creator)
+                || state
+                    .open_file_namespace
+                    .is_some_and(|(creator, _)| creator != maps.creator)
+            {
+                return Err(Errno::EIO);
+            }
+            self.next_open_file_sequence = self.next_open_file_sequence.max(maps.next_sequence);
+        }
         // Legacy discovery also allocates IDs. Reserve the complete old
         // namespace before it can create any nonrandom descriptions, including
         // same-leader exec where the creator did not change.
@@ -1168,6 +1222,8 @@ impl FileMetadata {
             // carried channel names (`crate::pipe_wake`).
             self.next_open_file_sequence = self.next_open_file_sequence.max(next_sequence);
             creator
+        } else if shared_guest_table && let Some(maps) = &state.maps {
+            maps.creator
         } else {
             owner
         };
@@ -1218,6 +1274,30 @@ impl FileMetadata {
                     );
                 }
             }
+        }
+        if let Some(maps) = state.maps {
+            let mut handles = HashMap::new();
+            for (fd, survivor) in maps.handles {
+                let raw_stat = stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) })
+                    .map_err(|error| Errno::new(error as i32))?;
+                let handle = DetFd::new(
+                    fd,
+                    OFlag::from_bits_truncate(survivor.flags),
+                    FdType::Regular,
+                    survivor.identity.id,
+                )
+                .with_stat(DetStat::from(raw_stat));
+                if let Some(path) = survivor.path {
+                    handle.set_path(path);
+                }
+                handle.set_procfs(survivor.procfs);
+                handle.mark_flock_mode_unobserved();
+                handles.insert(fd, handle);
+            }
+            // Aliases retain one old snapshot/cursor. Independent opens of the
+            // same proc inode remain separate because their IDs differ.
+            crate::fd::intern_open_files(&mut handles);
+            self.file_handles.extend(handles);
         }
         Ok(())
     }
@@ -1738,6 +1818,185 @@ mod file_metadata_tests {
     use super::*;
     use crate::pipe_wake::ChannelEnd;
     use crate::pipe_wake::ChannelId;
+
+    #[test]
+    fn maps_exec_survivors_keep_opened_target_aliases_and_cursor() {
+        use crate::procfs::BoundTask;
+        use crate::procfs::MapsTarget;
+        use crate::procfs::ProcfsFile;
+        use crate::procfs::ProcfsSnapshotContext;
+        use crate::procfs::TaskIncarnation;
+
+        let owner = DetTid::from_raw(9021);
+        let config = Config::default();
+        let mut parent = ThreadState::new(owner, &config, ());
+        let maps = std::fs::File::open("/proc/self/maps").unwrap();
+        let alias = maps.try_clone().unwrap();
+        let closed = maps.try_clone().unwrap();
+        let unread = std::fs::File::open("/proc/self/maps").unwrap();
+        let fd = maps.as_raw_fd();
+        let alias_fd = alias.as_raw_fd();
+        let closed_fd = closed.as_raw_fd();
+        let unread_fd = unread.as_raw_fd();
+        let target = MapsTarget {
+            task: BoundTask {
+                process: 9021,
+                thread: None,
+            },
+            incarnation: TaskIncarnation {
+                process: 1,
+                thread: None,
+            },
+            mm: MmId::initial(owner),
+            private: reverie::RuntimePrivateMemorySnapshot {
+                owner: [1, 2, 3, 4],
+                version: 7,
+                regions: vec![reverie::RuntimePrivateMemoryRegion {
+                    start: 0x1000,
+                    end: 0x2000,
+                }],
+            },
+        };
+        for number in [fd, unread_fd] {
+            parent
+                .add_fd(
+                    number,
+                    OFlag::O_RDONLY | OFlag::O_NONBLOCK,
+                    FdType::Regular,
+                    None,
+                )
+                .unwrap();
+            let mut procfs = ProcfsFile::from_path(Path::new("/proc/self/maps")).unwrap();
+            procfs.bind_maps_target(target.clone());
+            parent
+                .with_detfd(number, |handle| {
+                    handle.set_path("/proc/self/maps");
+                    handle.set_procfs(procfs.clone());
+                })
+                .unwrap();
+        }
+        parent.dup_fd(fd, alias_fd, OFlag::empty()).unwrap();
+        parent.dup_fd(fd, closed_fd, OFlag::O_CLOEXEC).unwrap();
+        parent
+            .with_detfd(fd, |handle| {
+                handle.initialize_procfs(
+                    b"3000-4000 rw-p 00000000 00:00 0 \n".to_vec(),
+                    ProcfsSnapshotContext::default(),
+                );
+                handle.commit_procfs_read(0, 7);
+            })
+            .unwrap();
+        assert!(
+            parent.maps_for_exec(None).unwrap().is_none(),
+            "exec maps carry requires an advertised private-memory provider"
+        );
+        let transfer = parent
+            .maps_for_exec(Some(&reverie::RuntimePrivateMemory::Unavailable))
+            .unwrap()
+            .unwrap();
+        let ready_transfer = parent
+            .maps_for_exec(Some(&reverie::RuntimePrivateMemory::Ready(
+                target.private.clone(),
+            )))
+            .unwrap()
+            .unwrap();
+        assert!(ready_transfer == transfer);
+        let original_preview = parent
+            .with_detfd(fd, |h| h.preview_procfs(3))
+            .unwrap()
+            .unwrap();
+        assert!(!transfer.handles.contains_key(&closed_fd));
+        assert_eq!(
+            transfer.handles[&fd].identity.id,
+            transfer.handles[&alias_fd].identity.id
+        );
+        assert_ne!(
+            transfer.handles[&fd].identity.id,
+            transfer.handles[&unread_fd].identity.id
+        );
+        let old_id = transfer.handles[&fd].identity.id;
+        let old_unread_id = transfer.handles[&unread_fd].identity.id;
+        let next_sequence = transfer.next_sequence;
+        let state = ExecFdState {
+            maps: Some(transfer),
+            ..ExecFdState::default()
+        };
+        assert!(!state.is_empty());
+        // Exercise the actual serialized exec preparation/completion payload.
+        let state: ExecFdState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        drop(state.clone()); // cancelled preparation leaves the original model alone
+        assert_eq!(
+            parent
+                .with_detfd(fd, |h| h.procfs_position())
+                .unwrap()
+                .unwrap()
+                .0,
+            7
+        );
+        let receiving_tid = DetTid::from_raw(9022);
+        let mut successor_thread = ThreadState::new(receiving_tid, &config, ());
+        // The same creator choice used by the real exec-completion handler.
+        assert_eq!(state.open_file_creator(), Some(owner));
+        successor_thread.set_open_file_creator(state.open_file_creator().unwrap());
+        let mut successor = successor_thread.metadata();
+        successor
+            .apply_exec_fd_state(receiving_tid, state.clone(), true)
+            .unwrap();
+        assert!(
+            successor.file_handles.contains_key(&fd),
+            "exec must retain maps provenance before lazy discovery"
+        );
+        assert!(!successor.file_handles.contains_key(&closed_fd));
+        for number in [fd, alias_fd, unread_fd] {
+            assert_eq!(
+                successor.file_handles[&number].procfs_maps_target(),
+                Some(target.clone())
+            );
+            assert!(successor.file_handles[&number].is_nonblocking());
+        }
+        assert_eq!(successor.file_handles[&fd].open_file_id(), old_id);
+        assert_eq!(
+            successor.file_handles[&unread_fd].open_file_id(),
+            old_unread_id
+        );
+        assert_eq!(successor.file_handles[&fd].procfs_position().unwrap().0, 7);
+        assert!(successor.file_handles[&unread_fd].procfs_needs_snapshot());
+        let (offset, bytes) = successor.file_handles[&alias_fd].preview_procfs(3).unwrap();
+        assert_eq!((offset, bytes.clone()), original_preview);
+        successor.file_handles[&alias_fd].commit_procfs_read(offset, bytes.len());
+        assert_eq!(successor.file_handles[&fd].procfs_position().unwrap().0, 10);
+        assert_eq!(
+            parent
+                .with_detfd(fd, |h| h.procfs_position())
+                .unwrap()
+                .unwrap()
+                .0,
+            7
+        );
+        assert!(successor.next_open_file_sequence >= parent.metadata().next_open_file_sequence);
+        drop(successor);
+        let next = tempfile::tempfile().unwrap();
+        successor_thread
+            .add_fd(next.as_raw_fd(), OFlag::O_RDWR, FdType::Regular, None)
+            .unwrap();
+        assert_eq!(
+            successor_thread
+                .with_detfd(next.as_raw_fd(), |h| h.open_file_id())
+                .unwrap(),
+            OpenFileId::new(owner, next_sequence),
+        );
+        // A reused numeric slot cannot acquire the old target's authority.
+        let replacement = tempfile::tempfile().unwrap();
+        assert_eq!(
+            unsafe { libc::dup2(replacement.as_raw_fd(), alias_fd) },
+            alias_fd
+        );
+        assert_eq!(
+            FileMetadata::new(owner).apply_exec_fd_state(owner, state, true),
+            Err(Errno::EIO)
+        );
+    }
 
     #[test]
     fn shared_exec_survivors_keep_aliases_and_allocator_after_closed_high_ids() {
@@ -3474,6 +3733,11 @@ pub struct ThreadState<T> {
     /// Linux memory address space shared by tasks created with `CLONE_VM`.
     pub mm_id: MmId,
 
+    /// Last acknowledged ownership publication. A new mm or changed provider
+    /// result is published before ordinary RPC can transfer the turn.
+    #[serde(skip)]
+    pub(crate) published_runtime_private_memory: Option<(MmId, reverie::RuntimePrivateMemory)>,
+
     /// Shared memory mappings used to resolve process-shared futex keys.
     pub(crate) memory_metadata: Arc<Mutex<MemoryMetadata>>,
 
@@ -4446,6 +4710,7 @@ impl<T> ThreadState<T> {
             pending_chaos_epochs: Vec::new(),
             max_timeslice_end: None,
             last_grant_deadline: None,
+            published_runtime_private_memory: None,
             last_rcb_timer: None,
             last_rcb_timer_is_max: false,
             record_or_replay,
@@ -5100,6 +5365,40 @@ impl<T> ThreadState<T> {
             creator: self.open_file_creator.unwrap_or(self.dettid),
             next_sequence: metadata.next_open_file_sequence,
             next_socket_sequence: metadata.next_socket_open_file_sequence,
+            handles,
+        }))
+    }
+
+    pub(crate) fn maps_for_exec(
+        &self,
+        private_memory: Option<&reverie::RuntimePrivateMemory>,
+    ) -> Result<Option<ExecMapsFiles>, Errno> {
+        // An unavailable advertised provider still owns saved maps bindings.
+        // Backends without a provider retain their existing exec behavior.
+        if private_memory.is_none() {
+            return Ok(None);
+        }
+        let metadata = self.metadata();
+        let mut handles = BTreeMap::new();
+        for (&fd, handle) in &metadata.file_handles {
+            if handle.is_cloexec() {
+                continue;
+            }
+            if let Some(procfs) = handle.maps_for_exec() {
+                handles.insert(
+                    fd,
+                    ExecMapsFile {
+                        identity: ExecOpenFile::capture(fd, handle.open_file_id())?,
+                        procfs,
+                        flags: handle.status_flags(),
+                        path: handle.path(),
+                    },
+                );
+            }
+        }
+        Ok((!handles.is_empty()).then_some(ExecMapsFiles {
+            creator: self.open_file_creator.unwrap_or(self.dettid),
+            next_sequence: metadata.next_open_file_sequence,
             handles,
         }))
     }

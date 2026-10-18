@@ -142,7 +142,6 @@ pub(crate) fn task_exists(
     Debug,
     Default,
     Clone,
-    Copy,
     PartialEq,
     Eq,
     serde::Serialize,
@@ -161,6 +160,12 @@ pub struct ProcfsTaskAnswer {
     pub process_incarnation: u32,
     /// How many tasks of the run have held the thread number, if one is named.
     pub thread_incarnation: Option<u32>,
+    /// Address-space incarnation of the exact named task.
+    #[serde(default)]
+    pub mm: Option<detcore_model::futex::MmId>,
+    /// Facts registered for that mm, never the requesting reader's.
+    #[serde(default)]
+    pub runtime_private_memory: Option<reverie::RuntimePrivateMemory>,
 }
 
 impl ProcfsTaskAnswer {

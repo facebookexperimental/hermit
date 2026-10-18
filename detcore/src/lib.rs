@@ -2989,6 +2989,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     pending_chaos_epochs: Vec::new(),
                     max_timeslice_end: None,
                     last_grant_deadline: None,
+                    published_runtime_private_memory: None,
                     last_rcb_timer: None,
                     last_rcb_timer_is_max: false,
 

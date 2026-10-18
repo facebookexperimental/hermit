@@ -85,9 +85,11 @@ const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | l
 /// This runtime accepts the version-8 layout but does not install the
 /// exchange, and no capability advertises it, so nothing calls it. Version 9
 /// adds `reverie_dbt_runtime_cpuid`: the native client keeps no CPUID table and
-/// asks this runtime, which answers from Detcore.
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 10;
-const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 64;
+/// asks this runtime, which answers from Detcore. Version 11 preserves the
+/// controller-capture callback at offset 56 and appends private-memory facts
+/// at offset 64. The incompatible historical version-10 tables are refused.
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 11;
+const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 72;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the inherited DBT report descriptor.
@@ -120,6 +122,7 @@ fn upgrade_runtime_callbacks_v1(
         evidence_log_level: 0,
         compare_exchange_u32: unsupported_compare_exchange,
         controller_capture_control: unsupported_controller_capture,
+        runtime_private_memory: unavailable_private_memory,
     }
 }
 
@@ -144,6 +147,19 @@ unsafe extern "C" fn unsupported_compare_exchange(
     _observed: *mut u32,
 ) -> i32 {
     -libc::ENOSYS
+}
+
+/// Old initialization paths cannot provide private-memory authority.
+unsafe extern "C" fn unavailable_private_memory(
+    _context: usize,
+    _expected: *const reverie_dbt::NativePrivateMemorySnapshot,
+    output: *mut reverie_dbt::NativePrivateMemorySnapshot,
+) -> i32 {
+    if !output.is_null() {
+        // SAFETY: the callback contract supplies writable fixed-size storage.
+        unsafe { output.write(Default::default()) };
+    }
+    0
 }
 
 fn runtime_callback_channels(
@@ -1265,6 +1281,7 @@ unsafe fn runtime_background_init(
 ) -> Result<(), String> {
     reverie_dbt::install_controller_capture_control(callbacks.controller_capture_control);
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
+    reverie_dbt::install_runtime_private_memory(callbacks.runtime_private_memory);
     let (emit_diagnostic, emit_evidence, protected_level) = runtime_callback_channels(callbacks);
     let _ = DBT_DIAGNOSTIC_EMITTER.set(emit_diagnostic);
     DBT_EVIDENCE_LOG_LEVEL.store(protected_level, Ordering::Release);
@@ -3439,8 +3456,24 @@ mod tests {
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 10);
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE, 64);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 11);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE, 72);
+        assert_eq!(
+            std::mem::offset_of!(reverie_dbt::DbtRuntimeCallbacks, controller_capture_control),
+            56,
+        );
+        assert_eq!(
+            std::mem::offset_of!(reverie_dbt::DbtRuntimeCallbacks, runtime_private_memory),
+            64,
+        );
+        assert_eq!(
+            std::mem::size_of::<reverie_dbt::NativeControllerCaptureFact>(),
+            24
+        );
+        assert_eq!(
+            std::mem::size_of::<reverie_dbt::NativePrivateMemorySnapshot>(),
+            96
+        );
         // The native client's dbt_signal_event_t (ABI version 7).
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
@@ -3512,6 +3545,14 @@ mod tests {
             0,
         );
         assert_eq!(capture, reverie_dbt::NativeControllerCaptureFact::default());
+        let mut private = reverie_dbt::NativePrivateMemorySnapshot::default();
+        // SAFETY: the fixed record contains only integer fields.
+        unsafe { std::ptr::write_bytes(&mut private, 0xa5, 1) };
+        assert_eq!(
+            unsafe { (current.runtime_private_memory)(0, std::ptr::null(), &mut private) },
+            0,
+        );
+        assert_eq!(private, reverie_dbt::NativePrivateMemorySnapshot::default());
     }
 
     #[test]
@@ -3526,6 +3567,7 @@ mod tests {
             evidence_log_level: 3,
             compare_exchange_u32: unsupported_compare_exchange,
             controller_capture_control: unsupported_controller_capture,
+            runtime_private_memory: unavailable_private_memory,
         };
         let (diagnostic, evidence, level) = runtime_callback_channels(&callbacks);
 

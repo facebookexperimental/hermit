@@ -891,7 +891,8 @@ mod tests {
             // test (+1). And procfs_determinism's directory-alias
             // record/replay test (+1,
             // https://github.com/rrnewton/hermit/issues/4213).
-            assert_eq!(population, 577);
+            // Runtime-private maps target/alias/lifetime coverage adds one.
+            assert_eq!(population, 578);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

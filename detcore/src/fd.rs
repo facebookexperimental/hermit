@@ -1255,6 +1255,20 @@ impl DetFd {
         })
     }
 
+    pub(crate) fn procfs_is_maps(&self) -> bool {
+        self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::is_maps))
+    }
+
+    pub(crate) fn procfs_maps_target(&self) -> Option<crate::procfs::MapsTarget> {
+        self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::maps_target))
+    }
+
+    /// Carry the opened maps description, including its old target and cursor,
+    /// through the authenticated exec handoff instead of rediscovering a target.
+    pub(crate) fn maps_for_exec(&self) -> Option<ProcfsFile> {
+        self.with_description(|d| d.procfs.as_ref().filter(|p| p.is_maps()).cloned())
+    }
+
     /// Whether this procfs file lists the guest's own address space, so
     /// its capture must not create a mapping that the listing would show.
     pub(crate) fn procfs_lists_address_space(&self) -> bool {

@@ -2508,7 +2508,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 2067.
     // And +1 from ca5325c1: 2068.
     // Guarded controller capture adds three units: 2071, freshly listed.
-    ("test.detcore_unit", 2071),
+    // Runtime-private maps adds nine units: 2080, freshly listed.
+    ("test.detcore_unit", 2080),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2824,7 +2825,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And procfs_determinism::a_name_outside_the_level_through_a_directory_alias_is_refused_before_its_turn
     // in the third shard (https://github.com/rrnewton/hermit/issues/4213):
     // 61 + 263 + 253 = 577.
-    ("test.hermit_integration_3", 253),
+    // Runtime-private maps target/alias/lifetime coverage: 254, freshly listed.
+    ("test.hermit_integration_3", 254),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4370,7 +4372,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same own-record test: 2067.
     // And +1 from ca5325c1: 2068.
     // The same three guarded controller-capture units: 2071, freshly listed.
-    ("test.detcore_unit_on_host", 2071),
+    // The same nine runtime-private maps units: 2080, freshly listed.
+    ("test.detcore_unit_on_host", 2080),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4448,7 +4451,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Ten DBT SIGKILL scenarios replace one aggregate test: 575.
     // And the container-init parent-died-before-arming test: 576, listed.
     // And the 4213 directory-alias record/replay test: 577.
-    ("test.hermit_integration_on_host", 577),
+    // And runtime-private maps target/alias/lifetime coverage: 578, listed.
+    ("test.hermit_integration_on_host", 578),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

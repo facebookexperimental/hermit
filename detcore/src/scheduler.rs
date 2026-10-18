@@ -1572,6 +1572,11 @@ pub struct Scheduler {
     /// (<https://github.com/rrnewton/hermit/issues/3994>).
     thread_mms: BTreeMap<DetTid, MmId>,
 
+    /// Runtime ownership facts bound to address-space incarnations. Old mm
+    /// entries remain available to descriptions opened before exec; native
+    /// token validation determines whether their authority is still live.
+    runtime_private_memory: BTreeMap<(DetTid, u64), reverie::RuntimePrivateMemory>,
+
     /// SIGKILL retirement at the kill turn (`sigkill_retirement`).
     sigkill: sigkill_retirement::SigkillRetirement,
 
@@ -3942,6 +3947,7 @@ impl Scheduler {
             logically_killed_threads: Default::default(),
             exec_incarnations: Default::default(),
             thread_mms: Default::default(),
+            runtime_private_memory: Default::default(),
             sigkill: Default::default(),
             retired_transferred_exec_callers: Default::default(),
             exec_teardowns: Default::default(),
@@ -5925,6 +5931,38 @@ impl Scheduler {
     /// The address-space identity recorded for `dettid` (`thread_mms`).
     pub(crate) fn thread_mm(&self, dettid: DetTid) -> Option<MmId> {
         self.thread_mms.get(&dettid).copied()
+    }
+
+    pub(crate) fn publish_runtime_private_memory(
+        &mut self,
+        tid: DetTid,
+        mm: MmId,
+        facts: reverie::RuntimePrivateMemory,
+    ) -> bool {
+        // Registration can race a newborn's first RPC in host time. Only its
+        // deterministic granted turn may make new ownership facts observable.
+        if !self.holds_serial_grant(tid)
+            || self.thread_mm(tid) != Some(mm)
+            || !self.rpc_incarnation_matches(tid, mm)
+        {
+            return false;
+        }
+        use reverie::RuntimePrivateMemory::Ready;
+        use reverie::RuntimePrivateMemory::Unavailable;
+        let key = (mm.creator(), mm.generation());
+        let facts = match (self.runtime_private_memory.get(&key), facts) {
+            (Some(Unavailable), _) => Unavailable,
+            (Some(Ready(old)), Ready(new)) if old.owner != new.owner => Unavailable,
+            (_, facts) => facts,
+        };
+        self.runtime_private_memory.insert(key, facts);
+        true
+    }
+
+    pub(crate) fn runtime_private_memory(&self, mm: MmId) -> Option<reverie::RuntimePrivateMemory> {
+        self.runtime_private_memory
+            .get(&(mm.creator(), mm.generation()))
+            .cloned()
     }
 
     pub(crate) fn rpc_incarnation_matches(&self, dettid: DetTid, mm: MmId) -> bool {
@@ -14947,6 +14985,47 @@ mod test {
     use crate::tool_local::RobustListExit;
     use crate::tool_local::RobustListWake;
     use crate::tool_local::ThreadState;
+
+    #[test]
+    fn private_memory_publication_waits_for_the_childs_granted_turn() {
+        let child = DetTid::from_raw(4);
+        let mm = MmId::initial(child);
+        let facts = reverie::RuntimePrivateMemory::Ready(reverie::RuntimePrivateMemorySnapshot {
+            owner: [1, 2, 3, 4],
+            version: 1,
+            regions: vec![reverie::RuntimePrivateMemoryRegion {
+                start: 0x1000,
+                end: 0x2000,
+            }],
+        });
+        for registered_before_message in [false, true] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            if registered_before_message {
+                scheduler.record_thread_mm(child, mm);
+            }
+            assert!(!scheduler.publish_runtime_private_memory(child, mm, facts.clone()));
+            assert_eq!(scheduler.runtime_private_memory(mm), None);
+            scheduler.record_thread_mm(child, mm);
+            assert!(!scheduler.publish_runtime_private_memory(child, mm, facts.clone()));
+            assert_eq!(scheduler.runtime_private_memory(mm), None);
+
+            // The same empty next-request slot and running identity that
+            // unblock_guest installs when it grants StartNewThread.
+            scheduler.next_turns.insert(
+                child,
+                ThreadNextTurn {
+                    dettid: child,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            scheduler.parked.running = Some(child);
+            assert!(scheduler.publish_runtime_private_memory(child, mm, facts.clone()));
+            assert_eq!(scheduler.runtime_private_memory(mm), Some(facts.clone()));
+        }
+    }
 
     #[test]
     fn every_scheduler_commit_shape_uses_the_same_typed_record() {

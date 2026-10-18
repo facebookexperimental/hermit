@@ -3694,6 +3694,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             .flatten()
             // Only a FIFO a guest made; every other one is opened as before.
             .filter(|(fifo, _)| crate::fifo_peer::is_guest_made(*fifo));
+        // A later descriptor lookup proves the object, while this observation
+        // brackets its kernel open against target exec/PID replacement.
+        let maps_before = if guest.runtime_private_memory_regions().is_some() {
+            if let Some((pid, tid)) = self.procfs_caller_ids(guest)
+                && let Some(task) = crate::procfs::maps_task_at(&procfs_spelling, pid, tid)
+            {
+                Some((task, crate::tool_global::procfs_task(guest, task).await))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let res: Result<i64, Error> = match fifo {
             Some((fifo, fifo_path)) => {
                 self.open_fifo_once_a_guest_holds_its_peer(guest, call, fifo, &fifo_path)
@@ -4075,6 +4088,36 @@ impl<T: RecordOrReplay> Detcore<T> {
                         &Path::new("/proc").join(within.strip_prefix("/").unwrap_or(&within)),
                     )
                     .filter(ProcfsFile::may_be_named_by_provenance);
+                }
+                if guest.runtime_private_memory_regions().is_some()
+                    && procfs.as_ref().is_some_and(ProcfsFile::is_maps)
+                    && let Some(stat) = host_stat
+                {
+                    match self
+                        .maps_descriptor_entry(guest, &DetStat::from(stat), fd)
+                        .await
+                    {
+                        ProcfsEntry::At(within) => {
+                            let actual = Path::new("/proc")
+                                .join(within.strip_prefix("/").unwrap_or(&within));
+                            if let Some(task) = self.maps_guest_target(guest, &actual).await
+                                && let Some((before_task, before)) = maps_before.as_ref()
+                                && *before_task == task
+                            {
+                                let after = crate::tool_global::procfs_task(guest, task).await;
+                                if let Some(target) =
+                                    crate::procfs::MapsTarget::from_open(task, before, &after)
+                                    && guest.runtime_private_memory_is_current(&target.private)
+                                {
+                                    procfs.as_mut().unwrap().bind_maps_target(target);
+                                }
+                            }
+                        }
+                        // A shadowed proc spelling is an ordinary file. Its
+                        // contents must not receive procfs projection at all.
+                        ProcfsEntry::NotProcfs => procfs = None,
+                        ProcfsEntry::Unnamed | ProcfsEntry::Unknown => {}
+                    }
                 }
                 if procfs
                     .as_ref()
@@ -5003,6 +5046,33 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Read,
     ) -> Result<(), Error> {
+        let maps_target = if guest.runtime_private_memory_regions().is_some()
+            && guest
+                .thread_state()
+                .with_detfd(call.fd(), |fd| fd.procfs_is_maps())?
+        {
+            if !guest.config().sequentialize_threads {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "runtime-private maps view unavailable: capture is not sequentialized"
+                )));
+            }
+            let target = guest
+                .thread_state()
+                .with_detfd(call.fd(), |fd| fd.procfs_maps_target())?
+                .ok_or_else(|| {
+                    Error::Tool(anyhow::anyhow!(
+                        "runtime-private maps view unavailable: opened target image is unbound"
+                    ))
+                })?;
+            if !guest.runtime_private_memory_is_current(&target.private) {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "runtime-private maps view unavailable: target ownership retired"
+                )));
+            }
+            Some(target)
+        } else {
+            None
+        };
         let template = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_rendering_template())?;
@@ -5038,6 +5108,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                 template.to_vec()
             }
             None => self.snapshot_procfs(guest, call).await?,
+        };
+        let raw_contents = if let Some(target) = maps_target {
+            if !guest.runtime_private_memory_is_current(&target.private) {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "runtime-private maps view unavailable: target ownership changed during capture"
+                )));
+            }
+            crate::procfs::private_maps::project(&raw_contents, &target.private.regions).map_err(
+                |reason| {
+                    Error::Tool(anyhow::anyhow!(
+                        "runtime-private maps view unavailable: {reason}"
+                    ))
+                },
+            )?
+        } else {
+            raw_contents
         };
         // The guest mount view is the launch namespace (guest mount/unshare/
         // setns are refused under Detcore). Ephemeral host FUSE seed rows
@@ -7564,6 +7650,70 @@ impl<T: RecordOrReplay> Detcore<T> {
         target: StatTarget<'_>,
     ) -> ProcfsEntry {
         procfs_inode::preserving_errno(Self::name_procfs_entry(guest, stat, target)).await
+    }
+
+    /// Maps ownership needs the actual opened object even where scheduler
+    /// IDs are virtual. Use the existing same-view task directory capability;
+    /// never pass a virtual TID to the host-only procfs naming path.
+    async fn maps_descriptor_entry<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        stat: &DetStat,
+        fd: RawFd,
+    ) -> ProcfsEntry {
+        procfs_inode::preserving_errno(async {
+            if guest.config().recordreplay_modes || !guest.config().sequentialize_threads {
+                return ProcfsEntry::Unknown;
+            }
+            let Some(task) = self.guest_task_directory(guest) else {
+                return ProcfsEntry::Unknown;
+            };
+            match procfs_inode::descriptor_procfs_path(&task, fd, stat.dev, stat.inode) {
+                Ok(Some(within)) => ProcfsEntry::At(within),
+                Ok(None) => ProcfsEntry::NotProcfs,
+                Err(_) => ProcfsEntry::Unknown,
+            }
+        })
+        .await
+    }
+
+    async fn maps_guest_target<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        actual: &Path,
+    ) -> Option<crate::procfs::BoundTask> {
+        let numbers = if Self::translates_procfs_numbers(guest) {
+            let ids = crate::procfs::ids::named_ids(actual);
+            Some(Self::guest_procfs_numbers(guest, &ids).await?)
+        } else {
+            None
+        };
+        let (pid, tid) = self.procfs_caller_ids(guest)?;
+        Self::maps_target_with_numbers(actual, numbers.as_ref(), pid, tid)
+    }
+
+    /// Preserve an authenticated spelling when its complete numeric mapping
+    /// is the identity. Missing target components cannot authorize a binding.
+    fn maps_target_with_numbers(
+        actual: &Path,
+        numbers: Option<&BTreeMap<i32, i32>>,
+        pid: i32,
+        tid: i32,
+    ) -> Option<crate::procfs::BoundTask> {
+        let translated;
+        let actual = if let Some(numbers) = numbers {
+            if crate::procfs::ids::named_ids(actual)
+                .iter()
+                .any(|id| !numbers.contains_key(id))
+            {
+                return None;
+            }
+            translated = crate::procfs::ids::translate(actual, |id| numbers.get(&id).copied());
+            translated.as_deref().unwrap_or(actual)
+        } else {
+            actual
+        };
+        crate::procfs::maps_task_at(actual, pid, tid)
     }
 
     /// [`Self::procfs_entry`], which restores the guest's `errno` afterwards.
@@ -14216,6 +14366,7 @@ mod inject_fstat_scratch {
     struct ScriptedStack {
         writable: bool,
         arena: usize,
+        capacity: usize,
         guard_live: Arc<AtomicBool>,
         /// A failing commit first overwrites the scratch's first word, as a
         /// commit that faults part way does.
@@ -14248,7 +14399,7 @@ mod inject_fstat_scratch {
             panic!("inject_fstat reserves its buffer rather than pushing one")
         }
         fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
-            assert!(std::mem::size_of::<T>() <= ARENA_WORDS * std::mem::size_of::<u64>());
+            assert!(std::mem::size_of::<T>() <= self.capacity);
             AddrMut::from_raw(self.arena).unwrap()
         }
         fn commit(self) -> Result<Self::StackGuard, Errno> {
@@ -14318,6 +14469,10 @@ mod inject_fstat_scratch {
         /// The injected syscall at which the scratch page becomes read-only,
         /// so that putting its bytes back fails.
         protect_page_on: Option<Sysno>,
+        private_memory: Option<reverie::RuntimePrivateMemorySnapshot>,
+        private_retired: bool,
+        private_validations: std::sync::atomic::AtomicUsize,
+        maps_reads: std::collections::VecDeque<Vec<u8>>,
     }
 
     impl ScriptedGuest {
@@ -14355,6 +14510,10 @@ mod inject_fstat_scratch {
                 commit_partial: false,
                 protect_page_on_commit_failure: false,
                 protect_page_on: None,
+                private_memory: None,
+                private_retired: false,
+                private_validations: std::sync::atomic::AtomicUsize::new(0),
+                maps_reads: Default::default(),
             };
             (tool, guest)
         }
@@ -14423,6 +14582,22 @@ mod inject_fstat_scratch {
         fn is_runtime_owned_fd(&self, fd: RawFd) -> bool {
             self.runtime_fd == Some(fd)
         }
+        fn runtime_private_memory_regions(&self) -> Option<reverie::RuntimePrivateMemory> {
+            self.private_memory.clone().map(|facts| {
+                if self.private_retired {
+                    reverie::RuntimePrivateMemory::Unavailable
+                } else {
+                    reverie::RuntimePrivateMemory::Ready(facts)
+                }
+            })
+        }
+        fn runtime_private_memory_is_current(
+            &self,
+            snapshot: &reverie::RuntimePrivateMemorySnapshot,
+        ) -> bool {
+            self.private_validations.fetch_add(1, Ordering::SeqCst);
+            !self.private_retired && self.private_memory.as_ref() == Some(snapshot)
+        }
         fn memory(&self) -> Self::Memory {
             LocalMemory::new()
         }
@@ -14441,6 +14616,11 @@ mod inject_fstat_scratch {
                 arena: self
                     .scratch_page
                     .unwrap_or(self.arena.as_mut_ptr() as usize),
+                capacity: if self.scratch_page.is_some() {
+                    4096
+                } else {
+                    ARENA_WORDS * std::mem::size_of::<u64>()
+                },
                 guard_live: self.guard_live.clone(),
                 partial: self.commit_partial,
                 protect_on_failure: self
@@ -14479,6 +14659,22 @@ mod inject_fstat_scratch {
             // SAFETY: each arm runs the syscall Detcore asked for against this
             // process, on addresses Detcore obtained from this guest.
             let raw = match Syscall::from_raw(number, args) {
+                Syscall::Lseek(call) if self.private_memory.is_some() => {
+                    assert_eq!(call.offset(), 0);
+                    assert_eq!(call.whence(), Whence::SEEK_SET);
+                    0
+                }
+                Syscall::Read(call) if self.private_memory.is_some() => {
+                    let bytes = self.maps_reads.pop_front().expect("scripted maps drain");
+                    assert!(bytes.len() <= call.len());
+                    self.memory().write_exact(call.buf().unwrap(), &bytes)?;
+                    if bytes.is_empty() {
+                        // The owner changes generation while the complete
+                        // drain is in flight, before snapshot publication.
+                        self.private_retired = true;
+                    }
+                    bytes.len() as i64
+                }
                 Syscall::Mmap(call) => {
                     assert!(call.addr().is_none(), "the kernel must choose the address");
                     assert_eq!(call.prot(), ProtFlags::PROT_READ | ProtFlags::PROT_WRITE);
@@ -14692,6 +14888,154 @@ mod inject_fstat_scratch {
                 }
             }
         }
+    }
+
+    #[test]
+    fn private_maps_targets_require_complete_identity_or_translated_numbers() {
+        use crate::procfs::BoundTask;
+        let actual = Path::new("/proc/21/task/23/maps");
+        for (numbers, expected) in [
+            (
+                BTreeMap::from([(21, 21), (23, 23)]),
+                Some(BoundTask {
+                    process: 21,
+                    thread: Some(23),
+                }),
+            ),
+            (
+                BTreeMap::from([(21, 3), (23, 5)]),
+                Some(BoundTask {
+                    process: 3,
+                    thread: Some(5),
+                }),
+            ),
+            (BTreeMap::from([(21, 3)]), None),
+        ] {
+            assert_eq!(
+                Detcore::<crate::record_or_replay::NoopTool>::maps_target_with_numbers(
+                    actual,
+                    Some(&numbers),
+                    1,
+                    1,
+                ),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn private_maps_authenticates_the_opened_descriptor_in_its_task_view() {
+        use std::os::fd::AsRawFd;
+        let (_, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.backend = reverie::BackendCapabilities::DBT;
+        guest.config.sequentialize_threads = true;
+        guest.thread.physical_tid = Some(123456);
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+        assert!(!procfs_inode::guest_tids_name_host_tasks(
+            &guest.config.backend,
+            guest.thread.physical_tid,
+        ));
+        let file = std::fs::File::open("/proc/thread-self/maps").unwrap();
+        let fd = file.as_raw_fd();
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+        let stat = DetStat::from(stat);
+        let authenticated = tool.maps_descriptor_entry(&guest, &stat, fd).await;
+        assert!(
+            matches!(&authenticated, ProcfsEntry::At(path) if path.ends_with("maps")),
+            "{authenticated:?}"
+        );
+
+        // The same spelling cannot authorize a different descriptor/object.
+        let ordinary = tempfile::tempfile().unwrap();
+        let mut ordinary_stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::fstat(ordinary.as_raw_fd(), &mut ordinary_stat) },
+            0
+        );
+        assert!(matches!(
+            tool.maps_descriptor_entry(&guest, &DetStat::from(ordinary_stat), ordinary.as_raw_fd())
+                .await,
+            ProcfsEntry::NotProcfs
+        ));
+        assert!(matches!(
+            tool.maps_descriptor_entry(&guest, &stat, ordinary.as_raw_fd())
+                .await,
+            ProcfsEntry::Unknown
+        ));
+        guest.thread.changed_root.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            tool.maps_descriptor_entry(&guest, &stat, fd).await,
+            ProcfsEntry::Unknown
+        ));
+    }
+
+    #[tokio::test]
+    async fn private_maps_retired_during_drain_never_publish_a_snapshot() {
+        let (_, mut guest) = ScriptedGuest::with_scratch_page(true);
+        guest.config.sequentialize_threads = true;
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+        let target = crate::procfs::MapsTarget {
+            task: crate::procfs::BoundTask {
+                process: 2,
+                thread: None,
+            },
+            incarnation: crate::procfs::TaskIncarnation {
+                process: 1,
+                thread: None,
+            },
+            mm: detcore_model::futex::MmId::initial(DetTid::from_raw(2)),
+            private: reverie::RuntimePrivateMemorySnapshot {
+                owner: [1, 2, 3, 4],
+                version: 1,
+                regions: vec![reverie::RuntimePrivateMemoryRegion {
+                    start: 0x1000,
+                    end: 0x2000,
+                }],
+            },
+        };
+        guest.private_memory = Some(target.private.clone());
+        guest.maps_reads = [b"1000-2000 rw-p 00000000 00:00 0 \n".to_vec(), Vec::new()].into();
+        let fd = 9;
+        guest
+            .thread
+            .add_fd(fd, OFlag::O_RDONLY, FdType::Regular, None)
+            .unwrap();
+        let mut file = ProcfsFile::from_path(Path::new("/proc/2/maps")).unwrap();
+        file.bind_maps_target(target.clone());
+        guest
+            .thread
+            .with_detfd(fd, |detfd| detfd.set_procfs(file.clone()))
+            .unwrap();
+        let mut output = [0xa5_u8; 512];
+        let call = syscalls::Read::new()
+            .with_fd(fd)
+            .with_buf(AddrMut::from_raw(output.as_mut_ptr() as usize))
+            .with_len(output.len());
+
+        let error = tool
+            .initialize_procfs_snapshot(&mut guest, call)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Tool(ref error) if error.to_string() ==
+            "runtime-private maps view unavailable: target ownership changed during capture"),
+            "{error:?}"
+        );
+        assert_eq!(guest.private_validations.load(Ordering::SeqCst), 2);
+        assert!(guest.maps_reads.is_empty());
+        assert_eq!(guest.injected, [Sysno::lseek, Sysno::read, Sysno::read]);
+        assert_eq!(output, [0xa5; 512]);
+        guest
+            .thread
+            .with_detfd(fd, |detfd| {
+                assert!(detfd.procfs_needs_snapshot());
+                assert_eq!(detfd.procfs_position(), Some((0, None)));
+                assert_eq!(detfd.preview_procfs(512), None);
+                assert_eq!(detfd.procfs_maps_target(), Some(target.clone()));
+            })
+            .unwrap();
+        assert_eq!(guest.take_scratch_page(), vec![0xa5; 4096]);
     }
 
     /// A real descriptor the test owns by number, and its inode. Ownership is

@@ -4355,6 +4355,8 @@ mod tests {
             without_mm: false,
             process_incarnation: process,
             thread_incarnation: None,
+            mm: None,
+            runtime_private_memory: None,
         };
         for (fail_closed, incarnation, expected) in [
             (true, procfs_inode::MAX_INCARNATION, "bound"),

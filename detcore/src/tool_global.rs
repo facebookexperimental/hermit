@@ -415,6 +415,8 @@ impl InodePool {
             without_mm,
             process_incarnation: self.incarnation(named.as_raw()),
             thread_incarnation: thread.map(|thread| self.incarnation(thread.as_raw())),
+            mm: None,
+            runtime_private_memory: None,
         }
     }
 
@@ -2534,6 +2536,14 @@ impl GlobalState {
                 .publish_signal_mask(dtid, request_mm, mask);
             return (None, R::PublishSignalMask(taken));
         }
+        if let GlobalRequest::PublishRuntimePrivateMemory(facts) = request {
+            let accepted = self
+                .sched
+                .lock()
+                .unwrap()
+                .publish_runtime_private_memory(dtid, request_mm, facts);
+            return (None, R::PublishRuntimePrivateMemory(accepted));
+        }
         if let GlobalRequest::SignalDequeued {
             detpid,
             identity,
@@ -2794,6 +2804,9 @@ impl GlobalState {
             }
             GlobalRequest::PublishSignalMask(_) => {
                 unreachable!("a published mask is answered before clock accounting")
+            }
+            GlobalRequest::PublishRuntimePrivateMemory(_) => {
+                unreachable!("private-memory publication precedes clock accounting")
             }
             GlobalRequest::ParkedRequest(rs, pid, capability) => {
                 let (response, _) = self
@@ -3811,16 +3824,20 @@ impl GlobalState {
                     .map_err(|errno| errno.into_raw()),
             ),
             GlobalRequest::ProcfsTask(named, thread) => {
-                let existence = self
-                    .lock_rpc_scheduler(false)
-                    .await
-                    .procfs_task(named, thread);
-                R::ProcfsTask(
-                    self.inodes
-                        .lock()
-                        .unwrap()
-                        .procfs_task_answer(named, thread, existence),
-                )
+                let scheduler = self.lock_rpc_scheduler(false).await;
+                let existence = scheduler.procfs_task(named, thread);
+                let mut answer = self
+                    .inodes
+                    .lock()
+                    .unwrap()
+                    .procfs_task_answer(named, thread, existence);
+                if existence.0 && !existence.1 {
+                    answer.mm = scheduler.thread_mm(thread.unwrap_or(named));
+                    answer.runtime_private_memory = answer
+                        .mm
+                        .and_then(|mm| scheduler.runtime_private_memory(mm));
+                }
+                R::ProcfsTask(answer)
             }
             GlobalRequest::RenderedFileState(inode, change) => R::RenderedFileState(
                 self.inodes
@@ -5986,6 +6003,9 @@ pub enum GlobalRequest {
         crate::syscalls::memory::BrkMappingCheck,
         reverie::ControllerCaptureFact,
     ),
+    /// Current image's native ownership facts, authenticated by the RPC MmId.
+    /// Answered without granting another task or advancing logical time.
+    PublishRuntimePrivateMemory(reverie::RuntimePrivateMemory),
 }
 
 /// Responses from the global object
@@ -6190,6 +6210,8 @@ pub enum GlobalResponse {
     /// None means the capture authority or mappings were unavailable.
     /// Appended last; this response owns no allocated storage.
     CheckBrkMappings(Option<bool>),
+    /// Current image ownership publication was accepted. Appended last.
+    PublishRuntimePrivateMemory(bool),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -6336,6 +6358,14 @@ pub async fn prepare_exec<G, T>(
             .thread_state()
             .shared_open_files_for_exec()
             .expect("prepared exec descriptors are no longer live"),
+        maps: if guest.config().backend.rediscovers_descriptors_after_exec {
+            guest
+                .thread_state()
+                .maps_for_exec(guest.runtime_private_memory_regions().as_ref())
+                .expect("prepared maps descriptors are no longer live")
+        } else {
+            None
+        },
         channels: Default::default(),
         open_file_namespace: None,
         exe,
@@ -6417,13 +6447,9 @@ pub async fn mark_past_first_execve<G, T>(
     // without one is the kernel's.
     guest.thread_state_mut().exe = overrides.exe.take().map(Arc::new);
     if !overrides.is_empty() {
-        if let Some(open_files) = &overrides.open_files {
-            guest
-                .thread_state_mut()
-                .set_open_file_creator(open_files.creator);
-        } else if let Some((creator, _)) = overrides.open_file_namespace {
-            // `--pipe-wake-latency`: continue the old numbering, as the
-            // random-device survivors above do.
+        if let Some(creator) = overrides.open_file_creator() {
+            // Every carried description continues the old namespace, including
+            // maps-only handoffs and the pipe-wake-latency channel namespace.
             guest.thread_state_mut().set_open_file_creator(creator);
         }
         let dettid = guest.thread_state().dettid;
@@ -6709,6 +6735,29 @@ where
     )
 }
 
+async fn publish_runtime_private_memory<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let Some(facts) = guest.runtime_private_memory_regions() else {
+        return;
+    };
+    let state = guest.thread_state();
+    let mm = state.mm_id;
+    if state.published_runtime_private_memory.as_ref() == Some(&(mm, facts.clone())) {
+        return;
+    }
+    let message = (
+        state.thread_logical_time.clone(),
+        mm,
+        GlobalRequest::PublishRuntimePrivateMemory(facts.clone()),
+    );
+    if guest.send_rpc(message).await.1 == GlobalResponse::PublishRuntimePrivateMemory(true) {
+        guest.thread_state_mut().published_runtime_private_memory = Some((mm, facts));
+    }
+}
+
 pub async fn send_and_update_time<G, T>(
     guest: &mut G,
     request: GlobalRequest,
@@ -6731,6 +6780,9 @@ where
     // this thread's process's dispositions or this thread's mask.
     crate::syscalls::signal_shadow::publish_dispositions(guest).await;
     crate::syscalls::signal_shadow::publish_mask(guest).await;
+    if !matches!(request, GlobalRequest::StartNewThread(..)) {
+        publish_runtime_private_memory(guest).await;
+    }
     let mytime = guest.thread_state().thread_logical_time.clone();
     let mm = guest.thread_state().mm_id;
     let mut resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
@@ -7097,6 +7149,9 @@ where
         .await;
         match resp.1 {
             GlobalResponse::StartNewThread(preempts) => {
+                // Publish only after the deterministic start grant. Before
+                // it, parent registration and this RPC can race in host time.
+                publish_runtime_private_memory(guest).await;
                 trace!("[detcore, dtid {}] new thread UNBLOCKED (post-rpc)", dettid);
                 preempts
             }
@@ -13365,6 +13420,7 @@ mod tests {
             initial_input: None,
             robust_wakes: Vec::new(),
             open_files: None,
+            maps: None,
             channels: Default::default(),
             open_file_namespace: None,
             exe: None,

@@ -32,6 +32,7 @@ mod fixed;
 pub(crate) mod ids;
 pub(crate) mod levels;
 pub(crate) mod listing;
+pub(crate) mod private_maps;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProcfsKind {
@@ -578,10 +579,58 @@ pub(crate) struct ProcfsTask {
 /// The task a per-process procfs file belongs to, as the guest numbers it:
 /// the process (or, at `/proc/<tid>`, the thread) named at the top of
 /// `/proc`, and the thread named below its `task` directory.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub(crate) struct BoundTask {
     pub(crate) process: i32,
     pub(crate) thread: Option<i32>,
+}
+
+/// Open-time target authority shared by every alias of a maps description.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct MapsTarget {
+    pub(crate) task: BoundTask,
+    pub(crate) incarnation: TaskIncarnation,
+    pub(crate) mm: detcore_model::futex::MmId,
+    pub(crate) private: reverie::RuntimePrivateMemorySnapshot,
+}
+
+impl MapsTarget {
+    /// Both observations bracket the kernel open; an intervening exec or PID
+    /// replacement cannot be rebound to the already-open description.
+    pub(crate) fn from_open(
+        task: BoundTask,
+        before: &listing::ProcfsTaskAnswer,
+        after: &listing::ProcfsTaskAnswer,
+    ) -> Option<Self> {
+        if !before.exists
+            || !after.exists
+            || before.without_mm
+            || after.without_mm
+            || before.incarnation() != after.incarnation()
+            || before.mm != after.mm
+            || before.runtime_private_memory != after.runtime_private_memory
+        {
+            return None;
+        }
+        let reverie::RuntimePrivateMemory::Ready(private) =
+            after.runtime_private_memory.as_ref()?
+        else {
+            return None;
+        };
+        Some(Self {
+            task,
+            incarnation: after.incarnation(),
+            mm: after.mm?,
+            private: private.clone(),
+        })
+    }
+}
+
+pub(crate) fn maps_task_at(path: &Path, pid: i32, tid: i32) -> Option<BoundTask> {
+    let normalized = normalize_observed_path(path)?;
+    ProcfsTask::parse(normalized.to_str()?, "maps")?
+        .bound_to(pid, tid)
+        .bound()
 }
 
 /// Which task holding a [`BoundTask`]'s numbers a per-process file belongs
@@ -775,6 +824,10 @@ pub(crate) struct ProcfsFile {
     /// was opened ([`ProcfsFile::set_task_incarnation`]).
     #[serde(default)]
     incarnation: Option<TaskIncarnation>,
+    /// Independent of rendered per-process kinds: these bytes originate from
+    /// an authenticated kernel object and retain its open-time mm.
+    #[serde(default)]
+    maps_target: Option<MapsTarget>,
     target_fd: Option<i32>,
     bound_thread_identity: Option<(i32, i32, i32)>,
     #[serde(default)]
@@ -1280,6 +1333,7 @@ impl ProcfsFile {
             kind,
             task,
             incarnation: None,
+            maps_target: None,
             target_fd,
             bound_thread_identity: None,
             timer_slack_identity: None,
@@ -1559,6 +1613,19 @@ impl ProcfsFile {
         matches!(self.kind, ProcfsKind::Maps | ProcfsKind::Smaps)
     }
 
+    pub(crate) fn is_maps(&self) -> bool {
+        self.kind == ProcfsKind::Maps
+    }
+
+    pub(crate) fn bind_maps_target(&mut self, target: MapsTarget) {
+        assert!(self.is_maps());
+        self.maps_target = Some(target);
+    }
+
+    pub(crate) fn maps_target(&self) -> Option<MapsTarget> {
+        self.maps_target.clone()
+    }
+
     /// True when this file lists the reading process's own virtual memory
     /// areas, so a mapping created while capturing it would appear in it.
     pub(crate) fn lists_address_space(&self) -> bool {
@@ -1812,7 +1879,26 @@ impl ProcfsFile {
             ProcfsKind::ProcessAuxv => contents.to_vec(),
             ProcfsKind::CpuidleCounter => sanitize_cpuidle_counter(&contents),
             ProcfsKind::Smaps => sanitize_smaps(&contents, mapping_identities),
-            ProcfsKind::Maps => sanitize_maps(&contents, mapping_identities),
+            ProcfsKind::Maps => {
+                let rendered = sanitize_maps(&contents, mapping_identities);
+                // Retain the exact served vector when diagnosing a divergence,
+                // without a second procfs read. DEBUG formatting can allocate
+                // after capture; INFO runs do not format these bytes. Omission
+                // is explicit rather than a misleading truncated snapshot.
+                if rendered.len() <= 64 * 1024 {
+                    tracing::debug!(
+                        "PROCFS_MAPS_SNAPSHOT len={} bytes={:02x?}",
+                        rendered.len(),
+                        rendered.as_slice()
+                    );
+                } else {
+                    tracing::debug!(
+                        "PROCFS_MAPS_SNAPSHOT omitted=oversize len={}",
+                        rendered.len()
+                    );
+                }
+                rendered
+            }
             ProcfsKind::Pressure => sanitize_pressure(&contents),
             ProcfsKind::SelfSchedstat => sanitize_self_schedstat(&contents),
             ProcfsKind::SoftnetStat => sanitize_softnet_stat(&contents),

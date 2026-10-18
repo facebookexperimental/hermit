@@ -2028,7 +2028,37 @@ fi
 # 6a5491c0 (AT_RANDOM startup seed). Its tree is exactly
 # 80fc77faa79da855612517666bd87134a915e2fc's, so everything the 80fc77fa block above
 # states holds unchanged (inventory 964, SDK and native inputs, limits).
-expected_pin=aaed1ab669b079a7f0a3adf00cf92d274e34649b
+# HISTORICAL MAPS BRANCH EVIDENCE (separate from the landed capture chain):
+# Preserved maps head 8bb1b7d26ad8defab878d0dd3f4ee431888a936c on ed29a09d.
+# PRIVATE MAPS f85bbe2aca52191d835e80f8600c9dfec880f81f: Guest ownership facts,
+# ABI 10 and native reservation retirement change vendor/SDK inputs. No old
+# SDK source-equivalence carry applies. The fresh SDK MISS at jobs=8 used key
+# 01e4833a30c4dcfaa615fb8c402e91fb1b0836601781376713641ab7605e4adf
+# and completed in 24.45 seconds. The scoped Reverie build/contract checks
+# completed in 42.901049 seconds, 156.484799 CPU seconds, peak 1,583,882,240
+# bytes and 86 tasks. The H ff17cc04 validate-profile consumer build completed
+# in 224.095764 seconds, 654.418854 CPU seconds, peak 3,532,775,424 bytes and
+# 345 tasks. These are capped local measurements with existing dependency
+# caches, not a new cold-build calibration. Inventory is 965; the existing
+# parallel-job, memory, CPU and elapsed limits remain unchanged.
+# The restack preserves the changed SDK inputs byte-for-byte while adding
+# landed Guest mask and DBT auxv support; full-runtime equality is not claimed.
+# COMBINED MAPS/CAPTURE 3090b098a5efbe124815ca6babec849511b52558: ABI 11 retains
+# controller capture and appends the maps provider. Native publication and
+# vendor inputs differ from both historical branches. Fresh SDK key
+# f33cd1a46e8c962dc6af2a0cced1024ac65500a8ac4934962551a6535ab6e5b3
+# was built in the debug and validate caches, respectively 33.71 and 30.58
+# seconds at 7 native jobs (NUM_JOBS=8). The H 776470bd validate consumer
+# build took 356.790859 seconds, 1217.714040 CPU seconds, peak 4,224,962,560
+# bytes and 337 tasks. Current native compile/link rows use Release/O3.
+# These are capped local builds with existing dependencies, not a cold-build
+# recalibration or equality to either historical SDK key. Inventory is 966;
+# all existing job, memory, CPU and elapsed limits remain unchanged.
+# CARRY TO c4c5b7374d4fe1aa3e04066744cb623e48b6695d (2026-10-18): the block above's
+# 3090b098 (private memory facts beside controller capture), replayed onto
+# aaed1ab669b079a7f0a3adf00cf92d274e34649b, whose tree equals 80fc77fa; the replayed
+# tree is byte-identical to 3090b098's, so the block above holds unchanged.
+expected_pin=c4c5b7374d4fe1aa3e04066744cb623e48b6695d
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
@@ -2093,7 +2123,7 @@ export REVERIE_DBT_BUDGET_BOUND_PIN
 # shellcheck source=ci/configure-build-jobs.sh
 source "$ROOT_DIR/ci/configure-build-jobs.sh" reverie-dbt-budget-child
 
-echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,sdk-build-observed:8da5596da1403ff0b682f35f088ce01dda82e3d1bd64a4395c94d4d8bb6df94e:source-6d76bb72}" >&2
+echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:existing-portable-budget,combined-sdk-key:f33cd1a46e8c962dc6af2a0cced1024ac65500a8ac4934962551a6535ab6e5b3,measured-current-source}" >&2
 
 # A cargo build, check, clippy, doc, rustc or test command reruns once if the
 # compiler itself crashed; every other command is exec'd unchanged

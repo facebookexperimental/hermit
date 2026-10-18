@@ -2105,8 +2105,38 @@ fi
 # 6a5491c0 (AT_RANDOM startup seed). Its tree is exactly
 # 80fc77faa79da855612517666bd87134a915e2fc's, so everything the 80fc77fa block above
 # states holds unchanged (inventory 964, SDK and native inputs, limits).
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != aaed1ab669b079a7f0a3adf00cf92d274e34649b ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie aaed1ab669b079a7f0a3adf00cf92d274e34649b (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# HISTORICAL MAPS BRANCH EVIDENCE (separate from the landed capture chain):
+# Preserved maps head 8bb1b7d26ad8defab878d0dd3f4ee431888a936c on ed29a09d.
+# PRIVATE MAPS f85bbe2aca52191d835e80f8600c9dfec880f81f: Guest ownership facts,
+# ABI 10 and native reservation retirement change vendor/SDK inputs. No old
+# SDK source-equivalence carry applies. The fresh SDK MISS at jobs=8 used key
+# 01e4833a30c4dcfaa615fb8c402e91fb1b0836601781376713641ab7605e4adf
+# and completed in 24.45 seconds. The scoped Reverie build/contract checks
+# completed in 42.901049 seconds, 156.484799 CPU seconds, peak 1,583,882,240
+# bytes and 86 tasks. The H ff17cc04 validate-profile consumer build completed
+# in 224.095764 seconds, 654.418854 CPU seconds, peak 3,532,775,424 bytes and
+# 345 tasks. These are capped local measurements with existing dependency
+# caches, not a new cold-build calibration. Inventory is 965; the existing
+# parallel-job, memory, CPU and elapsed limits remain unchanged.
+# The restack preserves the changed SDK inputs byte-for-byte while adding
+# landed Guest mask and DBT auxv support; full-runtime equality is not claimed.
+# COMBINED MAPS/CAPTURE 3090b098a5efbe124815ca6babec849511b52558: ABI 11 retains
+# controller capture and appends the maps provider. Native publication and
+# vendor inputs differ from both historical branches. Fresh SDK key
+# f33cd1a46e8c962dc6af2a0cced1024ac65500a8ac4934962551a6535ab6e5b3
+# was built in the debug and validate caches, respectively 33.71 and 30.58
+# seconds at 7 native jobs (NUM_JOBS=8). The H 776470bd validate consumer
+# build took 356.790859 seconds, 1217.714040 CPU seconds, peak 4,224,962,560
+# bytes and 337 tasks. Current native compile/link rows use Release/O3.
+# These are capped local builds with existing dependencies, not a cold-build
+# recalibration or equality to either historical SDK key. Inventory is 966;
+# all existing job, memory, CPU and elapsed limits remain unchanged.
+# CARRY TO c4c5b7374d4fe1aa3e04066744cb623e48b6695d (2026-10-18): the block above's
+# 3090b098 (private memory facts beside controller capture), replayed onto
+# aaed1ab669b079a7f0a3adf00cf92d274e34649b, whose tree equals 80fc77fa; the replayed
+# tree is byte-identical to 3090b098's, so the block above holds unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c4c5b7374d4fe1aa3e04066744cb623e48b6695d ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c4c5b7374d4fe1aa3e04066744cb623e48b6695d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

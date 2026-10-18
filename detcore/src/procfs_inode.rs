@@ -430,12 +430,23 @@ pub(crate) fn procfs_mounts(
     device: u64,
     reread: bool,
 ) -> io::Result<Option<Arc<[ProcfsMount]>>> {
+    procfs_mounts_at(Path::new(&format!("/proc/{tid}")), device, reread)
+}
+
+/// The same mount identity lookup through an already-selected task view.
+/// In-process tools use their own thread-self view rather than interpreting
+/// scheduler IDs as kernel task numbers.
+fn procfs_mounts_at(
+    task: &Path,
+    device: u64,
+    reread: bool,
+) -> io::Result<Option<Arc<[ProcfsMount]>>> {
     // The mount namespace, the root's mount, device, inode and path, and
     // the device.
     type Key = (u64, Option<u64>, u64, u64, PathBuf, u64);
     static PROCFS_DEVICES: OnceLock<Mutex<HashMap<Key, Arc<[ProcfsMount]>>>> = OnceLock::new();
-    let namespace = std::fs::metadata(format!("/proc/{tid}/ns/mnt"))?;
-    let root_link = PathBuf::from(format!("/proc/{tid}/root"));
+    let namespace = std::fs::metadata(task.join("ns/mnt"))?;
+    let root_link = task.join("root");
     let root = identify(&root_link, true)?;
     let root_path = std::fs::read_link(&root_link)?;
     let key = (
@@ -450,7 +461,13 @@ pub(crate) fn procfs_mounts(
     if !reread && let Some(mounts) = known.lock().unwrap().get(&key) {
         return Ok(Some(mounts.clone()));
     }
-    let mountinfo = read_checking_close(&format!("/proc/{tid}/mountinfo"))?;
+    let mountinfo_path = task.join("mountinfo");
+    let mountinfo = read_checking_close(mountinfo_path.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "non-UTF8 task procfs directory",
+        )
+    })?)?;
     let mounts = procfs_mounts_in(&mountinfo, device, &root_path);
     if mounts.is_empty() {
         known.lock().unwrap().remove(&key);
@@ -459,6 +476,38 @@ pub(crate) fn procfs_mounts(
     let mounts: Arc<[ProcfsMount]> = mounts.into();
     known.lock().unwrap().insert(key, mounts.clone());
     Ok(Some(mounts))
+}
+
+/// Authenticate an open descriptor through one coherent task/root/mount view.
+/// `None` proves an ordinary filesystem object; an unavailable identity is an
+/// error, never permission to treat a possible procfs file as ordinary data.
+pub(crate) fn descriptor_procfs_path(
+    task: &Path,
+    fd: i32,
+    device: u64,
+    inode: u64,
+) -> Result<Option<PathBuf>, String> {
+    let link = task.join("fd").join(fd.to_string());
+    if !is_on_procfs(&link, device, inode)? {
+        return Ok(None);
+    }
+    let mounts = procfs_mounts_at(task, device, false)
+        .map_err(|error| {
+            format!(
+                "cannot read task mount table: {}",
+                describe_io_error(&error)
+            )
+        })?
+        .ok_or_else(|| "procfs descriptor is outside the task's procfs mounts".to_owned())?;
+    let (canonical, mount_id) = inspect_link(&link, device, inode)?;
+    path_within(
+        &mounts,
+        mount_id,
+        &canonical,
+        || procfs_mounts_at(task, device, true),
+        mount_root,
+    )
+    .map(Some)
 }
 
 /// How many times Detcore makes a call of its own to read the guest's mount
