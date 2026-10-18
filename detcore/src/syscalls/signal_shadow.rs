@@ -1091,8 +1091,11 @@ pub(crate) fn published_dispositions_decide(signal: i32) -> bool {
 ///   (`observes_returns` false), or whose entry no check has seen yet (the
 ///   kernel keeps the old mask when it cannot write the frame).
 ///
-/// A mask Detcore installs privately is not this one either, but readers
-/// take the guest's mask from `Scheduler::saved_guest_sigmasks` first then.
+/// A mask Detcore installs privately is not this one either. While one is
+/// installed the scheduler reads no published mask: discard at send, poll
+/// admission and real-time timer fate take the guest's mask from
+/// `Scheduler::saved_guest_sigmasks`, and the choice of a process-directed
+/// signal's thread and the first SIGCHLD taker read the kernel's.
 fn mask_to_publish<T>(
     thread: &crate::tool_local::ThreadState<T>,
     observes_returns: bool,

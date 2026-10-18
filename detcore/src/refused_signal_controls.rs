@@ -26,10 +26,11 @@
 //! A refusal is reported at the process's next syscall Detcore sees, which is
 //! its exit call at the latest when it exits normally. A process that dies
 //! before then reports nothing: one killed from outside, and one that faults
-//! in the signal it asked to handle (the runtime delivers SIGSEGV's default
-//! action itself, and the kernel ends a process on SIGBUS, SIGFPE or SIGILL),
-//! because neither path reaches Detcore; a thread's exit hook does not run on
-//! those deaths either, so it is not used.
+//! in the signal it asked to handle (SIGSEGV's default action is delivered by
+//! the runtime while it traps instructions and by the kernel otherwise; the
+//! kernel ends a process on SIGBUS, SIGFPE or SIGILL), because neither path
+//! reaches Detcore; a thread's exit hook does not run on those deaths either,
+//! so it is not used.
 
 use std::sync::OnceLock;
 

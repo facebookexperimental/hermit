@@ -28,10 +28,16 @@ Where the copy is kept, some decisions read it in place of the kernel's
   thread blocks it, which thread takes a SIGCHLD first, whether a real-time
   timer's expiration is kept, and whether a restartable poll admits the
   signal. Each thread publishes its mask, except inside a temporary-mask
-  wait, before a reported handler return or a handler entry has been
-  checked, and with a handler frame open whose return the backend would not
-  report. While Detcore holds a thread under a mask of its own, the kernel's
-  mask is read, as before.
+  wait or after one was interrupted while its mask is still to be put back,
+  before a reported handler return or a handler entry has been checked, and
+  with a handler frame open whose return the backend would not report.
+  While Detcore holds a thread under a mask of its own, the published mask
+  is not read, and each reader reads what it read before: whether a send
+  discards the signal, whether a restartable poll admits it and whether a
+  real-time timer's expiration is kept read the guest's mask that Detcore
+  saved; the choice of the thread a process-directed signal goes to
+  (including whether every thread blocks it) and of the first SIGCHLD taker
+  read the kernel's mask.
 
 A thread publishes what changed before its next scheduler request, in at
 most three extra messages (its process's dispositions, at most twice, and its

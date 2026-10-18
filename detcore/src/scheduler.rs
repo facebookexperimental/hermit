@@ -1708,8 +1708,15 @@ pub struct Scheduler {
     /// does not show it: the guest's own mask while Detcore holds the thread
     /// under a private blocking mask (`block_signals_for_disposition`,
     /// `KernelSignalWait::block`), or a masked wait's temporary mask
-    /// (`publish_wait_mask`). Readers of a thread's mask use it in place of
-    /// the kernel's.
+    /// (`publish_wait_mask`). Most readers of a thread's mask use it in place
+    /// of the kernel's: discard at send (`discard_mask`), poll admission
+    /// (`poll_mask_admits`), real-time timer fate
+    /// (`real_time_expiration_fate`), `sibling_signal_state`, the child-exit
+    /// notification decision and `leader_ignores_sigalrm`. Of the readers
+    /// that may take a published mask, the choice of a process-directed
+    /// signal's thread (`kernel_signal_target`) and the first SIGCHLD taker
+    /// (`first_sigchld_taker`) read the kernel's mask instead, through
+    /// `thread_signal_mask_for`.
     saved_guest_sigmasks: BTreeMap<DetTid, u64>,
 
     /// Each thread's mask as Detcore's signal-state copy holds it, published
@@ -22431,15 +22438,6 @@ mod test {
         assert!(!scheduler.blocked.sigchld_takers.contains(&target));
     }
 
-    /// A second `SIGCHLD` sent while the first is still pending in the
-    /// process's shared queue coalesces, as Linux does not queue a standard
-    /// signal already pending (`legacy_queue`): it wakes no thread and makes
-    /// none a taker, so the thread the first send woke takes the one copy.
-    /// Before, the second send woke its own target and marked it too, and the
-    /// lower-numbered target was resumed first and took the copy (the Codex
-    /// review of https://github.com/rrnewton/hermit/issues/4304). Where the
-    /// window and the queue disagree, one is stale and the thread is woken,
-    /// as before.
     /// A5 step 2b: the first SIGCHLD taker is chosen by the mask its thread
     /// published in place of `SigBlk`, and by the kernel's under a private
     /// mask or once the mask is withdrawn.
@@ -22484,6 +22482,15 @@ mod test {
         assert_eq!(scheduler.first_sigchld_taker(), None, "withdrawn");
     }
 
+    /// A second `SIGCHLD` sent while the first is still pending in the
+    /// process's shared queue coalesces, as Linux does not queue a standard
+    /// signal already pending (`legacy_queue`): it wakes no thread and makes
+    /// none a taker, so the thread the first send woke takes the one copy.
+    /// Before, the second send woke its own target and marked it too, and the
+    /// lower-numbered target was resumed first and took the copy (the Codex
+    /// review of https://github.com/rrnewton/hermit/issues/4304). Where the
+    /// window and the queue disagree, one is stale and the thread is woken,
+    /// as before.
     #[test]
     fn a_coalesced_sigchld_wakes_no_thread() {
         let chld = kernel_signal_bit(libc::SIGCHLD);
