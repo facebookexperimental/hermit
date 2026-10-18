@@ -2108,13 +2108,13 @@ fi
 # portable1050 effective-job-second limit and all job/selection limits remain
 # unchanged, not recalibrated. One qualified sample from the dbt lane's
 # terminal-translation-candidate-r1, not a five-sample calibration campaign.
-# CARRY TO 188cb62ab812068cd71ef80f2c43e5854572f70e (2026-10-18): from
-# 4561503488d69d6d4350d5db090279c9cf8bb3e4. reverie-dbt/, root Cargo.toml, Cargo.lock and
-# rust-toolchain.toml and third-party/ are byte-identical. DBT inventory
-# remains 973. This R source identity preserves the existing SDK budget,
-# job width and limits; root Cargo/toolchain inputs are unchanged.
-# This source carry supplies no new timing or runtime qualification.
-expected_pin=188cb62ab812068cd71ef80f2c43e5854572f70e
+# CARRY TO 6bdd0533a38f68a5742b361df656e32b2237d78a (2026-10-18): from
+# 188cb62ab812068cd71ef80f2c43e5854572f70e. 6bdd0533 reverts 188cb62a (ptrace CPUID arming), so
+# its tree equals 4561503488d69d6d4350d5db090279c9cf8bb3e4's exactly. git diff is empty under reverie-dbt/ and
+# for the root Cargo.toml, Cargo.lock and rust-toolchain.toml in both steps, so
+# the inventory (973), SDK and native inputs, calibrated budget, job width and
+# limits are unchanged from the 45615034 carry.
+expected_pin=6bdd0533a38f68a5742b361df656e32b2237d78a
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
