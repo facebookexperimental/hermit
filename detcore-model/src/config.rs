@@ -223,10 +223,11 @@ pub struct Config {
     /// SIGHUP and SIGCONT when it hangs up, SIGINT, SIGQUIT and SIGTSTP for its
     /// interrupt, quit and suspend characters, SIGWINCH when it is resized, and
     /// SIGTTIN and SIGTTOU for a background process group's reads and writes.
-    /// The guest makes no traced call that arms them, so where blocked waits
-    /// decide interruption from the kernel's signal state
-    /// (`BackendCapabilities::supports_blocked_wait_signal_interruption`) the
-    /// scheduler records all eight as host-timed for every process before the
+    /// The guest makes no traced call that arms them, so where Detcore treats
+    /// such signals as reaching the guest from the host (the legacy bundled
+    /// condition
+    /// [`crate::bundled_signal_facts::host_timed_signal_sources_are_physical`])
+    /// the scheduler records all eight as host-timed for every process before the
     /// guest's first instruction, and no gated wait ends for them
     /// (<https://github.com/rrnewton/hermit/issues/3146>).
     ///
@@ -1940,8 +1941,9 @@ impl Default for Config {
 /// computed from `config`. [`Config::record_host_inputs`], which the legacy
 /// form never had, is left out too, and reads back as false: this form serves
 /// only DBT, whose launcher collects no host inputs. So is
-/// [`Config::guest_may_inherit_a_terminal`], which only DBT-false
-/// capability `supports_blocked_wait_signal_interruption` reads, and [`Config::in_guest_detlog_forward_policy`] and
+/// [`Config::guest_may_inherit_a_terminal`], which is read only where
+/// [`crate::bundled_signal_facts::host_timed_signal_sources_are_physical`]
+/// holds, false for DBT, and [`Config::in_guest_detlog_forward_policy`] and
 /// [`Config::in_guest_site_patching_off`], which is unset for DBT, and
 /// [`Config::launch_image`], which came after it. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
@@ -2374,9 +2376,9 @@ mod legacy_backend_json {
     /// `record_host_inputs` has no legacy key and no legacy value: the legacy
     /// form serves only DBT, whose launcher collects no host inputs, so it is
     /// never written and always reads as false.
-    /// So is `guest_may_inherit_a_terminal`, which only the capability
-    /// `supports_blocked_wait_signal_interruption` reads; that is false for
-    /// DBT.
+    /// So is `guest_may_inherit_a_terminal`, which is read only where
+    /// `bundled_signal_facts::host_timed_signal_sources_are_physical` holds;
+    /// that is false for DBT.
     /// `target_timeslice_syscalls_only` came after the legacy form froze; the
     /// legacy form never carried it, so it is never written and reads as false,
     /// the behaviour every legacy reader already has.

@@ -435,6 +435,7 @@ pub use detcore_dbt::reverie_dbt_runtime_thread_init;
 #[doc(hidden)]
 #[cfg(feature = "dbt")]
 pub use detcore_dbt::reverie_dbt_runtime_totals;
+use detcore_model::bundled_signal_facts;
 pub use error::Context;
 pub use error::Error;
 pub use error::FailureKind;
@@ -4048,10 +4049,14 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // `delivers_preemption_timer_events`, `runs_guest_code_between_injections`),
     // not derived from its name here (audit step A9 of
     // https://github.com/rrnewton/hermit/issues/4485).
-    // Only those waits read it (`Config::guest_may_inherit_a_terminal`), so the
+    // Only backends where Detcore treats a terminal's signals as reaching the
+    // guest from the host read it (`Config::guest_may_inherit_a_terminal`, the
+    // legacy bundled condition
+    // `bundled_signal_facts::host_timed_signal_sources_are_physical`), so the
     // host is asked only for them.
     config.guest_may_inherit_a_terminal =
-        config.backend.supports_blocked_wait_signal_interruption && launcher_may_pass_a_terminal();
+        bundled_signal_facts::host_timed_signal_sources_are_physical(&config.backend)
+            && launcher_may_pass_a_terminal();
     config
 }
 

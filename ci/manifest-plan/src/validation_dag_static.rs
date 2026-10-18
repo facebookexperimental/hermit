@@ -1114,7 +1114,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Restore the two qualified-runtime preparation tests: 1623.
     // And manifest-plan validation_dag::tests::
     // dev_profile_pinned_consumers_do_not_wait_for_the_e2e_artifact: 1627.
-    ("test.regular_crates", 1_627),
+    ("test.regular_crates", 1_628),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4823,7 +4823,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 7 Buck e2e cell tests (456dbc38, 5ebcb9dd, 1722f214): 1607.
     // Restore the two qualified-runtime preparation tests: 1609.
     // And the same dev-profile consumer ordering test: 1613.
-    ("test.regular_crates_on_host", 1_613),
+    ("test.regular_crates_on_host", 1_614),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

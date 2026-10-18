@@ -117,6 +117,7 @@ pub use config::to_legacy_backend_json;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
 pub use consts::ROOT_DETPID;
+use detcore_model::bundled_signal_facts;
 pub use digest::Digest;
 #[cfg(test)]
 use rand::RngExt as _;
@@ -2724,7 +2725,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if kept
             && self.cfg.signal_state_copy
             && self.cfg.sequentialize_threads
-            && self.cfg.backend.supports_blocked_wait_signal_interruption
+            && bundled_signal_facts::kernel_signal_state_is_guests(&self.cfg.backend)
             && signal != reverie::PERF_EVENT_SIGNAL as i32
             && signal != libc::SIGKILL
             && signal != libc::SIGSTOP

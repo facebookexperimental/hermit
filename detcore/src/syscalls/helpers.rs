@@ -2652,12 +2652,9 @@ pub(crate) async fn publish_wait_mask<T, G>(
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    let models_signal_targets = guest.config().sequentialize_threads
-        && guest
-            .config()
-            .backend
-            .supports_blocked_wait_signal_interruption;
-    if mask == published.0 || !models_signal_targets {
+    if mask == published.0
+        || !detcore_model::bundled_signal_facts::models_signal_targets(guest.config())
+    {
         return;
     }
     crate::tool_global::set_saved_guest_sigmask(guest, mask).await;

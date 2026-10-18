@@ -44,6 +44,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use detcore_model::bundled_signal_facts;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -64,7 +65,7 @@ use crate::types::DetTid;
 /// thread IDs are host tasks. Every guest-side hook and `/proc` read of the
 /// record is gated on it, so another backend (KVM) behaves as before.
 pub(crate) fn records(cfg: &crate::config::Config) -> bool {
-    cfg.sequentialize_threads && cfg.backend.supports_blocked_wait_signal_interruption
+    bundled_signal_facts::models_signal_targets(cfg)
 }
 
 /// The standard signals this record tracks: 1 to 31.

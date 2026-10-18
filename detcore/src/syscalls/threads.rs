@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use detcore_model::bundled_signal_facts;
 use procfs::process::Process;
 use rand::Rng;
 use reverie::BackendCapabilities;
@@ -1178,8 +1179,9 @@ pub(crate) enum SignalQueue {
 /// if any, chosen by host thread-ID allocation, so its signal state must never
 /// decide a guest-visible outcome. Every read that exists today is gated off on
 /// such a backend by a capability (`models_signal_targets`,
-/// `supports_blocked_wait_signal_interruption`,
-/// `reports_child_exit_publication`, a nested PID namespace, or the guard in
+/// `supports_blocked_wait_signal_interruption` or one of its named readings in
+/// `detcore_model::bundled_signal_facts`, `reports_child_exit_publication`, a
+/// nested PID namespace, or the guard in
 /// `restartable_internal_io_interrupting_signals`); this latch is the backstop
 /// for a future path that misses its gate.
 #[cfg(not(test))]
@@ -1866,10 +1868,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // process, and never forget it (`Scheduler::record_host_timed_signals`).
         let exit_signals = clone_host_timed_signals(flags, exit_signal);
         if exit_signals != 0
-            && guest
-                .config()
-                .backend
-                .supports_blocked_wait_signal_interruption
+            && bundled_signal_facts::host_timed_signal_sources_are_physical(&guest.config().backend)
         {
             record_host_timed_signals(guest, HostTimedSignalScope::Caller, exit_signals).await;
         }
@@ -5379,10 +5378,7 @@ fn read_futex_word<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     // Only a backend that runs the guest as real host threads has a host
     // `/proc/<pid>/maps` describing the guest; elsewhere (KVM's guest pid is
     // virtual) the user-access read above is the backend's whole answer.
-    if !guest
-        .config()
-        .backend
-        .supports_blocked_wait_signal_interruption
+    if !bundled_signal_facts::host_task_reads_enabled(&guest.config().backend)
         || !mapping_is_writable(guest.pid().as_raw(), address)
     {
         return Err(Error::Errno(Errno::EFAULT));
@@ -5445,11 +5441,7 @@ fn read_user_timespec<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     if last > user_ptr_max() {
         return Err(Error::Errno(Errno::EFAULT));
     }
-    if !guest
-        .config()
-        .backend
-        .supports_blocked_wait_signal_interruption
-    {
+    if !bundled_signal_facts::host_task_reads_enabled(&guest.config().backend) {
         // No host `/proc` describes this guest (KVM's guest pid is virtual), so
         // the backend's own user-access read decides, all or nothing.
         let mut bytes = [0u8; std::mem::size_of::<Timespec>()];

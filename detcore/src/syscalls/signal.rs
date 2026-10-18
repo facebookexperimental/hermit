@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use detcore_model::bundled_signal_facts;
 use detcore_model::schedule::SigWrapper;
 use nix::sys::signal::Signal;
 use reverie::Errno;
@@ -2348,7 +2349,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// to `pid` when `pid` names its own process (`process`, the process that
     /// `pid` names: any of its live threads' ids names it), and the process
     /// has another live thread (https://github.com/rrnewton/hermit/issues/4034).
-    /// Only on ptrace, where Detcore reads every input from the schedule.
+    /// Only where the kernel's signal state for a guest thread is the guest's
+    /// own (the legacy bundled condition
+    /// `bundled_signal_facts::kernel_signal_state_is_guests`: ptrace and
+    /// e9patch): the decision reads each thread's blocked, pending, ignored
+    /// and caught sets from the kernel, and Detcore reads every other input
+    /// from the schedule.
     async fn own_process_signal<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2357,11 +2363,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         process: libc::pid_t,
         sig: libc::c_int,
     ) -> Result<OwnProcessSend, Error> {
-        if !guest
-            .config()
-            .backend
-            .supports_blocked_wait_signal_interruption
-        {
+        if !bundled_signal_facts::kernel_signal_state_is_guests(&guest.config().backend) {
             return Ok(OwnProcessSend::NotOwn);
         }
         let sender = guest.thread_state().dettid;
@@ -2627,10 +2629,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let signals = orphaned_group_signals(sig);
         if signals != 0
-            && guest
-                .config()
-                .backend
-                .supports_blocked_wait_signal_interruption
+            && bundled_signal_facts::host_timed_signal_sources_are_physical(&guest.config().backend)
         {
             record_host_timed_signals(guest, HostTimedSignalScope::Container, signals).await;
         }
@@ -3451,11 +3450,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // may use), goes to it unchanged; a copy that certainly faults is
         // answered EFAULT here; and a `siginfo_t` Hermit cannot read whole is
         // refused by name (`rt_sigqueueinfo_precheck`).
-        if guest
-            .config()
-            .backend
-            .supports_blocked_wait_signal_interruption
-        {
+        if bundled_signal_facts::host_task_reads_enabled(&guest.config().backend) {
             match self.rt_sigqueueinfo_precheck(guest, &call) {
                 RtSigqueueinfoPrecheck::KernelFails => {
                     return Ok(self.record_or_replay(guest, call).await?);
@@ -3612,8 +3607,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         signal: SigWrapper,
     ) {
-        if !(self.cfg.sequentialize_threads
-            && self.cfg.backend.supports_blocked_wait_signal_interruption)
+        if !bundled_signal_facts::models_signal_targets(&self.cfg)
             || guest.thread_state().handler_restore_rt_reported == REAL_TIME_SIGNALS
         {
             return;

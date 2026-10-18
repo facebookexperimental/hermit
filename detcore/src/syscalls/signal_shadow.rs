@@ -27,6 +27,7 @@
 //! never repaired from the kernel, which would hide the defect the check is
 //! for.
 
+use detcore_model::bundled_signal_facts;
 use reverie::Errno;
 use reverie::Guest;
 use reverie::Pid;
@@ -142,9 +143,9 @@ impl From<KernelSigaction> for Action {
 
 /// Whether this backend's kernel signal state for a guest thread is the
 /// guest's own: the guest thread is a host task, and no runtime in the
-/// guest's process installs handlers or masks of its own. This is the mechanism
-/// fact `supports_blocked_wait_signal_interruption` describes (true for
-/// ptrace, and for e9patch, which runs under ptrace). Threads must also be
+/// guest's process installs handlers or masks of its own
+/// (`bundled_signal_facts::kernel_signal_state_is_guests`: ptrace, and
+/// e9patch, which runs under ptrace). Threads must also be
 /// serialized: otherwise two threads sharing actions could change them in the
 /// kernel in one order and in the copy in another. Elsewhere the copy is
 /// neither seeded from the kernel nor checked against it.
@@ -156,7 +157,7 @@ where
     let config = guest.config();
     config.signal_state_copy
         && config.sequentialize_threads
-        && config.backend.supports_blocked_wait_signal_interruption
+        && bundled_signal_facts::kernel_signal_state_is_guests(&config.backend)
         && !host_signal_state_reads_refused()
 }
 

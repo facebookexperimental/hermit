@@ -47,6 +47,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::vec::IntoIter;
 
+use detcore_model::bundled_signal_facts;
 use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::Position;
 use detcore_model::happens_before::Strength;
@@ -435,12 +436,16 @@ pub(crate) fn terminal_signals() -> u64 {
 /// The signals recorded as host-timed for every process of the container
 /// before the guest's first instruction (`host_timed_signals_everywhere`):
 /// every signal a terminal sends (`terminal_signals`) when the guest may start
-/// with a terminal and blocked waits decide interruption from the kernel's
-/// signal state (`Config::guest_may_inherit_a_terminal`), and nothing
-/// otherwise. The guest makes no traced call that arms them, so no guest turn
+/// with a terminal and Detcore treats a terminal's signals as reaching the
+/// guest from the host (`Config::guest_may_inherit_a_terminal`, the legacy
+/// bundled condition
+/// `bundled_signal_facts::host_timed_signal_sources_are_physical`), and
+/// nothing otherwise. The guest makes no traced call that arms them, so no guest turn
 /// could record them (<https://github.com/rrnewton/hermit/issues/3146>).
 fn startup_host_timed_signals(cfg: &Config) -> u64 {
-    if cfg.backend.supports_blocked_wait_signal_interruption && cfg.guest_may_inherit_a_terminal {
+    if bundled_signal_facts::host_timed_signal_sources_are_physical(&cfg.backend)
+        && cfg.guest_may_inherit_a_terminal
+    {
         terminal_signals()
     } else {
         0
@@ -1381,10 +1386,9 @@ pub struct Scheduler {
     pending_cross_task_signals: BTreeMap<DetTid, Vec<SigWrapper>>,
 
     /// Whether the scheduler models which thread the kernel gives a signal it
-    /// sends, from the signal masks it reads from the kernel: set exactly when
-    /// threads are serialized and the backend decides blocked-wait interruption
-    /// from the kernel's signal state
-    /// (`supports_blocked_wait_signal_interruption`). Under it the
+    /// sends, from the signal masks it reads from the kernel: set from
+    /// `bundled_signal_facts::models_signal_targets` (serialized threads on
+    /// ptrace or e9patch). Under it the
     /// scheduler records the mask of each thread it releases into a call
     /// outside the schedule (`BlockedPool::out_of_scheduler_masks`), wakes such
     /// a thread at a fixed point when its own signal reaches it
@@ -3882,8 +3886,7 @@ impl Scheduler {
             fast_forward_for_alone_poller: false,
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
-            models_signal_targets: cfg.sequentialize_threads
-                && cfg.backend.supports_blocked_wait_signal_interruption,
+            models_signal_targets: bundled_signal_facts::models_signal_targets(cfg),
             host_timed_signals: Default::default(),
             host_timed_signals_everywhere: startup_host_timed_signals(cfg),
             #[cfg(test)]
@@ -12549,11 +12552,10 @@ impl Scheduler {
                 // Only a scheduler with `models_signal_targets` reads or records
                 // that mask. Its two readers, `kernel_sigchld_target` (through
                 // `thread_signal_mask`) and `arm_signaled_background`, run only
-                // under that flag, and the flag needs
-                // `supports_blocked_wait_signal_interruption`, which a
-                // backend sets only when its `DetTid`s are the host thread IDs
-                // that `/proc` names (`prepare_backend_config` in
-                // `hermit-cli/src/lib.rs`). On a backend whose IDs are
+                // under that flag, and the flag
+                // (`bundled_signal_facts::models_signal_targets`) is true only
+                // on a backend whose `DetTid`s are the host thread IDs that
+                // `/proc` names (ptrace and e9patch). On a backend whose IDs are
                 // guest-virtual, a `/proc` read of `dettid` would name an
                 // unrelated host thread or none at all.
                 let own_mask = self
