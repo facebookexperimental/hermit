@@ -1805,13 +1805,16 @@ impl ProcfsFile {
     /// The guest thread whose signal mask this status snapshot reports as
     /// `SigBlk`, given the kernel's `contents` and the calling process
     /// (`virtual_pid`): the process's leader for the caller's own process
-    /// status, the thread its `Pid:` line names, in the guest's numbers, for
-    /// another process's or thread's, and none for the calling thread's own
-    /// status (it is in this call, so Detcore holds it under no private
-    /// mask) or for a file that is not a status.
+    /// status, the thread that opened a `thread-self` status
+    /// (`bound_thread_identity`), which a sibling may read through a shared
+    /// descriptor while that thread waits (Codex re-check of R2b-2 stage 2,
+    /// P2), the thread its `Pid:` line names, in the guest's numbers, for
+    /// another process's or thread's, and none for a file that is not a
+    /// status.
     pub(crate) fn status_mask_thread(&self, contents: &[u8], virtual_pid: i32) -> Option<i32> {
         match self.kind {
             ProcfsKind::Status => Some(virtual_pid),
+            ProcfsKind::ThreadStatus => self.bound_thread_identity.map(|(_, tid, _)| tid),
             ProcfsKind::ProcessStatus => {
                 let pid = contents
                     .split(|byte| *byte == b'\n')
@@ -6682,8 +6685,11 @@ Rss:                   4 kB\n" as &[u8];
         assert_eq!(process.status_mask_thread(status, 3), Some(5));
         let own = ProcfsFile::from_path(Path::new("/proc/self/status")).unwrap();
         assert_eq!(own.status_mask_thread(status, 3), Some(3));
-        let thread_self = ProcfsFile::from_path(Path::new("/proc/thread-self/status")).unwrap();
-        assert_eq!(thread_self.status_mask_thread(status, 3), None);
+        // A thread-self status describes the thread that opened it, whoever
+        // reads it through a shared descriptor.
+        let mut thread_self = ProcfsFile::from_path(Path::new("/proc/thread-self/status")).unwrap();
+        thread_self.bind_thread_identity(3, 5, 1);
+        assert_eq!(thread_self.status_mask_thread(status, 3), Some(5));
         let stat = ProcfsFile::from_path(Path::new("/proc/3/task/5/stat")).unwrap();
         assert_eq!(stat.status_mask_thread(status, 3), None);
     }

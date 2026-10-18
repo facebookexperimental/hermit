@@ -41808,7 +41808,7 @@ fn pipe_wake_rows_under_record_and_replay() {
 /// The rows of the R2b-2 stage 2 tests (`guest_restartable_two_signals`):
 /// arguments and the line Hermit prints. Natively (Linux 7.1.3, 3 of 3 each)
 /// a row's line is the same unless a comment says otherwise.
-const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 17] = [
+const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 18] = [
     (
         &["read", "chld", "winch"],
         "read: -1 EINTR, handlers before return: 28 17, after join: 28 17",
@@ -41889,6 +41889,14 @@ const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 17] = [
     (
         &["maskvis"],
         "maskvis: 1 0, handlers before return: 17, after join: 17, sibling saw SigBlk 0000000000000800",
+    ),
+    // As `maskvis`, through a /proc/thread-self/status descriptor the worker
+    // opened and main reads: the file describes the worker, which opened it,
+    // so it reports the worker's published mask too (Codex re-check of R2b-2
+    // stage 2, P2), which read fffffffe7ffb7eef.
+    (
+        &["maskvisfd"],
+        "maskvisfd: 1 0, handlers before return: 17, after join: 17, sibling saw SigBlk 0000000000000800",
     ),
     (
         &["spinwake"],
@@ -41973,7 +41981,7 @@ fn restartable_two_signal_rows_under_record_and_replay() {
         args.len() == 3
             || matches!(
                 args[0],
-                "twoturn" | "alarmheld" | "ignheld" | "spinwake" | "maskvis"
+                "twoturn" | "alarmheld" | "ignheld" | "spinwake" | "maskvis" | "maskvisfd"
             )
     }) {
         let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();

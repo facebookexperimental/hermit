@@ -40,6 +40,9 @@
  *       The worker's mask is SIGUSR2 alone throughout: under Hermit the
  *       status must report the guest's mask, not the one Detcore installs
  *       while the read blocks every signal for the held SIGCHLD.
+ *   maskvisfd  As maskvis, but the worker opens /proc/thread-self/status
+ *       before it reads, and main reads SigBlk through that shared
+ *       descriptor: the file still describes the worker, which opened it.
  *
  * The worker prints the call's result, the handlers that started before the
  * call returned, and, after main joins it, every handler that started:
@@ -96,6 +99,7 @@ static atomic_int returned;
 static int returned_during_spin = -1;
 static unsigned long long sibling_saw_sigblk;
 static int sibling_read_sigblk;
+static volatile int worker_status_fd = -1;
 
 /* Natively the read returns at once. Under Hermit a prompt drain wake ends it
  * within one of the spinning thread's timeslices: 26,619,596 iterations of a
@@ -159,12 +163,17 @@ static void *worker(void *unused)
     sigaddset(&mask, SIGALRM);
     if (pthread_sigmask(SIG_UNBLOCK, &mask, NULL) != 0)
         die("pthread_sigmask");
-    if (!strcmp(mode, "maskvis")) {
+    if (!strcmp(mode, "maskvis") || !strcmp(mode, "maskvisfd")) {
         sigset_t usr2;
         sigemptyset(&usr2);
         sigaddset(&usr2, SIGUSR2);
         if (pthread_sigmask(SIG_BLOCK, &usr2, NULL) != 0)
             die("pthread_sigmask");
+    }
+    if (!strcmp(mode, "maskvisfd")) {
+        worker_status_fd = open("/proc/thread-self/status", O_RDONLY | O_CLOEXEC);
+        if (worker_status_fd < 0)
+            die("open thread-self status");
     }
     worker_tid = syscall(SYS_gettid);
     static char buffer[70000];
@@ -215,7 +224,7 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < sizeof caught / sizeof caught[0]; i++)
         if (sigaction(caught[i], &action, NULL) != 0)
             die("sigaction");
-    if (!strcmp(mode, "maskvis")) {
+    if (!strcmp(mode, "maskvis") || !strcmp(mode, "maskvisfd")) {
         struct sigaction restart = action;
         restart.sa_flags |= SA_RESTART;
         if (sigaction(SIGCHLD, &restart, NULL) != 0)
@@ -265,14 +274,19 @@ int main(int argc, char **argv)
         for (long i = 0; i < SPIN_BOUND && !atomic_load(&returned); i++) {
         }
         returned_during_spin = atomic_load(&returned);
-    } else if (!strcmp(mode, "maskvis")) {
+    } else if (!strcmp(mode, "maskvis") || !strcmp(mode, "maskvisfd")) {
         syscall(SYS_tgkill, pid, worker_tid, SIGCHLD);
         sleep_ms(50);
-        char path[128];
-        snprintf(path, sizeof path, "/proc/self/task/%d/status", (int)worker_tid);
-        FILE *status = fopen(path, "r");
+        FILE *status;
+        if (!strcmp(mode, "maskvisfd")) {
+            status = fdopen(worker_status_fd, "r");
+        } else {
+            char path[128];
+            snprintf(path, sizeof path, "/proc/self/task/%d/status", (int)worker_tid);
+            status = fopen(path, "r");
+        }
         if (!status)
-            die("fopen status");
+            die("open status");
         char line[512];
         while (fgets(line, sizeof line, status))
             if (sscanf(line, "SigBlk: %llx", &sibling_saw_sigblk) == 1)
