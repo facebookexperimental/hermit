@@ -37,7 +37,7 @@
 #   -o OUTDIR  output directory (default: ignored/stress-test/<UTC time>)
 #   NEXTEST_SELECTION  the selection exactly as a validate DAG test.* node passes
 #              it to ci/run-nextest-counted.sh, e.g. for test.detcore_misc:
-#              -p hermit-detcore --test tests_misc -j 1 -- --skip has_rdrand_without_detcore
+#              -p hermit-detcore-tests --test tests_misc -j 1 -- --skip has_rdrand_without_detcore
 #
 # Writes OUTDIR/stress-test-results.json, OUTDIR/STRESS_TEST_RESULTS.md and
 # OUTDIR/junit.xml. Exit status: 0 when every test is CLEAN, 1 otherwise, 2 on

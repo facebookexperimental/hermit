@@ -45,7 +45,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `test-allocator`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-cdylib, hermit-detcore, hermit-record, hermit-record-format, hermit-replay, hermit-verify, test-allocator.",
+      "_why": "@generated: Cargo package `test-allocator`; reverse-dependent closure: detcore-testutils, hermit-detcore-tests, test-allocator.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -66,23 +66,12 @@
         "e2e.manifest_util_c_on_host",
         "lint.clippy_on_host",
         "lint.rustfmt",
-        "test.app_strict_verify_on_host",
         "test.applications_e2e",
-        "test.arbitrary_binaries_on_host",
-        "test.cli_on_host",
-        "test.command_strict_verify_on_host",
         "test.detcore_misc_on_host",
         "test.detcore_parallel_on_host",
         "test.detcore_time_on_host",
-        "test.detcore_unit_on_host",
         "test.envelope_levels",
-        "test.hermit_integration_on_host",
-        "test.hermit_modes_on_host",
-        "test.hermit_unit_on_host",
-        "test.ignored_syscall_regressions_on_host",
-        "test.regular_crates_on_host",
-        "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host"
+        "test.regular_crates_on_host"
       ],
       "paths": [
         "common/test-allocator/**/*.rs",
@@ -90,7 +79,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-test-workdir`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-cdylib, hermit-detcore, hermit-record, hermit-record-format, hermit-replay, hermit-test-workdir, hermit-verify.",
+      "_why": "@generated: Cargo package `hermit-test-workdir`; reverse-dependent closure: detcore-testutils, hermit, hermit-cdylib, hermit-detcore-tests, hermit-test-workdir.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -119,7 +108,6 @@
         "test.detcore_misc_on_host",
         "test.detcore_parallel_on_host",
         "test.detcore_time_on_host",
-        "test.detcore_unit_on_host",
         "test.envelope_levels",
         "test.hermit_integration_on_host",
         "test.hermit_modes_on_host",
@@ -135,7 +123,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-cdylib, hermit-detcore, hermit-record, hermit-record-format, hermit-replay, hermit-verify.",
+      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-cdylib, hermit-detcore, hermit-detcore-tests, hermit-record, hermit-record-format, hermit-replay, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -253,7 +241,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-cdylib, hermit-detcore, hermit-manifest-plan, hermit-record, hermit-record-format, hermit-replay, hermit-verify.",
+      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-cdylib, hermit-detcore, hermit-detcore-tests, hermit-manifest-plan, hermit-record, hermit-record-format, hermit-replay, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -318,6 +306,23 @@
       ]
     },
     {
+      "_why": "@generated: Cargo package `hermit-detcore-tests`; reverse-dependent closure: hermit-detcore-tests.",
+      "nodes": [
+        "build.workspace_on_host",
+        "doc.doctests_on_host",
+        "doc.rustdoc_on_host",
+        "lint.clippy_on_host",
+        "lint.rustfmt",
+        "test.detcore_misc_on_host",
+        "test.detcore_parallel_on_host",
+        "test.detcore_time_on_host"
+      ],
+      "paths": [
+        "detcore/tests/**/*.rs",
+        "detcore/tests/Cargo.toml"
+      ]
+    },
+    {
       "_why": "@generated: Cargo package `hermit-lit-guests`; reverse-dependent closure: hermit-lit-guests.",
       "nodes": [
         "build.workspace_on_host",
@@ -333,7 +338,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-testutils`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-cdylib, hermit-detcore, hermit-record, hermit-record-format, hermit-replay, hermit-verify.",
+      "_why": "@generated: Cargo package `detcore-testutils`; reverse-dependent closure: detcore-testutils, hermit-detcore-tests.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -354,23 +359,12 @@
         "e2e.manifest_util_c_on_host",
         "lint.clippy_on_host",
         "lint.rustfmt",
-        "test.app_strict_verify_on_host",
         "test.applications_e2e",
-        "test.arbitrary_binaries_on_host",
-        "test.cli_on_host",
-        "test.command_strict_verify_on_host",
         "test.detcore_misc_on_host",
         "test.detcore_parallel_on_host",
         "test.detcore_time_on_host",
-        "test.detcore_unit_on_host",
         "test.envelope_levels",
-        "test.hermit_integration_on_host",
-        "test.hermit_modes_on_host",
-        "test.hermit_unit_on_host",
-        "test.ignored_syscall_regressions_on_host",
-        "test.regular_crates_on_host",
-        "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host"
+        "test.regular_crates_on_host"
       ],
       "paths": [
         "detcore/tests/testutils/**/*.rs",

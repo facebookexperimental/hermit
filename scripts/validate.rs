@@ -225,7 +225,7 @@ const NEXTEST_FULL_PREPARE_COMMAND: &str =
     "./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target";
 const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str = "./ci/nextest-binaries.rs assert privileged";
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str =
-    r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1"#;
+    r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore-tests tests_misc)" || exit 1"#;
 
 fn integration_artifact_producer(step: &Step) -> &'static str {
     if step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
@@ -31289,7 +31289,7 @@ printf finalized >target/finalized
             "using the prior preparation must not invoke Cargo"
         );
         let executable = run_build(
-            "./ci/nextest-binaries.rs executable hermit-detcore tests_misc",
+            "./ci/nextest-binaries.rs executable hermit-detcore-tests tests_misc",
             root.path(),
             &bin,
             &log,
@@ -31300,7 +31300,7 @@ printf finalized >target/finalized
         assert_eq!(
             executable,
             root.path()
-                .join("custom-cargo-target/debug/build/hermit-detcore/out/tests_misc")
+                .join("custom-cargo-target/debug/build/hermit-detcore-tests/out/tests_misc")
         );
         assert!(
             executable.is_file(),
@@ -31384,7 +31384,7 @@ printf finalized >target/finalized
         assert!(
             privileged_selections
                 .values()
-                .any(|args| args == &["-p", "hermit-detcore", "--test", "tests_misc"])
+                .any(|args| args == &["-p", "hermit-detcore-tests", "--test", "tests_misc"])
         );
         let mut direct = committed
             .steps
@@ -31415,7 +31415,7 @@ printf finalized >target/finalized
             String::from_utf8_lossy(&direct_result.stderr)
         );
         let missing_declaration = run_build(
-            "export HERMIT_PREPARED_NEXTEST_REQUIRED=1; unset NEXTEST_PREPARED_BUILD_SELECTION; ./ci/nextest-binaries.rs executable hermit-detcore tests_misc",
+            "export HERMIT_PREPARED_NEXTEST_REQUIRED=1; unset NEXTEST_PREPARED_BUILD_SELECTION; ./ci/nextest-binaries.rs executable hermit-detcore-tests tests_misc",
             privileged_root.path(),
             &privileged_bin,
             &privileged_log,
@@ -31426,7 +31426,7 @@ printf finalized >target/finalized
             "the required direct selection cannot be omitted"
         );
         let wrong_declaration = run_build(
-            "export HERMIT_PREPARED_NEXTEST_REQUIRED=1; export NEXTEST_PREPARED_BUILD_SELECTION='[\"-p\",\"hermit-detcore\",\"--lib\"]'; ./ci/nextest-binaries.rs executable hermit-detcore tests_misc",
+            "export HERMIT_PREPARED_NEXTEST_REQUIRED=1; export NEXTEST_PREPARED_BUILD_SELECTION='[\"-p\",\"hermit-detcore\",\"--lib\"]'; ./ci/nextest-binaries.rs executable hermit-detcore-tests tests_misc",
             privileged_root.path(),
             &privileged_bin,
             &privileged_log,

@@ -512,7 +512,7 @@ the selection itself with `--stress-count`, retries are off, and each failure is
 classified from the typed `type` on the JUnit `<failure>` that nextest writes:
 
 ```console
-scripts/stress-test.sh -n 500 -- -p hermit-detcore --test tests_misc -j 1 -- --skip has_rdrand_without_detcore
+scripts/stress-test.sh -n 500 -- -p hermit-detcore-tests --test tests_misc -j 1 -- --skip has_rdrand_without_detcore
 ```
 
 This ports the useful one-box-per-red-cell shape from the old parent-workspace

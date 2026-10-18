@@ -15,6 +15,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--exclude",
             "hermit-detcore",
             "--exclude",
+            "hermit-detcore-tests",
+            "--exclude",
             "hermit",
             "--exclude",
             "hermetic_infra_hermit_flaky-tests",
@@ -43,17 +45,17 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         | "privileged-only-cpuid.faulting_on_host"
         | "super.post_fork_scheduling_diagnostics"
         | "super.network_syscall_determinism_diagnostic" => {
-            Some(&["-p", "hermit-detcore", "--test", "tests_misc"])
+            Some(&["-p", "hermit-detcore-tests", "--test", "tests_misc"])
         }
         "test.detcore_time" | "privileged-test.pmu_detcore_time_cases" => {
-            Some(&["-p", "hermit-detcore", "--test", "tests_time"])
+            Some(&["-p", "hermit-detcore-tests", "--test", "tests_time"])
         }
         "test.detcore_parallel"
         | "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore"
         | "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore"
         | "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore"
         | "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore" => {
-            Some(&["-p", "hermit-detcore", "--test", "tests_parallelism"])
+            Some(&["-p", "hermit-detcore-tests", "--test", "tests_parallelism"])
         }
         "test.hermit_integration" | "test.pmu_integration_cases" => Some(&[
             "-p",
@@ -1312,8 +1314,8 @@ mod tests {
         assert_command_selection(direct).unwrap();
         let mut wrong_target = direct.clone();
         wrong_target.cmd = wrong_target.cmd.replace(
-            "executable hermit-detcore tests_misc",
-            "executable hermit-detcore tests_parallelism",
+            "executable hermit-detcore-tests tests_misc",
+            "executable hermit-detcore-tests tests_parallelism",
         );
         assert!(assert_command_selection(&wrong_target).is_err());
         let mut missing_direct = direct.clone();

@@ -1054,7 +1054,6 @@ dependencies = [
  "chrono",
  "clap",
  "detcore-model",
- "detcore-testutils",
  "futures 0.3.33",
  "hex",
  "libc",
@@ -1068,16 +1067,34 @@ dependencies = [
  "raw-cpuid",
  "regex",
  "reverie-core",
- "reverie-ptrace",
  "ruzstd 0.9.0",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
- "test-allocator",
  "test-case",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "hermit-detcore-tests"
+version = "0.4.1"
+dependencies = [
+ "chrono",
+ "detcore-model",
+ "detcore-testutils",
+ "hermit-detcore",
+ "libc",
+ "nix 0.30.1",
+ "pretty_assertions",
+ "raw-cpuid",
+ "reverie-core",
+ "reverie-ptrace",
+ "serde",
+ "tempfile",
+ "test-allocator",
+ "tokio",
 ]
 
 [[package]]

@@ -581,6 +581,8 @@ pub fn budget_context(
         "--exclude",
         "hermit-detcore",
         "--exclude",
+        "hermit-detcore-tests",
+        "--exclude",
         "hermit",
         "--exclude",
         "hermetic_infra_hermit_flaky-tests",
@@ -2328,7 +2330,7 @@ mod tests {
     fn several_selections_unify_to_the_workspace_with_qualified_features() {
         let several = selections(&[
             "-p hermit --features third-party-backends,kvm-native-test-support --lib --bins",
-            "-p hermit-detcore --test tests_misc",
+            "-p hermit-detcore-tests --test tests_misc",
             "-p hermit --features third-party-backends,kvm-execution-tests --lib --test cli",
             "--workspace --exclude hermit",
         ]);
@@ -2348,7 +2350,7 @@ mod tests {
     #[test]
     fn only_validate_profile_profiles_unify_their_listing() {
         let several = selections(&[
-            "-p hermit-detcore --test tests_misc",
+            "-p hermit-detcore-tests --test tests_misc",
             "-p hermit --features third-party-backends --test hermit_modes",
         ]);
         for profile in ["full", "hosted-portable"] {
