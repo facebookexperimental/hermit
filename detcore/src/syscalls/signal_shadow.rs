@@ -1177,10 +1177,18 @@ where
 /// unreported (`BackendCapabilities::reports_sigreturns`) where nothing would
 /// check the copy before a later check reports a divergence. Handler frames then close only on those reports
 /// ([`record_sigreturn_report`]), not by inference ([`reconcile_returns`]).
+///
+/// Not under `--imprecise-timers` either. A reported return within the keep
+/// margin of a precise preemption event requests it again at the same target
+/// (Reverie `Timer::disregard_sigreturn_stop`), but an imprecise one past its
+/// period is cancelled, and nothing would preempt a thread that then runs
+/// without a syscall (A5 step 2c). Without the reports, the copy infers
+/// returns from the kernel's mask, as it does wherever they are off.
 pub(crate) fn observes_sigreturns(config: &crate::Config) -> bool {
     enabled()
         && config.sequentialize_threads
         && !config.gdbserver
+        && !config.imprecise_timers
         && config.backend.reports_sigreturns
         && config.inherited_seccomp == detcore_model::config::InheritedSeccomp::Disabled
 }
@@ -2765,6 +2773,13 @@ mod tests {
             ..config(reverie::BackendCapabilities::PTRACE)
         };
         assert!(!observes_sigreturns(&parallel));
+        // Nor under --imprecise-timers, whose preemption events a reported
+        // return would lose.
+        let imprecise = Config {
+            imprecise_timers: true,
+            ..config(reverie::BackendCapabilities::PTRACE)
+        };
+        assert!(!observes_sigreturns(&imprecise));
         for backend in [
             reverie::BackendCapabilities::E9PATCH,
             reverie::BackendCapabilities::KVM,

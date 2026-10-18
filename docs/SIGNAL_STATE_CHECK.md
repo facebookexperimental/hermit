@@ -58,8 +58,10 @@ would have decided as if nothing were known.
 On ptrace, turning it on also asks the backend to report each guest
 `rt_sigreturn` before it runs, so the copy follows handler returns exactly
 instead of guessing them. It asks only when Hermit measured that the guest
-inherits no seccomp filter and no gdbserver is attached (`--gdbserver`);
-without the reports the copy guesses returns from the kernel's mask, as it
+inherits no seccomp filter and no gdbserver is attached (`--gdbserver`),
+and not under `--imprecise-timers`, whose preemption events a reported
+return would cancel past their period without requesting them again.
+Without the reports the copy guesses returns from the kernel's mask, as it
 always did. The reports cost something, and in a few cases they change
 the run:
 
@@ -77,8 +79,6 @@ the run:
   again:
   - the mask the handler's frame restores blocks the timer's signal, or
     cannot be read;
-  - the run uses `--imprecise-timers`, whose events are cancelled past
-    their period;
   - single steps toward the event failed to clean up, and the thread has
     already reached the target (short of it, the event is requested again
     as above);
@@ -110,5 +110,4 @@ What it reports:
   much was actually checked.
 
 It stays opt-in because the backend does not report every delivery yet, and
-because the timer cases above, `--imprecise-timers` first, must be handled
-or refused before the copy can be on by default.
+because of the timer cases above.
