@@ -31210,6 +31210,40 @@ fn a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux() {
     assert_eq!(stdout(&replay), expected, "replayed ready2 lost a signal");
 }
 
+/// A thread that reads a pipe in a loop, retrying on EINTR, is interrupted by
+/// a sibling that `pthread_kill`s it every 100 us until its handler has run,
+/// as the jobserver crate's helper shutdown does, and verifies at bitwise
+/// parity. Each signal's wake moved the polling reader to the back of the run
+/// queue, behind the sender, whose next turn therefore always came first: the
+/// read was never interrupted, and the guest gave up after 1000 signals
+/// (https://github.com/rrnewton/hermit/issues/4504). The expected line is the
+/// native run's.
+#[test]
+fn a_polled_read_signaled_again_and_again_is_interrupted() {
+    let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--",
+        guest.as_str(),
+        "repeat",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "joined, handled 1\n");
+    let log = stderr(&output);
+    assert!(
+        log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+        "comparison was not canonical:\n{log}"
+    );
+    assert!(
+        log.contains(":: Success: deterministic. Determinism verified."),
+        "verification failed:\n{log}"
+    );
+}
+
 /// A process-directed signal a thread sends to its own multi-threaded process
 /// goes to the sender, before `kill` returns, exactly as Linux delivers it,
 /// when the schedule fixes the kernel's choice and the sender's dequeue

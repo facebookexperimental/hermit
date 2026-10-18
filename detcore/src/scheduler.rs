@@ -14279,7 +14279,7 @@ impl Scheduler {
                     // signal the kernel would deliver now ends the poll: a
                     // blocked, ignored or held one leaves it polling, with
                     // its request and place in the run queue unchanged.
-                    let (task, decides_itself) = self
+                    let (task, decides_itself, woken) = self
                         .next_turns
                         .get(&dettid)
                         .and_then(|next_turn| next_turn.req.try_read())
@@ -14288,9 +14288,13 @@ impl Scheduler {
                             (
                                 resources.signal_state_task,
                                 resources.decides_signal_interruption_itself,
+                                resources
+                                    .resources
+                                    .keys()
+                                    .any(|id| matches!(id, ResourceID::WaitidSignals(_))),
                             )
                         })
-                        .unwrap_or((None, false));
+                        .unwrap_or((None, false, false));
                     // A poll that checks the disposition itself after the
                     // wake (a parked pipe `writev`) keeps every signal.
                     let interrupting = if decides_itself {
@@ -14305,15 +14309,6 @@ impl Scheduler {
                     if signals.is_empty() {
                         continue;
                     }
-                    // Replace the polling request rather than adding a second
-                    // resource; step4 accepts exactly one.
-                    if self.run_queue.contains_tid(dettid) {
-                        let removed = self.run_queue.remove_tid(dettid);
-                        debug_assert!(
-                            removed,
-                            "run_queue.contains_tid disagreed with remove_tid for {dettid}"
-                        );
-                    }
                     let mut resources = Resources::new(dettid);
                     // `WaitidSignals` is already the scheduler's one-resource
                     // representation for a complete signal identity set. The
@@ -14325,6 +14320,29 @@ impl Scheduler {
                     // same thread's state.
                     resources.signal_state_task = task;
                     resources.decides_signal_interruption_itself = decides_itself;
+                    if woken && self.run_queue.contains_tid(dettid) {
+                        // An earlier batch already woke the poll and queued it.
+                        // Merge into that wake in place, as a pending waitid
+                        // wake does, keeping its place in the run queue. Moving
+                        // it to the back on every batch starved it whenever a
+                        // sibling signaled it once per turn: the sibling's own
+                        // turn always came first, so the poll never ran and
+                        // never took the signal
+                        // (https://github.com/rrnewton/hermit/issues/4504).
+                        if let Some(next_turn) = self.next_turns.get_mut(&dettid) {
+                            next_turn.req = Ivar::full(Ok(resources));
+                        }
+                        continue;
+                    }
+                    // Replace the polling request rather than adding a second
+                    // resource; step4 accepts exactly one.
+                    if self.run_queue.contains_tid(dettid) {
+                        let removed = self.run_queue.remove_tid(dettid);
+                        debug_assert!(
+                            removed,
+                            "run_queue.contains_tid disagreed with remove_tid for {dettid}"
+                        );
+                    }
                     // Marked after the unblock, which clears blocking entries,
                     // as for a futex waiter: a `SIGCHLD` this batch carries is
                     // not committed to the poll (`drain_woken_waiters`), whose
@@ -26397,6 +26415,63 @@ mod test {
                     SigWrapper::from(Signal::SIGTERM),
                 ]
         ));
+    }
+
+    /// A signal to a restartable internal IO poll that an earlier signal
+    /// already woke merges into that wake and leaves the poll where it is in
+    /// the run queue. Moving it to the back on every batch starved it behind
+    /// a sibling that signaled it once per turn: the sibling's requeued turn
+    /// always came first (https://github.com/rrnewton/hermit/issues/4504).
+    #[test]
+    fn a_signal_to_an_already_woken_poll_keeps_its_place_in_the_run_queue() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        let sender = DetTid::from_raw(101);
+        register_known_thread(&mut scheduler, target);
+        register_known_thread(&mut scheduler, sender);
+        let mut polling = Resources::new(target);
+        polling.insert(ResourceID::InternalIOPolling, Permission::W);
+        polling.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+        polling.fyi("read");
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(polling));
+        scheduler.runqueue_push_back(target);
+        scheduler.runqueue_push_back(sender);
+
+        // The first signal wakes the poll, which goes to the back.
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
+        scheduler.drain_pending_cross_task_signals();
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(sender));
+        scheduler.run_queue.undo_tentative_pop();
+
+        // The sender has its turn and is queued again behind the poll.
+        assert!(scheduler.run_queue.remove_tid(sender));
+        scheduler.runqueue_push_back(sender);
+
+        // Its next signal must not put the poll behind it again.
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR2));
+        scheduler.drain_pending_cross_task_signals();
+        assert_eq!(scheduler.run_queue.len(), 2);
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(target));
+        scheduler.run_queue.undo_tentative_pop();
+        let resources = scheduler
+            .next_turns
+            .get(&target)
+            .and_then(|next_turn| next_turn.req.try_read())
+            .and_then(Result::ok)
+            .expect("the target should hold its signal interruption request");
+        assert_eq!(resources.resources.len(), 1);
+        assert!(
+            resources
+                .resources
+                .contains_key(&ResourceID::WaitidSignals(vec![
+                    SigWrapper::from(Signal::SIGUSR1),
+                    SigWrapper::from(Signal::SIGUSR2)
+                ]))
+        );
+        assert_eq!(
+            resources.signal_interrupt_errno(),
+            Some(Errno::ERESTARTSYS.into_raw())
+        );
     }
 
     #[test]

@@ -58,6 +58,17 @@
  *   waitpid        a sibling signals a thread blocked in
  *                  waitpid(child, WUNTRACED) for a child that has not exited:
  *                  the wait fails with EINTR.
+ *   repeat         a sibling reads in a loop, retrying on EINTR, until told
+ *                  to stop; the main thread tells it, then sends SIGUSR1
+ *                  every 100 us until the handler has run, as the jobserver
+ *                  crate's helper shutdown does, and joins it. Natively the
+ *                  first signal interrupts the read. Under Hermit each signal
+ *                  moved the woken reader to the back of the run queue, so
+ *                  the sender's next turn always came first and the read was
+ *                  never interrupted
+ *                  (https://github.com/rrnewton/hermit/issues/4504). After
+ *                  REPEAT_LIMIT signals the main thread gives up, releases
+ *                  the reader with a byte and says so.
  *
  * Each mode prints one line per observation, which equals the native run's.
  */
@@ -187,6 +198,52 @@ static void write_byte(void) {
   if (write(pipe_fds[1], "x", 1) != 1) {
     fail("write");
   }
+}
+
+static volatile sig_atomic_t stop_reading;
+
+static void* looping_reader(void* unused) {
+  (void)unused;
+  announce_ready();
+  char byte;
+  while (!stop_reading) {
+    if (read(pipe_fds[0], &byte, 1) < 0 && errno != EINTR) {
+      fail("read");
+    }
+  }
+  return NULL;
+}
+
+/* Natively 1000 signals 100 us apart is 100 ms, far more than the reader needs. */
+#define REPEAT_LIMIT 1000
+
+static int repeat_mode(void) {
+  install(0, handler);
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, looping_reader, NULL) != 0) {
+    fail("pthread_create");
+  }
+  await_ready();
+  settle();
+  stop_reading = 1;
+  int sent = 0;
+  while (!handled && sent < REPEAT_LIMIT) {
+    if (pthread_kill(thread, SIGUSR1) != 0) {
+      fail("pthread_kill");
+    }
+    sent++;
+    struct timespec pause = {0, 100000};
+    nanosleep(&pause, NULL);
+  }
+  if (!handled) {
+    printf("no handler ran after %d signals\n", sent);
+    write_byte();
+  }
+  if (pthread_join(thread, NULL) != 0) {
+    fail("pthread_join");
+  }
+  printf("joined, handled %d\n", handled > 0);
+  return 0;
 }
 
 static int thread_mode(void) {
@@ -442,7 +499,7 @@ int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(stderr,
             "usage: %s eintr|restart|ignored|blocked|ready|eof|ready2|cancel|process|write-zero|write-room|write-partial|"
-            "write-partial-blocked|write-partial-ignored|waitpid\n",
+            "write-partial-blocked|write-partial-ignored|waitpid|repeat\n",
             argv[0]);
     return 2;
   }
@@ -462,6 +519,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(mode, "waitpid") == 0) {
     return waitpid_mode();
+  }
+  if (strcmp(mode, "repeat") == 0) {
+    return repeat_mode();
   }
   if (strcmp(mode, "eintr") == 0 || strcmp(mode, "restart") == 0 ||
       strcmp(mode, "ignored") == 0 || strcmp(mode, "blocked") == 0 ||
