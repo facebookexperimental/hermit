@@ -190,8 +190,13 @@ case $container in
         bundle_env+=(HERMIT_E2E_DIGEST_CACHE_DIR="${HERMIT_E2E_DIGEST_CACHE_DIR:-/tmp/hermit-e2e-digests-$UID}"
             HERMIT_E2E_SESSION_CENSUS="${HERMIT_E2E_SESSION_CENSUS:-/tmp/hermit-e2e-session-census-$UID}")
     fi
+    # The harness asks git whether an enclosing checkout tracks the bundle's src/ (a local
+    # bundle sits in the checkout's buck-out; runner.rs validate_source_snapshot). Where
+    # git is the telemetry wrapper of a Meta host, which runs four more git commands and a
+    # logger per call, it asks the git behind the wrapper.
+    [[ -x /usr/local/bin/git.meta.real ]] && bundle_env+=(HERMIT_E2E_SNAPSHOT_GIT=/usr/local/bin/git.meta.real)
     env -u HERMIT_E2E_EMPTY_WORKDIR -u HERMIT_E2E_BUNDLE_RECORD -u HERMIT_E2E_DIGEST_CACHE_DIR \
-        -u HERMIT_E2E_SESSION_CENSUS \
+        -u HERMIT_E2E_SESSION_CENSUS -u HERMIT_E2E_SNAPSHOT_GIT \
         "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_BUILD_ROOT="$B/build" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
@@ -266,7 +271,7 @@ exec "$@"'
     inner_bundle_env=()
     ((${#bundle_env[@]})) && inner_bundle_env=(HERMIT_E2E_BUNDLE_RECORD=/src/bundle/BUNDLE_RECORD.json)
     env -u HERMIT_E2E_EMPTY_WORKDIR -u HERMIT_E2E_BUNDLE_RECORD -u HERMIT_E2E_DIGEST_CACHE_DIR \
-        -u HERMIT_E2E_SESSION_CENSUS \
+        -u HERMIT_E2E_SESSION_CENSUS -u HERMIT_E2E_SNAPSHOT_GIT \
         "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \

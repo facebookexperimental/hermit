@@ -29,7 +29,12 @@ pub(crate) const REPOSITORY_LOCATION_VARIABLES: [&str; 8] = [
 /// A `git` command that finds its repository from its own `-C` or working
 /// directory, never from an inherited repository-location variable.
 pub(crate) fn git_command() -> Command {
-    let mut command = Command::new("git");
+    git_command_at(std::path::Path::new("git"))
+}
+
+/// [`git_command`] running the git executable `program`.
+pub(crate) fn git_command_at(program: &std::path::Path) -> Command {
+    let mut command = Command::new(program);
     for name in REPOSITORY_LOCATION_VARIABLES {
         command.env_remove(name);
     }

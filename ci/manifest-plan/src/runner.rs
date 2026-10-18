@@ -158,7 +158,18 @@ pub fn validate_source_sha(sha: &str) -> Result<(), String> {
 /// (a corrupt index, an unusable `.git`, no git to run) is refused: the files
 /// might be tracked. The search for `.git` starts from the resolved root, so
 /// a symlink to tracked files is looked up where the files are.
+///
+/// The SHA cannot stand in for this check: it is the claim being checked, and
+/// nothing in it says whether an enclosing checkout tracks the root.
+/// [`SNAPSHOT_GIT_ENV`] may name the git to ask.
 pub fn validate_source_snapshot(root: &Path, sha: &str) -> Result<(), String> {
+    let git = std::env::var_os(SNAPSHOT_GIT_ENV)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from("git"), PathBuf::from);
+    validate_source_snapshot_with(root, sha, &git)
+}
+
+fn validate_source_snapshot_with(root: &Path, sha: &str, git: &Path) -> Result<(), String> {
     validate_source_sha(sha)?;
     let resolved = std::fs::canonicalize(root).map_err(|error| {
         format!(
@@ -172,7 +183,7 @@ pub fn validate_source_snapshot(root: &Path, sha: &str) -> Result<(), String> {
     {
         return Ok(());
     }
-    let tracked = crate::git_environment::git_command()
+    let tracked = crate::git_environment::git_command_at(git)
         .arg("-C")
         .arg(root)
         .args(["ls-files", "--error-unmatch", "--", "."])
@@ -204,6 +215,12 @@ pub fn validate_source_snapshot(root: &Path, sha: &str) -> Result<(), String> {
         )),
     }
 }
+
+/// The git that [`validate_source_snapshot`] asks whether a snapshot's files
+/// are tracked, when set. ci/buck-e2e/cell.sh names the host's git behind its
+/// telemetry wrapper there: the wrapper runs four more git commands and a
+/// logger for each call, about 0.04 CPU-s against 0.015 for the one command.
+pub const SNAPSHOT_GIT_ENV: &str = "HERMIT_E2E_SNAPSHOT_GIT";
 
 fn first_attempt() -> u64 {
     1
@@ -10179,6 +10196,33 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// The git asked is the one named, and a named git that cannot run
+    /// refuses the snapshot as an absent one does.
+    #[test]
+    fn a_snapshot_is_checked_with_the_named_git() {
+        let base = std::env::temp_dir().join(format!("runner-named-git-{}", std::process::id()));
+        let checkout = base.join("checkout");
+        let snapshot = checkout.join("snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        let says = |name: &str, status: i32| {
+            let path = base.join(name);
+            fs::write(&path, format!("#!/bin/sh\nexit {status}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let untracked = says("untracked-git", 1);
+        let tracked = says("tracked-git", 0);
+        let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
+        let accepted = validate_source_snapshot_with(&snapshot, sha, &untracked);
+        let refused = validate_source_snapshot_with(&snapshot, sha, &tracked);
+        let absent = validate_source_snapshot_with(&snapshot, sha, &base.join("no-git"));
+        fs::remove_dir_all(&base).unwrap();
+        assert_eq!(accepted, Ok(()));
+        assert!(refused.unwrap_err().contains("Git tracks files under"));
+        assert!(absent.unwrap_err().contains("git cannot run"));
     }
 
     #[test]

@@ -71,7 +71,7 @@ def host(path):
 keys = ("HERMIT_E2E_EMPTY_WORKDIR", "E2E_RESULT_ROOT", "E2E_BUILD_ROOT", "VALIDATE_RUN_STATE",
         "E2E_RUN_ID", "HERMIT_BIN", "HERMIT_INSTALL_DIR", "E2E_KEEP_VERIFY_LOGS", "E2E_PARITY_POST_PASS",
         "HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN", "HERMIT_EPOCH", "HERMIT_E2E_BUNDLE_RECORD",
-        "HERMIT_E2E_DIGEST_CACHE_DIR", "HERMIT_E2E_SESSION_CENSUS")
+        "HERMIT_E2E_DIGEST_CACHE_DIR", "HERMIT_E2E_SESSION_CENSUS", "HERMIT_E2E_SNAPSHOT_GIT")
 # The client directory the DBT backend would load from: name -> link target, or None.
 rsrcs = os.path.join(host(os.environ.get("HERMIT_INSTALL_DIR", "/nonexistent")), "rsrcs")
 links = {n: os.readlink(os.path.join(rsrcs, n)) if os.path.islink(os.path.join(rsrcs, n)) else None
@@ -543,6 +543,13 @@ class CellTest(unittest.TestCase):
         [harness] = self.calls_by("harness")
         self.assertEqual(harness["env"]["HERMIT_E2E_SESSION_CENSUS"], str(self.tmp / "census"))
 
+    def test_a_host_cell_asks_the_git_behind_a_telemetry_wrapper_only_where_there_is_one(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_SNAPSHOT_GIT=str(self.tmp / "callers-git"))
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        real = "/usr/local/bin/git.meta.real"
+        self.assertEqual(harness["env"]["HERMIT_E2E_SNAPSHOT_GIT"], real if os.access(real, os.X_OK) else None)
+
     def test_a_bundle_without_a_record_names_none(self) -> None:
         done, _ = self.run_cell(HERMIT_E2E_BUNDLE_RECORD=str(self.tmp / "elsewhere.json"))
         self.assertEqual(done["status"], "passed", done)
@@ -573,6 +580,7 @@ class CellTest(unittest.TestCase):
         self.assertEqual(harness["env"]["HERMIT_E2E_BUNDLE_RECORD"], "/src/bundle/BUNDLE_RECORD.json")
         self.assertIsNone(harness["env"]["HERMIT_E2E_DIGEST_CACHE_DIR"])
         self.assertIsNone(harness["env"]["HERMIT_E2E_SESSION_CENSUS"])
+        self.assertIsNone(harness["env"]["HERMIT_E2E_SNAPSHOT_GIT"])
 
     def test_pinned_root_cell_drops_a_callers_cpu_scan_marker(self) -> None:
         done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",
