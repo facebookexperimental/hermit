@@ -377,7 +377,7 @@ class StageCargoOverlapTest(unittest.TestCase):
         self.assertEqual(self.finalizer_argv, [["--source-copy", target]])
         self.assertEqual(names.count(("start", "finalizer")), 1, names)
         self.assertEqual(names.count(("end", "finalizer")), 1, names)
-        for build in ("release", "hermit", "detcore-dbt+detcore-dbt-cdylib",
+        for build in ("release", "hermit", "detcore-liteinst", "detcore-dbt+detcore-dbt-cdylib",
                       "hermit-install+detcore-sabre+detcore-liteinst"):
             self.assertLess(names.index(("end", build)), names.index(("start", "finalizer")), names)
         publication = [i for i, (event, _) in enumerate(names) if event in ("install", "strip")]
@@ -386,8 +386,9 @@ class StageCargoOverlapTest(unittest.TestCase):
 
     def test_the_background_builds_overlap_the_validate_builds_and_finish_before_strip(self) -> None:
         # Each background build outlasts detcore-dbt and the install bundle (0.5 s each),
-        # so strip waits for both.
-        proc = self.run_stage(FAKE_CARGO_SECONDS_release="2.5", FAKE_CARGO_SECONDS_hermit="2.0")
+        # so strip waits for all three.
+        proc = self.run_stage(FAKE_CARGO_SECONDS_release="2.5", FAKE_CARGO_SECONDS_hermit="2.0",
+                              FAKE_CARGO_SECONDS_detcore_liteinst="2.0")
         events = self.events()
         self.assert_finalized_before_publication(events)
         names = [(event, label) for event, label, _ in events]
@@ -395,7 +396,7 @@ class StageCargoOverlapTest(unittest.TestCase):
         first_validate = "detcore-dbt+detcore-dbt-cdylib"
         strips = [i for i, (event, _) in enumerate(names) if event == "strip"]
         self.assertTrue(strips, f"stage never reached strip: {proc.stderr}")
-        for background in ("release", "hermit"):
+        for background in ("release", "hermit", "detcore-liteinst"):
             self.assertLess(times[("start", background)], times[("end", first_validate)], events)
             self.assertGreater(times[("end", background)], times[("start", first_validate)], events)
             self.assertLess(names.index(("end", background)), strips[0], events)
@@ -404,11 +405,14 @@ class StageCargoOverlapTest(unittest.TestCase):
         self.assertEqual(self.target_dirs["release"], target)
         self.assertEqual(self.target_dirs["detcore-dbt+detcore-dbt-cdylib"], target)
         self.assertEqual(self.target_dirs["hermit-install+detcore-sabre+detcore-liteinst"], target)
+        self.assertEqual(self.target_dirs["detcore-liteinst"], target)
         self.assertEqual(self.target_dirs["hermit"], target + "/stage-hermit")
         self.assertEqual((Path(target) / "validate" / "hermit").read_text(),
                          f"fake hermit built in {target}/stage-hermit\n")
         self.assertLess(names.index(("end", "hermit")), names.index(("install", f"{target}/validate/hermit")), events)
         # Each build is main's command; only the hermit build's target directory moved.
+        # The liteinst-runtime build is the packaging finalizer's own command, without
+        # --offline (the stage's other builds still fetch the git dependencies).
         manifest = str(self.stage.parent.parent.parent / "Cargo.toml")
         common = ["build", "--manifest-path", manifest, "--locked"]
         self.assertEqual(self.argv, {
@@ -420,6 +424,8 @@ class StageCargoOverlapTest(unittest.TestCase):
             "hermit-install+detcore-sabre+detcore-liteinst": common + [
                 "--profile", "validate", "-p", "hermit-install", "-p", "detcore-sabre", "-p", "detcore-liteinst",
                 "--target-dir", target],
+            "detcore-liteinst": common + ["-p", "detcore-liteinst", "--lib", "--profile", "liteinst-runtime",
+                                          "--target-dir", target],
         })
 
     def test_the_hermit_binary_is_copied_only_after_its_build_finishes_last(self) -> None:
@@ -464,7 +470,7 @@ class StageCargoOverlapTest(unittest.TestCase):
         self.assertEqual(names.count(("start", "finalizer")), 1, names)
         self.assertEqual(names.count(("fail", "finalizer")), 1, names)
         self.assertNotIn(("end", "finalizer"), names)
-        for build in ("release", "hermit", "detcore-dbt+detcore-dbt-cdylib",
+        for build in ("release", "hermit", "detcore-liteinst", "detcore-dbt+detcore-dbt-cdylib",
                       "hermit-install+detcore-sabre+detcore-liteinst"):
             self.assertLess(names.index(("end", build)), names.index(("start", "finalizer")), names)
         self.assertFalse(any(event in ("strip", "install") for event, _ in names), names)
@@ -502,14 +508,16 @@ class StageCargoOverlapTest(unittest.TestCase):
         self.assertIn("fake cargo hermit output", proc.stderr)
         self.assertNotIn("strip", [event for event, _, _ in self.events()])
 
-    def test_a_failed_validate_build_stops_both_running_background_builds(self) -> None:
+    def test_a_failed_validate_build_stops_every_running_background_build(self) -> None:
         children = self.tmp / "children"
-        proc = self.run_stage(FAKE_CARGO_FAIL="detcore-dbt+detcore-dbt-cdylib", FAKE_CARGO_FAIL_AFTER_START="hermit,release",
+        proc = self.run_stage(FAKE_CARGO_FAIL="detcore-dbt+detcore-dbt-cdylib",
+                              FAKE_CARGO_FAIL_AFTER_START="hermit,release,detcore-liteinst",
                               FAKE_CARGO_SECONDS_release="30", FAKE_CARGO_SECONDS_hermit="30",
+                              FAKE_CARGO_SECONDS_detcore_liteinst="30",
                               FAKE_CARGO_CHILDREN=str(children))
         self.assertEqual(proc.returncode, 3, proc.stderr)
         names = [(event, label) for event, label, _ in self.events()]
-        for background in ("release", "hermit"):
+        for background in ("release", "hermit", "detcore-liteinst"):
             self.assertIn(("killed", background), names)
             self.assertNotIn(("end", background), names)
         # The background builds' own children (rustc, build scripts) are stopped too,
@@ -518,8 +526,8 @@ class StageCargoOverlapTest(unittest.TestCase):
         pids = dict(line.split() for line in children.read_text().splitlines())
         for pid in pids.values():
             self.addCleanup(self.kill_quietly, int(pid))
-        self.assertEqual(sorted(pids), ["detcore-dbt+detcore-dbt-cdylib", "hermit", "release"])
-        for background in ("release", "hermit"):
+        self.assertEqual(sorted(pids), ["detcore-dbt+detcore-dbt-cdylib", "detcore-liteinst", "hermit", "release"])
+        for background in ("release", "hermit", "detcore-liteinst"):
             self.assertFalse(self.running(int(pids[background])),
                              f"the {background} build's child outlived stage")
             self.assertIn(("child-term", background), names, "the child was not sent SIGTERM with its build")
@@ -571,16 +579,18 @@ class StageReproducibleTest(unittest.TestCase):
         self.assertEqual(self.sentinel.read_text(), "previous staging\n", proc.stderr)
 
     def test_builds_run_in_the_fixed_copy_with_a_fixed_cargo_home_and_epoch(self) -> None:
-        proc = self.run_stage(FAKE_CARGO_FAIL="detcore-dbt+detcore-dbt-cdylib", FAKE_CARGO_FAIL_AFTER_START="hermit,release")
+        proc = self.run_stage(FAKE_CARGO_FAIL="detcore-dbt+detcore-dbt-cdylib",
+                              FAKE_CARGO_FAIL_AFTER_START="hermit,release,detcore-liteinst")
         self.assertEqual(proc.returncode, 3, proc.stderr)
         self.events()
         target = str(self.fixed / "src" / "target")
         self.assertEqual(self.target_dirs["release"], target)
+        self.assertEqual(self.target_dirs["detcore-liteinst"], target)
         self.assertEqual(self.target_dirs["detcore-dbt+detcore-dbt-cdylib"], target)
         self.assertEqual(self.target_dirs["hermit"], target + "/stage-hermit")
         epoch = subprocess.run(["git", "-C", str(self.tree), "log", "-1", "--format=%ct", "HEAD"],
                                capture_output=True, text=True, check=True).stdout.strip()
-        self.assertEqual(sorted(self.env), ["detcore-dbt+detcore-dbt-cdylib", "hermit", "release"])
+        self.assertEqual(sorted(self.env), ["detcore-dbt+detcore-dbt-cdylib", "detcore-liteinst", "hermit", "release"])
         for label, env in self.env.items():
             self.assertEqual(env, {"CARGO_HOME": str(self.fixed / "cargo"),
                                    "CARGO_HOME_TARGET": str(self.cargo_home.resolve()),
