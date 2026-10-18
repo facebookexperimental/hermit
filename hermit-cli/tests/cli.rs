@@ -7879,7 +7879,6 @@ fn run_ptrace_backend_engagement_from_a_working_directory_under_host_tmp() {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review DBT normal aggregation and strict failure coverage.
-// TODO(#2791): Remove the portable test.cli skip when DBT aggregation defect #2804 is fixed.
 #[test]
 fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls() {
     if dbt_unavailable(
@@ -9214,6 +9213,7 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
                 "dbt",
                 "run",
                 "--strict",
+                "--base-env=host",
                 "--verify",
                 "--verify-strict",
                 "--keep-logs",
@@ -9221,8 +9221,11 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
             ])
             .arg(&logs)
             .arg("--verify-json")
-            .arg(&verdict)
-            .arg("--")
+            .arg(&verdict);
+        // Use the normal epoch/workdir setup, while preserving the host-based
+        // environment that this test deliberately varies through HERMIT_LOG.
+        append_hermit_args(&mut command, &["--"]);
+        command
             .arg(dbt_log_env_guest())
             .arg(&expected_arg)
             .env_remove("HERMIT_LOG");

@@ -354,7 +354,7 @@
         "third-party-backends",
         "--test",
         "cli",
-        "run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them",
+        "run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls",
         "--",
         "--exact",
         "--test-threads=1"

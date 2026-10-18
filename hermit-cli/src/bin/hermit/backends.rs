@@ -55,6 +55,8 @@ use std::path::PathBuf;
 use std::process::Command as StdCommand;
 #[cfg(any(feature = "dbt", test))]
 use std::process::Output;
+#[cfg(feature = "dbt")]
+use std::sync::Arc;
 
 #[cfg(feature = "dbt")]
 use detcore::Config;
@@ -605,7 +607,7 @@ impl Drop for InstalledFd {
 #[cfg(feature = "dbt")]
 struct DbtUnsupportedSyscallReport {
     reader: std::fs::File,
-    _writer: std::fs::File,
+    writer: Arc<std::fs::File>,
     _report_fd: InstalledFd,
 }
 
@@ -627,7 +629,7 @@ impl DbtUnsupportedSyscallReport {
         )?;
         Ok(Self {
             reader,
-            _writer: writer,
+            writer: Arc::new(writer),
             _report_fd: report_fd,
         })
     }
@@ -980,10 +982,12 @@ impl DbtInvocation {
         for bind in &binds {
             hermit_test_workdir::check_bind_target(&bind.target)?;
         }
+        let unsupported_report = DbtUnsupportedSyscallReport::new()?;
         let execution = DbtExecution::new(
             options,
             isolated_workdir.is_some() && workdir == isolated_workdir,
         )
+        .reporting_unsupported_to(unsupported_report.writer.clone())
         .launching(
             program,
             workdir,
@@ -1010,7 +1014,6 @@ impl DbtInvocation {
             drrun.display()
         );
 
-        let unsupported_report = DbtUnsupportedSyscallReport::new()?;
         let mut guest = StdCommand::new(program);
         environment.remove(OsStr::new("HERMIT_LOG_FILE"));
         environment.insert(detcore_dbt::DETCONFIG_ENV.into(), config_json.into());
@@ -1543,6 +1546,8 @@ struct DbtExecution {
     options: super::run::RunOpts,
     /// The current physical run's unique host sink at its stable guest address.
     statistics: std::cell::RefCell<Option<Bind>>,
+    /// Existing invocation writer; Arc cloning does not create a descriptor.
+    unsupported_report: Option<Arc<std::fs::File>>,
     /// DynamoRIO's configuration directory inside the container; see
     /// `contained_command`.
     config_dir: PathBuf,
@@ -1572,9 +1577,15 @@ impl DbtExecution {
         Self {
             options: options.with_dbt_mounts(&[], mounts),
             statistics: Default::default(),
+            unsupported_report: None,
             config_dir: dynamorio_config_dir(),
             launched: None,
         }
+    }
+
+    fn reporting_unsupported_to(mut self, writer: Arc<std::fs::File>) -> Self {
+        self.unsupported_report = Some(writer);
+        self
     }
 
     /// Records `program`, run from `workdir` and found through `path`, as
@@ -1910,6 +1921,7 @@ fn run_once<R: Read + Send + 'static>(
     let runner = runner.clone();
     let guest = execution.contained_command(guest);
     let drrun = drrun.to_path_buf();
+    let report = execution.unsupported_report.clone();
     let evidence = OwnedDbtRunEvidence::from_borrowed(evidence)?;
     let mut input = Some(input);
     execution
@@ -1932,7 +1944,11 @@ fn run_once<R: Read + Send + 'static>(
                     ),
                 )
                 .map_err(|error| dbt_run_error(&drrun, error))?;
-            runtime.block_on(clean_up_dbt_global(&output.status, global));
+            runtime.block_on(clean_up_dbt_global(
+                &output.status,
+                global,
+                report.as_deref(),
+            ))?;
             Ok(DbtPhysicalOutput::from(output))
         })
         .map(Output::from)
@@ -1950,6 +1966,7 @@ fn run_once_with_inherited_input(
     let runner = runner.clone();
     let guest = execution.contained_command(guest);
     let drrun = drrun.to_path_buf();
+    let report = execution.unsupported_report.clone();
     let evidence = OwnedDbtRunEvidence::from_borrowed(evidence)?;
     execution
         .run(config, move |runtime, config| {
@@ -1966,7 +1983,11 @@ fn run_once_with_inherited_input(
                     ),
                 )
                 .map_err(|error| dbt_run_error(&drrun, error))?;
-            runtime.block_on(clean_up_dbt_global(&output.status, global));
+            runtime.block_on(clean_up_dbt_global(
+                &output.status,
+                global,
+                report.as_deref(),
+            ))?;
             Ok(DbtPhysicalOutput::from(output))
         })
         .map(Output::from)
@@ -1983,20 +2004,36 @@ fn run_status(
     let runner = runner.clone();
     let guest = execution.contained_command(guest);
     let drrun = drrun.to_path_buf();
+    let report = execution.unsupported_report.clone();
     execution
         .run(config, move |runtime, config| {
             let guest = prepare_dbt_physical_command(&guest)?;
             let (status, global) = runtime
                 .block_on(runner.status_with_global::<detcore::GlobalState>(&guest, config.clone()))
                 .map_err(|error| dbt_run_error(&drrun, error))?;
-            runtime.block_on(clean_up_dbt_global(&status, global));
+            runtime.block_on(clean_up_dbt_global(&status, global, report.as_deref()))?;
             Ok(status.into_raw())
         })
         .map(std::process::ExitStatus::from_raw)
 }
 
 #[cfg(feature = "dbt")]
-async fn clean_up_dbt_global(status: &std::process::ExitStatus, mut global: detcore::GlobalState) {
+async fn clean_up_dbt_global(
+    status: &std::process::ExitStatus,
+    mut global: detcore::GlobalState,
+    report: Option<&std::fs::File>,
+) -> std::io::Result<()> {
+    // The runner has drained RPC owners before returning exclusive GlobalState.
+    // Forward its aggregate through the existing invocation pipe used by
+    // copied-child records, without opening or duplicating a descriptor.
+    let exported = if let Some(mut report) = report {
+        global
+            .take_unsupported_syscalls()
+            .into_iter()
+            .try_for_each(|name| writeln!(report, "{name}"))
+    } else {
+        Ok(())
+    };
     if !status.success() {
         global.force_shutdown_with_error();
         // The physical supervisor and RPC owner drain have finished. A client
@@ -2004,6 +2041,8 @@ async fn clean_up_dbt_global(status: &std::process::ExitStatus, mut global: detc
         global.cancel_internal_scheduler().await;
     }
     global.clean_up(false, &None).await;
+    // Export failure must never bypass scheduler cleanup.
+    exported
 }
 
 /// Name the stage that actually failed.
@@ -2297,7 +2336,7 @@ mod tests {
             let status = std::process::ExitStatus::from_raw(raw_status);
             let completed = tokio::time::timeout(
                 std::time::Duration::from_millis(100),
-                super::clean_up_dbt_global(&status, global),
+                super::clean_up_dbt_global(&status, global, None),
             )
             .await
             .is_ok();
@@ -2327,7 +2366,7 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(100),
-                super::clean_up_dbt_global(&status, global),
+                super::clean_up_dbt_global(&status, global, None),
             )
             .await
             .is_ok(),
@@ -2341,7 +2380,7 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(100),
-                super::clean_up_dbt_global(&status, global),
+                super::clean_up_dbt_global(&status, global, None),
             )
             .await
             .is_err(),

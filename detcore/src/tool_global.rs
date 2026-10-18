@@ -1437,6 +1437,13 @@ impl Drop for GlobalState {
 }
 
 impl GlobalState {
+    /// Transfer the completed run's diagnostic aggregate to its output owner.
+    /// The backend must first reclaim exclusive ownership after all RPC clients
+    /// have drained. Callers that do not take it retain the ordinary Drop warning.
+    pub fn take_unsupported_syscalls(&mut self) -> BTreeSet<String> {
+        std::mem::take(self.unsupported_syscalls.get_mut().unwrap())
+    }
+
     /// Ordinary RPC mutation must linearize before terminal publication under
     /// the same mutex as scheduler grants. A losing callback stays pending for
     /// the backend's failure subscription to drop; no normal reply is invented.
@@ -14487,6 +14494,25 @@ mod tests {
         state.complete_physical_process_exit(detpid.as_raw());
         assert!(state.pending_exec_states.lock().unwrap().is_empty());
         assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn completed_unsupported_syscalls_transfer_once_without_duplicates() {
+        let mut state = GlobalState::initialize(&Config::default(), false);
+        for name in ["restart_syscall", "io_setup", "restart_syscall"] {
+            state
+                .unsupported_syscalls
+                .get_mut()
+                .unwrap()
+                .insert(name.to_owned());
+        }
+        assert_eq!(
+            state.take_unsupported_syscalls(),
+            ["io_setup".to_owned(), "restart_syscall".to_owned()]
+                .into_iter()
+                .collect()
+        );
+        assert!(state.take_unsupported_syscalls().is_empty());
     }
 
     #[test]
