@@ -2544,8 +2544,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the eight R2b-2 stage 2 units
     // (https://github.com/rrnewton/hermit/issues/4273): six in-place block
     // units, the drain-filter scheduler unit and the procfs SigBlk unit: 2094, listed.
-    // And +13 from 9ea35987: 2107.
-    ("test.detcore_unit", 2107),
+    // And +13 from 9ea35987: 2107. And +1 from the serialized-execution
+    // declaration (dh-mmmq): 2108.
+    ("test.detcore_unit", 2108),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4446,8 +4447,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the_first_child_exit_sigchld_taken_stands_for_the_exit_without_publication
     // (dev-hermit minibeads dh-l1fk): 2086.
     // And the same eight R2b-2 stage 2 units: 2094, listed.
-    // And +13 from 9ea35987: 2107.
-    ("test.detcore_unit_on_host", 2107),
+    // And +13 from 9ea35987: 2107. And +1 from the serialized-execution
+    // declaration (dh-mmmq): 2108.
+    ("test.detcore_unit_on_host", 2108),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
