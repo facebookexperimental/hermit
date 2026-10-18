@@ -71,7 +71,7 @@ def host(path):
 keys = ("HERMIT_E2E_EMPTY_WORKDIR", "E2E_RESULT_ROOT", "E2E_BUILD_ROOT", "VALIDATE_RUN_STATE",
         "E2E_RUN_ID", "HERMIT_BIN", "HERMIT_INSTALL_DIR", "E2E_KEEP_VERIFY_LOGS", "E2E_PARITY_POST_PASS",
         "HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN", "HERMIT_EPOCH", "HERMIT_E2E_BUNDLE_RECORD",
-        "HERMIT_E2E_DIGEST_CACHE_DIR")
+        "HERMIT_E2E_DIGEST_CACHE_DIR", "HERMIT_E2E_SESSION_CENSUS")
 # The client directory the DBT backend would load from: name -> link target, or None.
 rsrcs = os.path.join(host(os.environ.get("HERMIT_INSTALL_DIR", "/nonexistent")), "rsrcs")
 links = {n: os.readlink(os.path.join(rsrcs, n)) if os.path.islink(os.path.join(rsrcs, n)) else None
@@ -535,6 +535,13 @@ class CellTest(unittest.TestCase):
         self.assertEqual(done["status"], "passed", done)
         [harness] = self.calls_by("harness")
         self.assertEqual(harness["env"]["HERMIT_E2E_DIGEST_CACHE_DIR"], f"/tmp/hermit-e2e-digests-{os.getuid()}")
+        self.assertEqual(harness["env"]["HERMIT_E2E_SESSION_CENSUS"], f"/tmp/hermit-e2e-session-census-{os.getuid()}")
+
+    def test_a_host_cell_session_census_follows_the_callers_file(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_SESSION_CENSUS=str(self.tmp / "census"))
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertEqual(harness["env"]["HERMIT_E2E_SESSION_CENSUS"], str(self.tmp / "census"))
 
     def test_a_bundle_without_a_record_names_none(self) -> None:
         done, _ = self.run_cell(HERMIT_E2E_BUNDLE_RECORD=str(self.tmp / "elsewhere.json"))
@@ -544,17 +551,20 @@ class CellTest(unittest.TestCase):
 
     def test_an_re_cell_gets_the_record_but_no_digest_cache(self) -> None:
         (self.bundle / "BUNDLE_RECORD.json").write_text("{}\n")
-        done, _ = self.run_cell(HERMIT_E2E_ROUTE="re", HERMIT_E2E_DIGEST_CACHE_DIR=str(self.tmp / "digests"))
+        done, _ = self.run_cell(HERMIT_E2E_ROUTE="re", HERMIT_E2E_DIGEST_CACHE_DIR=str(self.tmp / "digests"),
+                                HERMIT_E2E_SESSION_CENSUS=str(self.tmp / "census"))
         self.assertEqual(done["status"], "passed", done)
         [harness] = self.calls_by("harness")
         self.assertEqual(harness["env"]["HERMIT_E2E_BUNDLE_RECORD"], str(self.bundle / "BUNDLE_RECORD.json"))
         self.assertIsNone(harness["env"]["HERMIT_E2E_DIGEST_CACHE_DIR"])
+        self.assertIsNone(harness["env"]["HERMIT_E2E_SESSION_CENSUS"])
 
     def test_a_pinned_root_cell_gets_its_private_copys_record_and_no_digest_cache(self) -> None:
         (self.bundle / "BUNDLE_RECORD.json").write_text("{}\n")
         done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",
                                 HERMIT_E2E_BUNDLE_RECORD=str(self.tmp / "elsewhere.json"),
-                                HERMIT_E2E_DIGEST_CACHE_DIR=str(self.tmp / "digests"))
+                                HERMIT_E2E_DIGEST_CACHE_DIR=str(self.tmp / "digests"),
+                                HERMIT_E2E_SESSION_CENSUS=str(self.tmp / "census"))
         self.assertEqual(done["status"], "passed", done)
         [wrapper] = self.calls_by("wrapper")
         self.assertIn("HERMIT_E2E_BUNDLE_RECORD=/src/bundle/BUNDLE_RECORD.json", wrapper["command"])
@@ -562,6 +572,7 @@ class CellTest(unittest.TestCase):
         [harness] = self.calls_by("harness")
         self.assertEqual(harness["env"]["HERMIT_E2E_BUNDLE_RECORD"], "/src/bundle/BUNDLE_RECORD.json")
         self.assertIsNone(harness["env"]["HERMIT_E2E_DIGEST_CACHE_DIR"])
+        self.assertIsNone(harness["env"]["HERMIT_E2E_SESSION_CENSUS"])
 
     def test_pinned_root_cell_drops_a_callers_cpu_scan_marker(self) -> None:
         done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",

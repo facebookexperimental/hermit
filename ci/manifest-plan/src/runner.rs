@@ -6969,11 +6969,32 @@ fn process_cgroup(pid: u32) -> Result<Option<String>, String> {
 /// comes from its leader's `stat`, or, once the leader is gone, from an earlier
 /// scan or from [`spawn_process`], which records each group it creates; without
 /// it every PID is read.
+///
+/// A Buck validation runs each e2e cell as a harness process of its own, so the
+/// first scan of every cell read every PID on the host (about 5,300 `stat`
+/// files, 0.12 CPU-s). With [`SESSION_CENSUS_ENV`] naming a file, the census
+/// starts from the one the last cell on this host left there and is written
+/// back after this process's first scan ([`SessionCensus::load`]), under the
+/// same reuse rule: an entry is kept only while the allocator cannot have
+/// handed its PID out again since the writer's scan began.
 fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
     let mut census = SESSION_CENSUS
-        .get_or_init(Default::default)
+        .get_or_init(session_census_from_env)
         .lock()
         .map_err(|_| "session census lock poisoned".to_string())?;
+    let (members, read) = scan_process_group(&mut census, pgid)?;
+    if !census.saved || read >= SESSION_CENSUS_SAVE_READS {
+        if let Some(path) = std::env::var_os(SESSION_CENSUS_ENV).filter(|v| !v.is_empty()) {
+            census.save(Path::new(&path));
+        }
+        census.saved = true;
+    }
+    Ok(members)
+}
+
+/// [`process_group_members`] with `census`; also returns how many `stat`
+/// files the scan read.
+fn scan_process_group(census: &mut SessionCensus, pgid: u32) -> Result<(Vec<u32>, usize), String> {
     let now = PidAllocator::read();
     census.begin(now, read_pid_max());
     let group_session = match read_process_stat(pgid)? {
@@ -6989,6 +7010,7 @@ fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
     };
     let mut members = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut read = 0;
     for entry in fs::read_dir("/proc").map_err(|error| format!("/proc: {error}"))? {
         let entry = entry.map_err(|error| format!("/proc: {error}"))?;
         let Some(pid) = entry
@@ -7003,6 +7025,7 @@ fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
         if group_session.is_some_and(|session| census.skip(pid, session)) {
             continue;
         }
+        read += 1;
         let mut session = None;
         let group = member_process_group(
             pid,
@@ -7023,7 +7046,7 @@ fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
         }
     }
     census.sessions.retain(|pid, _| seen.contains(pid));
-    Ok(members)
+    Ok((members, read))
 }
 
 /// Records the session of the process group a child of this process created
@@ -7034,7 +7057,7 @@ fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
 /// leaves the group.
 fn remember_spawned_group(pgid: u32) {
     let session = u32::try_from(unsafe { libc::getsid(0) }).ok();
-    if let Ok(mut census) = SESSION_CENSUS.get_or_init(Default::default).lock() {
+    if let Ok(mut census) = SESSION_CENSUS.get_or_init(session_census_from_env).lock() {
         census.remember_group(pgid, session, PidAllocator::read());
     }
 }
@@ -7046,6 +7069,31 @@ fn remember_spawned_group(pgid: u32) {
 static SESSION_CENSUS: std::sync::OnceLock<std::sync::Mutex<SessionCensus>> =
     std::sync::OnceLock::new();
 
+/// A file the session census starts from and is written back to, shared by
+/// the harness processes on one host (set by ci/buck-e2e/cell.sh).
+pub const SESSION_CENSUS_ENV: &str = "HERMIT_E2E_SESSION_CENSUS";
+const SESSION_CENSUS_SCHEMA: &str = "hermit-session-census/v1";
+/// After its first scan, a process writes the census back only after a scan
+/// that read at least this many `stat` files: later scans read little, and
+/// writing after every CPU poll would cost more than it saves.
+const SESSION_CENSUS_SAVE_READS: usize = 1024;
+
+fn session_census_from_env() -> std::sync::Mutex<SessionCensus> {
+    let census = std::env::var_os(SESSION_CENSUS_ENV)
+        .filter(|v| !v.is_empty())
+        .and_then(|path| SessionCensus::load(Path::new(&path)))
+        .unwrap_or_default();
+    std::sync::Mutex::new(census)
+}
+
+/// The kernel instance and PID namespace a census describes: PIDs and
+/// allocator positions mean nothing outside them.
+fn census_scope() -> Option<String> {
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let pidns = fs::read_link("/proc/self/ns/pid").ok()?;
+    Some(format!("{} {}", boot.trim(), pidns.to_str()?))
+}
+
 #[derive(Default)]
 struct SessionCensus {
     sessions: std::collections::HashMap<u32, u32>,
@@ -7053,9 +7101,72 @@ struct SessionCensus {
     /// was known to exist with that session.
     group_sessions: std::collections::HashMap<u32, (u32, PidAllocator)>,
     at: Option<PidAllocator>,
+    /// Whether this process has written the census back since it started.
+    saved: bool,
 }
 
 impl SessionCensus {
+    /// The census a previous process saved at `path`, or `None` when there is
+    /// none, it is unreadable, or it describes another boot or PID namespace;
+    /// every PID is then read, as without a file. Only the PID sessions and the
+    /// allocator position come across: [`Self::begin`] then drops each PID the
+    /// allocator may have handed out since the writer's scan began, exactly as
+    /// for this process's own previous scan. Group sessions stay per process.
+    fn load(path: &Path) -> Option<Self> {
+        Self::parse(&fs::read_to_string(path).ok()?, &census_scope()?)
+    }
+
+    fn parse(text: &str, scope: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        if lines.next()? != SESSION_CENSUS_SCHEMA || lines.next()?.strip_prefix("scope ")? != scope
+        {
+            return None;
+        }
+        let at: Vec<_> = lines.next()?.strip_prefix("at ")?.split(' ').collect();
+        let [last_pid, tasks, forks] = at.as_slice() else {
+            return None;
+        };
+        let at = PidAllocator {
+            last_pid: last_pid.parse().ok()?,
+            tasks: tasks.parse().ok()?,
+            forks: forks.parse().ok()?,
+        };
+        let mut sessions = std::collections::HashMap::new();
+        for line in lines {
+            let (pid, session) = line.split_once(' ')?;
+            sessions.insert(pid.parse().ok()?, session.parse().ok()?);
+        }
+        Some(Self {
+            sessions,
+            at: Some(at),
+            ..Self::default()
+        })
+    }
+
+    fn render(&self, scope: &str) -> Option<String> {
+        let at = self.at?;
+        let mut text = format!(
+            "{SESSION_CENSUS_SCHEMA}\nscope {scope}\nat {} {} {}\n",
+            at.last_pid, at.tasks, at.forks
+        );
+        for (pid, session) in &self.sessions {
+            text.push_str(&format!("{pid} {session}\n"));
+        }
+        Some(text)
+    }
+
+    /// Best effort, replacing the file whole: a process that cannot write it
+    /// leaves the next one to read every PID, as without a file.
+    fn save(&self, path: &Path) {
+        let Some(text) = census_scope().and_then(|scope| self.render(&scope)) else {
+            return;
+        };
+        let partial = path.with_extension(format!("{}.partial", std::process::id()));
+        if fs::write(&partial, text).is_err() || fs::rename(&partial, path).is_err() {
+            let _ = fs::remove_file(&partial);
+        }
+    }
+
     /// Starts a scan at allocator position `now`, dropping each entry whose
     /// PID the allocator may have handed out since the previous scan began.
     fn begin(&mut self, now: Option<PidAllocator>, pid_max: Option<u32>) {
@@ -9923,6 +10034,68 @@ mod tests {
         child.wait().unwrap();
         assert_eq!(first, vec![pgid]);
         assert_eq!(second, vec![pgid]);
+    }
+
+    /// A census saved by one process and loaded by another finds the same
+    /// members as a scan with none, and reads fewer `stat` files; a census
+    /// for another boot or PID namespace is not loaded at all.
+    #[test]
+    fn a_census_carried_to_another_process_finds_the_same_members() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id();
+        let mut writer = SessionCensus::default();
+        let (cold, cold_reads) = scan_process_group(&mut writer, pgid).unwrap();
+        let scope = census_scope().unwrap();
+        let text = writer.render(&scope).unwrap();
+        let mut reader = SessionCensus::parse(&text, &scope).unwrap();
+        assert_eq!(reader.sessions, writer.sessions);
+        let (warm, warm_reads) = scan_process_group(&mut reader, pgid).unwrap();
+        // With no census at all the scan reads every PID.
+        let (none, _) = scan_process_group(&mut SessionCensus::default(), pgid).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(cold, vec![pgid]);
+        assert_eq!(warm, cold);
+        assert_eq!(none, cold);
+        assert!(warm_reads < cold_reads, "{warm_reads} >= {cold_reads}");
+        assert!(SessionCensus::parse(&text, "another-boot pid:[1]").is_none());
+        assert!(SessionCensus::parse(&text.replace("/v1", "/v0"), &scope).is_none());
+        assert!(SessionCensus::parse(&format!("{text}12 x\n"), &scope).is_none());
+        assert!(
+            SessionCensus::default().render(&scope).is_none(),
+            "no position, no file"
+        );
+    }
+
+    /// A loaded census keeps only what the allocator cannot have reused since
+    /// the writer's scan began.
+    #[test]
+    fn a_loaded_census_drops_pids_the_allocator_may_have_reused() {
+        let at = PidAllocator {
+            last_pid: 1000,
+            tasks: 10,
+            forks: 5000,
+        };
+        let text = format!("{SESSION_CENSUS_SCHEMA}\nscope s\nat 1000 10 5000\n900 1\n1500 2\n");
+        let mut census = SessionCensus::parse(&text, "s").unwrap();
+        assert_eq!(census.at, Some(at));
+        let now = PidAllocator {
+            last_pid: 2000,
+            tasks: 10,
+            forks: 6000,
+        };
+        census.begin(Some(now), Some(4_194_304));
+        assert_eq!(
+            census.sessions.get(&900),
+            Some(&1),
+            "900 lies behind the allocator"
+        );
+        assert_eq!(census.sessions.get(&1500), None, "1500 may be a new task");
     }
 
     use super::*;

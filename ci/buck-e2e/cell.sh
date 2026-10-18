@@ -23,6 +23,9 @@
 #        HERMIT_E2E_DIGEST_CACHE_DIR
 #                                  where cells on this host share verified file digests
 #                                  (default /tmp/hermit-e2e-digests-UID; host cells only)
+#        HERMIT_E2E_SESSION_CENSUS the file cells on this host share the harness's process
+#                                  session census through (default
+#                                  /tmp/hermit-e2e-session-census-UID; host cells only)
 # stdout: Tpx HPHP-JSON (`type = "json"`): the harness's test_done for the cell, turned
 #         into a failure if its evidence is incomplete, then all_done. Always exits 0.
 #         A cell the harness withholds as HOST-INAPPLICABLE on a local route is reported
@@ -180,9 +183,15 @@ case $container in
     # What is left of the deadline after the setup above and any wait for a KVM slot.
     deadline=$((deadline - ($(date +%s%N) - t0) / 1000000000))
     ((deadline > 10)) || deadline=10
-    [[ ${HERMIT_E2E_ROUTE:-} == local ]] &&
-        bundle_env+=(HERMIT_E2E_DIGEST_CACHE_DIR="${HERMIT_E2E_DIGEST_CACHE_DIR:-/tmp/hermit-e2e-digests-$UID}")
+    # A host cell also starts the harness's process-group census from the one the last
+    # host cell left (runner.rs process_group_members): its first scan then reads only
+    # the PIDs created since, not every PID on the host.
+    if [[ ${HERMIT_E2E_ROUTE:-} == local ]]; then
+        bundle_env+=(HERMIT_E2E_DIGEST_CACHE_DIR="${HERMIT_E2E_DIGEST_CACHE_DIR:-/tmp/hermit-e2e-digests-$UID}"
+            HERMIT_E2E_SESSION_CENSUS="${HERMIT_E2E_SESSION_CENSUS:-/tmp/hermit-e2e-session-census-$UID}")
+    fi
     env -u HERMIT_E2E_EMPTY_WORKDIR -u HERMIT_E2E_BUNDLE_RECORD -u HERMIT_E2E_DIGEST_CACHE_DIR \
+        -u HERMIT_E2E_SESSION_CENSUS \
         "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_BUILD_ROOT="$B/build" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
@@ -257,6 +266,7 @@ exec "$@"'
     inner_bundle_env=()
     ((${#bundle_env[@]})) && inner_bundle_env=(HERMIT_E2E_BUNDLE_RECORD=/src/bundle/BUNDLE_RECORD.json)
     env -u HERMIT_E2E_EMPTY_WORKDIR -u HERMIT_E2E_BUNDLE_RECORD -u HERMIT_E2E_DIGEST_CACHE_DIR \
+        -u HERMIT_E2E_SESSION_CENSUS \
         "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
