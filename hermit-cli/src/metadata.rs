@@ -670,7 +670,13 @@ impl RecordVersion {
 // the recorder (https://github.com/rrnewton/hermit/issues/4213, K1-0), so an
 // openat, stat, access or readlinkat through such a descriptor is now
 // recorded, and an older recording containing one would replay out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16a);
+// 0x16a -> 0x16b was K3a (the recorded container mount table), shipped in
+// f8a824cf and reverted in ec169b91. 0x16b -> 0x16c (no format change from
+// 0x16a): this tree has no mount table, so it takes a new label rather than
+// reusing 0x16b. A K3a recording is then refused by the exact-match gate
+// instead of being replayed without its table, and the shipped 0x16b label is
+// not moved backward.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16c);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -695,7 +701,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16a);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x16a;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x16c;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
