@@ -19,7 +19,7 @@
 //!
 //! The runtime records each refusal; the runtime crate that hosts Detcore
 //! installs the function that takes them ([`install`]); Detcore takes them at
-//! each syscall entry ([`report`]) and tells the coordinator, which prints one
+//! each syscall entry (`report`) and tells the coordinator, which prints one
 //! WARN per refused signal and one for the alternate stack, per run. No other
 //! backend installs a source, so nothing is reported there.
 //!
