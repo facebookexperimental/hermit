@@ -26422,56 +26422,84 @@ mod test {
     /// the run queue. Moving it to the back on every batch starved it behind
     /// a sibling that signaled it once per turn: the sibling's requeued turn
     /// always came first (https://github.com/rrnewton/hermit/issues/4504).
+    /// The merged wake keeps the poll's signal-state task and whether it
+    /// decides interruption itself, and the first wake's
+    /// `drain_woken_waiters` entry stays as it is: a `SIGCHLD` the scheduler
+    /// committed to the poll in between (`scheduler_sent`) is kept, where the
+    /// old re-wake's unblock dropped it.
     #[test]
     fn a_signal_to_an_already_woken_poll_keeps_its_place_in_the_run_queue() {
-        let mut scheduler = Scheduler::new(&Config::default());
-        let target = DetTid::from_raw(100);
-        let sender = DetTid::from_raw(101);
-        register_known_thread(&mut scheduler, target);
-        register_known_thread(&mut scheduler, sender);
-        let mut polling = Resources::new(target);
-        polling.insert(ResourceID::InternalIOPolling, Permission::W);
-        polling.set_signal_interrupt_errno(Errno::ERESTARTSYS);
-        polling.fyi("read");
-        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(polling));
-        scheduler.runqueue_push_back(target);
-        scheduler.runqueue_push_back(sender);
+        for decides_itself in [false, true] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            let target = DetTid::from_raw(100);
+            let sender = DetTid::from_raw(101);
+            register_known_thread(&mut scheduler, target);
+            register_known_thread(&mut scheduler, sender);
+            let mut polling = Resources::new(target);
+            polling.insert(ResourceID::InternalIOPolling, Permission::W);
+            polling.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+            polling.signal_state_task = Some((3, 100));
+            polling.decides_signal_interruption_itself = decides_itself;
+            polling.fyi("read");
+            scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(polling));
+            scheduler.runqueue_push_back(target);
+            scheduler.runqueue_push_back(sender);
 
-        // The first signal wakes the poll, which goes to the back.
-        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
-        scheduler.drain_pending_cross_task_signals();
-        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(sender));
-        scheduler.run_queue.undo_tentative_pop();
+            // The first signal wakes the poll, which goes to the back.
+            scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
+            scheduler.drain_pending_cross_task_signals();
+            assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(sender));
+            scheduler.run_queue.undo_tentative_pop();
+            // A poll that decides interruption itself is not marked.
+            assert_eq!(
+                scheduler.blocked.drain_woken_waiters.contains_key(&target),
+                !decides_itself
+            );
+            // The scheduler commits a `SIGCHLD` to the woken poll.
+            if let Some(woken) = scheduler.blocked.drain_woken_waiters.get_mut(&target) {
+                woken.scheduler_sent = true;
+            }
 
-        // The sender has its turn and is queued again behind the poll.
-        assert!(scheduler.run_queue.remove_tid(sender));
-        scheduler.runqueue_push_back(sender);
+            // The sender has its turn and is queued again behind the poll.
+            assert!(scheduler.run_queue.remove_tid(sender));
+            scheduler.runqueue_push_back(sender);
 
-        // Its next signal must not put the poll behind it again.
-        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR2));
-        scheduler.drain_pending_cross_task_signals();
-        assert_eq!(scheduler.run_queue.len(), 2);
-        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(target));
-        scheduler.run_queue.undo_tentative_pop();
-        let resources = scheduler
-            .next_turns
-            .get(&target)
-            .and_then(|next_turn| next_turn.req.try_read())
-            .and_then(Result::ok)
-            .expect("the target should hold its signal interruption request");
-        assert_eq!(resources.resources.len(), 1);
-        assert!(
-            resources
-                .resources
-                .contains_key(&ResourceID::WaitidSignals(vec![
-                    SigWrapper::from(Signal::SIGUSR1),
-                    SigWrapper::from(Signal::SIGUSR2)
-                ]))
-        );
-        assert_eq!(
-            resources.signal_interrupt_errno(),
-            Some(Errno::ERESTARTSYS.into_raw())
-        );
+            // Its next signal must not put the poll behind it again.
+            scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR2));
+            scheduler.drain_pending_cross_task_signals();
+            assert_eq!(scheduler.run_queue.len(), 2);
+            assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(target));
+            scheduler.run_queue.undo_tentative_pop();
+            let resources = scheduler
+                .next_turns
+                .get(&target)
+                .and_then(|next_turn| next_turn.req.try_read())
+                .and_then(Result::ok)
+                .expect("the target should hold its signal interruption request");
+            assert_eq!(resources.resources.len(), 1);
+            assert!(
+                resources
+                    .resources
+                    .contains_key(&ResourceID::WaitidSignals(vec![
+                        SigWrapper::from(Signal::SIGUSR1),
+                        SigWrapper::from(Signal::SIGUSR2)
+                    ]))
+            );
+            assert_eq!(
+                resources.signal_interrupt_errno(),
+                Some(Errno::ERESTARTSYS.into_raw())
+            );
+            assert_eq!(resources.signal_state_task, Some((3, 100)));
+            assert_eq!(resources.decides_signal_interruption_itself, decides_itself);
+            assert_eq!(
+                scheduler.blocked.drain_woken_waiters.get(&target).copied(),
+                (!decides_itself).then_some(DrainWoken {
+                    waiter: DrainWokenWaiter::Poll,
+                    scheduler_sent: true,
+                }),
+                "decides_itself {decides_itself}"
+            );
+        }
     }
 
     #[test]
