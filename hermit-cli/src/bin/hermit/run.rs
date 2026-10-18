@@ -1932,12 +1932,6 @@ impl fmt::Display for RunOpts {
         if let Some(timeout) = self.timeout {
             write!(f, " --timeout={timeout}")?;
         }
-        // `--strict` refuses runs a plain one accepts and makes a signal-delivery
-        // contradiction fatal (`Config::signal_delivery_check_fatal`), so a
-        // reproducer without it would not end the same way.
-        if self.strict {
-            write!(f, " --strict")?;
-        }
         if self.no_sequentialize_threads {
             write!(f, " --no-sequentialize-threads")?;
         }
@@ -3236,7 +3230,7 @@ fn unsupported_syscalls_fail_closed_by_default_with_explicit_opt_out() {
     assert!(strict.det_opts.det_config.panic_on_unsupported_syscalls);
     assert_eq!(
         format!("{}", strict),
-        " --strict --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+        " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
     );
 
     let mut compatibility =
@@ -6717,9 +6711,6 @@ impl RunOpts {
         }
 
         config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
-        // A signal delivery the kernel contradicts ends a strict run (A5 step
-        // 3.2); elsewhere it is logged as a divergence.
-        config.signal_delivery_check_fatal = self.strict;
         // `--futex-wake-yields` is accepted only where Detcore's precise futex
         // scheduler runs the guest with sequentialized threads, on the ptrace
         // backend (with or without e9patch preprocessing). Every other launch

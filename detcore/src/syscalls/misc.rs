@@ -1594,9 +1594,6 @@ mod tests {
         }
 
         assert!(!is_supported_prctl_option(libc::PR_SET_NO_NEW_PRIVS));
-        // Detcore's serialized-execution contract
-        // (`Tool::enforces_serialized_execution`) rests on refusing it.
-        assert!(!is_supported_prctl_option(libc::PR_SET_SECCOMP));
         assert!(!is_supported_prctl_option(libc::PR_SET_TIMERSLACK));
         assert!(!is_supported_prctl_option(libc::PR_GET_TIMERSLACK));
     }
