@@ -6042,6 +6042,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
     /// and not when it reports an exact one or cannot be asked.
     #[test]
     fn import_mode_republishes_rows_and_a_missing_cell_is_an_error() {
+        const ROWLESS_CAUSE: &str = "Tpx RERUN (unmanaged), details 'No details found', after 26.1 s; the command's status Success, exit code 0, after 26.1 s of wall time";
         use std::path::PathBuf;
         use std::process::Command;
         use std::process::ExitCode;
@@ -6219,6 +6220,15 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             let bucket = bucket_dir(&import, "portable", "imported");
             fs::create_dir_all(&bucket).unwrap();
             fs::write(bucket.join("results.jsonl"), rows.join("\n") + "\n").unwrap();
+            // The ingest's record of why the rowless first execution wrote no
+            // row: diagnostics the refusal quotes, never what decides it.
+            if scenario == "rowless-first-execution" {
+                let mut entry = import_summary_cell("custom", "kvm");
+                entry["schema"] = "hermit-buck-e2e-no-row-execution/v1".into();
+                entry["attempt"] = 1.into();
+                entry["cause"] = ROWLESS_CAUSE.into();
+                fs::write(bucket.join("no-row-executions.jsonl"), format!("{entry}\n")).unwrap();
+            }
             let host_inapplicable_cells = match scenario {
                 "unconfirmed" => vec![("verify", "kvm", "kvm")],
                 "conflict" => vec![("verify", "ptrace", "kvm")],
@@ -6382,6 +6392,19 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                     .and_then(|row| row.reason.as_deref())
                     .unwrap_or_default();
                 assert!(reason.contains(expected), "{reason}\n{context}");
+                // The refusal quotes the ingest's cause for the rowless
+                // attempt when it has one, and adds nothing when it has none.
+                let quoted = format!("; attempt 1 wrote no row: {ROWLESS_CAUSE}");
+                assert_eq!(
+                    reason.contains(&quoted),
+                    scenario == "rowless-first-execution",
+                    "{reason}\n{context}"
+                );
+                assert_eq!(
+                    reason.contains("wrote no row"),
+                    scenario == "rowless-first-execution",
+                    "{reason}\n{context}"
+                );
             }
             // Every row is checked, not only the one that decides the cell.
             if scenario == "stale-first-row" {

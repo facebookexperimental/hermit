@@ -37,6 +37,15 @@ worker without an exact branch counter, which the plan cannot route around: RE w
 differ in CPU model). It is not an attempt and takes no number; the cell's next execution,
 on another worker, is attempt 1. Any other claim followed by a later execution still takes
 its number.
+--event-log FILE (repeatable) and --buck2 PATH: the invocations' Buck event logs and the
+buck2 that reads them. When an execution wrote no row, ingest reads its own record from
+them (`buck2 log show`): Tpx's status, details and duration for the target (every
+TestResult within 15 s of the execution's TestRun end), and the command's status, exit
+code and wall time (that TestRun span), matched by Buck target and nearest end time. Each
+such execution gets one line, {schema, test, mode, backend, attempt, cause}, in
+IMPORT_DIR/<lane>/manifest_<category>/no-row-executions.jsonl, which import mode quotes
+when it refuses the cell's history. It is diagnostics only: the refusal is the same with
+or without it, and a missing or unreadable event log only makes the cause say so.
 --withheld-on-re FILE: write the Buck target name (the harness's slug) of each cell that
 has no row and was withheld on RE by every one of its executions, one per line. Import
 mode would judge such a cell's claim against the machine that imports it, which did not
@@ -162,6 +171,70 @@ def cell_of(entry):
 def cell_slug(cell):
     """A plan cell's Buck target name (defs.bzl cell_slug)."""
     return "{}-{}-{}".format(cell["test"].replace("/", "-"), cell["mode"], cell["backend"])
+
+# buck2_data.TestStatus (buck2/app/buck2_data/data.proto).
+TPX_STATUS = {0: "NOT_SET", 1: "PASS", 2: "FAIL", 3: "SKIP", 4: "OMITTED", 5: "FATAL", 6: "TIMEOUT",
+              7: "UNKNOWN", 8: "RERUN", 9: "LISTING_SUCCESS", 10: "LISTING_FAILED", 11: "INFRA_FAILURE"}
+NO_ROW_FILE = "no-row-executions.jsonl"
+NO_ROW_SCHEMA = "hermit-buck-e2e-no-row-execution/v1"
+NO_ROW_MATCH_SECONDS = 15
+
+def event_log_tests(buck2, paths):
+    """(runs, results, errors) from the invocations' event logs: runs maps a Buck target
+    name to [(end time, command record)] for each TestRun span end (the command's own
+    status, exit code and wall time), results maps it to [(time, Tpx record)] for each
+    TestResult (Tpx's status, details and duration). errors says why a log was not read."""
+    runs, results, errors = collections.defaultdict(list), collections.defaultdict(list), []
+    for path in paths:
+        p = subprocess.run([buck2, "log", "show", path], capture_output=True, text=True)
+        if p.returncode != 0:
+            errors.append(f"`buck2 log show {path}` exited {p.returncode}: {p.stderr.strip()[-300:]}")
+            continue
+        for line in p.stdout.splitlines():
+            if '"TestRun"' not in line and '"TestResult"' not in line:
+                continue
+            try:
+                event = json.loads(line)["Event"]
+                at = event["timestamp"][0] + event["timestamp"][1] / 1e9
+            except (ValueError, KeyError, TypeError, IndexError):
+                continue
+            data = event.get("data") or {}
+            run = ((data.get("SpanEnd") or {}).get("data") or {}).get("TestRun")
+            if run:
+                name = run["suite"]["target_label"]["label"]["name"]
+                report = run.get("command_report") or {}
+                details = report.get("details") or {}
+                wall = (details.get("metadata") or {}).get("wall_time_us")
+                runs[name].append((at, {"command_status": next(iter(report.get("status") or {}), None),
+                                        "exit_code": details.get("signed_exit_code", details.get("exit_code")),
+                                        "wall_s": None if wall is None else int(wall) / 1e6}))
+            result = ((data.get("Instant") or {}).get("data") or {}).get("TestResult")
+            if result:
+                target, _, case = str(result.get("name", "")).partition(" - ")
+                duration = result.get("duration_us")
+                results[target.rsplit(":", 1)[-1]].append((at, {
+                    "case": case, "status": TPX_STATUS.get(result.get("status"), result.get("status")),
+                    "details": result.get("details"), "duration_s": None if duration is None else int(duration) / 1e6}))
+    return runs, results, errors
+
+def no_row_cause(slug, end, events):
+    """Why the execution of Buck target slug that testx says ended at end wrote no row, in
+    Tpx's and Buck's own words, or why that could not be read."""
+    if events is None:
+        return "ingest was given no Buck event log to read this execution's record from"
+    runs, results, errors = events
+    near = [(abs(at - end), at, record) for at, record in runs.get(slug, []) if abs(at - end) <= NO_ROW_MATCH_SECONDS]
+    if not near:
+        why = f"; event logs not read: {'; '.join(errors)}" if errors else ""
+        return f"no TestRun of {slug} ended within {NO_ROW_MATCH_SECONDS} s of {end} in the event logs{why}"
+    _, at, command = min(near, key=lambda x: x[0])
+    tpx = [record for t, record in results.get(slug, []) if abs(t - at) <= NO_ROW_MATCH_SECONDS]
+    def seconds(value):
+        return "?" if value is None else f"{value:.1f} s"
+    said = "; ".join(f"Tpx {r['status']} ({r['case'] or 'no case'}), details {r['details']!r}, after {seconds(r['duration_s'])}"
+                     for r in tpx) or "no Tpx result for it"
+    return (f"{said}; the command's status {command['command_status']}, exit code {command['exit_code']}, "
+            f"after {seconds(command['wall_s'])} of wall time")
 
 def claims_host_inapplicable(cell, summary):
     return any(cell_of(h) == cell for h in (summary or {}).get("host_inapplicable_cells", []))
@@ -407,6 +480,8 @@ def main():
     ap.add_argument("--failed-verify-logs", metavar="DIR", help="keep the verify logs of every execution that did not pass here")
     ap.add_argument("--failed-log-max-bytes", type=int, default=FAILED_LOG_MAX_BYTES, help=argparse.SUPPRESS)  # tests only
     ap.add_argument("--withheld-on-re", help="write the target name of each cell withheld on RE by every execution here")
+    ap.add_argument("--event-log", action="append", default=[], help="an invocation's Buck event log, read to name why an execution wrote no row")
+    ap.add_argument("--buck2", default=os.environ.get("BUCK2", "buck2"), help="the buck2 that reads --event-log")
     ap.add_argument("run_ids", nargs="+")
     a = ap.parse_args()
     failed_root, failed_logs_error = a.failed_verify_logs, None
@@ -532,6 +607,7 @@ def main():
         fetched = list(ex.map(fetch, executions))
     sources = collections.Counter(source for _, _, _, source, *_ in fetched)
     per_cell = collections.defaultdict(list)  # cell -> [(rows, summary)] in Tpx order
+    per_cell_ends = collections.defaultdict(list)  # cell -> [testx end time] in the same order
     complete_runs = collections.defaultdict(list)  # cell -> run ids of evidence-complete executions
     run_cells = {}
     log_sources = []  # (run id, result, (logs, log_dir, fetch_error)) of each execution
@@ -556,6 +632,7 @@ def main():
         if result is not None and result.get("evidence_complete") is True:
             complete_runs[cell].append(run_id)
         per_cell[cell].append((rows, summary, result.get("route") if result is not None else None))
+        per_cell_ends[cell].append(end)
         log_sources.append((run_id, result, logs))
         # An execution with neither a row nor a log (one that claimed host inapplicability) has nothing to keep.
         if failed is not None and (rows or failed[0]):
@@ -602,6 +679,7 @@ def main():
     attempts = collections.Counter()
     final = collections.Counter()
     no_row = []  # "cell attempt N" for each execution that wrote no row and claimed no host inapplicability
+    no_row_entries = collections.defaultdict(list)  # (lane, category) -> [(cell, attempt, testx end time)]
     withheld = 0  # executions that withheld their cell on an RE worker, which take no attempt number
     rerun_locally = []  # cells withheld on RE by every execution
     for cell, runs in per_cell.items():
@@ -617,7 +695,7 @@ def main():
         if all(withheld_on_re(cell, *run) for run in runs):
             rerun_locally.append(cell_slug(want[cell]))
         attempt = 0
-        for rows, summary, route in runs:
+        for (rows, summary, route), end in zip(runs, per_cell_ends[cell]):
             if withheld_on_re(cell, rows, summary, route):
                 withheld += 1
                 continue
@@ -627,12 +705,29 @@ def main():
                 attempts[attempt] += 1
             if not rows and not claims_host_inapplicable(cell, summary):
                 no_row.append(f"{cell} attempt {attempt}")
+                no_row_entries[(lane, category)].append((cell, attempt, end))
         final[final_rows[-1]["outcome"] if final_rows else
               "HOST-INAPPLICABLE" if claims_host_inapplicable(cell, final_summary) else "NO-ROW"] += 1
+    events = None
+    if no_row and a.event_log:
+        events = event_log_tests(a.buck2, a.event_log)
     for key in sorted(set(buckets) | set(summaries)):
         lane, category = key
         d = os.path.join(a.out, lane, "manifest_" + category.replace("-", "_"))
         os.makedirs(d, exist_ok=True)
+        # An earlier ingest into the same IMPORT_DIR (ci/buck-e2e/run ingests again after a
+        # local rerun) may have left one; this ingest's causes replace it.
+        no_row_path = os.path.join(d, NO_ROW_FILE)
+        if os.path.exists(no_row_path):
+            os.remove(no_row_path)
+        if no_row_entries[key]:
+            with open(no_row_path, "w") as f:
+                for cell, attempt, end in sorted(no_row_entries[key]):
+                    c = want[cell]
+                    f.write(json.dumps({"schema": NO_ROW_SCHEMA, "test": c["test"], "mode": c["mode"],
+                                        "backend": None if c["backend"] == "native" else c["backend"],
+                                        "attempt": attempt,
+                                        "cause": no_row_cause(cell_slug(c), end, events)}, sort_keys=True) + "\n")
         with open(os.path.join(d, "results.jsonl"), "w") as f:
             for row in sorted(buckets[key], key=lambda r: ("{}/{}@{}".format(r["test"], r["mode"], r.get("backend")), r["attempt"])):
                 f.write(json.dumps(row, sort_keys=True) + "\n")

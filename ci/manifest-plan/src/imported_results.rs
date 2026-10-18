@@ -138,6 +138,21 @@ struct SummaryExecution {
 
 type Key = (String, String, String, String, Option<String>);
 
+/// Per bucket, ci/buck-e2e/ingest.py's record of each producer execution that
+/// wrote no row: its attempt number and, in Tpx's and Buck's own words, why
+/// (`no_row_cause`). Diagnostics only: a history with a gap is refused with or
+/// without it, and the refusal quotes it.
+const NO_ROW_FILE: &str = "no-row-executions.jsonl";
+
+#[derive(Deserialize)]
+struct NoRowExecution {
+    test: String,
+    mode: String,
+    backend: Option<String>,
+    attempt: u64,
+    cause: String,
+}
+
 fn key(lane: &str, category: &str, test: &str, mode: &str, backend: Option<&str>) -> Key {
     (
         lane.into(),
@@ -241,8 +256,10 @@ fn stale_reason(context: &RunContext, cell: &SelectedCell, row: &CellResult) -> 
 
 /// Why `rows`, in file order, are not a history a producer writes, if they
 /// are not. The executed path's own rule decides (`outcome_after_retries`),
-/// and a producer never writes a HOST-INAPPLICABLE row.
-fn history_error(rows: &[CellResult]) -> Option<String> {
+/// and a producer never writes a HOST-INAPPLICABLE row. `no_rows` names, by
+/// attempt, the cause the producer recorded for each execution that wrote no
+/// row; it only words the refusal and never decides it.
+fn history_error(rows: &[CellResult], no_rows: Option<&BTreeMap<u64, String>>) -> Option<String> {
     if let Some(row) = rows.iter().find(|row| row.outcome == "HOST-INAPPLICABLE") {
         return Some(format!(
             "imported attempt {} is a HOST-INAPPLICABLE row; a producer reports host inapplicability only in summary.json's host_inapplicable_cells",
@@ -251,7 +268,14 @@ fn history_error(rows: &[CellResult]) -> Option<String> {
     }
     outcome_after_retries(rows.iter().map(|row| (row.attempt, row.outcome.as_str())))
         .err()
-        .map(|error| format!("imported rows are not one producer history: {error}"))
+        .map(|error| {
+            let causes = no_rows
+                .into_iter()
+                .flatten()
+                .map(|(attempt, cause)| format!("; attempt {attempt} wrote no row: {cause}"))
+                .collect::<String>();
+            format!("imported rows are not one producer history: {error}{causes}")
+        })
 }
 
 /// Read the import root for `cells`. `results_path` is where this run
@@ -273,6 +297,7 @@ pub fn load(
     let mut rows = BTreeMap::<Key, Vec<CellResult>>::new();
     let mut inapplicable = BTreeMap::<Key, String>::new();
     let mut evidence_complete = BTreeSet::<(Key, String)>::new();
+    let mut no_rows = BTreeMap::<Key, BTreeMap<u64, String>>::new();
     for (lane, category) in &buckets {
         let dir = bucket_dir(root, lane, category);
         let results = dir.join("results.jsonl");
@@ -308,6 +333,32 @@ pub fn load(
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("{}: {error}", results.display())),
+        }
+        let no_row_path = dir.join(NO_ROW_FILE);
+        match fs::read_to_string(&no_row_path) {
+            Ok(text) => {
+                for (number, line) in text.lines().enumerate() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let entry: NoRowExecution = serde_json::from_str(line).map_err(|error| {
+                        format!("{}:{}: {error}", no_row_path.display(), number + 1)
+                    })?;
+                    let id = key(
+                        lane,
+                        category,
+                        &entry.test,
+                        &entry.mode,
+                        entry.backend.as_deref(),
+                    );
+                    no_rows
+                        .entry(id)
+                        .or_default()
+                        .insert(entry.attempt, entry.cause);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("{}: {error}", no_row_path.display())),
         }
         let summary = dir.join("summary.json");
         match fs::read(&summary) {
@@ -388,7 +439,7 @@ pub fn load(
                 (Some(mut found), None) => {
                     if let Some(reason) = found.iter().find_map(|row| stale_reason(context, cell, row)) {
                         vec![error_row(context, cell, "import-stale", reason)]
-                    } else if let Some(reason) = history_error(&found) {
+                    } else if let Some(reason) = history_error(&found, no_rows.get(&id)) {
                         vec![error_row(context, cell, "import-history", reason)]
                     } else {
                         // Keep the history up to the first attempt this run

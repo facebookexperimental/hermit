@@ -293,6 +293,57 @@ class IngestTest(unittest.TestCase):
         self.assertEqual(rows, [(X, 1, "FAIL", "rx1"), (X, 3, "PASS", "rx3"), (Y, 1, "PASS", "ry1")])
         self.assertEqual(printed["no_row_examples"], [f"{X} attempt 2"])
 
+    def test_a_no_row_execution_records_its_cause_for_import_mode(self):
+        """Diagnostics only: ingest names, in Tpx's and Buck's own words, why an
+        execution wrote no row (no-row-executions.jsonl beside the bucket's rows), so
+        import mode can quote it when it refuses the history. The rows are the same."""
+        runs = {"RUN": [execution(X, 100, None, "rx1", complete=False), execution(X, 200, "PASS", "rx2"), Y_PASSES]}
+        X_ID = {"test": "t/x", "mode": "custom", "backend": "ptrace"}
+
+        def entries(work):
+            bucket = work / "out" / "portable" / "manifest_cat"
+            rows = [(r["test"], r["attempt"]) for r in map(json.loads, (bucket / "results.jsonl").read_text().splitlines())]
+            self.assertEqual(rows, [("t/x", 2), ("t/y", 1)])
+            return [json.loads(line) for line in (bucket / "no-row-executions.jsonl").read_text().splitlines()]
+
+        work, process = self.ingest(runs)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(entries(work), [dict(X_ID, schema="hermit-buck-e2e-no-row-execution/v1", attempt=1,
+                                              cause="ingest was given no Buck event log to read this execution's record from")])
+
+        # The execution's own TestRun span end and its Tpx TestResult, as `buck2 log show`
+        # prints them (buck2_data: TestStatus 8 is RERUN), ending within 15 s of testx's end.
+        events = [
+            {"Event": {"timestamp": [98, 0], "data": {"SpanEnd": {"duration_us": 29000000, "data": {"TestRun": {
+                "suite": {"target_label": {"label": {"package": "hermit//ci/buck-e2e", "name": X_SLUG}}},
+                "command_report": {"status": {"Success": {}}, "details": {
+                    "signed_exit_code": "0", "metadata": {"wall_time_us": 26078282}}}}}}}}},
+            {"Event": {"timestamp": [100, 500000000], "data": {"Instant": {"data": {"TestResult": {
+                "name": f"hermit//ci/buck-e2e:{X_SLUG} - unmanaged", "status": 8,
+                "details": "No details found", "duration_us": 26078282}}}}}},
+            # Another target's record at the same moment is not this execution's.
+            {"Event": {"timestamp": [99, 0], "data": {"Instant": {"data": {"TestResult": {
+                "name": "hermit//ci/buck-e2e:t-y-custom-ptrace - unmanaged", "status": 2,
+                "details": "other", "duration_us": 1}}}}}},
+        ]
+        log = self.root / "events.jsonl"
+        log.write_text("".join(json.dumps(e) + "\n" for e in events))
+        buck2 = self.root / "fake-buck2"
+        buck2.write_text("#!/bin/sh\n[ \"$1 $2\" = \"log show\" ] && exec cat \"$3\"\nexit 2\n")
+        buck2.chmod(0o755)
+        work, process = self.ingest(runs, extra=["--buck2", str(buck2), "--event-log", str(log)])
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(entries(work)[0]["cause"],
+                         "Tpx RERUN (unmanaged), details 'No details found', after 26.1 s; the command's status "
+                         "Success, exit code 0, after 26.1 s of wall time")
+
+        # An unreadable event log only makes the cause say so; the ingest still succeeds.
+        work, process = self.ingest(runs, extra=["--buck2", str(buck2), "--event-log", str(self.root / "missing")])
+        self.assertEqual(process.returncode, 0, process.stderr)
+        cause = entries(work)[0]["cause"]
+        self.assertIn(f"no TestRun of {X_SLUG} ended within 15 s of 100", cause)
+        self.assertIn("event logs not read", cause)
+
     def test_a_final_execution_without_a_row_is_reported_as_no_row(self):
         printed, rows, _ = self.accepted(
             {"RUN": [execution(X, 100, "FAIL", "rx1"), execution(X, 200, None, "rx2", complete=False), Y_PASSES]}

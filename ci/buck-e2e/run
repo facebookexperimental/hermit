@@ -138,7 +138,7 @@ invoke() { # invoke NAME TARGET... [buck2 args...]: one `buck2 test`, its exit s
     set -e
 }
 
-ids=()
+ids=() event_logs=()
 collect() { # collect NAME...: append each invocation's test-run id to ids, or exit 1
     local r rc
     for r in "$@"; do
@@ -150,12 +150,17 @@ collect() { # collect NAME...: append each invocation's test-run id to ids, or e
             exit 1
         fi
         ids+=("$(cat "$work/$r.test_id")")
+        # Read by ingest.py only to name why an execution wrote no row.
+        if [[ -s $work/$r.event-log.pb.zst ]]; then
+            event_logs+=(--event-log "$work/$r.event-log.pb.zst")
+        fi
     done
 }
 
 ingest() { # ingest: rows for every invocation in ids, and the cells withheld on every RE execution
     python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" --work "$work/artifacts" \
-        --local-artifacts "$root/buck-out/v2/test/execution" --withheld-on-re "$work/withheld-on-re" "${failed_logs[@]}" "${ids[@]}" || {
+        --local-artifacts "$root/buck-out/v2/test/execution" --withheld-on-re "$work/withheld-on-re" "${failed_logs[@]}" \
+        --buck2 "$buck2" "${event_logs[@]}" "${ids[@]}" || {
         echo "ci/buck-e2e/run: ingest.py could not turn the run's results into rows (above); the run has no verdict" >&2
         exit 1
     }
