@@ -720,12 +720,23 @@ impl AnalyzeOpts {
             .pipe_wake_latency
     }
 
-    /// `record` stamped with the trials' `--pipe-wake-latency`, as every
-    /// record analyze writes must be: a record that omitted it would be
-    /// refused when replayed with the latency it was made under, and accepted
-    /// without it (<https://github.com/rrnewton/hermit/issues/4380>).
+    /// Whether the trials keep the signal-state copy (off with
+    /// `--no-signal-state-copy` in their run arguments).
+    pub fn trial_signal_state_copy(&self) -> bool {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .signal_state_copy
+    }
+
+    /// `record` stamped with the trials' `--pipe-wake-latency` and
+    /// signal-state copy setting, as every record analyze writes must be: a
+    /// record that omitted either would be accepted when replayed under
+    /// another value (<https://github.com/rrnewton/hermit/issues/4380>).
     pub fn stamp_trial_record(&self, record: PreemptionRecord) -> PreemptionRecord {
-        record.with_pipe_wake_latency(self.trial_pipe_wake_latency())
+        record
+            .with_pipe_wake_latency(self.trial_pipe_wake_latency())
+            .with_signal_state_copy(Some(self.trial_signal_state_copy()))
     }
 
     /// Write the schedule `events` for a trial to replay, stamped
@@ -743,7 +754,10 @@ impl AnalyzeOpts {
     /// check is made here, as `adopt_recorded_epoch` makes the epoch's. Besides
     /// the named `recordings`, a record the run arguments replay
     /// (`--replay-schedule-from`, `--replay-preemptions-from`) is checked.
-    /// A record without the field was made with the option off.
+    /// A record without the field was made with the option off. The same
+    /// recordings are checked for the signal-state copy setting
+    /// (`--no-signal-state-copy`), which a record without that field does not
+    /// state, so it is accepted under either.
     pub fn refuse_recordings_under_another_pipe_wake_latency(
         &self,
         recordings: &[(&str, &Path)],
@@ -771,6 +785,15 @@ impl AnalyzeOpts {
                 &format!("{option} {}", path.display()),
                 recorded,
                 config.pipe_wake_latency,
+            ) {
+                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+            }
+            let recorded = detcore::preemptions::read_recorded_signal_state_copy(path)
+                .map_err(anyhow::Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::signal_state_copy_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.signal_state_copy,
             ) {
                 return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
             }

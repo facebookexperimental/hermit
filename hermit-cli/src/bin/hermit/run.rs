@@ -3527,6 +3527,38 @@ fn replay_networking_adopts_the_trace_epoch_and_refuses_another() {
     );
 }
 
+/// The environment variable that turned the signal-state copy on while it
+/// was opt-in (before A5 step 2d). It is no longer read.
+const SIGNAL_STATE_CHECK_ENV: &str = "HERMIT_SIGNAL_STATE_CHECK";
+
+/// Refuses a run whose environment sets [`SIGNAL_STATE_CHECK_ENV`], with any
+/// value. The copy is a run option now (`--no-signal-state-copy`), which a
+/// saved run configuration, a rendered command line and a recorded schedule
+/// all carry; a variable read beside it would be a hidden input, and one
+/// silently ignored would leave a run that asked for the copy off with it
+/// on.
+fn refuse_signal_state_check_env(value: Option<&std::ffi::OsStr>) -> Result<(), String> {
+    match value {
+        None => Ok(()),
+        Some(value) => Err(format!(
+            "{SIGNAL_STATE_CHECK_ENV}={value:?} is no longer read: the signal-state copy is on \
+             by default, and --no-signal-state-copy turns it off. Unset the variable."
+        )),
+    }
+}
+
+/// `HERMIT_SIGNAL_STATE_CHECK` is refused whatever its value, so that no run
+/// depends on it.
+#[test]
+fn the_retired_signal_state_check_variable_is_refused() {
+    use std::ffi::OsStr;
+    assert_eq!(refuse_signal_state_check_env(None), Ok(()));
+    for value in ["0", "1", "", "false"] {
+        let error = refuse_signal_state_check_env(Some(OsStr::new(value))).unwrap_err();
+        assert!(error.contains("--no-signal-state-copy"), "{error}");
+    }
+}
+
 /// A replay of a record made under another `--pipe-wake-latency` is refused,
 /// in both directions and for a different latency, under both replay flags;
 /// `0` is not off; a record without the field is off
@@ -5593,6 +5625,36 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Refuses a replay of a recorded schedule under the other signal-state
+    /// copy setting (`--no-signal-state-copy`), as
+    /// `refuse_replay_under_another_pipe_wake_latency` refuses another
+    /// latency. A record written before the setting was stored is replayed
+    /// under either.
+    fn refuse_replay_under_another_signal_state_copy(&self) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        for (option, path) in [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            let recorded =
+                detcore::preemptions::read_recorded_signal_state_copy(path).map_err(Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::signal_state_copy_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.signal_state_copy,
+            ) {
+                return Err(Error::new(PolicyRefusal).context(refusal));
+            }
+        }
+        Ok(())
+    }
+
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the
@@ -6243,6 +6305,7 @@ impl RunOpts {
         // explicit, and still before stdin is read or anything is launched.
         self.refuse_strict_with_host_drawn_inputs()?;
         self.refuse_replay_under_another_pipe_wake_latency()?;
+        self.refuse_replay_under_another_signal_state_copy()?;
         if !self.namespace_only
             && (self.verify_verbose
                 || global
@@ -6507,6 +6570,8 @@ impl RunOpts {
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
+        refuse_signal_state_check_env(std::env::var_os(SIGNAL_STATE_CHECK_ENV).as_deref())
+            .map_err(Error::msg)?;
         let timer = if self.arms_reverie_ptrace_pmu_timer() {
             reverie_timer_support()
         } else {

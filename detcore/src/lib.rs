@@ -2165,7 +2165,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
     }
 
-    /// The opt-in signal-state copy follows handler returns from the backend's
+    /// The signal-state copy follows handler returns from the backend's
     /// reports where it has them (`syscalls::signal_shadow`).
     fn observes_sigreturns(config: &Config) -> bool {
         crate::syscalls::signal_shadow::observes_sigreturns(config)
@@ -2722,7 +2722,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // guest handler.
         let signal = unreported.number();
         if kept
-            && crate::syscalls::signal_shadow::enabled()
+            && self.cfg.signal_state_copy
             && self.cfg.sequentialize_threads
             && self.cfg.backend.supports_blocked_wait_signal_interruption
             && signal != reverie::PERF_EVENT_SIGNAL as i32

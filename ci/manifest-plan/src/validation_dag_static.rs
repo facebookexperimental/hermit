@@ -1112,7 +1112,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the validate of d4594afa, which also carried the 2 since-reverted
     // qualified-runtime tests.
     // Restore the two qualified-runtime preparation tests: 1623.
-    ("test.regular_crates", 1_623),
+    ("test.regular_crates", 1_625),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1657,7 +1657,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4213): 1154, executed.
     // And dbt_launched_program_tests::a_relative_path_entry_is_taken_from_the_guests_directory_not_the_launchers:
     // 1155.
-    ("test.hermit_unit", 1155),
+    // And +2 from ca5325c1: 1157.
+    ("test.hermit_unit", 1157),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2503,7 +2504,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the refused_signal_controls warning-text test: 2066.
     // And tool_global::tests::an_images_own_record_fills_in_and_outranks_only_the_launchs_search:
     // 2067.
-    ("test.detcore_unit", 2067),
+    // And +1 from ca5325c1: 2068.
+    ("test.detcore_unit", 2068),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4361,7 +4363,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the nine 4213 process-auxv units: 2065, listed.
     // And the refused_signal_controls warning-text test: 2066.
     // And the same own-record test: 2067.
-    ("test.detcore_unit_on_host", 2067),
+    // And +1 from ca5325c1: 2068.
+    ("test.detcore_unit_on_host", 2068),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4641,7 +4644,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +15 from 2447c8e8: 1153.
     // And the 4213 received-directory record-version test: 1154.
     // And the same DBT launched-program test: 1155.
-    ("test.hermit_unit_on_host", 1155),
+    // And +2 from ca5325c1: 1157.
+    ("test.hermit_unit_on_host", 1157),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -4808,7 +4812,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 5 session-census tests (3920bf94): 1600.
     // And the same 7 Buck e2e cell tests (456dbc38, 5ebcb9dd, 1722f214): 1607.
     // Restore the two qualified-runtime preparation tests: 1609.
-    ("test.regular_crates_on_host", 1_609),
+    ("test.regular_crates_on_host", 1_611),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

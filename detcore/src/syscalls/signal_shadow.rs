@@ -8,7 +8,8 @@
 
 //! Keeping each thread's [`SignalShadow`] in step with the guest.
 //!
-//! Off unless [`SIGNAL_STATE_CHECK_ENV`] is `1` (docs/SIGNAL_STATE_CHECK.md).
+//! On unless `Config::signal_state_copy` is off (`--no-signal-state-copy`;
+//! docs/SIGNAL_STATE_CHECK.md).
 //!
 //! Every function here runs after the guest operation it records has
 //! committed, uses only values Detcore already holds for that operation, and
@@ -49,28 +50,6 @@ use crate::signal_state::Dispositions;
 use crate::signal_state::SignalShadow;
 use crate::signal_state::ThreadSignals;
 use crate::signal_state::sigbit;
-
-/// The environment variable that turns the copy on: `1` seeds, records and
-/// checks it, and lets the decisions A5 step 2 converted read it; unset (the
-/// default) leaves every run as it was. The ptrace backend reports
-/// handler returns to it (`Tool::handle_sigreturn`), but not every delivery,
-/// and asking for the reports adds a stop at each handler return, so it is
-/// opt-in.
-pub const SIGNAL_STATE_CHECK_ENV: &str = "HERMIT_SIGNAL_STATE_CHECK";
-
-/// Whether [`SIGNAL_STATE_CHECK_ENV`] turns the copy on, read once. Tests
-/// always have it on.
-pub(crate) fn enabled() -> bool {
-    #[cfg(test)]
-    {
-        true
-    }
-    #[cfg(not(test))]
-    {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os(SIGNAL_STATE_CHECK_ENV).is_some_and(|v| v == "1"))
-    }
-}
 
 /// The prefix of the one WARN line a divergence produces, for log searches.
 pub(crate) const DIVERGED: &str = "SIGNAL_STATE_COPY_DIVERGED";
@@ -175,7 +154,7 @@ where
     T: RecordOrReplay,
 {
     let config = guest.config();
-    enabled()
+    config.signal_state_copy
         && config.sequentialize_threads
         && config.backend.supports_blocked_wait_signal_interruption
         && !host_signal_state_reads_refused()
@@ -1185,7 +1164,7 @@ where
 /// without a syscall (A5 step 2c). Without the reports, the copy infers
 /// returns from the kernel's mask, as it does wherever they are off.
 pub(crate) fn observes_sigreturns(config: &crate::Config) -> bool {
-    enabled()
+    config.signal_state_copy
         && config.sequentialize_threads
         && !config.gdbserver
         && !config.imprecise_timers
@@ -2773,6 +2752,12 @@ mod tests {
             ..config(reverie::BackendCapabilities::PTRACE)
         };
         assert!(!observes_sigreturns(&parallel));
+        // Nor with the copy off.
+        let off = Config {
+            signal_state_copy: false,
+            ..config(reverie::BackendCapabilities::PTRACE)
+        };
+        assert!(!observes_sigreturns(&off));
         // Nor under --imprecise-timers, whose preemption events a reported
         // return would lose.
         let imprecise = Config {
@@ -3014,19 +2999,31 @@ mod tests {
 
     #[test]
     fn nothing_is_seeded_without_serialized_threads() {
-        // Outside tests the copy also needs this variable set to `1`.
-        assert_eq!(SIGNAL_STATE_CHECK_ENV, "HERMIT_SIGNAL_STATE_CHECK");
         let kernel = Kernel::default();
         let _seam = kernel.install();
-        let config = Config {
-            sequentialize_threads: false,
+        let ptrace = Config {
+            sequentialize_threads: true,
             backend: reverie::BackendCapabilities::PTRACE,
             ..Config::default()
         };
-        let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
-        let mut guest = ShadowGuest { config, thread };
-        at_exec(&mut guest);
-        assert!(guest.thread.signal_shadow.is_none());
+        // Nor with the copy turned off (`--no-signal-state-copy`), which is
+        // otherwise on.
+        assert!(ptrace.signal_state_copy);
+        for config in [
+            Config {
+                sequentialize_threads: false,
+                ..ptrace.clone()
+            },
+            Config {
+                signal_state_copy: false,
+                ..ptrace.clone()
+            },
+        ] {
+            let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
+            let mut guest = ShadowGuest { config, thread };
+            at_exec(&mut guest);
+            assert!(guest.thread.signal_shadow.is_none());
+        }
     }
 
     #[test]

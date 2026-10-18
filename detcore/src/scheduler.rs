@@ -3817,7 +3817,8 @@ impl Scheduler {
                 Some(
                     PreemptionWriter::new(cfg.record_preemptions_to.clone())
                         .with_epoch(cfg.epoch)
-                        .with_pipe_wake_latency(cfg.pipe_wake_latency_in_effect()),
+                        .with_pipe_wake_latency(cfg.pipe_wake_latency_in_effect())
+                        .with_signal_state_copy(cfg.signal_state_copy),
                 )
             } else {
                 None

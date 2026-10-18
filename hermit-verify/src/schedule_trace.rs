@@ -212,6 +212,7 @@ pub struct InterpolateOpts {
 impl InterpolateOpts {
     pub fn run(&self, _common_args: &CommonOpts) -> anyhow::Result<bool> {
         let latency = Self::common_pipe_wake_latency(&self.file_a, &self.file_b)?;
+        let copy = Self::common_signal_state_copy(&self.file_a, &self.file_b)?;
         let first_schedule = read_trace(&self.file_a);
         let second_schedule = read_trace(&self.file_b);
         // let i = 0;
@@ -232,8 +233,9 @@ impl InterpolateOpts {
             )
         };
         let sched_path = tmpdir_path.join(format!("interpolate_{}.events", self.interpolate));
-        let next_sched =
-            PreemptionRecord::from_sched_events(requested_schedule).with_pipe_wake_latency(latency);
+        let next_sched = PreemptionRecord::from_sched_events(requested_schedule)
+            .with_pipe_wake_latency(latency)
+            .with_signal_state_copy(copy);
         next_sched.write_to_disk(&sched_path).unwrap();
 
         Ok(true)
@@ -262,11 +264,60 @@ impl InterpolateOpts {
         }
         Ok(a)
     }
+
+    /// The signal-state copy setting the interpolated schedule carries: the
+    /// one the schedules state, where they agree or only one states it.
+    /// Schedules recorded under different settings are refused.
+    fn common_signal_state_copy(
+        file_a: &std::path::Path,
+        file_b: &std::path::Path,
+    ) -> anyhow::Result<Option<bool>> {
+        let read = |path: &std::path::Path| {
+            detcore::preemptions::read_recorded_signal_state_copy(path).map_err(anyhow::Error::msg)
+        };
+        match (read(file_a)?, read(file_b)?) {
+            (Some(a), Some(b)) if a != b => anyhow::bail!(
+                "{} and {} were recorded with the signal-state copy {} and {}; no \
+                 interpolation of them can be replayed",
+                file_a.display(),
+                file_b.display(),
+                if a { "on" } else { "off" },
+                if b { "on" } else { "off" },
+            ),
+            (a, b) => Ok(a.or(b)),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two schedules recorded under different signal-state copy settings
+    /// cannot be interpolated; one that does not say takes the other's.
+    #[test]
+    fn interpolate_refuses_schedules_recorded_under_different_signal_state_copy_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, copy: Option<bool>| {
+            let path = dir.path().join(name);
+            let record =
+                PreemptionRecord::from_sched_events(Vec::new()).with_signal_state_copy(copy);
+            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            path
+        };
+        let unsaid = write("unsaid.json", None);
+        let on = write("on.json", Some(true));
+        let off = write("off.json", Some(false));
+        let common = InterpolateOpts::common_signal_state_copy;
+        assert_eq!(common(&unsaid, &unsaid).unwrap(), None);
+        assert_eq!(common(&on, &on).unwrap(), Some(true));
+        assert_eq!(common(&unsaid, &off).unwrap(), Some(false));
+        assert_eq!(common(&on, &unsaid).unwrap(), Some(true));
+        for (a, b) in [(&on, &off), (&off, &on)] {
+            let error = common(a, b).unwrap_err();
+            assert!(error.to_string().contains("signal-state copy"), "{error}");
+        }
+    }
 
     /// Two schedules recorded under different `--pipe-wake-latency` values,
     /// off and `0` included, cannot be interpolated: no replay could

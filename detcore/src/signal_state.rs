@@ -18,12 +18,13 @@
 //! holds no guest handle and makes no syscall: callers apply a transition
 //! once the guest operation it describes has committed. The state is kept,
 //! seeded and compared with the kernel's only where the kernel's signal state
-//! is the guest's own (ptrace, serialized threads), and only when
-//! `HERMIT_SIGNAL_STATE_CHECK=1` turns it on (docs/SIGNAL_STATE_CHECK.md).
+//! is the guest's own (ptrace, serialized threads), unless
+//! `Config::signal_state_copy` is off (`--no-signal-state-copy`;
+//! docs/SIGNAL_STATE_CHECK.md).
 //! Step 1 kept it in shadow mode, read by no decision; since step 2 some
 //! decisions read it in place of the kernel's `/proc` view, as that document
-//! lists. Other backends need to report a first image's inherited state
-//! first (design step 3).
+//! lists, and since step 2d it is on by default. Other backends need to
+//! report a first image's inherited state first (design step 3).
 //!
 //! What is kept, and where Linux keeps the same thing:
 //! - [`Dispositions`]: the 64 actions of one `struct sighand_struct`. Every

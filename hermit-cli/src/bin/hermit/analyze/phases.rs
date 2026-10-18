@@ -1208,6 +1208,63 @@ mod tests {
         }
     }
 
+    /// Every record analyze writes states the trials' signal-state copy
+    /// setting, and a recording made under the other setting is refused
+    /// before any trial; one that states no setting is accepted.
+    #[test]
+    fn analyze_stamps_and_checks_the_signal_state_copy_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = |name: &str, copy: Option<bool>| {
+            let path = record_with_epoch(dir.path(), name, None);
+            let mut value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            if let Some(copy) = copy {
+                value["signal_state_copy"] = serde_json::Value::from(copy);
+            }
+            std::fs::write(&path, value.to_string()).unwrap();
+            path
+        };
+        let prepare = |run1: &Path, run_args: &[&str]| {
+            let run1 = format!("--run1-preemptions={}", run1.display());
+            let mut argv = vec!["hermit", "analyze", run1.as_str(), "--"];
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.prepare(&args.global).map(|_| options)
+        };
+        let unsaid = record("unsaid", None);
+        let on = record("on", Some(true));
+        let off = record("off", Some(false));
+        let written = |options: &AnalyzeOpts| {
+            let trial = dir.path().join("copy-trial.json");
+            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            detcore::preemptions::read_recorded_signal_state_copy(&trial).unwrap()
+        };
+        let default = prepare(&on, &[]).unwrap();
+        assert!(default.trial_signal_state_copy());
+        assert_eq!(written(&default), Some(true));
+        let copy_off = prepare(&off, &["--no-signal-state-copy"]).unwrap();
+        assert_eq!(written(&copy_off), Some(false));
+        assert!(prepare(&unsaid, &[]).is_ok());
+        assert!(prepare(&unsaid, &["--no-signal-state-copy"]).is_ok());
+        for (run1, run_args) in [(&off, vec![]), (&on, vec!["--no-signal-state-copy"])] {
+            let error = prepare(run1, &run_args).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{error:#}"
+            );
+            assert!(
+                format!("{error:#}").contains("signal-state copy"),
+                "{error:#}"
+            );
+        }
+    }
+
     /// Runs `test` (this module's test of that name) in two child processes,
     /// once with `HERMIT_EPOCH` unset and once set to [`OTHER`], and returns
     /// `None`. Inside such a child it returns the arm, `"unset"` or `"set"`.

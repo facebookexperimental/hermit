@@ -55,6 +55,15 @@ pub struct PreemptionRecord {
     /// records written before it. `Some(0)` is distinct from `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pipe_wake_latency: Option<u64>,
+    /// Whether Detcore's signal-state copy was on in the run that produced
+    /// this record (`Config::signal_state_copy`, A5 step 2d). With it on,
+    /// some signal decisions read the copy, and ptrace reports each handler
+    /// return, which can move a preemption in the cases docs/SIGNAL_STATE_CHECK.md
+    /// lists, so a replay under the other setting is refused. `None` for
+    /// records written before the field existed, and for records synthesized
+    /// in memory, which are replayed under either setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signal_state_copy: Option<bool>,
 }
 
 impl std::fmt::Display for PreemptionRecord {
@@ -72,6 +81,7 @@ impl PreemptionRecord {
             global: events,
             epoch: None,
             pipe_wake_latency: None,
+            signal_state_copy: None,
         }
     }
 
@@ -92,6 +102,21 @@ impl PreemptionRecord {
     /// The virtual-time epoch this record was produced under, if it was stored.
     pub fn epoch(&self) -> Option<DateTime<Utc>> {
         self.epoch
+    }
+
+    /// Whether the signal-state copy was on in the run this record came
+    /// from, if the record says.
+    pub fn signal_state_copy(&self) -> Option<bool> {
+        self.signal_state_copy
+    }
+
+    /// The same record, stating whether the copy was on in the trials it
+    /// came from (`None` for unknown). Every record analyze, minimize or
+    /// bisect writes from trials carries it, as it carries the pipe-wake
+    /// latency.
+    pub fn with_signal_state_copy(mut self, on: Option<bool>) -> Self {
+        self.signal_state_copy = on;
+        self
     }
 
     /// Make a copy of everything in the `PreemptionRecord` in a public format.
@@ -155,6 +180,7 @@ impl PreemptionRecord {
             global: Vec::new(),
             epoch: self.epoch,
             pipe_wake_latency: self.pipe_wake_latency,
+            signal_state_copy: self.signal_state_copy,
         }
     }
 
@@ -213,6 +239,7 @@ impl PreemptionRecord {
             global: Vec::new(),
             epoch: None,
             pipe_wake_latency: None,
+            signal_state_copy: None,
         }
     }
 
@@ -650,6 +677,50 @@ mod tests {
         }
     }
 
+    /// The signal-state copy setting rides in a preemption record as the
+    /// pipe-wake latency does, and a replay under the other setting is
+    /// refused; a record that does not say (older, or synthesized) is not.
+    #[test]
+    fn the_signal_state_copy_setting_round_trips_and_is_compared() {
+        let unsaid = PreemptionRecord::from_sched_events(Vec::new());
+        assert_eq!(unsaid.signal_state_copy(), None);
+        assert!(
+            !serde_json::to_string(&unsaid)
+                .unwrap()
+                .contains("signal_state_copy")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        for on in [true, false] {
+            let written = PreemptionWriter::new(None)
+                .with_signal_state_copy(on)
+                .into_string();
+            assert!(
+                written.contains(&format!("\"signal_state_copy\":{on}")),
+                "{written}"
+            );
+            let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert_eq!(back.signal_state_copy(), Some(on));
+            assert_eq!(back.clone_preemptions_only().signal_state_copy(), Some(on));
+            let path = dir.path().join("record.json");
+            std::fs::write(&path, &written).unwrap();
+            assert_eq!(read_recorded_signal_state_copy(&path), Ok(Some(on)));
+        }
+        for (recorded, replay, refused) in [
+            (None, true, false),
+            (None, false, false),
+            (Some(true), true, false),
+            (Some(false), false, false),
+            (Some(true), false, true),
+            (Some(false), true, true),
+        ] {
+            assert_eq!(
+                signal_state_copy_mismatch("--replay-schedule-from=x", recorded, replay).is_some(),
+                refused,
+                "{recorded:?} replayed with {replay}"
+            );
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
@@ -1023,6 +1094,13 @@ impl PreemptionWriter {
         self
     }
 
+    /// Store whether the run kept the signal-state copy
+    /// (`Config::signal_state_copy`).
+    pub fn with_signal_state_copy(mut self, on: bool) -> Self {
+        self.inner.signal_state_copy = Some(on);
+        self
+    }
+
     /// Does the record have zero entries?
     pub fn is_empty(&self) -> bool {
         self.inner.per_thread.is_empty()
@@ -1247,6 +1325,50 @@ pub fn pipe_wake_latency_mismatch(
             "{source} was recorded with {} and would be replayed with {}. A hand-off moves \
              turns and the time they charge, so the replay cannot reproduce the run. Replay \
              with {}.",
+            show(recorded),
+            show(replay),
+            show(recorded),
+        )
+    })
+}
+
+/// Read only whether the signal-state copy was on in the run that wrote a
+/// preemption record file, as [`read_recorded_epoch`] reads the epoch.
+/// `Ok(None)` for a record written before the field existed.
+pub fn read_recorded_signal_state_copy(path: &Path) -> Result<Option<bool>, String> {
+    #[derive(Deserialize)]
+    struct CopyOnly {
+        #[serde(default)]
+        signal_state_copy: Option<bool>,
+    }
+    let file = File::open(path)
+        .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
+    let record: CopyOnly = serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
+    Ok(record.signal_state_copy)
+}
+
+/// The refusal of a replay whose signal-state copy setting differs from the
+/// one a record stores, naming the record by `source` (an option and a path),
+/// or `None` when they agree or the record does not say.
+pub fn signal_state_copy_mismatch(
+    source: &str,
+    recorded: Option<bool>,
+    replay: bool,
+) -> Option<String> {
+    let show = |on: bool| {
+        if on {
+            "the signal-state copy on"
+        } else {
+            "the signal-state copy off (--no-signal-state-copy)"
+        }
+    };
+    let recorded = recorded?;
+    (recorded != replay).then(|| {
+        format!(
+            "{source} was recorded with {} and would be replayed with {}. The copy decides \
+             some signal questions and adds a stop at each handler return, which can move a \
+             preemption, so the replay cannot be relied on to reproduce the run. Replay with {}.",
             show(recorded),
             show(replay),
             show(recorded),

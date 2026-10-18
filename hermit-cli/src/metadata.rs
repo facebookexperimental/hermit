@@ -1000,6 +1000,11 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         seed: default_config.seed,
         rng_seed: default_config.rng_seed,
         imprecise_timers: false,
+        // Off in record and replay, a constant like the rest: replay rebuilds
+        // this configuration and must decide every signal question as the
+        // recording did, and recordings made before the copy was on by
+        // default (A5 step 2d) read the kernel's `/proc` view throughout.
+        signal_state_copy: false,
         chaos: false,
         sigint_instakill: false,
         warn_non_zero_binds: false,
