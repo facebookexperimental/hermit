@@ -1944,7 +1944,16 @@ fi
 # Cargo.lock and rust-toolchain.toml have the same object ids: all seven SDK
 # inputs, DBT inventory 961, calibrated budget, job width and limits are
 # unchanged.
-expected_pin=ce6433f83adfc3e666d1ebed175b869edaea3574
+# CARRY TO 0afd4fe6e9292853e253a9b0d1accf79ea6c25d2 (2026-10-18): from
+# ce6433f83adfc3e666d1ebed175b869edaea3574. One commit, 0afd4fe6 (getter-only
+# native get_robust_list admission forwards unrecorded targets to Linux;
+# replayed from d54422db with the same patch-id), touching only reverie-dbt:
+# native/client.c, native/task_membership.h, src/tools.rs and the
+# group_session_getters/task_membership tests and fixtures. No file is added or
+# removed (DBT inventory 961). reverie-dbt/vendor, third-party, build.rs, the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml have the same object ids: all
+# seven SDK inputs, calibrated budget, job width and limits are unchanged.
+expected_pin=0afd4fe6e9292853e253a9b0d1accf79ea6c25d2
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
