@@ -330,6 +330,19 @@ The tracer enables these ptrace options:
 
 `PTRACE_O_EXITKILL` prevents a guest from escaping if the tracer dies.
 
+### Ptrace untraced-stub gap
+
+The injection exemption also lets a deliberate guest jump to Reverie's private
+syscall stub and issue a syscall without Detcore observing it. The following
+`ud2` raises SIGILL, which records an unknown mutation, but that cannot undo the
+syscall's effect: a signal handler can retain the result, or a forked child can
+die and leave an effect behind. Rewriting or replacing the private page also
+records an unknown mutation. This remains a separate determinism gap after the
+exec-return and CPUID arming checks
+(https://github.com/rrnewton/reverie/issues/1064). The CLI's
+`unobserved_guest_execution` and `untraced_code_range` in
+`hermit-cli/src/bin/hermit/run.rs` describe the limit and guarded page range.
+
 ### One tracing task per guest thread
 
 The ptrace backend maintains an asynchronous tracing task for every guest TID.
@@ -466,14 +479,16 @@ vendor:
   support for wiring this to the same `arch_prctl` UAPI landed in Linux **6.17**;
   older kernels return `ENODEV` on AMD even when the silicon is capable.
 
-When arming fails, the backend logs `Unable to intercept CPUID: Underlying
-hardware does not support CPUID faulting` and continues **without** CPUID
-virtualization — the guest then sees real host CPUID. Because the UAPI is
-identical across vendors, no Hermit or Reverie change is needed to gain CPUID
-interception on capable AMD hardware; it requires only a new-enough kernel (or a
-backport of the AMD CPUID-faulting patch). On hardware or kernels where faulting
-is unavailable, the alternatives are the KVM/SVM backend or best-effort
-environment shims that ask specific libraries to avoid `RDRAND`.
+When CPUID virtualization is requested, ptrace requires a valid initial
+`ARCH_GET_CPUID` state, a successful `ARCH_SET_CPUID(0)`, and a second query that
+confirms CPUID is disabled. A query, set, or verification failure stops the run
+with `ptrace-cpuid-faulting-unavailable`, naming the operation and its errno or
+unexpected state. The guest cannot continue with host CPUID after this refusal.
+Linux re-enables CPUID at successful exec, so ptrace repeats this setup for each
+replacement image, after checking the exec syscall's return stop and before
+executing the image's first instruction. Capable AMD hardware needs Linux 6.17
+or the corresponding CPUID-faulting backport; an older kernel is refused when
+virtualization is requested.
 
 RDTSC faulting is independent and more portable: it is armed via
 `prctl(PR_SET_TSC, PR_TSC_SIGSEGV)` (backed by `CR4.TSD`) and works on both

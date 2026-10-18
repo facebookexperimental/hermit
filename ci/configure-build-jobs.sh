@@ -2184,8 +2184,14 @@ fi
 # portable1050 effective-job-second limit and all job/selection limits remain
 # unchanged, not recalibrated. One qualified sample from the dbt lane's
 # terminal-translation-candidate-r1, not a five-sample calibration campaign.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4561503488d69d6d4350d5db090279c9cf8bb3e4 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4561503488d69d6d4350d5db090279c9cf8bb3e4 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 188cb62ab812068cd71ef80f2c43e5854572f70e (2026-10-18): from
+# 4561503488d69d6d4350d5db090279c9cf8bb3e4. reverie-dbt/, root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml and third-party/ are byte-identical. DBT inventory
+# remains 973. This R source identity preserves the existing SDK budget,
+# job width and limits; root Cargo/toolchain inputs are unchanged.
+# This source carry supplies no new timing or runtime qualification.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 188cb62ab812068cd71ef80f2c43e5854572f70e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 188cb62ab812068cd71ef80f2c43e5854572f70e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

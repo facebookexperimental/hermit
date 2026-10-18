@@ -15,6 +15,9 @@ mod fault_sites;
 #[path = "common/timerfd_virtual_time.rs"]
 mod timerfd_virtual_time;
 
+#[path = "common/first_instruction_cpuid.rs"]
+mod first_instruction_cpuid;
+
 // The binary loads hermit_binary.rs once, through kvm_synchronous_fault, and
 // skid_overshoot.rs once, through hermit_binary.rs.
 use hermit_test::skid_overshoot;
