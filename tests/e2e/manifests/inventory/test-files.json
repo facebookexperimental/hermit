@@ -2311,6 +2311,12 @@
       "why": "tests/c/sigprocmask_state.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Direct C guest for sigprocmask(2) block, unblock and query round-tripping, verified with an exact stdout golden"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/c/sigreturn_preemption_spinner.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true)",
+      "why": "tests/c/sigreturn_preemption_spinner.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true): regression guest for A5 step 2c, a thread that returns from a signal handler within Reverie's keep margin of its slice's timer target and then spins without a syscall, which must still be preempted while Detcore's signal-state copy has ptrace report each handler return (https://github.com/rrnewton/hermit/issues/4485)"
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/c/sigsuspend_after_wnohang_wait.c",
       "runner": "hermit-cli/tests/cli.rs",

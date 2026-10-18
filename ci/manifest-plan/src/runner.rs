@@ -352,7 +352,9 @@ pub fn pmu_clock_backend(backend: &str) -> bool {
 /// Detcore (Reverie still sets the counters up), so Hermit does not refuse it
 /// (<https://github.com/rrnewton/hermit/issues/4291>):
 /// not a custom cell that passes it, and not a verify cell at the relaxed
-/// strictness level, which adds it ([`RELAXED_LEVEL_ARGS`]).
+/// strictness level, which adds it ([`RELAXED_LEVEL_ARGS`]) — unless the
+/// cell's recipe declares its own numeric `--max-timeslice`, which the
+/// relaxed level then leaves in place, so the run still arms the counter.
 pub fn refused_on_an_inexact_branch_counter(cell: &SelectedCell) -> bool {
     let strict_run = match cell.id.mode.as_str() {
         "verify" | "chaos" | "replay" => true,
@@ -368,7 +370,12 @@ pub fn refused_on_an_inexact_branch_counter(cell: &SelectedCell) -> bool {
     };
     strict_run
         && cell.id.backend.as_deref().is_some_and(pmu_clock_backend)
-        && cell.strictness_level() != Some(StrictnessLevel::Relaxed)
+        && match cell.strictness_level() {
+            Some(StrictnessLevel::Relaxed) => cell
+                .strictness()
+                .is_some_and(|strictness| strictness.max_timeslice != MaxTimeslice::Disabled),
+            _ => true,
+        }
 }
 
 pub fn requires_capability(token: &str) -> Result<Option<HostCapability>, String> {
@@ -11546,6 +11553,32 @@ corpus:
         naked.id.backend = None;
         assert_eq!(naked.strictness_level(), None);
         assert_eq!(naked.strictness(), None);
+    }
+
+    /// A verify cell that declares its own numeric `--max-timeslice` keeps it
+    /// at the relaxed level (the level adds `--max-timeslice=disabled` only
+    /// where the recipe names no timeslice), so it still arms the counter and
+    /// is withheld where the counter is inexact. c-programs/sigreturn-preemption
+    /// needs the preemption timer to finish at all.
+    #[test]
+    fn a_relaxed_verify_cell_with_its_own_timeslice_is_refused_on_an_inexact_counter() {
+        let mut cell = verify_cell(
+            "ptrace",
+            true,
+            BTreeMap::from([("ptrace".into(), vec!["--max-timeslice=100000".into()])]),
+            None,
+        );
+        cell.host_level = relaxed_host();
+        assert_eq!(cell.strictness_level(), Some(StrictnessLevel::Relaxed));
+        assert_eq!(
+            cell.strictness().unwrap().max_timeslice,
+            MaxTimeslice::Nanoseconds(100_000)
+        );
+        assert!(refused_on_an_inexact_branch_counter(&cell));
+        // Without its own timeslice the relaxed cell is not refused.
+        let mut plain = verify_cell("ptrace", true, BTreeMap::new(), None);
+        plain.host_level = relaxed_host();
+        assert!(!refused_on_an_inexact_branch_counter(&plain));
     }
 
     /// A run with `--max-timeslice=disabled` uses no branch count, so

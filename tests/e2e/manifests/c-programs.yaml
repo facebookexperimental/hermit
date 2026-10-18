@@ -20552,3 +20552,77 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this guest
           liteinst: No custom edge-case arguments have been calibrated for this guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/sigreturn-preemption
+    description: A thread that returns from a signal handler and then spins without a syscall is still preempted while the signal-state copy observes handler returns; it keeps its own --max-timeslice at the relaxed level, so the harness withholds it on a host whose hermit reports no exact branch counter (refused_on_an_inexact_branch_counter), and a runner without the PMU timer does not run it
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/sigreturn_preemption_spinner.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+        - -pthread
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: The defect this cell guards is in the ptrace backend's reported rt_sigreturn stop; DBT reports no sigreturns
+          kvm: The defect this cell guards is in the ptrace backend's reported rt_sigreturn stop; KVM reports no sigreturns
+          sabre: The defect this cell guards is in the ptrace backend's reported rt_sigreturn stop; SaBRe reports no sigreturns
+          liteinst: The defect this cell guards is in the ptrace backend's reported rt_sigreturn stop, and in-guest LiteInst refuses a preemption timer
+          in-guest-trap: The defect this cell guards is in the ptrace backend's reported rt_sigreturn stop, and in-guest LiteInst refuses a preemption timer
+        hermit_args:
+          ptrace:
+            - --max-timeslice=100000
+        hermit_args_reason: 'A 100 us maximum timeslice (10,000 branches) is shorter than Reverie''s 10,005-branch keep margin, so the guest''s handler return lands within the margin of the pending slice timer target; before A5 step 2c that run never finished (killed at 40 s with the copy on, 5 of 5 across both guest versions), and with 2c this guest (C11 atomics, handler count) passed 5 of 5 harness runs, and the earlier version of it 26 of 26, at load 270-286 on 2026-10-17, where variants with 3 and 12 iterations were refused for a host-timed skid overshoot 2 of 6 and 3 of 16 times (https://github.com/rrnewton/hermit/issues/4485)'
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): this cell asserts that Hermit preempts a spinning thread after a handler return; natively the kernel always preempts it, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: Native scheduling always preempts the spinner, so it asserts nothing this cell guards
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this preemption check and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is a separate exercise from this preemption check
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay qualification is a separate exercise from this preemption check
+          sabre: Record/replay qualification is a separate exercise from this preemption check
+          liteinst: Record/replay qualification is a separate exercise from this preemption check
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: chaos scheduling preempts at random points, which this calibrated handler length against one slice end does not model.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling preempts at random points, which this calibrated handler return does not model
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling preempts at random points, which this calibrated handler return does not model
+          sabre: Chaos scheduling preempts at random points, which this calibrated handler return does not model
+          liteinst: Chaos scheduling preempts at random points, which this calibrated handler return does not model
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap

@@ -9218,6 +9218,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigsuspend-sibling-signal-wake",
           "mode": "verify",
           "backend": "ptrace"
@@ -22677,7 +22684,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1625",
+        "NEXTEST_EXPECTED_EXECUTED": "1626",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -27171,6 +27178,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/sigprocmask-state",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -35027,6 +35041,13 @@
           "test": "c-programs/sigprocmask-state",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -46202,7 +46223,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1611",
+        "NEXTEST_EXPECTED_EXECUTED": "1612",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -55300,6 +55321,13 @@
           "test": "c-programs/sigprocmask-state",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",

@@ -5911,7 +5911,9 @@ mod tests {
         // into c-programs/lsm-refusals and c-programs/perf-event-{hardware,
         // software,watchpoint}-enosys into c-programs/perf-event-refusals:
         // (2 - 6) x 5: 2950.
-        assert_eq!(parsed.cells.len(), 2950);
+        // c-programs/sigreturn-preemption (A5 step 2c's regression cell)
+        // adds one row per candidate backend: 2955.
+        assert_eq!(parsed.cells.len(), 2955);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
