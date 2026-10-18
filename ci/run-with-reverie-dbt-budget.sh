@@ -2058,7 +2058,15 @@ fi
 # 3090b098 (private memory facts beside controller capture), replayed onto
 # aaed1ab669b079a7f0a3adf00cf92d274e34649b, whose tree equals 80fc77fa; the replayed
 # tree is byte-identical to 3090b098's, so the block above holds unchanged.
-expected_pin=c4c5b7374d4fe1aa3e04066744cb623e48b6695d
+# CARRY TO 38a30d7a4912d046487d4a517ffad092cfb5d4c0 (2026-10-18): from
+# c4c5b7374d4fe1aa3e04066744cb623e48b6695d. Two commits: 8be792c1 (SaBRe's plugin ABI for
+# the shared in-guest runtime, R1; experimental/reverie-sabre*) and 38a30d7a
+# (Guest::deliver_signal and the signal-delivery check types, A5 step 3.1;
+# reverie/src and reverie-ptrace). git diff is empty under reverie-dbt/, no
+# reverie-dbt file is added or removed (inventory 966), and the root Cargo.toml,
+# Cargo.lock and rust-toolchain.toml are unchanged. SDK and native inputs,
+# calibrated budget, job width and limits are unchanged.
+expected_pin=38a30d7a4912d046487d4a517ffad092cfb5d4c0
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
