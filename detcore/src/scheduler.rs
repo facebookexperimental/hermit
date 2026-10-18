@@ -5865,6 +5865,57 @@ impl Scheduler {
             && !self.blocked.signaled_background.contains(&dettid)
     }
 
+    /// The shared half of an external controller capture. The runtime fact
+    /// excludes pending/unmediated native execution; this check excludes every
+    /// modeled task released outside the serial schedule and binds the caller
+    /// to the live physical task registered for this exact address space.
+    /// The caller must retain the scheduler mutex through descriptor closure.
+    pub(crate) fn controller_capture_task(
+        &self,
+        dettid: DetTid,
+        mm: MmId,
+        fact: reverie::ControllerCaptureFact,
+    ) -> Option<(i32, i32)> {
+        if !self.holds_serial_grant(dettid)
+            || self.thread_mm(dettid) != Some(mm)
+            || !self.rpc_incarnation_matches(dettid, mm)
+            || !self.blocked.external_io_blockers.is_empty()
+            || !self.blocked.rt_sigsuspend_blockers.is_empty()
+            || !self.blocked.signaled_background.is_empty()
+            || self
+                .thread_tree
+                .pid_namespaces
+                .untranslatable(dettid)
+                .is_some()
+            || self
+                .thread_tree
+                .pid_namespaces
+                .namespace_of(dettid)
+                .is_some()
+        {
+            return None;
+        }
+        let process = self.thread_tree.thread_to_leader.get(&dettid)?;
+        if self.thread_tree.pid_ns_depth(*process) != 0 {
+            return None;
+        }
+        let (registered_mm, pid, tid, pidfd) = self.physical_thread_pidfds.get(&dettid)?;
+        if *registered_mm != mm
+            || *pid != fact.physical_pid.as_raw()
+            || *tid != fact.physical_tid.as_raw()
+        {
+            return None;
+        }
+        let mut poll = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll points to one initialized record; a zero timeout never
+        // releases scheduler ownership while waiting for the physical task.
+        (unsafe { libc::poll(&mut poll, 1, 0) == 0 && poll.revents == 0 }).then_some((*pid, *tid))
+    }
+
     /// Record the address-space identity `dettid` registered with
     /// (`thread_mms`).
     pub(crate) fn record_thread_mm(&mut self, dettid: DetTid, mm: MmId) {
@@ -15343,6 +15394,78 @@ mod test {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(scheduler.physical_thread_pidfds.is_empty());
+    }
+
+    #[test]
+    fn controller_capture_requires_the_current_turn_task_and_no_background_observers() {
+        let mut sched = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw(37);
+        let other = DetTid::from_raw(38);
+        let mm = MmId::initial(tid);
+        let physical_pid = std::process::id() as i32;
+        let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        let fact = reverie::ControllerCaptureFact {
+            physical_pid: reverie::Pid::from_raw(physical_pid),
+            physical_tid: reverie::Pid::from_raw(physical_tid),
+            procfs_device: 1,
+            procfs_inode: 1,
+        };
+        sched.thread_tree.add_child(tid, tid, true);
+        register_known_thread(&mut sched, tid);
+        sched.record_thread_mm(tid, mm);
+        sched
+            .register_physical_thread(tid, mm, physical_pid, physical_tid)
+            .unwrap();
+        assert_eq!(sched.controller_capture_task(tid, mm, fact), None);
+        sched.set_running_for_test(tid);
+        assert_eq!(
+            sched.controller_capture_task(tid, mm, fact),
+            Some((physical_pid, physical_tid))
+        );
+        assert_eq!(sched.controller_capture_task(other, mm, fact), None);
+        assert_eq!(
+            sched.controller_capture_task(tid, mm.for_exec(tid), fact),
+            None
+        );
+        assert_eq!(
+            sched.controller_capture_task(
+                tid,
+                mm,
+                reverie::ControllerCaptureFact {
+                    physical_tid: reverie::Pid::from_raw(physical_tid + 1),
+                    ..fact
+                },
+            ),
+            None
+        );
+        let operation = ExternalOpId::new(other, 1);
+        sched.blocked.external_io_blockers.insert(other, operation);
+        assert_eq!(sched.controller_capture_task(tid, mm, fact), None);
+        sched.blocked.external_io_blockers.clear();
+        sched
+            .blocked
+            .rt_sigsuspend_blockers
+            .insert(other, operation);
+        assert_eq!(sched.controller_capture_task(tid, mm, fact), None);
+        sched.blocked.rt_sigsuspend_blockers.clear();
+        sched.blocked.signaled_background.insert(other);
+        assert_eq!(sched.controller_capture_task(tid, mm, fact), None);
+        sched.blocked.signaled_background.clear();
+        sched
+            .thread_tree
+            .pid_namespaces
+            .mark_untranslatable(tid, "unknown".into());
+        assert_eq!(sched.controller_capture_task(tid, mm, fact), None);
+        sched.thread_tree.pid_namespaces.forget(tid);
+        sched.thread_tree.pid_ns_depth.insert(tid, 1);
+        assert_eq!(sched.controller_capture_task(tid, mm, fact), None);
+        sched.thread_tree.pid_ns_depth.remove(&tid);
+        assert_eq!(
+            sched.controller_capture_task(tid, mm, fact),
+            Some((physical_pid, physical_tid))
+        );
+        sched.exec_incarnations.insert(tid, mm.for_exec(tid));
+        assert_eq!(sched.controller_capture_task(tid, mm, fact), None);
     }
 
     /// A process's exit watch stays current through its leader's normal exit,

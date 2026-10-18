@@ -359,6 +359,111 @@ fn brk_may_shrink(mut vmas: impl Iterator<Item = Vma>, new_end: u64, old_end: u6
     vmas.any(|vma| vma.end > new_end && vma.start < old_end)
 }
 
+// Bounded DEBUG diagnostic: no new procfs read and no formatting between
+// the metadata capture and a mapping operation. Only the first rejected moving
+// request in this process is retained. Fork inherits the diagnostic latch.
+struct BrkDiagnostic<'a> {
+    dettid: i32,
+    model: &'a crate::memory::BrkModel,
+    requested: u64,
+}
+
+struct BrkDiagnosticHex<'a>(&'a [u8]);
+
+impl std::fmt::Display for BrkDiagnosticHex<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl BrkDiagnostic<'_> {
+    fn rejected(
+        &self,
+        branch: &'static str,
+        limit: Option<u64>,
+        smaps: Option<&[u8]>,
+        kernel_result: &dyn std::fmt::Debug,
+    ) {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+        static CAPTURED: AtomicBool = AtomicBool::new(false);
+        const MAX_BYTES: usize = 256 * 1024;
+        if self.requested == 0
+            || self.requested == self.model.current
+            || !tracing::enabled!(target: "detcore::brk_diagnostic", tracing::Level::DEBUG)
+            || CAPTURED.swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let complete = smaps.is_some_and(|bytes| bytes.len() <= MAX_BYTES);
+        tracing::debug!(
+            target: "detcore::brk_diagnostic",
+            dettid = self.dettid,
+            requested = self.requested,
+            start = self.model.start,
+            current = self.model.current,
+            data_span = self.model.data_span,
+            launcher_break = self.model.launcher_break,
+            ?limit,
+            branch,
+            ?kernel_result,
+            smaps_len = ?smaps.map(<[u8]>::len),
+            complete,
+            "BRK_DENIAL_V1 begin",
+        );
+        if complete {
+            for (index, chunk) in smaps.unwrap().chunks(1024).enumerate() {
+                tracing::debug!(
+                    target: "detcore::brk_diagnostic",
+                    dettid = self.dettid,
+                    index,
+                    bytes = %BrkDiagnosticHex(chunk),
+                    "BRK_DENIAL_V1 chunk",
+                );
+            }
+        }
+        tracing::debug!(
+            target: "detcore::brk_diagnostic",
+            dettid = self.dettid,
+            complete,
+            "BRK_DENIAL_V1 end",
+        );
+    }
+}
+
+/// The mapping-dependent part of a modeled program-break request. Endpoints
+/// are page-aligned; resource limits and the actual mapping operation stay
+/// with the caller, independently of where the smaps bytes were captured.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub enum BrkMappingCheck {
+    /// Check new pages and Linux's guard gap above the old break.
+    Grow { old_end: u64, new_end: u64 },
+    /// Check that some mapping overlaps the pages being removed.
+    Shrink { new_end: u64, old_end: u64 },
+}
+
+impl BrkMappingCheck {
+    pub(crate) fn allows(self, smaps: &[u8]) -> bool {
+        match self {
+            Self::Grow { old_end, new_end } => brk_may_grow(smaps_vmas(smaps), old_end, new_end),
+            Self::Shrink { new_end, old_end } => {
+                brk_may_shrink(smaps_vmas(smaps), new_end, old_end)
+            }
+        }
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// `brk(addr)` in a run that declares a launcher
     /// (`Detcore::declares_launcher`), where the kernel's program break is the
@@ -433,12 +538,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         requested: u64,
     ) -> Result<u64, &'static str> {
         let current = model.current;
+        let diagnostic = BrkDiagnostic {
+            dettid: guest.thread_state().dettid.as_raw(),
+            model,
+            requested,
+        };
         if requested < model.start {
             if requested >= model.launcher_break {
+                diagnostic.rejected("below_start_launcher", None, None, &"not_injected");
                 return Err(
                     "unsupported: brk from the launcher's break, which the guest's libc read before Detcore modeled the guest's",
                 );
             }
+            diagnostic.rejected("below_start", None, None, &"not_injected");
             return Ok(current);
         }
         let limit = guest
@@ -450,10 +562,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             .map_or(libc::RLIM64_INFINITY, |limit| limit.current);
         let used = (requested - model.start).saturating_add(model.data_span);
         if limit != libc::RLIM64_INFINITY && used > limit {
+            diagnostic.rejected("rlimit_data", Some(limit), None, &"not_injected");
             return Ok(current);
         }
         let (Some(new_end), Some(old_end)) = (brk_page_align(requested), brk_page_align(current))
         else {
+            diagnostic.rejected("page_overflow", Some(limit), None, &"not_injected");
             return Ok(current);
         };
         if new_end == old_end {
@@ -465,12 +579,41 @@ impl<T: RecordOrReplay> Detcore<T> {
         // sequentialized schedule.
         let smaps = self
             .guest_task_directory(guest)
-            .and_then(|directory| crate::util::raw_read_listing(&directory.join("smaps")).ok())
-            .ok_or("unsupported: brk where Detcore cannot read the guest's mappings")?;
-        if requested <= current {
-            if !brk_may_shrink(smaps_vmas(&smaps), new_end, old_end) {
-                return Ok(current);
+            .and_then(|directory| crate::util::raw_read_listing(&directory.join("smaps")).ok());
+        let check = if requested <= current {
+            BrkMappingCheck::Shrink { new_end, old_end }
+        } else {
+            BrkMappingCheck::Grow { old_end, new_end }
+        };
+        let allowed = match smaps.as_deref() {
+            Some(smaps) => Some(check.allows(smaps)),
+            None if guest
+                .thread_state()
+                .changed_root
+                .load(std::sync::atomic::Ordering::SeqCst) =>
+            {
+                crate::tool_global::check_brk_mappings(guest, check)
             }
+            None => None,
+        }
+        .ok_or_else(|| {
+            diagnostic.rejected("smaps_unavailable", Some(limit), None, &"not_injected");
+            "unsupported: brk where Detcore cannot read the guest's mappings"
+        })?;
+        if !allowed {
+            diagnostic.rejected(
+                if requested <= current {
+                    "shrink_predicate"
+                } else {
+                    "grow_predicate"
+                },
+                Some(limit),
+                smaps.as_deref(),
+                &"not_injected",
+            );
+            return Ok(current);
+        }
+        if requested <= current {
             // As Linux, which keeps the old break where the unmap fails.
             let unmapped = guest
                 .inject_with_retry(syscalls::Syscall::Munmap(
@@ -479,10 +622,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .with_len((old_end - new_end) as usize),
                 ))
                 .await;
+            if unmapped.is_err() {
+                diagnostic.rejected("munmap_error", Some(limit), smaps.as_deref(), &unmapped);
+            }
             return Ok(if unmapped.is_ok() { requested } else { current });
-        }
-        if !brk_may_grow(smaps_vmas(&smaps), old_end, new_end) {
-            return Ok(current);
         }
         let length = new_end - old_end;
         let mapped = guest
@@ -500,8 +643,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_offset(0),
             ))
             .await;
-        match mapped {
-            Ok(address) if address as u64 == old_end => Ok(requested),
+        match &mapped {
+            Ok(address) if *address as u64 == old_end => Ok(requested),
             // A kernel without MAP_FIXED_NOREPLACE treats the address as a
             // hint and may map elsewhere: give that mapping back, or refuse
             // where it cannot be.
@@ -509,10 +652,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let removed = guest
                     .inject_with_retry(syscalls::Syscall::Munmap(
                         syscalls::Munmap::new()
-                            .with_addr(syscalls::Addr::from_raw(address as usize))
+                            .with_addr(syscalls::Addr::from_raw(*address as usize))
                             .with_len(length as usize),
                     ))
                     .await;
+                diagnostic.rejected(
+                    "mmap_wrong_address",
+                    Some(limit),
+                    smaps.as_deref(),
+                    &(&mapped, &removed),
+                );
                 if removed.is_ok() {
                     Ok(current)
                 } else {
@@ -521,7 +670,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     )
                 }
             }
-            Err(_) => Ok(current),
+            Err(_) => {
+                diagnostic.rejected("mmap_error", Some(limit), smaps.as_deref(), &mapped);
+                Ok(current)
+            }
         }
     }
 }
@@ -529,6 +681,40 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_brk_check_uses_the_existing_mapping_policy() {
+        let smaps = b"00500000-00501000 rw-p 00000000 00:00 0\nVmFlags: rd wr\n";
+        let grow = |new_end| BrkMappingCheck::Grow {
+            old_end: 0x400000,
+            new_end,
+        };
+        assert!(grow(0x4ff000).allows(smaps));
+        assert!(!grow(0x500000).allows(smaps));
+        assert!(!grow(u64::MAX - BRK_PAGE + 1).allows(smaps));
+        assert!(
+            BrkMappingCheck::Shrink {
+                new_end: 0x500000,
+                old_end: 0x501000,
+            }
+            .allows(smaps)
+        );
+        assert!(
+            !BrkMappingCheck::Shrink {
+                new_end: 0x400000,
+                old_end: 0x500000,
+            }
+            .allows(smaps)
+        );
+        assert!(grow(0x500000).allows(b""));
+        assert!(
+            !BrkMappingCheck::Shrink {
+                new_end: 0x500000,
+                old_end: 0x501000,
+            }
+            .allows(b"")
+        );
+    }
 
     #[test]
     fn a_break_grows_and_shrinks_only_where_linuxs_brk_would() {

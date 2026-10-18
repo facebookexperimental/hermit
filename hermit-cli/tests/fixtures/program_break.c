@@ -25,7 +25,28 @@
 
 static long brk_(long to) { return syscall(SYS_brk, to); }
 
-int main(void) {
+int main(int argc, char **argv) {
+  int root_only = argc == 2 &&
+      (strcmp(argv[1], "--chroot-root-brk") == 0 ||
+       strcmp(argv[1], "--vfork-then-chroot-root-brk") == 0);
+  if (argc == 2 &&
+      (strcmp(argv[1], "--chroot-into-proc") == 0 ||
+       strcmp(argv[1], "--vfork-then-chroot-into-proc") == 0 || root_only)) {
+    if (strcmp(argv[1], "--vfork-then-chroot-into-proc") == 0 ||
+        strcmp(argv[1], "--vfork-then-chroot-root-brk") == 0) {
+      pid_t child = vfork();
+      if (child == 0)
+        _exit(0);
+      int status = 0;
+      if (child < 0 || waitpid(child, &status, 0) != child ||
+          !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        return 2;
+    }
+    if (chroot("/proc") != 0)
+      return 2;
+  } else if (argc != 1 && !(argc == 2 && strcmp(argv[1], "-") == 0)) {
+    return 2;
+  }
   /* Raw brk first, before stdio or malloc touch the heap; printed after. */
   long r[13];
   r[0] = brk_(0);
@@ -67,29 +88,33 @@ int main(void) {
                           "blocker placed", "past the blocker", "a page short of it",
                           "up to it"};
   /* A fork child moves its own break, not its parent's. */
-  long before_fork = brk_(0), child_grew = 0;
-  int pipefd[2];
-  if (pipe(pipefd) != 0)
-    return 2;
-  pid_t child = fork();
-  if (child == 0) {
-    long grew = brk_(before_fork + 3 * 4096);
-    if (write(pipefd[1], &grew, sizeof grew) != sizeof grew)
-      _exit(3);
-    _exit(0);
+  long before_fork = 0, child_grew = 0, parent_after = 0;
+  if (!root_only) {
+    before_fork = brk_(0);
+    int pipefd[2];
+    if (pipe(pipefd) != 0)
+      return 2;
+    pid_t child = fork();
+    if (child == 0) {
+      long grew = brk_(before_fork + 3 * 4096);
+      if (write(pipefd[1], &grew, sizeof grew) != sizeof grew)
+        _exit(3);
+      _exit(0);
+    }
+    if (read(pipefd[0], &child_grew, sizeof child_grew) != sizeof child_grew)
+      return 4;
+    waitpid(child, NULL, 0);
+    parent_after = brk_(0);
   }
-  if (read(pipefd[0], &child_grew, sizeof child_grew) != sizeof child_grew)
-    return 4;
-  waitpid(child, NULL, 0);
-  long parent_after = brk_(0);
   for (int i = 0; i < 13; i++)
     printf("%s: %#lx\n", labels[i], r[i]);
   printf("emptied heap grown to %#lx, shrink answers %#lx, query %#lx\n", empty[0], empty[1],
          empty[2]);
   printf("grow-down mapping placed: %ld, growth into its gap: %#lx\n", gap[0], gap[1]);
-  printf("child grew by 3 pages: %s, the parent kept its own: %s\n",
-         child_grew == before_fork + 3 * 4096 ? "yes" : "no",
-         parent_after == before_fork ? "yes" : "no");
+  if (!root_only)
+    printf("child grew by 3 pages: %s, the parent kept its own: %s\n",
+           child_grew == before_fork + 3 * 4096 ? "yes" : "no",
+           parent_after == before_fork ? "yes" : "no");
   char *small = malloc(24), *medium = malloc(5000);
   printf("malloc small %p medium %p\n", (void *)small, (void *)medium);
   free(medium);

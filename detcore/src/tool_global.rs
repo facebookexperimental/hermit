@@ -2197,6 +2197,14 @@ impl GlobalTool for GlobalState {
     }
 
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
+        if let GlobalRequest::CheckBrkMappings(check, fact) = &gr.2 {
+            return (
+                None,
+                GlobalResponse::CheckBrkMappings(
+                    self.capture_brk_mappings(from, gr.1, *check, *fact),
+                ),
+            );
+        }
         // Intercept even malformed counted envelopes before taking a deadline
         // hint. Native controls belong to the already owned exec cut.
         if native_exec::is_native_exec_control(&gr.2) {
@@ -2234,6 +2242,70 @@ impl GlobalTool for GlobalState {
 }
 
 impl GlobalState {
+    /// Evaluate a brk predicate in the controller's unchanged procfs view.
+    /// The scheduler lock retains the caller's grant and physical identity
+    /// until all temporary descriptors have closed. The backend fact excludes
+    /// native tasks that the scheduler cannot stop; it is not inferred here.
+    fn capture_brk_mappings(
+        &self,
+        from: Tid,
+        mm: MmId,
+        check: crate::syscalls::memory::BrkMappingCheck,
+        fact: reverie::ControllerCaptureFact,
+    ) -> Option<bool> {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        if !self.cfg.sequentialize_threads {
+            return None;
+        }
+        let sched = self.sched.lock().unwrap();
+        let dettid = DetTid::from_raw(from.as_raw());
+        let (pid, tid) = sched.controller_capture_task(dettid, mm, fact)?;
+        let root = File::open("/proc").ok()?;
+        let metadata = root.metadata().ok()?;
+        if !metadata.is_dir()
+            || metadata.dev() != fact.procfs_device
+            || metadata.ino() != fact.procfs_inode
+        {
+            return None;
+        }
+        let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: root is live and filesystem has space for the complete result.
+        if unsafe { libc::fstatfs(root.as_raw_fd(), filesystem.as_mut_ptr()) } != 0
+            || unsafe { filesystem.assume_init() }.f_type != libc::PROC_SUPER_MAGIC
+        {
+            return None;
+        }
+        // A live nonleader remains addressable by its TID after its leader
+        // exits, when the leader's /task directory may no longer be readable.
+        let relative = std::ffi::CString::new(format!("{tid}/smaps")).ok()?;
+        // SAFETY: both the directory and nul-terminated relative path are live.
+        let raw = unsafe {
+            libc::openat(
+                root.as_raw_fd(),
+                relative.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return None;
+        }
+        // SAFETY: openat returned a new descriptor exclusively owned here.
+        let mut smaps_file = unsafe { File::from_raw_fd(raw) };
+        let mut smaps = Vec::new();
+        smaps_file.read_to_end(&mut smaps).ok()?;
+        // External death cannot turn a partial or former task's capture into
+        // authority for a replacement. The registered pidfd is still held.
+        if sched.controller_capture_task(dettid, mm, fact) != Some((pid, tid)) {
+            return None;
+        }
+        Some(check.allows(&smaps))
+        // smaps_file and root close before sched releases the grant guard and
+        // before the caller receives the fixed, allocation-free answer.
+    }
+
     /// Prints, once per run, a WARN for each signal whose handler an in-guest
     /// runtime refused and one for a refused alternate stack
     /// (`crate::refused_signal_controls`), whichever process reports it.
@@ -2263,6 +2335,16 @@ impl GlobalState {
         from: Tid,
         gr: <Self as GlobalTool>::Request,
     ) -> <Self as GlobalTool>::Response {
+        // This read stays inside the caller's existing grant. In particular,
+        // it neither drains logs nor updates clocks or deadline ownership.
+        if let GlobalRequest::CheckBrkMappings(check, fact) = &gr.2 {
+            return (
+                None,
+                GlobalResponse::CheckBrkMappings(
+                    self.capture_brk_mappings(from, gr.1, *check, *fact),
+                ),
+            );
+        }
         // This entry is also used directly. The strict native cut must precede
         // ordinary forwarding drain/checks and all sender-clock accounting.
         if native_exec::is_native_exec_control(&gr.2) {
@@ -2691,6 +2773,9 @@ impl GlobalState {
                 unreachable!(
                     "refused signal controls are answered before the forwarded-record drain"
                 )
+            }
+            GlobalRequest::CheckBrkMappings(..) => {
+                unreachable!("mapping capture is answered before clock accounting")
             }
             GlobalRequest::Sigalrm(_) => {
                 unreachable!("SIGALRM ledger control answered before clock accounting")
@@ -5894,6 +5979,13 @@ pub enum GlobalRequest {
     /// (`crate::refused_signal_controls`). Answered before the forwarded-record
     /// drain and any clock or scheduler accounting. Appended last.
     AnnounceRefusedSignalControls(u64, bool),
+    /// A fixed reply from an external controller while the sender retains its
+    /// serial grant. The runtime fact and the scheduler jointly establish that
+    /// no guest can observe the temporary procfs descriptor. Appended last.
+    CheckBrkMappings(
+        crate::syscalls::memory::BrkMappingCheck,
+        reverie::ControllerCaptureFact,
+    ),
 }
 
 /// Responses from the global object
@@ -6095,6 +6187,33 @@ pub enum GlobalResponse {
     AuxvFromKernel(bool),
     /// Appended last.
     AnnounceRefusedSignalControls(()),
+    /// None means the capture authority or mappings were unavailable.
+    /// Appended last; this response owns no allocated storage.
+    CheckBrkMappings(Option<bool>),
+}
+
+/// Read only the mapping predicate through a backend's synchronous external
+/// channel. No deadline wrapper, log accounting, or async future may allocate
+/// or free guest-mm storage after the controller captures the mappings.
+pub(crate) fn check_brk_mappings<G, T>(
+    guest: &G,
+    check: crate::syscalls::memory::BrkMappingCheck,
+) -> Option<bool>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let fact = guest.controller_capture_fact()?;
+    let state = guest.thread_state();
+    let request = (
+        state.thread_logical_time.clone(),
+        state.mm_id,
+        GlobalRequest::CheckBrkMappings(check, fact),
+    );
+    match guest.try_send_rpc_sync(request).ok()? {
+        (None, GlobalResponse::CheckBrkMappings(answer)) => answer,
+        _ => None,
+    }
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -15585,6 +15704,110 @@ mod tests {
         let sched = state.sched.lock().unwrap();
         assert!(sched.blocked.external_io_blockers.contains_key(&tid));
         assert!(!sched.holds_serial_grant(tid));
+    }
+
+    /// Controller mapping capture authenticates its task and procfs view,
+    /// retains the existing serial grant, and returns no logical time.
+    #[tokio::test]
+    async fn controller_brk_capture_authenticates_the_view_without_spending_the_grant() {
+        use std::os::unix::fs::MetadataExt;
+
+        use crate::syscalls::memory::BrkMappingCheck;
+
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let tid = DetTid::from_raw(37);
+        let mm = MmId::initial(tid);
+        let pid = std::process::id() as i32;
+        let physical_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        let procfs = std::fs::metadata("/proc").unwrap();
+        let fact = reverie::ControllerCaptureFact {
+            physical_pid: reverie::Pid::from_raw(pid),
+            physical_tid: reverie::Pid::from_raw(physical_tid),
+            procfs_device: procfs.dev(),
+            procfs_inode: procfs.ino(),
+        };
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.thread_tree.add_child(tid, tid, true);
+            sched.record_thread_mm(tid, mm);
+            sched.next_turns.insert(
+                tid,
+                ThreadNextTurn {
+                    dettid: tid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            sched
+                .register_physical_thread(tid, mm, pid, physical_tid)
+                .unwrap();
+            sched.set_running_for_test(tid);
+        }
+        let before = state.global_time.lock().unwrap().as_nanos();
+        // This real smaps capture must deny an overflowing growth, without
+        // allocating a guest-visible snapshot or advancing the logical clock.
+        let check = BrkMappingCheck::Grow {
+            old_end: 0,
+            new_end: u64::MAX,
+        };
+        let answer = state
+            .receive_rpc(
+                Tid::from_raw(tid.as_raw()),
+                (
+                    DetTime::new(&config),
+                    mm,
+                    GlobalRequest::CheckBrkMappings(check, fact),
+                ),
+            )
+            .await;
+        assert_eq!(
+            answer,
+            (None, GlobalResponse::CheckBrkMappings(Some(false)))
+        );
+        assert_eq!(state.global_time.lock().unwrap().as_nanos(), before);
+        assert!(state.sched.lock().unwrap().holds_serial_grant(tid));
+        assert_eq!(
+            state.capture_brk_mappings(
+                Tid::from_raw(tid.as_raw()),
+                mm,
+                check,
+                reverie::ControllerCaptureFact {
+                    procfs_inode: fact.procfs_inode + 1,
+                    ..fact
+                },
+            ),
+            None,
+        );
+        let address = &before as *const _ as u64;
+        assert_eq!(
+            state.capture_brk_mappings(
+                Tid::from_raw(tid.as_raw()),
+                mm,
+                BrkMappingCheck::Shrink {
+                    new_end: address,
+                    old_end: address + 1
+                },
+                fact,
+            ),
+            Some(true),
+        );
+        let unsequentialized = GlobalState::initialize(
+            &Config {
+                sequentialize_threads: false,
+                ..config
+            },
+            false,
+        );
+        assert_eq!(
+            unsequentialized.capture_brk_mappings(Tid::from_raw(tid.as_raw()), mm, check, fact,),
+            None
+        );
     }
 
     /// Only the thread holding the serial grant reaches a shared open file

@@ -86,8 +86,8 @@ const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | l
 /// exchange, and no capability advertises it, so nothing calls it. Version 9
 /// adds `reverie_dbt_runtime_cpuid`: the native client keeps no CPUID table and
 /// asks this runtime, which answers from Detcore.
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 9;
-const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 56;
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 10;
+const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 64;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the inherited DBT report descriptor.
@@ -119,7 +119,20 @@ fn upgrade_runtime_callbacks_v1(
         emit_evidence: callbacks.emit,
         evidence_log_level: 0,
         compare_exchange_u32: unsupported_compare_exchange,
+        controller_capture_control: unsupported_controller_capture,
     }
+}
+
+unsafe extern "C" fn unsupported_controller_capture(
+    _context: usize,
+    _operation: u32,
+    output: *mut reverie_dbt::NativeControllerCaptureFact,
+) -> i32 {
+    if !output.is_null() {
+        // SAFETY: the callback contract supplies writable output when non-null.
+        unsafe { output.write(reverie_dbt::NativeControllerCaptureFact::default()) };
+    }
+    0
 }
 
 /// Stands in for the compare-and-exchange that callbacks older than ABI
@@ -1250,6 +1263,7 @@ unsafe fn runtime_background_init(
     abi: RuntimeAbi,
     mode: reverie_dbt::DbtStartupMode,
 ) -> Result<(), String> {
+    reverie_dbt::install_controller_capture_control(callbacks.controller_capture_control);
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
     let (emit_diagnostic, emit_evidence, protected_level) = runtime_callback_channels(callbacks);
     let _ = DBT_DIAGNOSTIC_EMITTER.set(emit_diagnostic);
@@ -3425,8 +3439,8 @@ mod tests {
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 9);
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE, 56);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 10);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE, 64);
         // The native client's dbt_signal_event_t (ABI version 7).
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
@@ -3490,6 +3504,14 @@ mod tests {
             unsafe { (current.compare_exchange_u32)(1, 7, 9, std::ptr::null_mut()) },
             -libc::ENOSYS
         );
+        let mut capture = reverie_dbt::NativeControllerCaptureFact::default();
+        // SAFETY: the fixed record contains only integer fields.
+        unsafe { std::ptr::write_bytes(&mut capture, 0xa5, 1) };
+        assert_eq!(
+            unsafe { (current.controller_capture_control)(0, 0, &mut capture) },
+            0,
+        );
+        assert_eq!(capture, reverie_dbt::NativeControllerCaptureFact::default());
     }
 
     #[test]
@@ -3503,6 +3525,7 @@ mod tests {
             emit_evidence: test_emit_evidence,
             evidence_log_level: 3,
             compare_exchange_u32: unsupported_compare_exchange,
+            controller_capture_control: unsupported_controller_capture,
         };
         let (diagnostic, evidence, level) = runtime_callback_channels(&callbacks);
 

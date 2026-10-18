@@ -1999,7 +1999,25 @@ fi
 # reverie-dbt file is added or removed, and the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml are unchanged. All seven SDK inputs, inventory 963,
 # calibrated budget, job width and limits are unchanged.
-expected_pin=b1e81ac276ccebe31d1a41e4c1f648bbcbd5e16f
+# CARRY TO 6d76bb72178c34b3ded8ec2d12b26aca8f51eee0 (2026-10-18): from
+# ed29a09d102ffa3bf33c3efce9401025e80b7e4e. Controller-capture certainty and inline RPC
+# storage add one DBT test file (inventory 964), native callback ABI 10, and
+# a small vendor export. Build recipes and calibrated limits stay unchanged;
+# vendor source identity changes, so no unchanged-SDK carry is asserted.
+# Actual R6d76 SDK MISS 8da5596da1403ff0b682f35f088ce01dda82e3d1bd64a4395c94d4d8bb6df94e
+# built in 25.36 seconds with 7 native jobs (NUM_JOBS=8). The scoped R build
+# peaked at 1,715,703,808 bytes and 163.077281 CPU seconds, with all caps clear.
+# This is SDK-input evidence; successor native-client compilation is separate.
+# CARRY TO 5ac38380bc85e49f5212a4d4518179595b016ce8 (2026-10-18): from
+# 6d76bb72178c34b3ded8ec2d12b26aca8f51eee0. Correct native reservation reuse and atomic
+# admission publication; the client and its existing component driver change.
+# Vendor/SDK recipe inputs are byte-identical, so key 8da5596d above still
+# names those inputs. Rebuild the native client separately; limits stay unchanged.
+# CARRY TO 9451327184143f9046c80415f65eafbc0b25bd43 (2026-10-18): rebase the two
+# controller-capture commits onto b1e81ac276ccebe31d1a41e4c1f648bbcbd5e16f.
+# Incoming changes are disjoint from DBT/native/vendor/build inputs; the
+# SDK and native component inputs equal 5ac above. All limits stay unchanged.
+expected_pin=9451327184143f9046c80415f65eafbc0b25bd43
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
@@ -2064,7 +2082,7 @@ export REVERIE_DBT_BUDGET_BOUND_PIN
 # shellcheck source=ci/configure-build-jobs.sh
 source "$ROOT_DIR/ci/configure-build-jobs.sh" reverie-dbt-budget-child
 
-echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:75c3067d4692cd8aa168d6791e718f21e6535e672b957291142070a0edc27234}" >&2
+echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,sdk-build-observed:8da5596da1403ff0b682f35f088ce01dda82e3d1bd64a4395c94d4d8bb6df94e:source-6d76bb72}" >&2
 
 # A cargo build, check, clippy, doc, rustc or test command reruns once if the
 # compiler itself crashed; every other command is exec'd unchanged

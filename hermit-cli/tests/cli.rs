@@ -4808,16 +4808,6 @@ const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
          (https://github.com/rrnewton/hermit/issues/4450)",
     ),
     (
-        "detcore_omits_the_procfs_names_outside_the_level_on_every_backend",
-        "dbt",
-        "REGRESSION from e71c697a (Detcore answers brk on DBT): after the guest's \
-         chroot (--chroot-into-proc) Detcore can no longer read the guest's smaps \
-         (guest_task_procfs is None once the root changes), so the guest's next brk \
-         is refused by name: \"unsupported: brk where Detcore cannot read the \
-         guest's mappings\". The brk model needs a procfs descriptor held across \
-         chroot; the DBT lane owns the fix, which removes this entry",
-    ),
-    (
         "detcore_answers_its_procfs_links_on_every_backend",
         "sabre",
         "a thread with its own descriptor table aborts the run \
@@ -9479,6 +9469,83 @@ fn run_dbt_program_break_is_the_guests_as_natively() {
         assert_eq!(stdout(&output), native, "{backend}");
     }
     assert_dbt_guest_mode_at_l2(&guest, "-", &native);
+}
+
+/// Changing the guest's root must not deprive the program-break model of its
+/// own mapping metadata. Run the same root grow/shrink and collision checks
+/// after chroot, with Linux itself as the stdout oracle. The fixture's separate
+/// full `--chroot-into-proc` mode retains the fork/reconnect reproduction.
+#[test]
+fn run_dbt_program_break_after_chroot_is_the_guests_as_natively() {
+    if dbt_unavailable("run_dbt_program_break_after_chroot_is_the_guests_as_natively") {
+        return;
+    }
+    let guest = program_break_guest(
+        "program-break-chroot",
+        "program_break.c",
+        &["-fno-pie", "-no-pie"],
+    );
+    let native = Command::new("unshare")
+        .args(["--user", "--map-root-user", "setarch", "-R"])
+        .arg(&guest)
+        .arg("--chroot-root-brk")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the chroot program-break guest natively");
+    assert!(native.status.success(), "native chroot failed: {native:?}");
+    let expected = stdout(&native);
+    for line in [
+        "kept bytes: 0x1\n",
+        "blocker placed: 0x1\n",
+        "grow-down mapping placed: 1,",
+        "malloc small ",
+        "sbrk(0) ",
+    ] {
+        assert!(expected.contains(line), "{line}{expected}");
+    }
+    let program = guest.to_str().expect("guest path should be UTF-8");
+    let args = [
+        "--log",
+        "info",
+        "--backend",
+        "dbt",
+        "run",
+        "--strict",
+        "--proc=standard",
+        "--base-env=minimal",
+        "--",
+        program,
+        "--chroot-root-brk",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), expected, "DBT after chroot");
+
+    // The native lifecycle stays supported. Once it may have created copied
+    // execution, however, the new controller fallback must not infer that all
+    // observers disappeared just because the original vfork child exited.
+    let native_after_vfork = Command::new("unshare")
+        .args(["--user", "--map-root-user", "setarch", "-R"])
+        .arg(&guest)
+        .arg("--vfork-then-chroot-root-brk")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the native vfork/chroot control");
+    assert!(
+        native_after_vfork.status.success(),
+        "native vfork/chroot failed: {native_after_vfork:?}"
+    );
+    assert_eq!(stdout(&native_after_vfork), expected);
+    let mut uncertain_args = args;
+    *uncertain_args.last_mut().unwrap() = "--vfork-then-chroot-root-brk";
+    let refused = hermit(&uncertain_args);
+    assert_eq!(refused.status.code(), Some(101), "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        stderr(&refused)
+            .contains("unsupported: brk where Detcore cannot read the guest's mappings"),
+        "{refused:?}"
+    );
 }
 
 /// Under DBT, a guest named without a `/`, as a user types it, is found

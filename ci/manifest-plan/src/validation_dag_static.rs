@@ -2505,7 +2505,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tool_global::tests::an_images_own_record_fills_in_and_outranks_only_the_launchs_search:
     // 2067.
     // And +1 from ca5325c1: 2068.
-    ("test.detcore_unit", 2068),
+    // Guarded controller capture adds three units: 2071, freshly listed.
+    ("test.detcore_unit", 2071),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3586,7 +3587,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_dbt_heap_records_are_ptraces (DBT brk servicing): 530.
     // And run_dbt_answers_brk_for_a_program_found_through_path: 531.
     // And run_dbt_answers_brk_for_a_child_spawned_from_a_long_path: 532.
-    ("test.cli", 532),
+    // Focused chroot program-break regression: 533, freshly listed.
+    ("test.cli", 533),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4038,7 +4040,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same tool-output protection test: 462.
     // And the same three DBT program-break tests: 465, and the PATH one: 466.
     // And the long-path spawn one: 467.
-    ("test.cli_on_host", 467),
+    // The same focused chroot program-break regression: 468, freshly listed.
+    ("test.cli_on_host", 468),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4364,7 +4367,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the refused_signal_controls warning-text test: 2066.
     // And the same own-record test: 2067.
     // And +1 from ca5325c1: 2068.
-    ("test.detcore_unit_on_host", 2068),
+    // The same three guarded controller-capture units: 2071, freshly listed.
+    ("test.detcore_unit_on_host", 2071),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

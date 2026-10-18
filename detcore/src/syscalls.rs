@@ -20,7 +20,7 @@ pub(crate) use files::read_guest_prefix;
 pub(crate) use files::rendered_procfs;
 pub(crate) use threads::VIRTUAL_CPUSET_BYTES;
 mod io;
-mod memory;
+pub(crate) mod memory;
 mod misc;
 mod namespace;
 pub(crate) use namespace::anonymous_object_devices;

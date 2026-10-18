@@ -1749,6 +1749,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         if kernel_break != kernel_start {
             return Err("guest code moved the launcher's break before Detcore modeled its own");
         }
+        tracing::debug!(
+            target: "detcore::brk_diagnostic",
+            dettid = guest.thread_state().dettid.as_raw(),
+            image = ?exe.exe,
+            identity = ?exe.identity(),
+            image_inode = ino,
+            layout = ?layout,
+            bias,
+            start,
+            kernel_start,
+            kernel_break,
+            "BRK_MODEL_V1",
+        );
         Ok(crate::memory::BrkModel {
             start,
             current: start,
