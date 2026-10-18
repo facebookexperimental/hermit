@@ -26,6 +26,13 @@
  *       sends it, installs its handler again, waits 50 ms and writes a byte:
  *       Linux discards a signal that is ignored when sent and that the
  *       thread's own mask does not block.
+ *   spinwake  Main sends a caught SIGCHLD, waits 50 ms, sends a caught SIGUSR1,
+ *       then spins with no syscall, for at most SPIN_BOUND iterations, until
+ *       the worker's call returns, and prints whether it did during the spin.
+ *       Under Hermit the scheduler's drain must wake the parked read for the
+ *       SIGUSR1 at once, though the read blocks every signal for the held
+ *       SIGCHLD; it must not wait for the read's backed-off poll turn while
+ *       the spinning thread holds the CPU.
  *
  * The worker prints the call's result, the handlers that started before the
  * call returned, and, after main joins it, every handler that started:
@@ -79,6 +86,13 @@ static atomic_int order[8];
 static atomic_int handled;
 static atomic_int before_return = -1;
 static atomic_int returned;
+static int returned_during_spin = -1;
+
+/* Natively the read returns at once. Under Hermit a prompt drain wake ends it
+ * within one of the spinning thread's timeslices (about 20 million iterations
+ * of a debug build); waiting for the read's backed-off poll turn took about
+ * 1.3 billion. */
+#define SPIN_BOUND 300000000L
 static volatile pid_t worker_tid;
 
 static void handler(int signal)
@@ -221,6 +235,13 @@ int main(int argc, char **argv)
         if (sigaction(SIGUSR2, &action, NULL) != 0)
             die("sigaction");
         sleep_ms(50);
+    } else if (!strcmp(mode, "spinwake")) {
+        syscall(SYS_tgkill, pid, worker_tid, SIGCHLD);
+        sleep_ms(50);
+        syscall(SYS_tgkill, pid, worker_tid, SIGUSR1);
+        for (long i = 0; i < SPIN_BOUND && !atomic_load(&returned); i++) {
+        }
+        returned_during_spin = atomic_load(&returned);
     } else if (!strcmp(mode, "alarmheld")) {
         syscall(SYS_tgkill, pid, worker_tid, SIGCHLD);
         struct itimerval timer = {{0, 0}, {0, 50000}};
@@ -253,6 +274,8 @@ int main(int argc, char **argv)
     pthread_join(thread, NULL);
     printf(", after join:");
     print_handlers(atomic_load(&handled));
+    if (returned_during_spin >= 0)
+        printf(", returned during the spin: %s", returned_during_spin ? "yes" : "no");
     printf("\n");
     return 0;
 }

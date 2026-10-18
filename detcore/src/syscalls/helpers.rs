@@ -875,6 +875,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                             && wait.needs_block()
                             && pending_could_stop_injection(&state)
                         {
+                            // As `install_turn_mask` does for `writev`: a fallback
+                            // injected restoration then holds a host-timed signal
+                            // that stops it (`absorb_restoration_stop`).
+                            wait.hold_until_return(host_timed_signals(guest).await);
                             match wait.block_in_place(guest).await {
                                 Ok(true) => {
                                     publish_wait_mask(guest, wait.effective_mask(), &mut published)
@@ -2412,6 +2416,10 @@ where
                         && wait.needs_block()
                         && pending_could_stop_injection(&state)
                     {
+                        // As `install_turn_mask` does for `writev`: a fallback
+                        // injected restoration then holds a host-timed signal
+                        // that stops it (`absorb_restoration_stop`).
+                        wait.hold_until_return(host_timed_signals(guest).await);
                         match wait.block_in_place(guest).await {
                             Ok(true) => {
                                 publish_wait_mask(guest, wait.effective_mask(), &mut published)

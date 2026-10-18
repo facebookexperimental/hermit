@@ -10308,6 +10308,19 @@ impl Scheduler {
         }
     }
 
+    /// `state`, with its mask replaced by the guest's own that `dettid`
+    /// published while Detcore holds it under a private blocking mask
+    /// (`saved_guest_sigmasks`), if any.
+    fn under_published_mask(&self, dettid: DetTid, state: KernelSignalState) -> KernelSignalState {
+        match self.saved_guest_sigmasks.get(&dettid) {
+            Some(mask) => KernelSignalState {
+                blocked: *mask,
+                ..state
+            },
+            None => state,
+        }
+    }
+
     /// The signals that would interrupt the restartable internal IO poll of
     /// `dettid` (`restartable_internal_io_signals`), read from the thread the
     /// request names for `/proc` (`Resources::signal_state_task`; with none,
@@ -10325,7 +10338,12 @@ impl Scheduler {
     /// cannot be read, every signal it does not hold is treated as
     /// interrupting, as before this filter. Where the record of copies Linux
     /// discarded at send is kept, a standard signal is filtered by the mask
-    /// alone (`poll_wake_signals`).
+    /// alone (`poll_wake_signals`). The mask is the guest's own while the poll
+    /// blocks every blockable signal in place (`saved_guest_sigmasks`), as
+    /// admission reads it (`poll_mask_admits`), never the full mask then in
+    /// the kernel: under that, every signal looked blocked, and a signal sent
+    /// after the block woke the poll only at its backed-off turn (Claude
+    /// review of R2b-2 stage 2, F1; https://github.com/rrnewton/hermit/issues/4273).
     fn restartable_internal_io_interrupting_signals(
         &self,
         dettid: DetTid,
@@ -10351,7 +10369,12 @@ impl Scheduler {
             self.test_internal_io_signal_state_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match self.test_kernel_signal_states.get(&dettid) {
-                Some(state) => poll_wake_signals(state, self.models_signal_targets) & !held,
+                Some(state) => {
+                    poll_wake_signals(
+                        &self.under_published_mask(dettid, *state),
+                        self.models_signal_targets,
+                    ) & !held
+                }
                 None => !held,
             }
         }
@@ -10362,7 +10385,12 @@ impl Scheduler {
             };
             match read_kernel_signal_state(reverie::Pid::from_raw(pid), reverie::Pid::from_raw(tid))
             {
-                Ok(state) => poll_wake_signals(&state, self.models_signal_targets) & !held,
+                Ok(state) => {
+                    poll_wake_signals(
+                        &self.under_published_mask(dettid, state),
+                        self.models_signal_targets,
+                    ) & !held
+                }
                 Err(errno) => {
                     debug!(
                         "[dtid {}] cannot read the signal state of its internal IO poll ({}); \
@@ -26218,6 +26246,54 @@ mod test {
             resources.signal_interrupt_errno(),
             Some(Errno::ERESTARTSYS.into_raw())
         );
+    }
+
+    /// A poll that blocks every blockable signal in place (R2b-2 stage 2,
+    /// `KernelSignalWait::block_in_place`) publishes the guest's own mask, and
+    /// the drain filters by that mask, as admission does: the caught SIGUSR1
+    /// the guest's mask leaves unblocked wakes the poll although the kernel's
+    /// mask, scripted here as every blockable signal, blocks it. Without the
+    /// published mask the drain dropped it, and the poll ended for the signal
+    /// only at its backed-off turn (Claude review of R2b-2 stage 2, F1;
+    /// https://github.com/rrnewton/hermit/issues/4273).
+    #[test]
+    fn the_drain_filters_a_poll_blocked_in_place_by_its_published_guest_mask() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = restartable_read_poller(&mut scheduler);
+        let state = scheduler.test_kernel_signal_states[&target];
+        scheduler.test_kernel_signal_states.insert(
+            target,
+            KernelSignalState {
+                blocked: !0,
+                ..state
+            },
+        );
+        scheduler.set_saved_guest_sigmask(target, Some(0));
+
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
+        scheduler.drain_pending_cross_task_signals();
+
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![SigWrapper::from(Signal::SIGUSR1)]
+        );
+
+        // The control: with nothing published, the kernel's full mask decides,
+        // and the poll keeps polling.
+        let mut unpublished = Scheduler::new(&Config::default());
+        let target = restartable_read_poller(&mut unpublished);
+        let state = unpublished.test_kernel_signal_states[&target];
+        unpublished.test_kernel_signal_states.insert(
+            target,
+            KernelSignalState {
+                blocked: !0,
+                ..state
+            },
+        );
+        unpublished.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
+        unpublished.drain_pending_cross_task_signals();
+        assert!(unpublished.inbound_signals(target).is_empty());
     }
 
     /// With only a blocked signal pending, the poller keeps its polling

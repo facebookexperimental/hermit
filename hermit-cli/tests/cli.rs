@@ -41808,7 +41808,7 @@ fn pipe_wake_rows_under_record_and_replay() {
 /// The rows of the R2b-2 stage 2 tests (`guest_restartable_two_signals`):
 /// arguments and the line Hermit prints. Natively (Linux 7.1.3, 3 of 3 each)
 /// a row's line is the same unless a comment says otherwise.
-const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 15] = [
+const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 16] = [
     (
         &["read", "chld", "winch"],
         "read: -1 EINTR, handlers before return: 28 17, after join: 28 17",
@@ -41872,6 +41872,18 @@ const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 15] = [
     (
         &["ignheld"],
         "ignheld: 1 0, handlers before return: 17 12, after join: 17 12",
+    ),
+    // Native `-1 EINTR, handlers before return: 17, after join: 17, returned
+    // during the spin: yes`, as for `twoturn`. The SIGUSR1 sent while the read
+    // blocks every signal for the held SIGCHLD wakes it at once, while a
+    // sibling spins with no syscall: the scheduler's drain filters by the
+    // guest mask the read publishes. Filtered by the kernel's full mask, the
+    // wake was dropped, and the read ended only at its backed-off poll turn,
+    // after about 1.3 billion iterations of the spin (Claude review of R2b-2
+    // stage 2, F1).
+    (
+        &["spinwake"],
+        "spinwake: -1 EINTR, handlers before return: 17 10, after join: 17 10, returned during the spin: yes",
     ),
     (
         &["read"],
@@ -41949,7 +41961,7 @@ fn restartable_two_signal_rows_under_record_and_replay() {
     let _guard = hermit_run_guard();
     let guest = poll_recheck_guest("guest_restartable_two_signals");
     for (args, line) in RESTARTABLE_TWO_SIGNAL_ROWS.iter().filter(|(args, _)| {
-        args.len() == 3 || matches!(args[0], "twoturn" | "alarmheld" | "ignheld")
+        args.len() == 3 || matches!(args[0], "twoturn" | "alarmheld" | "ignheld" | "spinwake")
     }) {
         let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let data_dir = format!("--data-dir={}", data.path().display());
