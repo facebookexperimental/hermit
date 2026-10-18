@@ -2094,8 +2094,15 @@ fi
 # controller-capture commits onto b1e81ac276ccebe31d1a41e4c1f648bbcbd5e16f.
 # Incoming changes are disjoint from DBT/native/vendor/build inputs; the
 # SDK and native component inputs equal 5ac above. All limits stay unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 9451327184143f9046c80415f65eafbc0b25bd43 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 9451327184143f9046c80415f65eafbc0b25bd43 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 80fc77faa79da855612517666bd87134a915e2fc (2026-10-18): from
+# 9451327184143f9046c80415f65eafbc0b25bd43. One commit, 80fc77fa (the SaBRe loader
+# keeps address space free above a PIE client's image for its program break;
+# replayed from 19f82dca with the same patch-id), touching only
+# experimental/reverie-sabre (vendor/sabre/loader/elf_loading.c and a new test
+# pair). git diff is empty under reverie-dbt/, so inventory 964, the SDK and
+# native component inputs, calibrated budget, job width and limits are unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 80fc77faa79da855612517666bd87134a915e2fc ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 80fc77faa79da855612517666bd87134a915e2fc (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

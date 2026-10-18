@@ -2017,7 +2017,14 @@ fi
 # controller-capture commits onto b1e81ac276ccebe31d1a41e4c1f648bbcbd5e16f.
 # Incoming changes are disjoint from DBT/native/vendor/build inputs; the
 # SDK and native component inputs equal 5ac above. All limits stay unchanged.
-expected_pin=9451327184143f9046c80415f65eafbc0b25bd43
+# CARRY TO 80fc77faa79da855612517666bd87134a915e2fc (2026-10-18): from
+# 9451327184143f9046c80415f65eafbc0b25bd43. One commit, 80fc77fa (the SaBRe loader
+# keeps address space free above a PIE client's image for its program break;
+# replayed from 19f82dca with the same patch-id), touching only
+# experimental/reverie-sabre (vendor/sabre/loader/elf_loading.c and a new test
+# pair). git diff is empty under reverie-dbt/, so inventory 964, the SDK and
+# native component inputs, calibrated budget, job width and limits are unchanged.
+expected_pin=80fc77faa79da855612517666bd87134a915e2fc
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
