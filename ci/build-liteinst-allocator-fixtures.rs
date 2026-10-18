@@ -60,6 +60,123 @@ fn require(ok: bool, message: &str) -> Result<()> {
     if ok { Ok(()) } else { Err(message.to_owned()) }
 }
 
+/// The two compiler-crash texts `ci/retry-on-compiler-crash.sh` reruns on.
+/// Both come from the compiler, never from the code it compiles.
+const COMPILER_CRASH_TEXTS: [&str; 2] = [
+    "error: rustc interrupted by SIGSEGV",
+    "internal compiler error",
+];
+
+/// The first line of a failed command's streams that names a compiler crash.
+fn compiler_crash_line(stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    [stderr, stdout].into_iter().find_map(|stream| {
+        String::from_utf8_lossy(stream)
+            .lines()
+            .find(|line| COMPILER_CRASH_TEXTS.iter().any(|text| line.contains(text)))
+            .map(str::to_owned)
+    })
+}
+
+/// Print a compiler-crash retry line and keep it in the validation run's
+/// state, where `scripts/validate.rs` reports it, exactly as
+/// `ci/retry-on-compiler-crash.sh` does for the other Cargo builds.
+fn record_compiler_crash_retry(record: &mut Option<PathBuf>, leaf: &str, line: &str) {
+    eprintln!("{line}");
+    let Some(state) = std::env::var_os("VALIDATE_RUN_STATE") else {
+        return;
+    };
+    let path = record.get_or_insert_with(|| {
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        PathBuf::from(state)
+            .join("compiler-crash-retries")
+            .join(format!("m1-producer-{leaf}-{seconds}-{}.txt", std::process::id()))
+    });
+    let appended = path
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|()| {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&*path)?
+                .write_all(format!("{line}\n").as_bytes())
+        });
+    if let Err(error) = appended {
+        eprintln!(
+            "M1 fixture producer: could not keep the retry record {}: {error}",
+            path.display()
+        );
+    }
+}
+
+/// Run the Cargo leaf build, and rerun it ONCE when rustc itself crashed.
+///
+/// The validation of Hermit fe9a56d6 failed this node on "error: rustc
+/// interrupted by SIGSEGV" in LLVM's JumpThreadingPass while compiling
+/// reverie-core; the same command then passed 4 of 4 times in the pinned image.
+/// That is the crash class `ci/retry-on-compiler-crash.sh` reruns once for the
+/// other Cargo builds, which this producer's own Cargo call bypasses. Only a
+/// normal non-zero exit whose output carries a compiler-crash text is rerun; a
+/// spawn failure, a byte-limit or deadline kill, a plain build error and a
+/// second crash all fail as before. The crashed attempt's logs stay in the log
+/// directory, and its evidence leaves `runner.commands` because the receipt
+/// admits only successful commands and exactly one Cargo build.
+fn run_cargo_build(
+    runner: &mut Runner,
+    leaf: &str,
+    arguments: &[String],
+    root: &Path,
+) -> Result<Vec<u8>> {
+    let commands_before = runner.commands.len();
+    let error = match runner.run("cargo", arguments, root) {
+        Ok(output) => return Ok(output),
+        Err(error) => error,
+    };
+    let Some(failed) = runner.commands.get(commands_before) else {
+        return Err(error);
+    };
+    if runner.commands.len() != commands_before + 1 || failed.status <= 0 {
+        return Err(error);
+    }
+    let stdout = fs::read(&failed.stdout.path).map_err(|e| e.to_string())?;
+    let stderr = fs::read(&failed.stderr.path).map_err(|e| e.to_string())?;
+    let Some(crash) = compiler_crash_line(&stdout, &stderr) else {
+        return Err(error);
+    };
+    let failed = runner.commands.pop().expect("the failed build's evidence is present");
+    let mut record = None;
+    let command = format!("cargo {}", arguments.join(" "));
+    for line in [
+        format!(
+            "retry-on-compiler-crash: INFRA RETRY 1 of 1: the compiler crashed (exit {}) in: {command}",
+            failed.status
+        ),
+        "retry-on-compiler-crash: first run's crash lines:".to_owned(),
+        crash.clone(),
+        format!("retry-on-compiler-crash: first run's logs: {}", failed.stderr.path.display()),
+        "retry-on-compiler-crash: rerunning once; a second failure of any kind fails the node".to_owned(),
+    ] {
+        record_compiler_crash_retry(&mut record, leaf, &line);
+    }
+    let rerun = runner.run("cargo", arguments, root);
+    record_compiler_crash_retry(
+        &mut record,
+        leaf,
+        &match &rerun {
+            Ok(_) => format!(
+                "retry-on-compiler-crash: INFRA RETRY: passed on its one rerun after a compiler crash ({crash}) in: {command}"
+            ),
+            Err(error) => format!(
+                "retry-on-compiler-crash: INFRA RETRY FAILED: the rerun failed too, after a compiler crash, in: {command}: {error}"
+            ),
+        },
+    );
+    rerun
+}
+
 fn cargo_profile(validate: bool) -> Value {
     json!({"opt_level":"3", "debuginfo":0, "debug_assertions":validate,
         "overflow_checks":validate, "test":false})
@@ -199,7 +316,7 @@ fn build_leaf(
     } else {
         build_arguments.extend(["--features".into(), "allocator-fixture".into()]);
     }
-    let output = runner.run("cargo", &build_arguments, root)?;
+    let output = run_cargo_build(&mut runner, name, &build_arguments, root)?;
     compiled_sources.verify_unchanged(&mut runner)?;
     let features: Vec<String> = FEATURES.into_iter().map(str::to_owned).collect();
     let cargo_artifact = m1_artifact::select_artifact(

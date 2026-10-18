@@ -20575,8 +20575,9 @@ fn terminal_environmental_observation(attempts: &[NodeAttempt], tag: &str) -> Op
     ))
 }
 
-/// Where ci/retry-on-compiler-crash.sh records each rerun it made, one file per
-/// rerun, under the run's VALIDATE_RUN_STATE.
+/// Where ci/retry-on-compiler-crash.sh, and the M1 fixture producer
+/// (ci/build-liteinst-allocator-fixtures.rs) for its own Cargo builds, record
+/// each rerun they made, one file per rerun, under the run's VALIDATE_RUN_STATE.
 const COMPILER_CRASH_RETRIES_DIR: &str = "compiler-crash-retries";
 
 /// The records of every compiler-crash rerun this run made, oldest first: what
