@@ -3408,6 +3408,11 @@ impl GlobalState {
             GlobalRequest::DeregisterThread(deregistration) => {
                 R::DeregisterThread(self.recv_deregister_thread(from, deregistration).await)
             }
+            GlobalRequest::PublishedGuestSigmask(thread) => R::PublishedGuestSigmask(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .published_guest_sigmask(thread),
+            ),
             GlobalRequest::SetSavedGuestSigmask(mask) => {
                 let updated = self
                     .lock_rpc_scheduler(false)
@@ -5755,6 +5760,11 @@ pub enum GlobalRequest {
     /// child-exit classification reads the guest's mask, not Detcore's.
     SetSavedGuestSigmask(Option<u64>),
 
+    /// The guest's own signal mask that a thread published while Detcore
+    /// holds it under a private blocking mask, if any
+    /// (`Scheduler::published_guest_sigmask`), for its `/proc` status.
+    PublishedGuestSigmask(DetTid),
+
     /// Record (`Some`) or clear (`None`) the set the calling thread waits for
     /// while it polls `rt_sigtimedwait`.
     SetSigtimedwaitSet(Option<u64>),
@@ -6199,6 +6209,7 @@ pub enum GlobalResponse {
     DeregisterThread(()),
     SetChildTidAddress(()),
     SetSavedGuestSigmask(()),
+    PublishedGuestSigmask(Option<u64>),
     SetSigtimedwaitSet(()),
     OwnProcessSignalInputs(OwnProcessSignalInputs),
     RecordGuestMarkerSignal(()),
@@ -6784,6 +6795,24 @@ where
         ),
         "unexpected response to SetSavedGuestSigmask: {response:?}"
     );
+}
+
+/// The guest's own signal mask that `thread` published while Detcore holds it
+/// under a private blocking mask, if any (`Scheduler::published_guest_sigmask`):
+/// the `SigBlk` its `/proc` status reports in place of the kernel's
+/// (https://github.com/rrnewton/hermit/issues/4273, R2b-2 stage 2).
+pub(crate) async fn published_guest_sigmask<G, T>(guest: &mut G, thread: DetTid) -> Option<u64>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::PublishedGuestSigmask(thread)).await;
+    match response {
+        GlobalResponse::PublishedGuestSigmask(mask) => mask,
+        GlobalResponse::ThreadExited => None,
+        other => panic!("unexpected response to PublishedGuestSigmask: {other:?}"),
+    }
 }
 
 /// Tells the scheduler the set the calling thread waits for while it polls

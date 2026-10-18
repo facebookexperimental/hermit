@@ -6268,6 +6268,13 @@ impl Scheduler {
         self.release_vfork_child(process);
     }
 
+    /// The mask Linux's `blocked` holds for `dettid` while Detcore holds it
+    /// under a private blocking mask (`saved_guest_sigmasks`), if any: the
+    /// `SigBlk` its `/proc` status reports.
+    pub(crate) fn published_guest_sigmask(&self, dettid: DetTid) -> Option<u64> {
+        self.saved_guest_sigmasks.get(&dettid).copied()
+    }
+
     /// Record (`Some`) or clear (`None`) the mask Linux's `blocked` holds for
     /// `dettid` while its kernel `SigBlk` differs (`saved_guest_sigmasks`).
     /// Returns false for a thread the scheduler no longer knows.

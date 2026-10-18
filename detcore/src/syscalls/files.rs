@@ -5591,6 +5591,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             None
         };
         let machine = crate::machine::MachineDescription::of(guest.config());
+        // A status reports the guest's own mask of a thread Detcore holds
+        // under a private blocking mask, which that thread published to the
+        // scheduler; the kernel's `SigBlk` is Detcore's mask (Codex review of
+        // R2b-2 stage 2, P2; https://github.com/rrnewton/hermit/issues/4273).
+        // Masks are published only where the scheduler models signal targets.
+        let mask_thread = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            detfd.procfs_status_mask_thread(&contents, virtual_pid)
+        })?;
+        let published_sigblk = match mask_thread {
+            Some(thread) if crate::scheduler::discarded_at_send::records(guest.config()) => {
+                crate::tool_global::published_guest_sigmask(guest, DetTid::from_raw(thread)).await
+            }
+            _ => None,
+        };
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
@@ -5607,6 +5621,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     random_uuid,
                     virtual_cpuinfo: virtual_cpuinfo.clone(),
                     machine: machine.clone(),
+                    published_sigblk,
                 },
             );
         })?;

@@ -1199,6 +1199,13 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_cpuinfo: Option<Vec<u8>>,
     /// The machine the fixed files describe.
     pub(crate) machine: MachineDescription,
+    /// For a status snapshot, the guest's own signal mask that the thread it
+    /// describes published while Detcore holds that thread under a private
+    /// blocking mask (`Scheduler::published_guest_sigmask`): reported as
+    /// `SigBlk` in place of the kernel's, which is Detcore's private mask
+    /// (Codex review of R2b-2 stage 2, P2;
+    /// https://github.com/rrnewton/hermit/issues/4273). Built by the caller.
+    pub(crate) published_sigblk: Option<u64>,
 }
 
 impl ProcfsFile {
@@ -1795,6 +1802,31 @@ impl ProcfsFile {
         self.guest_numbers = Some(numbers);
     }
 
+    /// The guest thread whose signal mask this status snapshot reports as
+    /// `SigBlk`, given the kernel's `contents` and the calling process
+    /// (`virtual_pid`): the process's leader for the caller's own process
+    /// status, the thread its `Pid:` line names, in the guest's numbers, for
+    /// another process's or thread's, and none for the calling thread's own
+    /// status (it is in this call, so Detcore holds it under no private
+    /// mask) or for a file that is not a status.
+    pub(crate) fn status_mask_thread(&self, contents: &[u8], virtual_pid: i32) -> Option<i32> {
+        match self.kind {
+            ProcfsKind::Status => Some(virtual_pid),
+            ProcfsKind::ProcessStatus => {
+                let pid = contents
+                    .split(|byte| *byte == b'\n')
+                    .find_map(|line| line.strip_prefix(b"Pid:"))
+                    .and_then(|value| std::str::from_utf8(value).ok())
+                    .and_then(|value| value.trim().parse::<i32>().ok())?;
+                Some(match &self.guest_numbers {
+                    Some(numbers) => numbers.get(&pid).copied().unwrap_or(pid),
+                    None => pid,
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Returns true when the procfs inode binds to the thread that opened it.
     pub(crate) fn needs_bound_thread_identity(&self) -> bool {
         matches!(
@@ -1905,13 +1937,16 @@ impl ProcfsFile {
             mountinfo,
             virtual_cpuinfo,
             machine,
+            published_sigblk,
         } = context;
         let mapping_identities = &mapping_identities;
         self.contents = Some(match &self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, Some((virtual_pid, virtual_ppid))),
-            ProcfsKind::Status => {
-                sanitize_status(&contents, Some((virtual_pid, virtual_pid, virtual_ppid)))
-            }
+            ProcfsKind::Status => sanitize_status(
+                &contents,
+                Some((virtual_pid, virtual_pid, virtual_ppid)),
+                published_sigblk,
+            ),
             ProcfsKind::ThreadStat => {
                 let (_, tid, ppid) = self
                     .bound_thread_identity
@@ -1922,7 +1957,7 @@ impl ProcfsFile {
                 let (tgid, tid, ppid) = self
                     .bound_thread_identity
                     .expect("thread-self status was not bound when opened");
-                sanitize_status(&contents, Some((tgid, tid, ppid)))
+                sanitize_status(&contents, Some((tgid, tid, ppid)), published_sigblk)
             }
             ProcfsKind::ProcessStat => {
                 let sanitized = sanitize_stat(&contents, None);
@@ -1933,7 +1968,7 @@ impl ProcfsFile {
             }
             ProcfsKind::Statm => sanitize_statm(&contents),
             ProcfsKind::ProcessStatus => {
-                let sanitized = sanitize_status(&contents, None);
+                let sanitized = sanitize_status(&contents, None, published_sigblk);
                 match &self.guest_numbers {
                     Some(numbers) => renumber_status(&sanitized, numbers),
                     None => sanitized,
@@ -2622,7 +2657,11 @@ fn sanitize_statm(contents: &[u8]) -> Vec<u8> {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#553)
 // TODO-HUMAN-REVIEW(PR-723): Review /proc status identity field normalization.
-fn sanitize_status(contents: &[u8], virtual_identity: Option<(i32, i32, i32)>) -> Vec<u8> {
+fn sanitize_status(
+    contents: &[u8],
+    virtual_identity: Option<(i32, i32, i32)>,
+    published_sigblk: Option<u64>,
+) -> Vec<u8> {
     const STATE: &[u8] = b"State:";
     const TGID: &[u8] = b"Tgid:";
     const PID: &[u8] = b"Pid:";
@@ -2633,6 +2672,7 @@ fn sanitize_status(contents: &[u8], virtual_identity: Option<(i32, i32, i32)>) -
     const NS_PGID: &[u8] = b"NSpgid:";
     const NS_SID: &[u8] = b"NSsid:";
     const SIGQ: &[u8] = b"SigQ:";
+    const SIGBLK: &[u8] = b"SigBlk:";
     const CPUS_ALLOWED: &[u8] = b"Cpus_allowed:";
     const CPUS_ALLOWED_LIST: &[u8] = b"Cpus_allowed_list:";
     // The nodes the task may allocate from: Hermit's single virtual node, as
@@ -2699,6 +2739,12 @@ fn sanitize_status(contents: &[u8], virtual_identity: Option<(i32, i32, i32)>) -
         } else if body.starts_with(SIGQ) {
             normalized.extend_from_slice(SIGQ);
             normalized.extend_from_slice(b"\t0/0");
+        } else if let Some(mask) = published_sigblk
+            && body.starts_with(SIGBLK)
+        {
+            // The guest's own mask while Detcore holds the thread under a
+            // private one; the kernel's value is Detcore's.
+            normalized.extend_from_slice(format!("SigBlk:\t{mask:016x}").as_bytes());
         } else if body.starts_with(CPUS_ALLOWED) {
             normalized.extend_from_slice(CPUS_ALLOWED);
             normalized.extend_from_slice(b"\t00000000,00000000,00000000,00000001");
@@ -6566,7 +6612,7 @@ Rss:                   4 kB\n" as &[u8];
     fn status_normalizes_affinity_and_context_switches() {
         let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nVmHWM:\t1572 kB\nVmRSS:\t1568 kB\nRssFile:\t1452 kB\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nMems_allowed:\t00000000,00000003\nMems_allowed_list:\t0-1\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
         assert_eq!(
-            sanitize_status(input, Some((3, 3, 1))),
+            sanitize_status(input, Some((3, 3, 1)), None),
             b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t1\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nMems_allowed:\t00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
         );
     }
@@ -6608,9 +6654,38 @@ Rss:                   4 kB\n" as &[u8];
         );
         let status = b"Name:\thermit\nState:\tR (running)\nPid:\t1\nPPid:\t0\nVmSize:\t249000 kB\nVmRSS:\t30000 kB\n";
         assert_eq!(
-            sanitize_status(status, None),
+            sanitize_status(status, None, None),
             b"Name:\thermit\nState:\tS (sleeping)\nPid:\t1\nPPid:\t0\nVmSize:\t0 kB\nVmRSS:\t0 kB\n"
         );
+    }
+
+    /// A status reports the guest's own mask, which the thread published
+    /// while Detcore holds it under a private blocking mask, in place of the
+    /// kernel's `SigBlk`, and leaves every other line as before; with nothing
+    /// published the kernel's value stands (Codex review of R2b-2 stage 2,
+    /// P2; https://github.com/rrnewton/hermit/issues/4273).
+    #[test]
+    fn a_status_reports_the_published_guest_mask_as_sigblk() {
+        let status = b"Name:\tworker\nPid:\t5\nSigPnd:\t0000000000000000\nSigBlk:\tfffffffe7ffb7eef\nSigIgn:\t0000000000000000\n";
+        assert_eq!(
+            sanitize_status(status, None, Some(0x800)),
+            b"Name:\tworker\nPid:\t5\nSigPnd:\t0000000000000000\nSigBlk:\t0000000000000800\nSigIgn:\t0000000000000000\n"
+        );
+        assert_eq!(
+            sanitize_status(status, None, None),
+            status.to_vec(),
+            "with nothing published, the kernel's mask stands"
+        );
+
+        // Which thread's published mask a status reports.
+        let process = ProcfsFile::from_path(Path::new("/proc/3/task/5/status")).unwrap();
+        assert_eq!(process.status_mask_thread(status, 3), Some(5));
+        let own = ProcfsFile::from_path(Path::new("/proc/self/status")).unwrap();
+        assert_eq!(own.status_mask_thread(status, 3), Some(3));
+        let thread_self = ProcfsFile::from_path(Path::new("/proc/thread-self/status")).unwrap();
+        assert_eq!(thread_self.status_mask_thread(status, 3), None);
+        let stat = ProcfsFile::from_path(Path::new("/proc/3/task/5/stat")).unwrap();
+        assert_eq!(stat.status_mask_thread(status, 3), None);
     }
 
     #[test]

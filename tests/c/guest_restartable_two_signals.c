@@ -33,6 +33,13 @@
  *       SIGUSR1 at once, though the read blocks every signal for the held
  *       SIGCHLD; it must not wait for the read's backed-off poll turn while
  *       the spinning thread holds the CPU.
+ *   maskvis  The worker blocks SIGUSR2 and reads; SIGCHLD's handler has
+ *       SA_RESTART, so Linux restarts the read after it. Main sends SIGCHLD,
+ *       waits 50 ms, reads the worker's SigBlk from
+ *       /proc/self/task/<tid>/status while the read waits, and writes a byte.
+ *       The worker's mask is SIGUSR2 alone throughout: under Hermit the
+ *       status must report the guest's mask, not the one Detcore installs
+ *       while the read blocks every signal for the held SIGCHLD.
  *
  * The worker prints the call's result, the handlers that started before the
  * call returned, and, after main joins it, every handler that started:
@@ -87,6 +94,8 @@ static atomic_int handled;
 static atomic_int before_return = -1;
 static atomic_int returned;
 static int returned_during_spin = -1;
+static unsigned long long sibling_saw_sigblk;
+static int sibling_read_sigblk;
 
 /* Natively the read returns at once. Under Hermit a prompt drain wake ends it
  * within one of the spinning thread's timeslices (about 20 million iterations
@@ -149,6 +158,13 @@ static void *worker(void *unused)
     sigaddset(&mask, SIGALRM);
     if (pthread_sigmask(SIG_UNBLOCK, &mask, NULL) != 0)
         die("pthread_sigmask");
+    if (!strcmp(mode, "maskvis")) {
+        sigset_t usr2;
+        sigemptyset(&usr2);
+        sigaddset(&usr2, SIGUSR2);
+        if (pthread_sigmask(SIG_BLOCK, &usr2, NULL) != 0)
+            die("pthread_sigmask");
+    }
     worker_tid = syscall(SYS_gettid);
     static char buffer[70000];
     long ret;
@@ -198,6 +214,12 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < sizeof caught / sizeof caught[0]; i++)
         if (sigaction(caught[i], &action, NULL) != 0)
             die("sigaction");
+    if (!strcmp(mode, "maskvis")) {
+        struct sigaction restart = action;
+        restart.sa_flags |= SA_RESTART;
+        if (sigaction(SIGCHLD, &restart, NULL) != 0)
+            die("sigaction");
+    }
     if (!strcmp(mode, "recv")) {
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
             die("socketpair");
@@ -242,6 +264,19 @@ int main(int argc, char **argv)
         for (long i = 0; i < SPIN_BOUND && !atomic_load(&returned); i++) {
         }
         returned_during_spin = atomic_load(&returned);
+    } else if (!strcmp(mode, "maskvis")) {
+        syscall(SYS_tgkill, pid, worker_tid, SIGCHLD);
+        sleep_ms(50);
+        char path[128];
+        snprintf(path, sizeof path, "/proc/self/task/%d/status", (int)worker_tid);
+        FILE *status = fopen(path, "r");
+        if (!status)
+            die("fopen status");
+        char line[512];
+        while (fgets(line, sizeof line, status))
+            if (sscanf(line, "SigBlk: %llx", &sibling_saw_sigblk) == 1)
+                sibling_read_sigblk = 1;
+        fclose(status);
     } else if (!strcmp(mode, "alarmheld")) {
         syscall(SYS_tgkill, pid, worker_tid, SIGCHLD);
         struct itimerval timer = {{0, 0}, {0, 50000}};
@@ -274,6 +309,8 @@ int main(int argc, char **argv)
     pthread_join(thread, NULL);
     printf(", after join:");
     print_handlers(atomic_load(&handled));
+    if (sibling_read_sigblk)
+        printf(", sibling saw SigBlk %016llx", sibling_saw_sigblk);
     if (returned_during_spin >= 0)
         printf(", returned during the spin: %s", returned_during_spin ? "yes" : "no");
     printf("\n");
