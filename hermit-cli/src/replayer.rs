@@ -489,7 +489,7 @@ impl Tool for Replayer {
 
     fn subscriptions(config: &<Self::GlobalState as GlobalTool>::Config) -> Subscription {
         // Subscribe to the exact same events as the recorder does.
-        crate::recorder::Recorder::subscriptions(config)
+        hermit_record::Recorder::subscriptions(config)
     }
 
     async fn handle_syscall_event<G: Guest<Self>>(

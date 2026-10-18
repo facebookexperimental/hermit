@@ -800,8 +800,9 @@ Reverie sub-tools that Detcore delegates to, one for capture and one for replay.
 ```
 
 **What is recorded.** Only syscalls that cannot be made deterministic by
-emulation or scheduling reach the `Recorder` (`hermit-cli/src/recorder/`, split
-into `fs`, `mmap`, `network`, `random`, and `time`). Anything Detcore can
+emulation or scheduling reach the `Recorder` (crate `hermit-record`,
+`hermit-record/src/recorder/`, split into `fs`, `mmap`, `network`, `random`, and
+`time`). Anything Detcore can
 emulate or order locally is *not* recorded, which keeps traces small and focused
 on true external inputs.
 
@@ -935,9 +936,9 @@ The main implementation entry points are:
 | Signal handling | `detcore/src/syscalls/signal.rs` |
 | CPUID table | `detcore/src/cpuid.rs` |
 | Syscall-family handlers | `detcore/src/syscalls/` |
-| Record (capture) sub-tool | `hermit-cli/src/recorder/`, `hermit-cli/src/record.rs` |
+| Record (capture) sub-tool | `hermit-record/src/recorder/` (its own crate, so its Detcore instantiation compiles in parallel), `hermit-cli/src/record.rs` |
 | Replay sub-tool and desync detection | `hermit-cli/src/replayer/`, `hermit-cli/src/replay.rs`, `hermit-cli/src/desync.rs` |
-| Recording metadata and event stream | `hermit-cli/src/metadata.rs`, `hermit-cli/src/event_stream.rs` |
+| Recording metadata and event stream | `hermit-cli/src/metadata.rs`, `hermit-record-format/src/event_stream.rs` |
 | Reverie tool contract | Reverie `reverie/src/tool.rs` and `reverie/src/guest.rs` |
 | Ptrace startup/filter | Reverie `reverie-ptrace/src/tracer.rs` |
 | Ptrace stop, injection, CPUID/RDTSC trap | Reverie `reverie-ptrace/src/task.rs` |

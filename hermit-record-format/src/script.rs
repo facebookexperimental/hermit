@@ -26,7 +26,7 @@ pub struct Shebang {
 
 impl Shebang {
     // Source of truth: fs/binfmt_script.c, function load_script().
-    pub(crate) fn from_buf(buf: &[u8]) -> Option<Self> {
+    pub fn from_buf(buf: &[u8]) -> Option<Self> {
         if !buf.starts_with(b"#!") {
             return None;
         }
@@ -115,14 +115,13 @@ impl Shebang {
 /// How the kernel's script handler reads the start of a file, for checks that
 /// must inspect exactly the interpreter the kernel executes.
 // Only the in-guest LiteInst program check uses it.
-#[cfg(any(test, feature = "liteinst"))]
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum KernelScript {
+pub enum KernelScript {
     /// The file does not start with `#!`; the kernel tries its other handlers.
     NotScript,
     /// The script handler runs no interpreter: the `#!` line names none, or it
     /// has no newline and the interpreter path runs to the end of the
-    /// [`BINPRM_BUF_SIZE`] bytes the kernel reads, so it may be truncated.
+    /// `BINPRM_BUF_SIZE` (256) bytes the kernel reads, so it may be truncated.
     /// Measured on Linux 7.1: `#!\n`, `#! \t\n` and a 254-byte path with no
     /// newline fail with `ENOEXEC`, so the kernel tries its other handlers;
     /// `#!` alone and `#!\0/bin/sh\n`, whose name a NUL leaves empty, fail the
@@ -132,14 +131,13 @@ pub(crate) enum KernelScript {
     Interpreter(PathBuf),
 }
 
-#[cfg(any(test, feature = "liteinst"))]
 impl KernelScript {
     /// Source of truth: `load_script()` in `fs/binfmt_script.c`; the errors
     /// noted on [`KernelScript::Declined`] were measured on Linux 7.1. Unlike
     /// [`Shebang::from_buf`], which its existing callers keep,
     /// this ends the interpreter path only at a space, tab or NUL: a carriage
     /// return is part of the path, as it is for the kernel.
-    pub(crate) fn from_buf(buf: &[u8]) -> Self {
+    pub fn from_buf(buf: &[u8]) -> Self {
         // The kernel reads the file's first BINPRM_BUF_SIZE bytes into a buffer
         // that is NUL-padded when the file is shorter.
         let mut header = [0_u8; BINPRM_BUF_SIZE];

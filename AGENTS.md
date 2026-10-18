@@ -213,8 +213,8 @@ Start investigations in these locations:
 - `detcore/src/cpuid.rs`, `detcore/src/time.rs`, and
   `detcore/src/record_or_replay.rs` for those subsystems.
 - `hermit-cli/src/bin/hermit/` for CLI subcommands.
-- `hermit-cli/src/recorder/` and `hermit-cli/src/replayer/` for log recording
-  and replay.
+- `hermit-record/src/recorder/` and `hermit-cli/src/replayer/` for log recording
+  and replay; `hermit-record-format/` for the event format they share.
 - `docs/Developers/Architecture.md` for the architecture overview and
   `docs/Users.md` for user-facing behavior.
 

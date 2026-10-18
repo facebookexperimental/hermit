@@ -253,7 +253,7 @@ The matrix was produced by comparing:
 - `Detcore::subscriptions` and `Detcore::handle_syscall_event` in
   `detcore/src/lib.rs`;
 - behavior in `detcore/src/syscalls/`;
-- record/replay additions in `hermit-cli/src/recorder/mod.rs`;
+- record/replay additions in `hermit-record/src/recorder.rs`;
 - the pinned x86_64 enum in `syscalls` 0.6.18.
 
 Re-run the audit whenever the syscall crate, subscription list, dispatch match,

@@ -33,14 +33,14 @@ use crate::event::Event;
 /// Unlike a process-local counter, this remains collision-free when Reverie
 /// forks the tool itself and each process receives its own tool instance.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct EventStreamId(Vec<u64>);
+pub struct EventStreamId(Vec<u64>);
 
 impl EventStreamId {
-    pub(crate) fn root() -> Self {
+    pub fn root() -> Self {
         Self(Vec::new())
     }
 
-    pub(crate) fn child(&self, ordinal: u64) -> Self {
+    pub fn child(&self, ordinal: u64) -> Self {
         let mut path = self.0.clone();
         path.push(ordinal);
         Self(path)
@@ -72,10 +72,10 @@ impl fmt::Display for EventStreamId {
 /// receives its already-assigned stream identity and a fresh descendant
 /// counter, while the continuing parent retains the incremented counter.
 #[derive(Default)]
-pub(crate) struct ChildEventStreamIds(AtomicU64);
+pub struct ChildEventStreamIds(AtomicU64);
 
 impl ChildEventStreamIds {
-    pub(crate) fn next(&self, parent: &EventStreamId) -> EventStreamId {
+    pub fn next(&self, parent: &EventStreamId) -> EventStreamId {
         let ordinal = self
             .0
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -216,12 +216,14 @@ impl DebugEvent {
         Syscall::from_raw(self.syscall.0, self.syscall.1)
     }
 
-    pub(crate) fn exec_request_matches(&self, other: &Self) -> bool {
+    pub fn exec_request_matches(&self, other: &Self) -> bool {
         self.exec_request == other.exec_request
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(sysno: Sysno, pretty: &str) -> Self {
+    /// A debug event naming SYSNO with no arguments. Test support only, for the
+    /// tests here and in the hermit library.
+    #[doc(hidden)]
+    pub fn for_test(sysno: Sysno, pretty: &str) -> Self {
         Self {
             syscall: (sysno, SyscallArgs::new(0, 0, 0, 0, 0, 0)),
             pretty: pretty.to_owned(),
@@ -279,7 +281,7 @@ fn kernel_arg_count(sysno: Sysno) -> Option<u8> {
 /// are not part of the syscall and may legitimately differ between record and
 /// replay. Syscalls without a known arity are returned unchanged (all six
 /// registers still compared).
-pub(crate) fn normalize_unused_args(syscall: Syscall) -> Syscall {
+pub fn normalize_unused_args(syscall: Syscall) -> Syscall {
     let (sysno, args) = syscall.into_parts();
     let Some(used) = kernel_arg_count(sysno) else {
         return syscall;

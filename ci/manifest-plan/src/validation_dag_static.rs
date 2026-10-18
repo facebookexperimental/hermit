@@ -1116,7 +1116,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // dev_profile_pinned_consumers_do_not_wait_for_the_e2e_artifact: 1627.
     // And detcore-model's twenty container_mounts tests
     // (https://github.com/rrnewton/hermit/issues/4213, K3a): 1648.
-    ("test.regular_crates", 1_648),
+    // And the 83 unit tests of the record/replay modules that moved out of
+    // the hermit library into hermit-record (41) and hermit-record-format
+    // (42), so the record tool's Detcore instantiation compiles in its own
+    // crate: 1731.
+    ("test.regular_crates", 1_731),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1670,7 +1674,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tests::kvm_mountinfo_config_keeps_a_snapshot_whose_host_row_left_the_namespace
     // and tests::kvm_mountinfo_config_refuses_provenance_of_another_namespace
     // (minibeads dh-dt0n): 1167.
-    ("test.hermit_unit", 1167),
+    // And -83 from 883e2e52: 1084.
+    ("test.hermit_unit", 1084),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4695,7 +4700,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // install-time mountpoint tests: 1160.
     // The same five e9patch executable-publication regressions: 1165.
     // And the two dh-dt0n KVM mount-snapshot tests: 1167.
-    ("test.hermit_unit_on_host", 1167),
+    // And -83 from 883e2e52: 1084.
+    ("test.hermit_unit_on_host", 1084),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -4864,7 +4870,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Restore the two qualified-runtime preparation tests: 1609.
     // And the same dev-profile consumer ordering test: 1613.
     // And the same twenty container_mounts tests: 1634.
-    ("test.regular_crates_on_host", 1_634),
+    // And the same 83 moved record/replay tests: 1717.
+    ("test.regular_crates_on_host", 1_717),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

@@ -21,23 +21,24 @@ mod backend_stats;
 pub mod build_info;
 pub mod canonical_verdict;
 mod chroot;
-mod consts;
+use hermit_record_format::consts;
 mod desync;
 pub mod logdiff_report;
 // TODO-HUMAN-REVIEW(PR-594): Review the public e9patch preprocessing API.
 pub mod cpu_profile_admission;
 pub mod e9patch;
 mod error;
-mod event;
-mod event_stream;
-mod fd;
+use hermit_record_format::event;
+use hermit_record_format::event_stream;
+use hermit_record_format::fd;
 pub mod happens_before;
 pub mod host_input_change;
 mod id;
 #[cfg(feature = "liteinst")]
 pub mod in_guest_exits;
 pub mod instruction_map;
-mod interp;
+#[cfg(feature = "liteinst")]
+use hermit_record_format::interp;
 pub mod liteinst_bootstrap;
 mod liteinst_constructor;
 pub mod liteinst_record;
@@ -364,15 +365,14 @@ const _: () = assert!(
     "a failure code of 0 would invert every assert_eq!(code, Some(CONST)) into demanding success"
 );
 mod record;
-mod record_replay_path;
-mod recorder;
+use hermit_record_format::record_replay_path;
 mod replay;
 mod replayer;
 #[cfg(feature = "sabre")]
 mod sabre_bootstrap;
 #[cfg(feature = "sabre")]
 mod sabre_ptrace;
-mod script;
+use hermit_record_format::script;
 mod tracer_thread;
 
 #[cfg(feature = "sabre")]
@@ -445,6 +445,8 @@ pub use error::SerializableError;
 use goblin::elf::Elf;
 use goblin::elf::header;
 use goblin::elf::section_header;
+use hermit_record_format::syscall_args::read_iovecs;
+use hermit_record_format::syscall_args::vectored_offset;
 pub use id::Id;
 use metadata::Metadata;
 pub use ptrace_completion::HermitCleanupStage;
@@ -466,34 +468,6 @@ pub use script::Shebang;
 use serde::Deserialize;
 use serde::Serialize;
 pub use tracer_thread::launch_on_calling_thread;
-
-fn read_iovecs<M: reverie::syscalls::MemoryAccess>(
-    memory: &M,
-    message: &libc::msghdr,
-) -> Result<Vec<libc::iovec>, reverie::Errno> {
-    if message.msg_iovlen == 0 {
-        return Ok(Vec::new());
-    }
-    let address = reverie::syscalls::Addr::from_raw(message.msg_iov as usize)
-        .ok_or(reverie::Errno::EFAULT)?;
-    let mut iovecs = vec![
-        libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
-        };
-        message.msg_iovlen
-    ];
-    memory.read_values(address, &mut iovecs)?;
-    Ok(iovecs)
-}
-
-fn vectored_offset(low: u64, high: u64) -> i64 {
-    if std::mem::size_of::<usize>() == 8 {
-        low as i64
-    } else {
-        ((high << 32) | (low & u32::MAX as u64)) as i64
-    }
-}
 
 enum KvmStdinReservation {
     Open(fs::File),

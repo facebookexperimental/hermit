@@ -11,6 +11,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use hermit_record::Tracer;
 use reverie::ExitStatus;
 use reverie::process::Command;
 use reverie::process::Output;
@@ -23,10 +24,6 @@ use crate::metadata::Metadata;
 use crate::metadata::record_or_replay_config;
 use crate::ptrace_completion::Control;
 use crate::ptrace_completion::{self};
-use crate::recorder::Recorder;
-
-type RecordTool = detcore::Detcore<Recorder>;
-type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
 
 /// Represents a recording that is currently running.
 pub struct Record {
@@ -100,10 +97,7 @@ impl Record {
         config.proc_level = metadata.proc_level.unwrap_or_default();
 
         crate::cpu_profile_admission::refuse_unadmitted_launch(&config, true)?;
-        let tracer = reverie_ptrace::TracerBuilder::<RecordTool>::new(command)
-            .config(config)
-            .spawn()
-            .await?;
+        let tracer = hermit_record::spawn_tracer(command, config).await?;
 
         metadata.proc_readonly = crate::proc_mount::guest_proc_readonly(tracer.guest_pid());
         crate::proc_mount::report_proc_mode(None, metadata.proc_readonly);

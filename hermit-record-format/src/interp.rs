@@ -71,7 +71,6 @@ pub fn elf_get_interp<P: AsRef<Path>>(elf: P) -> Option<PathBuf> {
 
 /// What an executable's ELF headers say about the code that runs before an
 /// `LD_PRELOAD` library's constructor.
-#[cfg(feature = "liteinst")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElfStartup {
     /// A 64-bit x86-64 image, the only kind a 64-bit preload can be loaded into.
@@ -84,11 +83,8 @@ pub struct ElfStartup {
     pub has_preinit_array: bool,
 }
 
-#[cfg(feature = "liteinst")]
 const DT_NULL: u64 = 0;
-#[cfg(feature = "liteinst")]
 const DT_PREINIT_ARRAYSZ: u64 = 33;
-#[cfg(feature = "liteinst")]
 const MAX_DYNAMIC_SIZE: usize = 1 << 20;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -96,7 +92,6 @@ const MAX_DYNAMIC_SIZE: usize = 1 << 20;
 /// Reads [`ElfStartup`] from `file`, starting at its beginning whatever its
 /// current offset. Returns `Ok(None)` when the file is not an ELF image, and an
 /// error when it is one whose headers cannot be read.
-#[cfg(feature = "liteinst")]
 pub fn elf_startup(file: &mut fs::File) -> std::io::Result<Option<ElfStartup>> {
     let invalid =
         |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, what.to_owned());
@@ -182,9 +177,10 @@ pub fn elf_startup(file: &mut fs::File) -> std::io::Result<Option<ElfStartup>> {
     Ok(Some(startup))
 }
 
-/// Synthetic ELF images for tests of [`elf_startup`] and its callers.
-#[cfg(all(test, feature = "liteinst"))]
-pub(crate) mod startup_fixtures {
+/// Synthetic ELF images for tests of [`elf_startup`] and its callers, here and
+/// in the hermit library. Test support only.
+#[doc(hidden)]
+pub mod startup_fixtures {
     use super::ELF_HEADER_SIZE;
 
     pub const EM_X86_64: u16 = 62;
@@ -391,7 +387,6 @@ mod tests {
         assert_eq!(elf_get_interp(file.path()), None);
     }
 
-    #[cfg(feature = "liteinst")]
     fn startup_of(bytes: &[u8]) -> Option<ElfStartup> {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(bytes).unwrap();
@@ -399,7 +394,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "liteinst")]
     fn startup_of_a_dynamic_x86_64_executable() {
         use startup_fixtures::*;
 
@@ -422,7 +416,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "liteinst")]
     fn startup_of_a_static_executable_has_no_interpreter() {
         use startup_fixtures::*;
 
@@ -437,7 +430,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "liteinst")]
     fn startup_reads_the_dynamic_section_only_up_to_dt_null() {
         use startup_fixtures::*;
 
@@ -457,7 +449,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "liteinst")]
     fn startup_of_other_machines_is_not_x86_64() {
         use startup_fixtures::*;
 
@@ -480,7 +471,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "liteinst")]
     fn startup_of_a_non_elf_file_is_none() {
         assert_eq!(startup_of(b"#!/bin/sh\necho script\n"), None);
         assert_eq!(startup_of(b""), None);

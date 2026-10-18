@@ -49,7 +49,7 @@ fn warn_kcmp_capability(error: &std::io::Error) {
 }
 
 // TODO-HUMAN-REVIEW(#557): Audit pidfd-based guest descriptor duplication.
-pub(crate) fn duplicate_guest_fd(pid: Pid, fd: RawFd) -> std::io::Result<OwnedFd> {
+pub fn duplicate_guest_fd(pid: Pid, fd: RawFd) -> std::io::Result<OwnedFd> {
     // pidfd_getfd returns a true duplicate of the guest descriptor, preserving
     // its open-file description (including offsets, flags, and socket identity).
     let pidfd = open_pidfd(pid, 0)?;
@@ -63,7 +63,7 @@ pub(crate) fn duplicate_guest_fd(pid: Pid, fd: RawFd) -> std::io::Result<OwnedFd
 /// Linux has none, through the leader's pidfd only if the two tasks share one
 /// table; otherwise it fails with `EINVAL`.
 // TODO-HUMAN-REVIEW(PR-3871): Audit thread-table descriptor duplication.
-pub(crate) fn duplicate_guest_thread_fd(pid: Pid, tid: Pid, fd: RawFd) -> std::io::Result<OwnedFd> {
+pub fn duplicate_guest_thread_fd(pid: Pid, tid: Pid, fd: RawFd) -> std::io::Result<OwnedFd> {
     const PIDFD_THREAD: libc::c_int = libc::O_EXCL;
     if tid == pid {
         return duplicate_guest_fd(pid, fd);
@@ -135,7 +135,7 @@ fn shares_fd_table(left: Pid, right: Pid) -> std::io::Result<bool> {
 }
 
 // TODO-HUMAN-REVIEW(#557): Audit kcmp-based open-file identity checks.
-pub(crate) fn same_open_file_description(left: RawFd, right: RawFd) -> std::io::Result<bool> {
+pub fn same_open_file_description(left: RawFd, right: RawFd) -> std::io::Result<bool> {
     const KCMP_FILE: libc::c_int = 0;
     // SAFETY: kcmp only compares descriptor-table entries owned by this process.
     let pid = unsafe { libc::getpid() };

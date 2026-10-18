@@ -24,7 +24,7 @@ const SIOCETHTOOL: usize = 0x8946;
 
 /// Returns the stable error used for legacy ioctls whose nested output cannot
 /// be represented by the currently pinned Reverie decoder.
-pub(crate) fn deterministic_ioctl_error(request: &ioctl::Request<'_>) -> Option<Errno> {
+pub fn deterministic_ioctl_error(request: &ioctl::Request<'_>) -> Option<Errno> {
     match request {
         // SIOCETHTOOL stores its output behind the data pointer nested in an
         // ifreq. Treating it as an opaque request would lose guest-visible
@@ -41,7 +41,7 @@ pub(crate) fn deterministic_ioctl_error(request: &ioctl::Request<'_>) -> Option<
 /// `lgetxattr`, `fgetxattr` and the `listxattr` family), or `None` for any
 /// other syscall. A zero size only asks for the length the value needs: the
 /// kernel copies nothing out and returns that length.
-pub(crate) fn xattr_query_output(syscall: &Syscall) -> Option<(Option<AddrMut<'_, u8>>, usize)> {
+pub fn xattr_query_output(syscall: &Syscall) -> Option<(Option<AddrMut<'_, u8>>, usize)> {
     match syscall {
         Syscall::Getxattr(call) => Some((call.value().map(|a| a.cast()), call.size())),
         Syscall::Lgetxattr(call) => Some((call.value().map(|a| a.cast()), call.size())),
@@ -58,9 +58,9 @@ pub(crate) fn xattr_query_output(syscall: &Syscall) -> Option<(Option<AddrMut<'_
 /// record-lock queries `F_GETLK`, `F_GETLK64` and `F_OFD_GETLK`, and the
 /// write-hint queries. Recording keeps those bytes, and replay writes them
 /// back; returning only the recorded status would leave the guest's struct as
-/// it was (https://github.com/rrnewton/hermit/issues/2289). glibc implements
+/// it was (<https://github.com/rrnewton/hermit/issues/2289>). glibc implements
 /// `fcntl(F_GETOWN)` with `F_GETOWN_EX`, so this also covers `F_GETOWN`.
-pub(crate) fn fcntl_output(
+pub fn fcntl_output(
     call: &reverie::syscalls::Fcntl,
 ) -> Option<(Option<AddrMut<'static, u8>>, usize)> {
     use reverie::syscalls::FcntlCmd;
@@ -276,67 +276,67 @@ pub struct MkdirEvent {
 /// post-exec callback, so its presence is proof that Linux replaced the image.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecEvent {
-    pub(crate) request: ExecRequest,
-    pub(crate) executable: ExecImage,
-    pub(crate) target: ExecTarget,
-    pub(crate) dependencies: Vec<ExecDependency>,
+    pub request: ExecRequest,
+    pub executable: ExecImage,
+    pub target: ExecTarget,
+    pub dependencies: Vec<ExecDependency>,
 }
 
 /// Raw pathname bytes and lookup context supplied to `execveat`. Detcore
 /// canonicalizes `execve` into this form before the recorder sees it.
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct ExecRequest {
-    pub(crate) dirfd: libc::c_int,
-    pub(crate) path: Vec<u8>,
-    pub(crate) flags: libc::c_int,
+pub struct ExecRequest {
+    pub dirfd: libc::c_int,
+    pub path: Vec<u8>,
+    pub flags: libc::c_int,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct ExecImage {
-    pub(crate) digest: detcore::Digest,
-    pub(crate) mode: u32,
+pub struct ExecImage {
+    pub digest: detcore::Digest,
+    pub mode: u32,
 }
 
 /// Guest-visible state of a descriptor used as an executable object. Replay
 /// restores this descriptor from the recorded image before asking Linux to
 /// resolve an `AT_EMPTY_PATH` or procfs-fd exec request.
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct ExecDescriptor {
+pub struct ExecDescriptor {
     /// Descriptor named by the exec request.
-    pub(crate) target_fd: libc::c_int,
-    pub(crate) status_flags: libc::c_int,
-    pub(crate) offset: Option<libc::off_t>,
+    pub target_fd: libc::c_int,
+    pub status_flags: libc::c_int,
+    pub offset: Option<libc::off_t>,
     /// Every descriptor that shared the target's open-file description before
     /// exec. `FD_CLOEXEC` belongs to each descriptor rather than the shared
     /// open-file description, so it is captured per alias.
-    pub(crate) aliases: Vec<ExecDescriptorAlias>,
+    pub aliases: Vec<ExecDescriptorAlias>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct ExecDescriptorAlias {
-    pub(crate) fd: libc::c_int,
-    pub(crate) descriptor_flags: libc::c_int,
+pub struct ExecDescriptorAlias {
+    pub fd: libc::c_int,
+    pub descriptor_flags: libc::c_int,
 }
 
 /// How the main target is reconstructed. Ordinary paths are materialized using
 /// their recorded symlink topology. Procfs/fd magic links and `AT_EMPTY_PATH`
 /// must already resolve to the recorded live object and are verified instead.
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) enum ExecTarget {
+pub enum ExecTarget {
     Materialize(ExecMaterialization),
     VerifyLive,
     RestoreDescriptor(ExecDescriptor),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct ExecMaterialization {
-    pub(crate) base: ExecMaterializationBase,
-    pub(crate) path: Vec<u8>,
-    pub(crate) symlinks: Vec<crate::record_replay_path::ResolvedSymlink>,
+pub struct ExecMaterialization {
+    pub base: ExecMaterializationBase,
+    pub path: Vec<u8>,
+    pub symlinks: Vec<crate::record_replay_path::ResolvedSymlink>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub(crate) enum ExecMaterializationBase {
+pub enum ExecMaterializationBase {
     Root,
     Cwd,
     DirectoryFd(libc::c_int),
@@ -344,11 +344,11 @@ pub(crate) enum ExecMaterializationBase {
 
 /// A shebang or ELF interpreter required by the recorded image.
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct ExecDependency {
-    pub(crate) base: ExecMaterializationBase,
-    pub(crate) path: Vec<u8>,
-    pub(crate) image: ExecImage,
-    pub(crate) symlinks: Vec<crate::record_replay_path::ResolvedSymlink>,
+pub struct ExecDependency {
+    pub base: ExecMaterializationBase,
+    pub path: Vec<u8>,
+    pub image: ExecImage,
+    pub symlinks: Vec<crate::record_replay_path::ResolvedSymlink>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

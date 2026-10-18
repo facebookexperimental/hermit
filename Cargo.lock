@@ -989,6 +989,8 @@ dependencies = [
  "fbinit",
  "goblin",
  "hermit-detcore",
+ "hermit-record",
+ "hermit-record-format",
  "hermit-resources",
  "hermit-test-workdir",
  "iced-x86",
@@ -1112,6 +1114,36 @@ dependencies = [
  "sha2",
  "shell-words",
  "toml",
+]
+
+[[package]]
+name = "hermit-record"
+version = "0.4.1"
+dependencies = [
+ "bincode 2.0.1",
+ "hermit-detcore",
+ "hermit-record-format",
+ "libc",
+ "reverie-core",
+ "reverie-ptrace",
+ "serde",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "hermit-record-format"
+version = "0.4.1"
+dependencies = [
+ "bincode 2.0.1",
+ "goblin",
+ "hermit-detcore",
+ "libc",
+ "reverie-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

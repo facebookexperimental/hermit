@@ -39,25 +39,25 @@ static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// ordinal is independent of pathname encoding and remains stable when a
 /// symlink target adds more components to the resolution queue.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct ResolvedSymlink {
-    pub(crate) lookup_index: u64,
-    pub(crate) target: Vec<u8>,
+pub struct ResolvedSymlink {
+    pub lookup_index: u64,
+    pub target: Vec<u8>,
 }
 
 /// The object and symlink topology selected by Linux-like component ordering.
-pub(crate) struct ResolvedPath {
-    pub(crate) object: OwnedFd,
-    pub(crate) symlinks: Vec<ResolvedSymlink>,
+pub struct ResolvedPath {
+    pub object: OwnedFd,
+    pub symlinks: Vec<ResolvedSymlink>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FileIdentity {
-    pub(crate) device: libc::dev_t,
-    pub(crate) inode: libc::ino_t,
-    pub(crate) mode: libc::mode_t,
-    pub(crate) size: libc::off_t,
-    pub(crate) mtime_seconds: libc::time_t,
-    pub(crate) mtime_nanoseconds: libc::c_long,
+pub struct FileIdentity {
+    pub device: libc::dev_t,
+    pub inode: libc::ino_t,
+    pub mode: libc::mode_t,
+    pub size: libc::off_t,
+    pub mtime_seconds: libc::time_t,
+    pub mtime_nanoseconds: libc::c_long,
 }
 
 #[derive(Debug)]
@@ -68,12 +68,12 @@ enum PendingComponent {
 }
 
 /// Pins the tracee's filesystem root as a directory descriptor.
-pub(crate) fn open_process_root(pid: Pid) -> io::Result<OwnedFd> {
+pub fn open_process_root(pid: Pid) -> io::Result<OwnedFd> {
     open_proc_directory(&format!("/proc/{}/root", pid.as_raw()))
 }
 
 /// Pins the tracee's current working directory as a directory descriptor.
-pub(crate) fn open_process_cwd(pid: Pid) -> io::Result<OwnedFd> {
+pub fn open_process_cwd(pid: Pid) -> io::Result<OwnedFd> {
     open_proc_directory(&format!("/proc/{}/cwd", pid.as_raw()))
 }
 
@@ -82,7 +82,7 @@ pub(crate) fn open_process_cwd(pid: Pid) -> io::Result<OwnedFd> {
 /// Recording keeps this resolved name for a successful `chdir`, so replay can
 /// enter the same directory even when the spelled path went through a host
 /// symlink that the replay root does not contain.
-pub(crate) fn process_cwd_path(tid: Pid) -> io::Result<PathBuf> {
+pub fn process_cwd_path(tid: Pid) -> io::Result<PathBuf> {
     // procfs appends " (deleted)" to a removed directory's name. That string is
     // not a path, and replay cannot reproduce a deleted working directory.
     let cwd_fd = open_process_cwd(tid)?;
@@ -106,19 +106,19 @@ pub(crate) fn process_cwd_path(tid: Pid) -> io::Result<PathBuf> {
 }
 
 /// Pins one tracee descriptor when it currently names a directory.
-pub(crate) fn open_process_directory_fd(pid: Pid, fd: RawFd) -> io::Result<OwnedFd> {
+pub fn open_process_directory_fd(pid: Pid, fd: RawFd) -> io::Result<OwnedFd> {
     open_proc_directory(&format!("/proc/{}/fd/{fd}", pid.as_raw()))
 }
 
 /// Pins one arbitrary tracee descriptor. The procfs magic link is intentionally
 /// followed so the returned O_PATH descriptor names the tracee's object rather
 /// than the controller's similarly spelled pathname.
-pub(crate) fn open_process_fd(pid: Pid, fd: RawFd) -> io::Result<OwnedFd> {
+pub fn open_process_fd(pid: Pid, fd: RawFd) -> io::Result<OwnedFd> {
     open_proc_path(&format!("/proc/{}/fd/{fd}", pid.as_raw()), libc::O_PATH)
 }
 
 /// Opens an arbitrary controller directory as a pinned O_PATH descriptor.
-pub(crate) fn open_directory_path(path: &Path) -> io::Result<OwnedFd> {
+pub fn open_directory_path(path: &Path) -> io::Result<OwnedFd> {
     let path = component_cstring(path.as_os_str())?;
     owned_fd(unsafe {
         libc::open(
@@ -265,7 +265,7 @@ fn directory_identity(fd: RawFd) -> io::Result<(libc::dev_t, libc::ino_t)> {
     Ok((stat.st_dev, stat.st_ino))
 }
 
-pub(crate) fn file_identity(fd: RawFd) -> io::Result<FileIdentity> {
+pub fn file_identity(fd: RawFd) -> io::Result<FileIdentity> {
     let mut stat = MaybeUninit::<libc::stat>::zeroed();
     if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
@@ -313,13 +313,13 @@ fn refuse_procfs_symlink(directory: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn is_regular_file(identity: FileIdentity) -> bool {
+pub fn is_regular_file(identity: FileIdentity) -> bool {
     identity.mode & libc::S_IFMT == libc::S_IFREG
 }
 
 /// Reopens an O_PATH descriptor for reading without consulting its original
 /// pathname. This preserves the selected object across rename/unlink races.
-pub(crate) fn open_readable_fd(fd: RawFd) -> io::Result<File> {
+pub fn open_readable_fd(fd: RawFd) -> io::Result<File> {
     let path = CString::new(format!("/proc/self/fd/{fd}"))
         .expect("controller descriptor path cannot contain NUL");
     let readable = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
@@ -332,7 +332,7 @@ fn same_directory(left: RawFd, right: RawFd) -> io::Result<bool> {
 
 /// Checks ancestry using only pinned directory descriptors. No pathname string
 /// is used as a security or confinement boundary.
-pub(crate) fn directory_is_beneath(root: &OwnedFd, directory: &OwnedFd) -> io::Result<bool> {
+pub fn directory_is_beneath(root: &OwnedFd, directory: &OwnedFd) -> io::Result<bool> {
     let mut current = duplicate_fd(directory.as_raw_fd())?;
     for _ in 0..MAX_DIRECTORY_DEPTH {
         if same_directory(current.as_raw_fd(), root.as_raw_fd())? {
@@ -401,7 +401,7 @@ fn parent_directory(root: &OwnedFd, current: &OwnedFd) -> io::Result<OwnedFd> {
 /// followed in the same order as Linux, so `link/..` first traverses `link` and
 /// only then applies the parent component. The final symlink can optionally be
 /// returned without following it for `AT_SYMLINK_NOFOLLOW` classification.
-pub(crate) fn resolve_existing_path(
+pub fn resolve_existing_path(
     root: &OwnedFd,
     start: &OwnedFd,
     path: &Path,
@@ -415,7 +415,7 @@ pub(crate) fn resolve_existing_path(
 /// kernel may perform a real filesystem operation on the path: the kernel
 /// follows procfs magic links to their objects, which this text resolution
 /// would place inside the replay root.
-pub(crate) fn resolve_existing_path_without_procfs_symlinks(
+pub fn resolve_existing_path_without_procfs_symlinks(
     root: &OwnedFd,
     start: &OwnedFd,
     path: &Path,
@@ -543,7 +543,7 @@ fn create_temporary_file(parent: RawFd) -> io::Result<(OsString, OwnedFd)> {
 /// root. The returned component can be opened by the stopped guest and then
 /// unlinked without ever resolving a controller pathname through guest-created
 /// symlinks.
-pub(crate) fn create_root_temporary_regular_file(
+pub fn create_root_temporary_regular_file(
     root: &OwnedFd,
     source: &mut File,
     expected_digest: detcore::Digest,
@@ -576,7 +576,7 @@ pub(crate) fn create_root_temporary_regular_file(
     Ok(name)
 }
 
-pub(crate) fn unlink_root_entry(root: &OwnedFd, component: &OsStr) -> io::Result<()> {
+pub fn unlink_root_entry(root: &OwnedFd, component: &OsStr) -> io::Result<()> {
     unlink_at(root.as_raw_fd(), component)
 }
 
@@ -644,7 +644,7 @@ fn materialize_regular_file_at(
 /// captured during recording are created/followed, and their targets must match
 /// byte-for-byte. Final replacement uses renameat relative to a pinned parent,
 /// so even a racing symlink cannot redirect writes outside the replay root.
-pub(crate) fn materialize_regular_file(
+pub fn materialize_regular_file(
     root: &OwnedFd,
     start: &OwnedFd,
     path: &Path,
@@ -737,18 +737,14 @@ pub(crate) fn materialize_regular_file(
 /// component with Linux-like symlink and `..` ordering. Intermediate symlinks
 /// are followed; the final component must be a directory rather than a symlink.
 /// Missing directory components are created relative to pinned parent fds.
-pub(crate) fn ensure_directory_path(
-    root: &OwnedFd,
-    start: &OwnedFd,
-    path: &Path,
-) -> io::Result<()> {
+pub fn ensure_directory_path(root: &OwnedFd, start: &OwnedFd, path: &Path) -> io::Result<()> {
     ensure_directory_path_impl(root, start, path, false, false)
 }
 
 /// As [`ensure_directory_path`], but follows an existing final symlink. This
 /// matches `chdir(2)` and mount-target lookup, which resolve the final
 /// component, while retaining descriptor-rooted confinement.
-pub(crate) fn ensure_directory_path_follow_final(
+pub fn ensure_directory_path_follow_final(
     root: &OwnedFd,
     start: &OwnedFd,
     path: &Path,
@@ -759,7 +755,7 @@ pub(crate) fn ensure_directory_path_follow_final(
 /// As [`ensure_directory_path_follow_final`], but fails with ELOOP instead of
 /// following a symlink on procfs (see
 /// [`resolve_existing_path_without_procfs_symlinks`]).
-pub(crate) fn ensure_directory_path_follow_final_without_procfs_symlinks(
+pub fn ensure_directory_path_follow_final_without_procfs_symlinks(
     root: &OwnedFd,
     start: &OwnedFd,
     path: &Path,

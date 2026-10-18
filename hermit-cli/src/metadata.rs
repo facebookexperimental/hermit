@@ -1303,7 +1303,7 @@ mod tests {
     #[test]
     fn record_and_replay_subscribe_every_determinized_syscall() {
         let config = record_or_replay_config(Path::new("replay-data"));
-        let record = <detcore::Detcore<crate::recorder::Recorder> as Tool>::subscriptions(&config);
+        let record = <detcore::Detcore<hermit_record::Recorder> as Tool>::subscriptions(&config);
         let replay = <detcore::Detcore<crate::replayer::Replayer> as Tool>::subscriptions(&config);
 
         for (phase, subscriptions) in [("record", record), ("replay", replay)] {
