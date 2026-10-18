@@ -13279,6 +13279,13 @@
           "category": "compat",
           "test": "compat/mountpoint",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/mountpoint",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16713,6 +16720,13 @@
           "test": "compat/mktemp",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/mountpoint",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -22681,7 +22695,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1628",
+        "NEXTEST_EXPECTED_EXECUTED": "1648",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -22730,7 +22744,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1157",
+        "NEXTEST_EXPECTED_EXECUTED": "1160",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -22779,7 +22793,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "2081",
+        "NEXTEST_EXPECTED_EXECUTED": "2084",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -23315,7 +23329,7 @@
       "group": "test",
       "job": "hermit_integration_3",
       "desc": "Portable Hermit integration targets (batched compile, serial test binaries) -- shard 3 of 3, procfs_determinism to zero_copy_pipe_fallback",
-      "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): all five current full-population runs were red for existing test failures, so their partial peaks are censored and do not lower the estimate. The last successful historical peak was 5351632896 bytes and an older 4-GiB run OOMed. The 6-GiB baseline rounds above the successful floor and the 8-GiB hard cap preserves 2 GiB more headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md. REGISTRATION 2026-10-05 (https://github.com/rrnewton/hermit/issues/3146): external_signal_interrupt runs here on the ptrace backend. A signal that Linux would deliver must end the tests/c/external_signal_interrupt.c guest's blocked futex, poll, epoll, select or child wait, and an ignored, blocked or default-ignored signal must leave the wait running to its deadline. test.liteinst_strict, where earlier rounds of https://github.com/rrnewton/hermit/pull/3361 registered the binary, no longer exists, and the binary's LiteInst cells are restoration targets (https://github.com/rrnewton/hermit/issues/3745). PMU CASES MOVED 2026-10-07: 25 external_signal_interrupt ptrace cases assert guest-observed virtual-time bounds (a 300 ms timed wait must end within 300-350 virtual ms) or watchdog progress that hold only with the PMU preemption timer. GitHub-hosted runners have no PMU, so hermit falls back to --max-timeslice=disabled, and in https://github.com/rrnewton/hermit/actions/runs/37631051557 exactly these 25 failed in test.hermit_integration_on_host (300 ms waits took 454-895 virtual ms). Forcing --max-timeslice=disabled locally fails the same 25 of 69 and no other; with the timer all 69 pass. This node and its hosted twin skip them by exact name and test.pmu_integration_cases runs them after privileged-pmu.preemption has shown the PMU works; the two filters are exact complements over this selection, so the full label runs each case once. DBT VERIFY EXCLUSION 2026-10-13: ppoll_simulation::ppoll_waits_use_nonblocking_probes_and_verify is skipped by exact name. Its --backend=dbt run --strict --verify cell diverges in every run, because pthread_join's futex waits on the joined thread's host thread ID (https://github.com/rrnewton/hermit/issues/3147). Here it fails sooner, because the test names no --workdir for DBT. The binary's other tests run here. PARALLEL 2026-10-15: preferred_inner_jobs 8 through NEXTEST_TEST_THREADS, which also sizes the step's cpu.max, instead of -j 1 under the former hermit-serialized group. Every guest these binaries build under CARGO_TARGET_TMPDIR goes to a `<name>-<pid>` path, so two test processes of one binary never overwrite each other's program; before that, 29 tests failed only at -j 8 with \"guest program not executable\" or DynamoRIO's \"Failed to read app ELF headers\". Measured with each local shard's exact selection in the validate profile, each run pinned to as many host CPUs as test threads: shard 1 (60 tests) 54.7-56.7 s at -j 1 and 18.2-18.9 s at -j 8; shard 2 (263) 221.5 s and 28.8-55.2 s; shard 3 (232) 173.5 s and 28.4-30.8 s; at -j 8 every run failed exactly the tests that failed at -j 1 on that host (lit, redis, liteinst-runtime and verify-report cases that need the pinned image) and no others. Peak summed RSS at -j 8 was 0.21 GiB (shard 1) and 0.49 GiB (shard 2); the validations' cgroup peaks at -j 1 were 129-327 MB, far inside the 8-GiB cap. SHARD 3 of 3 (validation_dag::SHARDED_NODES): the 57 binaries from procfs_determinism to zero_copy_pipe_fallback, selected by binary(=NAME) on top of the authored filter. Each shard runs the same prepared selection, and each binary runs in one shard, serialized there. The 254 tests and 125 s estimate are this shard's.",
+      "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): all five current full-population runs were red for existing test failures, so their partial peaks are censored and do not lower the estimate. The last successful historical peak was 5351632896 bytes and an older 4-GiB run OOMed. The 6-GiB baseline rounds above the successful floor and the 8-GiB hard cap preserves 2 GiB more headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md. REGISTRATION 2026-10-05 (https://github.com/rrnewton/hermit/issues/3146): external_signal_interrupt runs here on the ptrace backend. A signal that Linux would deliver must end the tests/c/external_signal_interrupt.c guest's blocked futex, poll, epoll, select or child wait, and an ignored, blocked or default-ignored signal must leave the wait running to its deadline. test.liteinst_strict, where earlier rounds of https://github.com/rrnewton/hermit/pull/3361 registered the binary, no longer exists, and the binary's LiteInst cells are restoration targets (https://github.com/rrnewton/hermit/issues/3745). PMU CASES MOVED 2026-10-07: 25 external_signal_interrupt ptrace cases assert guest-observed virtual-time bounds (a 300 ms timed wait must end within 300-350 virtual ms) or watchdog progress that hold only with the PMU preemption timer. GitHub-hosted runners have no PMU, so hermit falls back to --max-timeslice=disabled, and in https://github.com/rrnewton/hermit/actions/runs/37631051557 exactly these 25 failed in test.hermit_integration_on_host (300 ms waits took 454-895 virtual ms). Forcing --max-timeslice=disabled locally fails the same 25 of 69 and no other; with the timer all 69 pass. This node and its hosted twin skip them by exact name and test.pmu_integration_cases runs them after privileged-pmu.preemption has shown the PMU works; the two filters are exact complements over this selection, so the full label runs each case once. DBT VERIFY EXCLUSION 2026-10-13: ppoll_simulation::ppoll_waits_use_nonblocking_probes_and_verify is skipped by exact name. Its --backend=dbt run --strict --verify cell diverges in every run, because pthread_join's futex waits on the joined thread's host thread ID (https://github.com/rrnewton/hermit/issues/3147). Here it fails sooner, because the test names no --workdir for DBT. The binary's other tests run here. PARALLEL 2026-10-15: preferred_inner_jobs 8 through NEXTEST_TEST_THREADS, which also sizes the step's cpu.max, instead of -j 1 under the former hermit-serialized group. Every guest these binaries build under CARGO_TARGET_TMPDIR goes to a `<name>-<pid>` path, so two test processes of one binary never overwrite each other's program; before that, 29 tests failed only at -j 8 with \"guest program not executable\" or DynamoRIO's \"Failed to read app ELF headers\". Measured with each local shard's exact selection in the validate profile, each run pinned to as many host CPUs as test threads: shard 1 (60 tests) 54.7-56.7 s at -j 1 and 18.2-18.9 s at -j 8; shard 2 (263) 221.5 s and 28.8-55.2 s; shard 3 (232) 173.5 s and 28.4-30.8 s; at -j 8 every run failed exactly the tests that failed at -j 1 on that host (lit, redis, liteinst-runtime and verify-report cases that need the pinned image) and no others. Peak summed RSS at -j 8 was 0.21 GiB (shard 1) and 0.49 GiB (shard 2); the validations' cgroup peaks at -j 1 were 129-327 MB, far inside the 8-GiB cap. SHARD 3 of 3 (validation_dag::SHARDED_NODES): the 57 binaries from procfs_determinism to zero_copy_pipe_fallback, selected by binary(=NAME) on top of the authored filter. Each shard runs the same prepared selection, and each binary runs in one shard, serialized there. The 256 tests and 125 s estimate are this shard's.",
       "labels": [
         "full",
         "portable"
@@ -23472,7 +23486,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "254",
+        "NEXTEST_EXPECTED_EXECUTED": "256",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"aio_nr_determinism\",\"--test\",\"arch_prctl\",\"--test\",\"arch_status_determinism\",\"--test\",\"block_inflight_determinism\",\"--test\",\"btrfs_commit_determinism\",\"--test\",\"btrfs_pinned_bytes_determinism\",\"--test\",\"btrfs_reservation_determinism\",\"--test\",\"btrfs_reserved_bytes_determinism\",\"--test\",\"buddyinfo_determinism\",\"--test\",\"chaos_sched_yield_progress\",\"--test\",\"chaos_stress_pmu_detection\",\"--test\",\"child_time_rpc\",\"--test\",\"chown_virtual_root_identity\",\"--test\",\"cli_owned_lifecycle\",\"--test\",\"clock_determinism\",\"--test\",\"clock_discipline_determinism\",\"--test\",\"clock_passthrough\",\"--test\",\"compression\",\"--test\",\"container_init_deadline\",\"--test\",\"copy_file_range_refusal\",\"--test\",\"cppc_feedback_determinism\",\"--test\",\"cpufreq_avg_determinism\",\"--test\",\"cpuidle_determinism\",\"--test\",\"dbt_copied_tty\",\"--test\",\"deadline_slice_cap\",\"--test\",\"dentry_state_determinism\",\"--test\",\"dispatch_stats\",\"--test\",\"epoll_determinism\",\"--test\",\"epoll_pwait_zero_timeout_progress\",\"--test\",\"external_signal_interrupt\",\"--test\",\"fatal_core_capture\",\"--test\",\"file_nr_determinism\",\"--test\",\"first_seen_mtime\",\"--test\",\"flock_exclusion\",\"--test\",\"fp_reduction_determinism\",\"--test\",\"frontier_app_benchmarks\",\"--test\",\"full_summary_futex_order\",\"--test\",\"futex2_refusal\",\"--test\",\"getitimer_determinism\",\"--test\",\"hashseed_determinism\",\"--test\",\"host_kernel_probes\",\"--test\",\"host_security_identity\",\"--test\",\"inode_nr_determinism\",\"--test\",\"integration_matrix\",\"--test\",\"io_uring_ring_determinism\",\"--test\",\"ipc_determinism\",\"--test\",\"irq_per_cpu_determinism\",\"--test\",\"kernel_keyring\",\"--test\",\"key_users_determinism\",\"--test\",\"kvm_harder\",\"--test\",\"kvm_lifecycle_timing_log_level\",\"--test\",\"language_runtime_determinism\",\"--test\",\"leveldb\",\"--test\",\"lit\",\"--test\",\"madvise\",\"--test\",\"meminfo_determinism\",\"--test\",\"mmap_determinism\",\"--test\",\"mmap_stress_determinism\",\"--test\",\"mount_introspection\",\"--test\",\"name_to_handle_refusal\",\"--test\",\"netlink_table_determinism\",\"--test\",\"netns_cookie_determinism\",\"--test\",\"node_vmstat_determinism\",\"--test\",\"numa_maps_determinism\",\"--test\",\"optional_memory_features\",\"--test\",\"perf_event_refusal\",\"--test\",\"pidfd_creation\",\"--test\",\"ppoll_simulation\",\"--test\",\"prctl_dumpable_determinism\",\"--test\",\"privileged_observation\",\"--test\",\"proc_fd_link_determinism\",\"--test\",\"proc_fdinfo_determinism\",\"--test\",\"proc_locks_determinism\",\"--test\",\"process_isolation_refusals\",\"--test\",\"procfs_determinism\",\"--test\",\"procfs_positioned_determinism\",\"--test\",\"prodcons_determinism\",\"--test\",\"protocols_determinism\",\"--test\",\"pselect6_simulation\",\"--test\",\"ptrace_refusal\",\"--test\",\"pty_nr_determinism\",\"--test\",\"python_stdlib\",\"--test\",\"random_determinism\",\"--test\",\"random_uuid_determinism\",\"--test\",\"redis_strict\",\"--test\",\"relaxed_flag_matrix\",\"--test\",\"remap_file_pages_refusal\",\"--test\",\"reopened_pipe_progress\",\"--test\",\"robust_futex_owner_death\",\"--test\",\"robust_list_queries\",\"--test\",\"sched_setattr_abi\",\"--test\",\"sched_setattr_noop\",\"--test\",\"scheduler_deadlock\",\"--test\",\"scheduler_policy_queries\",\"--test\",\"self_sched_determinism\",\"--test\",\"self_schedstat_determinism\",\"--test\",\"sigmask_preemption\",\"--test\",\"signal_determinism\",\"--test\",\"smaps_determinism\",\"--test\",\"smaps_rollup_determinism\",\"--test\",\"so_incoming_cpu\",\"--test\",\"socket_cookie_determinism\",\"--test\",\"socket_ioctl_timestamp_determinism\",\"--test\",\"socket_timestamp_determinism\",\"--test\",\"sockstat_determinism\",\"--test\",\"softnet_stat_determinism\",\"--test\",\"sqlite_veryquick\",\"--test\",\"standalone\",\"--test\",\"stress_suite\",\"--test\",\"swaps_determinism\",\"--test\",\"syscall_file_io\",\"--test\",\"syscall_file_metadata\",\"--test\",\"syscall_quick_wins\",\"--test\",\"sysv_legacy_fallbacks\",\"--test\",\"tcp_info_determinism\",\"--test\",\"terminal_child_selectors\",\"--test\",\"thp_stats_determinism\",\"--test\",\"thread_scheduling_fairness\",\"--test\",\"thread_self_procfs_determinism\",\"--test\",\"thread_sync_determinism\",\"--test\",\"uevent_seqnum_determinism\",\"--test\",\"unix_socket_table_determinism\",\"--test\",\"utimensat_mtime\",\"--test\",\"verification_report_cli\",\"--test\",\"verification_report_consumers\",\"--test\",\"verify_claim_names_its_limit\",\"--test\",\"version_provenance\",\"--test\",\"vmstat_determinism\",\"--test\",\"waitid_signal_interrupt\",\"--test\",\"writev_determinism\",\"--test\",\"zero_copy_pipe_fallback\"]"
       },
       "networkonly": false,
@@ -23879,7 +23893,7 @@
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
         "HERMIT_REQUIRE_DAP_GDB": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "535",
+        "NEXTEST_EXPECTED_EXECUTED": "538",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -23931,7 +23945,7 @@
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "470",
+        "NEXTEST_EXPECTED_EXECUTED": "473",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -46220,7 +46234,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1614",
+        "NEXTEST_EXPECTED_EXECUTED": "1634",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -46266,7 +46280,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1157",
+        "NEXTEST_EXPECTED_EXECUTED": "1160",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -46312,7 +46326,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "2081",
+        "NEXTEST_EXPECTED_EXECUTED": "2084",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -46629,7 +46643,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "578",
+        "NEXTEST_EXPECTED_EXECUTED": "580",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"aio_nr_determinism\",\"--test\",\"arch_prctl\",\"--test\",\"arch_status_determinism\",\"--test\",\"block_inflight_determinism\",\"--test\",\"btrfs_commit_determinism\",\"--test\",\"btrfs_pinned_bytes_determinism\",\"--test\",\"btrfs_reservation_determinism\",\"--test\",\"btrfs_reserved_bytes_determinism\",\"--test\",\"buddyinfo_determinism\",\"--test\",\"chaos_sched_yield_progress\",\"--test\",\"chaos_stress_pmu_detection\",\"--test\",\"child_time_rpc\",\"--test\",\"chown_virtual_root_identity\",\"--test\",\"cli_owned_lifecycle\",\"--test\",\"clock_determinism\",\"--test\",\"clock_discipline_determinism\",\"--test\",\"clock_passthrough\",\"--test\",\"compression\",\"--test\",\"container_init_deadline\",\"--test\",\"copy_file_range_refusal\",\"--test\",\"cppc_feedback_determinism\",\"--test\",\"cpufreq_avg_determinism\",\"--test\",\"cpuidle_determinism\",\"--test\",\"dbt_copied_tty\",\"--test\",\"deadline_slice_cap\",\"--test\",\"dentry_state_determinism\",\"--test\",\"dispatch_stats\",\"--test\",\"epoll_determinism\",\"--test\",\"epoll_pwait_zero_timeout_progress\",\"--test\",\"external_signal_interrupt\",\"--test\",\"fatal_core_capture\",\"--test\",\"file_nr_determinism\",\"--test\",\"first_seen_mtime\",\"--test\",\"flock_exclusion\",\"--test\",\"fp_reduction_determinism\",\"--test\",\"frontier_app_benchmarks\",\"--test\",\"full_summary_futex_order\",\"--test\",\"futex2_refusal\",\"--test\",\"getitimer_determinism\",\"--test\",\"hashseed_determinism\",\"--test\",\"host_kernel_probes\",\"--test\",\"host_security_identity\",\"--test\",\"inode_nr_determinism\",\"--test\",\"integration_matrix\",\"--test\",\"io_uring_ring_determinism\",\"--test\",\"ipc_determinism\",\"--test\",\"irq_per_cpu_determinism\",\"--test\",\"kernel_keyring\",\"--test\",\"key_users_determinism\",\"--test\",\"kvm_harder\",\"--test\",\"kvm_lifecycle_timing_log_level\",\"--test\",\"language_runtime_determinism\",\"--test\",\"leveldb\",\"--test\",\"lit\",\"--test\",\"madvise\",\"--test\",\"meminfo_determinism\",\"--test\",\"mmap_determinism\",\"--test\",\"mmap_stress_determinism\",\"--test\",\"mount_introspection\",\"--test\",\"name_to_handle_refusal\",\"--test\",\"netlink_table_determinism\",\"--test\",\"netns_cookie_determinism\",\"--test\",\"node_vmstat_determinism\",\"--test\",\"numa_maps_determinism\",\"--test\",\"optional_memory_features\",\"--test\",\"perf_event_refusal\",\"--test\",\"pidfd_creation\",\"--test\",\"ppoll_simulation\",\"--test\",\"prctl_dumpable_determinism\",\"--test\",\"privileged_observation\",\"--test\",\"proc_fd_link_determinism\",\"--test\",\"proc_fdinfo_determinism\",\"--test\",\"proc_locks_determinism\",\"--test\",\"process_isolation_refusals\",\"--test\",\"procfs_determinism\",\"--test\",\"procfs_positioned_determinism\",\"--test\",\"prodcons_determinism\",\"--test\",\"protocols_determinism\",\"--test\",\"pselect6_simulation\",\"--test\",\"ptrace_refusal\",\"--test\",\"pty_nr_determinism\",\"--test\",\"python_stdlib\",\"--test\",\"random_determinism\",\"--test\",\"random_uuid_determinism\",\"--test\",\"redis_strict\",\"--test\",\"relaxed_flag_matrix\",\"--test\",\"remap_file_pages_refusal\",\"--test\",\"reopened_pipe_progress\",\"--test\",\"robust_futex_owner_death\",\"--test\",\"robust_list_queries\",\"--test\",\"sched_setattr_abi\",\"--test\",\"sched_setattr_noop\",\"--test\",\"scheduler_deadlock\",\"--test\",\"scheduler_policy_queries\",\"--test\",\"self_sched_determinism\",\"--test\",\"self_schedstat_determinism\",\"--test\",\"sigmask_preemption\",\"--test\",\"signal_determinism\",\"--test\",\"smaps_determinism\",\"--test\",\"smaps_rollup_determinism\",\"--test\",\"so_incoming_cpu\",\"--test\",\"socket_cookie_determinism\",\"--test\",\"socket_ioctl_timestamp_determinism\",\"--test\",\"socket_timestamp_determinism\",\"--test\",\"sockstat_determinism\",\"--test\",\"softnet_stat_determinism\",\"--test\",\"sqlite_veryquick\",\"--test\",\"standalone\",\"--test\",\"stress_suite\",\"--test\",\"swaps_determinism\",\"--test\",\"syscall_file_io\",\"--test\",\"syscall_file_metadata\",\"--test\",\"syscall_quick_wins\",\"--test\",\"sysv_legacy_fallbacks\",\"--test\",\"tcp_info_determinism\",\"--test\",\"terminal_child_selectors\",\"--test\",\"thp_stats_determinism\",\"--test\",\"thread_scheduling_fairness\",\"--test\",\"thread_self_procfs_determinism\",\"--test\",\"thread_sync_determinism\",\"--test\",\"uevent_seqnum_determinism\",\"--test\",\"unix_socket_table_determinism\",\"--test\",\"utimensat_mtime\",\"--test\",\"verification_report_cli\",\"--test\",\"verification_report_consumers\",\"--test\",\"verify_claim_names_its_limit\",\"--test\",\"version_provenance\",\"--test\",\"vmstat_determinism\",\"--test\",\"waitid_signal_interrupt\",\"--test\",\"writev_determinism\",\"--test\",\"zero_copy_pipe_fallback\"]"
       },
       "networkonly": false,
@@ -59360,6 +59374,13 @@
           "test": "compat/mktemp",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/mountpoint",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

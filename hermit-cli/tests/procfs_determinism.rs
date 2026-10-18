@@ -1378,6 +1378,124 @@ fn proc_self_mountinfo_shows_a_user_mount_at_its_target_not_as_hermit_owned() {
     );
 }
 
+/// After the guest's own `chroot`, its `mountinfo` is the kernel's view,
+/// sanitized: there a staged bind (a `--bind` below `/tmp`, as DBT's
+/// statistics bind is) still shows its target as its root, at every layer,
+/// and its host source never reaches the guest
+/// (https://github.com/rrnewton/hermit/issues/4213, K3a). The container mount
+/// table, which the guest reads before any `chroot`, leaves a backend's own
+/// bind out; this checks the root rewrite that still serves the kernel path.
+#[test]
+fn a_staged_binds_root_rewrite_holds_on_the_kernel_path_after_chroot() {
+    let _guard = hermit_run_lock();
+    let chroot = [
+        "/usr/sbin/chroot",
+        "/usr/bin/chroot",
+        "/sbin/chroot",
+        "/bin/chroot",
+    ]
+    .into_iter()
+    .find(|path| Path::new(path).exists())
+    .expect("a chroot command");
+    let source = tempfile::tempdir().expect("create the bind source");
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
+        .args(["--log=error", "run", "--base-env=minimal"])
+        .arg(format!(
+            "--bind={}:/tmp/k3-staged-bind",
+            source.path().display()
+        ))
+        .args(["--", chroot, "/", "/bin/cat", "/proc/self/mountinfo"]);
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let output = hermit_test::hermit_output(&rendered, &mut command);
+    assert!(
+        output.status.success(),
+        "{rendered}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let text = String::from_utf8(output.stdout).expect("mountinfo should be UTF-8");
+    let rows = text
+        .lines()
+        .filter(|line| line.split(' ').nth(4) == Some("/tmp/k3-staged-bind"))
+        .collect::<Vec<_>>();
+    assert!(
+        !rows.is_empty(),
+        "the kernel view has no row for the bind:\n{text}"
+    );
+    for row in &rows {
+        assert_eq!(row.split(' ').nth(3), Some("/tmp/k3-staged-bind"), "{row}");
+    }
+    let source_name = source.path().file_name().unwrap().to_str().unwrap();
+    assert!(
+        !text.contains(source_name),
+        "the bind's host source leaked:\n{text}"
+    );
+}
+
+/// A bind recorded where the kernel put it when the container's setup
+/// installed it stays the plan's, through the real setup path (`--mount`, as
+/// `--bind` takes only targets below /tmp): the second of three binds names
+/// opt/x, which crosses the symbolic link x -> foo in the
+/// first bind at opt, so the kernel mounts it at foo; the third bind replaces
+/// opt with a directory whose x links to bar. The row at foo is still shown,
+/// and the run is not refused (round 2 of
+/// https://github.com/rrnewton/hermit/issues/4213, K3a: provenance by
+/// install-time resolution, not by how a target resolves at the end).
+#[test]
+fn a_bind_through_a_symbolic_link_stays_shown_after_a_later_bind_replaces_it() {
+    let _guard = hermit_run_lock();
+    let scratch = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create scratch");
+    let root = fs::canonicalize(scratch.path()).expect("resolve scratch");
+    for dir in ["a", "c", "item", "foo", "bar", "opt"] {
+        fs::create_dir(root.join(dir)).expect("create a bind directory");
+    }
+    std::os::unix::fs::symlink(root.join("foo"), root.join("a/x")).expect("link a/x");
+    std::os::unix::fs::symlink(root.join("bar"), root.join("c/x")).expect("link c/x");
+    let path = |name: &str| root.join(name).to_str().expect("UTF-8 path").to_owned();
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
+        .args(["--log=error", "run", "--base-env=minimal"])
+        .arg(format!(
+            "--mount=type=bind,source={},target={}",
+            path("a"),
+            path("opt")
+        ))
+        .arg(format!(
+            "--mount=type=bind,source={},target={}",
+            path("item"),
+            path("opt/x")
+        ))
+        .arg(format!(
+            "--mount=type=bind,source={},target={}",
+            path("c"),
+            path("opt")
+        ))
+        .args(["--", "/bin/cat", "/proc/self/mountinfo"]);
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let output = hermit_test::hermit_output(&rendered, &mut command);
+    assert!(
+        output.status.success(),
+        "{rendered}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let text = String::from_utf8(output.stdout).expect("mountinfo should be UTF-8");
+    let at = |mountpoint: &str| {
+        text.lines()
+            .filter(|line| line.split(' ').nth(4) == Some(mountpoint))
+            .count()
+    };
+    assert_eq!(
+        at(&path("foo")),
+        1,
+        "the bind through the link is gone:\n{text}"
+    );
+    assert_eq!(at(&path("opt")), 2, "both binds at opt are shown:\n{text}");
+}
+
 fn mountinfo_and_stat_proc_device(no_virtualize_metadata: bool, stat_first: bool) -> (u64, u64) {
     let script = if stat_first {
         "/usr/bin/stat -c '__STAT__ %d' /proc; cat /proc/self/mountinfo"
@@ -1651,7 +1769,10 @@ fn user_binds_with_different_sources_show_identical_mountinfo() {
 /// A user bind rewrites only its own rows. Host /tmp may be the root of a
 /// btrfs subvolume (`/tmpvol` on the development hosts), as other host mounts are;
 /// binding it at a directory the test makes must not change the root of any
-/// other row.
+/// other row. The bind may add rows, but only the host mounts above its
+/// target, which the guest's container mount table shows because they hold a
+/// mount Hermit installed (https://github.com/rrnewton/hermit/issues/4213,
+/// K3a); every row the guest sees without the bind keeps its root.
 #[test]
 fn a_user_bind_changes_no_other_rows_root() {
     let _guard = hermit_run_lock();
@@ -1685,9 +1806,19 @@ fn a_user_bind_changes_no_other_rows_root() {
     );
     let plain = std::str::from_utf8(&plain).expect("mountinfo should be UTF-8");
     let bound = std::str::from_utf8(&bound).expect("mountinfo should be UTF-8");
+    let (plain_roots, mut bound_roots) = (roots(plain), roots(bound));
+    bound_roots.retain(|mountpoint, _| {
+        plain_roots.contains_key(mountpoint) || {
+            let above = format!("{}/", mountpoint.trim_end_matches('/'));
+            assert!(
+                target.starts_with(&above),
+                "binding /tmp at {target} added a row at {mountpoint}, which is not above it:\n{bound}"
+            );
+            false
+        }
+    });
     assert_eq!(
-        roots(bound),
-        roots(plain),
+        bound_roots, plain_roots,
         "binding /tmp at {target} changed another row:\n{bound}"
     );
     let row = bound

@@ -4118,6 +4118,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                         ProcfsEntry::Unnamed | ProcfsEntry::Unknown => {}
                     }
                 }
+                // A process's `mountinfo` or `mounts` the kernel opened reads
+                // the view its task's root gives it, decided now, at the open,
+                // as Linux takes the root at the open.
+                if let Some(file) = procfs.as_ref()
+                    && file.mount_table_rendering().is_some()
+                {
+                    let kernel = self.mount_view_is_kernel(guest, file).await;
+                    procfs
+                        .as_mut()
+                        .expect("a classified procfs file disappeared")
+                        .pin_mount_view(kernel);
+                }
                 if procfs
                     .as_ref()
                     .is_some_and(ProcfsFile::needs_bound_thread_identity)
@@ -5075,6 +5087,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let template = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_rendering_template())?;
+        // A process's `mountinfo` or `mounts`, in a run with a container
+        // mount table: the table's bytes, whoever opened the file.
+        let mount_table = self.mount_table_snapshot(guest, call.fd())?;
         let raw_contents = match template {
             // A descriptor that cannot read (`O_PATH`, write-only, or access
             // mode 3) reads nothing (EBADF), as the kernel's read of it,
@@ -5104,7 +5119,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if position == 0 {
                     self.require_rendered_task(guest, call.fd()).await?;
                 }
-                template.to_vec()
+                mount_table.unwrap_or_else(|| template.to_vec())
+            }
+            // A mount table file the kernel opened takes no capture of the
+            // kernel's bytes, which the table replaces; a descriptor that
+            // cannot read reads nothing (EBADF), as the kernel's read of it
+            // would answer.
+            None if let Some(table) = mount_table => {
+                if !can_read(
+                    guest
+                        .thread_state()
+                        .with_detfd(call.fd(), |detfd| detfd.status_flags())?,
+                ) {
+                    return Err(Errno::EBADF.into());
+                }
+                table
             }
             None => self.snapshot_procfs(guest, call).await?,
         };
@@ -5329,6 +5358,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         ))
                     })?
             } else {
+                // A file on a mount the container mount table hides reports
+                // its nearest shown ancestor (`ContainerMountTable::select`).
+                let raw_mount_id = self.shown_mount_id(guest, raw_mount_id);
                 determinize_mount_id(guest, raw_mount_id, None)
                     .await
                     .ok_or_else(|| {
@@ -5579,6 +5611,156 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
         })?;
         Ok(())
+    }
+
+    /// The bytes of the procfs file open as `fd`, if it is a process's
+    /// `mountinfo` or `mounts` and the run has a container mount table
+    /// (`Config::container_mount_table`): the table's `mountinfo`, with raw
+    /// identities that the snapshot then numbers as it numbers the kernel's,
+    /// or its `mounts`. Wherever the file was opened from: rendered by Detcore,
+    /// or opened by the kernel (under record and replay, through a spelling
+    /// Detcore does not resolve, on a backend's own procfs), except one the
+    /// kernel opened after the process it names changed its root, whose view
+    /// the kernel decides (`chroot` keeps the kernel's path, as for every
+    /// rendered file). `None` for every other file.
+    fn mount_table_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        fd: RawFd,
+    ) -> Result<Option<Vec<u8>>, Errno> {
+        let Some(table) = guest.config().container_mount_table.as_ref() else {
+            return Ok(None);
+        };
+        let (rendering, rendered, pinned) = guest.thread_state().with_detfd(fd, |detfd| {
+            (
+                detfd.procfs_mount_table_rendering(),
+                detfd.procfs_rendered_path().is_some(),
+                detfd.procfs_pinned_mount_view(),
+            )
+        })?;
+        let Some(rendering) = rendering else {
+            return Ok(None);
+        };
+        // A rendered file is the table, as its open decided. A file the kernel
+        // opened reads the view its open pinned; one nothing pinned (a
+        // descriptor Detcore learned of otherwise), the reader's.
+        let kernel_view = !rendered
+            && pinned.unwrap_or_else(|| {
+                guest
+                    .thread_state()
+                    .changed_root
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            });
+        if kernel_view {
+            return Ok(None);
+        }
+        Ok(Some(match rendering {
+            crate::procfs::MountTableRendering::Mountinfo => table.mountinfo(),
+            crate::procfs::MountTableRendering::Mounts => {
+                table.mounts(&guest.config().mountinfo_root_rewrites)
+            }
+        }))
+    }
+
+    /// Whether the process's `mountinfo` or `mounts` the kernel opened as
+    /// `file` reads the kernel's view: the task the path names has a changed
+    /// root (`tool_global::root_changed`, which follows filesystem groups
+    /// shared through CLONE_FS), or Detcore cannot tell which task it names.
+    /// As on Linux, where `mounts_open_common` takes the target task's root,
+    /// the reader's own root does not decide it. The kernel's view is
+    /// Linux's own answer for whatever task the path names, so it is the
+    /// answer whenever the task is unknown: never the launch table.
+    async fn mount_view_is_kernel<G: Guest<Self>>(&self, guest: &mut G, file: &ProcfsFile) -> bool {
+        // In a nested PID namespace the path's numbers are that namespace's
+        // (a child that kept a `/proc` directory descriptor across
+        // CLONE_NEWPID and opens `self/mountinfo` through it, for one), and
+        // Detcore does not map them here.
+        let Some((pid, tid)) = self.procfs_caller_ids(guest) else {
+            return true;
+        };
+        let mut bound = file.clone();
+        bound.bind_task(pid, tid);
+        match bound.bound_task() {
+            Some(task) => {
+                crate::tool_global::root_changed(
+                    guest,
+                    detcore_model::pid::DetPid::from_raw(task.thread.unwrap_or(task.process)),
+                )
+                .await
+            }
+            None => true,
+        }
+    }
+
+    /// The raw mount ID a file on mount `raw_mount_id` reports to the guest:
+    /// with a container mount table, and until the process changes its root,
+    /// a hidden mount's nearest shown ancestor
+    /// (`ContainerMountTable::shown_mount_id`); otherwise the mount itself.
+    pub(crate) fn shown_mount_id<G: Guest<Self>>(&self, guest: &G, raw_mount_id: u64) -> u64 {
+        match guest.config().container_mount_table.as_ref() {
+            Some(table)
+                if !guest
+                    .thread_state()
+                    .changed_root
+                    .load(std::sync::atomic::Ordering::SeqCst) =>
+            {
+                table.shown_mount_id(raw_mount_id)
+            }
+            _ => raw_mount_id,
+        }
+    }
+
+    /// Write `stat`, a procfs file Detcore renders, as `statx`'s result, with
+    /// the guest's procfs mount's ID, as its fdinfo `mnt_id` shows it.
+    async fn write_rendered_statx<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Statx,
+        stat: DetStat,
+    ) -> Result<i64, Error> {
+        let statptr = call.statx().ok_or(Errno::EFAULT)?;
+        let mut statx: libc::statx = stat.into();
+        let raw_mount_id = rendered_procfs::guest_procfs_mount_id().ok();
+        self.fill_statx_mount_id(guest, &mut statx, raw_mount_id)
+            .await;
+        guest.memory().write_value(statptr.0, &statx)?;
+        Ok(0)
+    }
+
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4213):
+    // Review STATX_MNT_ID numbered as fdinfo's mnt_id, a hidden mount's file
+    // reporting its nearest shown ancestor.
+    /// Fill `statx`'s `STATX_MNT_ID` for a file on mount `raw_mount_id`, as
+    /// Linux fills it whether or not the caller asked for it (`vfs_statx`):
+    /// the number its fdinfo `mnt_id` and its `mountinfo` row show, through
+    /// the run's mount-ID pool, a hidden mount's file showing its nearest
+    /// shown ancestor's ([`Self::shown_mount_id`]). Where there is no such
+    /// number (no mount provenance to number it by, outside Hermit's
+    /// container, or no mount ID from the kernel), the field is 0 and its
+    /// mask bit is cleared, so no caller reads a number that names nothing.
+    async fn fill_statx_mount_id<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        statx: &mut libc::statx,
+        raw_mount_id: Option<u64>,
+    ) {
+        let guest_mount_id = match raw_mount_id {
+            Some(raw_mount_id) if guest.config().mountinfo_mount_ids_captured => {
+                let raw_mount_id = self.shown_mount_id(guest, raw_mount_id);
+                determinize_mount_id(guest, raw_mount_id, None).await
+            }
+            _ => None,
+        };
+        match guest_mount_id {
+            Some(id) => {
+                statx.stx_mnt_id = id;
+                statx.stx_mask |= libc::STATX_MNT_ID;
+            }
+            None => {
+                statx.stx_mnt_id = 0;
+                statx.stx_mask &= !libc::STATX_MNT_ID;
+            }
+        }
     }
 
     /// SYS_read system call (MAYHANG).
@@ -8204,9 +8386,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     return Err(Errno::EINVAL.into());
                 }
             } else if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
-                let statptr = call.statx().ok_or(Errno::EFAULT)?;
-                guest.memory().write_value(statptr.0, &stat.into())?;
-                return Ok(0);
+                return self.write_rendered_statx(guest, call, stat).await;
             }
             let target = match call.statx() {
                 Some(result) => target.unless_overwritten(
@@ -8225,19 +8405,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             let stat: libc::statx = memory.read_value(statptr.0)?;
             // A placeholder another process made, or an earlier image of this
             // one, becomes known by its identity (`determinize_stat`).
-            if inode_override.is_none() {
-                let _ = self
-                    .recognize_placeholder(guest, &DetStat::from(stat), target)
-                    .await;
-            }
+            let placeholder = match inode_override {
+                None => {
+                    self.recognize_placeholder(guest, &DetStat::from(stat), target)
+                        .await
+                }
+                Some(_) => None,
+            };
             let procfs = match inode_override {
                 Some(_) => ProcfsEntry::NotProcfs,
                 None => Self::procfs_entry(guest, &DetStat::from(stat), target).await,
             };
+            // A rendered file reached through any spelling (a symbolic link to
+            // its descriptor link) is on the guest's procfs mount, not on the
+            // placeholder's memfd's.
+            let raw_mount_id = match placeholder {
+                Some(_) => rendered_procfs::guest_procfs_mount_id().ok(),
+                None => (stat.stx_mask & libc::STATX_MNT_ID != 0).then_some(stat.stx_mnt_id),
+            };
             let stat = self
                 .determinize_stat(guest, stat, inode_override, procfs)
                 .await?;
-            memory.write_value(statptr.0, &stat.into())?;
+            let mut statx: libc::statx = stat.into();
+            self.fill_statx_mount_id(guest, &mut statx, raw_mount_id)
+                .await;
+            memory.write_value(statptr.0, &statx)?;
             Ok(0)
         } else {
             // A procfs file Detcore renders has no kernel object to ask.
@@ -8249,9 +8441,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     return Err(Errno::EINVAL.into());
                 }
             } else if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
-                let statptr = call.statx().ok_or(Errno::EFAULT)?;
-                guest.memory().write_value(statptr.0, &stat.into())?;
-                return Ok(0);
+                return self.write_rendered_statx(guest, call, stat).await;
             }
             Ok(self.record_or_replay(guest, call).await?)
         }

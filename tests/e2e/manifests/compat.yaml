@@ -1471,7 +1471,9 @@ corpus:
     # after KVM began answering getsockopt(SO_ERROR), 10 of 10. shell-build
     # joined once its workload's cd became physical (a logical cd stats every
     # ancestor of the run-state work dir, whose sizes change while sibling
-    # cells run): 10 of 10 with four runs at once.
+    # cells run): 10 of 10 with four runs at once. mountpoint joined once
+    # Detcore rendered /proc/<pid>/mountinfo from the container mount table
+    # (K3a of https://github.com/rrnewton/hermit/issues/4213): 10 of 10.
     - backend: kvm
       rows:
         [
@@ -1486,7 +1488,7 @@ corpus:
           groups, gzip, gzip-roundtrip, head, hexdump, hostname, iconv, id,
           install, ionice, iostat, ip, join, jq, ld, ln, logger, logname, ls,
           lscpu, lua, lua-direct, m4, make, md5sum, mkdir, mkfifo, mktemp,
-          mpstat-softirqs, msgfmt, msgunfmt, mv, namei, netlink-route,
+          mountpoint, mpstat-softirqs, msgfmt, msgunfmt, mv, namei, netlink-route,
           netlink-sock-diag, nice, nl, nm, node, nohup, nproc, numactl-hardware,
           numastat, numfmt, objcopy, objdump, od, openssl, paste, patch,
           pathchk, perl, perl-direct, pidstat-disk, pinky, pkg-config, pr,
@@ -1504,10 +1506,6 @@ corpus:
         Not in the 2026-10-13 KVM survey: its KVM verify cell was not green
         on the compatibility ledger
       disabled:
-        mountpoint: >-
-          Diverged in 4 of 10 KVM verify runs on 2026-10-13: the size KVM
-          reports for /proc/self/mountinfo follows the host's mount table,
-          which changed between runs (https://github.com/rrnewton/hermit/issues/4213)
         rustc: >-
           Exceeded the default 22-second CPU budget in 10 of 10 KVM verify
           runs on 2026-10-13; the lane's own cell gives this heavy row 599

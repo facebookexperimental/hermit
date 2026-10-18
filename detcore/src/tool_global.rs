@@ -1285,14 +1285,100 @@ struct ProcessExitCleanup {
 /// none of them reports an initial stack pointer, so none renders this file.
 /// That path returns, with end-to-end tests, when DBT implements
 /// `Guest::initial_stack_pointer`.
+///
+/// It also keeps the other fact a `/proc/<pid>` file Detcore renders depends
+/// on: which tasks have a changed root, whose `mountinfo` and `mounts` are
+/// then the kernel's view, rooted where the task is (K3a of
+/// <https://github.com/rrnewton/hermit/issues/4213>). Linux keeps a task's
+/// root in its `fs_struct`, which `clone(CLONE_FS)` shares between creator
+/// and child (thread or process) and which a clone without it copies, so the
+/// table keeps each task's filesystem group the same way ([`FsRoots`]).
 #[derive(Debug, Default)]
 pub(crate) struct ProcessAuxvTable {
     /// Each live process's current image's auxiliary vector.
     processes: BTreeMap<DetPid, Vec<u8>>,
+    /// Each task's filesystem group, and the groups whose root changed.
+    roots: FsRoots,
     /// Whether this run has warned that a backend reports no initial stack
     /// pointer, and that an initial stack held no plausible vector
     /// ([`ProcessAuxvTable::first_kernel_file`]).
     kernel_file_warned: [bool; 2],
+}
+
+/// Each task's filesystem group: the tasks that share one Linux `fs_struct`,
+/// and so one root. A task is in its creator's group when it was created with
+/// `CLONE_FS`, and in a new group, starting from a copy of its creator's
+/// root, otherwise. `unshare(CLONE_FS)` would detach a task too, but Detcore
+/// refuses every `unshare` (EPERM), so no guest task does. A task Detcore has
+/// not seen created (none in practice) has an unchanged root.
+#[derive(Debug, Default)]
+struct FsRoots {
+    /// Each task's group, by its thread number.
+    groups: BTreeMap<DetPid, u64>,
+    /// The groups whose root changed.
+    changed: BTreeSet<u64>,
+    /// The next group's number.
+    next: u64,
+}
+
+impl FsRoots {
+    fn new_group(&mut self, changed: bool) -> u64 {
+        let group = self.next;
+        self.next += 1;
+        if changed {
+            self.changed.insert(group);
+        }
+        group
+    }
+
+    fn clone_task(&mut self, parent: DetPid, child: DetPid, shares_fs: bool) {
+        let group = match self.groups.get(&parent).copied() {
+            Some(group) if shares_fs => group,
+            parent_group => {
+                let changed = parent_group.is_some_and(|group| self.changed.contains(&group));
+                let group = self.new_group(changed);
+                if shares_fs {
+                    // A creator Detcore had not seen created shares the new
+                    // group from now on.
+                    self.groups.insert(parent, group);
+                }
+                group
+            }
+        };
+        self.groups.insert(child, group);
+    }
+
+    fn mark_changed(&mut self, task: DetPid) {
+        let group = match self.groups.get(&task).copied() {
+            Some(group) => group,
+            None => {
+                let group = self.new_group(false);
+                self.groups.insert(task, group);
+                group
+            }
+        };
+        self.changed.insert(group);
+    }
+
+    fn changed(&self, task: DetPid) -> bool {
+        self.groups
+            .get(&task)
+            .is_some_and(|group| self.changed.contains(group))
+    }
+
+    fn transfer(&mut self, former: DetPid, current: DetPid) {
+        if let Some(group) = self.groups.remove(&former) {
+            self.groups.insert(current, group);
+        }
+    }
+
+    fn forget(&mut self, task: DetPid) {
+        if let Some(group) = self.groups.remove(&task)
+            && !self.groups.values().any(|other| *other == group)
+        {
+            self.changed.remove(&group);
+        }
+    }
 }
 
 /// A process's `/proc/<pid>/auxv` ([`ProcessAuxvTable::current`]).
@@ -1338,12 +1424,46 @@ impl ProcessAuxvTable {
         };
     }
 
+    /// A new task `child` of `parent`: it shares `parent`'s filesystem group
+    /// (its root) with `CLONE_FS`, and starts a group of its own with a copy
+    /// of `parent`'s root without it, as Linux's `copy_fs` does.
+    pub(crate) fn clone_root(&mut self, parent: DetPid, child: DetPid, shares_fs: bool) {
+        self.roots.clone_task(parent, child, shares_fs);
+    }
+
+    /// `task` changed its root (a successful `chroot`): so did every task in
+    /// its filesystem group.
+    pub(crate) fn mark_changed_root(&mut self, task: DetPid) {
+        self.roots.mark_changed(task);
+    }
+
+    /// Whether `task`'s root has changed.
+    pub(crate) fn root_changed(&self, task: DetPid) -> bool {
+        self.roots.changed(task)
+    }
+
+    /// A successful exec by the non-leader thread `former` gave it its
+    /// process's number `current` (Linux's `de_thread`); its filesystem group
+    /// goes with it. An exec does not detach a shared filesystem group:
+    /// Linux's `check_unsafe_exec` only marks such an exec unsafe for set-id
+    /// programs, and `begin_new_exec` unshares the descriptor table, not
+    /// `fs_struct`.
+    pub(crate) fn transfer_root(&mut self, former: DetPid, current: DetPid) {
+        self.roots.transfer(former, current);
+    }
+
     /// `process` is gone, or its new image has no vector Detcore recorded
     /// (whatever it held before the exec, its own earlier image's or its
     /// creator's, is stale), so its file is the kernel's. Descriptors already
     /// open keep their snapshots.
     pub(crate) fn forget(&mut self, process: DetPid) {
         self.processes.remove(&process);
+    }
+
+    /// `process` is gone: none of its facts stay.
+    pub(crate) fn forget_process(&mut self, process: DetPid) {
+        self.processes.remove(&process);
+        self.roots.forget(process);
     }
 
     /// How many processes have a current vector.
@@ -1403,7 +1523,7 @@ impl ProcessExitCleanup {
             .remove(&process);
         self.post_exec_fd_blocking.lock().unwrap().remove(&process);
         self.exec_images.lock().unwrap().remove(&process);
-        self.process_auxv.lock().unwrap().forget(process);
+        self.process_auxv.lock().unwrap().forget_process(process);
         if consume_unreported {
             let consumed = sched.consume_unreported_exit(process);
             debug_assert_eq!(consumed, loss.is_some());
@@ -2141,7 +2261,7 @@ impl GlobalTool for GlobalState {
             self.process_auxv
                 .lock()
                 .unwrap()
-                .forget(DetPid::from_raw(pid));
+                .forget_process(DetPid::from_raw(pid));
             if released {
                 trace!("[detcore, dpid {}] backend published the child exit", pid);
             }
@@ -3806,6 +3926,19 @@ impl GlobalState {
                     .unwrap_or(process);
                 R::ProcessAuxv(self.process_auxv.lock().unwrap().current(process))
             }
+            GlobalRequest::MarkChangedRoot => {
+                // The sending task's own filesystem group: a thread created
+                // without CLONE_FS has its own root.
+                let _sched = self.lock_rpc_scheduler(false).await;
+                self.process_auxv.lock().unwrap().mark_changed_root(dtid);
+                R::MarkChangedRoot(())
+            }
+            GlobalRequest::RootChanged(task) => {
+                // The task the path names: a process's number names its
+                // leader thread, whose root Linux's `/proc/<pid>` shows.
+                let _sched = self.lock_rpc_scheduler(false).await;
+                R::RootChanged(self.process_auxv.lock().unwrap().root_changed(task))
+            }
             GlobalRequest::AuxvFromKernel(why) => {
                 let sched = self.lock_rpc_scheduler(false).await;
                 let process = sched.registered_process(dtid).unwrap_or(dtid);
@@ -4366,6 +4499,13 @@ impl GlobalState {
                         sched.note_member_of_ended_namespace(child_dettid);
                     }
                 }
+                // A new task's root: its creator's filesystem group with
+                // CLONE_FS, a copy of it without.
+                self.process_auxv.lock().unwrap().clone_root(
+                    parent_dettid,
+                    child_dettid,
+                    flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_FS)),
+                );
                 if is_group_leader && flags.is_some() {
                     // A new process runs its creator's image until it execs.
                     let mut images = self.exec_images.lock().unwrap();
@@ -6013,6 +6153,12 @@ pub enum GlobalRequest {
     /// Current image's native ownership facts, authenticated by the RPC MmId.
     /// Answered without granting another task or advancing logical time.
     PublishRuntimePrivateMemory(reverie::RuntimePrivateMemory),
+    /// The sender's process changed its root with `chroot`
+    /// (`ProcessAuxvTable::mark_changed_root`). Appended last.
+    MarkChangedRoot,
+    /// Whether the process a number names has changed its root
+    /// (`ProcessAuxvTable::root_changed`). Appended last.
+    RootChanged(DetPid),
 }
 
 /// Responses from the global object
@@ -6219,6 +6365,10 @@ pub enum GlobalResponse {
     CheckBrkMappings(Option<bool>),
     /// Current image ownership publication was accepted. Appended last.
     PublishRuntimePrivateMemory(bool),
+    /// Appended last.
+    MarkChangedRoot(()),
+    /// Whether the root changed. Appended last.
+    RootChanged(bool),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -8729,6 +8879,35 @@ where
     }
 }
 
+/// Record that the sender's process changed its root with `chroot`
+/// (`ProcessAuxvTable::mark_changed_root`).
+pub(crate) async fn mark_changed_root<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::MarkChangedRoot)
+        .await
+        .1;
+    assert_eq!(response, GlobalResponse::MarkChangedRoot(()));
+}
+
+/// Whether the process `task` names has changed its root
+/// (`ProcessAuxvTable::root_changed`).
+pub(crate) async fn root_changed<G, T>(guest: &mut G, task: DetPid) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::RootChanged(task))
+        .await
+        .1
+    {
+        GlobalResponse::RootChanged(changed) => changed,
+        _ => unreachable!(),
+    }
+}
+
 /// Report that the sender's process's new image's `/proc/<pid>/auxv` is left
 /// to the kernel beneath for `why`, and learn whether it is the run's first
 /// for that reason, which the caller warns of: the guest's tool prints where
@@ -9141,6 +9320,68 @@ mod tests {
     /// A process reads its current image's vector; a forked child its
     /// creator's until it execs; an exec replaces it; a forgotten process
     /// (gone, or an exec with no recorded vector) has none.
+    #[test]
+    fn a_changed_root_follows_fork_and_goes_at_exit() {
+        use super::ProcessAuxvTable;
+        use crate::types::DetPid;
+        let (parent, child, other) = (
+            DetPid::from_raw(3),
+            DetPid::from_raw(4),
+            DetPid::from_raw(5),
+        );
+        let mut table = ProcessAuxvTable::default();
+        table.clone_root(DetPid::from_raw(1), parent, false);
+        assert!(!table.root_changed(parent));
+        table.mark_changed_root(parent);
+        assert!(table.root_changed(parent));
+        // A new task without CLONE_FS starts with a copy of its creator's
+        // root.
+        table.clone_root(parent, child, false);
+        assert!(table.root_changed(child));
+        table.clone_root(other, child, false);
+        assert!(!table.root_changed(child), "a reused number starts afresh");
+        // An exec keeps the root, so only an exit forgets it.
+        table.forget(parent);
+        assert!(table.root_changed(parent));
+        table.forget_process(parent);
+        assert!(!table.root_changed(parent));
+    }
+
+    /// Tasks created with CLONE_FS share one root, as Linux's `fs_struct`:
+    /// a chroot by the child changes its creator's root too, a task created
+    /// without CLONE_FS keeps its own, and a non-leader thread's exec takes
+    /// its group to the process's number.
+    #[test]
+    fn a_root_is_shared_by_a_filesystem_group() {
+        use super::ProcessAuxvTable;
+        use crate::types::DetPid;
+        let pid = DetPid::from_raw;
+        let mut table = ProcessAuxvTable::default();
+        table.clone_root(pid(1), pid(3), false);
+        // A CLONE_FS|SIGCHLD child, and an ordinary fork as an observer.
+        table.clone_root(pid(3), pid(4), true);
+        table.clone_root(pid(3), pid(5), false);
+        table.mark_changed_root(pid(4));
+        assert!(
+            table.root_changed(pid(3)),
+            "the child's chroot is its creator's"
+        );
+        assert!(
+            !table.root_changed(pid(5)),
+            "a copied root stays where it was"
+        );
+        // A thread created without CLONE_FS has a root of its own.
+        table.clone_root(pid(5), pid(6), false);
+        table.mark_changed_root(pid(6));
+        assert!(!table.root_changed(pid(5)));
+        // Thread 6's exec gives it process 5's number, and its root.
+        table.transfer_root(pid(6), pid(5));
+        assert!(table.root_changed(pid(5)));
+        // The group outlives a member that exits.
+        table.forget_process(pid(4));
+        assert!(table.root_changed(pid(3)));
+    }
+
     #[test]
     fn process_auxv_follows_exec_and_fork() {
         use super::ProcessAuxv;

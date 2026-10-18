@@ -195,6 +195,7 @@ static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCFS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCESS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCESS_AUXV_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static RENDERED_MOUNT_TABLE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DIRECTORY_OPENAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LISTINGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1490,6 +1491,31 @@ fn rendered_process_auxv_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "rendered-process-auxv guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn rendered_mount_table_guest() -> &'static Path {
+    RENDERED_MOUNT_TABLE_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("rendered-mount-table");
+        fs::create_dir_all(&build_root).expect("failed to create rendered-mount-table directory");
+        let guest = build_root.join("rendered_mount_table");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/rendered_mount_table.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile rendered-mount-table guest");
+        assert!(
+            output.status.success(),
+            "rendered-mount-table guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -4756,6 +4782,35 @@ const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
          instead (package K, https://github.com/rrnewton/hermit/issues/4213)",
     ),
     (
+        "detcore_renders_the_mount_table_on_every_backend",
+        "sabre, liteinst, in-guest-trap",
+        "every device in mountinfo is numbered one lower than on ptrace, KVM and DBT \
+         (measured 2026-10-17 on all three: the rows, mount IDs and every other byte match, \
+         and each run reaches bitwise parity). Detcore's shared device pool numbers devices \
+         in the order it first sees them, and here it does not see the dynamic loader's \
+         fstat of /etc/ld.so.cache, which ptrace, KVM and DBT see before main (traced \
+         2026-10-18 on LiteInst). A campaign item of package K \
+         (https://github.com/rrnewton/hermit/issues/4213); a dedicated issue is drafted \
+         and will be filed when GitHub access returns",
+    ),
+    (
+        "detcore_follows_the_target_processs_root_for_its_mount_table",
+        "kvm",
+        "chroot is ENOSYS on KVM (measured 2026-10-18), so no KVM guest changes its root, \
+         and new syscall support in reverie-kvm is stopped by the owner's 2026-10-15 rule \
+         that backends only intercept",
+    ),
+    (
+        "detcore_follows_the_target_processs_root_for_its_mount_table",
+        "liteinst, in-guest-trap",
+        "the in-guest Tool of a process that changed its root loses its RPC channel: the \
+         chrooted child ends with \"reverie-liteinst tool error: rpc i/o error: NotFound\" \
+         and exit status 125 (measured 2026-10-18 on both). Reverie's in-guest runtime \
+         reconnects a forked child by its socket's path on the child's first RPC \
+         (reverie-inguest guest/rpc.rs), which the chroot has made unreachable; older than \
+         this test. A Reverie issue is drafted and will be filed when GitHub access returns",
+    ),
+    (
         "detcore_renders_process_cgroup_on_every_backend",
         "sabre",
         "the guest's second thread ends in SIGSEGV at its exit; a program that only \
@@ -7134,6 +7189,330 @@ fn detcore_renders_process_auxv_on_every_backend() {
         );
         eprintln!("{test}: {backend}: NOT YET: the file is the kernel's, and the run warns so");
     }
+}
+
+/// Detcore renders every process's `mountinfo` and `mounts`, `/proc/mounts`
+/// too, from the container mount table hermit-cli builds once before the
+/// guest starts (package K slice K3a,
+/// https://github.com/rrnewton/hermit/issues/4213): the files read the same
+/// bytes through every spelling and on every backend, `mounts` has
+/// `mountinfo`'s rows, both have size 0, a `/tmp` file's fdinfo `mnt_id` and
+/// `STATX_MNT_ID` name the row of the mount holding `/tmp`, the program's own
+/// file names the nearest shown mount holding it (on e9patch, where a
+/// backend's own overlay covers it, the same row as on ptrace), and a zombie's
+/// file cannot be opened, as on Linux, which the guest checks natively first. Each
+/// backend reaches bitwise parity and prints the same bytes, the two files
+/// included. A backend not available here is named as not compared, and one
+/// `PROCFS_NOT_YET` lists is named with its issue.
+#[test]
+fn detcore_renders_the_mount_table_on_every_backend() {
+    let test = "detcore_renders_the_mount_table_on_every_backend";
+    let guest = rendered_mount_table_guest();
+    let native = Command::new(guest)
+        .output()
+        .expect("run rendered-mount-table natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut outputs = Vec::new();
+    for backend in procfs_backends(test) {
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let mut args = vec!["--backend", backend, "run", "--strict"];
+        if backend == "liteinst" || backend == "in-guest-trap" {
+            args.push("--max-timeslice=disabled");
+        }
+        args.extend([
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            "--hermit",
+        ]);
+        // KVM's own /proc still answers what Detcore does not resolve
+        // (https://github.com/rrnewton/hermit/issues/4282), and refuses statx
+        // through a symbolic link to a descriptor link (ELOOP), so the guest
+        // skips that one spelling there, says so on stderr, and prints no
+        // line for it. Removed by package K10 with --kvm-local-procfs.
+        if backend == "kvm" {
+            args.push("--kvm-local-procfs");
+        }
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                .expect("parse the verification report");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+        let compared = &verdict["compared_log_messages"];
+        assert!(
+            compared["left"].as_u64().is_some_and(|count| count > 0)
+                && compared["left"] == compared["right"],
+            "{backend} compared no INFO messages: {verdict}"
+        );
+        let skip_notice = "rendered_mount_table: skipped: statx through a symbolic link to a \
+                           descriptor link (--kvm-local-procfs)";
+        assert_eq!(
+            stderr(&output).contains(skip_notice),
+            backend == "kvm",
+            "{backend}: the skipped spelling must be reported exactly where it is skipped"
+        );
+        outputs.push((backend, stdout(&output)));
+    }
+    let link_line = "statx: and through a symbolic link to its descriptor link\n";
+    let (first_backend, first) = &outputs[0];
+    for line in [
+        "mountinfo and mounts: every spelling reads the same bytes; mounts has mountinfo's \
+         rows, in order, with show_vfsmnt's options\n",
+        "size: 0 for both files, and SEEK_END is EINVAL\n",
+        "fdinfo: a /tmp file's mnt_id and STATX_MNT_ID (asked for or not) name the row of the \
+         nearest mount holding it\n",
+        "program: its mnt_id and STATX_MNT_ID name the nearest row holding it, at ",
+        "statx: a rendered file's STATX_MNT_ID is its fdinfo mnt_id by its path and its \
+         descriptor\n",
+        link_line,
+        "link: /proc/mounts with O_NOFOLLOW is ELOOP\n",
+        "exit: a zombie's mountinfo is EINVAL, a reaped process's ENOENT\n",
+    ] {
+        assert!(
+            first.contains(line),
+            "{first_backend} lacks {line:?}: {first}"
+        );
+    }
+    // The container's own mounts, as the guest names them: Hermit's /tmp and
+    // /etc/group, and /proc.
+    for row in [" /tmp ", " /etc/group ", " /proc "] {
+        assert!(
+            first.contains(row),
+            "{first_backend} shows no{row}row: {first}"
+        );
+    }
+    for (backend, output) in &outputs[1..] {
+        if *backend == "kvm" {
+            // The one skipped spelling's line is absent; every other byte is
+            // the same.
+            assert!(
+                !output.contains(link_line),
+                "kvm claims the skipped spelling"
+            );
+            assert_eq!(
+                *output,
+                first.replacen(link_line, "", 1),
+                "kvm differs from {first_backend} beyond the skipped spelling"
+            );
+        } else {
+            assert_eq!(output, first, "{backend} differs from {first_backend}");
+        }
+    }
+    eprintln!(
+        "{test} compared {:?}",
+        outputs
+            .iter()
+            .map(|(backend, _)| *backend)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A process's `mountinfo` follows its own root (K3a of
+/// https://github.com/rrnewton/hermit/issues/4213): descriptors opened before
+/// a `chroot` (by the file's path, which Detcore renders, and through a `..`
+/// spelling, which the kernel opens) keep the view they were opened with, and
+/// a chrooted child's `mountinfo`, read by its parent, is the child's own view
+/// (the kernel's: the mounts below its new root, none here), as on Linux.
+/// A CLONE_FS child's chroot moves its creator's root, which a third process
+/// reading the creator's file sees (Detcore follows filesystem groups, not
+/// processes), and a CLONE_NEWPID child reading `self/mountinfo` through a
+/// kept `/proc` descriptor gets the kernel's view, never the launch table
+/// (Detcore cannot name that task). The guest checks all of it natively
+/// first, as root in a user namespace. Each backend prints the same lines,
+/// at bitwise parity where its comparison can cover a chroot, and the same
+/// run is recorded and replayed on ptrace.
+#[test]
+fn detcore_follows_the_target_processs_root_for_its_mount_table() {
+    let test = "detcore_follows_the_target_processs_root_for_its_mount_table";
+    let guest = rendered_mount_table_guest();
+    let native = Command::new("unshare")
+        .args(["--user", "--map-root-user"])
+        .arg(guest)
+        .arg("--chroot")
+        .output()
+        .expect("run rendered-mount-table --chroot natively");
+    let expected = "chroot: descriptors opened before a chroot keep their view; a chrooted \
+                    child's mountinfo, read by its parent, is its own (0 rows)\n\
+                    chroot: a CLONE_FS child's chroot moves its creator's root, as a third \
+                    process reading the creator's mountinfo sees (0 rows)\n";
+    assert!(native.status.success(), "native: {native:?}");
+    assert_eq!(String::from_utf8_lossy(&native.stdout), expected);
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for backend in procfs_backends(test) {
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let mut args = vec!["--backend", backend, "run", "--strict"];
+        if backend == "liteinst" || backend == "in-guest-trap" {
+            args.push("--max-timeslice=disabled");
+        }
+        // DBT's strict comparison cannot yet cover a chroot
+        // (https://github.com/rrnewton/hermit/issues/4233), so DBT runs it
+        // once, unverified, and must still print the native line.
+        let verified = backend != "dbt";
+        if verified {
+            args.extend(["--verify", "--verify-strict", "--verify-json", &report_arg]);
+        }
+        args.extend([
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            "--chroot",
+            "--hermit",
+        ]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        if verified {
+            let verdict: serde_json::Value =
+                serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                    .expect("parse the verification report");
+            assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+        }
+        assert_eq!(stdout(&output), expected, "{backend}");
+    }
+    // Under record and replay on ptrace: a guest that chroots and reads its
+    // mount files, rendered and kernel-opened, replays bitwise as recorded.
+    // The recorder does not subscribe chroot, so Detcore never learns of the
+    // guest's chroot there and the mount files read the table: a named
+    // residual. So the guest reports what it read (--report) rather than
+    // requiring Linux's answer, and the comparison is record against replay.
+    let args = [
+        "record",
+        "start",
+        "--verify",
+        "--verify-strict",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        "--chroot",
+        "--hermit",
+        "--report",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let reported = stdout(&output);
+    assert_eq!(
+        reported
+            .lines()
+            .filter(|line| line.starts_with("chroot report: "))
+            .count(),
+        2,
+        "record start --verify: {reported}"
+    );
+    let log = stderr(&output);
+    assert!(
+        log.contains("Success: replay matched recording."),
+        "the replay must match the recording:\n{log}"
+    );
+    // A chrooted CLONE_NEWPID child, whose numbers Detcore does not map,
+    // reads self/mountinfo through a kept /proc descriptor: the kernel's view
+    // (its own, none), never the launch table. Natively first; then on
+    // ptrace, unverified: a chrooted task's open of a procfs file has no
+    // procfs mount below its root to name the file's inode by, which Detcore
+    // records as a determinism loss that --verify-strict refuses.
+    let nested_expected = "nested pid: a chrooted CLONE_NEWPID child reading self/mountinfo \
+                           through a kept /proc descriptor sees its own view (0 rows)\n";
+    let native = Command::new("unshare")
+        .args(["--user", "--map-root-user"])
+        .arg(guest)
+        .arg("--nested-pid")
+        .output()
+        .expect("run rendered-mount-table --nested-pid natively");
+    assert!(native.status.success(), "native: {native:?}");
+    assert_eq!(String::from_utf8_lossy(&native.stdout), nested_expected);
+    let args = [
+        "--backend",
+        "ptrace",
+        "run",
+        "--strict",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        "--nested-pid",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), nested_expected, "ptrace --nested-pid");
+}
+
+/// A host mount that exists when Hermit starts, outside the base set and
+/// holding none of Hermit's mounts, is not in the guest's mount table: the
+/// guest reads the same `mountinfo` and `mounts` bytes with it and without it
+/// (https://github.com/rrnewton/hermit/issues/4213). Before, the container's
+/// copy of the host's table showed it, and the row renumbered every row after
+/// it. Each run is Hermit in a user and mount namespace of its own, where the
+/// second first mounts a tmpfs below the test's directory.
+#[test]
+fn the_guest_mount_table_ignores_a_host_mount_made_before_the_run() {
+    let _guard = hermit_run_guard();
+    let guest = rendered_mount_table_guest();
+    let build_root = process_build_root("mount-table-host-mount");
+    let extra = build_root.join("host-only-mount");
+    fs::create_dir_all(&extra).expect("failed to create the host-only mount point");
+    let script = r#"
+        extra=$1; mount_first=$2; shift 2
+        if [ "$mount_first" = yes ]; then
+            mount -t tmpfs none "$extra" || exit 3
+            grep -q " $extra " /proc/self/mountinfo || exit 4
+        fi
+        exec "$@"
+    "#;
+    let run = |mount_first: &str| {
+        let mut command = Command::new("unshare");
+        command
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "sh",
+                "-c",
+                script,
+                "sh",
+            ])
+            .arg(&extra)
+            .arg(mount_first)
+            .args(["timeout", "--kill-after", "5s", "120s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "run",
+                "--strict",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--base-env=minimal",
+                "--",
+            ])
+            .arg(guest)
+            .arg("--hermit");
+        let output = hermit_test::hermit_output(
+            &format!("hermit under unshare, host mount first: {mount_first}"),
+            &mut command,
+        );
+        assert!(
+            output.status.success(),
+            "mount first: {mount_first}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("the guest prints UTF-8")
+    };
+    let quiet = run("no");
+    let churned = run("yes");
+    assert_eq!(
+        churned, quiet,
+        "a host mount changed the guest's mount table"
+    );
+    let extra = extra.to_str().expect("the mount point is UTF-8");
+    assert!(
+        !churned.contains(extra),
+        "the guest sees the host mount: {churned}"
+    );
 }
 
 /// DBT launches through the same container as ptrace

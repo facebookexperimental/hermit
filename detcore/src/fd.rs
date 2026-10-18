@@ -1279,6 +1279,24 @@ impl DetFd {
         })
     }
 
+    /// The view of the mounts this kernel-opened procfs file reads, as its
+    /// open pinned it (`ProcfsFile::pinned_mount_view`).
+    pub(crate) fn procfs_pinned_mount_view(&self) -> Option<bool> {
+        self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::pinned_mount_view))
+    }
+
+    /// Which rendering of the container mount table this procfs file is, if
+    /// it is one (`ProcfsFile::mount_table_rendering`).
+    pub(crate) fn procfs_mount_table_rendering(
+        &self,
+    ) -> Option<crate::procfs::MountTableRendering> {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .and_then(ProcfsFile::mount_table_rendering)
+        })
+    }
+
     pub(crate) fn procfs_needs_mountinfo_identities(&self) -> bool {
         self.with_description(|d| {
             d.procfs

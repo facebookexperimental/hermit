@@ -892,7 +892,9 @@ mod tests {
             // record/replay test (+1,
             // https://github.com/rrnewton/hermit/issues/4213).
             // Runtime-private maps target/alias/lifetime coverage adds one.
-            assert_eq!(population, 578);
+            // And the staged-bind kernel-path and install-time bind tests
+            // (+2, K3a of https://github.com/rrnewton/hermit/issues/4213).
+            assert_eq!(population, 580);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

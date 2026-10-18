@@ -72,11 +72,13 @@ use reverie::process::Namespace;
 use reverie::process::Output;
 
 use super::container::IdentityGuard;
+use super::container::PlannedMount;
 use super::container::PolicyRefusal;
 use super::container::apply_affinity;
-use super::container::default_container;
+use super::container::container_proc_mount;
 use super::container::identity_hardening_mounts;
 use super::container::image_container;
+use super::container::namespace_container;
 use super::global_opts::GlobalOpts;
 use super::host_capabilities::cpu_identity;
 use super::host_capabilities::exact_branch_counter_verdict;
@@ -860,7 +862,7 @@ fn forwarded_records_in_log(path: &Path) -> Result<usize, Error> {
 }
 
 struct PreparedMounts {
-    mounts: Vec<Mount>,
+    mounts: Vec<PlannedMount>,
     identity_sources: IdentityGuard,
 }
 
@@ -1644,6 +1646,14 @@ pub struct RunOpts {
     /// Read-only overlay that exposes the rewritten ELF at its original guest path.
     #[clap(skip)]
     e9patch_overlay: Option<E9patchOverlay>,
+
+    /// Runtime-only: how many of the last `--mount`s and `--bind`s a backend
+    /// adapter added to the caller's (`with_dbt_mounts`). They are installed
+    /// as a backend's own mounts (`PlannedMount::backend`), which the guest's
+    /// container mount table leaves out by that identity, so the table is
+    /// the same on every backend.
+    #[clap(skip)]
+    backend_mounts: (usize, usize),
 
     /// Resolved guest executable path used after e9patch preprocessing.
     #[clap(skip)]
@@ -2759,9 +2769,12 @@ fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
     let overlay = mounts
         .mounts
         .iter()
-        .find(|mount| mount.get_source() == Some(Path::new("/cache/patched-echo")))
+        .find(|planned| planned.mount.get_source() == Some(Path::new("/cache/patched-echo")))
         .unwrap();
-    assert_eq!(overlay.get_target(), Path::new("/bin/echo"));
+    assert_eq!(overlay.mount.get_target(), Path::new("/bin/echo"));
+    // The overlay is e9patch's own mount, which the guest's mount table
+    // leaves out by this identity.
+    assert!(overlay.backend);
 }
 
 #[test]
@@ -8075,6 +8088,11 @@ impl RunOpts {
             "with_container",
             timeout,
             move |(_, identity, guards, native_plan)| {
+                // What the mount plan made, before anything else uses the
+                // container's mounts (a no-op for a plan with no record).
+                if let Some(identity) = identity.as_mut() {
+                    identity.record_plan()?;
+                }
                 #[cfg(feature = "native-exec")]
                 let native = native_plan
                     .take()
@@ -8169,7 +8187,7 @@ impl RunOpts {
             .hostname("hermetic-container.local")
             .domainname("local")
             .mount(Mount::proc().allow_readonly_fallback())
-            .mounts(mounts);
+            .mounts(mounts.into_iter().map(|planned| planned.mount));
 
         match &self.network {
             NetworkingMode::Local => {
@@ -8872,9 +8890,20 @@ impl RunOpts {
     #[cfg(feature = "dbt")]
     pub(super) fn with_dbt_mounts(&self, binds: &[Bind], mounts: Vec<Mount>) -> Self {
         let mut options = self.clone();
+        options.backend_mounts.0 += mounts.len();
+        options.backend_mounts.1 += binds.len();
         options.bind.extend_from_slice(binds);
         options.mount.extend(mounts);
         options
+    }
+
+    /// Whether the caller's `--mount`s install a fresh tmpfs at guest path
+    /// `target` (a mount of type tmpfs: setting that type changes nothing).
+    #[cfg(feature = "dbt")]
+    pub(super) fn mounts_tmpfs_at(&self, target: &Path) -> bool {
+        self.mount
+            .iter()
+            .any(|mount| mount.get_target() == target && mount.clone().fstype("tmpfs") == *mount)
     }
 
     /// Whether the guest runs in the common container, with its own PID
@@ -8884,14 +8913,27 @@ impl RunOpts {
         !self.no_namespace
     }
 
-    /// Returns the mounts to be used with the container.
+    /// Returns the mounts to be used with the container, in the order they are
+    /// installed: the identity-hardening mounts, the caller's `--mount`s and
+    /// `--bind`s (a backend adapter's own last, marked as a backend's), the
+    /// e9patch overlay (a backend's own), and the private `/tmp`.
     fn mounts(&self, tmpfs: &Path) -> Result<PreparedMounts, Error> {
         let (mut identity_mounts, identity_sources) = identity_hardening_mounts()?;
         let mut identity_sources = identity_sources;
         let mut explicit_tmp_mount = false;
         let mut user_mounts = Vec::with_capacity(self.mount.len() + self.bind.len());
+        let backend_mounts_from = self.mount.len().saturating_sub(self.backend_mounts.0);
+        let backend_binds_from = self.bind.len().saturating_sub(self.backend_mounts.1);
+        let planned = |mount: Mount, backend: bool| {
+            if backend {
+                PlannedMount::backend(mount)
+            } else {
+                PlannedMount::hermit(mount)
+            }
+        };
 
-        for mount in &self.mount {
+        for (index, mount) in self.mount.iter().enumerate() {
+            let backend = index >= backend_mounts_from;
             let user_target = mount.get_target();
             identity_sources.discard_mounts_shadowed_by(&mut identity_mounts, user_target);
             let staging = mount
@@ -8906,13 +8948,17 @@ impl RunOpts {
                 explicit_tmp_mount |= path.as_os_str().is_empty();
                 // If the target is in /tmp, change it so it goes to our
                 // temporary /tmp instead.
-                user_mounts.push(mount.clone().target(tmpfs.join(path)).touch_target());
+                user_mounts.push(planned(
+                    mount.clone().target(tmpfs.join(path)).touch_target(),
+                    backend,
+                ));
             } else {
-                user_mounts.push(mount.clone());
+                user_mounts.push(planned(mount.clone(), backend));
             }
         }
 
-        for bind in &self.bind {
+        for (index, bind) in self.bind.iter().enumerate() {
+            let backend = index >= backend_binds_from;
             let mount = Mount::from(bind.clone()).rshared();
 
             // Bind mounts currently only make sense for things in `/tmp` since
@@ -8926,7 +8972,7 @@ impl RunOpts {
                     .discard_mounts_shadowed_by(&mut identity_mounts, mount.get_target());
                 let target = tmpfs.join(relative_path);
                 identity_sources.add_user_bind(mount.get_target(), Some(&target));
-                user_mounts.push(mount.target(target).touch_target());
+                user_mounts.push(planned(mount.target(target).touch_target(), backend));
             } else {
                 warn_bind_outside_tmp(bind);
             }
@@ -8946,7 +8992,10 @@ impl RunOpts {
             }
         }
 
-        let mut mounts = identity_mounts;
+        let mut mounts = identity_mounts
+            .into_iter()
+            .map(PlannedMount::hermit)
+            .collect::<Vec<_>>();
         mounts.extend(user_mounts);
 
         if let Some(overlay) = &self.e9patch_overlay {
@@ -8955,20 +9004,19 @@ impl RunOpts {
             } else {
                 overlay.target.clone()
             };
-            mounts.push(
+            mounts.push(PlannedMount::backend(
                 Mount::bind(&overlay.source, &target)
                     .readonly()
                     .touch_target(),
-            );
-            mounts.push(
-                Mount::new(target)
-                    .flags(MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_RDONLY),
-            );
+            ));
+            mounts.push(PlannedMount::backend(Mount::new(target).flags(
+                MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_RDONLY,
+            )));
         }
         // Bind the /tmp/tmpXXXXXX tmpfs mount over /tmp to hide it. This way,
         // we still preserve the files or directories bind-mounted inside of it
         // while hiding the real /tmp.
-        mounts.push(Mount::bind(tmpfs, TMP_DIR).rshared());
+        mounts.push(PlannedMount::hermit(Mount::bind(tmpfs, TMP_DIR).rshared()));
 
         Ok(PreparedMounts {
             mounts,
@@ -8977,6 +9025,12 @@ impl RunOpts {
     }
 
     /// Returns a configured container to run a function in.
+    ///
+    /// The container's setup makes its namespaces, (for `--network=local`)
+    /// its sysfs, and then its mount plan, the container's `/proc` first,
+    /// which the container's init records for the guest's container mount
+    /// table (`IdentityGuard::record_plan`). A native exec domain's container
+    /// follows the plan with its declared-input mounts, and has no table.
     fn container(&self, tmpfs: &Path) -> Result<(Container, IdentityGuard), Error> {
         // PROTOTYPE: when an OCI image is requested, the guest runs against the
         // image's materialized rootfs (deterministic file inputs) rather than
@@ -8991,15 +9045,21 @@ impl RunOpts {
             return Ok((container, identity_sources));
         }
 
-        let mut container = default_container(self.pin_threads);
+        let mut container = namespace_container(self.pin_threads);
         self.network
             .configure(&mut container, self.analyze_networking);
 
         let PreparedMounts {
             mounts,
-            identity_sources,
+            mut identity_sources,
         } = self.mounts(tmpfs)?;
-        container.mounts(mounts);
+        let mut plan = vec![PlannedMount::hermit(container_proc_mount())];
+        plan.extend(mounts);
+        identity_sources.set_plan(&mut container, plan)?;
+        #[cfg(feature = "native-exec")]
+        if self.native_exec_capture.is_some() {
+            identity_sources.forget_plan();
+        }
 
         Ok((container, identity_sources))
     }
@@ -10309,12 +10369,20 @@ pub(super) fn complete_container_config(
         .map(IdentityGuard::mountinfo_root_rewrites)
         .transpose()?
         .unwrap_or_default();
+    // Each run of `--verify` is its own container, whose namespace numbers
+    // its mounts afresh, so each builds its own table, from the same plan and
+    // the same host facts.
+    let table = identity_sources
+        .map(IdentityGuard::container_mount_table)
+        .transpose()?
+        .flatten();
     config.mountinfo_mount_ids = identity_sources
-        .map(IdentityGuard::mountinfo_identity_order)
+        .map(|identity| identity.mountinfo_identity_order(table.as_ref()))
         .transpose()?
         .unwrap_or_default();
     config.mountinfo_mount_ids_captured = identity_sources.is_some();
     config.mount_id_assignment_order.clear();
+    config.container_mount_table = table;
     Ok(config)
 }
 

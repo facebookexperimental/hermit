@@ -28,6 +28,12 @@ use std::sync::atomic::Ordering;
 
 use anyhow::anyhow;
 use detcore_model::config::MountInfoRootRewrite;
+use detcore_model::container_mounts::BASE_MOUNTPOINTS;
+use detcore_model::container_mounts::ContainerMountTable;
+use detcore_model::container_mounts::Installation;
+use detcore_model::container_mounts::assign_installed_rows;
+use detcore_model::container_mounts::check_installed_rows;
+use detcore_model::container_mounts::owned_mounts;
 use hermit::Context;
 use hermit::Error;
 use hermit::FailureKind;
@@ -35,7 +41,7 @@ use hermit::HERMIT_DEADLINE_EXIT;
 use hermit::HERMIT_LOG_CAP_EXIT;
 use hermit::SerializableError;
 use hermit::SkidOvershootError;
-use hermit::capture_mountinfo_identity_order;
+use hermit::capture_mountinfo_identity_order_keeping;
 use nix::sched::CpuSet;
 use nix::sched::sched_getaffinity;
 use nix::sys::signal::SaFlags;
@@ -153,6 +159,179 @@ fn mount_rows() -> io::Result<Vec<MountRow>> {
                     io::ErrorKind::InvalidData,
                     "mountinfo has a malformed row",
                 )),
+            }
+        })
+        .collect()
+}
+
+/// This process's mount namespace, every row of it (host FUSE seed rows
+/// included).
+fn namespace_rows() -> Result<Vec<detcore_model::container_mounts::ContainerMount>, Error> {
+    let contents = fs::read("/proc/self/mountinfo")
+        .context("Failed to read the guest mount table for its container mount table")?;
+    detcore_model::container_mounts::parse_container_mounts(&contents)
+        .ok_or_else(|| anyhow!("the guest mount table has a malformed row"))
+}
+
+/// Whether `row`, the row the walk took for the plan's first mount, is the
+/// container's own `/proc`: a procfs, and, where `/proc` reaches it, the
+/// procfs of this process's PID namespace (its `self` names this process's
+/// own PID, which a copy of the host's `/proc` does not). Where a later mount
+/// covers `/proc` (a user's mount at `/` or `/proc`), no path reaches the row,
+/// and only its filesystem type is checked.
+fn is_this_namespaces_proc(row: &detcore_model::container_mounts::ContainerMount) -> bool {
+    if row.fstype.as_slice() != b"proc" {
+        return false;
+    }
+    let Ok(proc_dir) = open_path(Path::new("/proc")) else {
+        return true;
+    };
+    if mount_id_for_fd(proc_dir.as_raw_fd()).ok() != Some(row.raw_mount_id) {
+        return true;
+    }
+    // SAFETY: getpid has no preconditions and cannot fail.
+    let me = unsafe { libc::getpid() };
+    fs::read_link("/proc/self").is_ok_and(|link| link.as_os_str() == me.to_string().as_str())
+}
+
+/// Where the contents at a guest path come from, for [`InstallTimeTree`]:
+/// a host directory or file, or a filesystem the plan mounted fresh (tmpfs,
+/// procfs, an overlay), which holds no symbolic link a target could cross.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Backing {
+    Host(PathBuf),
+    Fresh,
+}
+
+/// The guest's directory tree as each mount of the plan finds it when the
+/// container's setup installs it: the host's tree (which the container's
+/// mount namespace starts as a copy of) with the plan's earlier mounts laid
+/// over it. It resolves a target the way the kernel's `mount(2)` does at that
+/// moment, following symbolic links component by component, so that the
+/// mountpoint the kernel lists for each installation is known before any
+/// later mount can change how the same name resolves (a later bind that
+/// replaces a directory holding a symbolic link the target crossed).
+#[derive(Debug, Default)]
+struct InstallTimeTree {
+    /// The plan's mounts so far: where each was mounted, and what it shows.
+    layers: Vec<(PathBuf, Backing)>,
+}
+
+impl InstallTimeTree {
+    /// The most symbolic links one resolution follows, as Linux's `MAXSYMLINKS`.
+    const MAX_LINKS: usize = 40;
+
+    /// Where the contents at the resolved guest path `path` come from: the
+    /// latest of the plan's mounts at `path` or above it, or the host.
+    fn backing_of(&self, path: &Path) -> Backing {
+        let layer = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (mountpoint, backing))| {
+                let rest = path.strip_prefix(mountpoint).ok()?;
+                Some((mountpoint.components().count(), index, rest, backing))
+            })
+            .max_by_key(|(depth, index, _, _)| (*depth, *index));
+        match layer {
+            None => Backing::Host(path.to_path_buf()),
+            Some((_, _, rest, Backing::Host(source))) => {
+                Backing::Host(if rest.as_os_str().is_empty() {
+                    source.clone()
+                } else {
+                    source.join(rest)
+                })
+            }
+            Some((_, _, _, Backing::Fresh)) => Backing::Fresh,
+        }
+    }
+
+    /// `path` resolved as the kernel resolves it now: absolute, with every
+    /// symbolic link it crosses followed (a final one too), and its missing
+    /// components kept as named (Reverie creates a missing target).
+    fn resolve(&self, path: &Path) -> PathBuf {
+        let mut resolved = PathBuf::from("/");
+        let mut pending: std::collections::VecDeque<std::ffi::OsString> = path
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => Some(name.to_os_string()),
+                std::path::Component::ParentDir => Some("..".into()),
+                _ => None,
+            })
+            .collect();
+        let mut links = 0;
+        while let Some(name) = pending.pop_front() {
+            if name == ".." {
+                resolved.pop();
+                continue;
+            }
+            let candidate = resolved.join(&name);
+            if let Backing::Host(host) = self.backing_of(&candidate)
+                && links < Self::MAX_LINKS
+                && fs::symlink_metadata(&host).is_ok_and(|meta| meta.file_type().is_symlink())
+                && let Ok(target) = fs::read_link(&host)
+            {
+                links += 1;
+                if target.is_absolute() {
+                    resolved = PathBuf::from("/");
+                }
+                let mut front: std::collections::VecDeque<std::ffi::OsString> = target
+                    .components()
+                    .filter_map(|component| match component {
+                        std::path::Component::Normal(name) => Some(name.to_os_string()),
+                        std::path::Component::ParentDir => Some("..".into()),
+                        _ => None,
+                    })
+                    .collect();
+                front.extend(pending);
+                pending = front;
+                continue;
+            }
+            resolved = candidate;
+        }
+        resolved
+    }
+
+    /// Install `mount` in the tree, and return what the kernel will list for
+    /// it: its mountpoint (none for a remount, which creates no mount) and,
+    /// for a recursive bind, the resolved source whose mounts it copies.
+    fn install(&mut self, mount: &Mount) -> (Option<PathBuf>, Option<PathBuf>) {
+        if mount.clone().flags(MountFlags::MS_REMOUNT) == *mount {
+            return (None, None);
+        }
+        let mountpoint = self.resolve(mount.get_target());
+        let (backing, source) = match mount.get_source().filter(|_| is_bind_mount(mount)) {
+            Some(source) => {
+                let source = self.resolve(source);
+                let recursive = mount.clone().flags(MountFlags::MS_REC) == *mount;
+                (self.backing_of(&source), recursive.then_some(source))
+            }
+            None => (Backing::Fresh, None),
+        };
+        self.layers.push((mountpoint.clone(), backing));
+        (Some(mountpoint), source)
+    }
+}
+
+/// What the kernel will list for each mount of `plan`, as the container's
+/// setup installs them in order over the host's current tree
+/// ([`InstallTimeTree`]), as installations with no rows yet.
+fn installations_of(plan: &[PlannedMount]) -> Vec<Installation> {
+    let mut tree = InstallTimeTree::default();
+    plan.iter()
+        .map(|planned| {
+            let (mountpoint, source) = tree.install(&planned.mount);
+            Installation {
+                ids: Vec::new(),
+                mountpoints: mountpoint
+                    .iter()
+                    .map(|path| mountinfo_escape_path(path))
+                    .collect(),
+                sources: source
+                    .iter()
+                    .map(|path| mountinfo_escape_path(path))
+                    .collect(),
+                backend: planned.backend,
             }
         })
         .collect()
@@ -396,6 +575,60 @@ pub(super) struct IdentityGuard {
     /// The host's mount table before setup, as (mountpoint, root, device):
     /// the guest's copies of these rows are not any user bind's.
     host_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+    /// The container's mount plan, which the container's setup installs, in
+    /// order, as the last of its mounts, and what each installation created,
+    /// recorded in the container's init before the guest starts
+    /// ([`Self::record_plan`]).
+    plan: MountPlan,
+}
+
+/// One mount of the container's mount plan.
+#[derive(Clone, Debug)]
+pub(super) struct PlannedMount {
+    /// The mount, at the target it is installed at (a mount below guest
+    /// `/tmp` is installed in Hermit's private tmp directory first).
+    pub(super) mount: Mount,
+    /// Whether it is a backend's own mount (DBT's statistics bind and test
+    /// workdir, e9patch's overlay of the rewritten program), which the guest's
+    /// mount table leaves out by this identity, not by its path.
+    pub(super) backend: bool,
+}
+
+impl PlannedMount {
+    /// One of the plan's own mounts.
+    pub(super) fn hermit(mount: Mount) -> Self {
+        Self {
+            mount,
+            backend: false,
+        }
+    }
+
+    /// A backend's own mount.
+    pub(super) fn backend(mount: Mount) -> Self {
+        Self {
+            mount,
+            backend: true,
+        }
+    }
+}
+
+/// Where the guest's container mount table learns which mounts are Hermit's.
+#[derive(Debug, Default)]
+enum MountPlan {
+    /// No table: the container's mounts were installed by its setup, without
+    /// a record of what each one made (a native exec domain's container, whose
+    /// declared-input mounts must follow the plan's in that setup).
+    #[default]
+    Unrecorded,
+    /// The plan, given to the container's setup to install; what the kernel
+    /// will list for each of its mounts, resolved over the host's tree before
+    /// the container starts ([`installations_of`]); and whether the rows each
+    /// installation created have been recorded in them
+    /// ([`IdentityGuard::record_plan`]).
+    Recorded(Vec<PlannedMount>, Vec<Installation>, bool),
+    /// An image root (`--image`): every mount the guest's root can see is one
+    /// the container's setup installed into the image, so all are Hermit's.
+    ImageRoot,
 }
 
 impl IdentityGuard {
@@ -410,7 +643,162 @@ impl IdentityGuard {
             user_mount_targets: Vec::new(),
             user_binds: Vec::new(),
             host_rows: Vec::new(),
+            plan: MountPlan::Unrecorded,
         }
+    }
+
+    /// Give `plan` to `container`'s setup, which installs it after every
+    /// mount the container already has, and keep it to record what each
+    /// mount makes ([`Self::record_plan`]). The plan's first mount must be
+    /// the container's own `/proc` ([`container_proc_mount`]), whose row
+    /// marks where the plan's rows begin. Mounts the container already has
+    /// come before it: `/` made private, and for `--network=local` Reverie's
+    /// fresh `/sys`, which rule 2 shows as a base mountpoint.
+    pub(super) fn set_plan(
+        &mut self,
+        container: &mut Container,
+        plan: Vec<PlannedMount>,
+    ) -> Result<(), Error> {
+        if plan.first().map(|planned| &planned.mount) != Some(&container_proc_mount()) {
+            anyhow::bail!("a container's mount plan must begin with its own /proc");
+        }
+        container.mounts(plan.iter().map(|planned| planned.mount.clone()));
+        let installations = installations_of(&plan);
+        self.plan = MountPlan::Recorded(plan, installations, false);
+        Ok(())
+    }
+
+    /// Append `mounts`, a backend's own, to the plan and to `container`'s
+    /// setup. There must be a plan, not yet recorded: a backend's mount
+    /// dropped silently would run the guest without it.
+    pub(super) fn add_backend_mounts(
+        &mut self,
+        container: &mut Container,
+        mounts: impl IntoIterator<Item = Mount>,
+    ) -> Result<(), Error> {
+        let MountPlan::Recorded(plan, installations, false) = &mut self.plan else {
+            anyhow::bail!("a backend's own mounts need the container's mount plan");
+        };
+        for mount in mounts {
+            container.mount(mount.clone());
+            plan.push(PlannedMount::backend(mount));
+        }
+        *installations = installations_of(plan);
+        Ok(())
+    }
+
+    /// The container's mounts were installed into an image root, every one
+    /// of them Hermit's.
+    pub(super) fn set_image_root(&mut self) {
+        self.plan = MountPlan::ImageRoot;
+    }
+
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4213):
+    // Review the provenance of the container mount table's rule 1: the mount
+    // IDs each installation of the plan created.
+    /// Record what each mount of the plan created, in the container's init,
+    /// after its setup installed the plan and before the guest starts or
+    /// anything else changes the namespace (the guest cannot mount). The
+    /// setup installs the plan with Reverie's own mount operation, one mount
+    /// after another, as its last mounts, and the kernel lists rows in
+    /// creation order. The premise: the setup makes `/` recursively private
+    /// (`namespace_container`) before the plan's first mount, the
+    /// container's `/proc`, so no host mount or unmount propagates into the
+    /// namespace after that, and no row can follow that `/proc` but the
+    /// plan's own. So the plan's rows are the end of the namespace's list,
+    /// each installation's together and in plan order:
+    /// `detcore_model::container_mounts::assign_installed_rows` walks them
+    /// back from the end, giving each to the installation that made it (a
+    /// recursive bind's copies included), until it reaches the plan's first
+    /// row, the container's `/proc`. A row is matched by the mountpoint its
+    /// installation's target resolved to when the setup installed it
+    /// ([`installations_of`], resolved before the container starts), never by
+    /// how the target resolves after later mounts. Then
+    /// `check_installed_rows` refuses the record unless every mount that
+    /// creates a row got one at its recorded target and the first row is
+    /// this namespace's own procfs ([`is_this_namespaces_proc`]): a walk that
+    /// ran past the plan into the host's rows (which hold a copy of the
+    /// host's `/proc` at the same path) is refused, not trusted. No process
+    /// is created for this, so no guest PID moves. Nothing for a plan with
+    /// no record.
+    pub(super) fn record_plan(&mut self) -> Result<(), Error> {
+        let MountPlan::Recorded(_, installations, recorded) = &mut self.plan else {
+            return Ok(());
+        };
+        if *recorded {
+            return Ok(());
+        }
+        let rows = namespace_rows()?;
+        if !assign_installed_rows(&rows, installations) {
+            anyhow::bail!(
+                "the container's mount table has no row for the plan's first mount, its /proc, \
+                 so the plan's rows cannot be told from the host's"
+            );
+        }
+        check_installed_rows(&rows, installations, is_this_namespaces_proc)
+            .map_err(|refusal| anyhow!("refusing the container's mount table: {refusal}"))?;
+        *recorded = true;
+        Ok(())
+    }
+
+    /// Forget the record of a plan whose container's setup is followed by
+    /// more mounts (a native exec domain's declared inputs), so that the
+    /// plan's rows are not the end of the namespace's list: no table.
+    #[cfg(feature = "native-exec")]
+    pub(super) fn forget_plan(&mut self) {
+        self.plan = MountPlan::Unrecorded;
+    }
+
+    /// The guest's container mount table
+    /// (`detcore_model::container_mounts::ContainerMountTable::select`), read
+    /// from this process's mount namespace, which must be the completed,
+    /// quiescent guest namespace (with the guest's root), after
+    /// [`Self::record_plan`]. `None` where the plan has no record
+    /// ([`MountPlan::Unrecorded`]).
+    ///
+    /// Rule 1's rows are those the installations recorded
+    /// (`detcore_model::container_mounts::owned_mounts`), a backend's own
+    /// excepted, and every row under an image root. Rule 2's are the top
+    /// mounts at the base mountpoints, proven by a descriptor held on each.
+    /// Host FUSE seed rows stay in the topology, for ancestry and for the
+    /// mount a file on one reports, and are only never shown
+    /// (`is_ephemeral_host_seed`), unless the plan installed one.
+    pub(super) fn container_mount_table(&self) -> Result<Option<ContainerMountTable>, Error> {
+        let rows = namespace_rows()?;
+        let (installed, backend) = match &self.plan {
+            MountPlan::Unrecorded => return Ok(None),
+            MountPlan::Recorded(_, _, false) => {
+                anyhow::bail!(
+                    "the container mount table was asked for before the plan was recorded"
+                )
+            }
+            MountPlan::Recorded(_, installations, true) => owned_mounts(&rows, installations),
+            MountPlan::ImageRoot => (
+                rows.iter().map(|row| row.raw_mount_id).collect(),
+                std::collections::BTreeSet::new(),
+            ),
+        };
+        let never = rows
+            .iter()
+            .filter(|row| row.is_ephemeral_host_seed() && !installed.contains(&row.raw_mount_id))
+            .map(|row| row.raw_mount_id)
+            .chain(backend)
+            .collect();
+        let reached = |path: &Path| {
+            open_path(path)
+                .ok()
+                .and_then(|file| mount_id_for_fd(file.as_raw_fd()).ok())
+        };
+        let base = BASE_MOUNTPOINTS
+            .iter()
+            .filter_map(|mountpoint| {
+                let path = Path::new(mountpoint);
+                Some((mountinfo_escape_path(path), reached(path)?))
+            })
+            .collect::<Vec<_>>();
+        Ok(Some(ContainerMountTable::select(
+            &rows, &installed, &base, &never,
+        )))
     }
 
     /// Include an automatically-created private `/tmp` in mountinfo provenance.
@@ -541,11 +929,31 @@ impl IdentityGuard {
         Ok(rewrites)
     }
 
+    /// What a recording takes from the completed, quiescent recording
+    /// namespace: the proven roots of Hermit's mounts
+    /// ([`Self::mountinfo_root_rewrites`]) and the guest's container mount
+    /// table ([`Self::container_mount_table`]).
+    pub(super) fn mount_provenance(&self) -> Result<hermit::MountProvenance, Error> {
+        Ok(hermit::MountProvenance {
+            root_rewrites: self.mountinfo_root_rewrites()?,
+            container_mount_table: self.container_mount_table()?,
+        })
+    }
+
     /// Capture the exact raw mount-ID order used by Detcore's snapshot-local
     /// canonicalizer. This runs in the completed, quiescent guest namespace.
-    pub(super) fn mountinfo_identity_order(&self) -> Result<Vec<u64>, Error> {
-        capture_mountinfo_identity_order()
-            .context("Failed to capture guest mountinfo identity order")
+    /// A row `table` shows stays in it whatever its name
+    /// (`hermit::capture_mountinfo_identity_order_keeping`).
+    pub(super) fn mountinfo_identity_order(
+        &self,
+        table: Option<&ContainerMountTable>,
+    ) -> Result<Vec<u64>, Error> {
+        capture_mountinfo_identity_order_keeping(
+            &table
+                .map(ContainerMountTable::shown_mount_ids)
+                .unwrap_or_default(),
+        )
+        .context("Failed to capture guest mountinfo identity order")
     }
 }
 
@@ -652,6 +1060,7 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
         None
     };
 
+    // The container's own `/proc` (`default_container`) and the mounts above.
     Ok((
         mounts,
         IdentityGuard {
@@ -661,6 +1070,7 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
             user_mount_targets: Vec::new(),
             user_binds: Vec::new(),
             host_rows: Vec::new(),
+            plan: MountPlan::Unrecorded,
         },
     ))
 }
@@ -688,6 +1098,15 @@ pub(super) fn apply_affinity(container: &mut Container, pin_threads: bool) {
 }
 
 pub fn default_container(pin_threads: bool) -> Container {
+    let mut container = namespace_container(pin_threads);
+    container.mount(container_proc_mount());
+    container
+}
+
+/// [`default_container`] without its `/proc`: the namespaces and the private
+/// `/`, for a container given a mount plan, `/proc` first, which its setup
+/// installs and its init records (`IdentityGuard::set_plan`).
+pub(super) fn namespace_container(pin_threads: bool) -> Container {
     let mut container = Container::new();
     container
         .unshare(Namespace::PID)
@@ -697,11 +1116,15 @@ pub fn default_container(pin_threads: bool) -> Container {
         // A mount namespace created inside a user namespace starts as a slave
         // of the host's, so host mounts and unmounts would keep changing the
         // guest's mount table during a run. Cut that propagation first.
-        .mount(Mount::new("/").rprivate())
-        .mount(Mount::proc().allow_readonly_fallback());
+        .mount(Mount::new("/").rprivate());
 
     apply_affinity(&mut container, pin_threads);
     container
+}
+
+/// The container's own `/proc`, a new procfs of its PID namespace.
+pub(super) fn container_proc_mount() -> Mount {
+    Mount::proc().allow_readonly_fallback()
 }
 
 /// PROTOTYPE: a container whose root filesystem is a materialized OCI image
@@ -816,6 +1239,7 @@ pub(super) fn image_container(
     if private_tmp {
         identity_sources.add_private_tmp(tmpfs)?;
     }
+    identity_sources.set_image_root();
     Ok((container, identity_sources))
 }
 
@@ -4702,6 +5126,56 @@ mod readonly_proc;
 mod tests {
     use super::*;
 
+    /// Each installation's mountpoint is the one its target resolved to when
+    /// the setup installed it, over the plan's earlier mounts: a bind at
+    /// opt/x crosses the symbolic link x -> foo in the first bind at opt, so
+    /// it is recorded at foo, and the later bind that replaces opt (whose x
+    /// links to bar) changes nothing recorded (the provenance finding of
+    /// round 2 of https://github.com/rrnewton/hermit/issues/4213, K3a). Only
+    /// a recursive bind records its source, and a remount records nothing.
+    #[test]
+    fn installations_record_their_install_time_mountpoints() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(scratch.path()).unwrap();
+        for dir in ["a", "c", "item", "foo", "bar", "opt"] {
+            fs::create_dir(root.join(dir)).unwrap();
+        }
+        std::os::unix::fs::symlink(root.join("foo"), root.join("a/x")).unwrap();
+        std::os::unix::fs::symlink(root.join("bar"), root.join("c/x")).unwrap();
+        let plan = [
+            PlannedMount::hermit(container_proc_mount()),
+            PlannedMount::hermit(Mount::bind(root.join("a"), root.join("opt")).recursive()),
+            PlannedMount::hermit(Mount::bind(root.join("item"), root.join("opt/x"))),
+            PlannedMount::hermit(Mount::bind(root.join("c"), root.join("opt"))),
+            PlannedMount::backend(
+                Mount::new(root.join("opt"))
+                    .flags(MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_RDONLY),
+            ),
+        ];
+        let installations = installations_of(&plan);
+        let escaped = |path: &Path| vec![mountinfo_escape_path(path)];
+        assert_eq!(installations[0].mountpoints, escaped(Path::new("/proc")));
+        assert_eq!(installations[1].mountpoints, escaped(&root.join("opt")));
+        assert_eq!(installations[1].sources, escaped(&root.join("a")));
+        assert_eq!(installations[2].mountpoints, escaped(&root.join("foo")));
+        assert!(
+            installations[2].sources.is_empty(),
+            "a plain bind copies nothing"
+        );
+        assert_eq!(installations[3].mountpoints, escaped(&root.join("opt")));
+        assert!(
+            installations[4].mountpoints.is_empty(),
+            "a remount makes no row"
+        );
+        assert!(installations[4].backend);
+        // After the replacement, the same target would resolve to bar.
+        let mut tree = InstallTimeTree::default();
+        for planned in &plan[..4] {
+            tree.install(&planned.mount);
+        }
+        assert_eq!(tree.resolve(&root.join("opt/x")), root.join("bar"));
+    }
+
     /// How long a signalled test child may take to exit before it counts as
     /// having ignored the signal. A child that honours it exits within
     /// microseconds; this only bounds the failing case.
@@ -5299,6 +5773,7 @@ mod tests {
             user_mount_targets: Vec::new(),
             user_binds: Vec::new(),
             host_rows: Vec::new(),
+            plan: MountPlan::Unrecorded,
         };
 
         let rewrites = guard.mountinfo_root_rewrites().unwrap();
@@ -5372,6 +5847,7 @@ mod tests {
             user_mount_targets: Vec::new(),
             user_binds: Vec::new(),
             host_rows: Vec::new(),
+            plan: MountPlan::Unrecorded,
         };
 
         let error = guard.mountinfo_root_rewrites().unwrap_err().to_string();
