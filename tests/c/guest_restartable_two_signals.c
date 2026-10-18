@@ -98,10 +98,11 @@ static unsigned long long sibling_saw_sigblk;
 static int sibling_read_sigblk;
 
 /* Natively the read returns at once. Under Hermit a prompt drain wake ends it
- * within one of the spinning thread's timeslices (about 20 million iterations
- * of a debug build); waiting for the read's backed-off poll turn took about
- * 1.3 billion. */
-#define SPIN_BOUND 300000000L
+ * within one of the spinning thread's timeslices: 26,619,596 iterations of a
+ * debug build, the same in every run, as the count is deterministic. Waiting
+ * for the read's backed-off poll turn took 1,299,952,943. The bound is about
+ * two and a half timeslices (Claude re-check of R2b-2 stage 2, N1). */
+#define SPIN_BOUND 66000000L
 static volatile pid_t worker_tid;
 
 static void handler(int signal)

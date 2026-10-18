@@ -875,11 +875,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                             && wait.needs_block()
                             && pending_could_stop_injection(&state)
                         {
-                            // As `install_turn_mask` does for `writev`: a fallback
-                            // injected restoration then holds a host-timed signal
-                            // that stops it (`absorb_restoration_stop`).
-                            wait.hold_until_return(host_timed_signals(guest).await);
-                            match wait.block_in_place(guest).await {
+                            let host_timed = host_timed_signals(guest).await;
+                            match wait.block_in_place(guest, host_timed).await {
                                 Ok(true) => {
                                     publish_wait_mask(guest, wait.effective_mask(), &mut published)
                                         .await
@@ -2416,11 +2413,8 @@ where
                         && wait.needs_block()
                         && pending_could_stop_injection(&state)
                     {
-                        // As `install_turn_mask` does for `writev`: a fallback
-                        // injected restoration then holds a host-timed signal
-                        // that stops it (`absorb_restoration_stop`).
-                        wait.hold_until_return(host_timed_signals(guest).await);
-                        match wait.block_in_place(guest).await {
+                        let host_timed = host_timed_signals(guest).await;
+                        match wait.block_in_place(guest, host_timed).await {
                             Ok(true) => {
                                 publish_wait_mask(guest, wait.effective_mask(), &mut published)
                                     .await
@@ -4235,17 +4229,29 @@ impl KernelSignalWait {
     /// memory is needed, here or in `restore` (the Claude review of the R2b-2
     /// design, M1).
     ///
+    /// `host_timed` is the turn's host-timed signals, held until the call
+    /// returns as `hold_until_return` holds them.
+    ///
     /// Returns whether the mask is now blocked. A refusal changes nothing
     /// (`MaskChangeRefused::Unsupported`, `RestorePending`), and neither does a
     /// failure that put the old mask back, so the wait goes on under the
     /// guest's own mask, as before this existed. A failure that leaves the mask
     /// unknown ends the run before the guest resumes
     /// ([`BlockedWaitSignalError::MaskNotRestored`]).
-    pub(crate) async fn block_in_place<T, G>(&mut self, guest: &mut G) -> Result<bool, Error>
+    pub(crate) async fn block_in_place<T, G>(
+        &mut self,
+        guest: &mut G,
+        host_timed: KernelSigset,
+    ) -> Result<bool, Error>
     where
         T: RecordOrReplay,
         G: Guest<Detcore<T>>,
     {
+        // As `install_turn_mask` does for `writev`: the signals a host-timed
+        // source can post (`host_timed`) are held until the call returns, so a
+        // fallback injected restoration holds one that stops it
+        // (`absorb_restoration_stop`) rather than counting it lost.
+        self.hold_until_return(host_timed);
         let guest_mask = read_wait_signal_state(self.pid, self.tid)?.blocked;
         match guest
             .set_blocked_signals(blocked_signal_mask() | guest_mask)
@@ -5451,7 +5457,7 @@ mod kernel_signal_wait_failures {
         guest.commit_fails = true;
         kernel.lock().unwrap().setter.extend([None, None]);
         let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
-        assert!(wait.block_in_place(&mut guest).await.unwrap());
+        assert!(wait.block_in_place(&mut guest, 0).await.unwrap());
         assert_eq!(wait.effective_mask(), Some(guest_mask()));
         assert_eq!(
             kernel.lock().unwrap().blocked,
@@ -5471,6 +5477,23 @@ mod kernel_signal_wait_failures {
         assert_eq!(wait.effective_mask(), None);
     }
 
+    /// The in-place block holds the turn's host-timed signals until the call
+    /// returns (`hold_until_return`), as `install_turn_mask` does for
+    /// `writev`, so a fallback injected restoration that one of them stops
+    /// holds it rather than counting it lost (Claude re-check of R2b-2 stage
+    /// 2, F2).
+    #[tokio::test]
+    async fn an_in_place_block_holds_the_host_timed_signals() {
+        let (mut guest, kernel) = WaitGuest::live(guest_mask());
+        let _proc = scripted_proc(&kernel);
+        kernel.lock().unwrap().setter.push_back(None);
+        let host_timed = kernel_sigset_bit(libc::SIGIO) | kernel_sigset_bit(libc::SIGHUP);
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
+        assert!(wait.block_in_place(&mut guest, host_timed).await.unwrap());
+        assert_eq!(wait.held_until_return & host_timed, host_timed);
+        assert_eq!(wait.host_timed & host_timed, host_timed);
+    }
+
     /// A refused in-place block changes nothing: the wait goes on under the
     /// guest's own mask, does not try again (`needs_block`), and has nothing
     /// to restore.
@@ -5487,7 +5510,7 @@ mod kernel_signal_wait_failures {
                 effective: 0,
             }));
         let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
-        assert!(!wait.block_in_place(&mut guest).await.unwrap());
+        assert!(!wait.block_in_place(&mut guest, 0).await.unwrap());
         assert!(!wait.needs_block());
         assert_eq!(wait.effective_mask(), None);
         wait.restore(&mut guest, None).await.unwrap();
@@ -5510,7 +5533,7 @@ mod kernel_signal_wait_failures {
             .setter
             .extend([None, Some(MaskChangeRefused::Unsupported)]);
         let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
-        assert!(wait.block_in_place(&mut guest).await.unwrap());
+        assert!(wait.block_in_place(&mut guest, 0).await.unwrap());
         wait.restore(&mut guest, None).await.unwrap();
         let kernel = kernel.lock().unwrap();
         assert_eq!(kernel.blocked, guest_mask());
@@ -5536,13 +5559,13 @@ mod kernel_signal_wait_failures {
         kernel.lock().unwrap().setter.push_back(unknown);
         let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
         assert_eq!(
-            diagnostic(wait.block_in_place(&mut guest).await),
+            diagnostic(wait.block_in_place(&mut guest, 0).await),
             not_restored
         );
 
         kernel.lock().unwrap().setter.extend([None, unknown]);
         let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
-        assert!(wait.block_in_place(&mut guest).await.unwrap());
+        assert!(wait.block_in_place(&mut guest, 0).await.unwrap());
         assert_eq!(
             diagnostic(wait.restore(&mut guest, None).await),
             not_restored
@@ -5561,7 +5584,7 @@ mod kernel_signal_wait_failures {
             .setter
             .extend([None, Some(MaskChangeRefused::Gone)]);
         let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
-        assert!(wait.block_in_place(&mut guest).await.unwrap());
+        assert!(wait.block_in_place(&mut guest, 0).await.unwrap());
         wait.restore(&mut guest, None).await.unwrap();
         assert!(kernel.lock().unwrap().requested.is_empty());
     }
