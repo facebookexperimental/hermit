@@ -259,17 +259,12 @@ pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm", "liteinst", "in-
 /// cases run guests under the same runtime with site patching off
 /// (`--backend=in-guest-trap`), and the three self-signal-death cases run
 /// guests under both in-guest backends. The two scalar SIGALRM tests also
-/// require this runtime capability. The two startup-guard regressions also
-/// start that runtime before observing constructor/main/atexit guards. The
-/// two retained-bootstrap mapping regressions also require the real runtime.
-/// Only `test.cli_on_host`
+/// require this runtime capability. Only `test.cli_on_host`
 /// excludes them, with one exact-name filterset (`-E 'not (test(=NAME) |
 /// ...)'`) rather than substring `--skip`s; the local `test.cli` keeps running
 /// every one in the pinned root, and a test below holds both sides to this
 /// list.
 pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
-    "initial_auxv_retention::in_guest_trap_keeps_the_constructor_replacement_of_retired_seed_storage",
-    "initial_auxv_retention::liteinst_keeps_the_constructor_replacement_of_retired_seed_storage",
     "liteinst_backend_stats_report_the_guests_own_dispatch_paths",
     "liteinst_in_guest_programs::in_guest_trap_dispatch_record_reports_no_patched_sites",
     "liteinst_in_guest_programs::in_guest_trap_keeps_site_patching_off_whatever_a_guest_library_does",
@@ -335,8 +330,6 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader",
     "liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result",
     "run_liteinst_finds_the_runtime_staged_as_an_installed_resource",
-    "startup_guards::in_guest_trap_startup_guards_derive_from_at_random_and_repeat",
-    "startup_guards::liteinst_startup_guards_derive_from_at_random_and_repeat",
 ];
 
 /// rr suite cases the GitHub-hosted portable profile excludes by exact name.

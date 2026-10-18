@@ -4350,40 +4350,39 @@ async fn dispatch_backend(
                 .is_some()
                 .then(|| in_guest_detlog_forward_policy().encode());
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
-            let initial_auxv = pending_initial_auxv(&config)?;
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
-            let guest = reverie_liteinst::LiteinstBackend::with_connection_admission(
-                exits.clone(),
-                async {
-                    if stats_request.is_enabled() {
-                        let (exit_status, global_state, source) =
-                            reverie_liteinst::LiteinstBackend::run_with_preload_data_and_stats::<
-                                Detcore,
-                            >(command, config, preload, tool_data)
-                            .await?;
-                        let dispatch_stats = backend_stats::report(backend, stats_request, &source);
-                        let process_reports = source.snapshot().process_reports();
-                        Ok::<_, reverie::Error>((
-                            exit_status,
-                            global_state,
-                            dispatch_stats,
-                            process_reports,
-                        ))
-                    } else {
-                        let (exit_status, global_state) =
-                            reverie_liteinst::LiteinstBackend::run_with_preload_data::<Detcore>(
-                                command, config, preload, tool_data,
-                            )
-                            .await?;
-                        Ok((exit_status, global_state, None, 0))
-                    }
-                },
-            );
             let (exit_status, mut global_state, dispatch_stats, process_reports) =
-                reverie_inguest::launcher::PreloadBackend::with_initial_auxv(initial_auxv, guest)
-                    .await
-                    .inspect_err(|error| exits.fail_launch(error))?;
+                reverie_liteinst::LiteinstBackend::with_connection_admission(
+                    exits.clone(),
+                    async {
+                        if stats_request.is_enabled() {
+                            let (exit_status, global_state, source) =
+                                reverie_liteinst::LiteinstBackend::run_with_preload_data_and_stats::<
+                                    Detcore,
+                                >(command, config, preload, tool_data)
+                                .await?;
+                            let dispatch_stats =
+                                backend_stats::report(backend, stats_request, &source);
+                            let process_reports = source.snapshot().process_reports();
+                            Ok::<_, reverie::Error>((
+                                exit_status,
+                                global_state,
+                                dispatch_stats,
+                                process_reports,
+                            ))
+                        } else {
+                            let (exit_status, global_state) =
+                                reverie_liteinst::LiteinstBackend::run_with_preload_data::<Detcore>(
+                                    command, config, preload, tool_data,
+                                )
+                                .await?;
+                            Ok((exit_status, global_state, None, 0))
+                        }
+                    },
+                )
+                .await
+                .inspect_err(|error| exits.fail_launch(error))?;
             let patched =
                 in_guest_trap_patching_evidence(backend, dispatch_stats.as_ref(), process_reports);
             let settled = settle_in_guest_exits(&exits, &global_state).await;
@@ -4606,59 +4605,6 @@ async fn run_with_output_backend_inner(
     }
 }
 
-#[cfg(feature = "liteinst")]
-fn pending_initial_auxv(
-    config: &DetConfig,
-) -> Result<reverie_inguest::initial_auxv::launch::PendingWrite, Error> {
-    // Dispatch already resolved the actual ELF through ExecRecord, including
-    // kernel-script interpreters. Preserve the original command and use that
-    // shared identity rather than resolving or parsing the program again.
-    let expected_image = config
-        .launch_image
-        .as_ref()
-        .and_then(|image| image.exe.clone())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "initial AT_RANDOM startup-image refusal: resolved launch image is unavailable",
-            )
-        })?;
-    let config = config.clone();
-    let mut prng = detcore::random::root_prng(config.rng_seed());
-    let bytes = detcore::random::draw_initial_auxv(&mut prng);
-    Ok(reverie_inguest::initial_auxv::launch::PendingWrite::new(
-        expected_image,
-        bytes,
-        move |completed| {
-            if completed.bytes() != bytes {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "the completed initial auxv bytes differ from the prepared draw",
-                ));
-            }
-            // Drawing alone is not a receipt. Only the launcher's completed
-            // physical write supplies the image identity used by this encoder.
-            detcore::random::encode_initial_state(
-                &config,
-                detcore::random::InitialImage {
-                    pid: completed.pid(),
-                    start_time_ticks: completed.start_time_ticks(),
-                    at_random: completed.target(),
-                },
-                &prng,
-                bytes,
-                &[],
-            )
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "cannot encode initial auxv state",
-                )
-            })
-        },
-    ))
-}
-
 async fn dispatch_output_backend(
     mut command: Command,
     mut config: DetConfig,
@@ -4722,12 +4668,10 @@ async fn dispatch_output_backend(
                 .is_some()
                 .then(|| in_guest_detlog_forward_policy().encode());
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
-            let initial_auxv = pending_initial_auxv(&config)?;
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
-            let guest = reverie_liteinst::LiteinstBackend::with_connection_admission(
-                exits.clone(),
-                async {
+            let (output, mut global_state, dispatch_stats, process_reports) =
+                reverie_liteinst::LiteinstBackend::with_connection_admission(exits.clone(), async {
                     if stats_request.is_enabled() {
                         let (output, global_state, source) =
                             reverie_liteinst::LiteinstBackend::run_with_output_and_preload_data_and_stats::<
@@ -4736,12 +4680,7 @@ async fn dispatch_output_backend(
                             .await?;
                         let dispatch_stats = backend_stats::report(backend, stats_request, &source);
                         let process_reports = source.snapshot().process_reports();
-                        Ok::<_, reverie::Error>((
-                            output,
-                            global_state,
-                            dispatch_stats,
-                            process_reports,
-                        ))
+                        Ok::<_, reverie::Error>((output, global_state, dispatch_stats, process_reports))
                     } else {
                         let (output, global_state) =
                             reverie_liteinst::LiteinstBackend::run_with_output_and_preload_data::<
@@ -4750,12 +4689,9 @@ async fn dispatch_output_backend(
                             .await?;
                         Ok((output, global_state, None, 0))
                     }
-                },
-            );
-            let (output, mut global_state, dispatch_stats, process_reports) =
-                reverie_inguest::launcher::PreloadBackend::with_initial_auxv(initial_auxv, guest)
-                    .await
-                    .inspect_err(|error| exits.fail_launch(error))?;
+                })
+                .await
+                .inspect_err(|error| exits.fail_launch(error))?;
             let patched =
                 in_guest_trap_patching_evidence(backend, dispatch_stats.as_ref(), process_reports);
             let settled = settle_in_guest_exits(&exits, &global_state).await;
@@ -5418,31 +5354,6 @@ mod tests {
     use super::*;
 
     static SKID_OVERSHOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[cfg(feature = "liteinst")]
-    #[test]
-    fn initial_auxv_refuses_an_unresolved_startup_image_before_preparing_a_write() {
-        for launch_image in [
-            None,
-            Some(detcore::LaunchImage {
-                exe: None,
-                launcher: None,
-            }),
-        ] {
-            let config = DetConfig {
-                launch_image,
-                ..DetConfig::default()
-            };
-            let error = match pending_initial_auxv(&config) {
-                Ok(_) => panic!("an unresolved startup image must not prepare an auxv write"),
-                Err(error) => error,
-            };
-            assert_eq!(
-                error.to_string(),
-                "initial AT_RANDOM startup-image refusal: resolved launch image is unavailable"
-            );
-        }
-    }
 
     /// A run that drew an input from the host leaves a recording directory
     /// holding only `manifest.json`; `record rm` and `record clean` remove it

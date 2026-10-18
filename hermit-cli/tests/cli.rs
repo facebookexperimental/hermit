@@ -79,9 +79,6 @@ mod verify_run;
 mod verify_inputs;
 
 #[cfg(feature = "liteinst")]
-#[path = "common/initial_auxv_retention.rs"]
-mod initial_auxv_retention;
-#[cfg(feature = "liteinst")]
 #[path = "common/startup_guards.rs"]
 mod startup_guards;
 

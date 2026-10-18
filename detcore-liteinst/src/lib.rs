@@ -44,56 +44,6 @@ use reverie_inguest::guest::support::describe_io_error;
 // TODO-HUMAN-REVIEW(PR-3635): Review the
 // in-guest Detcore constructor boundary.
 
-// Only the ordinary constructor can supply this redeemed input. Explicit
-// InitialImage/native successors and legacy environment launches pass None.
-unsafe fn install_ordinary_detcore(
-    socket: OsString,
-    initial_auxv: Option<reverie_inguest::initial_auxv::InitialInput>,
-) -> std::io::Result<()> {
-    let Some(initial) = initial_auxv else {
-        return unsafe { reverie_liteinst::install_tool::<detcore::Detcore>(socket) };
-    };
-    // SAFETY: the caller retains the ordinary constructor's owned stack,
-    // allocation scope and single-threaded, pre-seccomp installation window.
-    unsafe {
-        reverie_liteinst::install_tool_with_root_initializer::<detcore::Detcore>(
-            socket,
-            move |config, root_pid, state| {
-                use sha2::Digest as _;
-                let wire = reverie_rpc_transport::codec::encode(config).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "cannot encode the initial auxv configuration",
-                    )
-                })?;
-                let digest: [u8; 32] = sha2::Sha256::digest(&wire).into();
-                if digest != initial.config_digest || root_pid.as_raw() != initial.image.pid() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "initial auxv configuration or root identity differs",
-                    ));
-                }
-                state
-                    .apply_initial_random_state(
-                        &initial.state,
-                        config,
-                        detcore::random::InitialImage {
-                            pid: initial.image.pid(),
-                            start_time_ticks: initial.image.start_time_ticks(),
-                            at_random: initial.image.target(),
-                        },
-                    )
-                    .map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "cannot adopt the completed initial auxv state",
-                        )
-                    })
-            },
-        )
-    }
-}
-
 /// Private opt-in, set by Hermit, for forwarding the in-guest Tool's
 /// deterministic INFO records: the number and identity of an inherited socket
 /// (the sending end of a Unix `SOCK_SEQPACKET` pair) to send them on
@@ -198,27 +148,16 @@ unsafe extern "C" fn detcore_liteinst_initialize_body() {
                 .unwrap_or_else(|error| {
                     fail(&format!("the launch bootstrap is unreadable: {error}"))
                 });
-            // SAFETY: this ordinary constructor is still single-threaded and
-            // pre-seccomp. Redemption authenticates the actual parent endpoint,
-            // consumes it once under checked signal exclusion, restores the
-            // incoming mask, and never accesses the retired seed storage.
-            let initial_auxv = bootstrap.initial_auxv.map(|token| unsafe {
-                reverie_inguest::initial_auxv::take_completed(token)
-                    .unwrap_or_else(|error| fail(&describe_io_error(&error)))
-            });
             // SAFETY: as below.
             unsafe {
-                initialize_detcore_with_auxv(
-                    InitializationInputs {
-                        coordinator_socket: bootstrap.coordinator.into_os_string(),
-                        forward_request: launch.forward_request.map(OsString::from),
-                        forward_policy: launch.forward_policy.map(OsString::from),
-                        coordinator_fingerprint: launch.coordinator_fingerprint.map(OsString::from),
-                        #[cfg(feature = "exec-private-init")]
-                        initial_image: None,
-                    },
-                    initial_auxv,
-                );
+                initialize_detcore(InitializationInputs {
+                    coordinator_socket: bootstrap.coordinator.into_os_string(),
+                    forward_request: launch.forward_request.map(OsString::from),
+                    forward_policy: launch.forward_policy.map(OsString::from),
+                    coordinator_fingerprint: launch.coordinator_fingerprint.map(OsString::from),
+                    #[cfg(feature = "exec-private-init")]
+                    initial_image: None,
+                });
             }
             return;
         }
@@ -273,15 +212,6 @@ unsafe extern "C" fn detcore_liteinst_initialize_body() {
 // SAFETY: the caller must hold the private allocation/dispatch scope in the
 // single-threaded, pre-seccomp initialization window required by install_tool.
 unsafe fn initialize_detcore(inputs: InitializationInputs) {
-    // Legacy environment and explicit native-image entries keep their existing
-    // admission and lifecycle. They never synthesize an ordinary startup input.
-    unsafe { initialize_detcore_with_auxv(inputs, None) }
-}
-
-unsafe fn initialize_detcore_with_auxv(
-    inputs: InitializationInputs,
-    initial_auxv: Option<reverie_inguest::initial_auxv::InitialInput>,
-) {
     let InitializationInputs {
         coordinator_socket: socket,
         forward_request,
@@ -407,10 +337,6 @@ unsafe fn initialize_detcore_with_auxv(
     // exists and before the application can install a seccomp filter, which is
     // the window `install_tool` requires.
     #[cfg(feature = "exec-private-init")]
-    if initial_image.is_some() && initial_auxv.is_some() {
-        fail("ordinary initial auxv input cannot initialize a native image");
-    }
-    #[cfg(feature = "exec-private-init")]
     let initial_control = match initial_image {
         Some(exec_initial::InitialImageInputs::Initial { prepared }) => {
             Some(exec_initial::InstalledImage::Initial(
@@ -431,14 +357,16 @@ unsafe fn initialize_detcore_with_auxv(
             ))
         }
         None => {
-            if let Err(error) = unsafe { install_ordinary_detcore(socket, initial_auxv) } {
+            if let Err(error) =
+                unsafe { reverie_liteinst::install_tool::<detcore::Detcore>(socket) }
+            {
                 fail(&describe_io_error(&error));
             }
             None
         }
     };
     #[cfg(not(feature = "exec-private-init"))]
-    if let Err(error) = unsafe { install_ordinary_detcore(socket, initial_auxv) } {
+    if let Err(error) = unsafe { reverie_liteinst::install_tool::<detcore::Detcore>(socket) } {
         fail(&describe_io_error(&error));
     }
     #[cfg(feature = "exec-private-init")]

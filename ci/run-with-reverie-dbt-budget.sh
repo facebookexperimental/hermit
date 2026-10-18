@@ -2024,22 +2024,11 @@ fi
 # experimental/reverie-sabre (vendor/sabre/loader/elf_loading.c and a new test
 # pair). git diff is empty under reverie-dbt/, so inventory 964, the SDK and
 # native component inputs, calibrated budget, job width and limits are unchanged.
-# CARRY TO b36c69b71133689a3394cf9f8d2bc4a5429d9af6 (2026-10-18): from
-# ed29a09d102ffa3bf33c3efce9401025e80b7e4e. SaBRe's shared patcher/installer
-# and the ordinary AT_RANDOM startup seed change Rust, bootstrap and qualifier
-# inputs, so fresh runtime/package checks are required.
-# The complete reverie-dbt tree remains fc8ae744acd4a7c4d19fc64e7177afdc03085725;
-# its build.rs, native/CMake/vendor/SDK inputs, root Cargo.toml and toolchain
-# are byte-identical. Root Cargo.lock adds only the reverie-inguest -> goblin
-# edge. SDK inventory 963, calibrated budget, job width and limits carry
-# unchanged; this source comparison does not transfer any earlier receipt.
-# CARRY TO 6a5491c09a0434bf91553b34770fbf551a179cfd (2026-10-18): from
-# 80fc77faa79da855612517666bd87134a915e2fc. One commit, 6a5491c0 (the block above's
-# b36c69b7, replayed onto Reverie main with the same patch-id). git diff is
-# empty under reverie-dbt/, so inventory 964 (set by 94513271), the SDK and
-# native component inputs, calibrated budget, job width and limits are
-# unchanged. The root Cargo.lock adds only the reverie-inguest -> goblin edge.
-expected_pin=6a5491c09a0434bf91553b34770fbf551a179cfd
+# CARRY TO aaed1ab669b079a7f0a3adf00cf92d274e34649b (2026-10-18): Reverie's revert of
+# 6a5491c0 (AT_RANDOM startup seed). Its tree is exactly
+# 80fc77faa79da855612517666bd87134a915e2fc's, so everything the 80fc77fa block above
+# states holds unchanged (inventory 964, SDK and native inputs, limits).
+expected_pin=aaed1ab669b079a7f0a3adf00cf92d274e34649b
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
