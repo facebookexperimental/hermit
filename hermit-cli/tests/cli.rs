@@ -4808,6 +4808,16 @@ const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
          (https://github.com/rrnewton/hermit/issues/4450)",
     ),
     (
+        "detcore_omits_the_procfs_names_outside_the_level_on_every_backend",
+        "dbt",
+        "REGRESSION from e71c697a (Detcore answers brk on DBT): after the guest's \
+         chroot (--chroot-into-proc) Detcore can no longer read the guest's smaps \
+         (guest_task_procfs is None once the root changes), so the guest's next brk \
+         is refused by name: \"unsupported: brk where Detcore cannot read the \
+         guest's mappings\". The brk model needs a procfs descriptor held across \
+         chroot; the DBT lane owns the fix, which removes this entry",
+    ),
+    (
         "detcore_answers_its_procfs_links_on_every_backend",
         "sabre",
         "a thread with its own descriptor table aborts the run \
