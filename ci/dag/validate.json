@@ -22677,7 +22677,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1621",
+        "NEXTEST_EXPECTED_EXECUTED": "1623",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -39991,11 +39991,11 @@
       "group": "e9patchcompatprep",
       "job": "release_resources",
       "desc": "Stage the release backend resources for the host e9patch cells",
-      "description": "Runs `cargo build --release --locked -p detcore-dbt`, then a release build of hermit with third-party-backends together with detcore-dbt, its shared object detcore-dbt-cdylib, detcore-sabre and hermit-install, both through ci/run-with-reverie-dbt-budget.sh (which sets Cargo's job count from the calibrated DBT build budget), and finally `test -x` on target/install_pkg/rsrcs/e9patch and e9tool. The e9patchcompat probes run the host release Hermit built by compatprep.hermit_release, which finds its packaged resources, the e9patch and e9tool binaries among them, through target/install_pkg; this node stages that tree for the e9patch-compat-only profile. If hermit-install stops staging e9tool, the final `test -x` fails here instead of in every probe.",
+      "description": "Runs `cargo build --release --locked -p detcore-dbt`, then a release build of hermit with third-party-backends together with detcore-dbt, its shared object detcore-dbt-cdylib, detcore-sabre and hermit-install, both through ci/run-with-reverie-dbt-budget.sh (which sets Cargo's job count from the calibrated DBT build budget), then finalizes the ordinary Detcore preload with `target/release/stage-detcore-liteinst --git target` in the existing liteinst-runtime profile and unchanged constructor/source proof, and finally `test -x` on target/install_pkg/rsrcs/e9patch and e9tool. The e9patchcompat probes run the host release Hermit built by compatprep.hermit_release, which finds its packaged resources, the e9patch and e9tool binaries among them, through target/install_pkg; this node stages that tree for the e9patch-compat-only profile. If hermit-install stops staging e9tool, the final `test -x` fails here instead of in every probe.",
       "labels": [
         "e9patch-compat-only"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbt -p detcore-dbt-cdylib -p detcore-sabre -p hermit-install && test -x target/install_pkg/rsrcs/e9patch && test -x target/install_pkg/rsrcs/e9tool",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbt -p detcore-dbt-cdylib -p detcore-sabre -p hermit-install && target/release/stage-detcore-liteinst --git target && test -x target/install_pkg/rsrcs/e9patch && test -x target/install_pkg/rsrcs/e9tool",
       "result_manifests": [],
       "deps": [
         "compatprep.hermit_release"
@@ -45971,7 +45971,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/clean-stale-reverie-dbt.sh validate && export HERMIT_INSTALL_FORCE_RESTAGE=\"${DAGRUN_STEP_STARTED_MONOTONIC_NS:-$(date +%s%N)}\" && ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate --workspace --all-targets --features hermit/kvm-native-test-support,hermit/third-party-backends && ./ci/nextest-binaries.rs prepare hosted-portable",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/clean-stale-reverie-dbt.sh validate && export HERMIT_INSTALL_FORCE_RESTAGE=\"${DAGRUN_STEP_STARTED_MONOTONIC_NS:-$(date +%s%N)}\" && ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate --workspace --all-targets --features hermit/kvm-native-test-support,hermit/third-party-backends && ./ci/nextest-binaries.rs prepare hosted-portable && target/validate/stage-detcore-liteinst --git target",
       "result_manifests": [],
       "deps": [
         "gate.manifest",
@@ -46202,7 +46202,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1607",
+        "NEXTEST_EXPECTED_EXECUTED": "1609",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -63792,12 +63792,12 @@
       "group": "build",
       "job": "workspace_in_pinned_root",
       "desc": "List every prepared Nextest executable from the one validate-profile build and record each selection's subset",
-      "description": "The preparation half of the pinned-root workspace build. Once build.workspace_compile_in_pinned_root has built every workspace target and build.rust_scripts_in_pinned_root has published the prebuilt rust-script tools, `nextest-binaries.rs prepare full` runs in the same pinned root, target directory and Cargo home: one `cargo nextest list` over the unified validate-profile build, the hermit_modes guests and record workloads from that build, and a dev-profile build of the nextest-cpu-wrapper. It hashes every listed executable and publishes all selections in one record, so no selection recompiles anything or relinks target/validate/hermit. Every consumer of the workspace build names this node, so none starts before that record exists. The budget is measured: in eight full validations on 2026-10-06 the unsplit node took 235 to 241 seconds, of which Cargo reported 45 to 46 for detcore-dbt and 130 to 136 for the workspace, leaving 58 to 60 seconds for container start and preparation. The CPU-wrapper build is the largest part, 27 to 28 seconds at 32 workers in those runs; a cold 16-worker build of it outside the root took 28 seconds, 135 CPU-seconds and a 2.4 GB memory peak. The 32-worker preference is the width preparation ran at inside the unsplit node.",
+      "description": "The preparation half of the pinned-root workspace build. Once build.workspace_compile_in_pinned_root has built every workspace target and build.rust_scripts_in_pinned_root has published the prebuilt rust-script tools, `nextest-binaries.rs prepare full` runs in the same pinned root, target directory and Cargo home: one `cargo nextest list` over the unified validate-profile build, the hermit_modes guests and record workloads from that build, and a dev-profile build of the nextest-cpu-wrapper. It hashes every listed executable and publishes all selections in one record, so no selection recompiles anything or relinks target/validate/hermit. After the final preparation Cargo invocation, `target/validate/stage-detcore-liteinst --git target` builds the ordinary preload in the existing liteinst-runtime profile, applies the unchanged source/constructor proof and atomically stages its receipt and bytes. Every consumer of the workspace build names this node, so none starts before both preparation and finalization complete. COLD ORDINARY FINALIZATION 2026-10-17: at Hermit 9b0e652d, eight admitted CPUs, with only target/liteinst-runtime removed before the run, the complete preparation plus ordinary finalizer took 294.965 wall seconds and 1383.852 CPU-seconds (1327.116 user, 56.736 system), with a 4.9-GiB peak and no OOM. This includes preparation rebuilding the stamped CLI and install staging; it is not just a warm artifact check. The former 1200-CPU-second cap interrupted the added dedicated-profile build. 2100 CPU-seconds is the next 300-second bucket above 1.5 times the complete measured cost (2075.778); the 600-second wall and 8-GiB memory bounds remain. The constructor/source proof and every prepared selection are unchanged. The budget is measured: in eight full validations on 2026-10-06 the unsplit node took 235 to 241 seconds, of which Cargo reported 45 to 46 for detcore-dbt and 130 to 136 for the workspace, leaving 58 to 60 seconds for container start and preparation. The CPU-wrapper build is the largest part, 27 to 28 seconds at 32 workers in those runs; a cold 16-worker build of it outside the root took 28 seconds, 135 CPU-seconds and a 2.4 GB memory peak. The 32-worker preference is the width preparation ran at inside the unsplit node.",
       "labels": [
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/nextest-binaries.rs prepare full'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target'",
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
@@ -63811,7 +63811,7 @@
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
-      "cpu_timeout": 1200,
+      "cpu_timeout": 2100,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {

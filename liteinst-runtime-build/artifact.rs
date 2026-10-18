@@ -66,7 +66,7 @@ pub(crate) fn constructor_qualifier_source(
         .ok_or("constructor qualifier library has no source")?;
     let source = fs::canonicalize(source)
         .map_err(|error| format!("canonicalize qualifier source: {error}"))?;
-    if source != checkout.join("scripts/m1_artifact.rs") || !source.is_file() {
+    if source != checkout.join("reverie-liteinst-artifact/src/lib.rs") || !source.is_file() {
         return Err("constructor qualifier does not compile the shared proof source".into());
     }
     Ok(source)
@@ -164,9 +164,9 @@ mod tests {
         let owned = Checkout(root);
         for relative in [
             "reverie-liteinst-preload",
-            "reverie-liteinst-artifact",
+            "reverie-liteinst-artifact/src",
             "scripts",
-            "other-checkout/reverie-liteinst-artifact",
+            "other-checkout/reverie-liteinst-artifact/src",
             "other-checkout/scripts",
         ] {
             fs::create_dir_all(owned.0.join(relative)).unwrap();
@@ -174,16 +174,17 @@ mod tests {
         for relative in [
             "reverie-liteinst-preload/Cargo.toml",
             "reverie-liteinst-artifact/Cargo.toml",
-            "scripts/m1_artifact.rs",
+            "reverie-liteinst-artifact/src/lib.rs",
             "scripts/unrelated.rs",
+            "scripts/m1_artifact.rs",
             "other-checkout/reverie-liteinst-artifact/Cargo.toml",
-            "other-checkout/scripts/m1_artifact.rs",
+            "other-checkout/reverie-liteinst-artifact/src/lib.rs",
         ] {
             fs::write(owned.0.join(relative), b"source identity control").unwrap();
         }
         let root = fs::canonicalize(&owned.0).unwrap();
         let preload = root.join("reverie-liteinst-preload/Cargo.toml");
-        let source = root.join("scripts/m1_artifact.rs");
+        let source = root.join("reverie-liteinst-artifact/src/lib.rs");
         let helper = serde_json::json!({
             "name": "reverie-liteinst-artifact", "version": "0.4.1",
             "source": format!("git+https://github.com/rrnewton/reverie.git?rev={REVISION}#{REVISION}"),
@@ -202,8 +203,12 @@ mod tests {
         assert_eq!(bind(vec![helper.clone()]).unwrap(), source);
         let mut alias = helper.clone();
         alias["targets"][0]["src_path"] =
-            serde_json::json!(root.join("scripts/../scripts/m1_artifact.rs"));
+            serde_json::json!(root.join("reverie-liteinst-artifact/src/../src/lib.rs"));
         assert_eq!(bind(vec![alias]).unwrap(), source);
+        let mut outside_package = helper.clone();
+        outside_package["targets"][0]["src_path"] =
+            serde_json::json!(root.join("scripts/m1_artifact.rs"));
+        assert!(bind(vec![outside_package]).is_err());
         assert!(bind(Vec::<Value>::new()).is_err());
         assert!(bind(vec![helper.clone(), helper.clone()]).is_err());
         for (field, value) in [
@@ -240,7 +245,7 @@ mod tests {
             ),
             (
                 "src_path",
-                serde_json::json!(root.join("other-checkout/scripts/m1_artifact.rs")),
+                serde_json::json!(root.join("other-checkout/reverie-liteinst-artifact/src/lib.rs")),
             ),
         ] {
             let mut wrong = helper.clone();
@@ -794,7 +799,8 @@ pub(crate) mod native {
         assert_eq!(rv_manifest, rv.join("reverie-inguest/Cargo.toml"));
         let qualifier_manifest = rv.join("reverie-liteinst-artifact/Cargo.toml");
         let proof_source =
-            qualifier::FileIdentity::read(&rv.join("scripts/m1_artifact.rs")).unwrap();
+            qualifier::FileIdentity::read(&rv.join("reverie-liteinst-artifact/src/lib.rs"))
+                .unwrap();
         assert_eq!(
             proof_source.sha256,
             qualifier::qualifier_source_sha256(),
@@ -1017,7 +1023,7 @@ pub(crate) mod native {
             root.join("detcore-liteinst/src"),
             root.join("Cargo.toml"),
             root.join("Cargo.lock"),
-            rv.join("scripts/m1_artifact.rs"),
+            rv.join("reverie-liteinst-artifact/src/lib.rs"),
             rv.join("reverie-inguest/src"),
             rv.join("reverie-inguest/native_exec"),
             rv.join("reverie-liteinst/src"),

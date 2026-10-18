@@ -2,7 +2,7 @@
 //! These observations do not claim all-entry, TLS or interior write isolation.
 
 #[allow(dead_code)]
-#[path = "../../reverie/scripts/m1_artifact.rs"]
+#[path = "../../reverie/reverie-liteinst-artifact/src/lib.rs"]
 mod artifact;
 #[path = "common/cold_bundle.rs"]
 mod cold_bundle;

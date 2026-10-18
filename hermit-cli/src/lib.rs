@@ -982,9 +982,10 @@ pub const LITEINST_TOOL_RUNTIME_ENV: &str = "HERMIT_LITEINST_TOOL_RUNTIME";
 /// names; otherwise the packaged `rsrcs/libdetcore_liteinst.so` of the selected
 /// Hermit installation (`hermit-install` stages it, as it stages the DBT and
 /// SaBRe Detcore runtimes, and a standalone installation or published bundle
-/// carries it); otherwise the one `cargo build -p detcore-liteinst` built beside
-/// the Hermit binary or in its `deps/` directory. Packaged resources come before
-/// the Cargo artifact directory, the order the DBT and SaBRe runtimes use.
+/// carries it). A selected installation missing that resource is incomplete
+/// and is refused. When no installation is selected, the development fallback
+/// is the one `cargo build -p detcore-liteinst` built beside the Hermit binary
+/// or in its `deps/` directory.
 ///
 /// A runtime built from another tree is refused when it starts: Hermit passes
 /// it [`detcore::config_wire_fingerprint`], which it compares with its own
@@ -1007,9 +1008,14 @@ pub fn liteinst_tool_runtime_library_path() -> io::Result<PathBuf> {
         });
     }
 
-    if let Some(path) = hermit_resources::resource("libdetcore_liteinst.so")?
-        && path.is_file()
-    {
+    if let Some(path) = hermit_resources::resource("libdetcore_liteinst.so")? {
+        if !path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "selected Hermit installation has no finalized in-guest Detcore runtime; \
+                 run `make install-deps` to build and stage the qualified LiteInst runtime",
+            ));
+        }
         return validate_liteinst_tool_runtime_library(&path);
     }
 

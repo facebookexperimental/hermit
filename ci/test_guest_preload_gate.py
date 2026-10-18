@@ -253,6 +253,7 @@ class GuestPreloadCallSiteTest(unittest.TestCase):
         cls.dir = Path(cls.scratch.name)
         (cls.dir / "ci").mkdir()
         for name in (
+            "verify-packaged-detcore.py",
             "publish-hermit-e2e-artifact.sh",
             "verify-hermit-e2e-artifact.sh",
             "run-with-hermit-e2e-artifact.sh",
@@ -293,6 +294,8 @@ class GuestPreloadCallSiteTest(unittest.TestCase):
             else:
                 path.write_text(f"#!/bin/sh\n# {name} {resource}\nexit 0\n")
             path.chmod(0o700)
+        from test_packaged_detcore import fixture_receipt
+        fixture_receipt(install, "1" * 40)
         return install
 
     def publish(self, name: str, install: Path) -> subprocess.CompletedProcess[str]:

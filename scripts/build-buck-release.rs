@@ -5985,6 +5985,15 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("rsrcs/unprobed-resource"), b"generation-one\n").unwrap();
+        checked_output(
+            Command::new("python3")
+                .arg(source_root().join("ci/test_packaged_detcore.py"))
+                .arg("--write-fixture")
+                .arg(root)
+                .arg(reverie_sha),
+            "write synthetic packaging receipt reader fixture",
+        )
+        .unwrap();
     }
 
     fn canonical_report(virtualize_time: bool) -> Value {
@@ -7312,6 +7321,7 @@ mod tests {
         let root = fixture_root("buck-shadow-publication-source");
         fs::create_dir_all(root.join("ci")).unwrap();
         for name in [
+            "verify-packaged-detcore.py",
             "publish-hermit-e2e-artifact.sh",
             "verify-hermit-e2e-artifact.sh",
         ] {
@@ -7421,6 +7431,7 @@ mod tests {
         let root = fixture_root("overlay-stage-origin");
         fs::create_dir_all(root.join("ci")).unwrap();
         for name in [
+            "verify-packaged-detcore.py",
             "publish-hermit-e2e-artifact.sh",
             "verify-hermit-e2e-artifact.sh",
         ] {
@@ -7553,6 +7564,7 @@ esac
         let root = fixture_root("validate-artifact-install");
         fs::create_dir_all(root.join("ci")).unwrap();
         for name in [
+            "verify-packaged-detcore.py",
             "publish-hermit-e2e-artifact.sh",
             "run-with-hermit-e2e-artifact.sh",
             "verify-hermit-e2e-artifact.sh",

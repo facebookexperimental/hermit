@@ -2058,8 +2058,15 @@ fi
 # inventory 963). reverie-dbt/vendor, native/, build.rs, third-party, the root
 # Cargo.toml, Cargo.lock and rust-toolchain.toml have the same object ids: all
 # seven SDK inputs, calibrated budget, job width and limits are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8214c7ee0d87b7a68eff6dbc1a02782035f42d54 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 8214c7ee0d87b7a68eff6dbc1a02782035f42d54 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO ed29a09d102ffa3bf33c3efce9401025e80b7e4e (2026-10-18): from
+# 8214c7ee0d87b7a68eff6dbc1a02782035f42d54. One commit, ed29a09d (the LiteInst
+# artifact qualifier moves inside its package for independent Reindeer
+# vendoring; replayed from 73242102 with the same patch-id). No runtime code
+# changes. git diff is empty under reverie-dbt/, and the root Cargo.toml,
+# Cargo.lock and rust-toolchain.toml are unchanged. All seven SDK inputs,
+# inventory 963, calibrated budget, job width and limits are unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ed29a09d102ffa3bf33c3efce9401025e80b7e4e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ed29a09d102ffa3bf33c3efce9401025e80b7e4e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

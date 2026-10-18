@@ -1111,7 +1111,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests (456dbc38, 5ebcb9dd, 1722f214: 4 + 2 + 1): 1621. Observed as 1623
     // in the validate of d4594afa, which also carried the 2 since-reverted
     // qualified-runtime tests.
-    ("test.regular_crates", 1_621),
+    // Restore the two qualified-runtime preparation tests: 1623.
+    ("test.regular_crates", 1_623),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3096,9 +3097,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // liteinst_backend_stats_report_the_guests_own_dispatch_paths retargeted to
     // in-guest LiteInst: 144 = 120 + 23 + 1 (`cargo nextest list --profile ci`
     // with this node's skips lists 144 non-ignored matches). They load the
-    // libdetcore_liteinst.so that build.workspace_compile_in_pinned_root's
-    // `cargo build --profile validate --workspace --all-targets` writes beside
-    // target/validate/hermit, the CARGO_BIN_EXE_hermit they run.
+    // ordinary libdetcore_liteinst.so finalized after preparation by
+    // target/validate/stage-detcore-liteinst: the installed resource uses the
+    // liteinst-runtime profile and unchanged source/constructor qualification,
+    // rather than the validate-profile DSO beside CARGO_BIN_EXE_hermit.
     // run_liteinst_finds_the_runtime_staged_as_an_installed_resource, which
     // checks that an installation's packaged rsrcs/libdetcore_liteinst.so is
     // found and is consulted before the Cargo artifact directory, retains all
@@ -4805,7 +4807,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Measured with copied_child_refuses_scheduler_parameter_queries_only_in_strict_mode: 1594.
     // And the same 5 session-census tests (3920bf94): 1600.
     // And the same 7 Buck e2e cell tests (456dbc38, 5ebcb9dd, 1722f214): 1607.
-    ("test.regular_crates_on_host", 1_607),
+    // Restore the two qualified-runtime preparation tests: 1609.
+    ("test.regular_crates_on_host", 1_609),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
@@ -5999,7 +6002,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/clean-stale-reverie-dbt.sh validate && export HERMIT_INSTALL_FORCE_RESTAGE="${DAGRUN_STEP_STARTED_MONOTONIC_NS:-$(date +%s%N)}" && ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate --workspace --all-targets --features hermit/kvm-execution-tests,hermit/kvm-native-test-support,hermit/third-party-backends && ./ci/nextest-binaries.rs prepare full"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/clean-stale-reverie-dbt.sh validate && export HERMIT_INSTALL_FORCE_RESTAGE="${DAGRUN_STEP_STARTED_MONOTONIC_NS:-$(date +%s%N)}" && ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate --workspace --all-targets --features hermit/kvm-execution-tests,hermit/kvm-native-test-support,hermit/third-party-backends && ./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,

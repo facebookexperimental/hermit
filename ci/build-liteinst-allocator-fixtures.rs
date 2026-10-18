@@ -15,7 +15,7 @@
 
 #[path = "../hermit-cli/tests/common/cold_bundle.rs"]
 mod cold_bundle;
-#[path = "../reverie/scripts/m1_artifact.rs"]
+#[path = "../reverie/reverie-liteinst-artifact/src/lib.rs"]
 pub mod m1_artifact;
 #[path = "../hermit-cli/tests/common/m1_bundle.rs"]
 mod m1_bundle;

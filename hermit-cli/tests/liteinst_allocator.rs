@@ -3,7 +3,7 @@
 //! reproducible placement or exact Q/W comparisons fail; no cases are skipped.
 
 #[allow(dead_code)]
-#[path = "../../reverie/scripts/m1_artifact.rs"]
+#[path = "../../reverie/reverie-liteinst-artifact/src/lib.rs"]
 mod artifact;
 #[allow(dead_code)]
 #[path = "../../reverie/scripts/m1_contract.rs"]

@@ -7,6 +7,7 @@
 
 # Verify and resolve one content-addressed Hermit E2E artifact.
 set -euo pipefail
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 function fail {
     echo "verify-hermit-e2e-artifact.sh: $*" >&2
@@ -123,6 +124,7 @@ function require_complete_resources {
     require_portable_guest_preload "SaBRe plugin" "$install/rsrcs/libdetcore_sabre.so"
     require_portable_guest_preload "In-guest LiteInst runtime" "$install/rsrcs/libdetcore_liteinst.so"
     require_portable_guest_preload "LiteInst preload" "$install/rsrcs/libreverie_liteinst.so"
+    "$ROOT_DIR/ci/verify-packaged-detcore.py" "$install" || fail "ordinary Detcore packaging qualification is missing or stale"
     if [[ $require_runtime == true ]]; then
         require_runtime_closure "$install/rsrcs/hermit-runtime"
     elif [[ -e $install/rsrcs/hermit-runtime ]]; then
