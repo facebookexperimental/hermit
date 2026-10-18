@@ -2173,8 +2173,19 @@ fi
 # inventory 968), and the root Cargo.toml, Cargo.lock and rust-toolchain.toml
 # are unchanged. All seven SDK inputs, calibrated budget, job width and limits
 # are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8ebc1ae72bfeaa4ae127ece2d108156092f884fd ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 8ebc1ae72bfeaa4ae127ece2d108156092f884fd (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 4561503488d69d6d4350d5db090279c9cf8bb3e4 (2026-10-18): from
+# 8ebc1ae72bfeaa4ae127ece2d108156092f884fd. One commit, a replay of the dbt lane's 51fed06f onto
+# E4a's 8ebc1ae7 (E4a itself is outside reverie-dbt). The terminal-app-UBR
+# translation repair changes vendored interp.c and adds five regression files
+# (tracked DBT inventory 968 -> 973). It preserves true successor translations
+# and original source extent; no clock policy changes. Fresh maintained SDK MISS
+# 49724b2667ab56f2408fb932c1d7dc06aa45677336fda523df9b47cd804c1c6a measured 26.87s with 7 available jobs
+# (NUM_JOBS=8), 188.10 job-seconds, below the default native ratchet572. The
+# portable1050 effective-job-second limit and all job/selection limits remain
+# unchanged, not recalibrated. One qualified sample from the dbt lane's
+# terminal-translation-candidate-r1, not a five-sample calibration campaign.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4561503488d69d6d4350d5db090279c9cf8bb3e4 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4561503488d69d6d4350d5db090279c9cf8bb3e4 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
