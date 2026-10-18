@@ -198,6 +198,130 @@ fn paired_verify_runs_report_what_run_verify_reports_on_dbt() {
 
 #[cfg(feature = "dbt")]
 #[test]
+fn dbt_capture_preserves_guest_stderr_and_controller_diagnostics() {
+    let _guard = hermit_run_guard();
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap()
+        .keep();
+    eprintln!(
+        "DBT diagnostic routing artifacts retained at {}",
+        root.display()
+    );
+    // Use a guest that has branch evidence in its final image; the existing
+    // straight-line no-libc stderr writer cannot satisfy that strict guard.
+    let write_stderr = "printf 'guest-stderr\\n' >&2";
+    let direct = ["/bin/bash", "-c", write_stderr];
+    let cases: [(&str, &[&str], &[u8]); 3] = [
+        ("empty", &["/bin/true"], b""),
+        ("direct", &direct, b"guest-stderr\n"),
+        (
+            "fork-exec",
+            &[
+                "/bin/bash",
+                "-c",
+                "set -e; \"$1\" -c \"$2\"; exec \"$1\" -c \"$2\"",
+                "dbt-diagnostic-routing",
+                "/bin/bash",
+                write_stderr,
+            ],
+            b"guest-stderr\nguest-stderr\n",
+        ),
+    ];
+    let assert_controller_diagnostics = |output: &Output| {
+        let diagnostics = stderr(output);
+        assert!(output.status.success(), "{diagnostics}");
+        assert!(
+            diagnostics.contains("detcore-dbt: entered Rust syscall callback"),
+            "native diagnostics were lost: {diagnostics}"
+        );
+        assert!(
+            !diagnostics.contains("guest-stderr"),
+            "guest bytes leaked into controller diagnostics: {diagnostics}"
+        );
+    };
+    for (name, guest, expected_stderr) in cases {
+        let directory = root.join(name);
+        let output = hermit_run(
+            &["--log=info", "--backend=dbt"],
+            &[
+                "--strict",
+                "--base-env=minimal",
+                "--verify-strict",
+                "--verify-run",
+                directory.to_str().unwrap(),
+            ],
+            guest,
+            EPOCH,
+        );
+        fs::write(
+            root.join(format!("{name}.controller.stderr")),
+            &output.stderr,
+        )
+        .unwrap();
+        fs::write(
+            root.join(format!("{name}.controller.stdout")),
+            &output.stdout,
+        )
+        .unwrap();
+        let saved = report(&directory.join("verify-run.json"));
+        assert_eq!(saved["outcome"]["kind"], "completed", "{name}: {saved}");
+        assert_eq!(saved["outcome"]["status"]["code"], 0, "{name}: {saved}");
+        assert_eq!(fs::read(directory.join("stdout")).unwrap(), b"", "{name}");
+        assert_eq!(
+            fs::read(directory.join("stderr")).unwrap(),
+            expected_stderr,
+            "{name}: the saved guest stderr must contain only guest bytes"
+        );
+        assert_controller_diagnostics(&output);
+        let log = fs::read_to_string(directory.join("run.log")).unwrap();
+        assert!(
+            log.contains("INFO detcore"),
+            "{name}: missing Detcore evidence"
+        );
+    }
+
+    let verdict = root.join("verify.json");
+    let output = hermit_run(
+        &["--log=info", "--backend=dbt"],
+        &[
+            "--strict",
+            "--base-env=minimal",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict.to_str().unwrap(),
+        ],
+        &direct,
+        EPOCH,
+    );
+    fs::write(root.join("verify.controller.stderr"), &output.stderr).unwrap();
+    fs::write(root.join("verify.controller.stdout"), &output.stdout).unwrap();
+    let value = super::read_terminal_dbt_verdict(&verdict);
+    assert_eq!(value["verdict"], "matched", "{value}");
+    assert_eq!(value["bitwise_parity"], true, "{value}");
+    assert_eq!(value["comparison"]["compare_io_buffers"], true, "{value}");
+    for side in ["left", "right"] {
+        assert_eq!(value["compared_outputs"][side]["exit_code"], 0, "{value}");
+        assert_eq!(
+            value["compared_outputs"][side]["stderr_bytes"], 13,
+            "{value}"
+        );
+        assert_eq!(
+            value["compared_outputs"][side]["stderr_sha256"],
+            detcore::Digest::new(b"guest-stderr\n").to_string(),
+            "{value}"
+        );
+        assert!(value["compared_log_messages"][side].as_u64().unwrap() > 0);
+    }
+    // Live verification replays the accepted guest stderr to its caller.
+    let diagnostics = stderr(&output);
+    assert!(output.status.success(), "{diagnostics}");
+    assert!(diagnostics.contains("detcore-dbt: entered Rust syscall callback"));
+    assert_eq!(diagnostics.matches("guest-stderr\n").count(), 1);
+}
+
+#[cfg(feature = "dbt")]
+#[test]
 fn dbt_stats_paths_are_private_in_plain_live_and_saved_runs() {
     let _guard = hermit_run_guard();
     let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();

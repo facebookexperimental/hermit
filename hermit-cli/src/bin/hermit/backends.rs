@@ -41,6 +41,8 @@ use std::io::SeekFrom;
 #[cfg(feature = "dbt")]
 use std::io::Write;
 #[cfg(feature = "dbt")]
+use std::os::fd::AsFd;
+#[cfg(feature = "dbt")]
 use std::os::fd::AsRawFd;
 #[cfg(feature = "dbt")]
 use std::os::fd::FromRawFd;
@@ -994,6 +996,12 @@ impl DbtInvocation {
             environment.get(OsStr::new("PATH")).map(OsString::as_os_str),
         );
 
+        // Retain the controller sink before the runner replaces the guest's
+        // fd 2 with a capture pipe. Native diagnostics must not enter that pipe.
+        let diagnostics =
+            std::fs::File::from(std::io::stderr().as_fd().try_clone_to_owned().map_err(
+                |error| Error::msg(format!("failed to retain DBT diagnostic stderr: {error}")),
+            )?);
         let mut runner = DbtRunner::new(&drrun, &client)
             .map_err(|error| {
                 Error::msg(format!(
@@ -1004,7 +1012,14 @@ impl DbtInvocation {
             })?
             .summary(options.summary)
             .isolated_process_group(panic_on_unsupported_syscalls)
-            .tool_answers_brk(true);
+            .tool_answers_brk(true)
+            .diagnostic_file(&diagnostics)
+            .map_err(|error| {
+                Error::msg(format!(
+                    "failed to configure DBT diagnostic stderr: {error}"
+                ))
+            })?;
+        drop(diagnostics);
         if panic_on_unsupported_syscalls {
             runner = runner.client_argument("-panic-on-unsupported-syscalls");
         }

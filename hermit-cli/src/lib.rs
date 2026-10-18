@@ -382,6 +382,8 @@ use std::io;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+#[cfg(feature = "dbt")]
+use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 #[cfg(any(feature = "sabre", all(test, feature = "liteinst")))]
@@ -3828,6 +3830,13 @@ async fn run_dbt(
     let config_json = dbt_detconfig_json(&config)
         .map_err(|error| anyhow!("failed to serialize the Detcore config for DBT: {error}"))?;
     let panic_on_unsupported_syscalls = config.panic_on_unsupported_syscalls;
+    // Bind native diagnostics to the controller before guest output capture.
+    let diagnostics = std::fs::File::from(
+        std::io::stderr()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|error| anyhow!("failed to retain DBT diagnostic stderr: {error}"))?,
+    );
     let mut runner = reverie_dbt::DbtRunner::new(&drrun, &client)
         .map_err(|error| {
             anyhow!(
@@ -3838,7 +3847,10 @@ async fn run_dbt(
         })?
         .summary(print_summary)
         .isolated_process_group(panic_on_unsupported_syscalls)
-        .tool_answers_brk(true);
+        .tool_answers_brk(true)
+        .diagnostic_file(&diagnostics)
+        .map_err(|error| anyhow!("failed to configure DBT diagnostic stderr: {error}"))?;
+    drop(diagnostics);
     if panic_on_unsupported_syscalls {
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
     }
@@ -7941,6 +7953,33 @@ mod tests {
             return;
         }
 
+        // Isolate the controller's fd 2 in a subprocess, without redirecting a
+        // descriptor shared by other tests in this process.
+        const CHILD: &str = "HERMIT_TEST_DBT_LIBRARY_DIAGNOSTICS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::dbt_public_dispatch_runs_echo_through_detcore",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .expect("run isolated DBT library output checks");
+            let diagnostics = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                diagnostics
+                    .lines()
+                    .filter(|line| line.starts_with("reverie-dbt: tool=Detcore "))
+                    .count()
+                    >= 2,
+                "DBT native summaries did not prove both Detcore dispatches: {diagnostics}"
+            );
+            assert!(!diagnostics.contains("guest-stderr"), "{diagnostics}");
+            return;
+        }
+
         let mut command = super::Command::new("/bin/echo");
         command.arg("hello");
         let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
@@ -7958,13 +7997,18 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
         );
         assert_eq!(output.stdout, b"hello\n");
-        assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .lines()
-                .any(|line| line.starts_with("reverie-dbt: tool=Detcore ")),
-            "DBT native summary did not prove Detcore dispatch: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert_eq!(output.stderr, b"");
+
+        let mut command = super::Command::new("/bin/sh");
+        command.args(["-c", "printf 'guest-stderr\\n' >&2"]);
+        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
+        config.sequentialize_threads = true;
+        config.validate();
+        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
+            .expect("capture nonempty guest stderr through DbtGuest<Detcore>");
+        assert_eq!(output.status, super::ExitStatus::Exited(0), "{output:?}");
+        assert_eq!(output.stdout, b"");
+        assert_eq!(output.stderr, b"guest-stderr\n");
     }
 
     #[test]

@@ -3611,7 +3611,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_guest_mount_table_ignores_a_host_mount_made_before_the_run and
     // detcore_follows_the_target_processs_root_for_its_mount_table
     // (https://github.com/rrnewton/hermit/issues/4213, K3a): 538.
-    ("test.cli", 538),
+    // And the DBT captured-stderr/controller-diagnostics regression: 539, listed.
+    ("test.cli", 539),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4066,7 +4067,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same focused chroot program-break regression: 468, freshly listed.
     // The same two restored cases remain selected on host: 470, freshly listed.
     // And the three 4213 container-mount-table tests: 473.
-    ("test.cli_on_host", 473),
+    // And the same captured-stderr/controller-diagnostics regression: 474, listed.
+    ("test.cli_on_host", 474),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

@@ -10914,8 +10914,7 @@ fn run_dbt_fails_when_a_child_ends_on_a_backend_failure_its_parent_ignores() {
 
 /// The same failing guest under `--verify`, where the process group is
 /// isolated and protected evidence turns the failure into an error. The
-/// error must not hide the child's diagnostic, which the guest tree wrote to
-/// its captured stderr.
+/// error must not hide the child's diagnostic on the controller's channel.
 #[test]
 fn run_dbt_verify_keeps_the_diagnostic_of_a_backend_failure() {
     if dbt_unavailable("run_dbt_verify_keeps_the_diagnostic_of_a_backend_failure") {
