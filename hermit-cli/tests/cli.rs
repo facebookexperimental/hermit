@@ -9526,6 +9526,68 @@ fn run_dbt_heap_records_are_ptraces() {
     assert_eq!(heap_records("dbt"), ptrace);
 }
 
+/// Under DBT, a child that glibc's `posix_spawn` starts from a long path has
+/// its brk answered (`hermit-cli/tests/fixtures/spawn_and_wait.c` running
+/// `heap_records.c`). The spawn's copied child execs without Detcore, so
+/// Detcore finds the new image from its AT_EXECFN. Where the path is longer
+/// than DynamoRIO's library's own, DynamoRIO moves the path and rewrites only
+/// the application's auxiliary vector, so the kernel's copy names cleared
+/// storage. The child then had no exec record, and its first brk was refused
+/// by name, until DBT's Guest::auxv became the application's vector.
+#[test]
+fn run_dbt_answers_brk_for_a_child_spawned_from_a_long_path() {
+    if dbt_unavailable("run_dbt_answers_brk_for_a_child_spawned_from_a_long_path") {
+        return;
+    }
+    let spawner = program_break_guest("spawn-and-wait", "spawn_and_wait.c", &[]);
+    let child = program_break_guest(
+        "heap-records-spawned",
+        "heap_records.c",
+        &["-fno-pie", "-no-pie"],
+    );
+    // Three 200-byte components: longer than any library path DynamoRIO
+    // lives at in a build or an installation.
+    let mut long_directory = process_build_root("long-path-spawn");
+    for letter in ["d", "e", "f"] {
+        long_directory.push(letter.repeat(200));
+    }
+    fs::create_dir_all(&long_directory).expect("failed to create the long directory");
+    let long_child = long_directory.join("heap-records");
+    fs::copy(&child, &long_child).expect("failed to copy the child");
+    let long_child = long_child.to_str().expect("child path should be UTF-8");
+    assert!(long_child.len() > 600, "{long_child}");
+
+    let output = Command::new("setarch")
+        .arg("-R")
+        .arg(&spawner)
+        .arg(long_child)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the spawner natively");
+    assert!(output.status.success(), "the spawner natively: {output:?}");
+    let native = String::from_utf8(output.stdout).expect("the spawner's stdout should be UTF-8");
+    assert_eq!(
+        native,
+        "grown 1 split 0 query 1 gone 0 after 1\nchild exited 0\n"
+    );
+
+    let spawner = spawner.to_str().expect("spawner path should be UTF-8");
+    for backend in ["ptrace", "dbt"] {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--",
+            spawner,
+            long_child,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), native, "{backend}");
+    }
+}
+
 /// Runs the thread-join guest in `mode` under DBT at L2 (`--strict --verify
 /// --verify-strict`) and requires `expected` on stdout, a matched verdict,
 /// bitwise parity and nonzero compared INFO messages.
