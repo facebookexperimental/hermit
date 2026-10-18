@@ -6999,19 +6999,29 @@ fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
         .get_or_init(session_census_from_env)
         .lock()
         .map_err(|_| "session census lock poisoned".to_string())?;
-    let (members, read) = scan_process_group(&mut census, pgid)?;
-    if !census.saved || read >= SESSION_CENSUS_SAVE_READS {
+    let scan = scan_process_group(&mut census, pgid)?;
+    if !census.saved || scan.read >= SESSION_CENSUS_SAVE_READS {
         if let Some(path) = std::env::var_os(SESSION_CENSUS_ENV).filter(|v| !v.is_empty()) {
             census.save(Path::new(&path));
         }
         census.saved = true;
     }
-    Ok(members)
+    Ok(scan.members)
 }
 
-/// [`process_group_members`] with `census`; also returns how many `stat`
-/// files the scan read.
-fn scan_process_group(census: &mut SessionCensus, pgid: u32) -> Result<(Vec<u32>, usize), String> {
+/// What one [`scan_process_group`] found and did.
+struct GroupScan {
+    members: Vec<u32>,
+    /// How many PIDs' `stat` it read.
+    read: usize,
+    /// The PIDs it saw in /proc and did not read, because the census placed
+    /// them in another session. Kept for the tests, which assert on the set.
+    #[cfg(test)]
+    skipped: Vec<u32>,
+}
+
+/// [`process_group_members`] with `census`.
+fn scan_process_group(census: &mut SessionCensus, pgid: u32) -> Result<GroupScan, String> {
     let now = PidAllocator::read();
     census.begin(now, read_pid_max());
     let group_session = match read_process_stat(pgid)? {
@@ -7028,6 +7038,8 @@ fn scan_process_group(census: &mut SessionCensus, pgid: u32) -> Result<(Vec<u32>
     let mut members = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut read = 0;
+    #[cfg(test)]
+    let mut skipped = Vec::new();
     for entry in fs::read_dir("/proc").map_err(|error| format!("/proc: {error}"))? {
         let entry = entry.map_err(|error| format!("/proc: {error}"))?;
         let Some(pid) = entry
@@ -7040,6 +7052,8 @@ fn scan_process_group(census: &mut SessionCensus, pgid: u32) -> Result<(Vec<u32>
         };
         seen.insert(pid);
         if group_session.is_some_and(|session| census.skip(pid, session)) {
+            #[cfg(test)]
+            skipped.push(pid);
             continue;
         }
         read += 1;
@@ -7063,7 +7077,12 @@ fn scan_process_group(census: &mut SessionCensus, pgid: u32) -> Result<(Vec<u32>
         }
     }
     census.sessions.retain(|pid, _| seen.contains(pid));
-    Ok((members, read))
+    Ok(GroupScan {
+        members,
+        read,
+        #[cfg(test)]
+        skipped,
+    })
 }
 
 /// Records the session of the process group a child of this process created
@@ -7269,7 +7288,16 @@ impl PidAllocator {
         if created == 0 {
             return false;
         }
+        // `created` counts tasks created on the whole host (/proc/stat), while
+        // `last_pid` is this PID namespace's allocator (/proc/loadavg). In a
+        // namespace other than the host's (the pinned root's), the host can
+        // create tasks while this namespace creates none, so the cursor stays
+        // put. With a full lap ruled out above, a cursor that did not move
+        // handed out no PID.
         let (start, end) = (self.last_pid, to.last_pid);
+        if start == end {
+            return false;
+        }
         if start < end {
             start < pid && pid <= end
         } else {
@@ -9990,6 +10018,13 @@ mod tests {
         assert!(at(500, 10).may_have_reused(at(400, 200_000), pid_max, 450));
         // A counter that went backwards proves nothing.
         assert!(at(500, 10).may_have_reused(at(510, 5), pid_max, 400));
+        // Host-wide tasks were created but this namespace's cursor did not
+        // move: no PID here was handed out, on either side of the cursor.
+        assert!(!at(500, 10).may_have_reused(at(500, 40), pid_max, 400));
+        assert!(!at(500, 10).may_have_reused(at(500, 40), pid_max, 500));
+        assert!(!at(500, 10).may_have_reused(at(500, 40), pid_max, 600));
+        // A lap is still a lap, cursor moved or not.
+        assert!(at(500, 10).may_have_reused(at(500, 200_000), pid_max, 400));
     }
 
     /// A group recorded after the previous scan began keeps its session at
@@ -10054,32 +10089,107 @@ mod tests {
     }
 
     /// A census saved by one process and loaded by another finds the same
-    /// members as a scan with none, and reads fewer `stat` files; a census
-    /// for another boot or PID namespace is not loaded at all.
+    /// members as a scan with none, and skips exactly what it may: the PIDs it
+    /// knows to be in another session. A census can save reads only where such
+    /// PIDs exist. In a PID namespace where every process shares the test's
+    /// session (the pinned root has about 26 PIDs) there is nothing to skip, so
+    /// the test makes that shape itself: three processes in a session of their
+    /// own, which no scan without a census may skip and the carried census must.
+    /// A census for another boot or PID namespace is not loaded at all.
     #[test]
     fn a_census_carried_to_another_process_finds_the_same_members() {
         use std::os::unix::process::CommandExt;
+        assert!(
+            PidAllocator::read().is_some() && read_pid_max().is_some(),
+            "the census needs /proc/loadavg, /proc/stat and /proc/sys/kernel/pid_max"
+        );
+        // Three processes in a new session; each stays until the session is killed.
+        let mut other = std::process::Command::new("sh");
+        other.args(["-c", "sleep 60 & sleep 60 & exec sleep 60"]);
+        // SAFETY: setsid is async-signal-safe; the child is not a group leader.
+        unsafe {
+            other.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut other = other.spawn().unwrap();
+        let other_session = other.id();
+        let in_other_session = || -> BTreeSet<u32> {
+            fs::read_dir("/proc")
+                .unwrap()
+                .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+                .filter(|pid| {
+                    matches!(read_process_stat(*pid), Ok(StatRead::Bytes(stat))
+                        if stat_session(&stat) == Some(other_session))
+                })
+                .collect()
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut skippable = in_other_session();
+        while skippable.len() < 3 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+            skippable = in_other_session();
+        }
         let mut child = std::process::Command::new("sleep")
-            .arg("30")
+            .arg("60")
             .process_group(0)
             .spawn()
             .unwrap();
         let pgid = child.id();
+        let group_session = u32::try_from(unsafe { libc::getsid(0) }).unwrap();
         let mut writer = SessionCensus::default();
-        let (cold, cold_reads) = scan_process_group(&mut writer, pgid).unwrap();
+        let cold = scan_process_group(&mut writer, pgid).unwrap();
         let scope = census_scope().unwrap();
         let text = writer.render(&scope).unwrap();
         let mut reader = SessionCensus::parse(&text, &scope).unwrap();
         assert_eq!(reader.sessions, writer.sessions);
-        let (warm, warm_reads) = scan_process_group(&mut reader, pgid).unwrap();
+        let warm = scan_process_group(&mut reader, pgid).unwrap();
         // With no census at all the scan reads every PID.
-        let (none, _) = scan_process_group(&mut SessionCensus::default(), pgid).unwrap();
+        let none = scan_process_group(&mut SessionCensus::default(), pgid).unwrap();
+        let still_there = in_other_session();
         child.kill().unwrap();
         child.wait().unwrap();
-        assert_eq!(cold, vec![pgid]);
-        assert_eq!(warm, cold);
-        assert_eq!(none, cold);
-        assert!(warm_reads < cold_reads, "{warm_reads} >= {cold_reads}");
+        unsafe { libc::kill(-(other_session as i32), libc::SIGKILL) };
+        other.wait().unwrap();
+        assert_eq!(
+            skippable.len(),
+            3,
+            "the other session never had its 3 processes"
+        );
+        assert_eq!(
+            still_there, skippable,
+            "a process of the other session left early"
+        );
+        assert_eq!(cold.members, vec![pgid]);
+        assert_eq!(warm.members, cold.members);
+        assert_eq!(none.members, cold.members);
+        // Without a census nothing may be skipped, so the other session's PIDs
+        // are read; the carried census skips every one of them.
+        assert_eq!(cold.skipped, Vec::<u32>::new());
+        assert_eq!(none.skipped, Vec::<u32>::new());
+        let skipped: BTreeSet<u32> = warm.skipped.iter().copied().collect();
+        assert!(
+            skippable.is_subset(&skipped),
+            "the census skipped {skipped:?}, not all of {skippable:?}"
+        );
+        // And it skipped nothing it may not: each skipped PID was cached in a
+        // session other than the group's, and is not the group's session leader.
+        // (A count comparison of the two scans is no property of the census:
+        // other tests create and reap processes in this session between them.)
+        for pid in &skipped {
+            assert_ne!(
+                *pid, group_session,
+                "the group's session leader was skipped"
+            );
+            let cached = writer.sessions.get(pid);
+            assert!(
+                cached.is_some_and(|session| *session != group_session),
+                "PID {pid} was skipped with cached session {cached:?}, group session {group_session}"
+            );
+        }
         assert!(SessionCensus::parse(&text, "another-boot pid:[1]").is_none());
         assert!(SessionCensus::parse(&text.replace("/v1", "/v0"), &scope).is_none());
         assert!(SessionCensus::parse(&format!("{text}12 x\n"), &scope).is_none());
