@@ -8897,6 +8897,16 @@ impl RunOpts {
         options
     }
 
+    /// These options with `mount` added after the caller's own, as one of
+    /// them (shown in the guest's mount table): the DBT adapter's tmpfs at
+    /// the test workdir, which the guest uses as its working directory.
+    #[cfg(feature = "dbt")]
+    pub(super) fn with_guest_mount(&self, mount: Mount) -> Self {
+        let mut options = self.clone();
+        options.mount.push(mount);
+        options
+    }
+
     /// Whether the caller's `--mount`s install a fresh tmpfs at guest path
     /// `target` (a mount of type tmpfs: setting that type changes nothing).
     #[cfg(feature = "dbt")]

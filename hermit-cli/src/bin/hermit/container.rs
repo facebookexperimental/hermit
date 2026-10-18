@@ -588,9 +588,11 @@ pub(super) struct PlannedMount {
     /// The mount, at the target it is installed at (a mount below guest
     /// `/tmp` is installed in Hermit's private tmp directory first).
     pub(super) mount: Mount,
-    /// Whether it is a backend's own mount (DBT's statistics bind and test
-    /// workdir, e9patch's overlay of the rewritten program), which the guest's
-    /// mount table leaves out by this identity, not by its path.
+    /// Whether it is a backend's own mount (DBT's statistics bind, e9patch's
+    /// overlay of the rewritten program), which the guest's mount table leaves
+    /// out by this identity, not by its path. DBT's tmpfs at the test workdir
+    /// is not one: it is the guest's working directory, shown as the caller's
+    /// mount there is on every other backend.
     pub(super) backend: bool,
 }
 
@@ -622,10 +624,16 @@ enum MountPlan {
     Unrecorded,
     /// The plan, given to the container's setup to install; what the kernel
     /// will list for each of its mounts, resolved over the host's tree before
-    /// the container starts ([`installations_of`]); and whether the rows each
-    /// installation created have been recorded in them
-    /// ([`IdentityGuard::record_plan`]).
-    Recorded(Vec<PlannedMount>, Vec<Installation>, bool),
+    /// the container starts ([`installations_of`]); and, once the rows each
+    /// installation created are recorded in them
+    /// ([`IdentityGuard::record_plan`]), the namespace's rows as read then,
+    /// which nothing changes afterwards (a container's namespace can hold
+    /// hundreds of rows, so it is read and parsed once per launch).
+    Recorded(
+        Vec<PlannedMount>,
+        Vec<Installation>,
+        Option<Vec<detcore_model::container_mounts::ContainerMount>>,
+    ),
     /// An image root (`--image`): every mount the guest's root can see is one
     /// the container's setup installed into the image, so all are Hermit's.
     ImageRoot,
@@ -664,7 +672,7 @@ impl IdentityGuard {
         }
         container.mounts(plan.iter().map(|planned| planned.mount.clone()));
         let installations = installations_of(&plan);
-        self.plan = MountPlan::Recorded(plan, installations, false);
+        self.plan = MountPlan::Recorded(plan, installations, None);
         Ok(())
     }
 
@@ -676,7 +684,7 @@ impl IdentityGuard {
         container: &mut Container,
         mounts: impl IntoIterator<Item = Mount>,
     ) -> Result<(), Error> {
-        let MountPlan::Recorded(plan, installations, false) = &mut self.plan else {
+        let MountPlan::Recorded(plan, installations, None) = &mut self.plan else {
             anyhow::bail!("a backend's own mounts need the container's mount plan");
         };
         for mount in mounts {
@@ -725,7 +733,7 @@ impl IdentityGuard {
         let MountPlan::Recorded(_, installations, recorded) = &mut self.plan else {
             return Ok(());
         };
-        if *recorded {
+        if recorded.is_some() {
             return Ok(());
         }
         let rows = namespace_rows()?;
@@ -737,7 +745,7 @@ impl IdentityGuard {
         }
         check_installed_rows(&rows, installations, is_this_namespaces_proc)
             .map_err(|refusal| anyhow!("refusing the container's mount table: {refusal}"))?;
-        *recorded = true;
+        *recorded = Some(rows);
         Ok(())
     }
 
@@ -764,19 +772,26 @@ impl IdentityGuard {
     /// mount a file on one reports, and are only never shown
     /// (`is_ephemeral_host_seed`), unless the plan installed one.
     pub(super) fn container_mount_table(&self) -> Result<Option<ContainerMountTable>, Error> {
-        let rows = namespace_rows()?;
-        let (installed, backend) = match &self.plan {
+        let (rows, installed, backend) = match &self.plan {
             MountPlan::Unrecorded => return Ok(None),
-            MountPlan::Recorded(_, _, false) => {
+            MountPlan::Recorded(_, _, None) => {
                 anyhow::bail!(
                     "the container mount table was asked for before the plan was recorded"
                 )
             }
-            MountPlan::Recorded(_, installations, true) => owned_mounts(&rows, installations),
-            MountPlan::ImageRoot => (
-                rows.iter().map(|row| row.raw_mount_id).collect(),
-                std::collections::BTreeSet::new(),
-            ),
+            MountPlan::Recorded(_, installations, Some(rows)) => {
+                let (installed, backend) = owned_mounts(rows, installations);
+                (std::borrow::Cow::Borrowed(rows), installed, backend)
+            }
+            MountPlan::ImageRoot => {
+                let rows = namespace_rows()?;
+                let installed = rows.iter().map(|row| row.raw_mount_id).collect();
+                (
+                    std::borrow::Cow::Owned(rows),
+                    installed,
+                    std::collections::BTreeSet::new(),
+                )
+            }
         };
         let never = rows
             .iter()

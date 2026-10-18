@@ -1560,30 +1560,26 @@ struct DbtExecution {
 #[cfg(feature = "dbt")]
 impl DbtExecution {
     fn new(options: &super::run::RunOpts, test_workdir: bool) -> Self {
-        // A marked workdir gets the fresh tmpfs that `hermit_test_workdir`
-        // mounts on it, unless the caller already mounts a tmpfs there (as
-        // the CLI tests' `--mount=type=tmpfs,target=/test` does), which is as
-        // fresh: a second tmpfs stacked on the first would change nothing the
-        // guest can use. A caller's mount of another type there keeps DBT's
-        // fresh tmpfs on top. Either way the guest's mount table shows the
-        // caller's mount and leaves out DBT's, by its identity as a backend's
-        // own (https://github.com/rrnewton/hermit/issues/4213).
+        // A marked workdir (the validate harness's HERMIT_E2E_EMPTY_WORKDIR)
+        // gets a fresh tmpfs, unless the caller already mounts a tmpfs there.
+        // It is the guest's working directory, part of the guest's machine,
+        // so it is a mount of the caller's kind, built exactly as the
+        // harness's `--mount=type=tmpfs,target=/test` is for every other
+        // backend (DBT refuses --mount): the guest's mount table then shows
+        // the same row on every backend
+        // (https://github.com/rrnewton/hermit/issues/4213).
         let test_workdir =
             test_workdir && !options.mounts_tmpfs_at(Path::new(hermit_test_workdir::WORKDIR));
-        let mounts = if test_workdir {
-            vec![
-                reverie::process::Mount::tmpfs(hermit_test_workdir::WORKDIR)
-                    .flags(
-                        reverie::process::MountFlags::MS_NOSUID
-                            | reverie::process::MountFlags::MS_NODEV,
-                    )
-                    .data("mode=1777"),
-            ]
+        let options = if test_workdir {
+            let workdir = format!("type=tmpfs,target={}", hermit_test_workdir::WORKDIR)
+                .parse::<reverie::process::Mount>()
+                .expect("a tmpfs mount at the test workdir parses");
+            options.with_guest_mount(workdir)
         } else {
-            Vec::new()
+            options.clone()
         };
         Self {
-            options: options.with_dbt_mounts(&[], mounts),
+            options,
             statistics: Default::default(),
             unsupported_report: None,
             config_dir: dynamorio_config_dir(),

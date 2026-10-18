@@ -89,7 +89,7 @@ impl Record {
         }
 
         let metadata_path = dir.join(METADATA_NAME);
-        serde_json::to_writer_pretty(fs::File::create(&metadata_path)?, &metadata)
+        write_metadata(fs::File::create(&metadata_path)?, &metadata)
             .context("Failed to serialize metadata")?;
 
         config.mountinfo_root_rewrites = metadata.mountinfo_root_rewrites.clone();
@@ -133,7 +133,7 @@ impl Record {
             .parent()
             .ok_or_else(|| Error::msg("recording metadata path has no parent"))?;
         let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-        serde_json::to_writer_pretty(temporary.as_file_mut(), metadata)
+        write_metadata(temporary.as_file_mut(), metadata)
             .context("Failed to serialize final recording metadata")?;
         temporary
             .persist(metadata_path)
@@ -182,4 +182,13 @@ impl Record {
 /// The lowercase hex form of a digest, as the recording stores it.
 pub(crate) fn hex_digest(digest: &[u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Writes a recording's metadata as pretty JSON through a buffer: serde_json
+/// issues one write(2) per token to an unbuffered file, and a container mount
+/// table makes that thousands of lines.
+fn write_metadata(file: impl std::io::Write, metadata: &Metadata) -> std::io::Result<()> {
+    let mut writer = std::io::BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, metadata)?;
+    std::io::Write::flush(&mut writer)
 }

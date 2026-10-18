@@ -135,9 +135,9 @@ impl ContainerMount {
     /// (`crate::procfs::is_ephemeral_host_seed_mount`), which the table never
     /// shows unless Hermit installed it.
     pub fn is_ephemeral_host_seed(&self) -> bool {
-        let mut line = Vec::new();
-        self.write_mountinfo(&mut line);
-        crate::procfs::is_ephemeral_host_seed_mount(line.strip_suffix(b"\n").unwrap_or(&line))
+        // From the fields, not a rendered line: a container's namespace can
+        // hold hundreds of rows, and this runs for each at every launch.
+        crate::procfs::is_ephemeral_host_seed_fields(&self.mountpoint, &self.fstype)
     }
 
     /// Append this row as Linux's `show_mountinfo` writes it.
@@ -221,7 +221,7 @@ pub fn parse_container_mounts(contents: &[u8]) -> Option<Vec<ContainerMount>> {
 }
 
 /// The guest's container mount table (see the module documentation).
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ContainerMountTable {
     /// The rows the guest sees, in the kernel's row order.
     pub mounts: Vec<ContainerMount>,
@@ -229,6 +229,23 @@ pub struct ContainerMountTable {
     /// above it that the table shows, as raw mount IDs: a file on a hidden
     /// mount reports that mount's ID in fdinfo `mnt_id` and `STATX_MNT_ID`.
     pub hidden_ancestors: Vec<(u64, u64)>,
+}
+
+/// Only the table's size: Detcore logs its whole configuration, this table
+/// included, on one line at each run's start, and verbose verification
+/// compares that line between two runs character by character. The rows'
+/// raw mount IDs differ from run to run, and their bytes print as decimal
+/// lists, so in a container with long mount options (an overlay root's layer
+/// list) the line, and that comparison, grew without bound: the validate
+/// node running hermit_modes hit its 4 GiB memory cap on it.
+impl std::fmt::Debug for ContainerMountTable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ContainerMountTable")
+            .field("rows", &self.mounts.len())
+            .field("hidden", &self.hidden_ancestors.len())
+            .finish()
+    }
 }
 
 impl ContainerMountTable {
@@ -415,8 +432,8 @@ pub struct Installation {
     /// A bind's source directory, as the kernel escapes it (as named and as
     /// resolved), whose mounts a recursive bind copies below the target.
     pub sources: Vec<Vec<u8>>,
-    /// Whether the installation is a backend's own (DBT's statistics bind and
-    /// test workdir, e9patch's overlay of the rewritten program): plumbing,
+    /// Whether the installation is a backend's own (DBT's statistics bind,
+    /// e9patch's overlay of the rewritten program): plumbing,
     /// not part of the guest's machine, so never shown, and neither is a
     /// recursive bind's copy of one.
     pub backend: bool,
@@ -645,7 +662,7 @@ mod tests {
 23 22 0:24 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,gid=5,mode=620,ptmxmode=000\n\
 24 20 0:25 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs rw\n\
 25 20 259:5 / /data rw,relatime - ext4 /dev/nvme1n1 rw\n\
-26 25 0:40 / /data/users/a/fbsource rw,nosuid,nodev,relatime - fuse.edenfs edenfs rw,user_id=0\n\
+26 25 0:40 / /data/a rw,nosuid,nodev,relatime - fuse.edenfs edenfs rw,user_id=0\n\
 27 20 0:26 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw,size=1024k\n\
 28 20 259:4 /tmp/tmpAbC/group /etc/group ro,relatime - btrfs /dev/nvme0n1p4 rw,ssd,subvol=/\n\
 29 21 0:41 / /proc rw,relatime - proc proc rw\n\
@@ -788,7 +805,7 @@ mod tests {
             churned.extend_from_slice(line);
             if line.starts_with(b"25 ") {
                 churned.extend_from_slice(
-                    b"95 25 0:93 / /data/users/b/checkout rw,nosuid,nodev,relatime - \
+                    b"95 25 0:93 / /data/b rw,nosuid,nodev,relatime - \
                       fuse.edenfs edenfs rw,user_id=1\n",
                 );
                 churned.extend_from_slice(

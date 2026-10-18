@@ -66,6 +66,12 @@ pub fn is_ephemeral_host_seed_mount(line: &[u8]) -> bool {
     };
     let mount_point = fields.get(4).copied().unwrap_or_default();
     let fs_type = fields.get(separator + 1).copied().unwrap_or_default();
+    is_ephemeral_host_seed_fields(mount_point, fs_type)
+}
+
+/// [`is_ephemeral_host_seed_mount`] for a row already split into its
+/// mountpoint and filesystem type (fields 5 and 9).
+pub fn is_ephemeral_host_seed_fields(mount_point: &[u8], fs_type: &[u8]) -> bool {
     let name = mount_point
         .rsplit(|byte| *byte == b'/')
         .next()

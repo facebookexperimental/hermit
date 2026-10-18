@@ -872,10 +872,11 @@ impl Metadata {
     /// Reads the metadata of the recording stored in `dir`.
     pub fn load(dir: &Path) -> Result<Self, Error> {
         let metadata_path = dir.join(METADATA_NAME);
-        serde_json::from_reader(
+        // Buffered: serde_json reads an unbuffered file one byte per read(2).
+        serde_json::from_reader(std::io::BufReader::new(
             fs::File::open(&metadata_path)
                 .with_context(|| format!("Failed to open {:?}", metadata_path))?,
-        )
+        ))
         .with_context(|| format!("Failed to parse {:?}", metadata_path))
     }
 
