@@ -221,7 +221,8 @@ const INTEGRATION_ARTIFACT_WRAPPER: &str =
 // a profile this producer had stopped preparing, so the bracket refused a graph
 // that was correct. Renamed as well as retargeted: a constant whose name says
 // portable while its value says full is the same defect one layer down.
-const NEXTEST_FULL_PREPARE_COMMAND: &str = "./ci/nextest-binaries.rs prepare full";
+const NEXTEST_FULL_PREPARE_COMMAND: &str =
+    "./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target";
 const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str = "./ci/nextest-binaries.rs assert privileged";
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str =
     r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1"#;
@@ -7584,6 +7585,7 @@ mod ordinary_artifact_pointer_tests {
         let source = Path::new(file!()).parent().unwrap().parent().unwrap();
         std::fs::create_dir_all(root.join("ci")).unwrap();
         for name in [
+            "verify-packaged-detcore.py",
             "publish-hermit-e2e-artifact.sh",
             "verify-hermit-e2e-artifact.sh",
             "run-with-hermit-e2e-artifact.sh",
@@ -7610,6 +7612,14 @@ mod ordinary_artifact_pointer_tests {
             std::fs::write(&path, format!("#!/bin/sh\n# {marker} {name}\nexit 0\n")).unwrap();
             exec_safe_fs::set_executable(path, 0o700).unwrap();
         }
+        let fixture = Command::new("python3")
+            .arg(source.join("ci/test_packaged_detcore.py"))
+            .arg("--write-fixture")
+            .arg(&install)
+            .arg("1".repeat(40))
+            .output()
+            .unwrap();
+        assert!(fixture.status.success(), "{fixture:?}");
         let pointer = root.join("target/ci/hermit-e2e-artifact.path");
         let output = Command::new(root.join("ci/publish-hermit-e2e-artifact.sh"))
             .arg(binary)
@@ -31005,11 +31015,25 @@ output.chmod(0o755)
             "a cold consumer cannot invent the missing preparation"
         );
         assert!(!log.exists(), "the consumer must not fall back to Cargo");
+        // Model only the finalizer's ordering/argv here; its physical and
+        // receipt checks have separate real-artifact and mismatch controls.
+        write_executable(
+            &root.path().join("target/validate/stage-detcore-liteinst"),
+            r#"#!/bin/sh
+[ "$#" -eq 2 ] && [ "$1" = --git ] && [ "$2" = target ] || exit 2
+test -f target/ci/nextest-binaries/current.json || exit 3
+printf finalized >target/finalized
+"#,
+        );
         let prepared = run_build(preparation, root.path(), &bin, &log, "current");
         assert!(
             prepared.status.success(),
             "{}",
             String::from_utf8_lossy(&prepared.stderr)
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("target/finalized")).unwrap(),
+            b"finalized"
         );
         let before = std::fs::read_to_string(&log).unwrap();
         // The FULL profile, because `preparation` above is the full plan's own

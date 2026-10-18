@@ -57,6 +57,7 @@ stamped build embeds one:
 
 ```sh
 HERMIT_STAMP_GIT_SHA=1 cargo build --release --workspace --features hermit/third-party-backends
+target/release/stage-detcore-liteinst --git target
 ```
 
 Then invoke the guarded wrapper with explicit absolute paths:
@@ -434,7 +435,13 @@ host in the checkout's `target/stage-hermit/`, beside its other Cargo builds,
 and copies the binary to `target/validate/hermit`. It has the same features,
 debug assertions and overflow checks as a Cargo-runner build; it differs only
 in the DynamoRIO build paths `reverie-dbt` records as a fallback, since Hermit
-finds that runtime through `install_pkg`. The ledger row records `release_builder: cargo`,
+finds that runtime through `install_pkg`. After its final Cargo invocation the
+stager runs `target/validate/stage-detcore-liteinst --source-copy target` against
+the explicit copied-source authority; supplied `--bundle` resources must already
+carry the same ordinary-runtime qualification receipt. A bare Cargo installation
+is incomplete until `target/release/stage-detcore-liteinst --git target` succeeds.
+The shadow command verifies that finalized caller installation before its initial
+resource snapshot; it does not rebuild or substitute a runtime. The ledger row records `release_builder: cargo`,
 the Cargo `e2e_payload` identity unchanged, and `e2e_runner` (`cargo`,
 `buck-local` or `buck-hybrid`). A Buck-runner request is never answered from the
 tree cache, and a Buck-runner row never answers a cargo request: the cache reads

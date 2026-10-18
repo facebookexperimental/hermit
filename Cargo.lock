@@ -1082,7 +1082,10 @@ name = "hermit-install"
 version = "0.4.0"
 dependencies = [
  "reverie-dbt",
+ "reverie-liteinst-artifact",
  "reverie-sabre",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]
@@ -1867,6 +1870,18 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "reverie-liteinst-artifact"
+version = "0.4.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=ce6433f83adfc3e666d1ebed175b869edaea3574#ce6433f83adfc3e666d1ebed175b869edaea3574"
+dependencies = [
+ "goblin",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

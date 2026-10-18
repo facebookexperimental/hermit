@@ -9,6 +9,11 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+reverie-liteinst-artifact = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "ce6433f83adfc3e666d1ebed175b869edaea3574", default-features = false }
+serde_json = "1"
+toml = "0.8"
+
 [build-dependencies]
 reverie-dbt = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "ce6433f83adfc3e666d1ebed175b869edaea3574", default-features = false }
 reverie-sabre = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "ce6433f83adfc3e666d1ebed175b869edaea3574" }
