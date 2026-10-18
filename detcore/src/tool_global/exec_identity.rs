@@ -77,6 +77,11 @@ impl GlobalState {
             reconnect_priority: None,
         });
         global_time.reassign_thread(former, current);
+        // The exec'ing thread keeps its root under its new number.
+        self.process_auxv
+            .lock()
+            .unwrap()
+            .transfer_root(former, current);
         self.completed_exec_transfers.lock().unwrap().insert(
             process,
             ExecTransferReceipt {

@@ -96,7 +96,15 @@ enum ProcfsKind {
     BtrfsBytesReserved,
     BtrfsBytesPinned,
     Rtc,
+    /// `/proc/<pid>/mountinfo`. Where the run has a container mount table
+    /// (`Config::container_mount_table`), its bytes are that table's, on every
+    /// backend and under record and replay; otherwise the kernel's, sanitized.
     Mountinfo,
+    /// `/proc/<pid>/mounts`, and `/proc/mounts`, the link to the caller's.
+    /// Where the run has a container mount table, its bytes are that table's,
+    /// as `mountinfo`'s are; otherwise the kernel's, unchanged
+    /// (<https://github.com/rrnewton/hermit/issues/3719>).
+    ProcessMounts,
     RandomUuid,
     Locks,
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -526,23 +534,48 @@ pub(crate) fn placeholder_link(
 pub(crate) struct RenderedFiles {
     /// Whether Detcore renders `/proc/cpuinfo`.
     pub(crate) cpuinfo: bool,
+    /// Whether Detcore renders every process's `mountinfo` and `mounts` from
+    /// the run's container mount table: exactly where the run has one
+    /// (`Config::container_mount_table`, which hermit-cli builds for a run in
+    /// its container).
+    pub(crate) mounts: bool,
 }
 
 impl RenderedFiles {
-    /// Every file Detcore can render, `/proc/cpuinfo` too.
-    pub(crate) const ALL: Self = Self { cpuinfo: true };
+    /// Every file Detcore can render, `/proc/cpuinfo` and the mount table's
+    /// files too.
+    pub(crate) const ALL: Self = Self {
+        cpuinfo: true,
+        mounts: true,
+    };
 
-    /// The files Detcore renders in every session, without `/proc/cpuinfo`.
-    pub(crate) const WITHOUT_CPUINFO: Self = Self { cpuinfo: false };
+    /// The files Detcore renders in every session, without `/proc/cpuinfo`
+    /// and the mount table's files.
+    pub(crate) const WITHOUT_CPUINFO: Self = Self {
+        cpuinfo: false,
+        mounts: false,
+    };
 
     /// The files a session renders whose configuration virtualizes CPUID
     /// (`virtualize_cpuid`) and whose backend delivers the guest's CPUID
-    /// instruction to Detcore (`cpuid_interception`).
-    pub(crate) fn of(virtualize_cpuid: bool, cpuid_interception: bool) -> Self {
+    /// instruction to Detcore (`cpuid_interception`), with a container mount
+    /// table or without one (`mount_table`).
+    pub(crate) fn of(virtualize_cpuid: bool, cpuid_interception: bool, mount_table: bool) -> Self {
         Self {
             cpuinfo: virtualize_cpuid && cpuid_interception,
+            mounts: mount_table,
         }
     }
+}
+
+/// The two renderings of the container mount table
+/// (`detcore_model::container_mounts`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MountTableRendering {
+    /// `/proc/<pid>/mountinfo`.
+    Mountinfo,
+    /// `/proc/<pid>/mounts` and `/proc/mounts`.
+    Mounts,
 }
 
 /// How a `/proc` path names the process or thread a per-process file belongs
@@ -789,6 +822,13 @@ pub(crate) struct ProcfsFile {
     /// otherwise than Detcore (DBT; [`ProcfsFile::kernel_numbers_held`]).
     #[serde(default)]
     guest_numbers: Option<BTreeMap<i32, i32>>,
+    /// For a process's `mountinfo` or `mounts` the kernel opened, whether it
+    /// reads the kernel's view (its task's root had changed when it was
+    /// opened) rather than the container mount table, pinned at the open, as
+    /// Linux pins the task's root (`mounts_open_common`)
+    /// ([`ProcfsFile::pin_mount_view`]). `None` where nothing pinned it.
+    #[serde(default)]
+    mount_view_kernel: Option<bool>,
     contents: Option<Vec<u8>>,
     offset: usize,
 }
@@ -1156,6 +1196,8 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-873): Review deterministic kernel pseudo-file snapshots.
             other if is_process_file_path(other, "mountinfo") => ProcfsKind::Mountinfo,
+            "/proc/mounts" => ProcfsKind::ProcessMounts,
+            other if is_process_file_path(other, "mounts") => ProcfsKind::ProcessMounts,
             "/proc/sys/kernel/random/uuid" => ProcfsKind::RandomUuid,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-927): Review host-global PTY count normalization.
@@ -1274,8 +1316,13 @@ impl ProcfsFile {
             _ if is_irq_per_cpu_count_path(&path) => ProcfsKind::IrqPerCpuCount,
             _ => sysfs_rtc_kind(&path)?,
         };
+        // `/proc/mounts` is Linux's link to the caller's `self/mounts`.
+        let task_path = match path_text {
+            "/proc/mounts" => "/proc/self/mounts",
+            other => other,
+        };
         let task = Self::per_process_name_of(&kind)
-            .and_then(|filename| ProcfsTask::parse(path_text, filename));
+            .and_then(|filename| ProcfsTask::parse(task_path, filename));
         Some(Self {
             kind,
             task,
@@ -1285,6 +1332,7 @@ impl ProcfsFile {
             timer_slack_identity: None,
             rendered: false,
             guest_numbers: None,
+            mount_view_kernel: None,
             contents: None,
             offset: 0,
         })
@@ -1304,7 +1352,10 @@ impl ProcfsFile {
     /// task's, `/proc/<pid>/<file>` or `/proc/<pid>/task/<tid>/<file>`, as
     /// Linux names the file in descriptor links.
     pub(crate) fn rendered_path(&self, files: RenderedFiles) -> Option<&'static Path> {
-        self.rendered_path_where(self.rendered || files.cpuinfo)
+        self.rendered_path_where(
+            self.rendered || files.cpuinfo,
+            self.rendered || files.mounts,
+        )
     }
 
     /// The path of this file where the reads of a descriptor open on it are
@@ -1339,14 +1390,42 @@ impl ProcfsFile {
             .map(|(_, name)| *name)
     }
 
-    /// The per-process files Detcore renders, and their names.
-    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 2] = [
+    /// The per-process files Detcore renders, and their names. `mountinfo`
+    /// and `mounts` only in a session with a container mount table
+    /// ([`RenderedFiles::mounts`]).
+    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 4] = [
         (ProcfsKind::ProcessCgroup, "cgroup"),
         (ProcfsKind::ProcessAuxv, "auxv"),
+        (ProcfsKind::Mountinfo, "mountinfo"),
+        (ProcfsKind::ProcessMounts, "mounts"),
     ];
 
     /// The names of the per-process files Detcore renders.
-    pub(crate) const PER_PROCESS_NAMES: [&'static str; 2] = ["cgroup", "auxv"];
+    pub(crate) const PER_PROCESS_NAMES: [&'static str; 4] =
+        ["cgroup", "auxv", "mountinfo", "mounts"];
+
+    /// Pin which view of the mounts this kernel-opened `mountinfo` or `mounts`
+    /// reads: the kernel's (`kernel`, its task's root had changed when it was
+    /// opened) or the container mount table. Linux takes the task's root at
+    /// the open, so a later `chroot` changes nothing an open file reads.
+    pub(crate) fn pin_mount_view(&mut self, kernel: bool) {
+        self.mount_view_kernel = Some(kernel);
+    }
+
+    /// The view [`Self::pin_mount_view`] pinned, if any.
+    pub(crate) fn pinned_mount_view(&self) -> Option<bool> {
+        self.mount_view_kernel
+    }
+
+    /// Which rendering of the container mount table this file is, if it is
+    /// one: a process's `mountinfo` or its `mounts`.
+    pub(crate) fn mount_table_rendering(&self) -> Option<MountTableRendering> {
+        match self.kind {
+            ProcfsKind::Mountinfo => Some(MountTableRendering::Mountinfo),
+            ProcfsKind::ProcessMounts => Some(MountTableRendering::Mounts),
+            _ => None,
+        }
+    }
 
     /// Whether a descriptor the kernel opened on this file (under record and
     /// replay, after `chroot`, through `..`) is classified as this file, so
@@ -1363,8 +1442,14 @@ impl ProcfsFile {
     /// position), which finds its task again: a process's `cgroup`. Not
     /// `auxv`, whose snapshot Linux takes at the open (`auxv_open` pins the
     /// memory map, and `auxv_read` reads its `saved_auxv`).
+    ///
+    /// Nor `mountinfo` or `mounts`, whose open takes the task's mount
+    /// namespace and root (`mounts_open_common`) and whose reads show that
+    /// namespace whatever became of the task since.
     pub(crate) fn shows_at_read(&self) -> bool {
-        self.per_process_name().is_some() && self.kind != ProcfsKind::ProcessAuxv
+        self.per_process_name().is_some()
+            && self.kind != ProcfsKind::ProcessAuxv
+            && self.mount_table_rendering().is_none()
     }
 
     /// Whether this is a process's `auxv`.
@@ -1413,13 +1498,18 @@ impl ProcfsFile {
     /// behind it ([`Self::is_rendered`]).
     pub(crate) fn opened_path(&self) -> Option<&'static Path> {
         self.rendered
-            .then(|| self.rendered_path_where(true))
+            .then(|| self.rendered_path_where(true, true))
             .flatten()
     }
 
     /// [`Self::rendered_path`], where Detcore renders `/proc/cpuinfo` exactly
-    /// when `cpuinfo_rendered`.
-    fn rendered_path_where(&self, cpuinfo_rendered: bool) -> Option<&'static Path> {
+    /// when `cpuinfo_rendered`, and a process's `mountinfo` and `mounts`
+    /// exactly when `mounts_rendered`.
+    fn rendered_path_where(
+        &self,
+        cpuinfo_rendered: bool,
+        mounts_rendered: bool,
+    ) -> Option<&'static Path> {
         match self.kind {
             ProcfsKind::RandomUuid => Some(Path::new("/proc/sys/kernel/random/uuid")),
             ProcfsKind::PtyNr => Some(Path::new("/proc/sys/kernel/pty/nr")),
@@ -1427,6 +1517,7 @@ impl ProcfsFile {
             ProcfsKind::SystemStat => Some(Path::new("/proc/stat")),
             ProcfsKind::Cpuinfo if cpuinfo_rendered => Some(Path::new("/proc/cpuinfo")),
             ProcfsKind::Fixed(file) => Some(file.path()),
+            ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts if !mounts_rendered => None,
             _ if let Some(name) = Self::per_process_name_of(&self.kind) => {
                 Some(per_process_path(self.bound_task()?, name, self.incarnation))
             }
@@ -1439,7 +1530,7 @@ impl ProcfsFile {
     /// decided that this session renders it.
     pub(crate) fn into_rendered(self) -> Self {
         assert!(
-            self.rendered_path_where(true).is_some(),
+            self.rendered_path_where(true, true).is_some(),
             "{:?} is not rendered",
             self.kind
         );
@@ -1496,8 +1587,14 @@ impl ProcfsFile {
     /// A per-process file too: Linux's `single_open` file runs its `show`
     /// method at the first read, which finds the task again (ESRCH once it is
     /// gone), and again after a rewind (`set_offset`).
+    ///
+    /// And a process's `mountinfo` and `mounts`, whose snapshot numbers the
+    /// table's mounts and devices through the run's pools, which an open does
+    /// not reach (`Detcore::initialize_procfs_snapshot`).
     pub(crate) fn snapshot_at_first_read(&self) -> bool {
-        self.snapshot_carries_uptime() || self.shows_at_read()
+        self.snapshot_carries_uptime()
+            || self.shows_at_read()
+            || self.mount_table_rendering().is_some()
     }
 
     /// Whether the snapshot of this file a first read takes is a function of
@@ -1548,6 +1645,9 @@ impl ProcfsFile {
             // open (or, for a descriptor rebuilt from its placeholder, its
             // exec generation) supplies; nothing else is rendered.
             ProcfsKind::ProcessAuxv => b"",
+            // The bytes are the session's container mount table, which the
+            // first read supplies (`Detcore::mount_table_snapshot`).
+            ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts => b"",
             _ => unreachable!("{:?} has no rendered path", self.kind),
         }
     }
@@ -1696,7 +1796,10 @@ impl ProcfsFile {
     /// https://github.com/rrnewton/hermit/pull/4386); the other process
     /// files served from a snapshot still seek as a memory file once read.
     pub(crate) fn seeks_only_from_start_or_position(&self) -> bool {
-        self.kind == ProcfsKind::ProcessCgroup
+        matches!(
+            self.kind,
+            ProcfsKind::ProcessCgroup | ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts
+        )
     }
 
     /// Whether a read that cannot copy everything it formats fails with
@@ -1838,6 +1941,10 @@ impl ProcfsFile {
                     .as_ref()
                     .expect("mountinfo identities were not prepared"),
             ),
+            // The container mount table's rendering, or the kernel's bytes
+            // where the run has no table: neither carries an identity Detcore
+            // numbers (no mount ID, device or peer group).
+            ProcfsKind::ProcessMounts => contents,
             ProcfsKind::RandomUuid => sanitize_random_uuid(
                 &contents,
                 random_uuid.expect("random UUID snapshot omitted deterministic bytes"),
@@ -1997,6 +2104,12 @@ impl ProcfsFile {
     pub(crate) fn target_fd(&self) -> Option<i32> {
         self.target_fd
     }
+}
+
+/// Whether `path` spells `/proc/mounts`, Linux's symbolic link to the
+/// caller's `self/mounts`.
+pub(crate) fn is_proc_mounts_link(path: &Path) -> bool {
+    normalize_observed_path(path).as_deref() == Some(Path::new("/proc/mounts"))
 }
 
 fn normalize_observed_path(path: &Path) -> Option<PathBuf> {
@@ -5327,6 +5440,10 @@ Rss:                   4 kB\n" as &[u8];
             ("/proc/37/mountinfo", ProcfsKind::Mountinfo),
             ("/proc/self/task/38/mountinfo", ProcfsKind::Mountinfo),
             ("/proc/37/task/38/mountinfo", ProcfsKind::Mountinfo),
+            ("/proc/mounts", ProcfsKind::ProcessMounts),
+            ("/proc/self/mounts", ProcfsKind::ProcessMounts),
+            ("/proc/thread-self/mounts", ProcfsKind::ProcessMounts),
+            ("/proc/37/task/38/mounts", ProcfsKind::ProcessMounts),
             ("/proc/sys/kernel/random/uuid", ProcfsKind::RandomUuid),
         ] {
             assert_eq!(ProcfsFile::from_path(Path::new(path)).unwrap().kind, kind);
@@ -5335,14 +5452,79 @@ Rss:                   4 kB\n" as &[u8];
             "/proc/task/mountinfo",
             "/proc/37/task/self/mountinfo",
             "/proc/37/task/38/mountinfo/extra",
-            // `mounts` stays raw passthrough until it shares mountinfo's
-            // seed exclusion and prefix rewrites:
-            // https://github.com/rrnewton/hermit/issues/3719.
-            "/proc/mounts",
-            "/proc/self/mounts",
+            "/proc/mounts/extra",
+            "/proc/37/task/self/mounts",
         ] {
-            assert!(ProcfsFile::from_path(Path::new(path)).is_none());
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none(), "{path}");
         }
+    }
+
+    /// A process's `mountinfo` and `mounts` are per-process files Detcore
+    /// renders exactly in a session with a container mount table
+    /// (https://github.com/rrnewton/hermit/issues/4213, K3a), at their task's
+    /// path, with their snapshot taken at the first read and no task check
+    /// at a read. `/proc/mounts` is the caller's `mounts`, through Linux's
+    /// link.
+    #[test]
+    fn the_mount_table_files_are_rendered_per_process_where_the_session_has_a_table() {
+        for (spelling, name, rendering) in [
+            (
+                "/proc/self/mountinfo",
+                "mountinfo",
+                MountTableRendering::Mountinfo,
+            ),
+            (
+                "/proc/thread-self/mountinfo",
+                "mountinfo",
+                MountTableRendering::Mountinfo,
+            ),
+            ("/proc/mounts", "mounts", MountTableRendering::Mounts),
+            ("/proc/self/mounts", "mounts", MountTableRendering::Mounts),
+        ] {
+            let mut file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            assert_eq!(file.per_process_name(), Some(name), "{spelling}");
+            assert_eq!(file.mount_table_rendering(), Some(rendering), "{spelling}");
+            assert!(file.snapshot_at_first_read(), "{spelling}");
+            assert!(!file.shows_at_read(), "{spelling}");
+            assert!(file.kernel_served(), "{spelling}");
+            assert!(file.seeks_only_from_start_or_position(), "{spelling}");
+            assert_eq!(file.rendered_path(RenderedFiles::ALL), None, "unbound");
+            file.bind_task(37, 38);
+            let without = RenderedFiles::of(true, true, false);
+            assert_eq!(
+                file.rendered_path(without),
+                None,
+                "{spelling} without a table"
+            );
+            let expected = if spelling.starts_with("/proc/thread-self") {
+                format!("/proc/37/task/38/{name}")
+            } else {
+                format!("/proc/37/{name}")
+            };
+            let path = file.rendered_path(RenderedFiles::ALL).unwrap();
+            assert_eq!(path, Path::new(&expected), "{spelling}");
+            // Opened as rendered, it stays so whatever the session renders.
+            let rendered = file.into_rendered();
+            assert_eq!(rendered.rendered_path(without), Some(path));
+            assert_eq!(rendered.rendering_template(), b"");
+        }
+        // A kernel-opened file's view is pinned at its open, and survives a
+        // copy of the description.
+        let mut file = ProcfsFile::from_path(Path::new("/proc/self/mountinfo")).unwrap();
+        assert_eq!(file.pinned_mount_view(), None);
+        file.pin_mount_view(true);
+        assert_eq!(file.clone().pinned_mount_view(), Some(true));
+        let restored: ProcfsFile =
+            serde_json::from_str(&serde_json::to_string(&file).unwrap()).unwrap();
+        assert_eq!(restored.pinned_mount_view(), Some(true));
+        assert!(is_proc_mounts_link(Path::new("/proc/mounts")));
+        assert!(is_proc_mounts_link(Path::new("/proc/./mounts")));
+        assert!(!is_proc_mounts_link(Path::new("/proc/self/mounts")));
+        // Without a table, a kernel-opened `mounts` reads the kernel's bytes.
+        let mut file = ProcfsFile::from_path(Path::new("/proc/self/mounts")).unwrap();
+        let kernel = b"proc /proc proc rw 0 0\n".to_vec();
+        file.initialize(kernel.clone(), ProcfsSnapshotContext::default());
+        assert_eq!(file.contents.as_deref(), Some(kernel.as_slice()));
     }
 
     fn mountinfo_snapshot(contents: &[u8], devices: BTreeMap<u64, u64>) -> MountInfoSnapshot {
@@ -6464,10 +6646,10 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             file.rendered_path(RenderedFiles::ALL),
             Some(Path::new("/proc/cpuinfo"))
         );
-        assert_eq!(RenderedFiles::of(true, true), RenderedFiles::ALL);
+        assert_eq!(RenderedFiles::of(true, true, true), RenderedFiles::ALL);
         for (virtualize, intercepted) in [(true, false), (false, true), (false, false)] {
             assert_eq!(
-                RenderedFiles::of(virtualize, intercepted),
+                RenderedFiles::of(virtualize, intercepted, false),
                 RenderedFiles::WITHOUT_CPUINFO
             );
         }

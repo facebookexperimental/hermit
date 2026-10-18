@@ -890,8 +890,10 @@ mod tests {
             // and container_init_deadline gains the parent-died-before-arming
             // test (+1). And procfs_determinism's directory-alias
             // record/replay test (+1,
-            // https://github.com/rrnewton/hermit/issues/4213).
-            assert_eq!(population, 577);
+            // https://github.com/rrnewton/hermit/issues/4213). And its
+            // staged-bind kernel-path and install-time bind tests (+2, K3a of
+            // the same issue).
+            assert_eq!(population, 579);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

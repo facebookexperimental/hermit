@@ -670,7 +670,14 @@ impl RecordVersion {
 // the recorder (https://github.com/rrnewton/hermit/issues/4213, K1-0), so an
 // openat, stat, access or readlinkat through such a descriptor is now
 // recorded, and an older recording containing one would replay out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16a);
+// 0x16a -> 0x16b (reserved as 0x16b): a recording carries its container's
+// mount table, and Detcore serves /proc/<pid>/mountinfo and /proc/<pid>/mounts
+// (and /proc/mounts) from it in place of the kernel's bytes
+// (https://github.com/rrnewton/hermit/issues/4213, K3a). A mounts file is now a
+// procfs file Detcore serves from a snapshot, where it was read through to the
+// kernel, and neither file captures the kernel's bytes, so an older recording
+// that reads one would replay out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16b);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -695,7 +702,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16a);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x16a;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x16b;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -753,6 +760,13 @@ pub struct Metadata {
     /// Replay numbers each raw ID by its position in this list.
     #[serde(default)]
     pub mount_id_assignment_order: Vec<u64>,
+    /// The recording container's mount table, which Detcore renders as the
+    /// guest's `/proc/<pid>/mountinfo` and `/proc/<pid>/mounts` in place of the
+    /// kernel's bytes, at recording and again at replay
+    /// (<https://github.com/rrnewton/hermit/issues/4213>). `None` in a
+    /// recording made before 0x16b, whose replay keeps the kernel's bytes.
+    #[serde(default)]
+    pub container_mount_table: Option<detcore_model::container_mounts::ContainerMountTable>,
     /// Whether the recording ran in an isolated network namespace with only
     /// loopback (`record start --network local`). `None` means the recorder
     /// did not say, which is every recording made before this field existed;
@@ -839,6 +853,7 @@ impl Metadata {
             mountinfo_mount_ids: Vec::new(),
             mountinfo_mount_ids_captured: false,
             mount_id_assignment_order: Vec::new(),
+            container_mount_table: None,
             local_networking: None,
             proc_level: None,
             cpu_profile: Default::default(),
@@ -953,6 +968,8 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         mountinfo_mount_ids: Vec::new(),
         mountinfo_mount_ids_captured: false,
         mount_id_assignment_order: Vec::new(),
+        // The recorder and the replayer set the table from the recording.
+        container_mount_table: None,
         virtualize_cpuid: true,
         // The recorder and the replayer set the profile from the command line
         // and the recording; see `record_or_replay_config`'s callers.
@@ -1708,6 +1725,21 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_received_directory_lookups() {
         for older in 0x163..=0x169 {
+            assert!(
+                !RECORD_VERSION.compatible_with(&RecordVersion(older)),
+                "{older:#x}"
+            );
+        }
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x16b read the kernel's /proc/<pid>/mountinfo
+    /// and /proc/<pid>/mounts where Detcore now serves the recording
+    /// container's mount table (K3a of
+    /// https://github.com/rrnewton/hermit/issues/4213).
+    #[test]
+    fn record_version_rejects_streams_from_before_the_container_mount_table() {
+        for older in 0x163..=0x16a {
             assert!(
                 !RECORD_VERSION.compatible_with(&RecordVersion(older)),
                 "{older:#x}"

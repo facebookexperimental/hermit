@@ -40,8 +40,10 @@ use reverie::process::Mount;
 use reverie::process::MountFlags;
 
 use super::container::IdentityGuard;
-use super::container::default_container;
+use super::container::PlannedMount;
+use super::container::container_proc_mount;
 use super::container::identity_hardening_mounts;
+use super::container::namespace_container;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
 use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
@@ -486,7 +488,7 @@ impl StartOpts {
         &self,
         network: NetworkingMode,
     ) -> Result<(Container, IdentityGuard), Error> {
-        let mut container = default_container(true);
+        let mut container = namespace_container(true);
         network.configure(&mut container, false);
         let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts()?;
         for mount in &self.mount {
@@ -496,8 +498,12 @@ impl StartOpts {
                 identity_guard.add_user_bind(user_target, None);
             }
         }
-        container.mounts(identity_mounts);
-        container.mounts(self.mount.clone());
+        // The mount plan, `/proc` first, installed by the container's setup
+        // and recorded in its init (`IdentityGuard::record_plan`).
+        let mut plan = vec![PlannedMount::hermit(container_proc_mount())];
+        plan.extend(identity_mounts.into_iter().map(PlannedMount::hermit));
+        plan.extend(self.mount.iter().cloned().map(PlannedMount::hermit));
+        identity_guard.set_plan(&mut container, plan)?;
         if let Some(workdir) = &self.workdir {
             container.current_dir(workdir);
         }
@@ -509,13 +515,19 @@ impl StartOpts {
         global: &GlobalOpts,
     ) -> Result<(Container, IdentityGuard), Error> {
         let overlay = self.prepare_e9patch_overlay(global)?;
-        let (mut container, identity_guard) = self.configured_container(self.network())?;
+        let (mut container, mut identity_guard) = self.configured_container(self.network())?;
         if let Some(overlay) = overlay {
-            container.mount(Mount::bind(&overlay.source, &overlay.target).readonly());
-            container.mount(
-                Mount::new(overlay.target)
-                    .flags(MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_RDONLY),
-            );
+            // The rewritten program over its original path: e9patch's own
+            // mounts, which the guest's mount table leaves out.
+            identity_guard.add_backend_mounts(
+                &mut container,
+                [
+                    Mount::bind(&overlay.source, &overlay.target).readonly(),
+                    Mount::new(overlay.target).flags(
+                        MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_RDONLY,
+                    ),
+                ],
+            )?;
         }
         Ok((container, identity_guard))
     }
@@ -590,8 +602,9 @@ impl StartOpts {
                 None,
                 move |(data, identity)| {
                     let _guard = global.init_tracing();
+                    identity.record_plan()?;
                     let command = options.guest_command()?;
-                    let mountinfo = identity.mountinfo_root_rewrites()?;
+                    let mountinfo = identity.mount_provenance()?;
                     match record_timeout {
                         Some(timeout) => with_recording_deadline(timeout, || {
                             hermit::record_to_with_mountinfo(
@@ -693,8 +706,9 @@ impl StartOpts {
                 None,
                 move |(data, identity, _, _)| {
                     let _guard = record_global.init_tracing();
+                    identity.record_plan()?;
                     let command = options.guest_command()?;
-                    let mountinfo = identity.mountinfo_root_rewrites()?;
+                    let mountinfo = identity.mount_provenance()?;
                     match record_timeout {
                         Some(timeout) => with_recording_deadline(timeout, || {
                             hermit::record_with_output_with_mountinfo(
@@ -854,8 +868,9 @@ impl StartOpts {
             None,
             move |identity| {
                 let _guard = record_global.init_tracing();
+                identity.record_plan()?;
                 let command = options.guest_command()?;
-                let mountinfo = identity.mountinfo_root_rewrites()?;
+                let mountinfo = identity.mount_provenance()?;
                 match record_timeout {
                     Some(timeout) => with_recording_deadline(timeout, || {
                         hermit::record_with_output_with_mountinfo(
@@ -934,8 +949,9 @@ impl StartOpts {
             None,
             move |(data, identity)| {
                 let _guard = record_global.init_tracing();
+                identity.record_plan()?;
                 let command = options.guest_command()?;
-                let mountinfo = identity.mountinfo_root_rewrites()?;
+                let mountinfo = identity.mount_provenance()?;
                 match record_timeout {
                     Some(timeout) => with_recording_deadline(timeout, || {
                         hermit::record_to_with_mountinfo(

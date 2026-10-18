@@ -11,7 +11,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use detcore_model::config::MountInfoRootRewrite;
 use reverie::ExitStatus;
 use reverie::process::Command;
 use reverie::process::Output;
@@ -43,7 +42,7 @@ impl Record {
     pub async fn spawn_with_mountinfo(
         command: Command,
         dir: &Path,
-        mountinfo_root_rewrites: Vec<MountInfoRootRewrite>,
+        mountinfo: crate::MountProvenance,
         mountinfo_mount_ids: Option<Vec<u64>>,
         local_networking: Option<bool>,
         proc_level: Option<detcore_model::config::ProcLevel>,
@@ -69,7 +68,8 @@ impl Record {
         metadata.cpu_profile_host = cpu_profile_host.clone();
         metadata.cpu_profile_residual =
             (!cpu_profile.is_default()).then(|| detcore_model::cpu_profile::V3_RESIDUAL.to_owned());
-        metadata.mountinfo_root_rewrites = mountinfo_root_rewrites;
+        metadata.mountinfo_root_rewrites = mountinfo.root_rewrites;
+        metadata.container_mount_table = mountinfo.container_mount_table;
         metadata.mountinfo_mount_ids_captured = mountinfo_mount_ids.is_some();
         metadata.mountinfo_mount_ids = mountinfo_mount_ids.unwrap_or_default();
 
@@ -96,6 +96,7 @@ impl Record {
         config.mountinfo_mount_ids = metadata.mountinfo_mount_ids.clone();
         config.mountinfo_mount_ids_captured = metadata.mountinfo_mount_ids_captured;
         config.mount_id_assignment_order = metadata.mount_id_assignment_order.clone();
+        config.container_mount_table = metadata.container_mount_table.clone();
         config.proc_level = metadata.proc_level.unwrap_or_default();
 
         crate::cpu_profile_admission::refuse_unadmitted_launch(&config, true)?;

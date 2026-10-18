@@ -123,6 +123,9 @@ impl Replay {
         config.mountinfo_mount_ids = metadata.mountinfo_mount_ids.clone();
         config.mountinfo_mount_ids_captured = metadata.mountinfo_mount_ids_captured;
         config.mount_id_assignment_order = metadata.mount_id_assignment_order.clone();
+        // The recording container's mount table: the guest's mountinfo and
+        // mounts read the bytes they read at recording.
+        config.container_mount_table = metadata.container_mount_table.clone();
         // The recording's `/proc` level: a replay sees the names its recording
         // saw.
         config.proc_level = metadata.proc_level.unwrap_or_default();

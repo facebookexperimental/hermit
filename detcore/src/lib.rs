@@ -505,7 +505,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// subscription before the first entry; DBT always intercepts), and a new
     /// task takes its parent's.
     pub(crate) fn rendered_files<G: Guest<Self>>(&self, guest: &G) -> procfs::RenderedFiles {
-        procfs::RenderedFiles::of(self.cfg.virtualize_cpuid, guest.has_cpuid_interception())
+        procfs::RenderedFiles::of(
+            self.cfg.virtualize_cpuid,
+            guest.has_cpuid_interception(),
+            self.cfg.container_mount_table.is_some(),
+        )
     }
 
     /// Give this image's descriptor table the session's answer to whether it
@@ -3735,6 +3739,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         .thread_state()
                         .changed_root
                         .store(true, std::sync::atomic::Ordering::SeqCst);
+                    // Another process's view of this one's mount table
+                    // follows its root (`Detcore::rendered_procfs_at`).
+                    crate::tool_global::mark_changed_root(guest).await;
                 }
                 result
             }
