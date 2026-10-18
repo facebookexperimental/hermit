@@ -520,6 +520,16 @@ pub fn getrandom_unrecorded(
     Ok((fill.written as i64, Some(fill)))
 }
 
+/// Draw the initial AT_RANDOM bytes and advance the guest stream.
+///
+/// This performs no memory write and emits no record. The bytes and post-draw
+/// stream may be held pending an authenticated initial-image write; drawing
+/// them alone does not satisfy [`encode_initial_state`]'s completed-write
+/// contract. A later write failure must not roll back the consumed stream.
+pub fn draw_initial_auxv(prng: &mut Pcg64Mcg) -> [u8; 16] {
+    prng.random()
+}
+
 /// Draw and write the actual initial auxv bytes. A write failure preserves the
 /// consumed PRNG state, as in the normal post-exec callback.
 pub fn initialize_auxv(
@@ -528,7 +538,7 @@ pub fn initialize_auxv(
     pointer: AddrMut<u8>,
     dettid: DetTid,
 ) -> Result<(), Errno> {
-    let bytes: [u8; 16] = prng.random();
+    let bytes = draw_initial_auxv(prng);
     record_initial_auxv(dettid, &bytes);
     memory.write_value(pointer.cast::<[u8; 16]>(), &bytes)
 }
@@ -543,7 +553,7 @@ pub fn write_initial_auxv(
     mut memory: impl MemoryAccess,
     pointer: AddrMut<u8>,
 ) -> Result<[u8; 16], Errno> {
-    let bytes: [u8; 16] = prng.random();
+    let bytes = draw_initial_auxv(prng);
     memory.write_value(pointer.cast::<[u8; 16]>(), &bytes)?;
     Ok(bytes)
 }
@@ -800,12 +810,27 @@ mod tests {
             at_random: pages.address(0).as_raw(),
         };
         let mut stream = root_prng(config.rng_seed());
-        let written = write_initial_auxv(&mut stream, OwnMemory, pages.address(0)).unwrap();
+        let written = draw_initial_auxv(&mut stream);
+        // Preparation advances the stream but has not touched the image. Only
+        // the later successful write permits the completed handoff below.
+        assert_eq!(pages.bytes(0, 16), [0xa5; 16]);
+        OwnMemory
+            .write_value(pages.address(0).cast::<[u8; 16]>(), &written)
+            .unwrap();
         assert_eq!(pages.bytes(0, 16), written);
-        // The early write draws exactly what post-exec's own write would have.
+        // Splitting preparation from the write preserves both existing writer
+        // paths, their exact bytes and their post-draw state.
+        let mut ordinary = root_prng(config.rng_seed());
+        assert_eq!(
+            write_initial_auxv(&mut ordinary, OwnMemory, pages.address(80)).unwrap(),
+            written
+        );
+        assert_eq!(pages.bytes(80, 16), written);
+        same_state(&stream, &ordinary);
         let mut ordinary = root_prng(config.rng_seed());
         initialize_auxv(&mut ordinary, OwnMemory, pages.address(64), tid).unwrap();
         assert_eq!(pages.bytes(64, 16), written);
+        same_state(&stream, &ordinary);
         // A loader's early getrandom draws and writes what the thread's own
         // handler would have, and returns the fill that handler would have
         // recorded, for post-exec to record instead.
@@ -1081,6 +1106,22 @@ mod tests {
                 .apply_initial_random_state(&encoded, &config, image)
                 .is_err()
         );
+        // After adopting and completing the delayed write, the ordinary
+        // handler must continue at the next bytes, without drawing auxv again.
+        let mut expected = stream.clone();
+        let mut next_bytes = [0; 32];
+        expected.fill(&mut next_bytes[..]);
+        assert_eq!(
+            guest_getrandom(
+                &mut state.prng,
+                OwnMemory,
+                tid,
+                call(pages.address(128).as_raw(), next_bytes.len(), 0),
+            ),
+            Ok(next_bytes.len() as i64)
+        );
+        assert_eq!(pages.bytes(128, next_bytes.len()), next_bytes);
+        same_state(&state.prng, &expected);
     }
 
     #[test]
@@ -1093,6 +1134,41 @@ mod tests {
         initialize_auxv(&mut actual, OwnMemory, pages.address(0), tid).unwrap();
         assert_eq!(pages.bytes(0, 16), auxv);
         same_state(&actual, &expected);
+
+        // Both existing auxv writers draw before a failed real memory write.
+        // The next successful handler call continues after that discarded draw.
+        for before_post_exec in [false, true] {
+            let mut failed = root_prng(0);
+            let mut after_failure = Pcg64Mcg::seed_from_u64(0);
+            let _: [u8; 16] = after_failure.random();
+            let pointer = pages.address(pages.size);
+            if before_post_exec {
+                assert_eq!(
+                    write_initial_auxv(&mut failed, OwnMemory, pointer),
+                    Err(Errno::EFAULT)
+                );
+            } else {
+                assert_eq!(
+                    initialize_auxv(&mut failed, OwnMemory, pointer, tid),
+                    Err(Errno::EFAULT)
+                );
+            }
+            assert_eq!(pages.bytes(pages.size, 16), [0xa5; 16]);
+            same_state(&failed, &after_failure);
+            let mut next_bytes = [0; 32];
+            after_failure.fill(&mut next_bytes[..]);
+            assert_eq!(
+                guest_getrandom(
+                    &mut failed,
+                    OwnMemory,
+                    tid,
+                    call(pages.address(128).as_raw(), next_bytes.len(), 0),
+                ),
+                Ok(next_bytes.len() as i64)
+            );
+            assert_eq!(pages.bytes(128, next_bytes.len()), next_bytes);
+            same_state(&failed, &after_failure);
+        }
 
         for (buffer, len, flags, result) in [
             (0, 0, 0, Ok(0)),

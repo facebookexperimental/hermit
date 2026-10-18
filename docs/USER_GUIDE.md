@@ -237,6 +237,11 @@ rather than letting the guest run unmonitored. The dynamic loader, the C
 library's initialization and the constructors of the program's own shared
 libraries run before that constructor and are not monitored.
 
+For LiteInst and in-guest-trap, Detcore supplies deterministic `AT_RANDOM`
+bytes before the original loader derives its startup guards. See
+[initial randomness](initial-random.md) for the authenticated handoff and
+the retained bootstrap range and runtime-layout visibility gaps.
+
 Detcore's constructor uses a guarded 8 MiB bootstrap stack in the fixed Tool
 region `[0x600000000000, 0x600100000000)`. That allocation remains reserved
 after initialization and is disjoint from the runtime's signal and callback

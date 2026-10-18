@@ -823,6 +823,8 @@ pub(crate) mod native {
         }
         let native_sources = rv.join("reverie-inguest/native_exec");
         let source_names = [
+            "bootstrap-image.c",
+            "bootstrap-image.h",
             "private-bootstrap.c",
             "private-control.h",
             "private-entry.S",
@@ -900,6 +902,7 @@ pub(crate) mod native {
         ];
         let mut objects = Vec::new();
         for name in [
+            "bootstrap-image.c",
             "private-entry.S",
             "private-bootstrap.c",
             "private-fs.S",

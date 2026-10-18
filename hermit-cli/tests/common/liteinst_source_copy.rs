@@ -150,11 +150,10 @@ fn copied_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Re
             .as_array()
             .unwrap()
             .len(),
-        // Shared handler extraction adds installed_tool.rs, guest/mod.rs,
-        // guest/host.rs and LiteInst tool_host.rs to the declared source catalog.
-        // Shared reserved-FD policy also binds the syscalls manifest, crate
-        // root and moved module: 22 inputs including the checker.
-        22
+        // The original 21 source premises plus 11 exact startup seed build,
+        // wire, launcher, bootstrap and C/assembly inputs, the shared typed
+        // installer that owns the root initializer, and the checker.
+        34
     );
     let alias = case.join("cargo-alias");
     let private_home = case.join("cargo-home");
