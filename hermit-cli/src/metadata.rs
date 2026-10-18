@@ -683,7 +683,14 @@ impl RecordVersion {
 // serves from a snapshot, where it was read through to the kernel, and
 // neither file captures the kernel's bytes, so an older recording that reads
 // one would replay out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16d);
+// 0x16d -> 0x16e (number to be set at land): a restartable call on an
+// internal pipe or socket (read, readv, recv*, accept4, the scalar pipe
+// write) blocks every blockable signal before its attempt when a signal is
+// pending (R2b-2 stage 2, https://github.com/rrnewton/hermit/issues/4273), so
+// a pending signal no longer stops the recorded attempt: the attempt's result
+// is recorded where an older recording has the stopped attempt's ERESTARTSYS,
+// and an older recording containing one would replay out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16e);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -708,7 +715,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16d);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x16d;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x16e;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1723,6 +1730,21 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_replaced_read_descriptors_block_the_claim() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15b)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x16e has a restartable call's attempt stopped by
+    /// a pending signal (ERESTARTSYS) where the call now blocks signals first
+    /// and records the attempt's result (R2b-2 stage 2,
+    /// https://github.com/rrnewton/hermit/issues/4273).
+    #[test]
+    fn record_version_rejects_streams_from_before_restartable_calls_block_first() {
+        for older in 0x163..=0x16d {
+            assert!(
+                !RECORD_VERSION.compatible_with(&RecordVersion(older)),
+                "{older:#x}"
+            );
+        }
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 

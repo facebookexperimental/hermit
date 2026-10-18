@@ -1567,11 +1567,13 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // below a received directory descriptor is the kernel's recorded lookup,
     // 0x16c the K3a revert's relabel of 0x16a's format after 0x16b shipped,
     // 0x16d the container mount table rendered by Detcore for
-    // https://github.com/rrnewton/hermit/issues/4213),
+    // https://github.com/rrnewton/hermit/issues/4213, 0x16e a restartable call
+    // blocks signals before its recorded attempt for R2b-2 stage 2 of
+    // https://github.com/rrnewton/hermit/issues/4273),
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x16d,
+        metadata["version"], 0x16e,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);

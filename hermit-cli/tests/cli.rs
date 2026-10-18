@@ -152,6 +152,7 @@ static POLL_RECHECK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_PARTIAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_TIMER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_ENTRY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static RESTARTABLE_TWO_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_BOOKKEEPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_POSTHOOK_FUTEX_INTERRUPT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_PIPE_READ_HELD_WRITER_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -31196,6 +31197,13 @@ fn a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux() {
         ),
         ("restart", "thread read: 1 byte 'x', handled 1\n"),
         ("ignored", "thread read: 1 byte 'x', handled 0\n"),
+        // Two caught signals at once: the byte, then both handlers, as on
+        // Linux. The read blocks every blockable signal before its attempt
+        // (R2b-2 stage 2, https://github.com/rrnewton/hermit/issues/4273), so
+        // neither can stop it and be replaced by the other in the backend's
+        // single held slot; before, SIGUSR1 was lost
+        // (https://github.com/rrnewton/reverie/issues/1012).
+        ("ready2", "thread read: 1 byte 'x', usr1 1, usr2 1\n"),
         ("blocked", "thread read: 1 byte 'x', handled 0\n"),
         ("ready", "thread read: 1 byte 'x'\n"),
         ("eof", "thread read: 0 byte '-'\n"),
@@ -31245,12 +31253,47 @@ fn a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux() {
             "mode {mode}: verification failed:\n{log}"
         );
     }
-    // Under record and replay a signal interrupts the blocked read as in a
-    // plain run. (A byte, end of file or room that is ready before the signal
-    // is not taken first there: the attempt after the signal is a plain
-    // injection that the pending signal stops, and making it again could lose
-    // a second signal, https://github.com/rrnewton/reverie/issues/1012, so
-    // `ready`, `eof` and `write-room` are run-mode cases.)
+    // Under record and replay each of these gives its run-mode line, and
+    // replay matches the recording. A byte, end of file or room that is ready
+    // before the signal is taken first, as on Linux: the call blocks every
+    // blockable signal before its attempt (R2b-2 stage 2), so the pending
+    // signal no longer stops the recorded attempt. Before, it did, and
+    // `ready`, `eof` and `write-room` were run-mode cases
+    // (https://github.com/rrnewton/reverie/issues/1012).
+    for (mode, expected) in [
+        (
+            "eintr",
+            "thread read: -1 Interrupted system call, handled 1\n",
+        ),
+        ("ready", "thread read: 1 byte 'x'\n"),
+        ("eof", "thread read: 0 byte '-'\n"),
+        ("write-room", "write: 1\n"),
+    ] {
+        let args = [
+            "record",
+            "start",
+            "--verify",
+            "--verify-strict",
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "recorded mode {mode}");
+        let log = stderr(&output);
+        assert!(
+            log.contains("Success: replay matched recording."),
+            "recorded mode {mode}: the replay must match the recording:\n{log}"
+        );
+    }
+    // Two caught signals at once (`ready2`) under record and replay: the byte,
+    // then both handlers, as on Linux, and replay matches the recording. The
+    // read blocks every blockable signal before its attempt (R2b-2 stage 2), so
+    // the recorded attempt is the read's own, neither signal is lost, and the
+    // replay delivers them as the recording did. Before, the recorded read
+    // returned EINTR and record and replay delivered the two signals in
+    // different orders (https://github.com/rrnewton/hermit/issues/4207).
     let args = [
         "record",
         "start",
@@ -31258,47 +31301,20 @@ fn a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux() {
         "--verify-strict",
         "--",
         guest.as_str(),
-        "eintr",
+        "ready2",
     ];
     let output = hermit(&args);
     assert_success(&output, &args);
     assert_eq!(
         stdout(&output),
-        "thread read: -1 Interrupted system call, handled 1\n",
-        "recorded mode eintr"
+        "thread read: 1 byte 'x', usr1 1, usr2 1\n",
+        "recorded mode ready2"
     );
     let log = stderr(&output);
     assert!(
         log.contains("Success: replay matched recording."),
-        "recorded mode eintr: the replay must match the recording:\n{log}"
+        "recorded mode ready2: the replay must match the recording:\n{log}"
     );
-    // Two caught signals at once (`ready2`): the recording and its replay must
-    // lose neither (an attempt made again after the first could, as the
-    // backend holds one signal at a time,
-    // https://github.com/rrnewton/reverie/issues/1012). The read returns EINTR
-    // where Linux returns the byte, as on main. Run mode, which retries in
-    // `inject_with_retry`, still loses SIGUSR1 (1012), so it is not run here.
-    // Record and replay are compared by their output: they deliver the two
-    // signals in a different order, as on main, so `record --verify` does not
-    // apply.
-    let data = tempfile::tempdir().unwrap();
-    let directory = data.path().to_str().unwrap();
-    let expected = "thread read: -1 Interrupted system call, usr1 1, usr2 1\n";
-    let record_args = [
-        "record",
-        "--data-dir",
-        directory,
-        "--",
-        guest.as_str(),
-        "ready2",
-    ];
-    let record = hermit(&record_args);
-    assert_success(&record, &record_args);
-    assert_eq!(stdout(&record), expected, "recorded ready2 lost a signal");
-    let replay_args = ["replay", "--autopilot", "--data-dir", directory];
-    let replay = hermit(&replay_args);
-    assert_success(&replay, &replay_args);
-    assert_eq!(stdout(&replay), expected, "replayed ready2 lost a signal");
 }
 
 /// A thread that reads a pipe in a loop, retrying on EINTR, is interrupted by
@@ -41130,6 +41146,7 @@ fn poll_recheck_guest(name: &str) -> String {
         "guest_poll_recheck_partial" => &POLL_RECHECK_PARTIAL_GUEST,
         "guest_poll_recheck_timer" => &POLL_RECHECK_TIMER_GUEST,
         "guest_poll_recheck_entry" => &POLL_RECHECK_ENTRY_GUEST,
+        "guest_restartable_two_signals" => &RESTARTABLE_TWO_SIGNALS_GUEST,
         other => panic!("unknown guest {other}"),
     };
     poll_recheck_c_guest(cell, name)
@@ -41694,15 +41711,19 @@ fn partial_and_timer_woken_pipe_calls_end_as_linux_does() {
 }
 
 /// The R2b-1 rows under `record start --verify --verify-strict`: replay
-/// matches the recording. In record and replay a blocked pipe call's attempt
-/// is one plain injection, which a pending copy Linux would not let end the
-/// call (one discarded at send followed by a handler) still stops, and which
-/// an interrupting copy stops even when data is ready, so these rows keep
-/// main's lines there (https://github.com/rrnewton/hermit/issues/4385): native
+/// matches the recording, and each row gives its run-mode line. A pending
+/// signal no longer stops a recorded attempt: the call blocks every blockable
+/// signal before it, without running guest code (R2b-2 stage 2,
+/// `KernelSignalWait::block_in_place`), so the attempt's result stands, as on
+/// Linux. Before that, the attempt was one plain injection that a pending
+/// copy stopped, and these rows gave `read -1 EINTR` or a short write
+/// (https://github.com/rrnewton/hermit/issues/4385). Natively:
 /// `read 1, h1 0` for `dflthandler` and `ignhandler`, `read 1, h1 0, h2 0` for
-/// `flushresend 1`, `write 70000, h1 0` for `write-partial-ign 0`, and
-/// `read 1, h1 1` for `dataready 0`. `caught 0` and `write-partial-flush 1`
-/// give the native line.
+/// `flushresend 1` and `write 70000, h1 0` for `write-partial-ign 0`: the late
+/// handler in each is the copy Linux discarded at send, still delivered as the
+/// call returns (https://github.com/rrnewton/hermit/issues/3995), as in run
+/// mode. `dataready 0`, `caught 0` and `write-partial-flush 1` give the native
+/// line.
 #[test]
 fn pipe_wake_rows_under_record_and_replay() {
     let _guard = hermit_run_guard();
@@ -41713,28 +41734,24 @@ fn pipe_wake_rows_under_record_and_replay() {
         (
             G,
             &["dflthandler", "0"],
-            "dflthandler 0: read -1 EINTR, h1 1, h2 0",
+            "dflthandler 0: read 1 0, h1 1, h2 0",
         ),
         (
             G,
             &["dflthandler", "1"],
-            "dflthandler 1: read -1 EINTR, h1 1, h2 0",
+            "dflthandler 1: read 1 0, h1 1, h2 0",
         ),
         (
             G,
             &["ignhandler", "0"],
-            "ignhandler 0: read -1 EINTR, h1 1, h2 0",
+            "ignhandler 0: read 1 0, h1 1, h2 0",
         ),
         (
             G,
             &["flushresend", "1"],
-            "flushresend 1: read -1 EINTR, h1 0, h2 1",
+            "flushresend 1: read 1 0, h1 0, h2 1",
         ),
-        (
-            G,
-            &["dataready", "0"],
-            "dataready 0: read -1 EINTR, h1 1, h2 0",
-        ),
+        (G, &["dataready", "0"], "dataready 0: read 1 0, h1 1, h2 0"),
         (G, &["caught", "0"], "caught 0: read -1 EINTR, h1 1, h2 0"),
         (
             G,
@@ -41744,7 +41761,7 @@ fn pipe_wake_rows_under_record_and_replay() {
         (
             P,
             &["write-partial-ign", "0"],
-            "write-partial-ign 0: write 4096 0, h1 1",
+            "write-partial-ign 0: write 70000 0, h1 1",
         ),
         // The rewrite of the iovec array lands between the call's entry and
         // its first attempt, in the recording and in the replay (R1).
@@ -41761,6 +41778,179 @@ fn pipe_wake_rows_under_record_and_replay() {
     ];
     for (guest, args, line) in rows {
         let guest = poll_recheck_guest(guest);
+        let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let data_dir = format!("--data-dir={}", data.path().display());
+        let mut command = vec![
+            "record",
+            "start",
+            "--verify",
+            "--verify-strict",
+            data_dir.as_str(),
+            "--",
+            guest.as_str(),
+        ];
+        command.extend_from_slice(args);
+        let output = hermit(&command);
+        let log = stderr(&output);
+        assert_success(&output, &command);
+        assert_eq!(
+            stdout(&output),
+            format!("{line}\n"),
+            "{args:?}: stderr:\n{log}"
+        );
+        assert!(
+            log.contains("Success: replay matched recording"),
+            "{args:?}: replay did not match:\n{log}"
+        );
+    }
+}
+
+/// The rows of the R2b-2 stage 2 tests (`guest_restartable_two_signals`):
+/// arguments and the line Hermit prints. Natively (Linux 7.1.3, 3 of 3 each)
+/// a row's line is the same unless a comment says otherwise.
+const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 15] = [
+    (
+        &["read", "chld", "winch"],
+        "read: -1 EINTR, handlers before return: 28 17, after join: 28 17",
+    ),
+    (
+        &["read", "chld", "usr1"],
+        "read: -1 EINTR, handlers before return: 17 10, after join: 17 10",
+    ),
+    (
+        &["read", "usr2", "winch"],
+        "read: -1 EINTR, handlers before return: 28 12, after join: 28 12",
+    ),
+    (
+        &["readv", "usr2", "winch"],
+        "readv: -1 EINTR, handlers before return: 28 12, after join: 28 12",
+    ),
+    (
+        &["recv", "usr2", "winch"],
+        "recv: -1 EINTR, handlers before return: 28 12, after join: 28 12",
+    ),
+    // Native `write: 65536`: a pipe holds 8192 bytes under Hermit
+    // (F_GETPIPE_SZ), 65536 natively, a separate difference, so the write
+    // returns one pipe's worth either way.
+    (
+        &["write", "usr2", "winch"],
+        "write: 8192 0, handlers before return: 28 12, after join: 28 12",
+    ),
+    // On a stack whose only writable memory below the stack pointer is the
+    // red zone: the block and its restore need no scratch memory (Claude
+    // review of the R2b-2 design, M1). An injected restore cannot commit its
+    // mask there and ends the run.
+    (
+        &["tight", "chld", "winch"],
+        "tight: -1 EINTR, handlers before return: 28 17, after join: 28 17",
+    ),
+    // Native `-1 EINTR, handlers before return: 17, after join: 17`: Linux
+    // ends the read for the SIGCHLD. Hermit holds a SIGCHLD whoever sent it
+    // until R2b-2 stage 3 (https://github.com/rrnewton/hermit/issues/4273),
+    // so the read blocks for it and ends at the SIGUSR1, which a later turn
+    // decides under the guest's own mask (Codex review of the R2b-2 design
+    // rev3, P2-1).
+    (
+        &["twoturn"],
+        "twoturn: -1 EINTR, handlers before return: 17 10, after join: 17 10",
+    ),
+    // Native `-1 EINTR, handlers before return: 17, after join: 17`, as for
+    // `twoturn`. The process-directed SIGALRM still reaches the reader, which
+    // blocks every signal for the held SIGCHLD.
+    (
+        &["alarmheld"],
+        "alarmheld: -1 EINTR, handlers before return: 14 17, after join: 14 17",
+    ),
+    // Native `-1 EINTR, handlers before return: 17, after join: 17`, as for
+    // `twoturn`. The SIGUSR2 sent while SIG_IGN is discarded at send, as on
+    // Linux, because the scheduler decides against the guest mask the reader
+    // publishes while it blocks every signal, not the full mask then installed
+    // (Claude review of the R2b-2 design rev4, L3); the late handler is that
+    // copy, still delivered as the call returns
+    // (https://github.com/rrnewton/hermit/issues/3995). Unpublished, the copy
+    // was counted as kept and ended the read with EINTR.
+    (
+        &["ignheld"],
+        "ignheld: 1 0, handlers before return: 17 12, after join: 17 12",
+    ),
+    (
+        &["read"],
+        "read: 1 0, handlers before return: none, after join: none",
+    ),
+    (
+        &["readv"],
+        "readv: 1 0, handlers before return: none, after join: none",
+    ),
+    (
+        &["recv"],
+        "recv: 1 0, handlers before return: none, after join: none",
+    ),
+    (
+        &["write"],
+        "write: 70000 0, handlers before return: none, after join: none",
+    ),
+    (
+        &["tight"],
+        "tight: 1 0, handlers before return: none, after join: none",
+    ),
+];
+
+/// Two caught signals sent to a thread parked in a restartable call on an
+/// internal pipe or socket run both handlers, the higher-numbered first, as
+/// on Linux, and end the call (https://github.com/rrnewton/hermit/issues/4273,
+/// R2b-2 stage 2). The call blocks every blockable signal before its timerfd
+/// publication and its attempt, without running guest code
+/// (`KernelSignalWait::block_in_place`), so neither private injection can
+/// take a signal into the backend's single held slot, and puts the guest's
+/// mask back the same way when it returns. Before, the attempt and its retry
+/// were each stopped by one signal, and the slot kept only the second: one
+/// handler ran (`read usr2 winch` gave `handlers ... 28`). Each row runs under
+/// `--strict --verify --verify-strict` at canonical parity; the no-signal rows
+/// are the baseline.
+#[test]
+fn restartable_calls_woken_by_two_signals_run_both_handlers() {
+    let _guard = hermit_run_guard();
+    let guest = poll_recheck_guest("guest_restartable_two_signals");
+    for (args, line) in RESTARTABLE_TWO_SIGNAL_ROWS {
+        let mut command = vec![
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            guest.as_str(),
+        ];
+        command.extend_from_slice(args);
+        let output = hermit(&command);
+        let log = stderr(&output);
+        assert_success(&output, &command);
+        assert_eq!(
+            stdout(&output),
+            format!("{line}\n"),
+            "{args:?}: stderr:\n{log}"
+        );
+        assert!(
+            log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+            "{args:?}: comparison was not canonical:\n{log}"
+        );
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "{args:?}: verification failed:\n{log}"
+        );
+    }
+}
+
+/// The two-signal rows under `record start --verify --verify-strict`: each
+/// gives its run-mode line, and replay matches the recording. A pipe read
+/// woken by two caught signals used to record one delivery and replay two
+/// (https://github.com/rrnewton/hermit/issues/4207).
+#[test]
+fn restartable_two_signal_rows_under_record_and_replay() {
+    let _guard = hermit_run_guard();
+    let guest = poll_recheck_guest("guest_restartable_two_signals");
+    for (args, line) in RESTARTABLE_TWO_SIGNAL_ROWS.iter().filter(|(args, _)| {
+        args.len() == 3 || matches!(args[0], "twoturn" | "alarmheld" | "ignheld")
+    }) {
         let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let data_dir = format!("--data-dir={}", data.path().display());
         let mut command = vec![
