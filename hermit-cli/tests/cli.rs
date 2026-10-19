@@ -43743,7 +43743,11 @@ fn a_run_without_namespaces_is_not_refused_where_user_namespaces_are_denied() {
         return;
     };
     let log = stderr(&refused);
-    assert_eq!(refused.status.code(), Some(125), "{log}");
+    assert_eq!(
+        refused.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{log}"
+    );
     assert!(
         log.contains("class=backend-unavailable")
             && log.contains("unshare(CLONE_NEWUSER | CLONE_NEWPID) was denied"),
