@@ -129,12 +129,8 @@ impl Action {
         }
     }
 
-    pub(crate) fn is_caught(&self) -> bool {
+    fn is_caught(&self) -> bool {
         self.handler != SIG_DFL && self.handler != SIG_IGN
-    }
-
-    pub(crate) fn is_ignored(&self) -> bool {
-        self.handler == SIG_IGN
     }
 }
 
@@ -190,6 +186,7 @@ impl Dispositions {
     }
 
     /// `signal`'s current action.
+    #[cfg(test)]
     pub(crate) fn action(&self, signal: i32) -> Result<Action, Errno> {
         Ok(self.actions[Self::index(signal)?])
     }
