@@ -385,6 +385,16 @@ Typical flow for a change:
   Administrative history, task bookkeeping, and review mechanics come later.
   Record `Task: <task-id>` after this opening section when the change implements
   task work.
+- A change to the Linux behaviour Hermit or Detcore presents (a syscall's
+  result, errno, restart or interruption; signal delivery, masks or handler
+  order; `/proc` or `/sys` contents) cites the Linux source it matches in its
+  **Linux Semantics** section: the kernel function and `file:line` at a named
+  kernel tag, with a link (for example
+  `https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/signal.c?h=v6.9#n2850`),
+  next to the native measurement the tests compare against. A measurement shows
+  what one kernel did; the citation shows why, and lets a reviewer check the
+  rule rather than one sample. Reviewers check the citation. (Owner,
+  2026-10-18.)
 - Run the workspace test, format, and Clippy gates relevant to the change, and
   report the assurance level reached along with the backend, log level, and any
   relaxations.
@@ -478,7 +488,8 @@ Language Summary and Project Impact**, giving the substantive outcome and its
 connection to the product vision or owner request rather than administrative
 history. It also requires **Determinism** (why the change is
 deterministic plus a logic or informal proof, not only tests), **Linux
-Semantics** (how the change preserves faithful Linux behavior), and
+Semantics** (how the change preserves faithful Linux behavior, citing the
+kernel source it matches as described in the change flow above), and
 **Validation**. KVM changes also require **Relationship to gVisor**. A labeled
 PR additionally requires **Human Review Required**, naming the specific
 numbered trigger rather than a vague category such as "backend change". For a
