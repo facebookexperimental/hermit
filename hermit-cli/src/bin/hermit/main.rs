@@ -745,6 +745,13 @@ fn main() {
         .prepare_log_budget()
         .map(|()| self::tracing::register_invocation_log_budget(global.log_budget()))
         .and_then(|()| global.open_log_file())
+        // The parallelism profile opens here too, and only here: no Detcore
+        // that runs inside a guest process ever enables it.
+        .and_then(|()| {
+            detcore::parallelism_probe::enable_from_env()
+                .map(drop)
+                .map_err(anyhow::Error::msg)
+        })
         .and_then(|()| command.main(&global));
 
     let status = result.unwrap_or_else(|error| {

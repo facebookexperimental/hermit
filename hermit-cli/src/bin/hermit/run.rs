@@ -1728,12 +1728,14 @@ fn apply_base_and_explicit_environment(
         }
         BaseEnv::Host => {
             // Hermit's own settings, not the guest's: where its verify logs go,
-            // its race probes, which must not change what the guest sees, and
-            // the mark on the run that `--dap-listen` supervises, so the
-            // guest's environment is that of the same run without it.
+            // its race probes and its parallelism profile, which must not
+            // change what the guest sees, and the mark on the run that
+            // `--dap-listen` supervises, so the guest's environment is that of
+            // the same run without it.
             command.env_remove(super::verify::VERIFY_TMPDIR_ENV);
             command.env_remove(detcore::race_probe::RACE_PROBE_ENV);
             command.env_remove(detcore::race_probe::RACE_PROBE_SEED_ENV);
+            command.env_remove(detcore::parallelism_probe::PARALLELISM_PROFILE_ENV);
             command.env_remove(DAP_LISTEN_INNER_ENV);
         }
     }
@@ -10849,6 +10851,7 @@ mod tests {
         for name in [
             super::super::verify::VERIFY_TMPDIR_ENV,
             DAP_LISTEN_INNER_ENV,
+            detcore::parallelism_probe::PARALLELISM_PROFILE_ENV,
         ] {
             assert!(
                 removed.iter().any(|removed| removed == name),

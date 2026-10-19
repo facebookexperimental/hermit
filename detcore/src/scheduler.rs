@@ -2013,6 +2013,10 @@ pub struct Scheduler {
     /// `HappensBeforeProgram`. Holds AFTER anchors until their BEFORE anchors
     /// fire, deterministically constructing an authored race ordering.
     happens_before: Option<HbRuntime>,
+
+    /// The measurement-only parallelism profile, present only when hermit
+    /// enabled it from `HERMIT_PARALLELISM_PROFILE` (`crate::parallelism_probe`).
+    pub(crate) parallelism_probe: Option<Box<dyn crate::parallelism_probe::SchedulerProbe>>,
 }
 
 type StacktraceEventsIter = Peekable<IntoIter<(u64, Option<SchedEvent>, Option<PathBuf>)>>;
@@ -4036,6 +4040,9 @@ impl Scheduler {
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
             post_fork_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed() ^ 0x706f_7374_666f_726b),
             happens_before: cfg.happens_before.clone().map(HbRuntime::new),
+            parallelism_probe: crate::parallelism_probe::scheduler_probe(
+                crate::procfs_inode::guest_tids_name_host_tasks(&cfg.backend, None),
+            ),
         }
     }
 
@@ -5275,6 +5282,10 @@ impl Scheduler {
             ));
         }
         for child in orphans {
+            let zombie = self.logically_exited_processes.contains(&child);
+            if let Some(probe) = self.parallelism_probe.as_mut() {
+                probe.note_adopt(child, exited, reaper.map(|(reaper, _)| reaper), zombie);
+            }
             let Some((reaper, owner)) = reaper else {
                 debug!(
                     "[scheduler] orphan {} of exited process {} goes to the container init",
@@ -13705,6 +13716,24 @@ impl Scheduler {
             ),
             _ => (false, false, false),
         };
+        if self.parallelism_probe.is_some()
+            && let Some(Ok(rs)) = self
+                .next_turns
+                .get(&dtid)
+                .and_then(|turn| turn.req.try_read())
+        {
+            let mm = self.thread_mm(dtid);
+            let physical = self.procfs_kernel_ids.get(&dtid).copied();
+            let turn = self.turn;
+            let wait_parents: Vec<_> = crate::parallelism_probe::wait_parent_subjects(&rs)
+                .into_iter()
+                .map(|process| (process, self.thread_tree.parent_process(&process)))
+                .collect();
+            let process = self.thread_tree.process_of(dtid);
+            if let Some(probe) = self.parallelism_probe.as_mut() {
+                probe.note_commit(turn, dtid, process, &rs, mm, physical, &wait_parents);
+            }
+        }
         self.progress_epoch += 1;
         self.last_commit_at.insert(dtid, self.progress_epoch);
         let previous_grant = self.guest_state_polled_at.remove(&dtid);
