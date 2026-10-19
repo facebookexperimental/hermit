@@ -747,7 +747,13 @@ impl RecordVersion {
 // and fstat, the openat2, the entry's fstatfs and fstat, the reads and two
 // closes. A 0x176 or 0x177 recording has no entry fstatfs and would replay
 // out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x178);
+// 0x178 -> 0x179 (reserved as queue hint 0x17b in minibeads dh-gxmvo; takes
+// HIGHEST_SHIPPED + 1 at land): a vfork parent resumes at its child's
+// successful exec or exit, as Linux resumes it (`vfork(2)`), instead of once
+// nothing else can run, and record logs that readmission in the rejoin log at
+// step 2a. Every recording of a vfork now holds a different schedule, so an
+// older one would replay out of step at its first vfork.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x179);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -772,7 +778,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x178);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x178;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x179;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
