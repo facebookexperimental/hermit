@@ -763,7 +763,13 @@ impl RecordVersion {
 // broke record/replay of make -jN (minibeads dh-ojrf): a vfork parent is again
 // held until nothing else can run, and the rejoin log entries are gone. A
 // recording made with the rejoin is refused by the exact-match gate.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17b);
+// 0x17b -> 0x17c (takes HIGHEST_SHIPPED + 1 at land): a thread readmitted from
+// a blocking pool whose call a signal ended keeps that call's temporary mask
+// until its continuation turn (`continuation_masks`), instead of the kernel's
+// SigBlk, which replay does not share with record (minibeads dh-ojrf). Replay
+// now chooses the SIGCHLD taker, a timer signal's fate and a discard as record
+// did, so an older recording could replay a different order there.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17c);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -788,7 +794,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17b);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17b;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17c;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

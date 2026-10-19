@@ -588,6 +588,23 @@ pub struct BlockedPool {
     /// An entry lives exactly as long as the thread's blocking-pool entry.
     pub out_of_scheduler_masks: BTreeMap<DetTid, Option<u64>>,
 
+    /// The mask a thread readmitted from a blocking pool is stopped under
+    /// until its continuation turn is granted, when a signal ended its call:
+    /// the call's temporary mask (`pselect6`, `ppoll`, `epoll_pwait`), which
+    /// Linux keeps installed through that signal's delivery and restores only
+    /// at `rt_sigreturn` (`syscalls::helpers::continuation_mask`). `None`
+    /// records a mask the scheduler does not know
+    /// (`Resources::blocked_signal_mask_unknown`): a masked record/replay wait,
+    /// and every `rt_sigsuspend`, of which record and replay cannot tell alike
+    /// whether the kernel installed its mask. The continuation request
+    /// carries it, decided from the call's result, which replay serves as
+    /// recorded; the kernel's own `SigBlk` at that stop differs between record,
+    /// where the call ran and was interrupted in the kernel, and replay, where
+    /// it was not. A call that returned normally has no entry: Linux restored
+    /// the thread's own mask before it returned, and the kernel holds that in
+    /// both.
+    pub continuation_masks: BTreeMap<DetTid, Option<u64>>,
+
     /// Parents parked awaiting deterministic delivery of a host-async `SIGCHLD`.
     ///
     /// When a guest child process exits, the kernel raises `SIGCHLD` on the
@@ -6736,6 +6753,7 @@ impl Scheduler {
         self.blocked.replay_log_served.remove(dtid);
         let _ = self.blocked.rt_sigsuspend_blockers.remove(dtid);
         let _ = self.blocked.out_of_scheduler_masks.remove(dtid);
+        let _ = self.blocked.continuation_masks.remove(dtid);
         let _ = self.background_entry_barriers.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
         self.blocked.sigchld_deferred.remove(dtid);
@@ -7580,7 +7598,7 @@ impl Scheduler {
             let external = self.blocked.external_io_blockers.remove(&dtid);
             self.blocked.replay_log_served.remove(&dtid);
             let sigsuspend = self.blocked.rt_sigsuspend_blockers.remove(&dtid);
-            let _ = self.blocked.out_of_scheduler_masks.remove(&dtid);
+            self.keep_mask_for_continuation(dtid);
             assert!(
                 external.is_some() ^ sigsuspend.is_some(),
                 "ready thread must belong to exactly one blocking pool"
@@ -10796,8 +10814,10 @@ impl Scheduler {
     /// `thread`'s signal mask: the one its parked futex wait reported, which only
     /// it can change and so cannot change while it is parked; for a thread
     /// sleeping outside the runnable set, the one recorded when its call was
-    /// committed (`BlockedPool::out_of_scheduler_masks`); and otherwise the
-    /// kernel's (`SigBlk`) for a thread stopped at a request.
+    /// committed (`BlockedPool::out_of_scheduler_masks`); for a thread
+    /// readmitted from there whose call a signal ended, the call's temporary
+    /// mask until its continuation turn (`BlockedPool::continuation_masks`);
+    /// and otherwise the kernel's (`SigBlk`) for a thread stopped at a request.
     fn thread_signal_mask(&self, thread: DetTid) -> Option<u64> {
         self.recorded_signal_mask(thread)
             .unwrap_or_else(|| self.read_thread_blocked_mask(thread))
@@ -10825,7 +10845,34 @@ impl Scheduler {
         {
             return Some(Some(!watch.unblocked));
         }
-        self.blocked.out_of_scheduler_masks.get(&thread).copied()
+        self.blocked
+            .out_of_scheduler_masks
+            .get(&thread)
+            .or_else(|| self.blocked.continuation_masks.get(&thread))
+            .copied()
+    }
+
+    /// `dtid` leaves its blocking pool for the run queue, its continuation
+    /// request posted: the mask its call ran with no longer applies, and a
+    /// temporary mask the call's signal left installed holds until its
+    /// continuation turn (`continuation_masks`).
+    fn keep_mask_for_continuation(&mut self, dtid: DetTid) {
+        let _ = self.blocked.out_of_scheduler_masks.remove(&dtid);
+        let kept = self
+            .next_turns
+            .get(&dtid)
+            .and_then(|turn| turn.req.try_read())
+            .and_then(|req| req.ok())
+            .and_then(|req| {
+                if req.blocked_signal_mask_unknown {
+                    Some(None)
+                } else {
+                    req.blocked_signal_mask.map(Some)
+                }
+            });
+        if let Some(mask) = kept {
+            self.blocked.continuation_masks.insert(dtid, mask);
+        }
     }
 
     /// `thread`'s current signal mask (`SigBlk`), read from the kernel; `None`
@@ -11322,7 +11369,7 @@ impl Scheduler {
                     let external = scheduler.blocked.external_io_blockers.remove(ready_dtid);
                     scheduler.blocked.replay_log_served.remove(ready_dtid);
                     let sigsuspend = scheduler.blocked.rt_sigsuspend_blockers.remove(ready_dtid);
-                    let _ = scheduler.blocked.out_of_scheduler_masks.remove(ready_dtid);
+                    scheduler.keep_mask_for_continuation(*ready_dtid);
                     assert!(
                         external.is_some() ^ sigsuspend.is_some(),
                         "ready thread must belong to exactly one blocking pool"
@@ -12759,7 +12806,9 @@ impl Scheduler {
             // Thread CONTINUES after completing [potentially] blocking IO.
             ResourceID::BlockedExternalContinue(_) | ResourceID::VforkFailed(_) => {
                 // We leave the thread out of the run-queue.  At the point we put it back
-                // in, this resource request is immediately granted.
+                // in, this resource request is immediately granted. From here
+                // the thread runs again, so its mask is the kernel's.
+                self.blocked.continuation_masks.remove(&dettid);
                 Ok(())
             }
 
@@ -22798,6 +22847,245 @@ mod test {
         assert_eq!(selected, vfork_child);
         scheduler.run_queue.undo_tentative_pop();
         assert!(!scheduler.blocked.sigchld_takers.contains(&target));
+    }
+
+    /// The readmission that broke record/replay of make -jN (minibeads
+    /// dh-ojrf): make (7), a SIGCHLD taker, is backgrounded in a `pselect6`
+    /// and a child (173) in a `connect`. Both calls have finished by one
+    /// step2c, which readmits them together as one rejoin entry, and step 3
+    /// decides between them from make's mask. That mask must not come from
+    /// the kernel, whose `SigBlk` there differs between record (0: the
+    /// interrupted call's temporary mask, still installed) and replay
+    /// (SIGCHLD blocked: the result was served). Whatever the kernel holds,
+    /// in record and in replay alike:
+    /// - a call a signal ended, with a known temporary mask that unblocks
+    ///   SIGCHLD: make is the taker and runs first;
+    /// - one whose temporary mask the scheduler does not know (a masked
+    ///   record/replay wait, as in dh-ojrf): no taker, the child runs first;
+    /// - a call that returned normally keeps no mask (Linux restored the
+    ///   thread's own, which the kernel holds in both).
+    ///
+    /// The kept mask decides `discard_mask` too, and ends at the continuation.
+    #[test]
+    fn two_calls_readmitted_together_choose_the_sigchld_taker_by_its_recorded_mask() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let make = DetTid::from_raw(7);
+        let child = DetTid::from_raw(173);
+        let pselect = ExternalOpId::new(make, 1016);
+        let connect = ExternalOpId::new(child, 199);
+        let logged = Rejoin {
+            turn: 12,
+            wakes: 0,
+            calls: vec![(make, 1016), (child, 199)],
+        };
+        // (what make's continuation carries, the kept mask, who runs first)
+        let interrupted_known = (Some(0), false, Some(Some(0)), Some(make));
+        let interrupted_unknown = (None, true, Some(None), Some(child));
+        let normal = (None, false, None, None);
+        for (mask, unknown, kept, first) in [interrupted_known, interrupted_unknown, normal] {
+            for replay in [false, true] {
+                for kernel_blocked in [0, chld] {
+                    let case = format!(
+                        "continuation mask {mask:?} unknown {unknown}, replay {replay}, \
+                         kernel SigBlk {kernel_blocked:#x}"
+                    );
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut scheduler = gated_scheduler();
+                    scheduler.recordreplay_modes = true;
+                    for (tid, op) in [(make, pselect), (child, connect)] {
+                        scheduler.thread_tree.add_child(tid, tid, true);
+                        register_known_thread(&mut scheduler, tid);
+                        background(&mut scheduler, op, true);
+                    }
+                    let mut continuation = Resources::new(make);
+                    continuation
+                        .insert(ResourceID::BlockedExternalContinue(pselect), Permission::RW);
+                    continuation.blocked_signal_mask = mask;
+                    continuation.blocked_signal_mask_unknown = unknown;
+                    scheduler.next_turns.get_mut(&make).unwrap().req = Ivar::full(Ok(continuation));
+                    scheduler
+                        .blocked
+                        .out_of_scheduler_masks
+                        .insert(make, if unknown { None } else { Some(0) });
+                    // make catches SIGCHLD; the kernel's SigBlk is record's or
+                    // replay's view.
+                    let mut kernel = signal_state(chld, 0);
+                    kernel.blocked = kernel_blocked;
+                    scheduler.test_kernel_signal_states.insert(make, kernel);
+                    assert!(scheduler.note_group_send(make, Signal::SIGCHLD, false));
+                    scheduler.blocked.sigchld_takers.insert(make);
+                    scheduler.turn = 12;
+                    if replay {
+                        replaying(&mut scheduler, std::slice::from_ref(&logged));
+                    } else {
+                        scheduler.rejoin_writer = Some(RejoinWriter::create(dir.path()).unwrap());
+                    }
+
+                    assert!(scheduler.step2c_process_io_blockers().is_ok(), "{case}");
+                    for tid in [make, child] {
+                        assert!(scheduler.run_queue.contains_tid(tid), "{case}");
+                    }
+                    if replay {
+                        assert!(scheduler.rejoin_replay.as_ref().unwrap().is_empty());
+                    } else {
+                        assert_eq!(
+                            rejoin_log::read(dir.path()).unwrap(),
+                            std::collections::VecDeque::from([logged.clone()]),
+                            "{case}"
+                        );
+                    }
+                    assert!(!scheduler.blocked.out_of_scheduler_masks.contains_key(&make));
+                    assert_eq!(
+                        scheduler.blocked.continuation_masks.get(&make).copied(),
+                        kept,
+                        "{case}"
+                    );
+                    let Some(first) = first else {
+                        // A normal return keeps nothing: the kernel's mask
+                        // decides, which record and replay share.
+                        continue;
+                    };
+                    assert_eq!(
+                        scheduler.discard_mask(make, libc::SIGCHLD),
+                        kept.flatten(),
+                        "{case}"
+                    );
+                    let (selected, _, _) = scheduler.step3_peek().expect("a thread is runnable");
+                    assert_eq!(selected, first, "{case}");
+                    scheduler.run_queue.undo_tentative_pop();
+
+                    assert!(
+                        scheduler
+                            .block_for_one_resource(
+                                make,
+                                &ResourceID::BlockedExternalContinue(pselect),
+                                &Permission::RW,
+                                None,
+                                None,
+                                &Ivar::new(),
+                            )
+                            .is_ok()
+                    );
+                    assert!(
+                        !scheduler.blocked.continuation_masks.contains_key(&make),
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An `rt_sigsuspend` continuation is published with an unknown mask,
+    /// whatever the call returned (`syscalls::helpers::continuation_mask`):
+    /// whether the kernel installed its temporary mask is host-timed in record
+    /// and hidden in replay. Readmitted together with another call, its thread
+    /// is then no `SIGCHLD` taker and no discard decides from it, so record and
+    /// replay pick the same next thread (queue order) whatever the kernel holds
+    /// for it (the Codex review of da662bb2).
+    #[test]
+    fn an_rt_sigsuspend_continuation_is_unknown_and_picks_alike_in_record_and_replay() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let waiter = DetTid::from_raw(13);
+        let child = DetTid::from_raw(173);
+        let suspend = ExternalOpId::new(waiter, 40);
+        let connect = ExternalOpId::new(child, 199);
+        let logged = Rejoin {
+            turn: 12,
+            wakes: 0,
+            calls: vec![(waiter, 40), (child, 199)],
+        };
+        let mut picks = Vec::new();
+        for replay in [false, true] {
+            for kernel_blocked in [0, chld] {
+                let case = format!("replay {replay}, kernel SigBlk {kernel_blocked:#x}");
+                let dir = tempfile::tempdir().unwrap();
+                let mut scheduler = gated_scheduler();
+                scheduler.recordreplay_modes = true;
+                for tid in [waiter, child] {
+                    scheduler.thread_tree.add_child(tid, tid, true);
+                    register_known_thread(&mut scheduler, tid);
+                }
+                background(&mut scheduler, connect, true);
+                background(&mut scheduler, suspend, true);
+                scheduler.blocked.external_io_blockers.remove(&waiter);
+                scheduler
+                    .blocked
+                    .rt_sigsuspend_blockers
+                    .insert(waiter, suspend);
+                scheduler
+                    .blocked
+                    .out_of_scheduler_masks
+                    .insert(waiter, Some(0));
+                let mut continuation = Resources::new(waiter);
+                continuation.insert(ResourceID::BlockedExternalContinue(suspend), Permission::RW);
+                continuation.blocked_signal_mask_unknown = true;
+                scheduler.next_turns.get_mut(&waiter).unwrap().req = Ivar::full(Ok(continuation));
+                let mut kernel = signal_state(chld, 0);
+                kernel.blocked = kernel_blocked;
+                scheduler.test_kernel_signal_states.insert(waiter, kernel);
+                assert!(scheduler.note_group_send(waiter, Signal::SIGCHLD, false));
+                scheduler.blocked.sigchld_takers.insert(waiter);
+                scheduler.turn = 12;
+                if replay {
+                    replaying(&mut scheduler, std::slice::from_ref(&logged));
+                } else {
+                    scheduler.rejoin_writer = Some(RejoinWriter::create(dir.path()).unwrap());
+                }
+
+                assert!(scheduler.step2c_process_io_blockers().is_ok(), "{case}");
+                for tid in [waiter, child] {
+                    assert!(scheduler.run_queue.contains_tid(tid), "{case}");
+                }
+                assert_eq!(
+                    scheduler.blocked.continuation_masks.get(&waiter),
+                    Some(&None),
+                    "{case}"
+                );
+                assert_eq!(
+                    scheduler.thread_signal_mask_for(waiter, libc::SIGCHLD),
+                    None,
+                    "{case}"
+                );
+                assert_eq!(
+                    scheduler.discard_mask(waiter, libc::SIGUSR1),
+                    None,
+                    "{case}"
+                );
+                let (selected, _, _) = scheduler.step3_peek().expect("a thread is runnable");
+                scheduler.run_queue.undo_tentative_pop();
+                picks.push(selected);
+            }
+        }
+        assert!(picks.iter().all(|pick| *pick == child), "{picks:?}");
+    }
+
+    /// A kept continuation mask also ends at a `VforkFailed` grant and when
+    /// its thread retires.
+    #[test]
+    fn a_kept_continuation_mask_ends_at_vfork_failed_and_at_retirement() {
+        let thread = DetTid::from_raw(7);
+        let op = ExternalOpId::new(thread, 3);
+        let mut scheduler = gated_scheduler();
+        scheduler.thread_tree.add_child(thread, thread, true);
+        register_known_thread(&mut scheduler, thread);
+        scheduler.blocked.continuation_masks.insert(thread, Some(0));
+        assert!(
+            scheduler
+                .block_for_one_resource(
+                    thread,
+                    &ResourceID::VforkFailed(op),
+                    &Permission::RW,
+                    None,
+                    None,
+                    &Ivar::new(),
+                )
+                .is_ok()
+        );
+        assert!(!scheduler.blocked.continuation_masks.contains_key(&thread));
+
+        scheduler.blocked.continuation_masks.insert(thread, None);
+        scheduler.logically_kill_thread(&thread, &thread, MmId::initial(thread));
+        assert!(!scheduler.blocked.continuation_masks.contains_key(&thread));
     }
 
     /// A5 step 2b: the first SIGCHLD taker is chosen by the mask its thread

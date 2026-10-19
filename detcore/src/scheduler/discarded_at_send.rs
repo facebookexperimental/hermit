@@ -1046,8 +1046,10 @@ impl Scheduler {
     /// 2. a parked futex waiter's watch;
     /// 3. the mask recorded for a thread asleep outside the schedule
     ///    (`out_of_scheduler_masks`), where an unknown one is `None`;
-    /// 4. a filed `BlockingRtSigsuspend` request's temporary mask;
-    /// 5. the mask `named` published, where it decides about `signal`, or
+    /// 4. the temporary mask a readmitted thread is stopped under until its
+    ///    continuation turn (`continuation_masks`), likewise;
+    /// 5. a filed `BlockingRtSigsuspend` request's temporary mask;
+    /// 6. the mask `named` published, where it decides about `signal`, or
     ///    else `SigBlk`, for a live thread stopped at a request
     ///    (`blocked_mask_for`).
     pub(crate) fn discard_mask(&self, named: DetTid, signal: i32) -> Option<u64> {
@@ -1062,6 +1064,9 @@ impl Scheduler {
         }
         if let Some(recorded) = self.blocked.out_of_scheduler_masks.get(&named) {
             return *recorded;
+        }
+        if let Some(kept) = self.blocked.continuation_masks.get(&named) {
+            return *kept;
         }
         if let Some(mask) = self.filed_sigsuspend_mask(named) {
             return Some(mask);

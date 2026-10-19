@@ -339,6 +339,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrcs = Resources::new(dettid);
             rsrcs.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
             rsrcs.fyi(call.name());
+            // The mask the thread is stopped under here, as the scheduler may
+            // decide from it before this turn (`BlockedPool::continuation_masks`).
+            match continuation_mask(call, &res) {
+                ContinuationMask::Temporary => {
+                    rsrcs.blocked_signal_mask = blocked_signal_mask;
+                    rsrcs.blocked_signal_mask_unknown = blocked_signal_mask_unknown;
+                }
+                ContinuationMask::Unknown => rsrcs.blocked_signal_mask_unknown = true,
+                ContinuationMask::Restored => {}
+            }
             resource_request(guest, rsrcs).await;
         }
         res
@@ -7242,5 +7252,106 @@ mod turn_signal_tests {
             turn_signals_before_discard(&caught_rt, 0, 0, rt, ByDisposition, 0).named,
             rt
         );
+    }
+}
+
+/// The mask a thread is stopped under where its blocking call returned, until
+/// its continuation turn (`continuation_mask`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContinuationMask {
+    /// The call's temporary mask: the call ran and a signal ended it.
+    Temporary,
+    /// Not known to the scheduler, in record and replay alike.
+    Unknown,
+    /// The thread's own mask, which the kernel restored before the call
+    /// returned and holds in record and replay alike.
+    Restored,
+}
+
+/// The mask `call`, having returned `result`, leaves its thread stopped under,
+/// decided from what the kernel did, which the raw result tells and replay
+/// serves as recorded:
+/// - pselect6 and ppoll that a signal ended return `-ERESTARTNOHAND`, or the
+///   `-EINTR` that `poll_select_finish` can still turn it into after keeping
+///   the mask (a timeout write-back that faults, or the STICKY_TIMEOUTS
+///   personality); epoll_pwait and epoll_pwait2 return `-EINTR`. Linux then
+///   delivers the signal under the temporary mask and `rt_sigreturn` restores
+///   the saved one (`restore_saved_sigmask_unless`, fs/select.c, fs/eventpoll.c
+///   and kernel/signal.c at v6.9): `Temporary`.
+/// - Their normal return: Linux restored the saved mask before returning. Their
+///   `-ERESTARTSYS`, which the host reports when the signal reached the thread
+///   before the call ran: the kernel never installed the mask, and the
+///   recording holds that result. Either way `Restored`.
+/// - rt_sigsuspend: `Unknown`, whatever its result. Whether it ran is not
+///   recorded: record injects it live, where a signal arriving first yields a
+///   host-timed `-ERESTARTSYS` (the kernel never installed the mask), and
+///   replay re-injects it with retry, which never shows that. A rule on its
+///   result would differ between the two (the Claude review of d1b9404c), and
+///   a known temporary mask would claim one the kernel may not have installed
+///   (the Codex review of da662bb2). The scheduler treats an unknown mask
+///   alike in both: no `SIGCHLD` taker or signal target, no discard.
+/// - Any other call: `Restored`; it installed no temporary mask.
+pub(crate) fn continuation_mask(call: Syscall, result: &Result<i64, Error>) -> ContinuationMask {
+    let ended_by = |errno: Errno| matches!(result, Err(Error::Errno(error)) if *error == errno);
+    let kept = match call {
+        Syscall::RtSigsuspend(_) => return ContinuationMask::Unknown,
+        Syscall::Pselect6(_) | Syscall::Ppoll(_) => {
+            ended_by(Errno::ERESTARTNOHAND) || ended_by(Errno::EINTR)
+        }
+        Syscall::EpollPwait(_) | Syscall::Other(Sysno::epoll_pwait2, _) => ended_by(Errno::EINTR),
+        _ => false,
+    };
+    if kept {
+        ContinuationMask::Temporary
+    } else {
+        ContinuationMask::Restored
+    }
+}
+
+#[cfg(test)]
+mod temporary_mask_tests {
+    use super::*;
+
+    /// The continuation mask follows what the kernel did: the temporary mask
+    /// for an interrupted pselect6 or ppoll (`-ERESTARTNOHAND`, or the `-EINTR`
+    /// it can become after the kernel kept the mask) and an interrupted
+    /// epoll_pwait or epoll_pwait2 (`-EINTR`); the restored own mask for their
+    /// normal return, a call the signal reached before it ran (`-ERESTARTSYS`)
+    /// or another errno; unknown for every rt_sigsuspend, whose `-ERESTARTSYS`
+    /// is host-timed in record and absent in replay; restored for a call
+    /// without a temporary mask.
+    #[test]
+    fn the_continuation_mask_follows_what_the_kernel_did() {
+        let restart = Err(Error::Errno(Errno::ERESTARTNOHAND));
+        let eintr = Err(Error::Errno(Errno::EINTR));
+        let pselect = Syscall::Pselect6(syscalls::Pselect6::new());
+        let ppoll = Syscall::Ppoll(syscalls::Ppoll::new());
+        let epoll = Syscall::EpollPwait(syscalls::EpollPwait::new());
+        let epoll2 = Syscall::Other(
+            Sysno::epoll_pwait2,
+            reverie::syscalls::SyscallArgs::new(0, 0, 0, 0, 0, 0),
+        );
+        let before_entry = Err(Error::Errno(Errno::ERESTARTSYS));
+        let sigsuspend = Syscall::RtSigsuspend(syscalls::RtSigsuspend::new());
+        let read = Syscall::Read(syscalls::Read::new());
+        let ebadf = Err(Error::Errno(Errno::EBADF));
+        use ContinuationMask::*;
+        for call in [pselect, ppoll] {
+            assert_eq!(continuation_mask(call, &restart), Temporary, "{call:?}");
+            assert_eq!(continuation_mask(call, &eintr), Temporary, "{call:?}");
+            assert_eq!(continuation_mask(call, &before_entry), Restored, "{call:?}");
+            assert_eq!(continuation_mask(call, &ebadf), Restored, "{call:?}");
+            assert_eq!(continuation_mask(call, &Ok(1)), Restored, "{call:?}");
+        }
+        for result in [&restart, &eintr, &before_entry, &Ok(0)] {
+            assert_eq!(continuation_mask(sigsuspend, result), Unknown, "{result:?}");
+        }
+        for call in [epoll, epoll2] {
+            assert_eq!(continuation_mask(call, &eintr), Temporary, "{call:?}");
+            assert_eq!(continuation_mask(call, &restart), Restored, "{call:?}");
+            assert_eq!(continuation_mask(call, &before_entry), Restored, "{call:?}");
+            assert_eq!(continuation_mask(call, &Ok(0)), Restored, "{call:?}");
+        }
+        assert_eq!(continuation_mask(read, &restart), Restored);
     }
 }
