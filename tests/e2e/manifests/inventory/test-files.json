@@ -2186,6 +2186,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/select_timeout_normalization.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/select_timeout_normalization.c is owned by hermit-cli/tests/cli.rs: select_timeout_folds_microseconds_into_seconds_as_linux runs it natively and under ptrace, --strict and not, and requires byte-identical output with a fixed expectation: kern_select folds tv_usec >= 1000000 into the seconds (a {0, 1500000} timeout waits 1.5 s, and a ready pipe with {0, 2000000} is reported), while a negative field and pselect6's tv_nsec of 1e9 are EINVAL. It stays a fixture because the test compares native and Hermit output and asserts a host-clock wait bound natively."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/self_signal_death_probe.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/self_signal_death_probe.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this probe of processes that end themselves with a signal they send themselves (abort, raise, kill, tgkill and tkill of their own process or thread), requires both in-guest LiteInst backends to verify the forking mode with Linux's output and no recorded determinism loss, and requires a root that aborts to end the run with its own status; it remains a guest fixture because a generic manifest cannot express those per-backend verdicts."

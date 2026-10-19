@@ -215,6 +215,7 @@ static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SELECT_TIMEOUT_NORMALIZATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TOOL_OUTPUT_PROTECTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "dbt")]
 static CLOCK_RLIMIT_PARITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -28272,6 +28273,63 @@ fn tool_output_respects_page_protection_and_the_private_page() {
             assert_success(&output, &args);
             assert_eq!(stdout(&output), expected, "{args:?}");
         }
+    }
+}
+
+/// `select`'s timeout is read as Linux v7.1 reads it: `kern_select`
+/// (`fs/select.c`) refuses a negative field, then folds `tv_usec >= 1000000`
+/// into the seconds before `poll_select_set_timeout`, so `{0, 1500000}` is a
+/// 1.5 s timeout. Detcore rejected the folded form with EINVAL. Every backend
+/// runs this through Detcore's shared `select_timeout_duration`; the guest's
+/// native output is the oracle (`tests/c/select_timeout_normalization.c`),
+/// except for its `mixed` lines on a host kernel older than 7.1, which had no
+/// sign check.
+#[test]
+fn select_timeout_folds_microseconds_into_seconds_as_linux() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(
+        &SELECT_TIMEOUT_NORMALIZATION_GUEST,
+        "select_timeout_normalization",
+    );
+    let expected = "usec 1500000 times out: r=0 tv=0.000000\n\
+         waited at least 1.5 s: 1\n\
+         usec 2000000 with a ready pipe: r=1\n\
+         ready descriptor reported: 1\n\
+         usec -1: r=-1 errno=Invalid argument\n\
+         sec -1: r=-1 errno=Invalid argument\n\
+         mixed {2, -1000000}: r=-1 errno=Invalid argument\n\
+         mixed {-1, 2000000}: r=-1 errno=Invalid argument\n\
+         mixed {1, -1}: r=-1 errno=Invalid argument\n\
+         pselect6 nsec 1000000000: r=-1 errno=Invalid argument\n";
+    // Before v7.1, kern_select had no sign check, so the mixed lines differ
+    // natively there; every other line is the same on any kernel.
+    let kernel = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
+    let mut release = kernel.trim().split(|c: char| !c.is_ascii_digit());
+    let major: u32 = release.next().unwrap().parse().unwrap();
+    let minor: u32 = release.next().unwrap_or("0").parse().unwrap_or(0);
+    let without_mixed = |output: &str| -> String {
+        output
+            .lines()
+            .filter(|line| !line.starts_with("mixed "))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    };
+    let native = native_stdout(guest);
+    if (major, minor) >= (7, 1) {
+        assert_eq!(native, expected);
+    } else {
+        assert_eq!(without_mixed(&native), without_mixed(expected));
+    }
+    let guest = guest.to_str().unwrap();
+    for strict in [true, false] {
+        let mut args = vec!["run"];
+        if strict {
+            args.push("--strict");
+        }
+        args.extend(["--base-env=minimal", "--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
     }
 }
 

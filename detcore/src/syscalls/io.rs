@@ -612,14 +612,27 @@ pub(super) fn ppoll_timeout_duration(timeout: Timespec) -> Result<Duration, Errn
     Ok(Duration::new(seconds, nanoseconds))
 }
 
+/// `select`'s timeout as Linux reads it. In Linux v7.1 `kern_select`
+/// (`fs/select.c`) first refuses a negative `tv_sec` or `tv_usec` with
+/// `EINVAL`, then passes `tv_sec + tv_usec / USEC_PER_SEC` seconds and
+/// `(tv_usec % USEC_PER_SEC) * NSEC_PER_USEC` nanoseconds to
+/// `poll_select_set_timeout`, which refuses only what `timespec64_valid`
+/// (`include/linux/time64.h`) refuses: so microseconds of a second or more
+/// fold into the seconds. (v6.12 has no separate sign check, so there a
+/// mixed-sign timeval such as `{2, -1000000}` normalizes to 1 s; v7.1 added
+/// the check because the signed sum could wrap a negative timeout into a
+/// valid one. This follows v7.1, the measured host behaviour.) A sum that
+/// would overflow the signed seconds is `EINVAL` here.
 pub(super) fn select_timeout_duration(timeout: libc::timeval) -> Result<Duration, Errno> {
-    let seconds = u64::try_from(timeout.tv_sec).map_err(|_| Errno::EINVAL)?;
-    let microseconds = u64::try_from(timeout.tv_usec).map_err(|_| Errno::EINVAL)?;
-    // Linux rejects select timeouts whose microsecond field is out of range.
-    if microseconds >= 1_000_000 {
+    if timeout.tv_sec < 0 || timeout.tv_usec < 0 {
         return Err(Errno::EINVAL);
     }
-    Ok(Duration::new(seconds, (microseconds * 1_000) as u32))
+    let seconds = timeout
+        .tv_sec
+        .checked_add(timeout.tv_usec / 1_000_000)
+        .ok_or(Errno::EINVAL)?;
+    let nanoseconds = (timeout.tv_usec % 1_000_000) * 1_000;
+    Ok(Duration::new(seconds as u64, nanoseconds as u32))
 }
 
 fn timespec_from_duration(duration: Duration) -> Timespec {
@@ -3814,6 +3827,40 @@ mod tests {
             Err(Errno::EINVAL)
         );
         assert_eq!(pselect6_probe_result(Err(Errno::EINTR)), Err(Errno::EINTR));
+    }
+
+    #[test]
+    fn select_timeout_folds_whole_seconds_out_of_microseconds() {
+        let timeval = |tv_sec, tv_usec| libc::timeval { tv_sec, tv_usec };
+        assert_eq!(
+            select_timeout_duration(timeval(0, 1_500_000)),
+            Ok(Duration::new(1, 500_000_000))
+        );
+        assert_eq!(
+            select_timeout_duration(timeval(2, 3_000_001)),
+            Ok(Duration::new(5, 1_000))
+        );
+        assert_eq!(
+            select_timeout_duration(timeval(0, 999_999)),
+            Ok(Duration::new(0, 999_999_000))
+        );
+        assert_eq!(select_timeout_duration(timeval(0, -1)), Err(Errno::EINVAL));
+        assert_eq!(select_timeout_duration(timeval(-1, 0)), Err(Errno::EINVAL));
+        // v7.1 refuses a negative field before normalizing, so neither mixed
+        // sign is read as the 1 s it would sum to.
+        assert_eq!(
+            select_timeout_duration(timeval(2, -1_000_000)),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            select_timeout_duration(timeval(-1, 2_000_000)),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(select_timeout_duration(timeval(1, -1)), Err(Errno::EINVAL));
+        assert_eq!(
+            select_timeout_duration(timeval(libc::time_t::MAX, 1_000_000)),
+            Err(Errno::EINVAL)
+        );
     }
 
     #[test]
