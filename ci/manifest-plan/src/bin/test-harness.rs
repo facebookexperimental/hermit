@@ -4476,11 +4476,21 @@ mod tests {
             "tests::production_mixed_selection_runs_each_verify_cell_on_its_own_backend";
         if let Some(fixture) = std::env::var_os(CHILD) {
             let fixture = PathBuf::from(fixture);
+            // Run against the fixture as a Git-less source snapshot
+            // (`--repo-root` plus `--source-sha`), as the skid test does, not
+            // against this checkout: describing the checkout runs `git status`
+            // over every tracked file, which rehashes the whole tree in the
+            // validation container (https://github.com/rrnewton/hermit/issues/1845).
+            // No assertion here reads the source identity.
             let values = vec![
                 "--category".into(),
                 "parity".into(),
                 "--ci-only".into(),
                 "--prebuilt".into(),
+                "--repo-root".into(),
+                fixture.display().to_string(),
+                "--source-sha".into(),
+                "0123456789abcdef0123456789abcdef01234567".into(),
                 "--jobs".into(),
                 "1".into(),
                 "--results".into(),
@@ -4491,11 +4501,7 @@ mod tests {
             let args = parse(values.into_iter());
             validate_args("run", &args);
             let manifests = ManifestSet::load(&fixture).unwrap();
-            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .canonicalize()
-                .unwrap();
-            assert_eq!(super::run(&root, &manifests, &args), ExitCode::SUCCESS);
+            assert_eq!(super::run(&fixture, &manifests, &args), ExitCode::SUCCESS);
             return;
         }
 
@@ -9925,12 +9931,19 @@ sys.exit(1 if failed else 0)
         const TEST_NAME: &str = "tests::production_run_retries_only_product_failures";
         if let Some(fixture) = std::env::var_os(CHILD_FIXTURE) {
             let fixture = PathBuf::from(fixture);
-            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .canonicalize()
-                .unwrap();
+            // Run against the fixture as a Git-less source snapshot
+            // (`--repo-root` plus `--source-sha`), as the skid test does, not
+            // against this checkout: describing the checkout runs `git status`
+            // over every tracked file, which rehashes the whole tree in the
+            // validation container (https://github.com/rrnewton/hermit/issues/1845).
+            // No assertion here reads the source identity.
+            let root = fixture.clone();
             let manifests = ManifestSet::load(&fixture).unwrap();
             let mut argv: Vec<String> = vec![
+                "--repo-root".into(),
+                fixture.to_string_lossy().into_owned(),
+                "--source-sha".into(),
+                "0123456789abcdef0123456789abcdef01234567".into(),
                 "--mode".into(),
                 "naked".into(),
                 "--jobs".into(),
@@ -10825,7 +10838,6 @@ sys.exit(1 if failed else 0)
     /// a failed run-verdict record, not just a passed cell.
     #[test]
     fn an_unwritable_count_file_fails_the_run_in_tpx_too() {
-        use std::path::Path;
         use std::path::PathBuf;
         use std::process::Command;
         use std::process::ExitCode;
@@ -10836,12 +10848,19 @@ sys.exit(1 if failed else 0)
         const TEST_NAME: &str = "tests::an_unwritable_count_file_fails_the_run_in_tpx_too";
         if let Some(fixture) = std::env::var_os(CHILD_FIXTURE) {
             let fixture = PathBuf::from(fixture);
-            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .canonicalize()
-                .unwrap();
+            // Run against the fixture as a Git-less source snapshot
+            // (`--repo-root` plus `--source-sha`), as the skid test does, not
+            // against this checkout: describing the checkout runs `git status`
+            // over every tracked file, which rehashes the whole tree in the
+            // validation container (https://github.com/rrnewton/hermit/issues/1845).
+            // No assertion here reads the source identity.
+            let root = fixture.clone();
             let manifests = ManifestSet::load(&fixture).unwrap();
             let argv: Vec<String> = vec![
+                "--repo-root".into(),
+                fixture.to_string_lossy().into_owned(),
+                "--source-sha".into(),
+                "0123456789abcdef0123456789abcdef01234567".into(),
                 "--mode".into(),
                 "naked".into(),
                 "--results".into(),
