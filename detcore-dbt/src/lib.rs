@@ -1673,6 +1673,14 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
             Err(status) => return status,
         }
     };
+    let emit_image_lifecycle = host_tid == pid && inherited_parent.is_none();
+    let Some(&emit) = DBT_DIAGNOSTIC_EMITTER.get() else {
+        return -1;
+    };
+    if emit_image_lifecycle {
+        emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore thread state\n");
+        emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore thread state\n");
+    }
     let parent_ref = inherited_parent
         .as_ref()
         .map(|parent| (Tid::from_raw(parent.tid.into()), &parent.state))
@@ -1715,9 +1723,9 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
         prepared_exec: None,
     });
     scratch.runtime_state = Box::into_raw(thread);
-    let Some(&emit) = DBT_DIAGNOSTIC_EMITTER.get() else {
-        return -1;
-    };
+    if emit_image_lifecycle {
+        emit_lifecycle_marker(emit, b"detcore-dbt: Detcore thread state constructed\n");
+    }
     // The native admission gate must not release a fresh image between its
     // thread-start and post-exec hooks. Child state keeps post_exec_pending
     // false, so the same once-only helper preserves its existing lifecycle.
@@ -1736,7 +1744,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
             read_registers,
             write_registers,
             emit,
-            false,
+            emit_image_lifecycle,
         )
     }
     .is_err()
@@ -2437,11 +2445,9 @@ unsafe fn start_thread_runtime(
     emit: unsafe extern "C" fn(*const u8, usize),
     first_event: bool,
 ) -> Result<*mut ThreadRuntime, i64> {
-    if first_event {
-        emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore thread state\n");
-    }
     if scratch.runtime_state.is_null() {
         if first_event {
+            emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore thread state\n");
             emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore thread state\n");
         }
         let mut state = init_dbt_thread_state(

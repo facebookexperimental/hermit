@@ -2327,8 +2327,14 @@ fi
 # byte-identical and no reverie-dbt file is added or removed, so the
 # inventory (989), SDK recipe and resource budget carry without a cold SDK
 # build. This is not runtime-correctness or binary/package identity evidence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d451e8dbc10461f875e78f65dbb3d5d28a718a42 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d451e8dbc10461f875e78f65dbb3d5d28a718a42 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 905b53dbdb37422fa5d1ea70c1e1df60e211cb18 (2026-10-19): from
+# d451e8dbc10461f875e78f65dbb3d5d28a718a42. One commit (dbt lane: keep DBT runtime readiness outside the birth deadline). It changes reverie-dbt/native/client.c
+# only: build.rs, native/CMakeLists.txt and vendor/dynamorio stay
+# byte-identical and no reverie-dbt file is added or removed, so the
+# inventory (989), SDK recipe and resource budget carry without a cold SDK
+# build. This is not runtime-correctness or binary/package identity evidence.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 905b53dbdb37422fa5d1ea70c1e1df60e211cb18 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 905b53dbdb37422fa5d1ea70c1e1df60e211cb18 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

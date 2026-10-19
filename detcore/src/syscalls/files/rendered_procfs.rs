@@ -3026,9 +3026,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub(crate) async fn record_process_auxv<G: Guest<Self>>(&self, guest: &mut G) {
         use crate::tool_global::AuxvFromKernel;
         // Only a stack pointer the backend observed at the image's first
-        // instruction: in the post-exec callback the registers' need not be
-        // (DBT runs it at the image's first syscall). Without one, or with an
-        // implausible vector there, the file is left to the kernel beneath:
+        // instruction: post-exec registers need not retain it on every
+        // backend. DBT's first-entry admission still does not supply this
+        // image-owned hook. Without one, or with an implausible vector there,
+        // the file is left to the kernel beneath:
         // the host kernel's file on ptrace and DBT, the provider's refusal on
         // KVM.
         let found = match guest.initial_stack_pointer() {
