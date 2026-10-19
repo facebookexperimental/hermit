@@ -2229,7 +2229,15 @@ fi
 # tree and SDK/native recipe inputs are identical (inventory989).
 # Preserve the incoming K3b carry and the original a15e measurement above;
 # this source equality is not a new build or runtime-package receipt.
-expected_pin=e7bf2d9b9d4f58c108b591b70ebf0e496de34f4b
+# CARRY TO 9547c3594d3881dead7d0e7a04ea5f32df7a7745 (2026-10-19): from
+# e7bf2d9b9d4f58c108b591b70ebf0e496de34f4b. One commit (signals lane, A5 step 3.0a:
+# injected syscalls run under the guest's own mask on an unshared
+# signal-action table). It changes reverie-ptrace/src/task.rs, sigtrap_state.rs
+# and its plain-guest fixture and tests only; git diff is empty under
+# reverie-dbt/ and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml,
+# so the inventory (989), SDK and native inputs, calibrated budget, job width
+# and limits are unchanged from the e7bf2d9b carry.
+expected_pin=9547c3594d3881dead7d0e7a04ea5f32df7a7745
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

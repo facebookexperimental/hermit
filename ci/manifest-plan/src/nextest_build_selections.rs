@@ -905,7 +905,9 @@ mod tests {
             // And proc_locks_determinism's deferred-refusal split, version-gate
             // and vfork tests (+3): 617.
             // And its fake-/proc-under-chroot test (+1): 618.
-            assert_eq!(population, 618);
+            // signal_determinism's five ptrace_signal_state_kept_* tests (A5
+            // step 3.0a, +5): 623.
+            assert_eq!(population, 623);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

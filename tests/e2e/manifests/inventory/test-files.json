@@ -2312,6 +2312,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/signal_state_kept.c",
+      "runner": "hermit-cli/tests/signal_determinism.rs",
+      "why": "tests/c/signal_state_kept.c is owned by hermit-cli/tests/signal_determinism.rs: the ptrace_signal_state_kept_* tests run it natively and under run --strict --verify --verify-strict, single-threaded and around a joined thread (glibc's pthread_create blocks every signal around the clone with a call Detcore injects, and Reverie single-steps), and compare SIGTRAP's action, rt_sigprocmask bit and procfs SigBlk/SigIgn/SigCgt with the native run's for an ignored, blocked-ignored, caught, blocked-caught and blocked-default SIGTRAP. Where Reverie keeps its step shield (a blocked-caught SIGTRAP, and every blocked state once a second thread has used the table) only SIGTRAP's SigBlk bit may differ, a pinned limit. A generic manifest cannot compare a guest's output with a native run of it (A5 step 3.0, https://github.com/rrnewton/hermit/issues/4485)."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/signal_then_sibling_exit.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/signal_then_sibling_exit.c is owned by hermit-cli/tests/cli.rs: run_kvm_a_sibling_may_exit_while_its_signal_is_taken runs it on the KVM backend, where a worker signals the main thread and exits at once while the main thread takes the signal at a system-call return (spin) or in a sigsuspend loop; the worker's exit must wait for the delivery permit rather than fail the parked signal protocol (https://github.com/rrnewton/hermit/issues/4367). It requires repeated run --strict --verify --verify-strict runs, with chaos seeds for sigsuspend, at bitwise parity, so it remains a guest fixture rather than a manifest cell."

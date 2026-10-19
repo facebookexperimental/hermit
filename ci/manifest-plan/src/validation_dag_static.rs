@@ -2900,7 +2900,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And six more of them (step 3.2 round 2), less the spin case, which needs
     // the PMU timer and moves to test.pmu_integration_cases: 279.
     // And forced-blocked (round 3): 280.
-    ("test.hermit_integration_3", 280),
+    // And signal_determinism's five ptrace_signal_state_kept_* tests (A5
+    // step 3.0a), listed: 285.
+    ("test.hermit_integration_3", 285),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4589,7 +4591,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // vfork tests: 617, listed.
     // And +3 from 16eca47a: 617.
     // And proc_locks_determinism's fake-/proc-under-chroot test: 618, listed.
-    ("test.hermit_integration_on_host", 618),
+    // And signal_determinism's five ptrace_signal_state_kept_* tests (A5
+    // step 3.0a), listed: 623.
+    ("test.hermit_integration_on_host", 623),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
