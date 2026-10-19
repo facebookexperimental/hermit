@@ -42448,23 +42448,85 @@ const PRIVATE_SIGCHLD_WAIT_ROWS: [(&[&str], &str); 85] = [
     (&["pending", "usr1"], "pending usr1: -1 EINTR, handled 1"),
 ];
 
-/// A `SIGCHLD` a guest sends a thread with `tgkill`, which the schedule records
-/// in the thread's private queue, ends the thread's `poll`, `ppoll`,
-/// `epoll_wait`, `epoll_pwait` or `rt_sigtimedwait`, and its restartable pipe
-/// `read`, `readv` or `write`, as on Linux: `-1 EINTR` with the handler first,
-/// or with `SA_RESTART` a pipe read or write restarted after it (R2b-2 stage 3,
-/// https://github.com/rrnewton/hermit/issues/4273). Before, Hermit held every
-/// such `SIGCHLD` until the call returned: the call completed and the handler
-/// ran late, and a pending one that an `epoll_pwait`'s temporary mask let in
-/// hung the call. The `fork` rows wait in a single-threaded process, which
-/// keeps Detcore's signal-state copy. A socket call still holds the `SIGCHLD`
-/// (rev4 1e). Each row runs under `--strict --verify --verify-strict` at
-/// canonical parity.
-#[test]
-fn a_private_sigchld_ends_gated_waits_and_pipe_calls_as_on_linux() {
+/// The test of `PRIVATE_SIGCHLD_WAIT_ROWS` that runs `args`, as an index into
+/// `PRIVATE_SIGCHLD_GROUP_TESTS`: each row belongs to exactly one of seven
+/// groups, so that no test runs more than 16 strict verifications and each
+/// stays well inside the per-test CPU budget and wall backstop under
+/// validation load (the single 85-row test ran past them there,
+/// https://github.com/rrnewton/hermit/issues/4273).
+fn private_sigchld_row_group(args: &[&str]) -> usize {
+    let gated = |call: &str| {
+        matches!(
+            call,
+            "read"
+                | "poll"
+                | "ppoll"
+                | "epoll_wait"
+                | "epoll_pwait"
+                | "select"
+                | "sigtimedwait"
+                | "futex"
+        )
+    };
+    match (args[0], args.get(1).copied(), args.get(2).copied()) {
+        ("thread", Some(call), Some("caught" | "restart")) if gated(call) => 0,
+        ("thread", Some(call), Some(_)) if gated(call) => 1,
+        ("thread", _, _) => 2,
+        ("fork", _, Some("caught")) => 3,
+        ("fork", _, Some("restart")) => 4,
+        ("fork", _, _) => 5,
+        ("edge" | "pending", _, _) => 6,
+        _ => panic!("no test runs the row {args:?}"),
+    }
+}
+
+/// The seven tests that run `PRIVATE_SIGCHLD_WAIT_ROWS`: the test at index `g`
+/// runs the rows `private_sigchld_row_group` puts in group `g`.
+const PRIVATE_SIGCHLD_GROUP_TESTS: [&str; 7] = [
+    "a_private_sigchld_ends_gated_waits_and_pipe_calls_as_on_linux",
+    "a_blocked_or_ignored_private_sigchld_ends_no_wait",
+    "a_private_sigchld_ends_a_pipe_readv_but_no_socket_call",
+    "a_private_sigchld_ends_a_single_threaded_wait_as_on_linux",
+    "a_private_sigchld_restarts_a_single_threaded_pipe_call_as_on_linux",
+    "a_blocked_private_sigchld_ends_a_wait_only_through_its_wait_mask",
+    "a_private_sigchld_edge_cases_and_pending_copies_behave_as_on_linux",
+];
+
+/// The four tests that run the recorded rows of `PRIVATE_SIGCHLD_WAIT_ROWS`:
+/// the test at index `p` runs the rows `private_sigchld_record_part` puts in
+/// part `p`.
+const PRIVATE_SIGCHLD_RECORD_TESTS: [&str; 4] = [
+    "private_sigchld_wait_rows_under_record_and_replay",
+    "private_sigchld_epoll_and_other_wait_rows_under_record_and_replay",
+    "single_threaded_private_sigchld_rows_under_record_and_replay",
+    "single_threaded_restarting_private_sigchld_rows_under_record_and_replay",
+];
+
+/// The index in `tests` of the running test, which libtest runs on a thread
+/// named after it, so that a test cannot run another test's rows.
+fn running_test_index(tests: &[&str]) -> usize {
+    let thread = std::thread::current();
+    let name = thread
+        .name()
+        .expect("libtest names the thread it runs a test on");
+    tests
+        .iter()
+        .position(|test| *test == name)
+        .unwrap_or_else(|| panic!("the test {name} is not in {tests:?}"))
+}
+
+/// Runs, under `--strict --verify --verify-strict` at canonical parity, the
+/// rows of `PRIVATE_SIGCHLD_WAIT_ROWS` in the running test's group, each
+/// against its line, and checks it ran every row of the group.
+fn run_private_sigchld_rows() {
+    let group = running_test_index(&PRIVATE_SIGCHLD_GROUP_TESTS);
     let _guard = hermit_run_guard();
     let guest = poll_recheck_guest("guest_private_sigchld_waits");
-    for (args, line) in PRIVATE_SIGCHLD_WAIT_ROWS {
+    let mut ran = 0;
+    for (args, line) in PRIVATE_SIGCHLD_WAIT_ROWS
+        .iter()
+        .filter(|(args, _)| private_sigchld_row_group(args) == group)
+    {
         let mut command = vec![
             "run",
             "--strict",
@@ -42482,33 +42544,137 @@ fn a_private_sigchld_ends_gated_waits_and_pipe_calls_as_on_linux() {
             "{args:?}: stderr:\n{}",
             stderr(&output)
         );
+        ran += 1;
+    }
+    let group_size = PRIVATE_SIGCHLD_WAIT_ROWS
+        .iter()
+        .filter(|(args, _)| private_sigchld_row_group(args) == group)
+        .count();
+    assert_eq!(ran, group_size, "group {group} ran {ran} of its rows");
+}
+
+/// Every row of `PRIVATE_SIGCHLD_WAIT_ROWS` is run by exactly one of the seven
+/// run-mode tests, none of which runs more than 16, and every recorded row by
+/// exactly one of the four record tests. Each test named in
+/// `PRIVATE_SIGCHLD_GROUP_TESTS` and `PRIVATE_SIGCHLD_RECORD_TESTS` exists and
+/// only calls its runner, which finds its rows by the test's own name, and
+/// each name is listed once.
+#[test]
+fn private_sigchld_wait_rows_are_split_across_seven_tests() {
+    let mut sizes = [0usize; 7];
+    let mut recorded = [0usize; 4];
+    for (args, _) in PRIVATE_SIGCHLD_WAIT_ROWS {
+        sizes[private_sigchld_row_group(args)] += 1;
+        if recorded_private_sigchld_row(args) {
+            recorded[private_sigchld_record_part(args)] += 1;
+        }
+    }
+    assert_eq!(sizes.iter().sum::<usize>(), PRIVATE_SIGCHLD_WAIT_ROWS.len());
+    assert!(
+        sizes.iter().all(|size| (1..=16).contains(size)),
+        "{sizes:?}"
+    );
+    assert!(recorded.iter().all(|size| *size > 0), "{recorded:?}");
+    let source = include_str!("cli.rs");
+    for (tests, runner) in [
+        (&PRIVATE_SIGCHLD_GROUP_TESTS[..], "run_private_sigchld_rows"),
+        (
+            &PRIVATE_SIGCHLD_RECORD_TESTS[..],
+            "record_private_sigchld_rows",
+        ),
+    ] {
+        for (index, test) in tests.iter().enumerate() {
+            assert!(!tests[..index].contains(test), "{test} is listed twice");
+            let body = format!("#[test]\nfn {test}() {{\n    {runner}();\n}}\n");
+            assert_eq!(source.matches(&body).count(), 1, "{test} must be:\n{body}");
+        }
     }
 }
 
-/// The caught, `SA_RESTART` and pending rows of
-/// `a_private_sigchld_ends_gated_waits_and_pipe_calls_as_on_linux`, under
-/// `record start --verify --verify-strict`: every replay matches its
-/// recording. The rows Hermit decides in every mode give the run-mode line
-/// too: a pipe `read`, `readv`, `write` or `writev` (internal polling under
-/// record too), `rt_sigtimedwait` (the gated loop in every mode), and the
-/// `pending` rows, whose signal is pending before the call. A `poll`,
-/// `ppoll`, `epoll_*` or `select` wait is the kernel's own under record (the
-/// R2b-2 design's record map), so its line follows host timing there, and a
-/// futex wait parks in the scheduler; only their replay is checked. The
-/// socket rows are left out: they hold the SIGCHLD by design (rev4 1e).
+/// A `SIGCHLD` a guest sends a thread with `tgkill`, which the schedule records
+/// in the thread's private queue, ends the thread's `poll`, `ppoll`,
+/// `epoll_wait`, `epoll_pwait` or `rt_sigtimedwait`, and its restartable pipe
+/// `read`, `readv` or `write`, as on Linux: `-1 EINTR` with the handler first,
+/// or with `SA_RESTART` a pipe read or write restarted after it (R2b-2 stage 3,
+/// https://github.com/rrnewton/hermit/issues/4273). Before, Hermit held every
+/// such `SIGCHLD` until the call returned: the call completed and the handler
+/// ran late, and a pending one that an `epoll_pwait`'s temporary mask let in
+/// hung the call. The `fork` rows wait in a single-threaded process, which
+/// keeps Detcore's signal-state copy. A socket call still holds the `SIGCHLD`
+/// (rev4 1e). This test runs the worker-thread rows of the pipe read and the
+/// gated waits, caught and `SA_RESTART`; the six that follow run the rest.
 #[test]
-fn private_sigchld_wait_rows_under_record_and_replay() {
+fn a_private_sigchld_ends_gated_waits_and_pipe_calls_as_on_linux() {
+    run_private_sigchld_rows();
+}
+
+/// The worker-thread rows of the pipe read and the gated waits with the
+/// `SIGCHLD` blocked by the guest, or left at its default (ignored) action.
+#[test]
+fn a_blocked_or_ignored_private_sigchld_ends_no_wait() {
+    run_private_sigchld_rows();
+}
+
+/// The worker-thread `readv` rows, and the socket rows, which still hold the
+/// `SIGCHLD` (rev4 1e).
+#[test]
+fn a_private_sigchld_ends_a_pipe_readv_but_no_socket_call() {
+    run_private_sigchld_rows();
+}
+
+/// The single-threaded rows with a caught `SIGCHLD`.
+#[test]
+fn a_private_sigchld_ends_a_single_threaded_wait_as_on_linux() {
+    run_private_sigchld_rows();
+}
+
+/// The single-threaded rows with an `SA_RESTART` handler.
+#[test]
+fn a_private_sigchld_restarts_a_single_threaded_pipe_call_as_on_linux() {
+    run_private_sigchld_rows();
+}
+
+/// The single-threaded rows with the `SIGCHLD` blocked by the guest, which
+/// a temporary wait mask may let in.
+#[test]
+fn a_blocked_private_sigchld_ends_a_wait_only_through_its_wait_mask() {
+    run_private_sigchld_rows();
+}
+
+/// The edge rows (a ready descriptor in the same turn, an argument error, a
+/// consumed or discarded copy, two copies, a tight stack) and the rows whose
+/// `SIGCHLD` is pending before the wait.
+#[test]
+fn a_private_sigchld_edge_cases_and_pending_copies_behave_as_on_linux() {
+    run_private_sigchld_rows();
+}
+
+/// Runs the recorded rows (`recorded_private_sigchld_row`) of
+/// `PRIVATE_SIGCHLD_WAIT_ROWS` in the running test's part
+/// (`private_sigchld_record_part`), under `record start
+/// --verify --verify-strict`: every replay matches its recording. The rows
+/// Hermit decides in every mode give the run-mode line too: a pipe `read`,
+/// `readv`, `write` or `writev` (internal polling under record too),
+/// `rt_sigtimedwait` (the gated loop in every mode), and the `pending` rows,
+/// whose signal is pending before the call. A `poll`, `ppoll`, `epoll_*` or
+/// `select` wait is the kernel's own under record (the R2b-2 design's record
+/// map), so its line follows host timing there, and a futex wait parks in the
+/// scheduler; only their replay is checked. The socket rows are left out:
+/// they hold the SIGCHLD by design (rev4 1e).
+fn record_private_sigchld_rows() {
+    let part = running_test_index(&PRIVATE_SIGCHLD_RECORD_TESTS);
+    let in_part = |args: &[&str]| {
+        recorded_private_sigchld_row(args) && private_sigchld_record_part(args) == part
+    };
     let _guard = hermit_run_guard();
     let guest = poll_recheck_guest("guest_private_sigchld_waits");
     let decided =
         |call: &str| matches!(call, "read" | "readv" | "write" | "writev" | "sigtimedwait");
-    let socket = |call: &str| matches!(call, "recv" | "send" | "accept4" | "recv-timeo");
-    for (args, line) in PRIVATE_SIGCHLD_WAIT_ROWS.iter().filter(|(args, _)| {
-        args[0] == "pending"
-            || (matches!(args[0], "thread" | "fork")
-                && matches!(args[2], "caught" | "restart")
-                && !socket(args[1]))
-    }) {
+    let mut ran = 0;
+    for (args, line) in PRIVATE_SIGCHLD_WAIT_ROWS
+        .iter()
+        .filter(|(args, _)| in_part(args))
+    {
         let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let data_dir = format!("--data-dir={}", data.path().display());
         let mut command = vec![
@@ -42535,7 +42701,68 @@ fn private_sigchld_wait_rows_under_record_and_replay() {
             log.contains("Success: replay matched recording"),
             "{args:?}: replay did not match:\n{log}"
         );
+        ran += 1;
     }
+    let part_size = PRIVATE_SIGCHLD_WAIT_ROWS
+        .iter()
+        .filter(|(args, _)| in_part(args))
+        .count();
+    assert_eq!(ran, part_size, "record part {part} ran {ran} of its rows");
+}
+
+/// Whether the record tests run a row: a pending row, or a worker-thread or
+/// single-threaded caught or `SA_RESTART` row of a pipe call or a wait
+/// (sockets hold the `SIGCHLD` by design). The single record test's filter
+/// before the split.
+fn recorded_private_sigchld_row(args: &[&str]) -> bool {
+    let socket = matches!(
+        args.get(1).copied(),
+        Some("recv" | "send" | "accept4" | "recv-timeo")
+    );
+    args[0] == "pending"
+        || (matches!(args[0], "thread" | "fork")
+            && matches!(args.get(2).copied(), Some("caught" | "restart"))
+            && !socket)
+}
+
+/// The record test that runs a recorded row, as an index into
+/// `PRIVATE_SIGCHLD_RECORD_TESTS`: the worker-thread pipe-read and poll rows,
+/// the other worker-thread rows, the single-threaded caught rows with the
+/// pending rows, and the single-threaded `SA_RESTART` rows.
+fn private_sigchld_record_part(args: &[&str]) -> usize {
+    match (args[0], args.get(1).copied(), args.get(2).copied()) {
+        ("thread", Some("read" | "readv" | "poll" | "ppoll"), _) => 0,
+        ("thread", _, _) => 1,
+        ("pending", _, _) | ("fork", _, Some("caught")) => 2,
+        ("fork", _, Some("restart")) => 3,
+        _ => panic!("no record test runs the row {args:?}"),
+    }
+}
+
+/// The worker-thread pipe-read and poll rows of `record_private_sigchld_rows`.
+#[test]
+fn private_sigchld_wait_rows_under_record_and_replay() {
+    record_private_sigchld_rows();
+}
+
+/// The other worker-thread rows of `record_private_sigchld_rows`: the epoll,
+/// select, sigtimedwait and futex waits.
+#[test]
+fn private_sigchld_epoll_and_other_wait_rows_under_record_and_replay() {
+    record_private_sigchld_rows();
+}
+
+/// The single-threaded caught rows and the pending rows of
+/// `record_private_sigchld_rows`.
+#[test]
+fn single_threaded_private_sigchld_rows_under_record_and_replay() {
+    record_private_sigchld_rows();
+}
+
+/// The single-threaded `SA_RESTART` rows of `record_private_sigchld_rows`.
+#[test]
+fn single_threaded_restarting_private_sigchld_rows_under_record_and_replay() {
+    record_private_sigchld_rows();
 }
 
 /// Under DBT the schedule records no private `SIGCHLD` (`private_sent` is kept
