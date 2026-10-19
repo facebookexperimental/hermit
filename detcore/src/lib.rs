@@ -221,8 +221,13 @@ fn consumed_signal_control(
     })
 }
 
-fn is_root_thread_start(is_root_process: bool, dettid: DetTid, detpid: DetPid) -> bool {
-    is_root_process && dettid == detpid
+fn thread_start_needs_registration(
+    is_root_process: bool,
+    past_first_execve: bool,
+    dettid: DetTid,
+    detpid: DetPid,
+) -> bool {
+    dettid == detpid && (is_root_process || !past_first_execve)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3096,7 +3101,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let new_dettid = DetTid::from_raw(guest.tid().into()); // TODO(T78538674): virtualize pid/tid:
         assert_eq!(new_dettid, guest.thread_state().dettid);
         let detpid = select_thread_start_detpid(guest.thread_state().detpid, guest.pid());
-        let is_root_thread = is_root_thread_start(guest.is_root_process(), new_dettid, detpid);
+        let needs_registration = thread_start_needs_registration(
+            guest.is_root_process(),
+            guest.thread_state().past_global_first_execve,
+            new_dettid,
+            detpid,
+        );
         trace!(
             "[tid {}] detcore handle_thread_start, pid={}",
             guest.tid(),
@@ -3115,10 +3125,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
             create_vfork_child_thread(guest, new_dettid, vfork).await;
-        } else if is_root_thread {
-            // There is no fork event to catch for the root thread.
+        } else if needs_registration {
+            // A root has no parent registration. A fresh runtime after exec
+            // also needs this handshake, even when the Guest has an in-tree
+            // parent: the global owner consumes its prepared exec and returns
+            // the replacement MmId before any ordinary image request. State
+            // inherited from a parent is already past the first exec and does
+            // not register a second birth here.
             debug!(
-                "[detcore, dtid {}] root thread start, scheduling.. full config:\n {:?}",
+                "[detcore, dtid {}] thread start registration, scheduling.. full config:\n {:?}",
                 &new_dettid,
                 guest.config()
             );
@@ -5843,9 +5858,34 @@ mod thread_start_identity_tests {
     #[test]
     fn root_thread_uses_deterministic_process_identity() {
         let detpid = DetPid::from_raw(3);
-        assert!(is_root_thread_start(true, DetTid::from_raw(3), detpid));
-        assert!(!is_root_thread_start(false, DetTid::from_raw(3), detpid));
-        assert!(!is_root_thread_start(true, DetTid::from_raw(4), detpid));
+        for past_first_execve in [false, true] {
+            assert!(thread_start_needs_registration(
+                true,
+                past_first_execve,
+                DetTid::from_raw(3),
+                detpid
+            ));
+            for is_root_process in [false, true] {
+                assert!(!thread_start_needs_registration(
+                    is_root_process,
+                    past_first_execve,
+                    DetTid::from_raw(4),
+                    detpid
+                ));
+            }
+        }
+        assert!(thread_start_needs_registration(
+            false,
+            false,
+            DetTid::from_raw(3),
+            detpid
+        ));
+        assert!(!thread_start_needs_registration(
+            false,
+            true,
+            DetTid::from_raw(3),
+            detpid
+        ));
     }
 }
 

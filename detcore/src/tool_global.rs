@@ -11292,6 +11292,8 @@ mod tests {
         thread: crate::ThreadState<()>,
         requests: Mutex<Vec<GlobalRequest>>,
         post_exec: bool,
+        ppid: Option<reverie::Pid>,
+        private_memory: Option<reverie::RuntimePrivateMemory>,
     }
 
     struct ExternalRegistrationStack;
@@ -11356,7 +11358,11 @@ mod tests {
         }
 
         fn ppid(&self) -> Option<reverie::Pid> {
-            None
+            self.ppid
+        }
+
+        fn runtime_private_memory_regions(&self) -> Option<reverie::RuntimePrivateMemory> {
+            self.private_memory.clone()
         }
 
         fn auxv(&self) -> reverie::Auxv {
@@ -12491,6 +12497,8 @@ mod tests {
             thread,
             requests: Mutex::new(Vec::new()),
             post_exec: false,
+            ppid: None,
+            private_memory: None,
         };
         let mutation = |n: u32| GlobalRequest::RecordHostMutation {
             path: format!("/a5-step-2b/{n}"),
@@ -12685,6 +12693,8 @@ mod tests {
             thread,
             requests: Mutex::new(Vec::new()),
             post_exec: false,
+            ppid: None,
+            private_memory: None,
         };
         let mutation = |n: u32| GlobalRequest::RecordHostMutation {
             path: format!("/a5-step-2b-mask/{n}"),
@@ -12844,6 +12854,8 @@ mod tests {
             thread,
             requests: Mutex::new(Vec::new()),
             post_exec: false,
+            ppid: None,
+            private_memory: None,
         };
         let child = DetTid::from_raw(18);
         let exit_signal = if flags.contains(CloneFlags::CLONE_THREAD) {
@@ -14184,45 +14196,160 @@ mod tests {
         assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
     }
 
+    async fn start_external_image(
+        tool: &Detcore,
+        guest: &mut ExternalRegistrationGuest<'_>,
+        expected_grants: &[ResourceID],
+    ) {
+        use reverie::Tool;
+
+        let state = guest.global;
+        let tid = guest.thread.dettid;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut start = std::pin::pin!(tool.handle_thread_start(guest));
+            assert!(futures::poll!(start.as_mut()).is_pending());
+            // Initial self-registration requests ParentContinue before
+            // StartNewThread. Reload registration has no parent turn.
+            // Drive these actual grants, without fabricating responses.
+            let grants = async {
+                let mut last = Err(crate::scheduler::SkipTurn);
+                for expected in expected_grants {
+                    let granted = crate::scheduler::do_a_turn_blocking(
+                        state.sched.clone(),
+                        state.global_time.clone(),
+                        &last,
+                    )
+                    .await
+                    .expect("image admission must receive its scheduler grant");
+                    assert_eq!(granted.tid, tid);
+                    assert!(granted.resources.contains_key(expected));
+                    last = Ok(granted);
+                }
+            };
+            let (started, ()) = tokio::join!(start, grants);
+            started.unwrap();
+        })
+        .await
+        .expect("image admission must finish without guest instructions");
+    }
+
+    /// A reloading backend supplies a real in-tree parent for a fresh image.
+    /// That image must reconnect its prepared exec before ordinary requests can
+    /// publish the replacement native memory owner.
+    #[tokio::test]
+    async fn a_reloaded_descendant_reconnects_before_publishing_its_new_memory_owner() {
+        use reverie::Tool;
+
+        let config = Config {
+            sequentialize_threads: true,
+            max_timeslice: None,
+            no_rcb_time: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true);
+        let state = GlobalState::initialize(&config, false);
+        let parent = super::ROOT_DETPID;
+        let child = DetTid::from_raw(17);
+        let old_mm = MmId::initial(child).for_exec(child);
+        let facts = |epoch| {
+            reverie::RuntimePrivateMemory::Ready(reverie::RuntimePrivateMemorySnapshot {
+                owner: [1, 2, 3, epoch],
+                version: 1,
+                regions: vec![reverie::RuntimePrivateMemoryRegion {
+                    start: 0x1000,
+                    end: 0x2000,
+                }],
+            })
+        };
+        // Seed the already registered descendant's old image. The exec and
+        // replacement-image admission below use actual global RPCs and grants.
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.thread_tree.add_child(parent, parent, true);
+            sched.thread_tree.add_child(parent, child, true);
+            assert_eq!(sched.thread_tree.process_of(child), Some(child));
+            assert_eq!(sched.thread_tree.parent_process(&child), Some(parent));
+            sched.record_thread_mm(child, old_mm);
+            sched.install_test_exec_incarnation(child, old_mm);
+        }
+        install_test_registration(&state, child, Ivar::new());
+        let tool = Detcore::new(reverie::Pid::from_raw(child.as_raw()), &config);
+        let mut old = ExternalRegistrationGuest {
+            global: &state,
+            config: &config,
+            thread: tool.init_thread_state(Tid::from_raw(child.as_raw()), None),
+            requests: Mutex::new(Vec::new()),
+            post_exec: false,
+            ppid: Some(reverie::Pid::from_raw(parent.as_raw())),
+            private_memory: Some(facts(1)),
+        };
+        old.thread.detpid = Some(child);
+        old.thread.mm_id = old_mm;
+        old.thread.past_global_first_execve = true;
+        start_external_image(&tool, &mut old, &[ResourceID::MemAddrSpace(child)]).await;
+        super::send_and_update_time(&mut old, GlobalRequest::GlobalTimeLowerBound).await;
+        assert_eq!(
+            state.sched.lock().unwrap().runtime_private_memory(old_mm),
+            Some(facts(1))
+        );
+        super::prepare_exec(&mut old, old_mm, Default::default(), Vec::new(), None).await;
+        assert!(
+            state
+                .pending_exec_states
+                .lock()
+                .unwrap()
+                .contains_key(&child)
+        );
+        let registered_children = state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .get_children(&parent)
+            .clone();
+        drop(old);
+
+        let mut successor = ExternalRegistrationGuest {
+            global: &state,
+            config: &config,
+            thread: tool.init_thread_state(Tid::from_raw(child.as_raw()), None),
+            requests: Mutex::new(Vec::new()),
+            post_exec: false,
+            ppid: Some(reverie::Pid::from_raw(parent.as_raw())),
+            private_memory: Some(facts(2)),
+        };
+        successor.thread.detpid = Some(child);
+        assert!(!successor.is_root_process());
+        assert!(!successor.thread.past_global_first_execve);
+        start_external_image(&tool, &mut successor, &[ResourceID::MemAddrSpace(child)]).await;
+        let new_mm = old_mm.for_exec(child);
+        assert_eq!(successor.thread.mm_id, new_mm);
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        super::send_and_update_time(&mut successor, GlobalRequest::GlobalTimeLowerBound).await;
+        let sched = state.sched.lock().unwrap();
+        assert_eq!(sched.thread_mm(child), Some(new_mm));
+        assert_eq!(
+            sched.thread_tree.get_children(&parent),
+            &registered_children,
+            "exec is not a new child birth"
+        );
+        assert_eq!(sched.thread_tree.process_of(child), Some(child));
+        assert_eq!(sched.thread_tree.parent_process(&child), Some(parent));
+        assert_eq!(sched.runtime_private_memory(new_mm), Some(facts(2)));
+        let requests = successor.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, GlobalRequest::CreateChildThread(..)))
+                .count(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn reloaded_post_exec_restores_prepared_input_aliases_once() {
         use nix::fcntl::OFlag;
         use reverie::Tool;
-
-        async fn start_image(
-            tool: &Detcore,
-            guest: &mut ExternalRegistrationGuest<'_>,
-            expected_grants: &[ResourceID],
-        ) {
-            let state = guest.global;
-            let tid = guest.thread.dettid;
-            tokio::time::timeout(Duration::from_secs(2), async {
-                let mut start = std::pin::pin!(tool.handle_thread_start(guest));
-                assert!(futures::poll!(start.as_mut()).is_pending());
-                // Initial self-registration requests ParentContinue before
-                // StartNewThread. Reload registration has no parent turn.
-                // Drive these actual grants, without fabricating responses.
-                let grants = async {
-                    let mut last = Err(crate::scheduler::SkipTurn);
-                    for expected in expected_grants {
-                        let granted = crate::scheduler::do_a_turn_blocking(
-                            state.sched.clone(),
-                            state.global_time.clone(),
-                            &last,
-                        )
-                        .await
-                        .expect("image admission must receive its scheduler grant");
-                        assert_eq!(granted.tid, tid);
-                        assert!(granted.resources.contains_key(expected));
-                        last = Ok(granted);
-                    }
-                };
-                let (started, ()) = tokio::join!(start, grants);
-                started.unwrap();
-            })
-            .await
-            .expect("image admission must finish without guest instructions");
-        }
 
         let config = Config {
             sequentialize_threads: true,
@@ -14278,9 +14405,11 @@ mod tests {
             thread: tool.init_thread_state(Tid::from_raw(leader.as_raw()), None),
             requests: Mutex::new(Vec::new()),
             post_exec: true,
+            ppid: None,
+            private_memory: None,
         };
         old.thread.detpid = Some(leader);
-        start_image(
+        start_external_image(
             &tool,
             &mut old,
             &[
@@ -14325,9 +14454,11 @@ mod tests {
             thread: tool.init_thread_state(Tid::from_raw(leader.as_raw()), None),
             requests: Mutex::new(Vec::new()),
             post_exec: true,
+            ppid: None,
+            private_memory: None,
         };
         successor.thread.detpid = Some(leader);
-        start_image(&tool, &mut successor, &[ResourceID::MemAddrSpace(leader)]).await;
+        start_external_image(&tool, &mut successor, &[ResourceID::MemAddrSpace(leader)]).await;
         assert_eq!(successor.thread.mm_id, old_mm.for_exec(leader));
         assert!(state.pending_exec_states.lock().unwrap().is_empty());
         assert_eq!(
@@ -14459,6 +14590,8 @@ mod tests {
             thread,
             requests: Mutex::new(Vec::new()),
             post_exec: true,
+            ppid: None,
+            private_memory: None,
         };
         let t = LogicalTime::from_nanos;
         let [periodic, disarmed, silent] = {
