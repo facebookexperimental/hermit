@@ -896,6 +896,7 @@ mod tests {
 
     /// The `run` rows of the sample table; see [`GLOBAL_SAMPLES`].
     const RUN_SAMPLES: &[(&str, &[&str])] = &[
+        ("in-guest-exec-stop", &["--in-guest-exec-stop"]),
         ("happens-before", &["--happens-before=/tmp/hb.json"]),
         (
             "hb-list-events",
@@ -1366,6 +1367,32 @@ mod tests {
             assert_eq!(saved.program.as_deref(), Some("/bin/echo"));
             assert_eq!(saved.args, ["x", "-y", "--seed=3"]);
         }
+    }
+
+    #[test]
+    fn exec_stop_config_round_trip_preserves_the_not_ready_refusal() {
+        let (before, after, saved) =
+            save_and_load(&sample_argv(Section::Run, &["--in-guest-exec-stop"]));
+        assert_eq!(before, after);
+        assert_eq!(saved.run["in-guest-exec-stop"], true);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("exec-stop.yaml");
+        write(&path, &saved).unwrap();
+        let args = run_options(&load(&path, &[]));
+        let crate::Subcommand::Run(run) = args.command else {
+            unreachable!()
+        };
+        let error = run.refuse_unready_exec_stop().unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            error.to_string().contains("exec-stop-runtime-not-ready"),
+            "{error:#}"
+        );
     }
 
     /// An epoch sampled from the host clock is written out, so a load at

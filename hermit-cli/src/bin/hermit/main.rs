@@ -21,6 +21,8 @@ mod clean;
 mod cli_owned_lifecycle;
 mod container;
 mod dap_adapter;
+#[cfg(test)]
+mod exec_stop_launch_tests;
 mod gdb_client;
 mod gdb_watch_helper;
 mod global_opts;
@@ -578,17 +580,27 @@ impl Subcommand {
     }
 
     /// The `--verify-json` path this invocation will publish a verdict to, if
-    /// any. Only the two subcommands that can produce a verification verdict
-    /// have one.
+    /// any, including an OCI run embedding the normal run options.
     fn verification_json_path(&self) -> Option<&Path> {
         match self {
             Subcommand::Run(run) => run.verify_json_path(),
             Subcommand::Record(record) => record.verify_json_path(),
+            Subcommand::Oci(oci) => oci.verify_json_path(),
             _ => None,
         }
     }
 
     fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.main_with_host_admission(global, host_seccomp::admit)
+    }
+
+    // Keep the host check injectable so ordering tests need no host mutation
+    // or guest execution to prove that a static refusal precedes host probes.
+    fn main_with_host_admission(
+        &mut self,
+        global: &GlobalOpts,
+        admit_host: impl FnOnce(bool) -> Result<(), Error>,
+    ) -> Result<ExitStatus, Error> {
         // Stamp the invocation-bound NO-RESULT record BEFORE the first fallible
         // statement of the whole program. This is the outermost point at which
         // `--verify-json` is known, and it is the only placement that dominates
@@ -613,12 +625,17 @@ impl Subcommand {
         if let Some(path) = self.verification_json_path() {
             write_pending_verification_json(path)?;
         }
+        match self {
+            Subcommand::Run(run) => run.refuse_unready_exec_stop()?,
+            Subcommand::Oci(oci) => oci.refuse_unready_exec_stop()?,
+            _ => (),
+        }
         self.validate_backend_scope(global.backend)?;
         // After the verdict stamp above, so a refused run leaves a no-result
         // verdict rather than a previous run's, and before anything starts a
         // guest or reads its stdin.
         if self.starts_guest() {
-            host_seccomp::admit(global.unsafe_ignore_host_seccomp)?;
+            admit_host(global.unsafe_ignore_host_seccomp)?;
         }
         match self {
             Subcommand::HostCapabilities(x) => x.main(),
@@ -1854,6 +1871,151 @@ mod tests {
         assert_eq!(now["bitwise_parity"], serde_json::json!(false), "{context}");
     }
 
+    #[test]
+    fn exec_stop_refusal_stamps_no_result_before_host_admission() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        plant_previous_green(file.path());
+        let mut args = Args::try_parse_from([
+            "hermit",
+            "--backend=in-guest-trap",
+            "run",
+            "--in-guest-exec-stop",
+            "--verify",
+            "--verify-json",
+            file.path().to_str().unwrap(),
+            "--",
+            "/nonexistent/hermit-exec-stop-guest",
+        ])
+        .unwrap();
+        let host_called = std::cell::Cell::new(false);
+        let error = args
+            .command
+            .main_with_host_admission(&args.global, |_| {
+                host_called.set(true);
+                Err(Error::msg("host admission must not run"))
+            })
+            .unwrap_err();
+        assert!(
+            !host_called.get(),
+            "host probe preceded exec-stop admission"
+        );
+        assert_eq!(
+            failure_exit_code(&error),
+            detcore_model::HERMIT_POLICY_REFUSAL_EXIT
+        );
+        assert_eq!(
+            classify_failure(&error),
+            "HERMIT_POLICY_REFUSAL class=policy-refusal"
+        );
+        assert!(
+            error.to_string().contains("exec-stop-runtime-not-ready"),
+            "{error:#}"
+        );
+        assert_no_result(file.path(), "exec-stop prelaunch refusal");
+    }
+
+    #[test]
+    fn oci_exec_stop_refuses_before_host_or_image_access_and_replaces_stale_verdict() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        plant_previous_green(file.path());
+        let mut args = Args::try_parse_from([
+            "hermit",
+            "oci",
+            "run",
+            "--pull",
+            "unresolvable.invalid/must-not-fetch",
+            "--in-guest-exec-stop",
+            "--verify",
+            "--verify-json",
+            file.path().to_str().unwrap(),
+            "--",
+            "/nonexistent/guest",
+        ])
+        .unwrap();
+        let error = args
+            .command
+            .main_with_host_admission(&args.global, |_| {
+                panic!("pending OCI launcher must not probe the host or start image access")
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exec-stop-runtime-not-ready"),
+            "{error:#}"
+        );
+        assert_no_result(file.path(), "OCI exec-stop prelaunch refusal");
+        let Subcommand::Oci(oci) = &mut args.command else {
+            unreachable!()
+        };
+        let error = oci.main(&args.global).unwrap_err();
+        assert!(
+            error.to_string().contains("exec-stop-runtime-not-ready"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn exec_stop_pending_run_does_not_capture_a_host_epoch() {
+        let matches = command_without_epoch_env()
+            .try_get_matches_from([
+                "hermit",
+                "run",
+                "--in-guest-exec-stop",
+                "--",
+                "/nonexistent/hermit-exec-stop-guest",
+            ])
+            .unwrap();
+        let args = args_from_matches_with_clock(&matches, || {
+            panic!("a pending exec-stop request must not sample the host clock")
+        })
+        .unwrap();
+        let Subcommand::Run(run) = args.command else {
+            unreachable!()
+        };
+        assert!(!run.epoch_capture_for_test().1);
+        assert!(
+            run.refuse_unready_exec_stop()
+                .unwrap_err()
+                .to_string()
+                .contains("exec-stop-runtime-not-ready")
+        );
+    }
+
+    #[test]
+    fn no_exec_stop_flag_preserves_host_admission_and_verdict_stamp() {
+        for prefix in [
+            vec!["hermit", "run"],
+            vec!["hermit", "oci", "run", "test-image"],
+        ] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            plant_previous_green(file.path());
+            let mut argv = prefix;
+            argv.extend([
+                "--verify",
+                "--verify-json",
+                file.path().to_str().unwrap(),
+                "--",
+                "/nonexistent/hermit-exec-stop-guest",
+            ]);
+            let mut args = Args::try_parse_from(argv).unwrap();
+            let host_called = std::cell::Cell::new(false);
+            let error = args
+                .command
+                .main_with_host_admission(&args.global, |_| {
+                    host_called.set(true);
+                    Err(Error::new(std::io::Error::from_raw_os_error(libc::EACCES)))
+                })
+                .unwrap_err();
+            assert!(host_called.get());
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error),
+                Some(libc::EACCES)
+            );
+            assert_no_result(file.path(), "ordinary host admission failure");
+        }
+    }
+
     /// Drive `Subcommand::main` for `argv` and assert that (a) it exits Err
     /// without reaching a verdict, and (b) the planted green has been replaced
     /// by an invocation-bound no-result.
@@ -2213,6 +2375,16 @@ mod tests {
     #[test]
     fn every_verdict_producing_spelling_reports_its_verdict_path() {
         for argv in [
+            vec![
+                "hermit",
+                "oci",
+                "run",
+                "test-image",
+                "--verify",
+                "--verify-json=/tmp/v.json",
+                "--",
+                "/bin/true",
+            ],
             vec![
                 "hermit",
                 "run",

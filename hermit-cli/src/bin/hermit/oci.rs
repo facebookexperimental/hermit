@@ -104,6 +104,22 @@ fn require_store() -> Result<PodmanStore, Error> {
 }
 
 impl OciOpts {
+    /// The embedded run participates in the outer invocation's verdict stamp.
+    pub(crate) fn verify_json_path(&self) -> Option<&std::path::Path> {
+        match &self.command {
+            OciSubcommand::Run(opts) => opts.run.verify_json_path(),
+            _ => None,
+        }
+    }
+
+    /// Refuse pending runtime integration before host probes or image access.
+    pub(crate) fn refuse_unready_exec_stop(&self) -> Result<(), Error> {
+        if let OciSubcommand::Run(opts) = &self.command {
+            opts.run.refuse_unready_exec_stop()?;
+        }
+        Ok(())
+    }
+
     /// Preserve the embedded run's explicit maximum separately from its default.
     pub(crate) fn capture_max_timeslice_source(&mut self, matches: &clap::ArgMatches) {
         if let OciSubcommand::Run(opts) = &mut self.command {
@@ -245,6 +261,7 @@ fn report(store: &PodmanStore, image: &ResolvedImage) -> Result<(), Error> {
 
 impl OciRunOpts {
     fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.run.refuse_unready_exec_stop()?;
         // `hermit oci run` takes its image as a positional; the inherited
         // `--image` flag would be a second, unresolved way to say the same
         // thing. Reject the ambiguity rather than silently picking one.

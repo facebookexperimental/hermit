@@ -1027,6 +1027,11 @@ fn started_by_a_dap_supervisor(owner: &OsStr) -> bool {
 #[derive(Debug, Parser, Clone)]
 #[clap(group(clap::ArgGroup::new("verification").args(["verify", "verify_run"])))]
 pub struct RunOpts {
+    /// Request the first-image exec-stop launcher. Not ready for production:
+    /// refuses before launch until the genuine Detcore runtime is integrated.
+    #[clap(long)]
+    in_guest_exec_stop: bool,
+
     /// Freeze explicitly declared dynamic files for the native trap exec domain.
     /// Static files, scripts, threads, fork and timers remain outside this domain.
     #[cfg(feature = "native-exec")]
@@ -1920,6 +1925,9 @@ impl FromStr for SeedFrom {
 /// not here.
 impl fmt::Display for RunOpts {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if self.in_guest_exec_stop {
+            write!(f, " --in-guest-exec-stop")?;
+        }
         let mut dop = self.det_opts.det_config.clone();
         // Fail-closed is the `run` default, so serialize only the compatibility
         // opt-out. `DetConfig` is also used outside `run` and retains a neutral
@@ -2299,6 +2307,85 @@ fn run_opts_for(argv: &[&str]) -> RunOpts {
     run.capture_max_timeslice_source(matches.subcommand_matches("run").unwrap());
     run.backend = args.global.backend;
     *run
+}
+
+#[cfg(test)]
+fn assert_exec_stop_not_ready(error: &Error) {
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    assert!(
+        error.to_string().contains("exec-stop-runtime-not-ready"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn exec_stop_opt_in_is_uniform_and_retained_in_reproducers() {
+    let mut ordinary = run_opts_for(&["hermit", "run", "--", "/nonexistent/guest"]);
+    assert!(!ordinary.in_guest_exec_stop);
+    ordinary.refuse_unready_exec_stop().unwrap();
+    ordinary.validate_args_with_perf_support(true).unwrap();
+    assert!(!ordinary.to_string().contains("--in-guest-exec-stop"));
+
+    for backend in <Backend as clap::ValueEnum>::value_variants() {
+        let backend_arg = format!("--backend={}", backend.as_str());
+        let options = run_opts_for(&[
+            "hermit",
+            &backend_arg,
+            "run",
+            "--in-guest-exec-stop",
+            "--",
+            "/nonexistent/guest",
+        ]);
+        assert!(options.in_guest_exec_stop);
+        assert_exec_stop_not_ready(&options.refuse_unready_exec_stop().unwrap_err());
+        // Display consumes a normalized configuration. A pending launch is
+        // deliberately refused before normalization; test its serialization
+        // separately, without bypassing the admission exercised above.
+        let mut rendered =
+            run_opts_for(&["hermit", &backend_arg, "run", "--", "/nonexistent/guest"]);
+        rendered.validate_args_with_perf_support(true).unwrap();
+        rendered.in_guest_exec_stop = true;
+        assert!(rendered.to_string().contains("--in-guest-exec-stop"));
+    }
+}
+
+#[test]
+fn exec_stop_direct_entries_refuse_before_launch_work() {
+    let args = crate::Args::try_parse_from([
+        "hermit",
+        "run",
+        "--in-guest-exec-stop",
+        "--dap-listen=127.0.0.1:0",
+        "--",
+        "/nonexistent/guest",
+    ])
+    .unwrap();
+    let crate::Subcommand::Run(mut options) = args.command else {
+        unreachable!()
+    };
+    // main must refuse before it can spawn the DAP supervisor; validation
+    // must refuse before it probes timers, and run before it creates a container.
+    assert_exec_stop_not_ready(&options.main(&args.global).unwrap_err());
+    assert_exec_stop_not_ready(&options.validate_args().unwrap_err());
+    for timer_available in [false, true] {
+        assert_exec_stop_not_ready(
+            &options
+                .validate_args_with_perf_support(timer_available)
+                .unwrap_err(),
+        );
+    }
+    assert_exec_stop_not_ready(&options.run(&args.global, false).unwrap_err());
+    let container_result = options.launch_in_container(
+        (),
+        "exec-stop refusal test",
+        None,
+        |_, _, _| -> Result<(), Error> { panic!("flagged request reached container work") },
+    );
+    assert_exec_stop_not_ready(&container_result.unwrap_err());
+    let verification_result = options.verify_with_execution(|_, _, _, _, _| {
+        panic!("flagged request reached verification execution")
+    });
+    assert_exec_stop_not_ready(&verification_result.unwrap_err());
 }
 
 /// A version-2 happens-before spec needs an effective preemption timer.
@@ -5489,7 +5576,9 @@ impl RunOpts {
     /// same concrete `DateTime`; Detcore never reads the host clock itself.
     pub(crate) fn capture_default_epoch(&mut self, capture_now: impl FnOnce() -> SystemTime) {
         self.epoch_omitted = true;
-        if self.uses_virtual_time_determinization() {
+        // The pending exec-stop path is refused after the verdict stamp; it
+        // must not resolve an implicit input for a guest that cannot start.
+        if !self.in_guest_exec_stop && self.uses_virtual_time_determinization() {
             self.det_opts
                 .det_config
                 .capture_epoch_from_host_time(capture_now());
@@ -6165,7 +6254,20 @@ impl RunOpts {
         })?))
     }
 
+    /// A mechanics fixture cannot supply production Detcore readiness. Keep
+    /// this admission independent of host capabilities and backend selection.
+    pub(crate) fn refuse_unready_exec_stop(&self) -> Result<(), Error> {
+        if self.in_guest_exec_stop {
+            return Err(Error::new(PolicyRefusal).context(
+                "--in-guest-exec-stop: exec-stop-runtime-not-ready: genuine Detcore readiness \
+                 and production ToolRegion image reservation/adoption are not integrated",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.refuse_unready_exec_stop()?;
         if self.dap_listen.is_some() {
             // Before validation, so every --gdbserver refusal applies.
             self.det_opts.det_config.gdbserver = true;
@@ -6589,6 +6691,7 @@ impl RunOpts {
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
+        self.refuse_unready_exec_stop()?;
         refuse_signal_state_check_env(std::env::var_os(SIGNAL_STATE_CHECK_ENV).as_deref())
             .map_err(Error::msg)?;
         let timer = if self.arms_reverie_ptrace_pmu_timer() {
@@ -6638,6 +6741,7 @@ impl RunOpts {
         &mut self,
         timer: Result<(), TimerUnavailable>,
     ) -> Result<(), Error> {
+        self.refuse_unready_exec_stop()?;
         self.resolve_preemption_settings()?;
         let backend = self.selected_backend();
         // LiteInst passes here so that the in-guest refusal, which names why
@@ -8001,6 +8105,7 @@ impl RunOpts {
         global: &GlobalOpts,
         capture_output: bool,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
+        self.refuse_unready_exec_stop()?;
         let mut options = self.clone();
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
@@ -8063,6 +8168,7 @@ impl RunOpts {
             + 'static,
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
+        self.refuse_unready_exec_stop()?;
         let (mut container, tmpfs, identity, resources) = if self.no_namespace {
             let mut container = Container::new();
             apply_affinity(&mut container, self.pin_threads);
@@ -8415,6 +8521,7 @@ impl RunOpts {
             VerificationRun,
         ) -> Result<VerificationRunOutput, Error>,
     ) -> Result<ExitStatus, Error> {
+        self.refuse_unready_exec_stop()?;
         let retained_log_dir = self.retained_verify_log_dir()?;
         let (log1, log2) = temp_log_files_in("run1", "run2", retained_log_dir.as_deref())
             .context("Failed to create verification log files")?;

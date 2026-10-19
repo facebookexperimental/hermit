@@ -15,7 +15,7 @@ hermit_build_env = {
     "CARGO_PKG_VERSION": "0.4.1",
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "956522100b5f6dbd3bb5a105087aa450db8648aa",
+    "HERMIT_REVERIE_PIN": "9ded00ff4ab82e48368e0113f65e954d3533bc3f",
 }
 
 # The shadow release entrypoint supplies these values from Git/Cargo metadata
@@ -93,8 +93,12 @@ rust_library(
                     "reverie-rpc-transport": {"optional": True},
                     "reverie-sabre-stats": {"optional": True},
                 },
+                "dev-dependencies": {
+                    "reverie-inguest": {"default-features": False, "features": ["exec-stop"]},
+                },
             },
             "features": {
+                "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop"],
                 "default": [],
                 "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
                 "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],
@@ -192,8 +196,12 @@ rust_binary(
                     "reverie-rpc-transport": {"optional": True},
                     "reverie-sabre-stats": {"optional": True},
                 },
+                "dev-dependencies": {
+                    "reverie-inguest": {"default-features": False, "features": ["exec-stop"]},
+                },
             },
             "features": {
+                "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop"],
                 "default": [],
                 "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
                 "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],

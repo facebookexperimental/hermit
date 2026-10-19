@@ -2137,7 +2137,15 @@ fi
 # rust-toolchain.toml, so the inventory (973), SDK and native inputs,
 # calibrated budget, job width and limits are unchanged from the 45615034
 # carry.
-expected_pin=956522100b5f6dbd3bb5a105087aa450db8648aa
+# CARRY TO 9ded00ff4ab82e48368e0113f65e954d3533bc3f (2026-10-19): from
+# 956522100b5f6dbd3bb5a105087aa450db8648aa. One commit, the liteinst lane's reviewed f962560b
+# replayed unchanged. Only inguest/loader ownership and fixtures move.
+# reverie-dbt/, root Cargo.toml and rust-toolchain.toml are byte-identical.
+# Cargo.lock changes only reverie-inguest and reverie-loader dependency edges;
+# neither is in the DBT dependency closure, whose locked packages are identical.
+# Native SDK recipe/source inputs, inventory 973, budgets and job limits carry
+# unchanged. This is not a claim that the whole workspace lock is unchanged.
+expected_pin=9ded00ff4ab82e48368e0113f65e954d3533bc3f
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
