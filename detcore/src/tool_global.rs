@@ -3841,6 +3841,13 @@ impl GlobalState {
                     .await
                     .host_timed_signals(dtid),
             ),
+            GlobalRequest::HostTimedAndPrivateSigchld(dtid) => {
+                let (host_timed, private) = self
+                    .lock_rpc_scheduler(false)
+                    .await
+                    .host_timed_and_private_sigchld(dtid);
+                R::HostTimedAndPrivateSigchld(host_timed, private)
+            }
             GlobalRequest::ExactChildWaitState(parent, child) => R::ExactChildWaitState(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -4815,6 +4822,7 @@ impl GlobalState {
                     signal_state_task: None,
                     decides_signal_interruption_itself: false,
                     continues_sigreturn: false,
+                    private_sigchld_decides: false,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
@@ -6295,6 +6303,10 @@ pub enum GlobalRequest {
     /// number, or on an unknown one
     /// (`procfs::locks::LockLedger::alias_inode`). Appended last.
     AliasedInode(Option<String>),
+    /// The calling thread's host-timed signals and the `SIGCHLD` the schedule
+    /// recorded in its private queue (`Scheduler::host_timed_and_private_sigchld`).
+    /// Appended last.
+    HostTimedAndPrivateSigchld(DetTid),
 }
 
 /// Responses from the global object
@@ -6517,6 +6529,9 @@ pub enum GlobalResponse {
     TableExec(()),
     /// Appended last.
     AliasedInode(()),
+    /// The host-timed signals, then the recorded private `SIGCHLD`. Appended
+    /// last.
+    HostTimedAndPrivateSigchld(u64, u64),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -8609,6 +8624,24 @@ where
     let response = send_and_update_time(guest, GlobalRequest::HostTimedSignals(dettid)).await;
     match response.1 {
         GlobalResponse::HostTimedSignals(signals) => signals,
+        _ => unreachable!(),
+    }
+}
+
+/// The calling thread's host-timed signals (`host_timed_signals`) and the
+/// `SIGCHLD` a guest sent it that the schedule recorded in its private queue,
+/// in one round trip (`Scheduler::host_timed_and_private_sigchld`). Read it in
+/// the waiting thread's turn, before any injection of that turn.
+pub(crate) async fn host_timed_and_private_sigchld<G, T>(guest: &mut G) -> (u64, u64)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let dettid = guest.thread_state().dettid;
+    let response =
+        send_and_update_time(guest, GlobalRequest::HostTimedAndPrivateSigchld(dettid)).await;
+    match response.1 {
+        GlobalResponse::HostTimedAndPrivateSigchld(host_timed, private) => (host_timed, private),
         _ => unreachable!(),
     }
 }

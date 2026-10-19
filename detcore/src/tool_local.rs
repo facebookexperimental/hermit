@@ -5223,6 +5223,7 @@ impl<T> ThreadState<T> {
             signal_state_task: None,
             decides_signal_interruption_itself: false,
             continues_sigreturn: false,
+            private_sigchld_decides: false,
         }
     }
 

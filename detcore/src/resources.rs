@@ -590,6 +590,17 @@ pub struct Resources {
     /// `SIGCHLD`, whose delivery the host-async rules place.
     #[serde(default)]
     pub(crate) continues_sigreturn: bool,
+    /// Set on a restartable internal IO poll on a pipe (`FdType::Pipe`:
+    /// pipes, and FIFOs that joined internal polling) by its `read`, `readv`
+    /// and scalar `write`: a `SIGCHLD` a guest sent the thread, which the
+    /// schedule recorded in its private queue (`Scheduler::private_sigchld`),
+    /// ends the call there as on Linux, where every other restartable call
+    /// holds it until it returns (R2b-2 stage 3,
+    /// <https://github.com/rrnewton/hermit/issues/4273>). `false` for every
+    /// other request, a socket call and a parked pipe `writev` (which decides
+    /// interruption itself) included.
+    #[serde(default)]
+    pub(crate) private_sigchld_decides: bool,
 }
 
 impl fmt::Debug for Resources {
@@ -645,6 +656,9 @@ impl fmt::Debug for Resources {
         if self.continues_sigreturn {
             debug.field("continues_sigreturn", &true);
         }
+        if self.private_sigchld_decides {
+            debug.field("private_sigchld_decides", &true);
+        }
         debug.finish()
     }
 }
@@ -684,6 +698,7 @@ impl Resources {
             signal_state_task: None,
             decides_signal_interruption_itself: false,
             continues_sigreturn: false,
+            private_sigchld_decides: false,
         }
     }
 
@@ -724,6 +739,7 @@ impl Resources {
         self.decides_signal_interruption_itself |= other.decides_signal_interruption_itself;
         // A combined operation is a continuation only if both parts are.
         self.continues_sigreturn &= other.continues_sigreturn;
+        self.private_sigchld_decides |= other.private_sigchld_decides;
         self.replay_served_from_log |= other.replay_served_from_log;
         self.polls_guest_state_only |= other.polls_guest_state_only;
         self.waits_until_nothing_else_can_run |= other.waits_until_nothing_else_can_run;

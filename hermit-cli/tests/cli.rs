@@ -41931,7 +41931,7 @@ fn pipe_wake_rows_under_record_and_replay() {
 /// The rows of the R2b-2 stage 2 tests (`guest_restartable_two_signals`):
 /// arguments and the line Hermit prints. Natively (Linux 7.1.3, 3 of 3 each)
 /// a row's line is the same unless a comment says otherwise.
-const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 19] = [
+const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 22] = [
     (
         &["read", "chld", "winch"],
         "read: -1 EINTR, handlers before return: 28 17, after join: 28 17",
@@ -41967,56 +41967,46 @@ const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 19] = [
         &["tight", "chld", "winch"],
         "tight: -1 EINTR, handlers before return: 28 17, after join: 28 17",
     ),
-    // Native `-1 EINTR, handlers before return: 17, after join: 17`: Linux
-    // ends the read for the SIGCHLD. Hermit holds a SIGCHLD whoever sent it
-    // until R2b-2 stage 3 (https://github.com/rrnewton/hermit/issues/4273),
-    // so the read blocks for it and ends at the SIGUSR1, which a later turn
-    // decides under the guest's own mask (Codex review of the R2b-2 design
-    // rev3, P2-1).
+    // Linux ends the read for the SIGCHLD, before the SIGUSR1 is sent. So
+    // does Hermit, since R2b-2 stage 3
+    // (https://github.com/rrnewton/hermit/issues/4273): a SIGCHLD a guest
+    // sent the reader, recorded in its private queue, ends a pipe read.
+    // Before, the read held it and ended at the SIGUSR1 (`17 10`).
     (
         &["twoturn"],
-        "twoturn: -1 EINTR, handlers before return: 17 10, after join: 17 10",
+        "twoturn: -1 EINTR, handlers before return: 17, after join: 17",
     ),
-    // Native `-1 EINTR, handlers before return: 17, after join: 17`, as for
-    // `twoturn`. The process-directed SIGALRM still reaches the reader, which
-    // blocks every signal for the held SIGCHLD.
+    // As `twoturn`: the SIGCHLD ends the read, before the process-directed
+    // SIGALRM fires, as on Linux (before stage 3, `14 17`).
     (
         &["alarmheld"],
-        "alarmheld: -1 EINTR, handlers before return: 14 17, after join: 14 17",
+        "alarmheld: -1 EINTR, handlers before return: 17, after join: 17",
     ),
-    // Native `-1 EINTR, handlers before return: 17, after join: 17`, as for
-    // `twoturn`. The SIGUSR2 sent while SIG_IGN is discarded at send, as on
-    // Linux, because the scheduler decides against the guest mask the reader
-    // publishes while it blocks every signal, not the full mask then installed
-    // (Claude review of the R2b-2 design rev4, L3); the late handler is that
-    // copy, still delivered as the call returns
-    // (https://github.com/rrnewton/hermit/issues/3995). Unpublished, the copy
-    // was counted as kept and ended the read with EINTR.
+    // As `twoturn`: the SIGCHLD ends the read before the SIGUSR2 is sent
+    // while SIG_IGN, as on Linux (before stage 3 the read held the SIGCHLD,
+    // and that discarded copy's late handler gave `1 0, ... 17 12`,
+    // https://github.com/rrnewton/hermit/issues/3995).
     (
         &["ignheld"],
-        "ignheld: 1 0, handlers before return: 17 12, after join: 17 12",
+        "ignheld: -1 EINTR, handlers before return: 17, after join: 17",
     ),
-    // Native `-1 EINTR, handlers before return: 17, after join: 17, returned
-    // during the spin: yes`, as for `twoturn`. The SIGUSR1 sent while the read
-    // blocks every signal for the held SIGCHLD wakes it at once, while a
-    // sibling spins with no syscall: the scheduler's drain filters by the
-    // guest mask the read publishes. Filtered by the kernel's full mask, the
-    // wake was dropped, and the read ended only at its backed-off poll turn,
-    // after about 1.3 billion iterations of the spin (Claude review of R2b-2
-    // stage 2, F1).
-    // A sibling reads the worker's SigBlk while the read waits, with SIGCHLD's
-    // SA_RESTART handler run: the guest's own mask, SIGUSR2 alone, as on
-    // Linux. The read blocks every signal for the held SIGCHLD meanwhile, and
-    // procfs reports the mask it published instead of the kernel's (Codex
+    // On a socketpair, where Hermit still holds the SIGCHLD: a socket read is
+    // outside the calls a recorded private SIGCHLD ends (R2b-2 stage 3, rev4
+    // 1e, https://github.com/rrnewton/hermit/issues/4273), so the read blocks
+    // every signal for it, which is what this row exercises. A sibling reads
+    // the worker's SigBlk while the read waits, with SIGCHLD's SA_RESTART
+    // handler run: the guest's own mask, SIGUSR2 alone, as on Linux. procfs
+    // reports the mask the read published instead of the kernel's (Codex
     // review of R2b-2 stage 2, P2), which read fffffffe7ffb7eef.
     (
         &["maskvis"],
         "maskvis: 1 0, handlers before return: 17, after join: 17, sibling saw SigBlk 0000000000000800",
     ),
-    // As `maskvis`, through a /proc/thread-self/status descriptor the worker
-    // opened and main reads: the file describes the worker, which opened it,
-    // so it reports the worker's published mask too (Codex re-check of R2b-2
-    // stage 2, P2), which read fffffffe7ffb7eef.
+    // As `maskvis` (on a socketpair, held as there), through a
+    // /proc/thread-self/status descriptor the worker opened and main reads:
+    // the file describes the worker, which opened it, so it reports the
+    // worker's published mask too (Codex re-check of R2b-2 stage 2, P2),
+    // which read fffffffe7ffb7eef.
     (
         &["maskvisfd"],
         "maskvisfd: 1 0, handlers before return: 17, after join: 17, sibling saw SigBlk 0000000000000800",
@@ -42031,9 +42021,33 @@ const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 19] = [
         &["maskvisfork"],
         "maskvisfork: child saw SigBlk 0000000000000800\nmaskvisfork: parent read 1",
     ),
+    // On a socketpair, where Hermit still holds the SIGCHLD (rev4 1e, as for
+    // `maskvis`). Native `-1 EINTR, handlers before return: 17, after join:
+    // 17, returned during the spin: yes`: Linux ends the read for the
+    // SIGCHLD. Under Hermit the SIGUSR1 sent while the read blocks every
+    // signal for the held SIGCHLD wakes it at once, while a sibling spins with
+    // no syscall: the scheduler's drain filters by the guest mask the read
+    // publishes. Filtered by the kernel's full mask, the wake was dropped, and
+    // the read ended only at its backed-off poll turn, after about 1.3 billion
+    // iterations of the spin (Claude review of R2b-2 stage 2, F1).
     (
         &["spinwake"],
         "spinwake: -1 EINTR, handlers before return: 17 10, after join: 17 10, returned during the spin: yes",
+    ),
+    // The same three rows on a pipe, where the SIGCHLD a guest sent the
+    // reader, recorded in its private queue, ends the read as on Linux (R2b-2
+    // stage 3): the native lines.
+    (
+        &["spinwakepipe"],
+        "spinwakepipe: -1 EINTR, handlers before return: 17, after join: 17, returned during the spin: yes",
+    ),
+    (
+        &["maskvispipe"],
+        "maskvispipe: 1 0, handlers before return: 17, after join: 17, sibling saw SigBlk 0000000000000800",
+    ),
+    (
+        &["maskvisfdpipe"],
+        "maskvisfdpipe: 1 0, handlers before return: 17, after join: 17, sibling saw SigBlk 0000000000000800",
     ),
     (
         &["read"],
@@ -42121,6 +42135,9 @@ fn restartable_two_signal_rows_under_record_and_replay() {
                     | "maskvis"
                     | "maskvisfd"
                     | "maskvisfork"
+                    | "spinwakepipe"
+                    | "maskvispipe"
+                    | "maskvisfdpipe"
             )
     }) {
         let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();

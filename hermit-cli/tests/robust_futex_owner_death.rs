@@ -1573,11 +1573,13 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // after each OFD lock, for the guest's own /proc/locks rows, 0x171 the
     // R2b-2 stage 3 revert's relabel of 0x16f's format after 0x170 shipped,
     // 0x172 the descriptor-table ledger's /proc/locks decision and its
-    // deferred fdinfo refusal),
+    // deferred fdinfo refusal,
+    // 0x173 a recorded private SIGCHLD ends a gated wait for R2b-2 stage 3 of
+    // https://github.com/rrnewton/hermit/issues/4273, re-landed),
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x172,
+        metadata["version"], 0x173,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);

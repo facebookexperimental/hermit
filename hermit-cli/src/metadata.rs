@@ -715,7 +715,15 @@ impl RecordVersion {
 // /proc/thread-self. A 0x16f or 0x171 recording would replay different guest
 // bytes, or refuse where it recorded a run that went on, so it is refused
 // here instead.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x172);
+// 0x172 -> 0x173 (R2b-2 stage 3 re-landed; 0x170's format under a new
+// label): a `SIGCHLD` a guest sent a thread, which the schedule recorded in
+// its private queue, ends that thread's gated wait (poll, ppoll, epoll_wait,
+// epoll_pwait, rt_sigtimedwait) and its restartable pipe read, readv or
+// scalar write, as on Linux, where it was held until the call returned
+// (https://github.com/rrnewton/hermit/issues/4273). Such a turn also blocks
+// signals in place before its timerfd publication. The recorded decisions
+// change, so an older recording containing one would replay out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x173);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -740,7 +748,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x172);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x172;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x173;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1767,6 +1775,22 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_restartable_calls_block_first() {
         for older in 0x163..=0x16d {
+            assert!(
+                !RECORD_VERSION.compatible_with(&RecordVersion(older)),
+                "{older:#x}"
+            );
+        }
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x170 held a `SIGCHLD` a guest sent a thread,
+    /// recorded in its private queue, until the thread's gated wait or
+    /// restartable pipe call returned, where it now ends the call (R2b-2
+    /// stage 3, https://github.com/rrnewton/hermit/issues/4273). 0x171 and
+    /// 0x172 held it too, and 0x170, stage 3's first label, is refused as well.
+    #[test]
+    fn record_version_rejects_streams_from_before_a_private_sigchld_ends_a_wait() {
+        for older in 0x163..=0x172 {
             assert!(
                 !RECORD_VERSION.compatible_with(&RecordVersion(older)),
                 "{older:#x}"
