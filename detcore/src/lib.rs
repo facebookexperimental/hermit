@@ -65,7 +65,6 @@ mod memory;
 pub mod native_exec;
 pub mod netlink_route;
 pub mod nonwaiting_write;
-pub mod parallelism_probe;
 mod pipe_wake;
 mod procfs;
 mod procfs_inode;
@@ -653,8 +652,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         count: u64,
         res: &Result<i64, Error>,
     ) {
-        // The syscall's result is decided: a checkpoint turn comes after it.
-        crate::parallelism_probe::complete_syscall(guest.thread_state().dettid);
         let posthook = std::mem::take(&mut guest.thread_state_mut().stats.hb_pending_posthook);
         if let Some(checkpoint) = posthook_checkpoint(count, posthook, res) {
             let request = guest.thread_state().mk_request(checkpoint, Permission::R);
@@ -2569,7 +2566,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let result = if guest.config().virtualize_time {
             let dettid = guest.thread_state().dettid;
             guest.thread_state_mut().thread_logical_time.add_rdtsc();
-            crate::parallelism_probe::note_event(dettid, "rdtsc");
             info!(
                 "[dtid {}] inbound rdtsc, new logical time: {:?}",
                 dettid,
@@ -3560,22 +3556,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 crate::syscalls::read_thread_signal_state(pid, tid)
             });
         guest.thread_state_mut().claimed_sigchld = claimed;
-        // Before the pre-handler hook, which can take a turn: a turn taken
-        // from here on comes after the previous syscall.
-        // Its targets are resolved later, at dispatch.
-        if crate::parallelism_probe::enabled() {
-            let a = call.into_parts().1;
-            let args = [a.arg0, a.arg1, a.arg2, a.arg3, a.arg4, a.arg5].map(|arg| arg as u64);
-            let proc_tid =
-                crate::procfs_inode::guest_tids_name_host_tasks(&guest.config().backend, None)
-                    .then(|| guest.tid().as_raw());
-            crate::parallelism_probe::note_syscall(
-                guest.thread_state().dettid,
-                call.name(),
-                args,
-                proc_tid,
-            );
-        }
         self.pre_handler_hook(guest, false, CheckIn::Event).await;
 
         // Linux's restart of an interrupted wait is the thread's very next syscall,
@@ -3844,8 +3824,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         } else {
             None
         };
-        // Past every gate that can yield before an untracked syscall runs.
-        crate::parallelism_probe::note_targets(guest.thread_state().dettid, &guest.memory());
         let res = match classify_syscall(call.number()) {
             _ if sigalrm_refusal.is_some() => Err(sigalrm_refusal.expect("checked").into()),
             _ if rendered_procfs_answer.is_some() => rendered_procfs_answer.expect("checked"),
