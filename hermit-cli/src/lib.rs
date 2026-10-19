@@ -682,7 +682,7 @@ pub struct Recording {
     pub exit_status: ExitStatus,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CapabilityProbe {
     Namespaces,
     Ptrace,
@@ -755,15 +755,37 @@ fn run_capability_probe(probe: CapabilityProbe) -> Result<bool, Error> {
     }
 }
 
-fn validate_tracing_environment() -> Result<(), Error> {
-    if !run_capability_probe(CapabilityProbe::Namespaces)? {
+/// Whether a run creates Hermit's user and PID namespaces. A `--no-namespace`
+/// run starts the guest as a plain child and never calls `unshare`, so the
+/// namespace probe says nothing about whether it can run
+/// (<https://github.com/rrnewton/hermit/issues/4515>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamespaceUse {
+    /// The run unshares its user and PID namespaces (the default).
+    Creates,
+    /// The run creates no namespace (`--no-namespace`).
+    None,
+}
+
+fn validate_tracing_environment(namespaces: NamespaceUse) -> Result<(), Error> {
+    check_tracing_environment(namespaces, run_capability_probe)
+}
+
+/// Refuses a ptrace run that `probe` says this environment cannot host: the
+/// namespace probe for a run that creates namespaces, then the ptrace and
+/// seccomp probes for every run, which a `--no-namespace` run needs too.
+fn check_tracing_environment(
+    namespaces: NamespaceUse,
+    mut probe: impl FnMut(CapabilityProbe) -> Result<bool, Error>,
+) -> Result<(), Error> {
+    if namespaces == NamespaceUse::Creates && !probe(CapabilityProbe::Namespaces)? {
         anyhow::bail!(
             "Hermit cannot create its required user and PID namespaces: \
              unshare(CLONE_NEWUSER | CLONE_NEWPID) was denied. Allow unprivileged user namespaces \
              and the unshare syscall in the host/container policy."
         );
     }
-    if !run_capability_probe(CapabilityProbe::Ptrace)? {
+    if !probe(CapabilityProbe::Ptrace)? {
         anyhow::bail!(
             "Hermit cannot use ptrace in this environment: a child PTRACE_TRACEME probe was \
              denied. Allow same-UID parent-child ptrace in the container seccomp and host \
@@ -772,7 +794,7 @@ fn validate_tracing_environment() -> Result<(), Error> {
              filter)."
         );
     }
-    if !run_capability_probe(CapabilityProbe::Seccomp)? {
+    if !probe(CapabilityProbe::Seccomp)? {
         anyhow::bail!(
             "Hermit cannot install its tracee seccomp filter: \
              seccomp(SECCOMP_SET_MODE_FILTER) was denied. Allow seccomp and \
@@ -1756,7 +1778,15 @@ impl Backend {
 
     /// Returns an actionable error when this backend's prerequisites are not met.
     pub fn ensure_available(self) -> Result<(), Error> {
-        if let Some(reason) = self.unavailable_reason() {
+        self.ensure_available_for(NamespaceUse::Creates)
+    }
+
+    /// [`Backend::ensure_available`] for a run that creates `namespaces`: a
+    /// `--no-namespace` ptrace run is not refused where only `unshare` of a
+    /// user namespace is denied, since it never makes that call; the ptrace
+    /// and seccomp probes still apply.
+    pub fn ensure_available_for(self, namespaces: NamespaceUse) -> Result<(), Error> {
+        if let Some(reason) = self.unavailable_reason_for(namespaces) {
             Err(Error::new(BackendUnavailable::new(self, reason)))
         } else {
             Ok(())
@@ -1764,8 +1794,12 @@ impl Backend {
     }
 
     fn unavailable_reason(self) -> Option<String> {
+        self.unavailable_reason_for(NamespaceUse::Creates)
+    }
+
+    fn unavailable_reason_for(self, namespaces: NamespaceUse) -> Option<String> {
         match self {
-            Self::Ptrace => validate_tracing_environment()
+            Self::Ptrace => validate_tracing_environment(namespaces)
                 .err()
                 .map(|error| error.to_string()),
             Self::Dbt => dbt_unavailable_reason(),
@@ -1897,7 +1931,9 @@ fn sabre_unavailable_reason() -> Option<String> {
 
 #[cfg(feature = "e9patch")]
 fn e9patch_unavailable_reason() -> Option<String> {
-    validate_tracing_environment()
+    // e9patch overlays the rewritten ELF in a mount namespace, so it always
+    // creates namespaces (run refuses `--backend=e9patch --no-namespace`).
+    validate_tracing_environment(NamespaceUse::Creates)
         .err()
         .map(|error| error.to_string())
         .or_else(e9patch::unavailable_reason)
@@ -5708,6 +5744,70 @@ mod tests {
     use super::*;
 
     static SKID_OVERSHOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Runs `check_tracing_environment` against probes that report `denied`
+    /// as unavailable and every other probe as available; returns the refusal,
+    /// if any, and the probes in the order they ran.
+    fn check_with_denied(
+        namespaces: NamespaceUse,
+        denied: &[CapabilityProbe],
+    ) -> (Option<String>, Vec<CapabilityProbe>) {
+        let mut ran = Vec::new();
+        let result = check_tracing_environment(namespaces, |probe| {
+            ran.push(probe);
+            Ok(!denied.contains(&probe))
+        });
+        (result.err().map(|error| error.to_string()), ran)
+    }
+
+    /// Where unprivileged user namespaces are denied, a run that creates them
+    /// is refused at the namespace probe, and a `--no-namespace` run, which
+    /// never calls unshare, is not: it still passes the ptrace and seccomp
+    /// probes (https://github.com/rrnewton/hermit/issues/4515).
+    #[test]
+    fn denied_namespaces_refuse_only_a_run_that_creates_them() {
+        let denied = [CapabilityProbe::Namespaces];
+        let (refusal, ran) = check_with_denied(NamespaceUse::Creates, &denied);
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|refusal| refusal.contains("unshare(CLONE_NEWUSER | CLONE_NEWPID)")),
+            "{refusal:?}"
+        );
+        assert_eq!(ran, [CapabilityProbe::Namespaces]);
+        let (refusal, ran) = check_with_denied(NamespaceUse::None, &denied);
+        assert_eq!(refusal, None);
+        assert_eq!(ran, [CapabilityProbe::Ptrace, CapabilityProbe::Seccomp]);
+    }
+
+    /// A `--no-namespace` run is still refused where ptrace or seccomp is
+    /// denied: skipping the namespace probe skips nothing else.
+    #[test]
+    fn a_run_without_namespaces_still_needs_ptrace_and_seccomp() {
+        for denied in [CapabilityProbe::Ptrace, CapabilityProbe::Seccomp] {
+            let (refusal, _) = check_with_denied(NamespaceUse::None, &[denied]);
+            let expected = match denied {
+                CapabilityProbe::Ptrace => "PTRACE_TRACEME",
+                _ => "SECCOMP_SET_MODE_FILTER",
+            };
+            assert!(
+                refusal
+                    .as_deref()
+                    .is_some_and(|refusal| refusal.contains(expected)),
+                "{denied:?}: {refusal:?}"
+            );
+        }
+        let (refusal, ran) = check_with_denied(NamespaceUse::Creates, &[]);
+        assert_eq!(refusal, None);
+        assert_eq!(
+            ran,
+            [
+                CapabilityProbe::Namespaces,
+                CapabilityProbe::Ptrace,
+                CapabilityProbe::Seccomp
+            ]
+        );
+    }
 
     /// A run that drew an input from the host leaves a recording directory
     /// holding only `manifest.json`; `record rm` and `record clean` remove it

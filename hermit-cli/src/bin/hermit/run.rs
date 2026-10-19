@@ -6525,7 +6525,14 @@ impl RunOpts {
             // E9patch's own availability check covers both its ptrace runtime and
             // the `e9patch` cargo feature (it reports "not included in this build"
             // when the feature is disabled), so it no longer needs a special case.
-            backend.ensure_available()?;
+            // A `--no-namespace` run creates no namespace, so it is not refused
+            // where only unshare(CLONE_NEWUSER) is denied
+            // (https://github.com/rrnewton/hermit/issues/4515).
+            backend.ensure_available_for(if self.no_namespace {
+                hermit::NamespaceUse::None
+            } else {
+                hermit::NamespaceUse::Creates
+            })?;
         }
         // Native exec uses the embedded, producer-qualified catalog rather
         // than the ordinary preload. Its complete Capture::prepare below

@@ -43693,3 +43693,64 @@ fn a_pipe_writev_whose_iovec_array_is_rewritten_keeps_both_signals() {
         }
     }
 }
+
+/// Runs hermit with `args` inside a new user namespace (as its root) whose
+/// `max_user_namespaces` is 0, so that hermit's own unshare(CLONE_NEWUSER)
+/// fails with ENOSPC, as where unprivileged user namespaces are denied. Returns
+/// `None` when this host denies the outer `unshare -U -r` itself.
+fn hermit_where_user_namespaces_are_denied(args: &[&str]) -> Option<Output> {
+    let outer = Command::new("unshare")
+        .args(["-U", "-r", "true"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run unshare");
+    if !outer.status.success() {
+        return None;
+    }
+    let inner = hermit_command(args);
+    let mut command = Command::new("unshare");
+    command
+        .args(["-U", "-r", "sh", "-c"])
+        .arg("echo 0 > /proc/sys/user/max_user_namespaces && exec \"$@\"")
+        .arg("sh")
+        .arg(inner.get_program())
+        .args(inner.get_args())
+        .stdin(Stdio::null());
+    for (name, value) in inner.get_envs() {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    Some(hermit_test::hermit_output(
+        &format!("hermit {args:?} with user namespaces denied"),
+        &mut command,
+    ))
+}
+
+/// Where unprivileged user namespaces are denied, `hermit run` refuses at its
+/// namespace probe, and `hermit run --no-namespace`, which creates no
+/// namespace, runs: before, the ptrace availability check probed unshare for
+/// every run and refused both
+/// (https://github.com/rrnewton/hermit/issues/4515).
+#[test]
+fn a_run_without_namespaces_is_not_refused_where_user_namespaces_are_denied() {
+    let Some(refused) = hermit_where_user_namespaces_are_denied(&["run", "--", "/bin/true"]) else {
+        eprintln!(
+            "a_run_without_namespaces_is_not_refused_where_user_namespaces_are_denied: SKIPPED: \
+             this host denies `unshare -U -r`, so the test cannot deny hermit's own"
+        );
+        return;
+    };
+    let log = stderr(&refused);
+    assert_eq!(refused.status.code(), Some(125), "{log}");
+    assert!(
+        log.contains("class=backend-unavailable")
+            && log.contains("unshare(CLONE_NEWUSER | CLONE_NEWPID) was denied"),
+        "{log}"
+    );
+    let args = ["run", "--no-namespace", "--", "/bin/echo", "ran"];
+    let ran = hermit_where_user_namespaces_are_denied(&args).expect("unshare worked above");
+    assert_success(&ran, &args);
+    assert_eq!(stdout(&ran), "ran\n", "stderr:\n{}", stderr(&ran));
+}
