@@ -42558,7 +42558,10 @@ fn run_private_sigchld_rows() {
 /// exactly one of the four record tests. Each test named in
 /// `PRIVATE_SIGCHLD_GROUP_TESTS` and `PRIVATE_SIGCHLD_RECORD_TESTS` exists and
 /// only calls its runner, which finds its rows by the test's own name, and
-/// each name is listed once.
+/// each name is listed once. The group and part sizes are pinned, so a change
+/// to `recorded_private_sigchld_row` or either mapping that moves a row in or
+/// out of a test fails here until the sizes are restated (dropping the
+/// pending rows from the record filter passed silently before).
 #[test]
 fn private_sigchld_wait_rows_are_split_across_seven_tests() {
     let mut sizes = [0usize; 7];
@@ -42574,7 +42577,9 @@ fn private_sigchld_wait_rows_are_split_across_seven_tests() {
         sizes.iter().all(|size| (1..=16).contains(size)),
         "{sizes:?}"
     );
-    assert!(recorded.iter().all(|size| *size > 0), "{recorded:?}");
+    assert_eq!(PRIVATE_SIGCHLD_WAIT_ROWS.len(), 85);
+    assert_eq!(sizes, [16, 16, 15, 10, 10, 10, 8]);
+    assert_eq!(recorded, [8, 10, 12, 10]);
     let source = include_str!("cli.rs");
     for (tests, runner) in [
         (&PRIVATE_SIGCHLD_GROUP_TESTS[..], "run_private_sigchld_rows"),
