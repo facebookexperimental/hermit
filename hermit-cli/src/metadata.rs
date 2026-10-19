@@ -698,7 +698,14 @@ impl RecordVersion {
 // recorder (an openat, its reads and a close), and replay matches the
 // recorded /proc/locks rows against those recorded bytes. An older recording
 // has no such events there and would replay out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16f);
+// 0x16f -> 0x170 was R2b-2 stage 3 (a recorded private SIGCHLD ends gated
+// waits and pipe calls), shipped in 4381d927 and reverted in a6fb8ad0.
+// 0x170 -> 0x171 (no format change from 0x16f): this tree does not end those
+// calls on a recorded private SIGCHLD, so it takes a new label rather than
+// reusing 0x170. A stage 3 recording is then refused by the exact-match gate
+// instead of being replayed to other results, and the shipped 0x170 label is
+// not moved backward.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x171);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -723,7 +730,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16f);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x16f;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x171;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
