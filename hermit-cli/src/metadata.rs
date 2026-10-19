@@ -705,7 +705,17 @@ impl RecordVersion {
 // reusing 0x170. A stage 3 recording is then refused by the exact-match gate
 // instead of being replayed to other results, and the shipped 0x170 label is
 // not moved backward.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x171);
+// 0x171 -> 0x172: replay recomputes which /proc/locks rows are the guest's
+// from the recorded raw rows and fdinfo reads, and that decision changed
+// after 0x16f's format shipped: the descriptor-table ledger (d8117115) stops
+// a description counting when no guest table references it and hides what it
+// cannot follow, an fdinfo that cannot be opened or read no longer stops the
+// run at the lock call but at the next /proc/locks read while that
+// description is still referenced, and the fdinfo is read through
+// /proc/thread-self. A 0x16f or 0x171 recording would replay different guest
+// bytes, or refuse where it recorded a run that went on, so it is refused
+// here instead.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x172);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -730,7 +740,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x171);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x171;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x172;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

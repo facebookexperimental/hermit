@@ -3955,10 +3955,11 @@ impl GlobalState {
             GlobalRequest::DescriptionLocks(open_file, locks, slots) => {
                 let sched = self.lock_rpc_scheduler(false).await;
                 let process = sched.registered_process(dtid).unwrap_or(dtid);
-                self.lock_ledger
-                    .lock()
-                    .unwrap()
-                    .note_locks(process, open_file, locks, slots);
+                let mut ledger = self.lock_ledger.lock().unwrap();
+                match locks {
+                    Ok(locks) => ledger.note_locks(process, open_file, locks, slots),
+                    Err(reason) => ledger.note_unknown(process, open_file, reason, slots),
+                }
                 R::DescriptionLocks(())
             }
             GlobalRequest::TableReleased(open_file, remaining) => {
@@ -3978,6 +3979,11 @@ impl GlobalState {
                     .unwrap()
                     .exec_kept(process, &surviving);
                 R::TableExec(())
+            }
+            GlobalRequest::AliasedInode(inode) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
+                self.lock_ledger.lock().unwrap().alias_inode(inode);
+                R::AliasedInode(())
             }
             GlobalRequest::GuestLockRows(rows) => {
                 // A positive owner is the kernel's number for a process in the
@@ -4004,12 +4010,19 @@ impl GlobalState {
                 // references nothing (`LockLedger::prune`).
                 let mut ledger = self.lock_ledger.lock().unwrap();
                 ledger.prune(|process| sched.process_is_alive(process));
-                let held = ledger.held();
-                R::GuestLockRows(crate::procfs::locks::guest_lock_rows(
-                    &rows,
-                    |owner| guest_owners.contains(&owner),
-                    &held,
-                ))
+                // A referenced description whose locks are unknown could own
+                // any OFD or flock row: the snapshot is refused
+                // (`LockLedger::unknown`).
+                if let Some(reason) = ledger.unknown() {
+                    R::GuestLockRows(Err(reason.to_string()))
+                } else {
+                    let held = ledger.held();
+                    R::GuestLockRows(Ok(crate::procfs::locks::guest_lock_rows(
+                        &rows,
+                        |owner| guest_owners.contains(&owner),
+                        &held,
+                    )))
+                }
             }
             GlobalRequest::AuxvFromKernel(why) => {
                 let sched = self.lock_rpc_scheduler(false).await;
@@ -4601,6 +4614,14 @@ impl GlobalState {
                         child_dettid,
                         flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_FILES)),
                     );
+                }
+                // A thread with a table of its own: the ledger counts its
+                // calls as its process's, so that process's table can no
+                // longer be followed (`procfs::locks::LockLedger::mark_opaque`).
+                if !is_group_leader
+                    && flags.is_some_and(|flags| !flags.contains(CloneFlags::CLONE_FILES))
+                {
+                    self.lock_ledger.lock().unwrap().mark_opaque(parent_detpid);
                 }
             }
 
@@ -6250,8 +6271,14 @@ pub enum GlobalRequest {
     /// The OFD and flock locks this open file description holds, as its
     /// fdinfo showed them after a call through one of the sender's
     /// descriptors, and how many slots of the sender's descriptor table name
-    /// it (`procfs::locks::LockLedger::note_locks`). Appended last.
-    DescriptionLocks(OpenFileId, Vec<crate::procfs::locks::HeldLock>, u32),
+    /// it (`procfs::locks::LockLedger::note_locks`), or why that fdinfo
+    /// could not be read (`procfs::locks::LockLedger::note_unknown`).
+    /// Appended last.
+    DescriptionLocks(
+        OpenFileId,
+        Result<Vec<crate::procfs::locks::HeldLock>, String>,
+        u32,
+    ),
     /// How many slots of the sender's descriptor table still name this
     /// description after a close or replacement there
     /// (`procfs::locks::LockLedger::release`). Appended last.
@@ -6263,6 +6290,11 @@ pub enum GlobalRequest {
     /// table still names after its successful exec, with their slot counts
     /// (`procfs::locks::LockLedger::exec_kept`). Appended last.
     TableExec(Vec<(OpenFileId, u32)>),
+    /// A lock or unlock went through a descriptor whose description the
+    /// ledger may know under another identity, on the file with this inode
+    /// number, or on an unknown one
+    /// (`procfs::locks::LockLedger::alias_inode`). Appended last.
+    AliasedInode(Option<String>),
 }
 
 /// Responses from the global object
@@ -6478,10 +6510,13 @@ pub enum GlobalResponse {
     DescriptionLocks(()),
     /// Appended last.
     TableReleased(()),
-    /// One answer per row, in row order. Appended last.
-    GuestLockRows(Vec<bool>),
+    /// One answer per row, in row order, or, while a referenced description's
+    /// locks are unknown, why. Appended last.
+    GuestLockRows(Result<Vec<bool>, String>),
     /// Appended last.
     TableExec(()),
+    /// Appended last.
+    AliasedInode(()),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -9051,11 +9086,12 @@ where
 /// Record the OFD and flock locks `open_file` holds, as its fdinfo showed
 /// them after a call through one of the sender's descriptors, and that
 /// `slots` slots of the sender's table name it
-/// (`procfs::locks::LockLedger::note_locks`).
+/// (`procfs::locks::LockLedger::note_locks`), or why that fdinfo could not be
+/// read (`procfs::locks::LockLedger::note_unknown`).
 pub(crate) async fn note_description_locks<G, T>(
     guest: &mut G,
     open_file: OpenFileId,
-    locks: Vec<crate::procfs::locks::HeldLock>,
+    locks: Result<Vec<crate::procfs::locks::HeldLock>, String>,
     slots: u32,
 ) where
     G: Guest<Detcore<T>>,
@@ -9097,12 +9133,27 @@ where
     assert_eq!(response, GlobalResponse::TableExec(()));
 }
 
+/// Record that a lock or unlock went through a descriptor whose description
+/// the ledger may know under another identity, on the file with inode number
+/// `inode` (`None`: unknown) (`procfs::locks::LockLedger::alias_inode`).
+pub(crate) async fn note_aliased_inode<G, T>(guest: &mut G, inode: Option<String>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::AliasedInode(inode))
+        .await
+        .1;
+    assert_eq!(response, GlobalResponse::AliasedInode(()));
+}
+
 /// Which of the rows of a `/proc/locks` snapshot the guest owns, in row order
-/// (`procfs::locks::guest_lock_rows`).
+/// (`procfs::locks::guest_lock_rows`), or why no snapshot can be decided
+/// (`procfs::locks::LockLedger::unknown`).
 pub(crate) async fn guest_lock_rows<G, T>(
     guest: &mut G,
     rows: Vec<crate::procfs::locks::LockRowFacts>,
-) -> Vec<bool>
+) -> Result<Vec<bool>, String>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,

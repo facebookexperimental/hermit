@@ -903,6 +903,12 @@ impl FileMetadata {
         })
     }
 
+    fn has_unsafe_vfork_ofd_state(&self) -> bool {
+        self.file_handles
+            .values()
+            .any(|detfd| detfd.may_hold_ofd_lock())
+    }
+
     fn forget_flock_modes(&self) {
         for detfd in self.file_handles.values() {
             detfd.forget_local_flock_mode_at_fork();
@@ -5537,6 +5543,14 @@ impl<T> ThreadState<T> {
     /// Whether any open file description is held or not proven unlocked.
     pub fn has_unsafe_vfork_flock_state(&self) -> bool {
         self.metadata().has_unsafe_vfork_flock_state()
+    }
+
+    /// Whether a description in this table may hold an OFD lock. A copied
+    /// `vfork` child (DBT) runs its lock calls natively, so the
+    /// `procfs::locks::LockLedger` entry of such a description could go stale
+    /// and admit a host's identical `/proc/locks` row.
+    pub fn has_unsafe_vfork_ofd_state(&self) -> bool {
+        self.metadata().has_unsafe_vfork_ofd_state()
     }
 
     /// A new process can change every inherited open file description through

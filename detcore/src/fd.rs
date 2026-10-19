@@ -554,6 +554,18 @@ struct OpenFileDescription {
     /// description is. Not printed, so descriptions log as before.
     #[serde(default)]
     lock_tracked: bool,
+    /// True once this description was registered on reception over
+    /// `SCM_RIGHTS` (`Detcore::refresh_description_locks`): the sender's
+    /// entry in `procfs::locks::LockLedger` may name the same kernel
+    /// description under another identity. Not printed.
+    #[serde(default)]
+    received_for_locks: bool,
+    /// True once this description may hold an OFD lock: an `F_OFD_SETLK` or
+    /// `F_OFD_SETLKW` went through it, its fdinfo showed one, or its fdinfo
+    /// could not be read. DBT refuses a copied `vfork` child, which would run
+    /// its lock calls natively, while one does. Not printed.
+    #[serde(default)]
+    may_hold_ofd_lock: bool,
 }
 /// Written out, not derived, so that `channel` is printed only when it is set:
 /// a run without `--pipe-wake-latency` logs every description exactly as
@@ -832,6 +844,8 @@ impl DetFd {
                 timerfd: None,
                 channel: None,
                 lock_tracked: false,
+                received_for_locks: false,
+                may_hold_ofd_lock: false,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             }))),
@@ -1758,6 +1772,28 @@ impl DetFd {
     /// Whether `procfs::locks::LockLedger` follows this description's locks.
     pub(crate) fn is_lock_tracked(&self) -> bool {
         self.with_description(|d| d.lock_tracked)
+    }
+
+    /// Mark this description as registered on reception over `SCM_RIGHTS`.
+    /// Permanent.
+    pub(crate) fn set_received_for_locks(&self) {
+        self.with_description(|d| d.received_for_locks = true);
+    }
+
+    /// Whether this description was registered on reception over
+    /// `SCM_RIGHTS`.
+    pub(crate) fn is_received_for_locks(&self) -> bool {
+        self.with_description(|d| d.received_for_locks)
+    }
+
+    /// Mark this description as one that may hold an OFD lock. Permanent.
+    pub(crate) fn set_may_hold_ofd_lock(&self) {
+        self.with_description(|d| d.may_hold_ofd_lock = true);
+    }
+
+    /// Whether this description may hold an OFD lock.
+    pub(crate) fn may_hold_ofd_lock(&self) -> bool {
+        self.with_description(|d| d.may_hold_ofd_lock)
     }
 
     /// Mark this open file as passed over `SCM_RIGHTS`. Permanent.

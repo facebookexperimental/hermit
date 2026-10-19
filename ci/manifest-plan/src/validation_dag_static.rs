@@ -2556,7 +2556,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_sigreturn_continuation_needs_a_queued_delivery and
     // the_sigreturn_continuation_rule_reads_no_request_when_none_is_marked
     // (https://github.com/rrnewton/hermit/issues/4505): 2127, freshly listed.
-    ("test.detcore_unit", 2127),
+    // And +4 from 16eca47a: 2131.
+    ("test.detcore_unit", 2131),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2869,7 +2870,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And proc_locks_determinism's stale-ledger tests (ptrace and DBT), its
     // shared-flock control and its full-descriptor-table refusal test:
     // 61 + 273 + 256 = 590, listed.
-    ("test.hermit_integration_2", 273),
+    // Its full-descriptor-table refusal test becomes two (the lock goes on
+    // without a /proc/locks read; the next read refuses), its pre-ledger
+    // version-gate test and its vfork-after-OFD-lock test: 276, listed.
+    ("test.hermit_integration_2", 276),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -4476,7 +4480,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +13 from c1068de6: 2123.
     // And +1 from 7c9958d1: 2124.
     // And the same three sigreturn-continuation units: 2127, freshly listed.
-    ("test.detcore_unit_on_host", 2127),
+    // And +4 from 16eca47a: 2131.
+    ("test.detcore_unit_on_host", 2131),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4559,7 +4564,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And proc_locks_determinism's six new tests: 586, listed.
     // And its four descriptor-table ledger tests: 590, listed.
     // And +24 from c1068de6: 614.
-    ("test.hermit_integration_on_host", 614),
+    // And proc_locks_determinism's deferred-refusal split, version-gate and
+    // vfork tests: 617, listed.
+    // And +3 from 16eca47a: 617.
+    ("test.hermit_integration_on_host", 617),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

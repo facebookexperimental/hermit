@@ -2969,6 +2969,21 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         );
         return -1;
     }
+    // The copied child would run an OFD lock or unlock natively, which
+    // Detcore never sees, so the parent's /proc/locks ledger entry for that
+    // description could go stale and admit a host's identical row.
+    if clone_properties.blocks_parent
+        && !scratch.runtime_state.is_null()
+        && unsafe { &*scratch.runtime_state }
+            .state
+            .has_unsafe_vfork_ofd_state()
+    {
+        emit_lifecycle_marker(
+            emit,
+            b"detcore-dbt: refusing vfork/CLONE_VFORK while an open file description may hold an OFD lock\n",
+        );
+        return -1;
+    }
 
     // clone(2) and clone3(2) return in both the parent and child. Injecting
     // either from this callback makes the child return on the client stack.

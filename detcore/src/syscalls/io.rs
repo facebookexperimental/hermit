@@ -3366,7 +3366,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // is left out, so its locks are hidden once no modelled table names
         // the description (a named residual).
         for fd in received_descriptors(&control) {
-            self.refresh_description_locks(guest, fd).await?;
+            self.refresh_description_locks(guest, fd, super::files::LockCall::Recvmsg)
+                .await?;
         }
         if socket_timestamp_messages(&control).is_empty() {
             return Ok(result);

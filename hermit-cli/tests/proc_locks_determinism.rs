@@ -920,12 +920,16 @@ const LOCK_SCENARIOS_SOURCE: &str = r#"
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/futex.h>
+#include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1202,6 +1206,210 @@ static int failed_exec_scenario(const char* path) {
   return 0;
 }
 
+static void send_descriptor(int socket, int fd) {
+  char byte = 'x';
+  char control[CMSG_SPACE(sizeof(int))];
+  memset(control, 0, sizeof(control));
+  struct iovec vector = {.iov_base = &byte, .iov_len = 1};
+  struct msghdr message = {
+      .msg_iov = &vector,
+      .msg_iovlen = 1,
+      .msg_control = control,
+      .msg_controllen = sizeof(control),
+  };
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+  header->cmsg_level = SOL_SOCKET;
+  header->cmsg_type = SCM_RIGHTS;
+  header->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(header), &fd, sizeof(fd));
+  if (sendmsg(socket, &message, 0) != 1) {
+    die("sendmsg");
+  }
+}
+
+static int receive_descriptor(int socket) {
+  char byte = 0;
+  char control[CMSG_SPACE(sizeof(int))];
+  struct iovec vector = {.iov_base = &byte, .iov_len = 1};
+  struct msghdr message = {
+      .msg_iov = &vector,
+      .msg_iovlen = 1,
+      .msg_control = control,
+      .msg_controllen = sizeof(control),
+  };
+  if (recvmsg(socket, &message, 0) != 1) {
+    die("recvmsg");
+  }
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+  if (header == NULL || header->cmsg_type != SCM_RIGHTS) {
+    die("no descriptor");
+  }
+  int received;
+  memcpy(&received, CMSG_DATA(header), sizeof(received));
+  return received;
+}
+
+// The parent locks and sends its descriptor to the child, which unlocks
+// through the one it received while the parent keeps its own open: the
+// shared description, and so the kernel, holds no lock.
+static int stale_receiver_unlock_scenario(const char* path) {
+  int pair[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+    die("socketpair");
+  }
+  fflush(stdout);
+  pid_t child = fork();
+  if (child < 0) {
+    die("fork");
+  }
+  if (child == 0) {
+    close(pair[0]);
+    int received = receive_descriptor(pair[1]);
+    ofd(received, F_UNLCK, 0, 1);
+    byte_out(pair[1]);
+    byte_in(pair[1]);
+    _exit(0);
+  }
+  close(pair[1]);
+  int file = open_path(path, O_RDWR);
+  ofd(file, F_RDLCK, 0, 1);
+  send_descriptor(pair[0], file);
+  byte_in(pair[0]);
+  snapshot("receiver-unlocked");
+  byte_out(pair[0]);
+  wait_for(child);
+  return 0;
+}
+
+// The parent's locked descriptor is the only reference to its description;
+// `dup2` over it with a descriptor received from the child closes that
+// description, and with it the lock. The call's result is not checked:
+// Detcore answers EBADF on ptrace, where it keeps no model of the received
+// source, though the kernel replaced the slot.
+static int stale_dup_over_scenario(const char* path) {
+  int pair[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+    die("socketpair");
+  }
+  fflush(stdout);
+  pid_t child = fork();
+  if (child < 0) {
+    die("fork");
+  }
+  if (child == 0) {
+    close(pair[0]);
+    int null = open("/dev/null", O_RDONLY);
+    if (null < 0) {
+      die("open /dev/null");
+    }
+    send_descriptor(pair[1], null);
+    byte_in(pair[1]);
+    _exit(0);
+  }
+  close(pair[1]);
+  int file = open_path(path, O_RDWR);
+  ofd(file, F_RDLCK, 0, 1);
+  int received = receive_descriptor(pair[0]);
+  (void)dup2(received, file);
+  snapshot("replaced");
+  byte_out(pair[0]);
+  wait_for(child);
+  return 0;
+}
+
+// The child shares the parent's descriptor table (CLONE_FILES), from before
+// any lock. The parent locks; the child closes the table's only slot naming
+// the description, which releases the lock.
+static int stale_shared_table_scenario(const char* path) {
+  int ready[2];
+  int go[2];
+  if (pipe(ready) != 0 || pipe(go) != 0) {
+    die("pipe");
+  }
+  fflush(stdout);
+  long child = syscall(SYS_clone, CLONE_FILES | SIGCHLD, NULL, NULL, NULL, NULL);
+  if (child < 0) {
+    die("clone");
+  }
+  if (child == 0) {
+    int fd = -1;
+    if (read(go[0], &fd, sizeof(fd)) != sizeof(fd)) {
+      _exit(1);
+    }
+    if (close(fd) != 0) {
+      _exit(1);
+    }
+    byte_out(ready[1]);
+    _exit(0);
+  }
+  int fd = open_path(path, O_RDWR);
+  ofd(fd, F_RDLCK, 0, 1);
+  if (write(go[1], &fd, sizeof(fd)) != sizeof(fd)) {
+    die("write fd");
+  }
+  byte_in(ready[0]);
+  snapshot("child-closed");
+  wait_for((pid_t)child);
+  return 0;
+}
+
+static volatile int private_thread_status = 1;
+
+// A thread with a descriptor table of its own (CLONE_THREAD without
+// CLONE_FILES) opens and locks the file, then exits: its table, and the lock,
+// go with it.
+static int private_table_thread(void* path) {
+  int fd = open((const char*)path, O_RDWR);
+  struct flock lock = {.l_type = F_RDLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1};
+  private_thread_status = (fd >= 0 && fcntl(fd, F_OFD_SETLK, &lock) == 0) ? 0 : 2;
+  return 0;
+}
+
+static int stale_private_table_scenario(const char* path) {
+  static char stack[256 * 1024] __attribute__((aligned(16)));
+  // CLONE_CHILD_SETTID sets it, CLONE_CHILD_CLEARTID clears it and wakes the
+  // waiter when the thread has exited.
+  static volatile int thread_id = 1;
+  pid_t created = clone(private_table_thread, stack + sizeof(stack),
+                        CLONE_VM | CLONE_SIGHAND | CLONE_THREAD | CLONE_CHILD_SETTID |
+                            CLONE_CHILD_CLEARTID,
+                        (void*)path, NULL, NULL, (pid_t*)&thread_id);
+  if (created < 0) {
+    die("clone");
+  }
+  for (;;) {
+    int current = thread_id;
+    if (current == 0) {
+      break;
+    }
+    syscall(SYS_futex, (int*)&thread_id, FUTEX_WAIT, current, NULL, NULL, 0);
+  }
+  if (private_thread_status != 0) {
+    die("thread lock");
+  }
+  snapshot("thread-exited");
+  return 0;
+}
+
+// An OFD lock, then vfork; the child exits at once. DBT runs a vfork child's
+// calls natively, so it refuses this vfork rather than let the parent's lock
+// record go stale.
+static int ofd_then_vfork_scenario(const char* path) {
+  int fd = open_path(path, O_RDWR);
+  ofd(fd, F_RDLCK, 0, 1);
+  fflush(stdout);
+  pid_t child = vfork();
+  if (child < 0) {
+    die("vfork");
+  }
+  if (child == 0) {
+    _exit(0);
+  }
+  wait_for(child);
+  snapshot("after-vfork");
+  return 0;
+}
+
 // The parent opens the file and forks before any lock; the child locks it
 // (an OFD read lock, or with `flock`, an exclusive flock) and exits while the
 // parent keeps its descriptor.
@@ -1279,17 +1487,24 @@ static int exhaust_scenario(const char* directory) {
   if (write(1, reached, sizeof(reached) - 1) < 0 || result != 0) {
     return 2;
   }
-  return 3;
+  return 0;
 }
 
-static int descriptors_scenario(const char* directory) {
+// With `read_after`, the guest then frees two slots and reads /proc/locks.
+static int descriptors_scenario(const char* directory, int read_after) {
   int file = open_in(directory, "descriptors");
   // Fill the descriptor table up to the soft limit the test set for Hermit,
   // which the guest inherits; Hermit's resource limits are virtual, so the
   // guest's own setrlimit could not lower the kernel's.
-  while (dup(file) >= 0) {
+  int last = file;
+  for (;;) {
+    int next = dup(file);
+    if (next < 0) {
+      break;
+    }
+    last = next;
   }
-  if (errno != EMFILE) {
+  if (errno != EMFILE || last - 1 <= file) {
     die("dup");
   }
   static const char exhausted[] = "descriptors exhausted\n";
@@ -1302,7 +1517,13 @@ static int descriptors_scenario(const char* directory) {
   if (write(1, reached, sizeof(reached) - 1) < 0 || result != 0) {
     return 2;
   }
-  return 3;
+  if (read_after) {
+    if (close(last) != 0 || close(last - 1) != 0) {
+      die("close");
+    }
+    snapshot("after-lock");
+  }
+  return 0;
 }
 
 int main(int argc, char** argv) {
@@ -1338,7 +1559,10 @@ int main(int argc, char** argv) {
     return exhaust_scenario(where);
   }
   if (strcmp(mode, "descriptors") == 0) {
-    return descriptors_scenario(where);
+    return descriptors_scenario(where, 0);
+  }
+  if (strcmp(mode, "descriptors-read") == 0) {
+    return descriptors_scenario(where, 1);
   }
   if (strcmp(mode, "stale-unlock") == 0) {
     return stale_unlock_scenario(where);
@@ -1354,6 +1578,21 @@ int main(int argc, char** argv) {
   }
   if (strcmp(mode, "stale-exec") == 0) {
     return stale_exec_scenario(where, argv[0]);
+  }
+  if (strcmp(mode, "stale-receiver-unlock") == 0) {
+    return stale_receiver_unlock_scenario(where);
+  }
+  if (strcmp(mode, "stale-dup-over") == 0) {
+    return stale_dup_over_scenario(where);
+  }
+  if (strcmp(mode, "stale-shared-table") == 0) {
+    return stale_shared_table_scenario(where);
+  }
+  if (strcmp(mode, "stale-private-table") == 0) {
+    return stale_private_table_scenario(where);
+  }
+  if (strcmp(mode, "ofd-then-vfork") == 0) {
+    return ofd_then_vfork_scenario(where);
   }
   if (strcmp(mode, "after-exec") == 0) {
     snapshot("after-exec");
@@ -1544,11 +1783,12 @@ fn lock_rows_follow_the_guests_descriptions_on_dbt() {
 }
 
 /// A guest that has used up its address space leaves Detcore no page to read
-/// an OFD-locking descriptor's fdinfo through. The run stops there, by name,
-/// with the policy-refusal exit, the same way every time, rather than going on
-/// with the guest's locks and the recording's events depending on it.
+/// an OFD-locking descriptor's fdinfo through. The lock is Linux's to grant
+/// and the guest goes on, the same way every time; only a later
+/// `/proc/locks` read would refuse, since that description's locks are
+/// unknown (`procfs::locks::LockLedger::unknown`).
 #[test]
-fn an_ofd_lock_without_address_space_left_stops_the_run() {
+fn an_ofd_lock_without_address_space_left_goes_on() {
     let root = tempfile::Builder::new()
         .prefix("proc-locks-exhaust-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -1567,28 +1807,20 @@ fn an_ofd_lock_without_address_space_left_stops_the_run() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             output.status.code(),
-            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            Some(0),
             "attempt {attempt}\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert!(
-            stdout.contains("address space exhausted") && !stdout.contains("the lock returned"),
-            "attempt {attempt}: the guest did not stop at its lock\nstdout:\n{stdout}"
-        );
-        assert!(
-            stderr.contains("could not map the page it reads fd"),
-            "attempt {attempt}: the refusal does not name its reason\nstderr:\n{stderr}"
+            stdout.contains("address space exhausted") && stdout.contains("the lock returned"),
+            "attempt {attempt}: the guest's lock did not return\nstdout:\n{stdout}"
         );
     }
 }
 
-/// A guest whose descriptor table is full leaves Detcore no descriptor to read
-/// an OFD-locking descriptor's fdinfo through: the open fails with EMFILE. The
-/// run stops there, by name, with the policy-refusal exit, rather than taking
-/// the failure to mean the description holds no lock. The test lowers the
-/// soft descriptor limit Hermit starts with, which the guest inherits, so the
-/// guest fills its table in a few hundred calls.
-#[test]
-fn an_ofd_lock_with_a_full_descriptor_table_stops_the_run() {
+/// Run the lock-scenarios guest in `mode` on ptrace with the soft descriptor
+/// limit Hermit starts with, which the guest inherits, lowered so the guest
+/// fills its table in a few hundred calls.
+fn run_with_a_full_descriptor_table(mode: &str) -> Output {
     use std::os::unix::process::CommandExt;
 
     /// Comfortably above what Hermit's own processes use, far below the
@@ -1601,33 +1833,64 @@ fn an_ofd_lock_with_a_full_descriptor_table_stops_the_run() {
     let guest = compile_embedded_guest(root.path(), "lock-scenarios", LOCK_SCENARIOS_SOURCE);
     let own = root.path().join("own");
     fs::create_dir(&own).expect("create the guest's own lock directory");
+    let mut command = guest_command(
+        "ptrace",
+        &["--strict"],
+        &guest,
+        &[OsStr::new(mode), own.as_os_str()],
+        None,
+    );
+    // SAFETY: the closure calls only getrlimit and setrlimit, which are
+    // async-signal-safe, on a local value.
+    unsafe {
+        command.pre_exec(|| {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            limit.rlim_cur = limit.rlim_cur.min(SOFT_LIMIT);
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    hermit_test::hermit_output(&format!("{command:?}"), &mut command)
+}
+
+/// A guest whose descriptor table is full leaves Detcore no descriptor to read
+/// an OFD-locking descriptor's fdinfo through: the open fails with EMFILE.
+/// Linux grants the lock, and a guest that never reads `/proc/locks` runs to
+/// its end.
+#[test]
+fn a_full_descriptor_table_lock_goes_on_without_a_proc_locks_read() {
     for attempt in 0..2 {
-        let mut command = guest_command(
-            "ptrace",
-            &["--strict"],
-            &guest,
-            &[OsStr::new("descriptors"), own.as_os_str()],
-            None,
+        let output = run_with_a_full_descriptor_table("descriptors");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "attempt {attempt}\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
-        // SAFETY: the closure calls only getrlimit and setrlimit, which are
-        // async-signal-safe, on a local value.
-        unsafe {
-            command.pre_exec(|| {
-                let mut limit = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                limit.rlim_cur = limit.rlim_cur.min(SOFT_LIMIT);
-                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+        assert!(
+            stdout.contains("descriptors exhausted") && stdout.contains("the lock returned"),
+            "attempt {attempt}: the guest's lock did not return\nstdout:\n{stdout}"
+        );
+    }
+}
+
+/// After that lock, a `/proc/locks` read cannot tell the description's rows
+/// from a host's, since its locks are unknown: the read stops the run, by
+/// name, with the policy-refusal exit, the same way every time, rather than
+/// taking the failure to mean the description holds no lock.
+#[test]
+fn a_full_descriptor_table_refuses_the_next_proc_locks_read() {
+    for attempt in 0..2 {
+        let output = run_with_a_full_descriptor_table("descriptors-read");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
@@ -1636,12 +1899,97 @@ fn an_ofd_lock_with_a_full_descriptor_table_stops_the_run() {
             "attempt {attempt}\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert!(
-            stdout.contains("descriptors exhausted") && !stdout.contains("the lock returned"),
-            "attempt {attempt}: the guest did not stop at its lock\nstdout:\n{stdout}"
+            stdout.contains("the lock returned") && !stdout.contains("--- after-lock ---"),
+            "attempt {attempt}: the guest did not stop at its /proc/locks read\nstdout:\n{stdout}"
         );
         assert!(
-            stderr.contains("could not open fd") && stderr.contains("EMFILE"),
+            stderr.contains("/proc/locks: after fcntl on fd")
+                && stderr.contains("could not open that descriptor's fdinfo")
+                && stderr.contains("EMFILE"),
             "attempt {attempt}: the refusal does not name its reason\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// A recording in the format before the descriptor-table ledger (labelled
+/// 0x16f, and 0x171 after the R2b-2 stage 3 revert's relabel) would replay
+/// different `/proc/locks` bytes, since replay recomputes which recorded rows
+/// are the guest's, so the version gate refuses it under either label; the
+/// same recording at the current version replays.
+#[test]
+fn recordings_from_before_the_lock_ledger_are_refused_by_the_version_gate() {
+    let root = tempfile::Builder::new()
+        .prefix("proc-locks-version-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create version directory");
+    let guest = compile_embedded_guest(root.path(), "lock-scenarios", LOCK_SCENARIOS_SOURCE);
+    let shared = root.path().join("shared");
+    fs::write(&shared, b"shared\n").expect("create the shared lock file");
+    let data_dir = root.path().join("recording");
+    fs::create_dir(&data_dir).expect("create the recording directory");
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after", "5s", "90s"])
+        .arg(hermit_test::hermit_binary())
+        .args(["--log=off", "record", "start"])
+        .arg(format!("--data-dir={}", data_dir.display()))
+        .args(["--proc=standard", "--base-env=minimal", "--"])
+        .arg(&guest)
+        .arg("unlock")
+        .arg(&shared);
+    hermit_test::configure_guest_execution(&mut record);
+    let recorded = hermit_test::hermit_output(&format!("{record:?}"), &mut record);
+    assert!(
+        recorded.status.success(),
+        "recording the unlock scenario failed\nstderr:\n{}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+    let replay = || {
+        let mut replay = Command::new("timeout");
+        replay
+            .args(["--kill-after", "5s", "90s"])
+            .arg(hermit_test::hermit_binary())
+            .args(["--log=off", "replay", "--autopilot"])
+            .arg(format!("--data-dir={}", data_dir.display()));
+        hermit_test::configure_guest_execution(&mut replay);
+        hermit_test::hermit_output(&format!("{replay:?}"), &mut replay)
+    };
+    let accepted = replay();
+    assert!(
+        accepted.status.success(),
+        "the current-version recording did not replay, so the refusal below would prove \
+         nothing\nstderr:\n{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let metadata_path = fs::read_dir(&data_dir)
+        .expect("read the recording directory")
+        .map(|entry| {
+            entry
+                .expect("read a recording entry")
+                .path()
+                .join("metadata.json")
+        })
+        .find(|candidate| candidate.is_file())
+        .expect("no recording metadata.json");
+    let text = fs::read_to_string(&metadata_path).expect("read the recording metadata");
+    let mut metadata: serde_json::Value =
+        serde_json::from_str(&text).expect("recording metadata is not JSON");
+    assert_eq!(
+        metadata["version"], 0x172,
+        "RECORD_VERSION moved; point this test at the current version and the ledger's predecessor"
+    );
+    for older in [0x171, 0x16f] {
+        metadata["version"] = serde_json::json!(older);
+        fs::write(
+            &metadata_path,
+            serde_json::to_vec(&metadata).expect("serialize the metadata"),
+        )
+        .expect("rewrite the recording metadata");
+        let refused = replay();
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            !refused.status.success() && stderr.contains("Version mismatch"),
+            "a {older:#x} recording was not refused by the version gate\nstderr:\n{stderr}"
         );
     }
 }
@@ -1707,7 +2055,13 @@ fn lock_scenarios_replay_from_their_recordings() {
 /// - a child that locks and exits, once reaped;
 /// - a parent that closes after forking, once the child exits too;
 /// - a description sent over `SCM_RIGHTS`, once sender and receiver closed it;
-/// - a close-on-exec descriptor, after a successful exec.
+/// - a close-on-exec descriptor, after a successful exec;
+/// - an unlock through a descriptor received over `SCM_RIGHTS` while the
+///   sender keeps its own;
+/// - `dup2` over the only slot, from a received source;
+/// - on ptrace, a close through a table shared with `CLONE_FILES` from
+///   before the lock, and the exit of a thread with a private table that
+///   took it.
 ///
 /// The lock stays shown after a failed exec. Two named residuals are
 /// pinned too: a lock a child takes on a description its parent opened before
@@ -1734,7 +2088,7 @@ fn stale_ledger_entries_admit_no_host_row(backend: &str) {
     );
     let flock_file = root.path().join("flock-after-fork");
     fs::write(&flock_file, b"flock\n").expect("create the flock file");
-    let scenarios: [(&str, &OsStr, Sections); 8] = [
+    let mut scenarios: Vec<(&str, &OsStr, Sections)> = vec![
         (
             "stale-unlock",
             shared.as_os_str(),
@@ -1784,7 +2138,35 @@ fn stale_ledger_entries_admit_no_host_row(backend: &str) {
                 ("after-child", vec![]),
             ]),
         ),
+        // An unlock through a received descriptor, while the sender keeps its
+        // own: no lock on that file is shown again (`LockLedger::alias_inode`).
+        (
+            "stale-receiver-unlock",
+            shared.as_os_str(),
+            expected(vec![("receiver-unlocked", vec![])]),
+        ),
+        // dup2 over the locked descriptor's only slot, from a received source.
+        (
+            "stale-dup-over",
+            shared.as_os_str(),
+            expected(vec![("replaced", vec![])]),
+        ),
     ];
+    if backend == "ptrace" {
+        // DBT refuses CLONE_FILES without CLONE_THREAD; on ptrace a shared
+        // table and a private-table thread make their process's locks
+        // uncounted (`LockLedger::mark_opaque`).
+        scenarios.push((
+            "stale-shared-table",
+            shared.as_os_str(),
+            expected(vec![("child-closed", vec![])]),
+        ));
+        scenarios.push((
+            "stale-private-table",
+            shared.as_os_str(),
+            expected(vec![("thread-exited", vec![])]),
+        ));
+    }
     for (scenario, argument, want) in scenarios {
         let label = format!("{backend} {scenario}");
         let report = root.path().join(format!("{scenario}-verify.json"));
@@ -1812,6 +2194,74 @@ fn stale_ledger_entries_admit_no_host_row_on_dbt() {
         return;
     }
     stale_ledger_entries_admit_no_host_row("dbt");
+}
+
+/// The exit status of a run DBT's runtime refuses at a process lifecycle
+/// call, as hermit-cli's flock_exclusion tests require it too.
+const DBT_REFUSAL_EXIT: i32 = 101;
+
+/// DBT runs a `vfork` child's calls natively, where Detcore would not see an
+/// OFD lock or unlock it makes, so it refuses a `vfork` while a description
+/// may hold an OFD lock; ptrace sees every call and runs it, showing the
+/// parent's lock after the child exits.
+#[test]
+fn a_vfork_after_an_ofd_lock_is_refused_on_dbt_and_runs_on_ptrace() {
+    let root = tempfile::Builder::new()
+        .prefix("proc-locks-vfork-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create vfork directory");
+    let guest = compile_embedded_guest(root.path(), "lock-scenarios", LOCK_SCENARIOS_SOURCE);
+    let file = root.path().join("vfork");
+    fs::write(&file, b"vfork\n").expect("create the vfork lock file");
+    let report = root.path().join("ptrace-verify.json");
+    let output = run_guest_on(
+        "ptrace",
+        &guest,
+        &[OsStr::new("ofd-then-vfork"), file.as_os_str()],
+        Some(&report),
+    );
+    assert_bitwise_parity("ptrace ofd-then-vfork", &report, &output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        sections(&stdout),
+        expected(vec![("after-vfork", vec!["OFDLCK"])]),
+        "{stdout}"
+    );
+    if dbt_unavailable() {
+        return;
+    }
+    // At log level info, where DBT prints its lifecycle refusals.
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "5s", "90s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--log=info",
+            "--backend=dbt",
+            "run",
+            "--strict",
+            "--proc=standard",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--panic-on-unsupported-syscalls",
+            "--base-env=minimal",
+            "--",
+        ])
+        .arg(&guest)
+        .arg("ofd-then-vfork")
+        .arg(&file);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.code() == Some(DBT_REFUSAL_EXIT)
+            && stderr.contains(
+                "detcore-dbt: refusing vfork/CLONE_VFORK while an open file description may hold an OFD lock"
+            )
+            && !stdout.contains("--- after-vfork ---"),
+        "DBT ran a vfork child after an OFD lock\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 }
 
 /// Under `--no-namespace` the guest sees a host process's flock rows too.

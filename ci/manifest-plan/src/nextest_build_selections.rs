@@ -902,7 +902,9 @@ mod tests {
             // step 3.2) add eighteen, and six more add six, less the spin
             // case, which test.pmu_integration_cases runs, and forced-blocked
             // adds one (+24): 614.
-            assert_eq!(population, 614);
+            // And proc_locks_determinism's deferred-refusal split, version-gate
+            // and vfork tests (+3): 617.
+            assert_eq!(population, 617);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

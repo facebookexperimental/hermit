@@ -29,7 +29,12 @@
 //! per table, kept as Linux keeps the references (close, replacement, fork,
 //! `CLONE_FILES`, a successful exec, exit). A description's locks are the
 //! guest's while some table it knows references it. If the fdinfo cannot be
-//! read, the run stops by name rather than take that to mean "no locks".
+//! opened or read (a full descriptor table, no `/proc` in a chroot, a seccomp
+//! filter), the description's locks are unknown rather than taken to be none:
+//! the call itself goes on as Linux runs it, and a `/proc/locks` read made
+//! while a guest table still references that description stops the run by
+//! name ([`LockLedger::unknown`]), since its rows could not be told from a
+//! host's. A run that never reads `/proc/locks` is not stopped.
 //!
 //! Before the snapshot's identities are numbered, Detcore keeps only the
 //! groups of rows the guest owns ([`guest_lock_rows`]). A group is a granted
@@ -85,13 +90,31 @@
 //!   it (the child exits), its lock is hidden though Linux keeps it. A flock
 //!   taken that way is shown while its taker lives, by its pid; after the
 //!   taker is reaped, Linux hides it too under a PID namespace;
-//! - a descriptor table several processes share (`CLONE_FILES`) is dropped
-//!   when the first of them exits, hiding locks the others still hold;
+//! - a process whose descriptor table the ledger cannot follow contributes no
+//!   lock while it lives, nor does a process forked from it: one sharing its
+//!   table with another process (`CLONE_FILES` without `CLONE_THREAD`, whose
+//!   slots in-guest backends also count in separate per-process copies), and
+//!   one with a thread that has a private table (`CLONE_THREAD` without
+//!   `CLONE_FILES`), whose calls the ledger cannot tell from the leader's;
+//! - once a lock or unlock goes through a descriptor whose description the
+//!   ledger may know under another identity (one Detcore keeps no model of,
+//!   such as a descriptor received over `SCM_RIGHTS` on ptrace, or one an
+//!   in-guest backend registered on reception), no lock on that inode number,
+//!   on any device, is shown again; if that descriptor's fdinfo cannot be
+//!   read, no OFD or flock lock is shown again;
 //! - a lease set by a process that was then reaped, under `--no-namespace`,
 //!   is not shown; leases are kept by their owner's pid only;
 //! - the guest's own `F_GETLK`, `F_OFD_GETLK` and conflicting lock calls still
 //!   see host locks on files it shares with the host: this filter changes only
 //!   what `/proc/locks` shows.
+//!
+//! Remaining ways a host row can still appear, until `/proc/locks` is decided
+//! from the kernel's state at the snapshot: a description an in-guest
+//! backend's exec rebuilds under a new identity, whose lock changes through
+//! the new identity leave the old one's entry stale in a table forked before
+//! the exec; and a lock change the guest makes without Detcore seeing the call
+//! at all (DBT refuses the one known case, a copied `vfork` child, while the
+//! parent's descriptions may hold an OFD lock).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -327,6 +350,10 @@ type Table = u64;
 /// - a table any of whose processes has exited, reaped or not, is dropped
 ///   ([`LockLedger::prune`]).
 ///
+/// A description whose fdinfo could not be read is followed the same way,
+/// with its locks unknown ([`LockLedger::note_unknown`]) until a later read
+/// succeeds or no table references it.
+///
 /// Where it cannot follow a reference exactly, the ledger forgets it, which
 /// hides the guest's own row; it never keeps one it has not seen, which would
 /// show a host's.
@@ -336,9 +363,22 @@ pub(crate) struct LockLedger {
     process_table: BTreeMap<DetPid, Table>,
     owners: BTreeMap<Table, BTreeSet<DetPid>>,
     references: BTreeMap<OpenFileId, BTreeMap<Table, u32>>,
-    locks: BTreeMap<OpenFileId, Vec<HeldLock>>,
-    after_exec: BTreeMap<DetPid, BTreeMap<OpenFileId, Vec<HeldLock>>>,
+    locks: BTreeMap<OpenFileId, DescriptionLocks>,
+    after_exec: BTreeMap<DetPid, BTreeMap<OpenFileId, DescriptionLocks>>,
+    /// Processes whose descriptor table the ledger cannot follow
+    /// ([`LockLedger::mark_opaque`]): a description any of their tables
+    /// references contributes no lock.
+    opaque: BTreeSet<DetPid>,
+    /// Inode numbers, as `/proc/locks` prints them, on which no lock counts
+    /// ([`LockLedger::alias_inode`]).
+    aliased_inodes: BTreeSet<String>,
+    /// No lock counts at all ([`LockLedger::alias_inode`] without an inode).
+    aliased_everything: bool,
 }
+
+/// The locks a description holds, as its fdinfo last showed them, or why
+/// that fdinfo could not be read.
+type DescriptionLocks = Result<Vec<HeldLock>, String>;
 
 impl LockLedger {
     /// The table `process` uses, made for it if it has none yet.
@@ -376,6 +416,28 @@ impl LockLedger {
         locks: Vec<HeldLock>,
         slots: u32,
     ) {
+        self.note(process, open_file, Ok(locks), slots);
+    }
+
+    /// As [`Self::note_locks`], for a description whose fdinfo could not be
+    /// read, for `reason`: which locks it holds is unknown.
+    pub(crate) fn note_unknown(
+        &mut self,
+        process: DetPid,
+        open_file: OpenFileId,
+        reason: String,
+        slots: u32,
+    ) {
+        self.note(process, open_file, Err(reason), slots);
+    }
+
+    fn note(
+        &mut self,
+        process: DetPid,
+        open_file: OpenFileId,
+        locks: DescriptionLocks,
+        slots: u32,
+    ) {
         let table = self.table_of(process);
         self.set_references(open_file, table, slots);
         if self.references.contains_key(&open_file) {
@@ -395,9 +457,21 @@ impl LockLedger {
     /// A new process `child` starts with a copy of `parent`'s table, or,
     /// with `shares_table` (`CLONE_FILES`), with that table itself. Whatever an
     /// earlier process with the same number left is not the child's.
+    ///
+    /// A table two processes share is one the ledger cannot follow (in-guest
+    /// backends count its slots in separate per-process copies), so both
+    /// become opaque, as does a child of an opaque process, whose copy may
+    /// hold the wrong slots ([`Self::mark_opaque`]).
     pub(crate) fn fork(&mut self, parent: DetPid, child: DetPid, shares_table: bool) {
         self.forget_process(child);
         self.after_exec.remove(&child);
+        self.opaque.remove(&child);
+        if shares_table {
+            self.opaque.insert(parent);
+        }
+        if shares_table || self.opaque.contains(&parent) {
+            self.opaque.insert(child);
+        }
         let Some(table) = self.process_table.get(&parent).copied() else {
             return;
         };
@@ -458,6 +532,7 @@ impl LockLedger {
     /// table processes share (`CLONE_FILES`) goes when the first of them
     /// exits, which can only hide a row the survivors still hold.
     pub(crate) fn prune(&mut self, mut alive: impl FnMut(DetPid) -> bool) {
+        self.opaque.retain(|process| alive(*process));
         let gone = self
             .owners
             .iter()
@@ -502,14 +577,72 @@ impl LockLedger {
         }
     }
 
+    /// `process`'s descriptor table cannot be followed (one of its threads
+    /// has a private table, `CLONE_THREAD` without `CLONE_FILES`, whose calls
+    /// the ledger counts as the leader's): while it lives, a description any
+    /// of its tables references contributes no lock, which can hide the
+    /// guest's row but never admits a host's.
+    pub(crate) fn mark_opaque(&mut self, process: DetPid) {
+        self.opaque.insert(process);
+    }
+
+    /// A lock or unlock went through a descriptor whose description the
+    /// ledger may know under another identity, on the file with inode number
+    /// `inode` (from that descriptor's fdinfo), so another identity's entry
+    /// may be stale: from now on no lock on that inode number counts, on any
+    /// device. Without an inode (its fdinfo could not be read), no lock
+    /// counts at all.
+    pub(crate) fn alias_inode(&mut self, inode: Option<String>) {
+        match inode {
+            Some(inode) => {
+                self.aliased_inodes.insert(inode);
+            }
+            None => self.aliased_everything = true,
+        }
+    }
+
     /// Every lock a description some table references holds, repeats
-    /// included.
+    /// included. A description whose locks are unknown contributes none, nor
+    /// does one an opaque process's table references, nor a lock on an
+    /// aliased inode.
     pub(crate) fn held(&self) -> Vec<HeldLock> {
+        if self.aliased_everything {
+            return Vec::new();
+        }
+        let opaque_tables = self
+            .owners
+            .iter()
+            .filter(|(_, owners)| owners.iter().any(|process| self.opaque.contains(process)))
+            .map(|(table, _)| *table)
+            .collect::<BTreeSet<_>>();
+        self.locks
+            .iter()
+            .filter(|(open_file, _)| {
+                self.references.get(*open_file).is_some_and(|references| {
+                    references
+                        .keys()
+                        .all(|table| !opaque_tables.contains(table))
+                })
+            })
+            .filter_map(|(_, locks)| locks.as_ref().ok())
+            .flat_map(|locks| locks.iter().cloned())
+            .filter(|lock| {
+                let inode = lock.object.rsplit(':').next().unwrap_or_default();
+                !self.aliased_inodes.contains(inode)
+            })
+            .collect()
+    }
+
+    /// Why the locks of a description some table references are unknown, for
+    /// the first such description: a `/proc/locks` snapshot taken now cannot
+    /// tell that description's rows from a host's, so it is refused. `None`
+    /// when every referenced description's locks are known.
+    pub(crate) fn unknown(&self) -> Option<&str> {
         self.locks
             .iter()
             .filter(|(open_file, _)| self.references.contains_key(open_file))
-            .flat_map(|(_, locks)| locks.iter().cloned())
-            .collect()
+            .find_map(|(_, locks)| locks.as_ref().err())
+            .map(String::as_str)
     }
 }
 
@@ -828,6 +961,72 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         assert_eq!(ledger.held(), [lock("0")]);
         ledger.prune(|process| process != child);
         assert!(ledger.held().is_empty());
+    }
+
+    #[test]
+    fn a_table_the_ledger_cannot_follow_contributes_no_lock() {
+        let [parent, sibling, child, other] = [3, 4, 5, 6].map(DetPid::from_raw);
+        let mut ledger = LockLedger::default();
+        // CLONE_FILES before any lock: both sharers are opaque.
+        ledger.fork(parent, sibling, true);
+        ledger.note_locks(parent, description(0), vec![lock("0")], 1);
+        assert!(ledger.held().is_empty());
+        // So is a child forked from an opaque process.
+        ledger.fork(parent, child, false);
+        ledger.note_locks(child, description(1), vec![lock("1")], 1);
+        assert!(ledger.held().is_empty());
+        // A process with a private-table thread is opaque until it exits.
+        ledger.note_locks(other, description(2), vec![lock("2")], 1);
+        assert_eq!(ledger.held(), [lock("2")]);
+        ledger.mark_opaque(other);
+        assert!(ledger.held().is_empty());
+        // A reused number starts transparent.
+        ledger.prune(|process| process != other);
+        ledger.fork(DetPid::from_raw(9), other, false);
+        ledger.note_locks(other, description(3), vec![lock("3")], 1);
+        assert_eq!(ledger.held(), [lock("3")]);
+    }
+
+    #[test]
+    fn an_aliased_inode_contributes_no_lock() {
+        let process = DetPid::from_raw(3);
+        let mut ledger = LockLedger::default();
+        ledger.note_locks(process, description(0), vec![lock("0")], 1);
+        ledger.alias_inode(Some("8".to_string()));
+        assert_eq!(ledger.held(), [lock("0")]);
+        ledger.alias_inode(Some("7".to_string()));
+        assert!(ledger.held().is_empty());
+        let mut ledger = LockLedger::default();
+        ledger.note_locks(process, description(0), vec![lock("0")], 1);
+        ledger.alias_inode(None);
+        assert!(ledger.held().is_empty());
+    }
+
+    #[test]
+    fn unknown_locks_count_while_a_table_references_them() {
+        let [parent, child] = [3, 4].map(DetPid::from_raw);
+        let mut ledger = LockLedger::default();
+        ledger.note_unknown(parent, description(0), "EMFILE".to_string(), 1);
+        assert_eq!(ledger.unknown(), Some("EMFILE"));
+        assert!(ledger.held().is_empty());
+        // A fork's copy references it too; the parent's close leaves it
+        // unknown until the child's table goes as well.
+        ledger.fork(parent, child, false);
+        ledger.release(parent, description(0), 0);
+        assert_eq!(ledger.unknown(), Some("EMFILE"));
+        ledger.prune(|process| process != child);
+        assert_eq!(ledger.unknown(), None);
+        // A later read that succeeds makes the locks known again.
+        ledger.note_unknown(parent, description(1), "ENOENT".to_string(), 1);
+        ledger.note_locks(parent, description(1), vec![lock("0")], 1);
+        assert_eq!(ledger.unknown(), None);
+        assert_eq!(ledger.held(), [lock("0")]);
+        // An exec keeps an unknown description its table still names.
+        ledger.note_unknown(parent, description(1), "EACCES".to_string(), 1);
+        ledger.exec(parent);
+        assert_eq!(ledger.unknown(), None);
+        ledger.exec_kept(parent, &[(description(1), 1)]);
+        assert_eq!(ledger.unknown(), Some("EACCES"));
     }
 
     #[test]
