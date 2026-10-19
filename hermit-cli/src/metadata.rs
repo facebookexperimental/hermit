@@ -723,7 +723,15 @@ impl RecordVersion {
 // (https://github.com/rrnewton/hermit/issues/4273). Such a turn also blocks
 // signals in place before its timerfd publication. The recorded decisions
 // change, so an older recording containing one would replay out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x173);
+// 0x173 -> 0x176 (reserved as 0x176; 0x174 and 0x175 are reserved by other
+// lanes, and whichever lands later takes HIGHEST_SHIPPED + 1): Detcore reads
+// a description's fdinfo after a lock call only through an anchor proved to
+// be procfs. The recorded sequence is now an openat of the guest's /proc
+// (O_PATH), its fstatfs and fstat, an openat2 of thread-self/fdinfo/<fd>
+// beneath it (RESOLVE_BENEATH | RESOLVE_NO_XDEV), that entry's fstat, the
+// reads and two closes, where an older recording holds one openat of
+// /proc/thread-self/fdinfo/<fd>, so it would replay out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x176);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -748,7 +756,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x173);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x173;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x176;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

@@ -904,7 +904,8 @@ mod tests {
             // adds one (+24): 614.
             // And proc_locks_determinism's deferred-refusal split, version-gate
             // and vfork tests (+3): 617.
-            assert_eq!(population, 617);
+            // And its fake-/proc-under-chroot test (+1): 618.
+            assert_eq!(population, 618);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

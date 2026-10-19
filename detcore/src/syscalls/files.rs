@@ -1176,6 +1176,62 @@ fn fdinfo_inode(fdinfo: &[u8]) -> Option<String> {
         .filter(|inode| !inode.is_empty() && inode.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
+/// The fdinfo page [`Detcore::read_own_fdinfo`] stages its calls in, and its
+/// layout: the path, `openat2`'s `struct open_how`, the `fstatfs`/`fstat`
+/// buffer, then the read buffer.
+const FDINFO_PAGE: usize = 4096;
+const FDINFO_PATH: usize = 0;
+const FDINFO_HOW: usize = 64;
+const FDINFO_HOW_SIZE: usize = 24;
+const FDINFO_STAT: usize = 128;
+const FDINFO_READ: usize = 512;
+const _: () = assert!(FDINFO_HOW + FDINFO_HOW_SIZE <= FDINFO_STAT);
+const _: () = assert!(FDINFO_STAT + std::mem::size_of::<libc::stat>() <= FDINFO_READ);
+const _: () = assert!(FDINFO_STAT + std::mem::size_of::<libc::statfs>() <= FDINFO_READ);
+/// `openat2`'s resolution for the fdinfo entry: no step out of the anchor
+/// and no mount crossed.
+const FDINFO_RESOLVE: u64 = libc::RESOLVE_NO_XDEV | libc::RESOLVE_BENEATH;
+
+/// What [`Detcore::read_own_fdinfo`] found.
+pub(crate) enum FdinfoRead {
+    /// The fdinfo's text, from an entry proved to be on the guest's procfs.
+    Contents(Vec<u8>),
+    /// A step failed for a reason that says nothing about the description's
+    /// locks: they are unknown (`procfs::locks::LockLedger::note_unknown`).
+    Unknown(String),
+    /// The guest's `/proc` could not be proved to be procfs: the description
+    /// contributes no lock, which can hide the guest's row but never admits
+    /// a host's.
+    Untrackable(String),
+}
+
+impl FdinfoRead {
+    /// The inode number the fdinfo names, if it was read.
+    fn inode(&self) -> Option<String> {
+        match self {
+            Self::Contents(contents) => fdinfo_inode(contents),
+            Self::Unknown(_) | Self::Untrackable(_) => None,
+        }
+    }
+}
+
+/// Why [`Detcore::read_staged_fdinfo`] did not read an fdinfo.
+enum FdinfoFailure {
+    /// A step (`open`, `fstatfs`, `read`) failed with an errno.
+    Failed(&'static str, Errno),
+    /// The guest's `/proc` was shown not to be procfs, for this reason.
+    NotProcfs(&'static str),
+}
+
+/// Whether an fdinfo step's `errno` is an exhausted resource of the guest's
+/// own (its descriptor table, its memory), which says nothing about its
+/// `/proc`. Such a failure leaves the description's locks unknown, so a later
+/// `/proc/locks` read refuses; any other failure, a backend's or the host's
+/// included, makes the description untrackable (hidden, never a host row).
+fn says_nothing_about_procfs(errno: Errno) -> bool {
+    matches!(errno, Errno::EMFILE | Errno::ENOMEM)
+}
+
 /// Why Detcore does not know which locks the description descriptor `fd`
 /// names holds after the guest's `call` through it: `step` (the open or a
 /// read of its fdinfo) failed with `errno`. A failure says nothing about
@@ -1208,6 +1264,30 @@ mod fdinfo_refusal_tests {
         );
         assert!(reason.contains("EMFILE"), "{reason}");
         assert!(fdinfo_refusal("flock", 7, "read", Errno::EIO).contains("could not read that"));
+    }
+
+    /// Only an exhausted resource of the guest's own leaves the locks
+    /// unknown (and a later `/proc/locks` read refused); every other failure
+    /// hides the description.
+    #[test]
+    fn only_a_missing_resource_leaves_fdinfo_locks_unknown() {
+        for errno in [Errno::EMFILE, Errno::ENOMEM] {
+            assert!(says_nothing_about_procfs(errno), "{errno}");
+        }
+        for errno in [
+            Errno::ENFILE,
+            Errno::EAGAIN,
+            Errno::EINTR,
+            Errno::EIO,
+            Errno::ENOENT,
+            Errno::ENOTDIR,
+            Errno::EACCES,
+            Errno::EPERM,
+            Errno::EXDEV,
+            Errno::ENOSYS,
+        ] {
+            assert!(!says_nothing_about_procfs(errno), "{errno}");
+        }
     }
 
     #[test]
@@ -8921,20 +9001,32 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Ok((open_file, received)) = model else {
             if call.changes_locks() {
                 let fdinfo = self.read_own_fdinfo(guest, fd, call.name()).await?;
-                let inode = fdinfo.ok().and_then(|fdinfo| fdinfo_inode(&fdinfo));
-                crate::tool_global::note_aliased_inode(guest, inode).await;
+                crate::tool_global::note_aliased_inode(guest, fdinfo.inode()).await;
             }
             return Ok(());
         };
         let fdinfo = self.read_own_fdinfo(guest, fd, call.name()).await?;
         if received && call.changes_locks() {
-            let inode = fdinfo.as_ref().ok().and_then(|fdinfo| fdinfo_inode(fdinfo));
-            crate::tool_global::note_aliased_inode(guest, inode).await;
+            crate::tool_global::note_aliased_inode(guest, fdinfo.inode()).await;
         }
-        let locks = fdinfo.map(|fdinfo| crate::procfs::locks::held_locks_in_fdinfo(&fdinfo));
-        if locks.as_ref().map_or(true, |locks| {
-            locks.iter().any(|lock| lock.class == "OFDLCK")
-        }) {
+        let held = matches!(&fdinfo, FdinfoRead::Contents(_));
+        let locks = match fdinfo {
+            FdinfoRead::Contents(contents) => {
+                Ok(crate::procfs::locks::held_locks_in_fdinfo(&contents))
+            }
+            FdinfoRead::Unknown(reason) => Err(reason),
+            // Hidden, never admitted: the description contributes no lock
+            // until a later read through a proved procfs.
+            FdinfoRead::Untrackable(reason) => {
+                info!("[detcore] /proc/locks: {reason}; its locks are not shown");
+                Ok(Vec::new())
+            }
+        };
+        if !held
+            || locks
+                .as_ref()
+                .is_ok_and(|locks| locks.iter().any(|lock| lock.class == "OFDLCK"))
+        {
             let _ = guest
                 .thread_state()
                 .with_detfd(fd, |detfd| detfd.set_may_hold_ofd_lock());
@@ -8992,32 +9084,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// The text of `/proc/self/fdinfo/<fd>`, read through the recorder
-    /// ([`Self::record_or_replay`]) by an injected `openat`, reads and
-    /// `close`, staged in a private page mapped for this call only and
-    /// unmapped before it returns.
+    /// The text of `/proc/thread-self/fdinfo/<fd>`, read through the guest's
+    /// procfs only, by a recorded sequence staged in a private page mapped for
+    /// this call and unmapped before it returns ([`Self::read_staged_fdinfo`]).
     ///
-    /// Every step can fail: a guest that has mapped its whole address space
-    /// away refuses the page, one at its descriptor limit refuses the open
-    /// (EMFILE), one in a chroot without `/proc` or under a seccomp filter
-    /// cannot open it, and a backend may serve no fdinfo. None of those says
-    /// the description holds no lock, and taking it to would hide the guest's
-    /// own locks at a moment its address space or descriptor table decided.
-    /// The inner error is the reason, naming the guest's `call`
-    /// ([`fdinfo_refusal`]); the caller marks the description's locks unknown.
+    /// The guest chooses its own root, so a path alone proves nothing: under a
+    /// `chroot` its `/proc` can be any tree, with any text where an fdinfo is
+    /// expected, and lock lines that matched a host's lock would admit the
+    /// host's `/proc/locks` row. So the read starts from an anchor, the
+    /// guest's `/proc`, which must be procfs (`fstatfs`), opens the entry
+    /// below it with `openat2`'s `RESOLVE_BENEATH | RESOLVE_NO_XDEV` (no step
+    /// out of the anchor, no mount crossed, so nothing bound over an entry),
+    /// and requires the entry on the anchor's device (`fstat` of both). Every
+    /// step goes through the recorder, so record and replay decide alike.
+    ///
+    /// A step short of a resource of the guest's own (no page for a guest
+    /// that mapped its whole address space away, a full descriptor table, no
+    /// memory) leaves the description's locks unknown
+    /// ([`FdinfoRead::Unknown`], whose reason names the guest's `call`,
+    /// [`fdinfo_refusal`]). Every other outcome that gives no proved fdinfo
+    /// (no `/proc`, not procfs, an entry outside it or across a mount, a
+    /// device mismatch, any other failure, a backend's or the host's
+    /// included) makes the description untrackable
+    /// ([`FdinfoRead::Untrackable`]).
     async fn read_own_fdinfo<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
         call: &str,
-    ) -> Result<Result<Vec<u8>, String>, Error> {
-        const PAGE: usize = 4096;
-        const PATH_ROOM: usize = 64;
+    ) -> Result<FdinfoRead, Error> {
         let mapped = guest
             .inject_with_retry(Syscall::Mmap(
                 syscalls::Mmap::new()
                     .with_addr(None)
-                    .with_len(PAGE)
+                    .with_len(FDINFO_PAGE)
                     .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
                     .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
                     .with_fd(-1)
@@ -9029,24 +9129,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             .and_then(|mapped| usize::try_from(mapped).ok())
             .filter(|page| *page != 0)
         else {
-            return Ok(Err(format!(
+            return Ok(FdinfoRead::Unknown(format!(
                 "after {call} on fd {fd}, Detcore could not map the page it reads that \
                  descriptor's fdinfo through ({mapped:?}), so it does not know which locks \
                  the description holds"
             )));
         };
-        // The calling thread's own table: a thread created without
-        // CLONE_FILES has one of its own, which `/proc/self` (its process
-        // leader's) does not show.
-        let path = format!("/proc/thread-self/fdinfo/{fd}\0");
-        let result = self
-            .read_staged_fdinfo(guest, page, &path, PATH_ROOM, PAGE)
-            .await;
+        let result = self.read_staged_fdinfo(guest, page, fd).await;
         if let Err(errno) = guest
             .inject_with_retry(Syscall::Munmap(
                 syscalls::Munmap::new()
                     .with_addr(Addr::from_raw(page))
-                    .with_len(PAGE),
+                    .with_len(FDINFO_PAGE),
             ))
             .await
         {
@@ -9055,7 +9149,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                 errno
             );
         }
-        Ok(result?.map_err(|(step, errno)| fdinfo_refusal(call, fd, step, errno)))
+        Ok(match result? {
+            Ok(contents) => FdinfoRead::Contents(contents),
+            // A step short of a resource of the guest's own says nothing
+            // about the locks.
+            Err(FdinfoFailure::Failed(step, errno)) if says_nothing_about_procfs(errno) => {
+                FdinfoRead::Unknown(fdinfo_refusal(call, fd, step, errno))
+            }
+            Err(FdinfoFailure::Failed(step, errno)) => FdinfoRead::Untrackable(format!(
+                "after {call} on fd {fd}, the guest's /proc did not give a procfs fdinfo \
+                 ({step}: {errno})"
+            )),
+            Err(FdinfoFailure::NotProcfs(why)) => FdinfoRead::Untrackable(format!(
+                "after {call} on fd {fd}, the guest's /proc did not give a procfs fdinfo \
+                 ({why})"
+            )),
+        })
     }
 
     /// Stop the run, by name, with the policy-refusal exit, because Detcore
@@ -9069,53 +9178,188 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
     }
 
-    /// [`Self::read_own_fdinfo`]'s reads, in the mapped `page`: the path at
-    /// its start, the read buffer from `path_room` to `page_len`. An open or
-    /// a read that fails is the inner error: which step, and its errno.
+    /// [`Self::read_own_fdinfo`]'s recorded sequence, in the mapped `page`
+    /// (layout: the path at [`FDINFO_PATH`], `openat2`'s `struct open_how` at
+    /// [`FDINFO_HOW`], `fstatfs` and `fstat` buffers at [`FDINFO_STAT`], the
+    /// read buffer from [`FDINFO_READ`]): open the anchor, prove it procfs,
+    /// open the entry beneath it on its mount, compare devices, read, and
+    /// close both descriptors.
     async fn read_staged_fdinfo<G: Guest<Self>>(
         &self,
         guest: &mut G,
         page: usize,
-        path: &str,
-        path_room: usize,
-        page_len: usize,
-    ) -> Result<Result<Vec<u8>, (&'static str, Errno)>, Error> {
-        assert!(
-            path.len() <= path_room,
-            "fdinfo path {path:?} outgrew its room"
-        );
-        let start = AddrMut::<u8>::from_raw(page).ok_or(Errno::EFAULT)?;
-        guest.memory().write_exact(start, path.as_bytes())?;
-        let path_ptr = PathPtr::from_ptr(page as *const libc::c_char).ok_or(Errno::EFAULT)?;
-        let open = syscalls::Openat::new()
+        fd: RawFd,
+    ) -> Result<Result<Vec<u8>, FdinfoFailure>, Error> {
+        let path_ptr =
+            PathPtr::from_ptr((page + FDINFO_PATH) as *const libc::c_char).ok_or(Errno::EFAULT)?;
+        self.write_fdinfo_path(guest, page, "/proc")?;
+        let anchor = syscalls::Openat::new()
             .with_dirfd(libc::AT_FDCWD)
             .with_path(Some(path_ptr))
-            .with_flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC)
+            .with_flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
             .with_mode(None);
-        let opened = match self.record_or_replay(guest, Syscall::Openat(open)).await {
-            Ok(opened) => opened as RawFd,
-            Err(errno) => return Ok(Err(("open", errno))),
+        let anchor = match self.record_or_replay(guest, Syscall::Openat(anchor)).await {
+            Ok(anchor) => anchor as RawFd,
+            Err(errno) => return Ok(Err(FdinfoFailure::Failed("open", errno))),
         };
-        let scratch = AddrMut::<u8>::from_raw(page + path_room).ok_or(Errno::EFAULT)?;
-        let read = self
-            .drain_procfs(
+        let result = self.read_beneath_anchor(guest, page, anchor, fd).await;
+        if let Err(errno) = self
+            .record_or_replay(guest, syscalls::Close::new().with_fd(anchor))
+            .await
+        {
+            trace!("[detcore] closing the fdinfo anchor failed: {errno}");
+        }
+        result
+    }
+
+    /// [`Self::read_staged_fdinfo`] once its `anchor` is open.
+    async fn read_beneath_anchor<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        page: usize,
+        anchor: RawFd,
+        fd: RawFd,
+    ) -> Result<Result<Vec<u8>, FdinfoFailure>, Error> {
+        let stat = page + FDINFO_STAT;
+        match self
+            .record_or_replay(
                 guest,
-                syscalls::Read::new().with_fd(opened),
-                scratch,
-                page_len - path_room,
+                Syscall::from_raw(
+                    Sysno::fstatfs,
+                    procfs_levels::raw_args([anchor as usize, stat, 0, 0, 0, 0]),
+                ),
             )
-            .await;
-        let closed = self
+            .await
+        {
+            Ok(_) => {}
+            Err(errno) => return Ok(Err(FdinfoFailure::Failed("fstatfs", errno))),
+        }
+        // `f_type` is the first field of `struct statfs`.
+        if self.read_fdinfo_word(guest, stat)? != libc::PROC_SUPER_MAGIC as u64 {
+            return Ok(Err(FdinfoFailure::NotProcfs("/proc is not procfs")));
+        }
+        let Some(anchor_device) = self.recorded_device(guest, anchor, stat).await? else {
+            return Ok(Err(FdinfoFailure::NotProcfs("/proc gave no device")));
+        };
+        self.write_fdinfo_path(guest, page, &format!("thread-self/fdinfo/{fd}"))?;
+        // struct open_how { u64 flags; u64 mode; u64 resolve; }
+        let how = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
+        let mut open_how = [0u8; FDINFO_HOW_SIZE];
+        open_how[..8].copy_from_slice(&how.to_ne_bytes());
+        open_how[16..].copy_from_slice(&FDINFO_RESOLVE.to_ne_bytes());
+        let how_ptr = AddrMut::<u8>::from_raw(page + FDINFO_HOW).ok_or(Errno::EFAULT)?;
+        guest.memory().write_exact(how_ptr, &open_how)?;
+        let opened = match self
+            .record_or_replay(
+                guest,
+                Syscall::from_raw(
+                    Sysno::openat2,
+                    procfs_levels::raw_args([
+                        anchor as usize,
+                        page + FDINFO_PATH,
+                        page + FDINFO_HOW,
+                        FDINFO_HOW_SIZE,
+                        0,
+                        0,
+                    ]),
+                ),
+            )
+            .await
+        {
+            Ok(opened) => opened as RawFd,
+            // The entry is outside the anchor or across a mount.
+            Err(Errno::EXDEV) => {
+                return Ok(Err(FdinfoFailure::NotProcfs(
+                    "the entry is outside /proc or across a mount",
+                )));
+            }
+            Err(errno) => return Ok(Err(FdinfoFailure::Failed("open", errno))),
+        };
+        let result = match self.recorded_device(guest, opened, stat).await? {
+            Some(device) if device == anchor_device => {
+                let scratch = AddrMut::<u8>::from_raw(page + FDINFO_READ).ok_or(Errno::EFAULT)?;
+                match self
+                    .drain_procfs(
+                        guest,
+                        syscalls::Read::new().with_fd(opened),
+                        scratch,
+                        FDINFO_PAGE - FDINFO_READ,
+                    )
+                    .await
+                {
+                    Ok(contents) => Ok(Ok(contents)),
+                    Err(Error::Errno(errno)) => Ok(Err(FdinfoFailure::Failed("read", errno))),
+                    Err(error) => Err(error),
+                }
+            }
+            _ => Ok(Err(FdinfoFailure::NotProcfs(
+                "the entry is not on /proc's device",
+            ))),
+        };
+        if let Err(errno) = self
             .record_or_replay(guest, syscalls::Close::new().with_fd(opened))
-            .await;
-        if let Err(errno) = closed {
-            trace!("[detcore] closing fdinfo {path:?} failed: {errno}");
+            .await
+        {
+            trace!("[detcore] closing fdinfo failed: {errno}");
         }
-        match read {
-            Ok(contents) => Ok(Ok(contents)),
-            Err(Error::Errno(errno)) => Ok(Err(("read", errno))),
-            Err(error) => Err(error),
-        }
+        result
+    }
+
+    /// The device `fstat` names for the descriptor `fd`, through the
+    /// recorder, into the `stat` buffer of the fdinfo page; `None` if it
+    /// fails.
+    async fn recorded_device<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        stat: usize,
+    ) -> Result<Option<u64>, Error> {
+        let answered = self
+            .record_or_replay(
+                guest,
+                Syscall::from_raw(
+                    Sysno::fstat,
+                    procfs_levels::raw_args([fd as usize, stat, 0, 0, 0, 0]),
+                ),
+            )
+            .await
+            .is_ok();
+        // `st_dev` is the first field of `struct stat`.
+        Ok(if answered {
+            Some(self.read_fdinfo_word(guest, stat)?)
+        } else {
+            None
+        })
+    }
+
+    /// Write `path`, NUL-terminated, at the fdinfo page's path slot.
+    fn write_fdinfo_path<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        page: usize,
+        path: &str,
+    ) -> Result<(), Error> {
+        assert!(
+            path.len() < FDINFO_HOW - FDINFO_PATH,
+            "fdinfo path {path:?} outgrew its room"
+        );
+        let start = AddrMut::<u8>::from_raw(page + FDINFO_PATH).ok_or(Errno::EFAULT)?;
+        let mut bytes = path.as_bytes().to_vec();
+        bytes.push(0);
+        guest.memory().write_exact(start, &bytes)?;
+        Ok(())
+    }
+
+    /// The first 8 bytes at `address`, a native-endian `u64`.
+    fn read_fdinfo_word<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        address: usize,
+    ) -> Result<u64, Error> {
+        let mut word = [0u8; 8];
+        let start = Addr::<u8>::from_raw(address).ok_or(Errno::EFAULT)?;
+        guest.memory().read_exact(start, &mut word)?;
+        Ok(u64::from_ne_bytes(word))
     }
 
     /// Refuse with EPERM a call that would make one of Hermit's tasks the

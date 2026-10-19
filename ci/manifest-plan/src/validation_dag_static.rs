@@ -2562,7 +2562,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4505): 2127, freshly listed.
     // And +4 from 16eca47a: 2131.
     // And the five R2b-2 stage 3 private-SIGCHLD units (https://github.com/rrnewton/hermit/issues/4273): 2136, listed.
-    ("test.detcore_unit", 2136),
+    // And the fdinfo procfs-anchor classification unit: 2137, freshly listed.
+    ("test.detcore_unit", 2137),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2878,7 +2879,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its full-descriptor-table refusal test becomes two (the lock goes on
     // without a /proc/locks read; the next read refuses), its pre-ledger
     // version-gate test and its vfork-after-OFD-lock test: 276, listed.
-    ("test.hermit_integration_2", 276),
+    // And its fake-/proc-under-chroot test: 277, listed.
+    ("test.hermit_integration_2", 277),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -4497,7 +4499,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three sigreturn-continuation units: 2127, freshly listed.
     // And +4 from 16eca47a: 2131.
     // And the same five R2b-2 stage 3 units: 2136, listed.
-    ("test.detcore_unit_on_host", 2136),
+    // And the same fdinfo procfs-anchor unit: 2137, freshly listed.
+    ("test.detcore_unit_on_host", 2137),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4583,7 +4586,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And proc_locks_determinism's deferred-refusal split, version-gate and
     // vfork tests: 617, listed.
     // And +3 from 16eca47a: 617.
-    ("test.hermit_integration_on_host", 617),
+    // And proc_locks_determinism's fake-/proc-under-chroot test: 618, listed.
+    ("test.hermit_integration_on_host", 618),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

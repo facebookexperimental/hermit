@@ -929,6 +929,7 @@ const LOCK_SCENARIOS_SOURCE: &str = r#"
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -1391,6 +1392,77 @@ static int stale_private_table_scenario(const char* path) {
   return 0;
 }
 
+// Inside a chroot whose /proc is an ordinary tree, the guest plants an
+// "fdinfo" for its own locking descriptor whose lock line is the host's lock
+// (`object` from `<jail>/object`), takes a real write lock on another file,
+// and reads /proc/locks through a descriptor it opened on the real procfs
+// before the chroot. Detcore must not take the planted line as the guest's.
+static int fake_proc_scenario(const char* jail) {
+  int locks = open("/proc/locks", O_RDONLY);
+  if (locks < 0) {
+    die("open /proc/locks");
+  }
+  char path[4096];
+  if (snprintf(path, sizeof(path), "%s/object", jail) >= (int)sizeof(path)) {
+    die("path");
+  }
+  char object[256];
+  int object_file = open(path, O_RDONLY);
+  ssize_t length = object_file < 0 ? -1 : read(object_file, object, sizeof(object) - 1);
+  if (length <= 0) {
+    die("read object");
+  }
+  object[length] = 0;
+  close(object_file);
+  if (chdir(jail) != 0 || chroot(".") != 0) {
+    die("chroot");
+  }
+  int own = open("/own", O_CREAT | O_RDWR, 0600);
+  if (own < 0) {
+    die("open /own");
+  }
+  if ((mkdir("/proc", 0755) != 0 && errno != EEXIST) ||
+      (mkdir("/proc/thread-self", 0755) != 0 && errno != EEXIST) ||
+      (mkdir("/proc/thread-self/fdinfo", 0755) != 0 && errno != EEXIST)) {
+    die("mkdir fake proc");
+  }
+  char fake[64];
+  if (snprintf(fake, sizeof(fake), "/proc/thread-self/fdinfo/%d", own) >= (int)sizeof(fake)) {
+    die("fake path");
+  }
+  FILE* planted = fopen(fake, "w");
+  if (planted == NULL ||
+      fprintf(planted, "pos:\t0\nflags:\t02\nmnt_id:\t1\nino:\t1\nlock:\t1: OFDLCK ADVISORY  READ -1 %s 0 0\n",
+              object) < 0 ||
+      fclose(planted) != 0) {
+    die("plant fdinfo");
+  }
+  ofd(own, F_WRLCK, 0, 1);
+  static char buffer[256 * 1024];
+  size_t used = 0;
+  for (;;) {
+    ssize_t count = pread(locks, buffer + used, sizeof(buffer) - used, (off_t)used);
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0) {
+      die("read /proc/locks");
+    }
+    if (count == 0) {
+      break;
+    }
+    used += (size_t)count;
+    if (used == sizeof(buffer)) {
+      die("snapshot too large");
+    }
+  }
+  printf("--- after-fake ---\n");
+  if (fwrite(buffer, 1, used, stdout) != used || fflush(stdout) != 0) {
+    die("write snapshot");
+  }
+  return 0;
+}
+
 // An OFD lock, then vfork; the child exits at once. DBT runs a vfork child's
 // calls natively, so it refuses this vfork rather than let the parent's lock
 // record go stale.
@@ -1593,6 +1665,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(mode, "ofd-then-vfork") == 0) {
     return ofd_then_vfork_scenario(where);
+  }
+  if (strcmp(mode, "fake-proc") == 0) {
+    return fake_proc_scenario(where);
   }
   if (strcmp(mode, "after-exec") == 0) {
     snapshot("after-exec");
@@ -1914,7 +1989,8 @@ fn a_full_descriptor_table_refuses_the_next_proc_locks_read() {
 /// A recording in the format before the descriptor-table ledger (labelled
 /// 0x16f, and 0x171 after the R2b-2 stage 3 revert's relabel) would replay
 /// different `/proc/locks` bytes, since replay recomputes which recorded rows
-/// are the guest's, so the version gate refuses it under either label; the
+/// are the guest's, and one from before the procfs anchor (0x172, 0x173)
+/// holds a different fdinfo read, so the version gate refuses each label; the
 /// same recording at the current version replays.
 #[test]
 fn recordings_from_before_the_lock_ledger_are_refused_by_the_version_gate() {
@@ -1975,10 +2051,11 @@ fn recordings_from_before_the_lock_ledger_are_refused_by_the_version_gate() {
     let mut metadata: serde_json::Value =
         serde_json::from_str(&text).expect("recording metadata is not JSON");
     assert_eq!(
-        metadata["version"], 0x173,
+        metadata["version"], 0x176,
         "RECORD_VERSION moved; point this test at the current version and the ledger's predecessor"
     );
-    for older in [0x171, 0x16f] {
+    // 0x173 and 0x172 read the fdinfo by path, without the procfs anchor.
+    for older in [0x173, 0x172, 0x171, 0x16f] {
         metadata["version"] = serde_json::json!(older);
         fs::write(
             &metadata_path,
@@ -2194,6 +2271,64 @@ fn stale_ledger_entries_admit_no_host_row_on_dbt() {
         return;
     }
     stale_ledger_entries_admit_no_host_row("dbt");
+}
+
+/// A guest that chroots into a tree whose `/proc` is ordinary directories can
+/// plant an "fdinfo" for its own locking descriptor whose lock line is a host
+/// lock, field for field. Detcore reads a description's fdinfo only through
+/// an anchor proved to be procfs, so the planted line is not taken as the
+/// guest's lock and the host's identical `/proc/locks` row stays out (L2,
+/// ptrace). The guest's own lock is hidden too: its `/proc` is not procfs.
+#[test]
+fn a_fake_proc_under_chroot_admits_no_host_row() {
+    let root = tempfile::Builder::new()
+        .prefix("proc-locks-fake-proc-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create fake-proc directory");
+    let guest = compile_embedded_guest(root.path(), "lock-scenarios", LOCK_SCENARIOS_SOURCE);
+    let held = root.path().join("held");
+    fs::write(&held, b"held\n").expect("create the host-locked file");
+    let host = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&held)
+        .expect("open the host-locked file");
+    record_lock(&host, libc::F_OFD_SETLK, libc::F_RDLCK, 0, 1);
+    // The host lock's object, exactly as /proc/locks prints it.
+    let suffix = inode_suffix(&held);
+    let object = fs::read_to_string("/proc/locks")
+        .expect("read the host's /proc/locks")
+        .lines()
+        .filter(|line| line.contains("OFDLCK") && line.contains(" -1 ") && line.contains(&suffix))
+        .find_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let owner = fields.iter().position(|field| *field == "-1")?;
+            fields.get(owner + 1).map(|object| object.to_string())
+        })
+        .expect("the host's /proc/locks does not show the control's OFD lock");
+    let jail = root.path().join("jail");
+    fs::create_dir(&jail).expect("create the jail");
+    fs::write(jail.join("object"), object.as_bytes()).expect("write the lock object");
+    // The jail's tree exists before the first run, so the guest's calls that
+    // make it (mkdir, open with O_CREAT) answer the same in both runs of the
+    // L2 check.
+    fs::create_dir_all(jail.join("proc/thread-self/fdinfo")).expect("create the fake /proc");
+    fs::write(jail.join("own"), b"").expect("create the jail's own file");
+    let report = root.path().join("fake-proc-verify.json");
+    let output = run_guest_on(
+        "ptrace",
+        &guest,
+        &[OsStr::new("fake-proc"), jail.as_os_str()],
+        Some(&report),
+    );
+    assert_bitwise_parity("ptrace fake-proc", &report, &output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        sections(&stdout),
+        expected(vec![("after-fake", vec![])]),
+        "the planted fdinfo admitted a host row\n{stdout}"
+    );
+    drop(host);
 }
 
 /// The exit status of a run DBT's runtime refuses at a process lifecycle
