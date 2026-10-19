@@ -9,17 +9,20 @@
 // Caught signal deliveries that Hermit's Detcore checks against the kernel
 // before its signal-state copy records them (A5 step 3.2,
 // https://github.com/rrnewton/hermit/issues/4485). Each mode makes one
-// delivery of a known shape, from a single thread, and checks what Linux
+// delivery of a known shape, most from a single thread and the mt-* modes
+// with a sibling thread (step 3.2b), and checks what Linux
 // guarantees about it: that the handler ran once, the mask it ran under, the
 // interrupted call's result or restart, and the action afterwards. It prints
 // "OK <mode>" and exits 0, or prints what differed and exits 1.
 //
-// Signals come from the thread itself (raise, sigqueue) or from the
+// Signals come from the thread itself (raise, sigqueue), from a sibling
+// thread of the guest's own (the mt-* modes, A5 step 3.2b), or from the
 // scheduler (an ITIMER_REAL expiry), never from outside, so every run is
 // deterministic.
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -29,9 +32,11 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t handled;
@@ -41,6 +46,10 @@ _Static_assert(ATOMIC_LONG_LOCK_FREE == 2, "the handler's atomic must be lock-fr
 static volatile sig_atomic_t handler_value;
 static volatile sig_atomic_t handler_values[2];
 static volatile sig_atomic_t write_end = -1;
+// The thread a handler ran on, and the mask its frame restores
+// (uc_sigmask).
+static volatile sig_atomic_t handler_tid;
+static _Atomic uint64_t handler_frame_mask;
 static sigjmp_buf recovery;
 // A null pointer the compiler cannot see through, for a deliberate fault.
 static int* volatile nowhere;
@@ -63,9 +72,20 @@ static uint64_t bit(int sig) {
   return 1ull << (sig - 1);
 }
 
+static uint64_t sigset_bits(const sigset_t* set) {
+  uint64_t bits = 0;
+  for (int sig = 1; sig <= 64; sig++) {
+    if (sigismember(set, sig) == 1) {
+      bits |= 1ull << (sig - 1);
+    }
+  }
+  return bits;
+}
+
 static void on_signal(int sig, siginfo_t* info, void* context) {
   (void)sig;
-  (void)context;
+  handler_tid = (sig_atomic_t)syscall(SYS_gettid);
+  handler_frame_mask = sigset_bits(&((ucontext_t*)context)->uc_sigmask);
   if (handled < 2) {
     handler_values[handled] = info->si_value.sival_int;
   }
@@ -129,6 +149,58 @@ static void arm_alarm(void) {
 }
 
 static int failures;
+
+// What a sibling thread does (mt-* modes): set its mask to `blocks` (0, the
+// default, admits every signal: a new thread inherits its creator's mask,
+// which here blocks the signal under test), sleep `delay_ms`, then send each
+// of `signals` in turn, to `target` with tgkill, or to the process with kill
+// when `target` is 0. A process-directed signal is sent only by its sole
+// eligible receiver: Hermit refuses one whose sender blocks it, or that more
+// than one thread could take (https://github.com/rrnewton/hermit/issues/4034).
+struct sibling {
+  pid_t target;
+  uint64_t blocks;
+  long delay_ms;
+  int signals[2];
+  // Set by the sibling to its thread ID before it sends.
+  volatile pid_t tid;
+};
+
+static void* sibling_main(void* arg) {
+  struct sibling* job = arg;
+  sigset_t set;
+  sigemptyset(&set);
+  for (int sig = 1; sig <= 64; sig++) {
+    if (job->blocks & (1ull << (sig - 1))) {
+      sigaddset(&set, sig);
+    }
+  }
+  if (pthread_sigmask(SIG_SETMASK, &set, NULL) != 0) {
+    _exit(2);
+  }
+  job->tid = (pid_t)syscall(SYS_gettid);
+  if (job->delay_ms) {
+    struct timespec delay = {0, job->delay_ms * 1000000};
+    nanosleep(&delay, NULL);
+  }
+  for (int i = 0; i < 2 && job->signals[i]; i++) {
+    long r = job->target ? syscall(SYS_tgkill, getpid(), job->target, job->signals[i])
+                         : kill(getpid(), job->signals[i]);
+    if (r != 0) {
+      _exit(2);
+    }
+  }
+  return NULL;
+}
+
+static pthread_t start_sibling(struct sibling* job) {
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, sibling_main, job) != 0) {
+    perror("pthread_create");
+    exit(2);
+  }
+  return thread;
+}
 
 static void expect(const char* what, long long actual, long long expected) {
   if (actual != expected) {
@@ -391,6 +463,111 @@ int main(int argc, char** argv) {
     expect("waitpid", waitpid(child, &status, 0), child);
     expect("killed by SIGSEGV", WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV, 1);
     handled = 1;
+  } else if (!strcmp(mode, "mt-suspend") || !strcmp(mode, "mt-suspend-late")) {
+    // Must deliver: the main thread blocks a caught SIGUSR1 and waits in
+    // sigsuspend with a temporary mask that admits it; a sibling sends it to
+    // the main thread, at once (it arrives before the wait starts) or after a
+    // 20 ms sleep (it arrives during the wait). One handler, on the main
+    // thread, under the temporary mask (SIGQUIT, which the thread's own mask
+    // does not hold) plus sa_mask plus SIGUSR1; its frame restores the main
+    // thread's own mask; sigsuspend fails with EINTR.
+    catch_signal(SIGUSR1, 0);
+    set_mask(own | bit(SIGUSR1));
+    struct sibling job = {
+        .target = (pid_t)syscall(SYS_gettid),
+        .delay_ms = !strcmp(mode, "mt-suspend-late") ? 20 : 0,
+        .signals = {SIGUSR1}};
+    pthread_t thread = start_sibling(&job);
+    sigset_t temporary;
+    sigemptyset(&temporary);
+    sigaddset(&temporary, SIGQUIT);
+    result = sigsuspend(&temporary);
+    error = errno;
+    pthread_join(thread, NULL);
+    expect("sigsuspend", result, -1);
+    expect("sigsuspend errno", error, EINTR);
+    expect("handler thread", handler_tid, job.target);
+    expect(
+        "handler mask",
+        (long long)handler_mask,
+        (long long)(bit(SIGQUIT) | sa_mask | bit(SIGUSR1)));
+    expect("frame mask", (long long)handler_frame_mask, (long long)(own | bit(SIGUSR1)));
+    expect("mask after sigsuspend", (long long)current_mask(), (long long)(own | bit(SIGUSR1)));
+  } else if (!strcmp(mode, "mt-suspend-blocked")) {
+    // Must not deliver: the temporary mask blocks SIGUSR1 too, so the
+    // sibling's SIGUSR1 stays pending through the wait, which a second,
+    // admitted signal (SIGWINCH) ends. SIGUSR1 is delivered at the unblock.
+    // The temporary mask holds SIGQUIT, which the thread's own mask does not.
+    catch_signal(SIGUSR1, 0);
+    catch_signal(SIGWINCH, 0);
+    set_mask(own | bit(SIGUSR1) | bit(SIGWINCH));
+    struct sibling job = {
+        .target = (pid_t)syscall(SYS_gettid), .signals = {SIGUSR1, SIGWINCH}};
+    pthread_t thread = start_sibling(&job);
+    sigset_t temporary;
+    sigemptyset(&temporary);
+    sigaddset(&temporary, SIGQUIT);
+    sigaddset(&temporary, SIGUSR1);
+    result = sigsuspend(&temporary);
+    error = errno;
+    pthread_join(thread, NULL);
+    expect("sigsuspend", result, -1);
+    expect("sigsuspend errno", error, EINTR);
+    expect("handled in the wait", handled, 1);
+    expect(
+        "SIGWINCH handler mask",
+        (long long)handler_mask,
+        (long long)(bit(SIGQUIT) | bit(SIGUSR1) | sa_mask | bit(SIGWINCH)));
+    expect(
+        "SIGWINCH frame mask",
+        (long long)handler_frame_mask,
+        (long long)(own | bit(SIGUSR1) | bit(SIGWINCH)));
+    sigset_t pending;
+    sigpending(&pending);
+    expect("SIGUSR1 pending after the wait", sigismember(&pending, SIGUSR1), 1);
+    expect("SIGWINCH handler thread", handler_tid, job.target);
+    set_mask(own);
+    expect("handled after the unblock", handled, 2);
+    expect("SIGUSR1 handler thread", handler_tid, job.target);
+    expect(
+        "SIGUSR1 handler mask", (long long)handler_mask, (long long)(own | sa_mask | bit(SIGUSR1)));
+    expect("SIGUSR1 frame mask", (long long)handler_frame_mask, (long long)own);
+    handled = 1;
+  } else if (!strcmp(mode, "mt-process-to-sibling")) {
+    // A process-directed SIGUSR1 goes to a thread that does not block it
+    // (complete_signal): the sibling that sends it, while the main thread
+    // blocks it and waits for the sibling in pthread_join (the sibling first
+    // sleeps 20 ms, meant to let the main thread return from pthread_create,
+    // whose block-everything mask would otherwise decide alone; nothing here
+    // checks that it did, and either way the main thread blocks SIGUSR1). The
+    // handler runs on the sibling under the sibling's mask (empty) plus
+    // sa_mask plus SIGUSR1, and its frame restores the sibling's mask.
+    catch_signal(SIGUSR1, 0);
+    set_mask(own | bit(SIGUSR1));
+    struct sibling job = {.target = 0, .delay_ms = 20, .signals = {SIGUSR1}};
+    pthread_t thread = start_sibling(&job);
+    pthread_join(thread, NULL);
+    expect("handler thread is the sibling", handler_tid, job.tid);
+    expect("handler mask", (long long)handler_mask, (long long)(sa_mask | bit(SIGUSR1)));
+    expect("frame mask", (long long)handler_frame_mask, 0);
+    set_mask(own);
+  } else if (!strcmp(mode, "mt-thread-to-masked")) {
+    // A thread-directed SIGUSR1 to a thread that blocks it stays pending on
+    // that thread, though another thread admits it, and is delivered there
+    // at the unblock.
+    catch_signal(SIGUSR1, 0);
+    set_mask(own | bit(SIGUSR1));
+    struct sibling job = {.target = (pid_t)syscall(SYS_gettid), .signals = {SIGUSR1}};
+    pthread_t thread = start_sibling(&job);
+    pthread_join(thread, NULL);
+    expect("handled while blocked", handled, 0);
+    sigset_t pending;
+    sigpending(&pending);
+    expect("SIGUSR1 pending on the main thread", sigismember(&pending, SIGUSR1), 1);
+    set_mask(own);
+    expect("handler thread is the main thread", handler_tid, job.target);
+    expect("handler mask", (long long)handler_mask, (long long)(own | sa_mask | bit(SIGUSR1)));
+    expect("frame mask", (long long)handler_frame_mask, (long long)own);
   } else if (!strcmp(mode, "ignored")) {
     signal(SIGUSR1, SIG_IGN);
     raise(SIGUSR1);

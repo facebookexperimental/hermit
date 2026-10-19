@@ -909,7 +909,9 @@ mod tests {
             // step 3.0a, +5): 623.
             // Its six ptrace_sigsegv_state_kept_* tests (A5 step 3.0b, +6):
             // 629.
-            assert_eq!(population, 629);
+            // Five multithreaded ptrace_delivery_check_* tests (A5 step 3.2b,
+            // +5): 634.
+            assert_eq!(population, 634);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

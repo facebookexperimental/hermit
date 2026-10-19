@@ -1256,7 +1256,8 @@ fn run_against_an_undrained_pipe(
 static DELIVERY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 /// tests/c/signal_delivery_check.c, built once: caught deliveries of known
-/// shapes from one thread, each checking what Linux guarantees about it.
+/// shapes, from the thread itself or a sibling, each checking what Linux
+/// guarantees about it.
 fn delivery_guest() -> &'static Path {
     DELIVERY_GUEST
         .get_or_init(|| {
@@ -1278,6 +1279,7 @@ fn delivery_guest() -> &'static Path {
                     "-Wall",
                     "-Wextra",
                     "-Werror",
+                    "-pthread",
                 ])
                 .arg(repository.join("tests/c/signal_delivery_check.c"))
                 .arg("-o")
@@ -1299,6 +1301,17 @@ fn delivery_guest() -> &'static Path {
 /// the order the threads exited, and each approval's trace line, from
 /// `the delivery of` on.
 fn delivery_log(mode: &str, extra: &[&str]) -> (Vec<String>, Vec<String>) {
+    let (counters, approvals, _) = delivery_log_with(mode, extra, "detcore::signal_delivery=trace");
+    (counters, approvals)
+}
+
+/// [`delivery_log`], with `rust_log` for the counted run, also returning
+/// that run's whole log.
+fn delivery_log_with(
+    mode: &str,
+    extra: &[&str],
+    rust_log: &str,
+) -> (Vec<String>, Vec<String>, String) {
     let expected = format!("OK {mode}\n");
     let mut verify = Command::new(hermit_test::hermit_binary());
     verify.args(["run", "--strict", "--verify", "--verify-strict"]);
@@ -1317,7 +1330,7 @@ fn delivery_log(mode: &str, extra: &[&str]) -> (Vec<String>, Vec<String>) {
     let _ = fs::remove_file(&log);
     let mut counted = Command::new(hermit_test::hermit_binary());
     counted
-        .env("RUST_LOG", "detcore::signal_delivery=trace")
+        .env("RUST_LOG", rust_log)
         .arg("--log-file")
         .arg(&log)
         .args(["run", "--strict"]);
@@ -1337,7 +1350,22 @@ fn delivery_log(mode: &str, extra: &[&str]) -> (Vec<String>, Vec<String>) {
         .filter_map(|line| line.split("signal-state copy: ").nth(1))
         .map(str::to_owned)
         .collect();
-    (counters, approvals)
+    (counters, approvals, log_text)
+}
+
+/// For the multithreaded modes: [`assert_counters`], with Detcore's warnings
+/// and errors logged too, of which there must be none: no copy diverged
+/// after the last delivery (`SIGNAL_STATE_COPY_DIVERGED`), and no signal was
+/// refused.
+fn assert_mt_counters(mode: &str, expected: &[&str]) {
+    let (counters, _, log) =
+        delivery_log_with(mode, &[], "detcore=warn,detcore::signal_delivery=trace");
+    assert_eq!(counters, expected, "mode {mode}");
+    let noise: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains(" WARN ") || line.contains(" ERROR "))
+        .collect();
+    assert!(noise.is_empty(), "mode {mode}: {noise:#?}");
 }
 
 /// [`delivery_log`]'s counter lines.
@@ -1589,6 +1617,93 @@ fn ptrace_delivery_check_gives_up_a_forced_signal_the_copy_ignores() {
             NOT_CAUGHT,
         ],
     );
+}
+/// In an `--log info` run of `mode` of the delivery guest, the first DETLOG
+/// syscall entry of `first` must come before that of `second`, each given as
+/// (Detcore thread ID, syscall name): the proof that a multithreaded case hit
+/// the window it names. The main thread is dtid 3 and its sibling dtid 5. The
+/// run is separate from the counted ones; its schedule is the same.
+fn assert_detlog_order(mode: &str, first: (u32, &str), second: (u32, &str)) {
+    let log = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "signal-delivery-order-{}-{mode}.log",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&log);
+    let mut run = Command::new(hermit_test::hermit_binary());
+    run.args(["--log", "info", "--log-file"])
+        .arg(&log)
+        .args(["run", "--strict", "--"]);
+    run.arg(delivery_guest()).arg(mode);
+    let output = command_output(run, &format!("delivery check {mode} with DETLOG"));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("OK {mode}\n")
+    );
+    let text = fs::read_to_string(&log).expect("read the DETLOG log");
+    let entry = |(dtid, name): (u32, &str)| {
+        let needle = format!("dtid {dtid}] inbound syscall: {name}(");
+        text.lines()
+            .position(|line| line.contains(&needle))
+            .unwrap_or_else(|| panic!("no dtid {dtid} {name} entry in the {mode} DETLOG"))
+    };
+    assert!(
+        entry(first) < entry(second),
+        "{mode}: {first:?} must come before {second:?} in DETLOG"
+    );
+}
+
+/// A sibling's thread-directed SIGUSR1 that reaches the main thread before
+/// its sigsuspend starts, while its own mask blocks the signal: the wait's
+/// temporary mask admits it, and Detcore's check approves the delivery at
+/// the wait's ERESTARTNOHAND, as the kernel delivers it. The DETLOG order
+/// shows the send finished before the wait began.
+#[test]
+fn ptrace_delivery_check_approves_a_sibling_signal_pending_before_sigsuspend() {
+    let _guard = hermit_signal_lock();
+    assert_mt_counters("mt-suspend", &[ONE_APPROVAL]);
+    assert_detlog_order("mt-suspend", (5, "tgkill"), (3, "rt_sigsuspend"));
+}
+
+/// The same, with the sibling's send after a 20 ms sleep, so that it reaches
+/// the main thread during its sigsuspend (DETLOG: the wait began before the
+/// send).
+#[test]
+fn ptrace_delivery_check_approves_a_sibling_signal_that_arrives_during_sigsuspend() {
+    let _guard = hermit_signal_lock();
+    assert_mt_counters("mt-suspend-late", &[ONE_APPROVAL]);
+    assert_detlog_order("mt-suspend-late", (3, "rt_sigsuspend"), (5, "tgkill"));
+}
+
+/// Must not deliver: a sibling's SIGUSR1 that the wait's temporary mask also
+/// blocks stays pending through sigsuspend, which the sibling's next signal,
+/// an admitted SIGWINCH, ends. Two approvals: SIGWINCH at the wait, then
+/// SIGUSR1 at the unblock.
+#[test]
+fn ptrace_delivery_check_does_not_deliver_a_sibling_signal_the_wait_blocks() {
+    let _guard = hermit_signal_lock();
+    assert_mt_counters(
+        "mt-suspend-blocked",
+        &["approved=2 result_checked=2 mismatched=0 interruption_from_registers=0 skipped={}"],
+    );
+}
+
+/// A process-directed SIGUSR1 from a sibling that admits it, while the main
+/// thread blocks it and waits in pthread_join, runs its handler on the
+/// sibling, under the sibling's mask, as Linux's complete_signal chooses. (A sender that blocks a process-directed signal
+/// is refused: https://github.com/rrnewton/hermit/issues/4034.)
+#[test]
+fn ptrace_delivery_check_approves_a_process_directed_signal_on_the_thread_that_admits_it() {
+    let _guard = hermit_signal_lock();
+    assert_mt_counters("mt-process-to-sibling", &[ONE_APPROVAL]);
+}
+
+/// A thread-directed SIGUSR1 to the main thread, which blocks it, stays
+/// pending there though the sibling admits it, and is delivered on the main
+/// thread at its unblock.
+#[test]
+fn ptrace_delivery_check_keeps_a_thread_directed_signal_on_its_masked_target() {
+    let _guard = hermit_signal_lock();
+    assert_mt_counters("mt-thread-to-masked", &[ONE_APPROVAL]);
 }
 
 static STATE_KEPT_GUEST: OnceLock<PathBuf> = OnceLock::new();
