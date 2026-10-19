@@ -164,7 +164,6 @@ static HB_PIPE_READ_HELD_WRITER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_PARENT_KILLED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_KILL_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static VFORK_EXEC_RESUME_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_COUNT_ZERO_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_REQUEUE_WAKE_OP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_LOCK_PI_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -2525,32 +2524,6 @@ fn vfork_kill_exec_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "vfork-kill-exec guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        guest
-    })
-}
-
-fn vfork_exec_resume_guest() -> &'static Path {
-    VFORK_EXEC_RESUME_GUEST.get_or_init(|| {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        let build_root = process_build_root("vfork-exec-resume");
-        fs::create_dir_all(&build_root)
-            .expect("failed to create vfork-exec-resume guest directory");
-        let guest = build_root.join("vfork_exec_resume");
-        let output = Command::new("cc")
-            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/vfork_exec_resume.c"))
-            .arg("-o")
-            .arg(&guest)
-            .output()
-            .expect("failed to compile vfork-exec-resume guest");
-        assert!(
-            output.status.success(),
-            "vfork-exec-resume guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -31559,55 +31532,6 @@ fn a_vfork_child_that_kills_its_parent_and_execs_lets_its_own_child_run() {
         stdout, "A killed by signal 9\nforkwait ok\n",
         "stderr:\n{log}"
     );
-}
-
-/// A vfork parent resumes when its child execs, as Linux resumes it
-/// (`vfork(2)`; kernel/fork.c `mm_release` -> `complete_vfork_done`). So when
-/// the exec'd child yields, the parent's write comes before the child's; and
-/// a child that `_exit`s is found exited by the parent's `wait4(WNOHANG)`.
-/// Both outcomes are the native ones (in 30 native runs: "parent
-/// resumed" first 30 of 30, "after exit: exited" 29 of 30). Before the rejoin
-/// the exec'd child ran to its exit first and wrote "child done" first. The
-/// run is bitwise-identical under `--verify-strict` and under record/replay.
-#[test]
-fn a_vfork_parent_resumes_at_its_childs_exec() {
-    let guest = vfork_exec_resume_guest().to_str().unwrap().to_owned();
-    let expected = "parent resumed\nchild done\nexec child exit=5\n\
-                    after exit: exited\nexit child exit=6\n";
-    let directory = tempfile::tempdir().expect("failed to create report directory");
-    let report = directory.path().join("verify.json");
-    let report_arg = report.to_str().expect("report path is UTF-8");
-    let verify_args = [
-        "run",
-        "--strict",
-        "--verify",
-        "--verify-strict",
-        "--verify-json",
-        report_arg,
-        "--",
-        guest.as_str(),
-    ];
-    let verified = hermit(&verify_args);
-    assert_success(&verified, &verify_args);
-    assert_eq!(stdout(&verified), expected, "run --verify");
-    let verdict: serde_json::Value =
-        serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
-            .expect("parse the verification report");
-    assert_eq!(verdict["bitwise_parity"], true, "{verdict}");
-    let record_args = [
-        "record",
-        "--verify",
-        "--verify-strict",
-        "--",
-        guest.as_str(),
-    ];
-    let recorded = hermit(&record_args);
-    assert_success(&recorded, &record_args);
-    assert!(
-        stderr(&recorded).contains("Success: replay matched recording."),
-        "replay must match the recording: {recorded:?}"
-    );
-    assert_eq!(stdout(&recorded), expected, "record");
 }
 
 /// A `FUTEX_WAKE` count of 0, and a count of 0xffffffff (negative as the

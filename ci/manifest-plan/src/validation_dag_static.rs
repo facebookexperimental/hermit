@@ -2567,12 +2567,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the fdinfo procfs-anchor classification unit: 2137, freshly listed.
     // And +4 from 83100c02: 2141.
     // And +1 from 37121ff4: 2142.
+    // Minus the vfork rejoin's tests, reverted in this commit.
     // And the fifteen vfork-rejoin scheduler units: 2157, listed.
     // And +15 from a84cd832: 2157.
     // And +3 from d9351f50 (select tv_usec) and 14da9861 (race-probe hold),
     // which did not move this pin; nextest list: 2160.
     // And +1 from 1648d29d: 2161.
-    ("test.detcore_unit", 2161),
+    ("test.detcore_unit", 2146),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3710,11 +3711,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_run_without_namespaces_is_not_refused_where_user_namespaces_are_denied
     // (https://github.com/rrnewton/hermit/issues/4515): 569, listed.
     // And select_timeout_folds_microseconds_into_seconds_as_linux: 570.
+    // Minus the vfork rejoin's tests, reverted in this commit.
     // And +1 from a84cd832: 571.
     // And statx_reports_the_classic_and_the_unique_mount_id_as_linux_does and
     // systemd_sysusers_reads_its_configuration_as_natively
     // (https://github.com/rrnewton/hermit/issues/4519): 573, listed.
-    ("test.cli", 573),
+    ("test.cli", 572),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4182,9 +4184,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five K3b CLI tests: 502.
     // And the same denied-user-namespace test: 503, listed.
     // And select_timeout_folds_microseconds_into_seconds_as_linux: 504.
+    // Minus the vfork rejoin's tests, reverted in this commit.
     // And +1 from a84cd832: 505.
     // And the same two statx mount-ID tests: 507, listed.
-    ("test.cli_on_host", 507),
+    ("test.cli_on_host", 506),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4528,12 +4531,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fdinfo procfs-anchor unit: 2137, freshly listed.
     // And +4 from 83100c02: 2141.
     // And +1 from 37121ff4: 2142.
+    // Minus the vfork rejoin's tests, reverted in this commit.
     // And the fifteen vfork-rejoin scheduler units: 2157, listed.
     // And +15 from a84cd832: 2157.
     // And +3 from d9351f50 (select tv_usec) and 14da9861 (race-probe hold),
     // which did not move this pin; nextest list: 2160.
     // And +1 from 1648d29d: 2161.
-    ("test.detcore_unit_on_host", 2161),
+    ("test.detcore_unit_on_host", 2146),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

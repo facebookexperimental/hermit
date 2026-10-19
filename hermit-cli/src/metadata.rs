@@ -759,7 +759,11 @@ impl RecordVersion {
 // admitted those hooks at their first syscall, after guest instructions had
 // executed. The lifecycle timing/context is observable even with an unchanged
 // wire layout, so recordings require a new behavior version.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17a);
+// 0x17a -> 0x17b: the vfork rejoin (0x179, 7ff8743b) is reverted, because it
+// broke record/replay of make -jN (minibeads dh-ojrf): a vfork parent is again
+// held until nothing else can run, and the rejoin log entries are gone. A
+// recording made with the rejoin is refused by the exact-match gate.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17b);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -784,7 +788,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17a);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17a;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17b;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
