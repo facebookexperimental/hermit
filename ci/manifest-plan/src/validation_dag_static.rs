@@ -1681,7 +1681,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And metadata::tests::record_version_rejects_streams_from_before_restartable_calls_block_first
     // (R2b-2 stage 2, https://github.com/rrnewton/hermit/issues/4273): 1039, listed.
     // And +3 from 8c4d53e7: 1042.
-    ("test.hermit_unit", 1042),
+    // And the R2b-2 stage 3 record-version test (https://github.com/rrnewton/hermit/issues/4273): 1043, listed.
+    ("test.hermit_unit", 1043),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2546,7 +2547,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 2103, freshly listed.
     // And the descriptor-table ledger's six procfs::locks units and the
     // fdinfo-refusal unit: 2110, freshly listed.
-    ("test.detcore_unit", 2110),
+    // And the five R2b-2 stage 3 private-SIGCHLD units (https://github.com/rrnewton/hermit/issues/4273): 2115, listed.
+    ("test.detcore_unit", 2115),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3652,7 +3654,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And restartable_calls_woken_by_two_signals_run_both_handlers and
     // restartable_two_signal_rows_under_record_and_replay (R2b-2 stage 2,
     // https://github.com/rrnewton/hermit/issues/4273): 543, listed.
-    ("test.cli", 543),
+    // And the four R2b-2 stage 3 CLI tests (https://github.com/rrnewton/hermit/issues/4273): 547, listed.
+    ("test.cli", 547),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4111,7 +4114,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same repeated-signal polled-read test: 475, listed.
     // And the same one-SIGCHLD-per-child-exit regression: 476.
     // And the same two R2b-2 stage 2 tests: 478, listed.
-    ("test.cli_on_host", 478),
+    // And the same four R2b-2 stage 3 CLI tests: 482, listed.
+    ("test.cli_on_host", 482),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4447,7 +4451,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same eight R2b-2 stage 2 units: 2094, listed.
     // And the same nine procfs::locks units: 2103, freshly listed.
     // And the same seven ledger and fdinfo-refusal units: 2110, freshly listed.
-    ("test.detcore_unit_on_host", 2110),
+    // And the same five R2b-2 stage 3 units: 2115, listed.
+    ("test.detcore_unit_on_host", 2115),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4740,7 +4745,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Less the same 46 replay-tool tests: 1038.
     // And the same R2b-2 stage 2 record-version test: 1039, listed.
     // And +3 from 8c4d53e7: 1042.
-    ("test.hermit_unit_on_host", 1042),
+    // And the same R2b-2 stage 3 record-version test: 1043, listed.
+    ("test.hermit_unit_on_host", 1043),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
