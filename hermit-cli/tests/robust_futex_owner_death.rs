@@ -1582,12 +1582,13 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // 0x178 the procfs anchor's entry rechecked as procfs, and
     // 0x179 a vfork parent resumed at its child's exec or exit,
     // 0x17a first-instruction DBT lifecycle admission,
-    // 0x17b the vfork rejoin reverted, and
-    // 0x17c a readmitted thread keeps its call's mask until its continuation),
+    // 0x17b the vfork rejoin reverted,
+    // 0x17c a readmitted thread keeps its call's mask until its continuation,
+    // and 0x17d the vfork rejoin re-landed),
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x17c,
+        metadata["version"], 0x17d,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);

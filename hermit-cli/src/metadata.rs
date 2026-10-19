@@ -769,7 +769,11 @@ impl RecordVersion {
 // SigBlk, which replay does not share with record (minibeads dh-ojrf). Replay
 // now chooses the SIGCHLD taker, a timer signal's fate and a discard as record
 // did, so an older recording could replay a different order there.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17c);
+// 0x17c -> 0x17d (takes HIGHEST_SHIPPED + 1 at land): the vfork rejoin
+// re-lands on the continuation-mask fix: a vfork parent again resumes at its
+// child's successful exec or exit (`vfork(2)`), with the readmission logged at
+// step 2a, so every recording of a vfork holds a different schedule.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17d);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -794,7 +798,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17c);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17c;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17d;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
