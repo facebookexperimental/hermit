@@ -42765,6 +42765,142 @@ fn single_threaded_restarting_private_sigchld_rows_under_record_and_replay() {
     record_private_sigchld_rows();
 }
 
+/// Detcore's delivery check (A5 step 3.2) approves each delivery of a
+/// `SIGCHLD` a guest sent with `tgkill` at the wait it interrupts: the
+/// approval names the wait's syscall and the result Detcore ended it with,
+/// which the backend compares with the guest's `rax`
+/// (`signal_shadow::check_and_record_delivery`). The result is fixed per call
+/// before measuring: -ERESTARTSYS (-512) for a pipe `read`, `readv` or
+/// `write`, caught or `SA_RESTART`; Detcore's -ERESTARTNOHAND (-514) for
+/// `poll` with no timeout and `ppoll`; -EINTR (-4) for `epoll_wait`,
+/// `epoll_pwait`, `epoll_pwait2` and `rt_sigtimedwait` (R2b-2 stage 3,
+/// https://github.com/rrnewton/hermit/issues/4273). Only the wait's approval
+/// binds: the child's exit `SIGCHLD` is approved too, at the parent's later
+/// `kill` or `rt_sigprocmask`. A ready descriptor and the copy in one turn
+/// (`edge both`) complete the call first, so the approval names its result
+/// (1). The single-threaded waiters keep Detcore's signal-state copy, so
+/// every delivery is checked: no skip, no mismatch.
+#[test]
+fn the_delivery_check_approves_each_private_sigchld_at_the_wait_it_ends() {
+    let _guard = hermit_run_guard();
+    let guest = poll_recheck_guest("guest_private_sigchld_waits");
+    let rows: [(&[&str], &str); 18] = [
+        (
+            &["fork", "read", "caught"],
+            "Return { syscall: 0, result: -512 }",
+        ),
+        (
+            &["fork", "readv", "caught"],
+            "Return { syscall: 19, result: -512 }",
+        ),
+        (
+            &["fork", "write", "caught"],
+            "Return { syscall: 1, result: -512 }",
+        ),
+        (
+            &["fork", "poll", "caught"],
+            "Return { syscall: 7, result: -514 }",
+        ),
+        (
+            &["fork", "ppoll", "caught"],
+            "Return { syscall: 271, result: -514 }",
+        ),
+        (
+            &["fork", "epoll_wait", "caught"],
+            "Return { syscall: 232, result: -4 }",
+        ),
+        (
+            &["fork", "epoll_pwait", "caught"],
+            "Return { syscall: 281, result: -4 }",
+        ),
+        (
+            &["fork", "epoll_pwait2", "caught"],
+            "Return { syscall: 441, result: -4 }",
+        ),
+        (
+            &["fork", "sigtimedwait", "caught"],
+            "Return { syscall: 128, result: -4 }",
+        ),
+        (
+            &["fork", "read", "restart"],
+            "Return { syscall: 0, result: -512 }",
+        ),
+        (
+            &["fork", "readv", "restart"],
+            "Return { syscall: 19, result: -512 }",
+        ),
+        (
+            &["fork", "write", "restart"],
+            "Return { syscall: 1, result: -512 }",
+        ),
+        (
+            &["fork", "poll", "restart"],
+            "Return { syscall: 7, result: -514 }",
+        ),
+        (
+            &["fork", "epoll_pwait", "blocked"],
+            "Return { syscall: 281, result: -4 }",
+        ),
+        (
+            &["fork", "epoll_pwait2", "blocked"],
+            "Return { syscall: 441, result: -4 }",
+        ),
+        (
+            &["fork", "ppoll", "blocked"],
+            "Return { syscall: 271, result: -514 }",
+        ),
+        (&["pending", "chld"], "Return { syscall: 281, result: -4 }"),
+        (&["edge", "both"], "Return { syscall: 7, result: 1 }"),
+    ];
+    for (args, interrupted) in rows {
+        let log = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "private-sigchld-delivery-{}-{}.log",
+            std::process::id(),
+            args.join("-")
+        ));
+        let _ = std::fs::remove_file(&log);
+        let log_arg = log.to_str().unwrap().to_owned();
+        let mut command = vec![
+            "--log-file",
+            log_arg.as_str(),
+            "run",
+            "--strict",
+            "--",
+            guest.as_str(),
+        ];
+        command.extend_from_slice(args);
+        let mut process = hermit_command(&command);
+        process.env("RUST_LOG", "detcore::signal_delivery=trace");
+        let output = hermit_test::hermit_output(&format!("hermit {command:?}"), &mut process);
+        assert_success(&output, &command);
+        let text = std::fs::read_to_string(&log).expect("read the delivery log");
+        let approvals: Vec<&str> = text
+            .lines()
+            .filter_map(|line| {
+                line.split("the delivery of signal 17 is approved, interrupting ")
+                    .nth(1)
+            })
+            .map(|rest| rest.trim_end_matches('"'))
+            .collect();
+        assert_eq!(
+            approvals.first().copied(),
+            Some(interrupted),
+            "{args:?}: approvals {approvals:?}"
+        );
+        let counters: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.split("signal deliveries: ").nth(1))
+            .collect();
+        assert!(!counters.is_empty(), "{args:?}: no counters line:\n{text}");
+        for counters in counters {
+            assert!(
+                counters.contains("mismatched=0") && counters.contains("skipped={}"),
+                "{args:?}: {counters}"
+            );
+        }
+    }
+}
+
 /// Under DBT the schedule records no private `SIGCHLD` (`private_sent` is kept
 /// only where Detcore models signal targets), so a pipe read and a poll still
 /// hold a `SIGCHLD` a guest sent with `tgkill` until they return: a known
