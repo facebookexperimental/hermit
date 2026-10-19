@@ -7353,6 +7353,10 @@ where
     // Any turn of its own is a hand-off under `--pipe-wake-latency`: the
     // thread goes back behind the pollers it readied (`crate::pipe_wake`).
     guest.thread_state_mut().pipe_handoff_due = None;
+    // A continuation is granted at most once in a row; any other request in
+    // between, a turn in which other threads may run, allows the next
+    // (`ThreadState::previous_request_continued`).
+    guest.thread_state_mut().previous_request_continued = r.continues_sigreturn;
     if guest.config().sequentialize_threads {
         if let Some(lease) = guest.signal_observation_lease() {
             if let Some(site) = guest.parked_signal_site() {

@@ -4017,14 +4017,23 @@ pub struct ThreadState<T> {
     /// maximum or in a timer callback (<https://github.com/rrnewton/hermit/issues/4034>).
     #[serde(default)]
     pub(crate) own_signal_turn_hold: Option<libc::c_int>,
-    /// Set when this thread's `rt_sigreturn` passes through, cleared by the
-    /// next event of any kind (`pre_handler_hook`). A signal stop that finds
-    /// it set is a delivery Linux makes on that same return to user space,
-    /// before any instruction of the interrupted code runs, so its turn
-    /// continues this thread's (`Resources::continues_sigreturn`,
+    /// Set when this thread's `rt_sigreturn` passes through, cleared by its
+    /// next event of any other kind (`pre_handler_hook`). A signal stop that
+    /// finds it set is the thread's first Detcore event since that
+    /// `rt_sigreturn`: usually the delivery Linux makes on that same return
+    /// to user space of a signal the restored mask unblocks, and otherwise a
+    /// fault or host signal its user code met with no intercepted event in
+    /// between (`Resources::continues_sigreturn`,
     /// <https://github.com/rrnewton/hermit/issues/4505>).
     #[serde(default)]
     pub(crate) returned_from_sigreturn: bool,
+    /// Whether this thread's last scheduler request was a delivery marked
+    /// `Resources::continues_sigreturn`. A thread gets at most one such
+    /// continuation in a row: with no timeslice end (as under
+    /// `--max-timeslice=disabled`) nothing else would stop a handler that
+    /// raises its own signal from holding the CPU for ever.
+    #[serde(default)]
+    pub(crate) previous_request_continued: bool,
 
     /// Thread state associated with record/replay.
     pub record_or_replay: T,
@@ -4732,6 +4741,7 @@ impl<T> ThreadState<T> {
             pipe_handoff_due: None,
             own_signal_turn_hold: None,
             returned_from_sigreturn: false,
+            previous_request_continued: false,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
             // AUTONOMOUS-BOT-IMPLEMENTED

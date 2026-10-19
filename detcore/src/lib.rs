@@ -1114,11 +1114,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             let timeslice = guest.thread_state().stats.timeslice_count;
             self.pre_handler_hook(guest, false, CheckIn::Event).await;
             // The delivery continues the thread's turn only while the slice
-            // that ran its `rt_sigreturn` is still open: a slice this stop
-            // ended has already yielded, so the delivery waits its turn as
-            // any other does, and a thread whose handlers keep raising
-            // signals cannot hold the CPU past its slice.
+            // that ran its `rt_sigreturn` is still open. A stop that ends the
+            // slice is Linux's TIF_NEED_RESCHED case: other threads run
+            // (`schedule()`) before this one resumes and delivers, so the
+            // delivery waits its place behind them instead of being taken
+            // right after the yield. And never twice in a row
+            // (`previous_request_continued`): with no timeslice end at all, a
+            // handler that raises its own signal would otherwise hold the
+            // CPU for ever.
             let continues_sigreturn = from_sigreturn
+                && !guest.thread_state().previous_request_continued
                 && signal.signal() != Some(Signal::SIGCHLD)
                 && guest.thread_state().stats.timeslice_count == timeslice;
 
@@ -3038,6 +3043,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     pipe_handoff_due: None,
                     own_signal_turn_hold: None,
                     returned_from_sigreturn: false,
+                    previous_request_continued: false,
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,

@@ -31357,55 +31357,83 @@ fn a_polled_read_signaled_again_and_again_is_interrupted() {
 /// signal the sibling had sent meanwhile before the reader ran any of its own
 /// code: the delivery waited behind the sibling's next turn, which sent
 /// another. The guest gave up after 1000 signals
-/// (https://github.com/rrnewton/hermit/issues/4505). The expected line is the
-/// native run's.
+/// (https://github.com/rrnewton/hermit/issues/4505). Also with no timeslice
+/// at all (`--max-timeslice=disabled`, which Hermit picks itself on a host
+/// without performance counters), where the run of deliveries never ended.
+/// The expected line is the native run's.
 #[test]
 fn a_reader_signaled_until_joined_gets_past_its_handler() {
     let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
-    let args = [
-        "run",
-        "--strict",
-        "--verify",
-        "--verify-strict",
-        "--",
-        guest.as_str(),
-        "repeat-join",
-    ];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "joined, handled 1\n");
-    let log = stderr(&output);
-    assert!(
-        log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
-        "comparison was not canonical:\n{log}"
-    );
-    assert!(
-        log.contains(":: Success: deterministic. Determinism verified."),
-        "verification failed:\n{log}"
-    );
+    for extra in [None, Some("--max-timeslice=disabled")] {
+        let mut args = vec!["run", "--strict", "--verify", "--verify-strict"];
+        args.extend(extra);
+        args.extend(["--", guest.as_str(), "repeat-join"]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), "joined, handled 1\n", "{extra:?}");
+        let log = stderr(&output);
+        assert!(
+            log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+            "{extra:?}: comparison was not canonical:\n{log}"
+        );
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "{extra:?}: verification failed:\n{log}"
+        );
+    }
 }
 
 /// A thread whose handler raises its own signal again takes the next one at
-/// every `rt_sigreturn`; those deliveries continue its turn only until its
-/// timeslice ends, so the main thread still runs, stops it and joins it, and
-/// the run verifies at bitwise parity
-/// (https://github.com/rrnewton/hermit/issues/4505). The expected line is the
+/// every `rt_sigreturn`. Those deliveries continue its turn at most once in
+/// a row and only until its timeslice ends, so the main thread still runs,
+/// stops it and joins it, and the run verifies at bitwise parity
+/// (https://github.com/rrnewton/hermit/issues/4505). With no timeslice
+/// (`--max-timeslice=disabled`) only the once-in-a-row bound stops the run
+/// of deliveries; without it this hung (Claude review of
+/// https://github.com/rrnewton/hermit/pull/4509). The expected line is the
 /// native run's.
 #[test]
 fn a_handler_that_raises_its_own_signal_does_not_hold_the_cpu() {
     let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
+    for extra in [None, Some("--max-timeslice=disabled")] {
+        let mut args = vec!["run", "--strict", "--verify", "--verify-strict"];
+        args.extend(extra);
+        args.extend(["--", guest.as_str(), "resignal"]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), "stopped, resignaled 1\n", "{extra:?}");
+        let log = stderr(&output);
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "{extra:?}: verification failed:\n{log}"
+        );
+    }
+}
+
+/// A handler that runs past `--target-timeslice` ends the reader's slice at
+/// its next signal stop. That stop yields, and its delivery then waits behind
+/// the other runnable threads, as Linux reschedules (TIF_NEED_RESCHED) before
+/// it delivers; it is not taken right after the yield as a continuation of
+/// the `rt_sigreturn`. The count is Hermit's deterministic schedule, not a
+/// native comparison: with the delivery taken right after the yield, the
+/// sender sends 3 signals instead of 4 (Claude and Codex reviews of
+/// https://github.com/rrnewton/hermit/pull/4509).
+#[test]
+fn a_slice_that_ends_at_a_signal_stop_puts_its_delivery_behind_other_threads() {
+    let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
     let args = [
         "run",
         "--strict",
+        "--target-timeslice=1000",
         "--verify",
         "--verify-strict",
         "--",
         guest.as_str(),
-        "resignal",
+        "repeat-join-spin",
     ];
     let output = hermit(&args);
     assert_success(&output, &args);
-    assert_eq!(stdout(&output), "stopped, resignaled 1\n");
+    assert_eq!(stdout(&output), "joined after 4 signals, handled 1\n");
     let log = stderr(&output);
     assert!(
         log.contains(":: Success: deterministic. Determinism verified."),

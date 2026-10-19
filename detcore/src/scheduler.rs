@@ -1427,6 +1427,15 @@ pub struct Scheduler {
     /// (`restartable_internal_io_interrupting_signals`).
     #[cfg(test)]
     test_internal_io_signal_state_reads: std::sync::atomic::AtomicUsize,
+    /// Threads that filed an `InboundSignal` request marked
+    /// `Resources::continues_sigreturn` (`request_put`), which step 3 may
+    /// grant first (`first_sigreturn_continuation`). An entry whose request
+    /// has been granted or replaced is dropped there, so the set holds at
+    /// most a few threads, and a turn with none costs the rule nothing.
+    sigreturn_continuations: BTreeSet<DetTid>,
+    /// Counts `first_sigreturn_continuation`'s reads of a filed request.
+    #[cfg(test)]
+    test_continuation_request_reads: std::sync::atomic::AtomicUsize,
 
     /// Child-TID futexes whose kernel clear may still be racing a guest join.
     cleared_child_tids: HashMap<FutexID, DetTid>,
@@ -3897,6 +3906,9 @@ impl Scheduler {
             test_kernel_mask_reads: Default::default(),
             #[cfg(test)]
             test_internal_io_signal_state_reads: Default::default(),
+            sigreturn_continuations: Default::default(),
+            #[cfg(test)]
+            test_continuation_request_reads: Default::default(),
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
             terminal_clock_exhaustion: None,
@@ -4590,6 +4602,8 @@ impl Scheduler {
         // restarts and re-issues a fresh request on the next turn. Any other
         // double-put still panics, preserving the write-once Ivar invariant.
         // Mirrors the `try_put` guard in `logically_kill_thread` (PR-845).
+        let continuation =
+            (rs.continues_sigreturn && Self::is_inbound_signal_turn(&rs)).then_some(rs.tid);
         if let Some(dropped) = req.try_put(Ok(rs)) {
             let tolerated = matches!(
                 req.try_read(),
@@ -4615,6 +4629,8 @@ impl Scheduler {
                     dropped, req
                 );
             }
+        } else if let Some(thread) = continuation {
+            self.sigreturn_continuations.insert(thread);
         }
     }
 
@@ -10115,23 +10131,49 @@ impl Scheduler {
     /// the other runnable threads let a sibling that signals it once per turn
     /// re-arm the signal at every `rt_sigreturn`, so the thread never ran its
     /// own code (<https://github.com/rrnewton/hermit/issues/4505>). A thread
-    /// held at a happens-before gate is not preferred; the gate decides it.
-    fn first_sigreturn_continuation(&self) -> Option<DetTid> {
-        self.run_queue.tids().copied().find(|&thread| {
-            self.run_queue.contains_non_polling_tid(thread)
-                && !self
-                    .happens_before
-                    .as_ref()
-                    .is_some_and(|hb| hb.parked.contains(&thread))
-                && self
-                    .next_turns
-                    .get(&thread)
-                    .and_then(|next_turn| next_turn.req.try_read())
-                    .and_then(Result::ok)
-                    .is_some_and(|request| {
-                        request.continues_sigreturn && Self::is_inbound_signal_turn(&request)
-                    })
-        })
+    /// held at a happens-before gate is never considered: the gate takes it
+    /// out of the run queue until it opens.
+    ///
+    /// Only the threads `request_put` recorded are examined
+    /// (`sigreturn_continuations`), so a turn with no marked request reads no
+    /// request and walks no queue.
+    fn first_sigreturn_continuation(&mut self) -> Option<DetTid> {
+        if self.sigreturn_continuations.is_empty() {
+            return None;
+        }
+        let mut stale = Vec::new();
+        let mut eligible = Vec::new();
+        for &thread in &self.sigreturn_continuations {
+            #[cfg(test)]
+            self.test_continuation_request_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let marked = self
+                .next_turns
+                .get(&thread)
+                .and_then(|next_turn| next_turn.req.try_read())
+                .and_then(Result::ok)
+                .is_some_and(|request| {
+                    request.continues_sigreturn && Self::is_inbound_signal_turn(&request)
+                });
+            if !marked {
+                stale.push(thread);
+            } else if self.run_queue.contains_non_polling_tid(thread) {
+                eligible.push(thread);
+            }
+        }
+        for thread in stale {
+            self.sigreturn_continuations.remove(&thread);
+        }
+        match eligible.as_slice() {
+            [] => None,
+            [thread] => Some(*thread),
+            // More than one: the earliest in run-queue order.
+            _ => self
+                .run_queue
+                .tids()
+                .copied()
+                .find(|thread| eligible.contains(thread)),
+        }
     }
 
     /// The `sigchld_takers` thread step 3 resumes first, if any (see there).
@@ -12335,21 +12377,24 @@ impl Scheduler {
             // caller), so it is the thread that takes the process-directed
             // copy (`sigchld_takers`).
             let taker = self.first_sigchld_taker();
-            // Then a delivery that continues its thread's own `rt_sigreturn`
-            // (`first_sigreturn_continuation`), after a vfork child, which
-            // Linux runs while it suspends only the caller.
-            let next_dtid = match self
-                .queued_group_exit_decider()
-                .or(taker)
-                .or(gated_child)
-                .or_else(|| self.first_sigreturn_continuation())
-            {
+            let next_dtid = match self.queued_group_exit_decider().or(taker).or(gated_child) {
                 Some(child) => self
                     .run_queue
                     .tentative_pop_tid(child)
                     .expect("selected thread disappeared from run queue"),
                 None if self.vfork_gated_background_child().is_some() => return None,
-                None => self.run_queue.tentative_pop_next().expect("impossible"),
+                // Then a delivery that continues its thread's own
+                // `rt_sigreturn` (`first_sigreturn_continuation`). Only after
+                // the wait for a backgrounded vfork child: that wait is what
+                // keeps the child's host-timed completion from deciding which
+                // turn commits next.
+                None => match self.first_sigreturn_continuation() {
+                    Some(thread) => self
+                        .run_queue
+                        .tentative_pop_tid(thread)
+                        .expect("selected thread disappeared from run queue"),
+                    None => self.run_queue.tentative_pop_next().expect("impossible"),
+                },
             };
             let nextturn = self.next_turns.get(&next_dtid).unwrap_or_else(|| {
                 panic!(
@@ -26633,12 +26678,13 @@ mod test {
     }
 
     /// A signal delivery a thread reached straight from its own `rt_sigreturn`
-    /// (`Resources::continues_sigreturn`) is selected before a thread queued
-    /// ahead of it; the same request without the mark waits its turn
-    /// (https://github.com/rrnewton/hermit/issues/4505).
+    /// (`Resources::continues_sigreturn`), filed through `request_put`, is
+    /// selected before a thread queued ahead of it; the same request without
+    /// the mark waits its turn (https://github.com/rrnewton/hermit/issues/4505).
     #[test]
     fn a_delivery_that_continues_its_threads_sigreturn_runs_first() {
         for continues in [false, true] {
+            let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
             let mut scheduler = Scheduler::new(&Config::default());
             let sender = DetTid::from_raw(100);
             let target = DetTid::from_raw(101);
@@ -26655,8 +26701,10 @@ mod test {
                 Permission::RW,
             );
             delivery.continues_sigreturn = continues;
-            scheduler.next_turns.get_mut(&sender).unwrap().req = Ivar::full(Ok(other));
-            scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(delivery));
+            let req = scheduler.next_turns[&sender].req.clone();
+            scheduler.request_put(&req, other, &global_time);
+            let req = scheduler.next_turns[&target].req.clone();
+            scheduler.request_put(&req, delivery, &global_time);
             scheduler.runqueue_push_back(sender);
             scheduler.runqueue_push_back(target);
 
@@ -26672,6 +26720,73 @@ mod test {
             );
             scheduler.run_queue.undo_tentative_pop();
         }
+    }
+
+    /// The mark is honoured only on a delivery (`InboundSignal`) that a
+    /// thread queued to run its turn filed: not on a request of another kind,
+    /// and not while the thread is queued as a poller.
+    #[test]
+    fn a_sigreturn_continuation_needs_a_queued_delivery() {
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let mut scheduler = Scheduler::new(&Config::default());
+        let sleeper = DetTid::from_raw(100);
+        let poller = DetTid::from_raw(101);
+        register_known_thread(&mut scheduler, sleeper);
+        register_known_thread(&mut scheduler, poller);
+        let mut sleep = Resources::new(sleeper);
+        sleep.insert(
+            ResourceID::SleepUntil(LogicalTime::from_nanos(1)),
+            Permission::W,
+        );
+        sleep.continues_sigreturn = true;
+        let req = scheduler.next_turns[&sleeper].req.clone();
+        scheduler.request_put(&req, sleep, &global_time);
+        let mut delivery = Resources::new(poller);
+        delivery.insert(
+            ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
+            Permission::RW,
+        );
+        delivery.continues_sigreturn = true;
+        let req = scheduler.next_turns[&poller].req.clone();
+        scheduler.request_put(&req, delivery, &global_time);
+        scheduler.runqueue_push_back(sleeper);
+        scheduler.run_queue.push_poller(poller, DEFAULT_PRIORITY, 0);
+
+        assert_eq!(scheduler.first_sigreturn_continuation(), None);
+        assert!(
+            !scheduler.sigreturn_continuations.contains(&sleeper),
+            "a request that is not a delivery is never recorded"
+        );
+    }
+
+    /// A turn with no marked request costs the rule nothing: with 64 queued
+    /// threads whose requests are unmarked, step 3 reads none of them for it
+    /// (Codex review of https://github.com/rrnewton/hermit/pull/4509).
+    #[test]
+    fn the_sigreturn_continuation_rule_reads_no_request_when_none_is_marked() {
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let mut scheduler = Scheduler::new(&Config::default());
+        for raw in 100..164 {
+            let thread = DetTid::from_raw(raw);
+            register_known_thread(&mut scheduler, thread);
+            let mut delivery = Resources::new(thread);
+            delivery.insert(
+                ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
+                Permission::RW,
+            );
+            let req = scheduler.next_turns[&thread].req.clone();
+            scheduler.request_put(&req, delivery, &global_time);
+            scheduler.runqueue_push_back(thread);
+        }
+        assert_eq!(scheduler.first_sigreturn_continuation(), None);
+        assert!(scheduler.step3_peek().is_some());
+        scheduler.run_queue.undo_tentative_pop();
+        assert_eq!(
+            scheduler
+                .test_continuation_request_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]

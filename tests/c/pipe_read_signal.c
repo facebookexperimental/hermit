@@ -78,6 +78,12 @@
  *                  ended (https://github.com/rrnewton/hermit/issues/4505).
  *                  After REPEAT_LIMIT signals the main thread gives up,
  *                  releases the reader with a byte and says so.
+ *   repeat-join-spin  as repeat-join with a handler that spins 1000
+ *                  iterations, and the line names how many signals were sent.
+ *                  Not a native comparison: under Hermit with
+ *                  --target-timeslice=1000 the handler ends the reader's
+ *                  slice at a signal stop, and the count pins where that
+ *                  delivery waits (https://github.com/rrnewton/hermit/issues/4505).
  *   resignal       not a read: a sibling raises SIGUSR1 at itself, and its
  *                  handler raises it again until the main thread, after a
  *                  1 ms sleep, tells it to stop. Every rt_sigreturn takes the
@@ -261,8 +267,15 @@ static int repeat_mode(void) {
   return 0;
 }
 
-static int repeat_join_mode(void) {
-  install(0, handler);
+static void spinning_handler(int signal) {
+  (void)signal;
+  for (volatile int i = 0; i < 1000; i++) {
+  }
+  handled++;
+}
+
+static int repeat_join_mode(int spin) {
+  install(0, spin ? spinning_handler : handler);
   pthread_t thread;
   if (pthread_create(&thread, NULL, looping_reader, NULL) != 0) {
     fail("pthread_create");
@@ -290,7 +303,11 @@ static int repeat_join_mode(void) {
       fail("pthread_join");
     }
   }
-  printf("joined, handled %d\n", handled > 0);
+  if (spin) {
+    printf("joined after %d signals, handled %d\n", sent, handled > 0);
+  } else {
+    printf("joined, handled %d\n", handled > 0);
+  }
   return 0;
 }
 
@@ -579,7 +596,7 @@ int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(stderr,
             "usage: %s eintr|restart|ignored|blocked|ready|eof|ready2|cancel|process|write-zero|write-room|write-partial|"
-            "write-partial-blocked|write-partial-ignored|waitpid|repeat|repeat-join|resignal\n",
+            "write-partial-blocked|write-partial-ignored|waitpid|repeat|repeat-join|repeat-join-spin|resignal\n",
             argv[0]);
     return 2;
   }
@@ -604,7 +621,10 @@ int main(int argc, char** argv) {
     return repeat_mode();
   }
   if (strcmp(mode, "repeat-join") == 0) {
-    return repeat_join_mode();
+    return repeat_join_mode(0);
+  }
+  if (strcmp(mode, "repeat-join-spin") == 0) {
+    return repeat_join_mode(1);
   }
   if (strcmp(mode, "resignal") == 0) {
     return resignal_mode();
