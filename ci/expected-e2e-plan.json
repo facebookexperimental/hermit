@@ -16627,23 +16627,6 @@
         "ptrace",
         "cc"
       ],
-      "test": "c-programs/inline-syscall-sites",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
       "test": "c-programs/inotify-watch",
       "timeout_seconds": 57
     },

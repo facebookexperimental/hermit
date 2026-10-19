@@ -19665,12 +19665,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - sabre
           - kvm
           - dbt
           - liteinst
           - in-guest-trap
-        backends_disabled: {}
+        backends_disabled:
+          sabre: 'NAMED GAP (dh-dk8kv): SaBRe crashes this guest since Reverie 80fc77fa ("SaBRe loader: keep address space free above a PIE client''s image for its program break", picked up by Hermit 5f2d987e5). The guest, built by the pinned image''s GCC 15.3.0 as a PIE, has two syscall sites 10 bytes apart; under that loader the first site''s trampoline returns into the middle of the second site''s patch (SIGSEGV at offset 0x1096, 3 of 3 runs), while a loader built from its parent 94513271 passes 3 of 3. Kept as a named gap, not fixed, under the owner''s ruling that SaBRe is a drop candidate. Disabled on every route: the Buck route builds this guest with another compiler and passed only because its binary does not trigger the bug.'
         hermit_args:
           liteinst:
             - --max-timeslice=disabled

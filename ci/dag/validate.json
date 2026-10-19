@@ -3667,13 +3667,6 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/inline-syscall-sites",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
           "test": "c-programs/inotify-watch",
           "mode": "verify",
           "backend": "dbt"
@@ -32151,13 +32144,6 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/inline-syscall-sites",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
           "test": "c-programs/inotify-watch",
           "mode": "verify",
           "backend": "dbt"
@@ -49781,13 +49767,6 @@
           "test": "c-programs/inline-syscall-sites",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/inline-syscall-sites",
-          "mode": "verify",
-          "backend": "sabre"
         },
         {
           "lane": "portable",
