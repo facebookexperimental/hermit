@@ -217,17 +217,29 @@ fn build_guest(repository: &Path, build_root: &Path, name: &str, api: &str) -> s
     guest
 }
 
-fn run_guest(guest: &Path, verify: bool) -> Output {
+/// Run `guest` under `hermit --backend=<backend> run --strict`, and with
+/// `verify_json`, as the L2 check: `--verify --verify-strict` writing its
+/// report there, at log level info.
+fn run_guest_on(
+    backend: &str,
+    guest: &Path,
+    args: &[&OsStr],
+    verify_json: Option<&Path>,
+) -> Output {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "5s", "90s"])
         .arg(hermit_test::hermit_binary());
-    if verify {
-        command.args(["--log", "DEBUG"]);
+    if verify_json.is_some() {
+        command.arg("--log=info");
     }
-    command.args(["--backend=ptrace", "run", "--strict", "--proc=standard"]);
-    if verify {
-        command.arg("--verify");
+    command
+        .arg(format!("--backend={backend}"))
+        .args(["run", "--strict", "--proc=standard"]);
+    if let Some(report) = verify_json {
+        command
+            .args(["--verify", "--verify-strict", "--verify-json"])
+            .arg(report);
     }
     command
         .args([
@@ -237,17 +249,53 @@ fn run_guest(guest: &Path, verify: bool) -> Output {
             "--base-env=minimal",
         ])
         .arg("--")
-        .arg(guest);
+        .arg(guest)
+        .args(args);
     hermit_test::configure_guest_execution(&mut command);
     hermit_test::hermit_output(&format!("{command:?}"), &mut command)
 }
 
+fn run_guest(guest: &Path, verify_json: Option<&Path>) -> Output {
+    run_guest_on("ptrace", guest, &[], verify_json)
+}
+
+/// Require the `--verify-strict` report at `report` to show bitwise parity
+/// over a nonzero, equal number of compared INFO messages: the L2 check, which
+/// the default `--verify` comparator (`Stripped`) cannot establish.
+fn assert_bitwise_parity(label: &str, report: &Path, output: &Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{label} failed strict verification\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(report)
+            .unwrap_or_else(|error| panic!("{label}: no verification report: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("{label}: verification report is not JSON: {error}"));
+    assert_eq!(
+        report["bitwise_parity"],
+        serde_json::Value::Bool(true),
+        "{label}: {report}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let compared = &report["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "{label}: verification compared no INFO messages: {report}"
+    );
+}
+
 #[test]
 fn proc_locks_consumers_are_deterministic_under_strict_verify() {
-    // Linux intentionally exposes OFD locks from other PID namespaces because
-    // those locks have no owning PID. Keep this whole-snapshot test exclusive
-    // across test processes. The host-side BSD flock is PID-owned, so it is
-    // hidden from the guest snapshot and released if the test process dies.
+    // Linux exposes OFD locks from other PID namespaces because those locks
+    // have no owning PID. Detcore now drops every row the guest does not own
+    // (`host_locks_stay_out_of_the_guests_proc_locks_*` below is the control),
+    // so this lease no longer decides the result; it stays until its
+    // validation wiring is retired. The host-side BSD flock is PID-owned, so
+    // it is hidden from the guest snapshot and released if the test process
+    // dies.
     let _lease = acquire_proc_locks_snapshot_lease();
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -257,7 +305,7 @@ fn proc_locks_consumers_are_deterministic_under_strict_verify() {
 
     for (name, api) in [("fcntl", "1"), ("lockf", "2"), ("ofd-fcntl", "3")] {
         let guest = build_guest(repository, &build_root, name, api);
-        let strict = run_guest(&guest, false);
+        let strict = run_guest(&guest, None);
         let strict_out = String::from_utf8_lossy(&strict.stdout);
         let strict_err = String::from_utf8_lossy(&strict.stderr);
         assert!(
@@ -269,16 +317,13 @@ fn proc_locks_consumers_are_deterministic_under_strict_verify() {
             "{name}: content/alias probe omitted its marker\nstdout:\n{strict_out}\nstderr:\n{strict_err}"
         );
 
-        let output = run_guest(&guest, true);
+        let report = build_root.join(format!("{name}-verify.json"));
+        let output = run_guest(&guest, Some(&report));
+        assert_bitwise_parity(name, &report, &output);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            output.status.success(),
-            "{name} failed strict verification\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        assert!(
-            stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),
-            "{name} omitted verification marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            stdout.contains("proc-locks-virtual-graph-and-aliases-ok"),
+            "{name}: the verified run omitted its marker\nstdout:\n{stdout}"
         );
     }
 }
@@ -381,20 +426,12 @@ fn run_proc_locks_worker() -> bool {
                 env::var_os(CONCURRENT_GUEST).expect("concurrent proc-locks worker lacks guest"),
             );
             let _lease = acquire_proc_locks_snapshot_lease();
-            let output = run_guest(&guest, true);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                output.status.success(),
-                "concurrent proc-locks worker {} failed strict verification\n\
-                 stdout:\n{stdout}\nstderr:\n{stderr}",
-                worker.to_string_lossy()
-            );
-            assert!(
-                stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),
-                "concurrent proc-locks worker {} omitted verification marker\n\
-                 stdout:\n{stdout}\nstderr:\n{stderr}",
-                worker.to_string_lossy()
+            let report = root.join(format!("worker-{}-verify.json", worker.to_string_lossy()));
+            let output = run_guest(&guest, Some(&report));
+            assert_bitwise_parity(
+                &format!("concurrent proc-locks worker {}", worker.to_string_lossy()),
+                &report,
+                &output,
             );
         }
         LOUD_HOLDER_MODE => {
@@ -493,4 +530,858 @@ fn loud_later_worker_cannot_deadlock_output_collection() {
         holder_stderr.len() > 64 * 1024,
         "loud holder did not exceed a typical pipe capacity"
     );
+}
+
+/// A guest that takes one POSIX lock and one OFD lock on files of its own,
+/// opens (and never locks) a file the host locks, and writes `/proc/locks`
+/// verbatim to stdout, several times.
+const HOST_LOCKS_GUEST_SOURCE: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static int open_own(const char* directory, const char* name) {
+  char path[4096];
+  if (snprintf(path, sizeof(path), "%s/%s", directory, name) >= (int)sizeof(path)) {
+    return -1;
+  }
+  return open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+}
+
+static int print_snapshot(int index) {
+  static char buffer[256 * 1024];
+  int fd = open("/proc/locks", O_RDONLY);
+  if (fd < 0) {
+    return 1;
+  }
+  size_t used = 0;
+  for (;;) {
+    ssize_t count = read(fd, buffer + used, sizeof(buffer) - used);
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0 || (count > 0 && used + (size_t)count == sizeof(buffer))) {
+      close(fd);
+      return 1;
+    }
+    if (count == 0) {
+      break;
+    }
+    used += (size_t)count;
+  }
+  close(fd);
+  printf("--- snapshot %d ---\n", index);
+  return fwrite(buffer, 1, used, stdout) == used ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+  if (argc != 4) {
+    return 2;
+  }
+  int shared = open(argv[2], O_RDONLY);
+  int posix = open_own(argv[1], "own-posix");
+  int ofd = open_own(argv[1], "own-ofd");
+  if (shared < 0 || posix < 0 || ofd < 0) {
+    return 1;
+  }
+  struct flock posix_lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+  struct flock ofd_lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+  if (fcntl(posix, F_SETLK, &posix_lock) != 0 || fcntl(ofd, F_OFD_SETLK, &ofd_lock) != 0) {
+    return 1;
+  }
+  int snapshots = atoi(argv[3]);
+  for (int index = 0; index < snapshots; index++) {
+    if (print_snapshot(index) != 0) {
+      return 1;
+    }
+  }
+  return fflush(stdout) == 0 ? 0 : 1;
+}
+"#;
+
+/// Snapshots each guest run takes, to give the toggling host locks many
+/// chances to appear.
+const HOST_LOCKS_SNAPSHOTS: &str = "8";
+
+/// The host's locks for the control: an OFD write lock and a POSIX write lock
+/// (on separate ranges) and a flock on a file the guest opens but never
+/// locks, and an OFD write lock on a file the guest never sees. The test
+/// process takes them outside the guest's PID namespace.
+struct HostLocks {
+    shared: File,
+    shared_flock: File,
+    unseen: File,
+}
+
+/// `F_OFD_SETLK` or `F_SETLK` of `kind` (`F_WRLCK` or `F_UNLCK`) on
+/// `[start, start + len)`.
+fn record_lock(file: &File, command: libc::c_int, kind: libc::c_int, start: i64, len: i64) {
+    // SAFETY: an all-zero flock is a valid value; the fields set below are
+    // the ones fcntl reads.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = kind as libc::c_short;
+    lock.l_whence = libc::SEEK_SET as libc::c_short;
+    lock.l_start = start;
+    lock.l_len = len;
+    // SAFETY: `file` owns a valid descriptor and `lock` outlives the call.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), command, &lock as *const libc::flock) };
+    assert_eq!(
+        result,
+        0,
+        "host lock command {command} type {kind}: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+impl HostLocks {
+    fn open(shared: &Path, unseen: &Path) -> Self {
+        let open = |path: &Path| {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap_or_else(|error| panic!("open host lock file {}: {error}", path.display()))
+        };
+        Self {
+            shared: open(shared),
+            shared_flock: open(shared),
+            unseen: open(unseen),
+        }
+    }
+
+    fn set(&self, held: bool) {
+        let kind = if held { libc::F_WRLCK } else { libc::F_UNLCK };
+        record_lock(&self.shared, libc::F_OFD_SETLK, kind, 0, 1);
+        record_lock(&self.shared, libc::F_SETLK, kind, 1, 1);
+        record_lock(&self.unseen, libc::F_OFD_SETLK, kind, 0, 0);
+        let operation = if held {
+            libc::LOCK_EX | libc::LOCK_NB
+        } else {
+            libc::LOCK_UN
+        };
+        // SAFETY: `shared_flock` owns a valid descriptor.
+        let result = unsafe { libc::flock(self.shared_flock.as_raw_fd(), operation) };
+        assert_eq!(result, 0, "host flock: {}", std::io::Error::last_os_error());
+    }
+}
+
+/// The inode of `path`, as `/proc/locks` prints it at the end of the object.
+fn inode_suffix(path: &Path) -> String {
+    format!(
+        ":{} ",
+        fs::metadata(path).expect("stat host lock file").ino()
+    )
+}
+
+/// Whether the host's own `/proc/locks` shows an OFD lock on `path`. The
+/// control is real only if it does: a host lock nothing could see would
+/// prove nothing about the guest's view.
+fn host_sees_ofd_lock(path: &Path) -> bool {
+    let suffix = inode_suffix(path);
+    fs::read_to_string("/proc/locks")
+        .expect("read the host's /proc/locks")
+        .lines()
+        .any(|line| line.contains("OFDLCK") && line.contains(" -1 ") && line.contains(&suffix))
+}
+
+/// The guest's snapshots: each must hold exactly its two rows, its own OFD
+/// lock (owner -1) and its own POSIX lock, and nothing of the host's.
+fn assert_only_guest_rows(label: &str, stdout: &str) {
+    let snapshots = stdout.split("--- snapshot ").skip(1).collect::<Vec<_>>();
+    assert_eq!(
+        snapshots.len().to_string(),
+        HOST_LOCKS_SNAPSHOTS,
+        "{label}: the guest printed {} snapshots\n{stdout}",
+        snapshots.len()
+    );
+    for snapshot in snapshots {
+        let rows = snapshot.lines().skip(1).collect::<Vec<_>>();
+        assert_eq!(
+            rows.len(),
+            2,
+            "{label}: expected only the guest's two rows\n{stdout}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains(" OFDLCK ") && row.contains(" WRITE -1 "))
+                .count(),
+            1,
+            "{label}: the guest's own OFD lock is not shown exactly once\n{stdout}"
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.contains(" POSIX ")).count(),
+            1,
+            "{label}: the guest's own POSIX lock is not shown exactly once\n{stdout}"
+        );
+    }
+}
+
+/// A directory for the file the guest never sees, removed when dropped: a
+/// fresh one under `/dev/shm`, another filesystem than the guest's files,
+/// where the host lets the test create one, else one beside the guest's files
+/// (which the guest never opens either). Says which on stderr, so a run that
+/// fell back does not pass as if it had covered another filesystem.
+fn unseen_directory(fallback: &Path) -> tempfile::TempDir {
+    let (directory, class) = match tempfile::Builder::new()
+        .prefix("hermit-proc-locks-unseen-")
+        .tempdir_in("/dev/shm")
+    {
+        Ok(directory) => (directory, "/dev/shm"),
+        Err(error) => {
+            eprintln!("cannot create a directory under /dev/shm ({error}); falling back");
+            (
+                tempfile::Builder::new()
+                    .prefix("unseen-")
+                    .tempdir_in(fallback)
+                    .expect("create a directory for the unseen lock file"),
+                "test tempdir",
+            )
+        }
+    };
+    eprintln!("unseen host lock file location: {class}");
+    directory
+}
+
+/// Host locks taken outside the guest change nothing it sees in
+/// `/proc/locks`, on `backend`:
+/// 1. `run --strict` prints the same bytes with the host's locks held as
+///    without them;
+/// 2. `run --strict --verify --verify-strict` reaches bitwise parity while a
+///    host thread takes and drops the locks about every millisecond;
+/// 3. the guest's own OFD and POSIX rows are still there.
+fn host_locks_stay_out_of_the_guests_proc_locks(backend: &str) {
+    let root = tempfile::Builder::new()
+        .prefix("proc-locks-host-control-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create host-lock control directory");
+    let source = root.path().join("host-locks-guest.c");
+    fs::write(&source, HOST_LOCKS_GUEST_SOURCE).expect("write host-lock guest source");
+    let guest = root.path().join("host-locks-guest");
+    let compile = Command::new("cc")
+        .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("start cc for the host-lock guest");
+    assert!(
+        compile.status.success(),
+        "failed to compile the host-lock guest:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let own = root.path().join("own");
+    fs::create_dir(&own).expect("create the guest's own lock directory");
+    let shared = root.path().join("shared");
+    fs::write(&shared, b"shared\n").expect("create the shared lock file");
+    let unseen_directory = unseen_directory(root.path());
+    let unseen = unseen_directory.path().join("unseen");
+    fs::write(&unseen, b"unseen\n").expect("create the unseen lock file");
+    let args = [
+        own.as_os_str(),
+        shared.as_os_str(),
+        OsStr::new(HOST_LOCKS_SNAPSHOTS),
+    ];
+    let run = |label: &str, verify_json: Option<&Path>| {
+        let output = run_guest_on(backend, &guest, &args, verify_json);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if verify_json.is_none() {
+            assert!(
+                output.status.success(),
+                "{backend} {label}: run failed\nstdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        (output, stdout)
+    };
+
+    let (_, unlocked) = run("without host locks", None);
+    assert_only_guest_rows(&format!("{backend} without host locks"), &unlocked);
+
+    let host = HostLocks::open(&shared, &unseen);
+    host.set(true);
+    assert!(
+        host_sees_ofd_lock(&shared) && host_sees_ofd_lock(&unseen),
+        "the host's /proc/locks does not show the control's OFD locks"
+    );
+    let (_, locked) = run("with host locks held", None);
+    host.set(false);
+    assert_eq!(
+        locked, unlocked,
+        "{backend}: host locks held outside the guest changed its /proc/locks"
+    );
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let toggles = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let toggler = {
+        let (stop, toggles) = (stop.clone(), toggles.clone());
+        thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                host.set(true);
+                thread::sleep(Duration::from_micros(500));
+                host.set(false);
+                thread::sleep(Duration::from_micros(500));
+                toggles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+    };
+    let report = root.path().join("verify.json");
+    let (verified, verified_stdout) = run("verify while host locks toggle", Some(&report));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    toggler.join().expect("host lock toggler panicked");
+    assert!(
+        toggles.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "the host never toggled its locks during the verified run"
+    );
+    assert_bitwise_parity(
+        &format!("{backend} with toggling host locks"),
+        &report,
+        &verified,
+    );
+    assert_eq!(
+        verified_stdout, unlocked,
+        "{backend}: toggling host locks changed the verified run's /proc/locks"
+    );
+}
+
+#[test]
+fn host_locks_stay_out_of_the_guests_proc_locks_on_ptrace() {
+    host_locks_stay_out_of_the_guests_proc_locks("ptrace");
+}
+
+/// Whether this test binary cannot run DBT: built without the `dbt` feature.
+/// With `HERMIT_REQUIRE_DBT` set that is a failure rather than a skip.
+fn dbt_unavailable() -> bool {
+    if cfg!(feature = "dbt") {
+        return false;
+    }
+    assert!(
+        env::var_os("HERMIT_REQUIRE_DBT").is_none(),
+        "HERMIT_REQUIRE_DBT is set, but this test binary was built without the dbt \
+         feature, so it cannot exercise DBT"
+    );
+    eprintln!("skipping: built without the dbt feature");
+    true
+}
+
+#[test]
+fn host_locks_stay_out_of_the_guests_proc_locks_on_dbt() {
+    if dbt_unavailable() {
+        return;
+    }
+    host_locks_stay_out_of_the_guests_proc_locks("dbt");
+}
+
+/// A guest that runs one lock scenario, chosen by its first argument, and
+/// prints `/proc/locks` verbatim under a `--- label ---` line at each point the
+/// scenario names:
+/// - `unlock FILE`: an OFD write lock on byte 0 of FILE, then its release;
+/// - `fork DIR`: the parent takes an OFD lock and a flock, forks, closes both
+///   descriptors while the child holds its copies and a POSIX lock of its own,
+///   then the child exits;
+/// - `transfer DIR`: the parent OFD-locks a file it opened after forking,
+///   sends the descriptor over `SCM_RIGHTS` and closes it; the child holds it,
+///   then closes it;
+/// - `write-only DIR`: an OFD lock whose `struct flock` is on a page mapped
+///   `PROT_WRITE` only, which the kernel reads and a tracer's
+///   `process_vm_readv` cannot;
+/// - `exhaust DIR`: an OFD lock after the guest has mapped its whole address
+///   space away, which leaves Detcore no page to read the descriptor's fdinfo
+///   through.
+const LOCK_SCENARIOS_SOURCE: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static void die(const char* what) {
+  fprintf(stderr, "scenario: %s: %s\n", what, strerror(errno));
+  exit(1);
+}
+
+static int open_in(const char* directory, const char* name) {
+  char path[4096];
+  if (snprintf(path, sizeof(path), "%s/%s", directory, name) >= (int)sizeof(path)) {
+    die("path");
+  }
+  int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+  if (fd < 0) {
+    die(name);
+  }
+  return fd;
+}
+
+static void snapshot(const char* label) {
+  static char buffer[256 * 1024];
+  int fd = open("/proc/locks", O_RDONLY);
+  if (fd < 0) {
+    die("open /proc/locks");
+  }
+  size_t used = 0;
+  for (;;) {
+    ssize_t count = read(fd, buffer + used, sizeof(buffer) - used);
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0) {
+      die("read /proc/locks");
+    }
+    if (count == 0) {
+      break;
+    }
+    used += (size_t)count;
+    if (used == sizeof(buffer)) {
+      die("snapshot too large");
+    }
+  }
+  close(fd);
+  printf("--- %s ---\n", label);
+  if (fwrite(buffer, 1, used, stdout) != used || fflush(stdout) != 0) {
+    die("write snapshot");
+  }
+}
+
+static void ofd(int fd, short type, off_t start, off_t length) {
+  struct flock lock = {.l_type = type, .l_whence = SEEK_SET, .l_start = start, .l_len = length};
+  if (fcntl(fd, F_OFD_SETLK, &lock) != 0) {
+    die("F_OFD_SETLK");
+  }
+}
+
+static void wait_for(pid_t pid) {
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    die("child");
+  }
+}
+
+static void byte_in(int fd) {
+  char byte = 0;
+  if (read(fd, &byte, 1) != 1) {
+    die("read byte");
+  }
+}
+
+static void byte_out(int fd) {
+  if (write(fd, "x", 1) != 1) {
+    die("write byte");
+  }
+}
+
+static int unlock_scenario(const char* path) {
+  int fd = open(path, O_RDWR);
+  if (fd < 0) {
+    die("open shared file");
+  }
+  ofd(fd, F_WRLCK, 0, 1);
+  snapshot("held");
+  ofd(fd, F_UNLCK, 0, 1);
+  snapshot("released");
+  return 0;
+}
+
+static int fork_scenario(const char* directory) {
+  int ofd_file = open_in(directory, "fork-ofd");
+  int flock_file = open_in(directory, "fork-flock");
+  int posix_file = open_in(directory, "fork-posix");
+  ofd(ofd_file, F_WRLCK, 0, 0);
+  if (flock(flock_file, LOCK_EX | LOCK_NB) != 0) {
+    die("flock");
+  }
+  int ready[2];
+  int go[2];
+  if (pipe(ready) != 0 || pipe(go) != 0) {
+    die("pipe");
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    die("fork");
+  }
+  if (child == 0) {
+    struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+    if (fcntl(posix_file, F_SETLK, &lock) != 0) {
+      die("F_SETLK");
+    }
+    byte_out(ready[1]);
+    byte_in(go[0]);
+    _exit(0);
+  }
+  byte_in(ready[0]);
+  close(ofd_file);
+  close(flock_file);
+  snapshot("parent-closed");
+  byte_out(go[1]);
+  wait_for(child);
+  snapshot("child-exited");
+  return 0;
+}
+
+static int transfer_scenario(const char* directory) {
+  int pair[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+    die("socketpair");
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    die("fork");
+  }
+  if (child == 0) {
+    close(pair[0]);
+    char byte = 0;
+    char control[CMSG_SPACE(sizeof(int))];
+    struct iovec vector = {.iov_base = &byte, .iov_len = 1};
+    struct msghdr message = {
+        .msg_iov = &vector,
+        .msg_iovlen = 1,
+        .msg_control = control,
+        .msg_controllen = sizeof(control),
+    };
+    if (recvmsg(pair[1], &message, 0) != 1) {
+      die("recvmsg");
+    }
+    struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+    if (header == NULL || header->cmsg_type != SCM_RIGHTS) {
+      die("no descriptor");
+    }
+    int received;
+    memcpy(&received, CMSG_DATA(header), sizeof(received));
+    byte_in(pair[1]);
+    snapshot("transferred");
+    close(received);
+    snapshot("closed");
+    _exit(0);
+  }
+  close(pair[1]);
+  int file = open_in(directory, "transfer-ofd");
+  ofd(file, F_WRLCK, 0, 0);
+  char byte = 'x';
+  char control[CMSG_SPACE(sizeof(int))];
+  memset(control, 0, sizeof(control));
+  struct iovec vector = {.iov_base = &byte, .iov_len = 1};
+  struct msghdr message = {
+      .msg_iov = &vector,
+      .msg_iovlen = 1,
+      .msg_control = control,
+      .msg_controllen = sizeof(control),
+  };
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+  header->cmsg_level = SOL_SOCKET;
+  header->cmsg_type = SCM_RIGHTS;
+  header->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(header), &file, sizeof(file));
+  if (sendmsg(pair[0], &message, 0) != 1) {
+    die("sendmsg");
+  }
+  close(file);
+  byte_out(pair[0]);
+  wait_for(child);
+  return 0;
+}
+
+static int write_only_scenario(const char* directory) {
+  int file = open_in(directory, "write-only");
+  struct flock* lock = mmap(NULL, 4096, PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (lock == MAP_FAILED) {
+    die("mmap");
+  }
+  *lock = (struct flock){.l_type = F_WRLCK, .l_whence = SEEK_SET};
+  if (fcntl(file, F_OFD_SETLK, lock) != 0) {
+    die("F_OFD_SETLK");
+  }
+  snapshot("write-only");
+  return 0;
+}
+
+static int exhaust_scenario(const char* directory) {
+  int file = open_in(directory, "exhaust");
+  // Map the whole address space away, in PROT_NONE reservations that cost no
+  // memory, largest first. Hermit's resource limits are virtual, so
+  // RLIMIT_AS cannot do this.
+  for (size_t size = (size_t)1 << 46; size >= 4096; size /= 2) {
+    while (mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) !=
+           MAP_FAILED) {
+    }
+  }
+  static const char exhausted[] = "address space exhausted\n";
+  if (write(1, exhausted, sizeof(exhausted) - 1) < 0) {
+    return 2;
+  }
+  struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+  int result = fcntl(file, F_OFD_SETLK, &lock);
+  static const char reached[] = "the lock returned\n";
+  if (write(1, reached, sizeof(reached) - 1) < 0 || result != 0) {
+    return 2;
+  }
+  return 3;
+}
+
+int main(int argc, char** argv) {
+  if (argc != 3) {
+    return 2;
+  }
+  if (strcmp(argv[1], "unlock") == 0) {
+    return unlock_scenario(argv[2]);
+  }
+  if (strcmp(argv[1], "fork") == 0) {
+    return fork_scenario(argv[2]);
+  }
+  if (strcmp(argv[1], "transfer") == 0) {
+    return transfer_scenario(argv[2]);
+  }
+  if (strcmp(argv[1], "write-only") == 0) {
+    return write_only_scenario(argv[2]);
+  }
+  if (strcmp(argv[1], "exhaust") == 0) {
+    return exhaust_scenario(argv[2]);
+  }
+  return 2;
+}
+"#;
+
+/// Compile `source` as `name` in `directory` with the flags the C corpus uses.
+fn compile_embedded_guest(directory: &Path, name: &str, source: &str) -> PathBuf {
+    let source_path = directory.join(format!("{name}.c"));
+    fs::write(&source_path, source).expect("write embedded guest source");
+    let guest = directory.join(name);
+    let compile = Command::new("cc")
+        .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .unwrap_or_else(|error| panic!("start cc for {name}: {error}"));
+    assert!(
+        compile.status.success(),
+        "failed to compile {name}:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    guest
+}
+
+/// The lock classes of each `--- label ---` section of a scenario's output,
+/// in order, each section's classes sorted.
+fn sections(stdout: &str) -> Sections {
+    let mut sections: Sections = Vec::new();
+    for line in stdout.lines() {
+        if let Some(label) = line
+            .strip_prefix("--- ")
+            .and_then(|line| line.strip_suffix(" ---"))
+        {
+            sections.push((label.to_owned(), Vec::new()));
+        } else if let Some((_, classes)) = sections.last_mut() {
+            let mut fields = line.split_whitespace().skip(1);
+            let class = fields
+                .find(|field| *field != "->")
+                .unwrap_or("?")
+                .to_owned();
+            classes.push(class);
+        }
+    }
+    for (_, classes) in &mut sections {
+        classes.sort();
+    }
+    sections
+}
+
+/// A scenario's output: the lock classes of each labelled section.
+type Sections = Vec<(String, Vec<String>)>;
+
+fn expected(sections: Vec<(&str, Vec<&str>)>) -> Sections {
+    sections
+        .into_iter()
+        .map(|(label, classes)| {
+            (
+                label.to_owned(),
+                classes.into_iter().map(str::to_owned).collect(),
+            )
+        })
+        .collect()
+}
+
+/// The guest's own OFD and flock rows follow its open file descriptions on
+/// `backend`, at L2 (`--verify --verify-strict`, bitwise parity):
+/// - after an unlock, nothing of the guest's remains, and a host OFD lock on
+///   the same file (another range) is never shown, before or after: the
+///   scenario Detcore got wrong when it kept a file alive from host rows;
+/// - an OFD lock and a flock a forked child inherited stay shown after the
+///   parent closes its descriptors, with the child's POSIX lock, and go when
+///   the child exits;
+/// - an OFD lock sent over `SCM_RIGHTS` stays shown after its sender closes
+///   it, and goes when the receiver closes it;
+/// - an OFD lock whose argument is on a write-only page is shown.
+fn lock_rows_follow_the_guests_descriptions(backend: &str) {
+    let root = tempfile::Builder::new()
+        .prefix("proc-locks-scenarios-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create lock-scenario directory");
+    let guest = compile_embedded_guest(root.path(), "lock-scenarios", LOCK_SCENARIOS_SOURCE);
+    let shared = root.path().join("shared");
+    fs::write(&shared, b"shared\n").expect("create the shared lock file");
+    // The host holds a shared OFD lock on byte 10 of the file the guest locks
+    // byte 0 of, for the whole run.
+    let host = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&shared)
+        .expect("open the shared lock file");
+    record_lock(&host, libc::F_OFD_SETLK, libc::F_RDLCK, 10, 1);
+    assert!(
+        host_sees_ofd_lock(&shared),
+        "the host's /proc/locks does not show the control's OFD lock"
+    );
+    let own = root.path().join("own");
+    fs::create_dir(&own).expect("create the guest's own lock directory");
+    let scenarios: [(&str, &OsStr, Sections); 4] = [
+        (
+            "unlock",
+            shared.as_os_str(),
+            expected(vec![("held", vec!["OFDLCK"]), ("released", vec![])]),
+        ),
+        (
+            "fork",
+            own.as_os_str(),
+            expected(vec![
+                ("parent-closed", vec!["FLOCK", "OFDLCK", "POSIX"]),
+                ("child-exited", vec![]),
+            ]),
+        ),
+        (
+            "transfer",
+            own.as_os_str(),
+            expected(vec![("transferred", vec!["OFDLCK"]), ("closed", vec![])]),
+        ),
+        (
+            "write-only",
+            own.as_os_str(),
+            expected(vec![("write-only", vec!["OFDLCK"])]),
+        ),
+    ];
+    for (scenario, argument, want) in scenarios {
+        let label = format!("{backend} {scenario}");
+        let report = root.path().join(format!("{scenario}-verify.json"));
+        let output = run_guest_on(
+            backend,
+            &guest,
+            &[OsStr::new(scenario), argument],
+            Some(&report),
+        );
+        assert_bitwise_parity(&label, &report, &output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(sections(&stdout), want, "{label}\nstdout:\n{stdout}");
+    }
+    drop(host);
+}
+
+#[test]
+fn lock_rows_follow_the_guests_descriptions_on_ptrace() {
+    lock_rows_follow_the_guests_descriptions("ptrace");
+}
+
+#[test]
+fn lock_rows_follow_the_guests_descriptions_on_dbt() {
+    if dbt_unavailable() {
+        return;
+    }
+    lock_rows_follow_the_guests_descriptions("dbt");
+}
+
+/// A guest that has used up its address space leaves Detcore no page to read
+/// an OFD-locking descriptor's fdinfo through. The run stops there, by name,
+/// with the policy-refusal exit, the same way every time, rather than going on
+/// with the guest's locks and the recording's events depending on it.
+#[test]
+fn an_ofd_lock_without_address_space_left_stops_the_run() {
+    let root = tempfile::Builder::new()
+        .prefix("proc-locks-exhaust-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create exhaust directory");
+    let guest = compile_embedded_guest(root.path(), "lock-scenarios", LOCK_SCENARIOS_SOURCE);
+    let own = root.path().join("own");
+    fs::create_dir(&own).expect("create the guest's own lock directory");
+    for attempt in 0..2 {
+        let output = run_guest_on(
+            "ptrace",
+            &guest,
+            &[OsStr::new("exhaust"), own.as_os_str()],
+            None,
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "attempt {attempt}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("address space exhausted") && !stdout.contains("the lock returned"),
+            "attempt {attempt}: the guest did not stop at its lock\nstdout:\n{stdout}"
+        );
+        assert!(
+            stderr.contains("could not map the page it reads fd"),
+            "attempt {attempt}: the refusal does not name its reason\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// A recording of the lock scenarios replays to the same `/proc/locks`, at the
+/// canonical comparison, while the host holds a lock on the guest's file: the
+/// fdinfo reads Detcore makes after each lock call are recorded, and replay,
+/// which takes no real lock, matches the recorded rows against the recorded
+/// fdinfo.
+#[test]
+fn lock_scenarios_replay_from_their_recordings() {
+    let root = tempfile::Builder::new()
+        .prefix("proc-locks-record-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create record directory");
+    let guest = compile_embedded_guest(root.path(), "lock-scenarios", LOCK_SCENARIOS_SOURCE);
+    let shared = root.path().join("shared");
+    fs::write(&shared, b"shared\n").expect("create the shared lock file");
+    let host = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&shared)
+        .expect("open the shared lock file");
+    record_lock(&host, libc::F_OFD_SETLK, libc::F_RDLCK, 10, 1);
+    let own = root.path().join("own");
+    fs::create_dir(&own).expect("create the guest's own lock directory");
+    for (scenario, argument) in [
+        ("unlock", shared.as_os_str()),
+        ("fork", own.as_os_str()),
+        ("transfer", own.as_os_str()),
+    ] {
+        let report = root.path().join(format!("{scenario}-record.json"));
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after", "5s", "90s"])
+            .arg(hermit_test::hermit_binary())
+            .args([
+                "--log=info",
+                "record",
+                "start",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+            ])
+            .arg(&report)
+            .args(["--proc=standard", "--base-env=minimal", "--"])
+            .arg(&guest)
+            .arg(scenario)
+            .arg(argument);
+        hermit_test::configure_guest_execution(&mut command);
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+        assert_bitwise_parity(&format!("record {scenario}"), &report, &output);
+    }
+    drop(host);
 }

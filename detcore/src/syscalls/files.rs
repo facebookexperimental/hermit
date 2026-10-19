@@ -4535,6 +4535,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Flock,
     ) -> Result<i64, Error> {
+        // A flock belongs to its open file description. Whatever the call
+        // did (took, converted, released, or, refused, dropped a lock in a
+        // non-atomic conversion), the description's own fdinfo now says which
+        // locks it holds (`procfs::locks`).
+        let fd = call.fd();
+        let result = self.flock_through_the_kernel(guest, call).await;
+        self.refresh_description_locks(guest, fd).await?;
+        result
+    }
+
+    /// [`Self::handle_flock`]'s call itself.
+    async fn flock_through_the_kernel<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Flock,
+    ) -> Result<i64, Error> {
         const LOCK_NB: i32 = libc::LOCK_NB;
         /// `LOCK_SH`/`LOCK_EX`/`LOCK_UN` with `LOCK_NB` (and any padding) masked off.
         const MODE_MASK: i32 = libc::LOCK_SH | libc::LOCK_EX | libc::LOCK_UN;
@@ -5590,6 +5606,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        // `/proc/locks` keeps the guest's own rows only: an OFD lock has no
+        // owning task, so Linux shows every process's OFD locks from every
+        // PID namespace (`procfs::locks`). Decided before the sanitizer
+        // numbers identities, so a dropped row shifts no remaining id. The
+        // capture above and this decision are two steps of one turn: with
+        // sequentialized threads no other guest thread's lock call (and its
+        // fdinfo record) runs between them. Parallel execution would need
+        // them taken as one.
+        let lock_rows_kept = if guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_lists_locks())?
+        {
+            match crate::procfs::locks::lock_rows(&contents) {
+                Some(rows) => Some(crate::tool_global::guest_lock_rows(guest, rows).await),
+                // Rows that do not parse: the sanitizer refuses the snapshot.
+                None => None,
+            }
+        } else {
+            None
+        };
         let machine = crate::machine::MachineDescription::of(guest.config());
         // A status reports the guest's own mask of a thread Detcore holds
         // under a private blocking mask, which that thread published to the
@@ -5622,6 +5658,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     virtual_cpuinfo: virtual_cpuinfo.clone(),
                     machine: machine.clone(),
                     published_sigblk,
+                    lock_rows_kept: lock_rows_kept.clone(),
                 },
             );
         })?;
@@ -8647,6 +8684,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 );
                 Err(Errno::EPERM.into())
             }
+            // An OFD lock belongs to its open file description, and Linux
+            // shows it in `/proc/locks` from every PID namespace, the host's
+            // included, as owner -1. After each call, the description's own
+            // fdinfo says which locks it holds (`procfs::locks`); the lock
+            // itself is the kernel's, as for POSIX locks.
+            F_OFD_SETLK(_) | F_OFD_SETLKW(_) => {
+                let result = self.record_or_replay(guest, call).await?;
+                self.refresh_description_locks(guest, fd).await?;
+                Ok(result)
+            }
             _ => {
                 trace!(
                     "[detcore-finishme]: fcntl unhandled cases: {:?}",
@@ -8654,6 +8701,154 @@ impl<T: RecordOrReplay> Detcore<T> {
                 );
                 Ok(self.record_or_replay(guest, call).await?)
             }
+        }
+    }
+
+    /// Record which OFD and flock locks the open file description `fd` names
+    /// holds now, after a call through it that may have changed them
+    /// (`procfs::locks`), from the `lock:` lines of its fdinfo, which name
+    /// exactly that description's locks with the device `/proc/locks`
+    /// prints. A descriptor Detcore keeps no model of is left out.
+    ///
+    /// The fdinfo is read through the recorder: the `/proc/locks` rows a
+    /// replay filters are the recording's, and replay takes no real lock, so
+    /// the locks they are matched against must be the recording's too. A
+    /// recording therefore holds an `openat`, the reads and a `close` after
+    /// each such call (hermit-cli's `RECORD_VERSION` names the change).
+    pub(crate) async fn refresh_description_locks<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<(), Error> {
+        let Ok(open_file) = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.open_file_id())
+        else {
+            return Ok(());
+        };
+        let fdinfo = self.read_own_fdinfo(guest, fd).await?;
+        let locks = crate::procfs::locks::held_locks_in_fdinfo(&fdinfo);
+        crate::tool_global::note_description_locks(guest, open_file, locks).await;
+        Ok(())
+    }
+
+    /// The text of `/proc/self/fdinfo/<fd>`, read through the recorder
+    /// ([`Self::record_or_replay`]) by an injected `openat`, reads and
+    /// `close`, staged in a private page mapped for this call only and
+    /// unmapped before it returns. A file that cannot be opened or read
+    /// (a backend that serves no fdinfo for this descriptor) reads as empty.
+    ///
+    /// The page is the one thing this needs that may be missing: a guest that
+    /// has mapped its whole address space away refuses the mapping.
+    /// Going on without the reads would leave the recording's events and
+    /// Detcore's record of the guest's locks depending on that, so the run
+    /// stops instead, by name, with the policy-refusal exit.
+    async fn read_own_fdinfo<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<Vec<u8>, Error> {
+        const PAGE: usize = 4096;
+        const PATH_ROOM: usize = 64;
+        let mapped = guest
+            .inject_with_retry(Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(PAGE)
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await;
+        let Some(page) = mapped
+            .ok()
+            .and_then(|mapped| usize::try_from(mapped).ok())
+            .filter(|page| *page != 0)
+        else {
+            let reason = format!(
+                "fcntl/flock: Detcore could not map the page it reads fd {fd}'s fdinfo \
+                 through ({mapped:?}), which it needs to know which locks the guest holds"
+            );
+            error!("[detcore] {reason}");
+            crate::tool_global::report_policy_refusal(guest, reason).await;
+            crate::tool_global::unrecoverable_shutdown(
+                guest,
+                detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+            )
+            .await;
+        };
+        let path = format!("/proc/self/fdinfo/{fd}\0");
+        let result = self
+            .read_staged_fdinfo(guest, page, &path, PATH_ROOM, PAGE)
+            .await;
+        if let Err(errno) = guest
+            .inject_with_retry(Syscall::Munmap(
+                syscalls::Munmap::new()
+                    .with_addr(Addr::from_raw(page))
+                    .with_len(PAGE),
+            ))
+            .await
+        {
+            warn!(
+                "[detcore] could not unmap the transient fdinfo page: {}",
+                errno
+            );
+        }
+        result
+    }
+
+    /// [`Self::read_own_fdinfo`]'s reads, in the mapped `page`: the path at
+    /// its start, the read buffer from `path_room` to `page_len`.
+    async fn read_staged_fdinfo<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        page: usize,
+        path: &str,
+        path_room: usize,
+        page_len: usize,
+    ) -> Result<Vec<u8>, Error> {
+        assert!(
+            path.len() <= path_room,
+            "fdinfo path {path:?} outgrew its room"
+        );
+        let start = AddrMut::<u8>::from_raw(page).ok_or(Errno::EFAULT)?;
+        guest.memory().write_exact(start, path.as_bytes())?;
+        let path_ptr = PathPtr::from_ptr(page as *const libc::c_char).ok_or(Errno::EFAULT)?;
+        let open = syscalls::Openat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(Some(path_ptr))
+            .with_flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC)
+            .with_mode(None);
+        let opened = match self.record_or_replay(guest, Syscall::Openat(open)).await {
+            Ok(opened) => opened as RawFd,
+            Err(errno) => {
+                warn!("[detcore] fdinfo {path:?} did not open: {errno}");
+                return Ok(Vec::new());
+            }
+        };
+        let scratch = AddrMut::<u8>::from_raw(page + path_room).ok_or(Errno::EFAULT)?;
+        let read = self
+            .drain_procfs(
+                guest,
+                syscalls::Read::new().with_fd(opened),
+                scratch,
+                page_len - path_room,
+            )
+            .await;
+        let closed = self
+            .record_or_replay(guest, syscalls::Close::new().with_fd(opened))
+            .await;
+        if let Err(errno) = closed {
+            trace!("[detcore] closing fdinfo {path:?} failed: {errno}");
+        }
+        match read {
+            Ok(contents) => Ok(contents),
+            Err(Error::Errno(errno)) => {
+                warn!("[detcore] fdinfo {path:?} did not read: {errno}");
+                Ok(Vec::new())
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -10948,6 +11143,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(open_file_id) = replaced {
             self.release_port_for_open_file(guest, open_file_id).await;
         }
+        // This process now holds the description too, with any OFD or flock
+        // lock it holds (`procfs::locks`).
+        self.refresh_description_locks(guest, fd).await?;
         Ok(fd as i64)
     }
 

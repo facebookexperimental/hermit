@@ -3126,6 +3126,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .into_iter()
             .collect();
         self.refuse_sending_virtual_timerfds(guest, &headers);
+        self.pin_sent_lock_descriptions(guest, &headers).await;
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         guest.thread_state().forget_flock_modes();
         Ok(result)
@@ -3203,6 +3204,31 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
+impl<T: RecordOrReplay> Detcore<T> {
+    /// Before messages at `headers` are sent, keep the OFD and flock locks of
+    /// the descriptions they pass over `SCM_RIGHTS` the guest's after this
+    /// process closes them (`procfs::locks`): the receiver holds them, and
+    /// Detcore cannot see who that is. Before the send and whatever it
+    /// returns, as for `mark_exported_listeners`. A message Detcore cannot
+    /// read in full may pass any description this process holds. A message
+    /// passing no descriptor asks nothing of the global state.
+    async fn pin_sent_lock_descriptions<G: Guest<Self>>(&self, guest: &mut G, headers: &[usize]) {
+        let (sent, unread) = sent_descriptors(guest, headers);
+        let open_files = sent
+            .into_iter()
+            .filter_map(|fd| {
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.open_file_id())
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+        if !open_files.is_empty() || unread {
+            crate::tool_global::pin_description_locks(guest, open_files, unread).await;
+        }
+    }
+}
+
 /// The descriptors the messages at `headers` name in `SCM_RIGHTS`, and
 /// whether a header or control buffer could not be read in full, in which case
 /// the list may be incomplete (`mark_exported_listeners`).
@@ -3276,6 +3302,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .collect()
         });
         self.refuse_sending_virtual_timerfds(guest, &headers);
+        self.pin_sent_lock_descriptions(guest, &headers).await;
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         if result > 0 {
             guest.thread_state().forget_flock_modes();

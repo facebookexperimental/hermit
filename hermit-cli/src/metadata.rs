@@ -690,7 +690,15 @@ impl RecordVersion {
 // a pending signal no longer stops the recorded attempt: the attempt's result
 // is recorded where an older recording has the stopped attempt's ERESTARTSYS,
 // and an older recording containing one would replay out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16e);
+// 0x16e -> 0x16f: Detcore keeps only the guest's own rows of /proc/locks,
+// matching OFD and flock rows against the locks the guest's own open file
+// descriptions hold, which their fdinfo names. After every successful
+// F_OFD_SETLK or F_OFD_SETLKW, every flock call, and every successful
+// pidfd_getfd, Detcore reads the descriptor's /proc/self/fdinfo through the
+// recorder (an openat, its reads and a close), and replay matches the
+// recorded /proc/locks rows against those recorded bytes. An older recording
+// has no such events there and would replay out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16f);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -715,7 +723,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16e);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x16e;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x16f;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

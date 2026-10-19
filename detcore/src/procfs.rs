@@ -32,6 +32,7 @@ mod fixed;
 pub(crate) mod ids;
 pub(crate) mod levels;
 pub(crate) mod listing;
+pub(crate) mod locks;
 pub(crate) mod private_maps;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1206,6 +1207,13 @@ pub(crate) struct ProcfsSnapshotContext {
     /// (Codex review of R2b-2 stage 2, P2;
     /// https://github.com/rrnewton/hermit/issues/4273). Built by the caller.
     pub(crate) published_sigblk: Option<u64>,
+    /// For `/proc/locks`, which of the kernel's rows, in order, the guest
+    /// owns (`locks::guest_lock_rows`); the others are dropped before the
+    /// sanitizer numbers identities. Built by the caller, which asks
+    /// Detcore's global state. `None` keeps every row, which only a snapshot
+    /// whose rows do not parse (refused whole by the sanitizer) or a unit
+    /// test gives.
+    pub(crate) lock_rows_kept: Option<Vec<bool>>,
 }
 
 impl ProcfsFile {
@@ -1746,6 +1754,11 @@ impl ProcfsFile {
         self.kind == ProcfsKind::Mountinfo
     }
 
+    /// Whether this is `/proc/locks` (see [`locks`]).
+    pub(crate) fn lists_locks(&self) -> bool {
+        self.kind == ProcfsKind::Locks
+    }
+
     pub(crate) fn needs_snapshot(&self) -> bool {
         !matches!(self.kind, ProcfsKind::TimerSlack(_)) && self.contents.is_none()
     }
@@ -1948,6 +1961,7 @@ impl ProcfsFile {
             virtual_cpuinfo,
             machine,
             published_sigblk,
+            lock_rows_kept,
         } = context;
         let mapping_identities = &mapping_identities;
         self.contents = Some(match &self.kind {
@@ -2055,7 +2069,9 @@ impl ProcfsFile {
             ProcfsKind::BtrfsBytesPinned => sanitize_btrfs_bytes_pinned(&contents),
             ProcfsKind::Rtc => sanitize_rtc(&contents, virtual_realtime_seconds),
             ProcfsKind::NetlinkSockets => sanitize_netlink_sockets(&contents),
-            ProcfsKind::Locks => sanitize_locks(&contents),
+            ProcfsKind::Locks => {
+                sanitize_locks(&locks::keep_lock_rows(&contents, lock_rows_kept.as_deref()))
+            }
             ProcfsKind::NodeVmstat => sanitize_node_vmstat(&contents),
             ProcfsKind::CppcFeedback => sanitize_cppc_feedback(&contents),
             ProcfsKind::UnixSockets => sanitize_unix_sockets(&contents),
@@ -4758,6 +4774,11 @@ fn sanitize_rtc(contents: &[u8], virtual_realtime_seconds: i64) -> Vec<u8> {
 // stay distinct, holder/waiter groups stay adjacent, and raw ID renumbering or
 // row reordering does not change the resulting snapshot. An unknown format
 // fails the complete snapshot closed instead of leaking any raw identities.
+//
+// The rows reaching this function are the guest's own: the caller has already
+// dropped every other process's rows (`locks::keep_lock_rows`), so a lock
+// outside the container neither adds a row nor shifts the numbering of the
+// guest's rows.
 fn sanitize_locks(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return Vec::new();
@@ -4766,45 +4787,14 @@ fn sanitize_locks(contents: &[u8]) -> Vec<u8> {
         return Vec::new();
     }
 
-    #[derive(Clone)]
-    struct LockRow {
-        sequence: String,
-        waiter: bool,
-        fields: Vec<String>,
-        owner_index: usize,
-        object_index: usize,
-    }
+    use locks::LockLine as LockRow;
 
     let mut rows: Vec<LockRow> = Vec::new();
     for line in text.lines() {
-        let fields = line
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        let waiter = fields.get(1).is_some_and(|field| field == "->");
-        let details = usize::from(waiter) + 1;
-        let owner_index = details + 3;
-        let object_index = details + 4;
-        let Some(sequence) = fields
-            .first()
-            .and_then(|field| field.strip_suffix(':'))
-            .filter(|field| !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit()))
-        else {
+        let Some(row) = locks::parse_line(line) else {
             return Vec::new();
         };
-        if fields.len() != details + 7
-            || fields[owner_index].parse::<i64>().is_err()
-            || fields[object_index].split(':').count() != 3
-        {
-            return Vec::new();
-        }
-        rows.push(LockRow {
-            sequence: sequence.to_owned(),
-            waiter,
-            fields,
-            owner_index,
-            object_index,
-        });
+        rows.push(row);
     }
 
     let mut object_signatures: BTreeMap<String, Vec<String>> = BTreeMap::new();

@@ -1305,6 +1305,12 @@ impl DetFd {
         })
     }
 
+    /// Whether this descriptor's procfs file is `/proc/locks`, whose rows
+    /// Detcore filters to the guest's own (`procfs::locks`).
+    pub(crate) fn procfs_lists_locks(&self) -> bool {
+        self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::lists_locks))
+    }
+
     pub(crate) fn procfs_needs_random_uuid(&self) -> bool {
         self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::needs_random_uuid))
     }

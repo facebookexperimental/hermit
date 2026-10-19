@@ -1218,6 +1218,12 @@ pub struct GlobalState {
     /// The auxiliary vector of each guest process's current image, for its
     /// `/proc/<pid>/auxv` ([`ProcessAuxvTable`]).
     process_auxv: Arc<Mutex<ProcessAuxvTable>>,
+    /// The OFD and flock locks each guest open file description holds, as
+    /// its fdinfo last showed them after a call through it, and which guest
+    /// processes hold the description, so that `/proc/locks` keeps exactly
+    /// the guest's own rows (`procfs::locks`). Locked after `sched`, never
+    /// before it.
+    guest_lock_descriptions: Mutex<BTreeMap<OpenFileId, LockedDescription>>,
     /// The registered root thread, whose first image
     /// `Config::launch_image` names, and whether that image was completed.
     root_dettid: OnceLock<DetTid>,
@@ -1482,6 +1488,20 @@ impl ProcessAuxvTable {
     }
 }
 
+/// What `GlobalState::guest_lock_descriptions` keeps for one guest open file
+/// description: the OFD and flock locks its fdinfo showed after the last call
+/// through it, the guest processes that hold a descriptor of it (a process
+/// stops at its last close there and at its exit; a fork's child starts with
+/// its parent's), and whether a guest process sent it over `SCM_RIGHTS`, after
+/// which it stays held until a call through it shows no lock, since Detcore
+/// cannot see who received it.
+#[derive(Debug, Default)]
+struct LockedDescription {
+    locks: Vec<crate::procfs::locks::HeldLock>,
+    holders: BTreeSet<DetPid>,
+    sent: bool,
+}
+
 impl ProcessExitCleanup {
     /// Complete the exit `watch` observed, unless a later registration has
     /// replaced it. Nothing calls this in production yet; the daemon-point
@@ -1694,6 +1714,7 @@ impl GlobalState {
             post_exec_fd_blocking: process_exit_cleanup.post_exec_fd_blocking,
             exec_images: process_exit_cleanup.exec_images,
             process_auxv: process_exit_cleanup.process_auxv,
+            guest_lock_descriptions: Mutex::new(BTreeMap::new()),
             root_dettid: OnceLock::new(),
             root_image_marked: AtomicBool::new(false),
             launcher_identity: OnceLock::new(),
@@ -1831,6 +1852,21 @@ impl GlobalState {
         }
         if let Some(loss) = loss {
             crate::detlog::write_loss_notice(&loss);
+        }
+    }
+
+    /// A new process `child` holds every open file description its parent's
+    /// process holds, as Linux copies the descriptor table at fork: their OFD
+    /// and flock locks stay the guest's after the parent closes them or exits.
+    /// The number is fresh: whatever an earlier process with the same number
+    /// held is not the child's.
+    fn inherit_lock_holders(&self, parent: DetPid, child: DetPid) {
+        let mut table = self.guest_lock_descriptions.lock().unwrap();
+        for entry in table.values_mut() {
+            entry.holders.remove(&child);
+            if entry.holders.contains(&parent) {
+                entry.holders.insert(child);
+            }
         }
     }
 
@@ -3352,7 +3388,13 @@ impl GlobalState {
                         )
                         .await
                     {
-                        SchedulerRpcResult::Continue(()) => R::CreateChildThread(None),
+                        SchedulerRpcResult::Continue(()) => {
+                            if !flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_THREAD))
+                            {
+                                self.inherit_lock_holders(parent_detpid, dettid);
+                            }
+                            R::CreateChildThread(None)
+                        }
                         SchedulerRpcResult::ThreadExited => R::ThreadExited,
                     }
                 }
@@ -3384,7 +3426,12 @@ impl GlobalState {
                 )
                 .await
             {
-                SchedulerRpcResult::Continue(()) => R::CreateChildThread(None),
+                SchedulerRpcResult::Continue(()) => {
+                    if !flags.contains(CloneFlags::CLONE_THREAD) {
+                        self.inherit_lock_holders(parent_detpid, child_dettid);
+                    }
+                    R::CreateChildThread(None)
+                }
                 SchedulerRpcResult::ThreadExited => R::ThreadExited,
             },
             // Requested by the child thread itself:
@@ -3943,6 +3990,76 @@ impl GlobalState {
                 let _sched = self.lock_rpc_scheduler(false).await;
                 R::RootChanged(self.process_auxv.lock().unwrap().root_changed(task))
             }
+            GlobalRequest::DescriptionLocks(open_file, locks) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let process = sched.registered_process(dtid).unwrap_or(dtid);
+                let mut table = self.guest_lock_descriptions.lock().unwrap();
+                if locks.is_empty() {
+                    // Locks belong to the description, whichever process
+                    // released them: none is held through it now.
+                    table.remove(&open_file);
+                } else {
+                    let entry = table.entry(open_file).or_default();
+                    entry.locks = locks;
+                    entry.holders.insert(process);
+                }
+                R::DescriptionLocks(())
+            }
+            GlobalRequest::PinDescriptionLocks(open_files, every_held) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let process = sched.registered_process(dtid).unwrap_or(dtid);
+                let mut table = self.guest_lock_descriptions.lock().unwrap();
+                for (open_file, entry) in table.iter_mut() {
+                    if open_files.contains(open_file)
+                        || (every_held && entry.holders.contains(&process))
+                    {
+                        entry.sent = true;
+                    }
+                }
+                R::PinDescriptionLocks(())
+            }
+            GlobalRequest::GuestLockRows(rows) => {
+                // A positive owner is the kernel's number for a process in the
+                // container's PID namespace, as `/proc` spells it; it is the
+                // guest's when it names a process `/proc` lists, in the
+                // guest's numbering. Hermit's own init is not listed.
+                let sched = self.lock_rpc_scheduler(false).await;
+                let owners = rows
+                    .iter()
+                    .filter_map(|row| i32::try_from(row.owner).ok().filter(|owner| *owner > 0))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let listed = sched.procfs_listing(None).processes;
+                let guest_owners = owners
+                    .iter()
+                    .zip(sched.procfs_ids(false, &owners))
+                    .filter(|(_, guest)| {
+                        guest.is_some_and(|guest| listed.binary_search(&guest).is_ok())
+                    })
+                    .map(|(owner, _)| i64::from(*owner))
+                    .collect::<BTreeSet<_>>();
+                // A description a guest process held stops being held by it
+                // at that process's exit, which the scheduler orders in the
+                // guest's turns; a description no live guest process holds,
+                // and none was sent away, holds nothing of the guest's.
+                let mut table = self.guest_lock_descriptions.lock().unwrap();
+                table.retain(|_, entry| {
+                    entry
+                        .holders
+                        .retain(|holder| sched.exited_process_is_zombie(*holder).is_none());
+                    entry.sent || !entry.holders.is_empty()
+                });
+                let held = table
+                    .values()
+                    .flat_map(|entry| entry.locks.iter().cloned())
+                    .collect::<Vec<_>>();
+                R::GuestLockRows(crate::procfs::locks::guest_lock_rows(
+                    &rows,
+                    |owner| guest_owners.contains(&owner),
+                    &held,
+                ))
+            }
             GlobalRequest::AuxvFromKernel(why) => {
                 let sched = self.lock_rpc_scheduler(false).await;
                 let process = sched.registered_process(dtid).unwrap_or(dtid);
@@ -4070,7 +4187,19 @@ impl GlobalState {
                 R::AddUsedPort
             }
             GlobalRequest::ReleasePort(open_file_id) => {
-                let _sched = self.lock_rpc_scheduler(false).await;
+                let sched = self.lock_rpc_scheduler(false).await;
+                // The sender's process closed its last descriptor of this
+                // description, so it holds none of the description's locks.
+                let process = sched.registered_process(dtid).unwrap_or(dtid);
+                {
+                    let mut table = self.guest_lock_descriptions.lock().unwrap();
+                    if let Some(entry) = table.get_mut(&open_file_id) {
+                        entry.holders.remove(&process);
+                        if entry.holders.is_empty() && !entry.sent {
+                            table.remove(&open_file_id);
+                        }
+                    }
+                }
                 let mut used_ports = self.used_ports.lock().unwrap();
                 let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
                 let port = open_file_to_port.remove(&open_file_id);
@@ -6168,6 +6297,19 @@ pub enum GlobalRequest {
     /// Whether the process a number names has changed its root
     /// (`ProcessAuxvTable::root_changed`). Appended last.
     RootChanged(DetPid),
+    /// The OFD and flock locks this open file description holds, as its
+    /// fdinfo showed them after a call through one of the sender's
+    /// descriptors (`GlobalState::guest_lock_descriptions`); the sender's
+    /// process holds the description. Appended last.
+    DescriptionLocks(OpenFileId, Vec<crate::procfs::locks::HeldLock>),
+    /// The sender is about to send these descriptions over `SCM_RIGHTS`, or,
+    /// with `true`, descriptors it could not read the message for: their
+    /// locks stay the guest's after the sender closes them, until a call
+    /// through one shows none. Appended last.
+    PinDescriptionLocks(Vec<OpenFileId>, bool),
+    /// Which rows of a `/proc/locks` snapshot the guest owns
+    /// (`procfs::locks::guest_lock_rows`). Appended last.
+    GuestLockRows(Vec<crate::procfs::locks::LockRowFacts>),
 }
 
 /// Responses from the global object
@@ -6379,6 +6521,12 @@ pub enum GlobalResponse {
     MarkChangedRoot(()),
     /// Whether the root changed. Appended last.
     RootChanged(bool),
+    /// Appended last.
+    DescriptionLocks(()),
+    /// Appended last.
+    PinDescriptionLocks(()),
+    /// One answer per row, in row order. Appended last.
+    GuestLockRows(Vec<bool>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -8932,6 +9080,62 @@ where
         .1
     {
         GlobalResponse::RootChanged(changed) => changed,
+        _ => unreachable!(),
+    }
+}
+
+/// Record the OFD and flock locks `open_file` holds, as its fdinfo showed
+/// them after a call through one of the sender's descriptors
+/// (`GlobalState::guest_lock_descriptions`).
+pub(crate) async fn note_description_locks<G, T>(
+    guest: &mut G,
+    open_file: OpenFileId,
+    locks: Vec<crate::procfs::locks::HeldLock>,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::DescriptionLocks(open_file, locks))
+        .await
+        .1;
+    assert_eq!(response, GlobalResponse::DescriptionLocks(()));
+}
+
+/// Keep the locks of `open_files`, which the sender is about to send over
+/// `SCM_RIGHTS` (with `every_held`, of every description its process holds),
+/// the guest's after the sender closes them (`GlobalState::guest_lock_descriptions`).
+pub(crate) async fn pin_description_locks<G, T>(
+    guest: &mut G,
+    open_files: Vec<OpenFileId>,
+    every_held: bool,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(
+        guest,
+        GlobalRequest::PinDescriptionLocks(open_files, every_held),
+    )
+    .await
+    .1;
+    assert_eq!(response, GlobalResponse::PinDescriptionLocks(()));
+}
+
+/// Which of the rows of a `/proc/locks` snapshot the guest owns, in row order
+/// (`procfs::locks::guest_lock_rows`).
+pub(crate) async fn guest_lock_rows<G, T>(
+    guest: &mut G,
+    rows: Vec<crate::procfs::locks::LockRowFacts>,
+) -> Vec<bool>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::GuestLockRows(rows))
+        .await
+        .1
+    {
+        GlobalResponse::GuestLockRows(kept) => kept,
         _ => unreachable!(),
     }
 }
