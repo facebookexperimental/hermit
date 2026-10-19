@@ -5118,6 +5118,10 @@ mod kernel_signal_wait_failures {
         blocked: KernelSigset,
         /// Pending signals (`SigPnd | ShdPnd`).
         pending: KernelSigset,
+        /// The signals of `pending` pending only on the thread group's shared
+        /// queue (`ShdPnd`); every other one is on the thread's own
+        /// (`SigPnd`).
+        shared: KernelSigset,
         /// Signals with a handler (`SigCgt`).
         caught: KernelSigset,
         /// Signals whose disposition is `SIG_IGN` (`SigIgn`).
@@ -5156,6 +5160,10 @@ mod kernel_signal_wait_failures {
         setter: VecDeque<Option<MaskChangeRefused>>,
         /// Every mask `Guest::set_blocked_signals` was asked to set, in order.
         set_calls: Vec<KernelSigset>,
+        /// The scheduler's answer to `HostTimedAndPrivateSigchld`: the
+        /// host-timed signals, then the recorded private `SIGCHLD`. `None`
+        /// panics, as every other request does.
+        private_record: Option<(KernelSigset, KernelSigset)>,
     }
 
     impl FakeKernel {
@@ -5349,11 +5357,11 @@ mod kernel_signal_wait_failures {
                 Some(errno) => Err(errno),
                 None => Ok(KernelSignalState {
                     pending: kernel.pending,
-                    thread_pending: kernel.pending,
+                    thread_pending: kernel.pending & !kernel.shared,
+                    shared_pending: kernel.pending & kernel.shared,
                     blocked: kernel.blocked,
                     caught: kernel.caught,
                     ignored: kernel.ignored,
-                    ..KernelSignalState::default()
                 }),
             };
             kernel.pending |= std::mem::take(&mut kernel.pending_repost);
@@ -5367,7 +5375,18 @@ mod kernel_signal_wait_failures {
             &self,
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
-            panic!("these waits must not send an RPC: {:?}", message.2)
+            match (&message.2, self.kernel.lock().unwrap().private_record) {
+                (
+                    crate::tool_global::GlobalRequest::HostTimedAndPrivateSigchld(_),
+                    Some((host_timed, private)),
+                ) => (
+                    None,
+                    crate::tool_global::GlobalResponse::HostTimedAndPrivateSigchld(
+                        host_timed, private,
+                    ),
+                ),
+                _ => panic!("these waits must not send an RPC: {:?}", message.2),
+            }
         }
         fn config(&self) -> &Config {
             &self.config
@@ -6729,6 +6748,244 @@ mod kernel_signal_wait_failures {
         assert!(
             !host_timed.interrupted().unwrap(),
             "a SIGCHLD a host-timed source can post stays held although committed"
+        );
+    }
+
+    /// A `SIGCHLD` a guest sent this thread, which the schedule recorded in its
+    /// private queue and the turn admits (`KernelSignalWait::admit`), ends a
+    /// gated wait from the thread's own queue only: one pending only on the
+    /// shared queue, which a host-timed child event can fill, decides nothing.
+    /// It is admitted for the turn alone, and never when a host-timed source
+    /// can post `SIGCHLD` (R2b-2 stage 3,
+    /// https://github.com/rrnewton/hermit/issues/4273).
+    #[tokio::test]
+    async fn an_admitted_private_sigchld_ends_a_gated_wait_from_the_threads_own_queue_only() {
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let (guest, kernel) = caught_sigchld_guest(true);
+        let _proc = scripted_proc(&kernel);
+
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTNOHAND);
+        wait.admit(0, chld);
+        assert!(
+            wait.interrupted().unwrap(),
+            "the thread's own copy ends the wait"
+        );
+        assert!(
+            wait.interrupts_only_by_committed(
+                &read_wait_signal_state(guest.pid(), guest.tid()).unwrap()
+            ),
+            "only the admitted copy ends it, so the turn's probe runs first"
+        );
+        kernel.lock().unwrap().shared = chld;
+        assert!(
+            !wait.interrupted().unwrap(),
+            "a SIGCHLD pending only on the shared queue is held"
+        );
+        kernel.lock().unwrap().shared = 0;
+        wait.admit(0, 0);
+        assert!(!wait.interrupted().unwrap(), "the next turn holds it again");
+
+        let mut host_timed = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTNOHAND);
+        host_timed.hold_until_return(chld);
+        host_timed.admit(0, chld);
+        assert!(
+            !host_timed.interrupted().unwrap(),
+            "a SIGCHLD a host-timed source can post stays held"
+        );
+    }
+
+    /// An admitted private `SIGCHLD` that only the wait mask lets in is
+    /// delivered under that mask (`interrupts_only_under_wait_mask`), as a
+    /// committed one is: an `epoll_pwait` whose temporary mask unblocks a
+    /// `SIGCHLD` the thread's own mask blocks (R2b-2 stage 3).
+    #[tokio::test]
+    async fn an_admitted_private_sigchld_that_only_the_wait_mask_lets_in_is_delivered_under_it() {
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let (guest, kernel) = caught_sigchld_guest(true);
+        let _proc = scripted_proc(&kernel);
+        kernel.lock().unwrap().blocked |= chld;
+        let mut wait =
+            KernelSignalWait::new(&guest, 0, false, Errno::EINTR).with_wait_mask(Some(0));
+        let state = read_wait_signal_state(guest.pid(), guest.tid()).unwrap();
+        assert!(
+            !wait.interrupts_only_under_wait_mask(&state),
+            "held while not admitted"
+        );
+        wait.admit(0, chld);
+        assert!(wait.interrupts_only_under_wait_mask(&state));
+    }
+
+    /// `admit_under_block` keeps a recorded private `SIGCHLD` only once every
+    /// blockable signal is blocked in place, and only if the thread's own
+    /// queue holds `SIGCHLD`, read after the block. A turn that admits nothing
+    /// makes no request; a refused setter keeps the wait's fallback, the
+    /// injected `block` after the first probe; a wait whose earlier injected
+    /// `block` failed (`unblockable`, no `saved_mask`) keeps nothing (R2b-2
+    /// stage 3, M3c of the rev5 review).
+    #[tokio::test]
+    async fn a_recorded_private_sigchld_is_kept_only_under_a_block_in_place() {
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        // The block publishes the guest's own mask, already published here,
+        // so no request leaves the test (`publish_wait_mask`).
+        let mut published = PublishedWaitMask(Some(guest_mask()));
+
+        let (mut guest, kernel) = caught_sigchld_guest(true);
+        let _proc = scripted_proc(&kernel);
+        kernel.lock().unwrap().setter.push_back(None);
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTNOHAND);
+        assert_eq!(
+            wait.admit_under_block(&mut guest, 0, chld, 0, &mut published)
+                .await
+                .unwrap(),
+            chld,
+            "blocked in place, and the thread's own queue holds it"
+        );
+        assert!(wait.blocked_in_place);
+        wait.restore(&mut guest, None).await.unwrap();
+        drop(_proc);
+
+        let (mut guest, kernel) = caught_sigchld_guest(true);
+        let _proc = scripted_proc(&kernel);
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTNOHAND);
+        assert_eq!(
+            wait.admit_under_block(&mut guest, 0, 0, 0, &mut published)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            kernel.lock().unwrap().set_calls.is_empty(),
+            "nothing admitted, no request"
+        );
+        assert_eq!(
+            wait.admit_under_block(&mut guest, 0, chld, chld, &mut published)
+                .await
+                .unwrap(),
+            0,
+            "a SIGCHLD a host-timed source can post is not admitted"
+        );
+        assert!(kernel.lock().unwrap().set_calls.is_empty());
+        drop(_proc);
+
+        let (mut guest, kernel) = caught_sigchld_guest(true);
+        let _proc = scripted_proc(&kernel);
+        kernel.lock().unwrap().shared = chld;
+        kernel.lock().unwrap().setter.push_back(None);
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTNOHAND);
+        assert_eq!(
+            wait.admit_under_block(&mut guest, 0, chld, 0, &mut published)
+                .await
+                .unwrap(),
+            0,
+            "only on the shared queue: not the recorded copy"
+        );
+        wait.restore(&mut guest, None).await.unwrap();
+        drop(_proc);
+
+        let (mut guest, kernel) = caught_sigchld_guest(true);
+        let _proc = scripted_proc(&kernel);
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTNOHAND);
+        assert_eq!(
+            wait.admit_under_block(&mut guest, 0, chld, 0, &mut published)
+                .await
+                .unwrap(),
+            0,
+            "the setter refuses (no answer queued)"
+        );
+        assert!(
+            wait.needs_block(),
+            "the injected block after the first probe stays"
+        );
+        drop(_proc);
+
+        let (mut guest, kernel) = caught_sigchld_guest(true);
+        let _proc = scripted_proc(&kernel);
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTNOHAND);
+        wait.unblockable = true;
+        assert_eq!(
+            wait.admit_under_block(&mut guest, 0, chld, 0, &mut published)
+                .await
+                .unwrap(),
+            0,
+            "an earlier injected block failed: no block, no private copy"
+        );
+        assert!(kernel.lock().unwrap().set_calls.is_empty());
+    }
+
+    /// A pipe turn (`turn_signals_with_block`) counts the recorded private
+    /// `SIGCHLD` only where the gate holds, a block is in force and the
+    /// thread's own queue holds it. Not on the scalar writer's first attempt,
+    /// the guest's own write, which blocks nothing (`may_block` false): an
+    /// injection of that turn could take the copy into the backend's single
+    /// held slot. Not without the gate, as on a socket. Not from the shared
+    /// queue alone (R2b-2 stage 3).
+    #[tokio::test]
+    async fn a_pipe_turn_counts_a_recorded_private_sigchld_only_under_a_block_in_place() {
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let turn = |may_block: bool, gate: bool, shared: bool| async move {
+            // Thread 1, the thread state's own number, so a request may leave.
+            let (mut guest, kernel) = WaitGuest::new(Pid::from_raw(1), guest_mask());
+            {
+                let mut kernel = kernel.lock().unwrap();
+                kernel.pending = chld;
+                kernel.caught = chld;
+                kernel.shared = if shared { chld } else { 0 };
+                kernel.setter.push_back(None);
+                kernel.private_record = Some((0, chld));
+            }
+            let _proc = scripted_proc(&kernel);
+            let mut wait = Some(KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS));
+            let mut published = PublishedWaitMask(Some(guest_mask()));
+            let pending =
+                turn_signals_with_block(&mut guest, &mut wait, may_block, 0, gate, &mut published)
+                    .await
+                    .unwrap()
+                    .pending;
+            if let Some(wait) = wait.as_mut() {
+                wait.restore(&mut guest, None).await.unwrap();
+            }
+            let blocked_in_place = !kernel.lock().unwrap().set_calls.is_empty();
+            (pending & chld, blocked_in_place)
+        };
+        assert_eq!(
+            turn(true, true, false).await,
+            (chld, true),
+            "blocked in place: admitted"
+        );
+        assert_eq!(
+            turn(false, true, false).await,
+            (0, false),
+            "the writer's first attempt blocks nothing: held"
+        );
+        assert_eq!(turn(true, false, false).await, (0, true), "no gate: held");
+        assert_eq!(
+            turn(true, true, true).await,
+            (0, true),
+            "the shared queue alone: held"
+        );
+    }
+
+    /// The pipe path's hold leaves out an admitted private `SIGCHLD`
+    /// (`turn_signals_before_discard`'s `private`): it counts in the turn's
+    /// `pending`, where without it the hold keeps it out (R2b-2 stage 3).
+    #[test]
+    fn a_pipe_turn_counts_an_admitted_private_sigchld() {
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let state = KernelSignalState {
+            pending: chld,
+            thread_pending: chld,
+            caught: chld,
+            ..KernelSignalState::default()
+        };
+        assert_eq!(
+            turn_signals_before_discard(&state, 0, 0, 0, NamedRealTime::Woken, 0).pending,
+            0,
+            "held"
+        );
+        assert_eq!(
+            turn_signals_before_discard(&state, 0, 0, 0, NamedRealTime::Woken, chld).pending,
+            chld,
+            "admitted"
         );
     }
 
