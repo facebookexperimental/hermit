@@ -47,6 +47,14 @@ const fn cpuid_result(eax: u32, ebx: u32, ecx: u32, edx: u32) -> CpuIdResult {
     CpuIdResult { eax, ebx, ecx, edx }
 }
 
+// These flags are required for x86-64-v2 support. Found via https://www.felixcloutier.com/x86/cpuid
+const X86_64_V2_LEAF1_ECX: u32 =
+    (1 << 0) | (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 23);
+
+const X86_64_V3_LEAF1_ECX: u32 = (1 << 12) | (1 << 22) | (1 << 26) | (1 << 27) | (1 << 29);
+
+const X86_64_V3_EXTENDED_LEAF1_ECX: u32 = 1 << 5;
+
 // CPUID output from older CPU (broadwell?), with some features like RDRAND
 // masked off to prevent non-determinism.
 const CPUIDS: &[CpuIdResult] = &[
@@ -54,8 +62,7 @@ const CPUIDS: &[CpuIdResult] = &[
     cpuid_result(
         0x00000663,
         0x00000800,
-        // These flags are required for x86-64-v2 support. Found via https://www.felixcloutier.com/x86/cpuid
-        0x90202001 | (1 << 0) | (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 23),
+        0x90202001 | X86_64_V2_LEAF1_ECX | X86_64_V3_LEAF1_ECX,
         0x078BFBFD,
     ),
     cpuid_result(0x00000001, 0x00000000, 0x0000004D, 0x002C307D),
@@ -81,7 +88,12 @@ const CPUIDS: &[CpuIdResult] = &[
 
 const EXTENDED_CPUIDS: &[CpuIdResult] = &[
     cpuid_result(0x8000000A, 0x756E6547, 0x6C65746E, 0x49656E69),
-    cpuid_result(0x00000663, 0x00000000, 0x00000001, 0x20100800),
+    cpuid_result(
+        0x00000663,
+        0x00000000,
+        0x00000001 | X86_64_V3_EXTENDED_LEAF1_ECX,
+        0x20100800,
+    ),
     cpuid_result(0x554D4551, 0x72695620, 0x6C617574, 0x55504320),
     cpuid_result(0x72657620, 0x6E6F6973, 0x352E3220, 0x0000002B),
     cpuid_result(0x00000000, 0x00000000, 0x00000000, 0x00000000),
