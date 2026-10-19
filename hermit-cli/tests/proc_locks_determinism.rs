@@ -1989,9 +1989,10 @@ fn a_full_descriptor_table_refuses_the_next_proc_locks_read() {
 /// A recording in the format before the descriptor-table ledger (labelled
 /// 0x16f, and 0x171 after the R2b-2 stage 3 revert's relabel) would replay
 /// different `/proc/locks` bytes, since replay recomputes which recorded rows
-/// are the guest's, and one from before the procfs anchor (0x172, 0x173)
-/// holds a different fdinfo read, so the version gate refuses each label; the
-/// same recording at the current version replays.
+/// are the guest's, and one from before the procfs anchor (0x172, 0x173) or
+/// from before its entry recheck (0x176, 0x177) holds a different fdinfo
+/// read, so the version gate refuses each label; the same recording at the
+/// current version replays.
 #[test]
 fn recordings_from_before_the_lock_ledger_are_refused_by_the_version_gate() {
     let root = tempfile::Builder::new()
@@ -2051,11 +2052,12 @@ fn recordings_from_before_the_lock_ledger_are_refused_by_the_version_gate() {
     let mut metadata: serde_json::Value =
         serde_json::from_str(&text).expect("recording metadata is not JSON");
     assert_eq!(
-        metadata["version"], 0x177,
+        metadata["version"], 0x178,
         "RECORD_VERSION moved; point this test at the current version and the ledger's predecessor"
     );
-    // 0x173 and 0x172 read the fdinfo by path, without the procfs anchor.
-    for older in [0x173, 0x172, 0x171, 0x16f] {
+    // 0x177 (dbt's) and 0x176 do not recheck the entry as procfs; 0x173 and
+    // 0x172 read the fdinfo by path, without the procfs anchor.
+    for older in [0x177, 0x176, 0x173, 0x172, 0x171, 0x16f] {
         metadata["version"] = serde_json::json!(older);
         fs::write(
             &metadata_path,

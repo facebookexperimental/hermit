@@ -1199,9 +1199,10 @@ pub(crate) enum FdinfoRead {
     /// A step failed for a reason that says nothing about the description's
     /// locks: they are unknown (`procfs::locks::LockLedger::note_unknown`).
     Unknown(String),
-    /// The guest's `/proc` could not be proved to be procfs: the description
-    /// contributes no lock, which can hide the guest's row but never admits
-    /// a host's.
+    /// The guest's `/proc` could not be proved to be procfs, or a step failed
+    /// for a cause the guest's own view or the backend decides
+    /// ([`fdinfo_failure_hides`]): the description contributes no lock, which
+    /// can hide the guest's row but never admits a host's.
     Untrackable(String),
 }
 
@@ -1217,19 +1218,31 @@ impl FdinfoRead {
 
 /// Why [`Detcore::read_staged_fdinfo`] did not read an fdinfo.
 enum FdinfoFailure {
-    /// A step (`open`, `fstatfs`, `read`) failed with an errno.
+    /// A step (`open`, `fstatfs`, `fstat`, `read`) failed with an errno.
     Failed(&'static str, Errno),
     /// The guest's `/proc` was shown not to be procfs, for this reason.
     NotProcfs(&'static str),
 }
 
-/// Whether an fdinfo step's `errno` is an exhausted resource of the guest's
-/// own (its descriptor table, its memory), which says nothing about its
-/// `/proc`. Such a failure leaves the description's locks unknown, so a later
-/// `/proc/locks` read refuses; any other failure, a backend's or the host's
-/// included, makes the description untrackable (hidden, never a host row).
-fn says_nothing_about_procfs(errno: Errno) -> bool {
-    matches!(errno, Errno::EMFILE | Errno::ENOMEM)
+/// Whether an fdinfo step that failed with `errno` shows the description
+/// is untrackable: a cause the guest's own filesystem view or the backend
+/// decides, the same in every run of the same program (no `/proc` or an
+/// entry missing, ENOENT or ENOTDIR; a symlink loop, ELOOP; an entry outside
+/// the anchor or across a mount, EXDEV; a backend that refuses the call,
+/// EINVAL, as KVM refuses an `O_PATH` open of its `/proc`). Every other
+/// errno, ambient or resource state that can differ between runs, leaves the
+/// locks unknown, so a later `/proc/locks` read refuses rather than shows a
+/// row that depends on host state: a full descriptor table, EMFILE; a full
+/// host file table, ENFILE; no memory, ENOMEM; an interruption, EINTR; an I/O
+/// error, EIO; EAGAIN; a kernel without `openat2`, ENOSYS; a permission
+/// refusal, EACCES or EPERM, which a host security module keyed by the host
+/// process can give as well as the guest's own seccomp filter; anything
+/// unlisted.
+fn fdinfo_failure_hides(errno: Errno) -> bool {
+    matches!(
+        errno,
+        Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP | Errno::EXDEV | Errno::EINVAL
+    )
 }
 
 /// Why Detcore does not know which locks the description descriptor `fd`
@@ -1266,27 +1279,33 @@ mod fdinfo_refusal_tests {
         assert!(fdinfo_refusal("flock", 7, "read", Errno::EIO).contains("could not read that"));
     }
 
-    /// Only an exhausted resource of the guest's own leaves the locks
-    /// unknown (and a later `/proc/locks` read refused); every other failure
-    /// hides the description.
+    /// A failure the guest's filesystem view or the backend decides hides
+    /// the description; ambient or resource state, and anything unlisted,
+    /// leaves its locks unknown (and a later `/proc/locks` read refused).
     #[test]
-    fn only_a_missing_resource_leaves_fdinfo_locks_unknown() {
-        for errno in [Errno::EMFILE, Errno::ENOMEM] {
-            assert!(says_nothing_about_procfs(errno), "{errno}");
-        }
+    fn only_a_guest_or_backend_decided_failure_hides_the_description() {
         for errno in [
-            Errno::ENFILE,
-            Errno::EAGAIN,
-            Errno::EINTR,
-            Errno::EIO,
             Errno::ENOENT,
             Errno::ENOTDIR,
+            Errno::ELOOP,
+            Errno::EXDEV,
+            Errno::EINVAL,
+        ] {
+            assert!(fdinfo_failure_hides(errno), "{errno}");
+        }
+        for errno in [
             Errno::EACCES,
             Errno::EPERM,
-            Errno::EXDEV,
+            Errno::EMFILE,
+            Errno::ENFILE,
+            Errno::ENOMEM,
+            Errno::EINTR,
+            Errno::EIO,
+            Errno::EAGAIN,
             Errno::ENOSYS,
+            Errno::EBADF,
         ] {
-            assert!(!says_nothing_about_procfs(errno), "{errno}");
+            assert!(!fdinfo_failure_hides(errno), "{errno}");
         }
     }
 
@@ -8964,15 +8983,24 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// exactly that description's locks with the device `/proc/locks`
     /// prints. A descriptor Detcore keeps no model of is left out.
     ///
-    /// The fdinfo is read through the recorder: the `/proc/locks` rows a
-    /// replay filters are the recording's, and replay takes no real lock, so
-    /// the locks they are matched against must be the recording's too. A
-    /// recording therefore holds an `openat`, the reads and a `close` after
-    /// each such call (hermit-cli's `RECORD_VERSION` names the change).
+    /// The fdinfo is read only through an anchor proved to be procfs, by a
+    /// sequence of calls through the recorder ([`Self::read_own_fdinfo`]):
+    /// the `/proc/locks` rows a replay filters are the recording's, and
+    /// replay takes no real lock, so the locks they are matched against must
+    /// be the recording's too. A recording therefore holds, after each such
+    /// call, the anchor's `openat`, `fstatfs` and `fstat`, the entry's
+    /// `openat2`, `fstatfs` and `fstat`, the reads and two `close`s
+    /// (hermit-cli's `RECORD_VERSION` names the change).
     ///
-    /// An fdinfo that cannot be read leaves the description's locks unknown
-    /// and the guest's `call` unaffected: a later `/proc/locks` read refuses
-    /// while a guest table references the description
+    /// The guest's `call` is never affected. A read that fails for a cause
+    /// the guest's own filesystem view or the backend decides (no `/proc`,
+    /// not procfs, an entry outside it or across a mount, a backend's
+    /// refusal) makes the description untrackable: it contributes no lock. A
+    /// read that fails for ambient or resource state (a full descriptor table
+    /// or file table, no memory, an interruption, an I/O error, a kernel
+    /// without `openat2`, a permission refusal) leaves its locks unknown, and
+    /// a later `/proc/locks` read
+    /// refuses while a guest table references the description
     /// (`procfs::locks::LockLedger::unknown`).
     ///
     /// A lock or unlock through a descriptor whose description the ledger
@@ -8981,7 +9009,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// in-guest backend registered on reception) can leave that other
     /// identity's entry stale, so no lock on that file's inode number counts
     /// from then on (`procfs::locks::LockLedger::alias_inode`): hidden, never
-    /// a host's row admitted.
+    /// a host's row admitted. If that descriptor's fdinfo cannot be read for
+    /// ambient or resource state, every later `/proc/locks` read refuses
+    /// instead ([`Self::note_alias`]).
     pub(crate) async fn refresh_description_locks<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -9001,13 +9031,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Ok((open_file, received)) = model else {
             if call.changes_locks() {
                 let fdinfo = self.read_own_fdinfo(guest, fd, call.name()).await?;
-                crate::tool_global::note_aliased_inode(guest, fdinfo.inode()).await;
+                Self::note_alias(guest, &fdinfo).await;
             }
             return Ok(());
         };
         let fdinfo = self.read_own_fdinfo(guest, fd, call.name()).await?;
         if received && call.changes_locks() {
-            crate::tool_global::note_aliased_inode(guest, fdinfo.inode()).await;
+            Self::note_alias(guest, &fdinfo).await;
         }
         let held = matches!(&fdinfo, FdinfoRead::Contents(_));
         let locks = match fdinfo {
@@ -9034,6 +9064,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         let slots = guest.thread_state().slots_naming(open_file);
         crate::tool_global::note_description_locks(guest, open_file, locks, slots).await;
         Ok(())
+    }
+
+    /// After a lock or unlock through a descriptor whose description the
+    /// ledger may know under another identity: no lock on its inode number
+    /// counts from now on (`procfs::locks::LockLedger::alias_inode`). If its
+    /// fdinfo could not be read for ambient or resource state, which
+    /// identities it changed is unknown, and every later `/proc/locks`
+    /// snapshot is refused by name (`procfs::locks::LockLedger::refuse`); if
+    /// the guest's `/proc` could not be proved to be procfs, no lock counts
+    /// at all (an inode of `None`), which only hides.
+    async fn note_alias<G: Guest<Self>>(guest: &mut G, fdinfo: &FdinfoRead) {
+        match fdinfo {
+            FdinfoRead::Unknown(reason) => {
+                crate::tool_global::note_lock_ledger_refused(guest, reason.clone()).await;
+            }
+            FdinfoRead::Contents(_) | FdinfoRead::Untrackable(_) => {
+                crate::tool_global::note_aliased_inode(guest, fdinfo.inode()).await;
+            }
+        }
     }
 
     /// The descriptions named by the slots `fds` of this thread's table
@@ -9095,18 +9144,23 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// guest's `/proc`, which must be procfs (`fstatfs`), opens the entry
     /// below it with `openat2`'s `RESOLVE_BENEATH | RESOLVE_NO_XDEV` (no step
     /// out of the anchor, no mount crossed, so nothing bound over an entry),
-    /// and requires the entry on the anchor's device (`fstat` of both). Every
-    /// step goes through the recorder, so record and replay decide alike.
+    /// and requires the entry itself on procfs and on the anchor's device
+    /// (`fstatfs` and `fstat` of both). Every step goes through the
+    /// recorder, so record and replay decide alike. The read holds two
+    /// descriptors at once, the anchor and the entry. These checks rely on
+    /// the serialized schedule, under which no other guest thread runs
+    /// between the calls; with concurrent threads the entry check narrows a
+    /// `dup2` race on the descriptor numbers but does not close it
+    /// ([`Self::read_opened_entry`]).
     ///
-    /// A step short of a resource of the guest's own (no page for a guest
-    /// that mapped its whole address space away, a full descriptor table, no
-    /// memory) leaves the description's locks unknown
-    /// ([`FdinfoRead::Unknown`], whose reason names the guest's `call`,
-    /// [`fdinfo_refusal`]). Every other outcome that gives no proved fdinfo
-    /// (no `/proc`, not procfs, an entry outside it or across a mount, a
-    /// device mismatch, any other failure, a backend's or the host's
-    /// included) makes the description untrackable
-    /// ([`FdinfoRead::Untrackable`]).
+    /// No page for a guest that mapped its whole address space away, and a
+    /// failed step whose errno is ambient or resource state
+    /// ([`fdinfo_failure_hides`] is false), leave the description's locks
+    /// unknown ([`FdinfoRead::Unknown`], whose reason names the guest's
+    /// `call`, [`fdinfo_refusal`]). Every other outcome that gives no proved
+    /// fdinfo (no `/proc`, not procfs, an entry outside it or across a
+    /// mount, a device mismatch, a guest-decided or backend-decided errno)
+    /// makes the description untrackable ([`FdinfoRead::Untrackable`]).
     async fn read_own_fdinfo<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -9151,9 +9205,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         Ok(match result? {
             Ok(contents) => FdinfoRead::Contents(contents),
-            // A step short of a resource of the guest's own says nothing
-            // about the locks.
-            Err(FdinfoFailure::Failed(step, errno)) if says_nothing_about_procfs(errno) => {
+            // Ambient or resource state says nothing about the locks.
+            Err(FdinfoFailure::Failed(step, errno)) if !fdinfo_failure_hides(errno) => {
                 FdinfoRead::Unknown(fdinfo_refusal(call, fd, step, errno))
             }
             Err(FdinfoFailure::Failed(step, errno)) => FdinfoRead::Untrackable(format!(
@@ -9220,26 +9273,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         anchor: RawFd,
         fd: RawFd,
     ) -> Result<Result<Vec<u8>, FdinfoFailure>, Error> {
-        let stat = page + FDINFO_STAT;
-        match self
-            .record_or_replay(
-                guest,
-                Syscall::from_raw(
-                    Sysno::fstatfs,
-                    procfs_levels::raw_args([anchor as usize, stat, 0, 0, 0, 0]),
-                ),
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(errno) => return Ok(Err(FdinfoFailure::Failed("fstatfs", errno))),
-        }
-        // `f_type` is the first field of `struct statfs`.
-        if self.read_fdinfo_word(guest, stat)? != libc::PROC_SUPER_MAGIC as u64 {
-            return Ok(Err(FdinfoFailure::NotProcfs("/proc is not procfs")));
-        }
-        let Some(anchor_device) = self.recorded_device(guest, anchor, stat).await? else {
-            return Ok(Err(FdinfoFailure::NotProcfs("/proc gave no device")));
+        let anchor_device = match self.recorded_procfs_device(guest, page, anchor).await? {
+            Ok(device) => device,
+            Err(failure) => return Ok(Err(failure)),
         };
         self.write_fdinfo_path(guest, page, &format!("thread-self/fdinfo/{fd}"))?;
         // struct open_how { u64 flags; u64 mode; u64 resolve; }
@@ -9275,27 +9311,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             Err(errno) => return Ok(Err(FdinfoFailure::Failed("open", errno))),
         };
-        let result = match self.recorded_device(guest, opened, stat).await? {
-            Some(device) if device == anchor_device => {
-                let scratch = AddrMut::<u8>::from_raw(page + FDINFO_READ).ok_or(Errno::EFAULT)?;
-                match self
-                    .drain_procfs(
-                        guest,
-                        syscalls::Read::new().with_fd(opened),
-                        scratch,
-                        FDINFO_PAGE - FDINFO_READ,
-                    )
-                    .await
-                {
-                    Ok(contents) => Ok(Ok(contents)),
-                    Err(Error::Errno(errno)) => Ok(Err(FdinfoFailure::Failed("read", errno))),
-                    Err(error) => Err(error),
-                }
-            }
-            _ => Ok(Err(FdinfoFailure::NotProcfs(
-                "the entry is not on /proc's device",
-            ))),
-        };
+        // Closed on every path, the error ones included.
+        let result = self
+            .read_opened_entry(guest, page, opened, anchor_device)
+            .await;
         if let Err(errno) = self
             .record_or_replay(guest, syscalls::Close::new().with_fd(opened))
             .await
@@ -9305,16 +9324,76 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
-    /// The device `fstat` names for the descriptor `fd`, through the
-    /// recorder, into the `stat` buffer of the fdinfo page; `None` if it
-    /// fails.
-    async fn recorded_device<G: Guest<Self>>(
+    /// The text of the `opened` fdinfo entry, once it too is shown to be on
+    /// procfs and on the anchor's device. The checks run on the entry's own
+    /// descriptor, so a sibling thread that replaces the anchor's descriptor
+    /// number between calls (`dup2` of a fake directory) cannot pass them.
+    ///
+    /// The defence relies on Detcore's serialized schedule: no other guest
+    /// thread runs between these injected calls. Under
+    /// `--no-sequentialize-threads` a sibling could still `dup2` onto the
+    /// entry's own descriptor number between its checks and the read; the
+    /// entry check narrows that race but does not close it.
+    async fn read_opened_entry<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        page: usize,
+        opened: RawFd,
+        anchor_device: u64,
+    ) -> Result<Result<Vec<u8>, FdinfoFailure>, Error> {
+        match self.recorded_procfs_device(guest, page, opened).await? {
+            Ok(device) if device == anchor_device => {}
+            Ok(_) => {
+                return Ok(Err(FdinfoFailure::NotProcfs(
+                    "the entry is not on /proc's device",
+                )));
+            }
+            Err(failure) => return Ok(Err(failure)),
+        }
+        let scratch = AddrMut::<u8>::from_raw(page + FDINFO_READ).ok_or(Errno::EFAULT)?;
+        match self
+            .drain_procfs(
+                guest,
+                syscalls::Read::new().with_fd(opened),
+                scratch,
+                FDINFO_PAGE - FDINFO_READ,
+            )
+            .await
+        {
+            Ok(contents) => Ok(Ok(contents)),
+            Err(Error::Errno(errno)) => Ok(Err(FdinfoFailure::Failed("read", errno))),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The device of the descriptor `fd`, once `fstatfs` shows it is on
+    /// procfs, both through the recorder into the stat buffer of the fdinfo
+    /// page. A failed call keeps its errno, for the common classification
+    /// ([`fdinfo_failure_hides`]).
+    async fn recorded_procfs_device<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        page: usize,
         fd: RawFd,
-        stat: usize,
-    ) -> Result<Option<u64>, Error> {
-        let answered = self
+    ) -> Result<Result<u64, FdinfoFailure>, Error> {
+        let stat = page + FDINFO_STAT;
+        if let Err(errno) = self
+            .record_or_replay(
+                guest,
+                Syscall::from_raw(
+                    Sysno::fstatfs,
+                    procfs_levels::raw_args([fd as usize, stat, 0, 0, 0, 0]),
+                ),
+            )
+            .await
+        {
+            return Ok(Err(FdinfoFailure::Failed("fstatfs", errno)));
+        }
+        // `f_type` is the first field of `struct statfs`.
+        if self.read_fdinfo_word(guest, stat)? != libc::PROC_SUPER_MAGIC as u64 {
+            return Ok(Err(FdinfoFailure::NotProcfs("not procfs")));
+        }
+        if let Err(errno) = self
             .record_or_replay(
                 guest,
                 Syscall::from_raw(
@@ -9323,13 +9402,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ),
             )
             .await
-            .is_ok();
+        {
+            return Ok(Err(FdinfoFailure::Failed("fstat", errno)));
+        }
         // `st_dev` is the first field of `struct stat`.
-        Ok(if answered {
-            Some(self.read_fdinfo_word(guest, stat)?)
-        } else {
-            None
-        })
+        Ok(Ok(self.read_fdinfo_word(guest, stat)?))
     }
 
     /// Write `path`, NUL-terminated, at the fdinfo page's path slot.

@@ -374,6 +374,9 @@ pub(crate) struct LockLedger {
     aliased_inodes: BTreeSet<String>,
     /// No lock counts at all ([`LockLedger::alias_inode`] without an inode).
     aliased_everything: bool,
+    /// Why no `/proc/locks` snapshot can be decided for the rest of the run
+    /// ([`LockLedger::refuse`]): set once, never cleared.
+    refused: Option<String>,
 }
 
 /// The locks a description holds, as its fdinfo last showed them, or why
@@ -633,11 +636,25 @@ impl LockLedger {
             .collect()
     }
 
-    /// Why the locks of a description some table references are unknown, for
-    /// the first such description: a `/proc/locks` snapshot taken now cannot
-    /// tell that description's rows from a host's, so it is refused. `None`
+    /// A lock or unlock went through a descriptor whose description the
+    /// ledger may know under another identity, and its fdinfo could not be
+    /// read for `reason` (ambient or resource state): which identities it
+    /// changed is unknown, so every later `/proc/locks` snapshot is refused,
+    /// by the first such reason. Hiding every lock instead would make the
+    /// guest's rows depend on a transient host state.
+    pub(crate) fn refuse(&mut self, reason: String) {
+        self.refused.get_or_insert(reason);
+    }
+
+    /// Why a `/proc/locks` snapshot taken now cannot be decided: the run's
+    /// refusal ([`Self::refuse`]), or else the reason the locks of a
+    /// description some table references are unknown, for the first such
+    /// description, whose rows a snapshot cannot tell from a host's. `None`
     /// when every referenced description's locks are known.
     pub(crate) fn unknown(&self) -> Option<&str> {
+        if let Some(reason) = &self.refused {
+            return Some(reason);
+        }
         self.locks
             .iter()
             .filter(|(open_file, _)| self.references.contains_key(open_file))
@@ -1003,6 +1020,24 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
     }
 
     #[test]
+    fn a_refusal_holds_for_the_rest_of_the_run_by_its_first_reason() {
+        let process = DetPid::from_raw(3);
+        let mut ledger = LockLedger::default();
+        ledger.note_locks(process, description(0), vec![lock("0")], 1);
+        assert_eq!(ledger.unknown(), None);
+        ledger.refuse("ENFILE".to_string());
+        ledger.refuse("EIO".to_string());
+        assert_eq!(ledger.unknown(), Some("ENFILE"));
+        // Neither a later successful read nor the end of every table clears it.
+        ledger.note_locks(process, description(0), Vec::new(), 1);
+        ledger.prune(|_| false);
+        assert_eq!(ledger.unknown(), Some("ENFILE"));
+        // It does not hide what the ledger knows: the decision is refused.
+        ledger.note_locks(process, description(1), vec![lock("1")], 1);
+        assert_eq!(ledger.held(), [lock("1")]);
+    }
+
+    #[test]
     fn unknown_locks_count_while_a_table_references_them() {
         let [parent, child] = [3, 4].map(DetPid::from_raw);
         let mut ledger = LockLedger::default();
@@ -1017,16 +1052,16 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         ledger.prune(|process| process != child);
         assert_eq!(ledger.unknown(), None);
         // A later read that succeeds makes the locks known again.
-        ledger.note_unknown(parent, description(1), "ENOENT".to_string(), 1);
+        ledger.note_unknown(parent, description(1), "EIO".to_string(), 1);
         ledger.note_locks(parent, description(1), vec![lock("0")], 1);
         assert_eq!(ledger.unknown(), None);
         assert_eq!(ledger.held(), [lock("0")]);
         // An exec keeps an unknown description its table still names.
-        ledger.note_unknown(parent, description(1), "EACCES".to_string(), 1);
+        ledger.note_unknown(parent, description(1), "ENFILE".to_string(), 1);
         ledger.exec(parent);
         assert_eq!(ledger.unknown(), None);
         ledger.exec_kept(parent, &[(description(1), 1)]);
-        assert_eq!(ledger.unknown(), Some("EACCES"));
+        assert_eq!(ledger.unknown(), Some("ENFILE"));
     }
 
     #[test]

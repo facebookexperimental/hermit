@@ -739,7 +739,15 @@ impl RecordVersion {
 // longer issue physical arms/rearms or manufacture skid state. This
 // observable-behavior correction takes a new label even though the event
 // layout is unchanged.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x177);
+// 0x177 -> 0x178 (reserved as 0x178; 0x177 is the dbt lane's, landed as
+// 9231425b): the procfs anchor's fix-forward also runs fstatfs on the opened
+// fdinfo entry (it must be procfs too, so a sibling's dup2 over the anchor's
+// descriptor number cannot pass) and closes the entry on every path, so the
+// recorded sequence after each lock call is now the anchor's openat, fstatfs
+// and fstat, the openat2, the entry's fstatfs and fstat, the reads and two
+// closes. A 0x176 or 0x177 recording has no entry fstatfs and would replay
+// out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x178);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -764,7 +772,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x177);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x177;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x178;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

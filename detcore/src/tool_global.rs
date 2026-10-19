@@ -3991,6 +3991,11 @@ impl GlobalState {
                 self.lock_ledger.lock().unwrap().alias_inode(inode);
                 R::AliasedInode(())
             }
+            GlobalRequest::LockLedgerRefused(reason) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
+                self.lock_ledger.lock().unwrap().refuse(reason);
+                R::LockLedgerRefused(())
+            }
             GlobalRequest::GuestLockRows(rows) => {
                 // A positive owner is the kernel's number for a process in the
                 // container's PID namespace, as `/proc` spells it; it is the
@@ -6328,6 +6333,10 @@ pub enum GlobalRequest {
     /// recorded in its private queue (`Scheduler::host_timed_and_private_sigchld`).
     /// Appended last.
     HostTimedAndPrivateSigchld(DetTid),
+    /// A lock or unlock through a descriptor whose description the ledger
+    /// may know under another identity, whose fdinfo could not be read for
+    /// this reason (`procfs::locks::LockLedger::refuse`). Appended last.
+    LockLedgerRefused(String),
 }
 
 /// Responses from the global object
@@ -6553,6 +6562,8 @@ pub enum GlobalResponse {
     /// The host-timed signals, then the recorded private `SIGCHLD`. Appended
     /// last.
     HostTimedAndPrivateSigchld(u64, u64),
+    /// Appended last.
+    LockLedgerRefused(()),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -9199,6 +9210,19 @@ where
         .await
         .1;
     assert_eq!(response, GlobalResponse::AliasedInode(()));
+}
+
+/// Record that every later `/proc/locks` snapshot is refused, for `reason`
+/// (`procfs::locks::LockLedger::refuse`).
+pub(crate) async fn note_lock_ledger_refused<G, T>(guest: &mut G, reason: String)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::LockLedgerRefused(reason))
+        .await
+        .1;
+    assert_eq!(response, GlobalResponse::LockLedgerRefused(()));
 }
 
 /// Which of the rows of a `/proc/locks` snapshot the guest owns, in row order

@@ -2567,7 +2567,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the fdinfo procfs-anchor classification unit: 2137, freshly listed.
     // And +4 from 83100c02: 2141.
     // And +11 from f198e2c4: 2152.
-    ("test.detcore_unit", 2152),
+    // And +1 from 37121ff4: 2153.
+    ("test.detcore_unit", 2153),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4511,7 +4512,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fdinfo procfs-anchor unit: 2137, freshly listed.
     // And +4 from 83100c02: 2141.
     // And +11 from f198e2c4: 2152.
-    ("test.detcore_unit_on_host", 2152),
+    // And +1 from 37121ff4: 2153.
+    ("test.detcore_unit_on_host", 2153),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
