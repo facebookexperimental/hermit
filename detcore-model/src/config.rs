@@ -441,11 +441,14 @@ pub struct Config {
     /// spelling of `/proc/<pid>/mountinfo` and `/proc/<pid>/mounts` on every
     /// backend (`crate::container_mounts`,
     /// <https://github.com/rrnewton/hermit/issues/4213>). hermit-cli builds it
-    /// once, in the completed container namespace before the guest starts;
-    /// a recording carries it, so its replay renders the recorded table.
-    /// `None` (a run outside Hermit's container, such as `--no-namespace` or a
-    /// library caller, and every older configuration) leaves both files to
-    /// the kernel, sanitized as before. Runtime provenance, not a user option.
+    /// once, in the completed container namespace before the guest starts,
+    /// or, for `--no-namespace` and a library caller on KVM that built no
+    /// container, in the namespace the guest runs in (its launch mounts and
+    /// base mountpoints); a recording carries it, so its replay renders the
+    /// recorded table. `None` (a library caller on a backend other than KVM,
+    /// whose command may chroot or mount where Hermit cannot see, and every
+    /// older configuration) leaves both files to the kernel, sanitized as
+    /// before. Runtime provenance, not a user option.
     #[serde(default)]
     #[clap(skip)]
     pub container_mount_table: Option<crate::container_mounts::ContainerMountTable>,

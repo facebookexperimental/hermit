@@ -757,6 +757,24 @@ directory or temporarily cover an existing directory at that name; existing
 contents are preserved. An incompatible file at the target is a mount error.
 `--no-namespace` keeps the host capture path and adds no statistics bind.
 
+The guest's mount table (`/proc/<pid>/mountinfo`, `/proc/<pid>/mounts` and
+`/proc/mounts`) is a fixed description taken when the guest launches, not the
+host's live table. It is the same on every backend, and in every run as long as
+the mounts it lists (and, under `--no-namespace`, the mounts holding the working
+directory and `/tmp`) do not change on the host between runs. In Hermit's
+container it lists the mounts Hermit installed (its `/proc`, `/tmp`, identity
+files and your `--mount` and `--bind` targets), the ancestors of those mounts,
+and the base mountpoints `/`, `/proc`, `/dev`, `/dev/pts`, `/dev/shm`,
+`/dev/mqueue`, `/sys`, `/sys/fs/cgroup` and `/run` where they are mounted. With
+`--no-namespace`, where Hermit installs no mount, it lists the mounts holding
+the guest's working directory and the host `/tmp`, their ancestors, and those
+base mountpoints. Every other host mount is hidden, although its files stay
+reachable: a file on a hidden mount reports its nearest listed ancestor in
+`/proc/self/fdinfo` (`mnt_id`) and `statx` (`STATX_MNT_ID`), and `df` on it
+prints `-` as the source and that ancestor's mountpoint. This keeps unrelated
+host mount activity out of the guest's view, at the cost of a less complete
+table than Linux shows.
+
 Network modes are:
 
 - `--network=local` (default): isolated loopback networking.

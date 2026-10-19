@@ -1813,6 +1813,12 @@
       "why": "tests/c/received_directory_openat.c is owned by hermit-cli/tests/cli.rs: the CLI test a_name_below_a_received_directory_is_looked_up_on_ptrace_dbt_and_kvm runs it natively and at bitwise parity on ptrace, DBT and KVM, and requires openat, fstatat, statx, faccessat and readlinkat to look a name up below a /tmp directory and a /proc directory the guest received over SCM_RIGHTS, which failed with EBADF on ptrace and KVM where Detcore keeps no record of a received descriptor; that a name the --proc level omits stays absent there; and that namespace, socket and pipe links below a received /proc/self/ns and /proc/self/fd read as their absolute, canonicalized spellings. It stays a fixture because a generic manifest cannot compare stdout across backends."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/received_directory_swap.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/received_directory_swap.c is owned by hermit-cli/tests/cli.rs: the CLI test a_received_directory_replaced_during_an_open_is_what_the_open_returned runs it natively and then on ptrace with --no-sequentialize-threads and the procfs_spelling_resolved race probe, so that a second thread replaces a received /proc descriptor with an ordinary directory between Detcore naming it and the kernel's open, and requires the returned directory to behave as what it holds (marker found, mountinfo ENOENT), not as /proc/self (https://github.com/rrnewton/hermit/issues/4213, K3b). It stays a fixture because a generic manifest cannot set a race probe or assert which object the open returned."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/record_lock.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -2573,6 +2579,12 @@
       "path": "tests/c/statx_metadata.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/statx_metadata.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/statx_mount_id.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/statx_mount_id.c is owned by hermit-cli/tests/cli.rs: the CLI test a_no_namespace_run_shows_its_working_mount_and_hides_another runs it under --no-namespace on ptrace and KVM and requires statx's STATX_MNT_ID, asked for and not asked for, with its result-mask bit set, to equal the fdinfo mnt_id of a file on a hidden host mount, which is its nearest shown ancestor's row in the guest's mount table (https://github.com/rrnewton/hermit/issues/4213, K3b). It stays a fixture because a generic manifest cannot compare the three values with the rendered mountinfo."
     },
     {
       "disposition": "guest-fixture",

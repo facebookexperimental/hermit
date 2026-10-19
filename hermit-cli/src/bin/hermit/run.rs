@@ -1331,6 +1331,11 @@ pub struct RunOpts {
     /// guests. Host process, filesystem, and network state are shared, reducing determinism.
     /// Schedule and preemption replay require stable namespace PIDs and are not supported.
     ///
+    /// The guest's mount table (/proc/self/mountinfo, /proc/mounts) is not the host's: it
+    /// lists the mounts holding the guest's working directory and the host /tmp, their
+    /// ancestors, and the base mountpoints (/, /proc, /dev, /sys, /run and a few below them).
+    /// Other host mounts are hidden; a file on one reports its nearest listed ancestor.
+    ///
     /// Incompatible with `--image`, which chroots the guest into a materialized
     /// OCI rootfs and therefore requires namespaces; that conflict is reported
     /// at runtime with an explanatory message rather than as a generic clap
@@ -9284,6 +9289,12 @@ impl RunOpts {
         self.build_guest_command(false)
     }
 
+    /// The guest's working directory as `--workdir` names it, if given
+    /// (relative to Hermit's own, as the guest command takes it).
+    pub(super) fn launch_workdir(&self) -> Option<&Path> {
+        self.workdir.as_deref().map(Path::new)
+    }
+
     fn build_guest_command(
         &self,
         disable_sanitizer_leak_detection_for_guest: bool,
@@ -10034,7 +10045,11 @@ impl RunOpts {
         let command = self.guest_command()?;
         // The command has no `pre_exec` callback, so it installs no seccomp
         // filter.
-        let config = complete_container_config(self.effective_det_config(), identity_sources)?;
+        let config = complete_container_config(
+            self.effective_det_config(),
+            identity_sources,
+            self.launch_workdir(),
+        )?;
 
         let timeout = self.run_timeout();
         let summary_json = self.summary_json.clone();
@@ -10127,7 +10142,11 @@ impl RunOpts {
         let command = self.guest_command()?;
 
         // The command has no `pre_exec` callback.
-        let config = complete_container_config(self.effective_det_config(), identity_sources)?;
+        let config = complete_container_config(
+            self.effective_det_config(),
+            identity_sources,
+            self.launch_workdir(),
+        )?;
 
         #[cfg(feature = "native-exec")]
         if let Some(native) = native {
@@ -10484,11 +10503,14 @@ impl Tmpfs {
 }
 
 /// Complete `config` inside the container whose identity mounts are
-/// `identity_sources`, on every backend. The guest inherits this thread's
+/// `identity_sources`, or, with none (`--no-namespace`), in this process's own
+/// namespace, on every backend. Either way the config gets a container mount
+/// table, so Detcore renders the guest's mount files. The guest inherits this thread's
 /// seccomp filters, as Hermit installs none besides the backend's own.
 pub(super) fn complete_container_config(
     mut config: DetConfig,
     identity_sources: Option<&IdentityGuard>,
+    launch_workdir: Option<&Path>,
 ) -> Result<DetConfig, Error> {
     config.inherited_seccomp = detcore::InheritedSeccomp::measure();
     // Each run of `--verify` is its own container, whose namespace numbers
@@ -10499,8 +10521,8 @@ pub(super) fn complete_container_config(
     let view = identity_sources
         .map(IdentityGuard::container_mount_view)
         .transpose()?;
-    config.mountinfo_mount_ids_captured = view.is_some();
     config.mount_id_assignment_order.clear();
+    config.mountinfo_mount_ids_captured = true;
     match view {
         Some(view) => {
             config.mountinfo_root_rewrites = view.root_rewrites;
@@ -10508,11 +10530,23 @@ pub(super) fn complete_container_config(
             config.mountinfo_mount_namespace = Some(view.namespace);
             config.container_mount_table = view.table;
         }
+        // No container (`--no-namespace`): the guest runs in this process's
+        // own namespace, where Hermit installed no mount, so its table is
+        // that namespace's launch mounts (the guest's working directory's and
+        // /tmp's) and base mountpoints, with the order from the same read.
+        // Nothing here changes this process's namespace.
         None => {
+            let namespace = hermit::current_mount_namespace()?;
+            // `--workdir`, or the working directory the guest inherits ("."),
+            // resolved as the guest's chdir resolves it: an absolute one
+            // without Hermit's own working directory, and neither by asking
+            // that directory for its name (it may have been removed).
+            let launch_cwd = launch_workdir.unwrap_or(Path::new("."));
+            let (table, order) = hermit::unplanned_container_mount_table(launch_cwd)?;
             config.mountinfo_root_rewrites = Vec::new();
-            config.mountinfo_mount_ids = Vec::new();
-            config.mountinfo_mount_namespace = None;
-            config.container_mount_table = None;
+            config.mountinfo_mount_ids = order;
+            config.mountinfo_mount_namespace = Some(namespace);
+            config.container_mount_table = Some(table);
         }
     }
     Ok(config)

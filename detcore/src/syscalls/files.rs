@@ -3229,14 +3229,35 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// table per process. `None` for a descriptor Detcore has a record of, any
     /// other object, a task number no task of the guest's holds, and where
     /// Detcore does not render procfs files (record and replay, after
-    /// `chroot`). Only with sequentialized threads, so that no other guest
-    /// thread can replace the descriptor before its link is read.
+    /// `chroot`).
+    ///
+    /// In every threading mode, `--no-sequentialize-threads` included. For a
+    /// file Detcore renders, the link is the only observation of the
+    /// descriptor, read once inside the guest's own call, and the answer comes
+    /// from that name alone: another thread that replaces the descriptor
+    /// concurrently is ordered before that read (the call looks below the new
+    /// directory) or after it (below the old one), and Linux takes the
+    /// descriptor at one point inside the call too (`path_init`), so each
+    /// answer is one Linux can give. Without this a relaxed run's received
+    /// `/proc` would leave its mount tables to the backend, which keeps no copy
+    /// (KVM).
+    ///
+    /// Where the name only guides a call the kernel then resolves through the
+    /// same descriptor, there are two observations, and without
+    /// sequentialized threads another thread can replace the descriptor
+    /// between them. A directory opened below it gets procfs provenance only
+    /// if the descriptor the kernel returned holds a directory below `/proc`
+    /// (`handle_openat`). The `--proc` level's refusal of an omitted name below
+    /// it is best-effort there for `stat`, `access` and `readlink`, which have
+    /// no check after the kernel's lookup: a residual of the relaxed mode,
+    /// narrower than before, when no level applied below a received descriptor
+    /// in that mode at all.
     pub(crate) async fn unrecorded_procfs_directory<G: Guest<Self>>(
         &self,
         guest: &mut G,
         dirfd: i32,
     ) -> Option<PathBuf> {
-        if dirfd < 0 || !self.renders_procfs(guest) || !guest.config().sequentialize_threads {
+        if dirfd < 0 || !self.renders_procfs(guest) {
             return None;
         }
         let recorded = guest
@@ -3671,6 +3692,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let observed_path = Self::observed_path(guest, call.dirfd(), &path)?;
         // The spelling Detcore's own lookups of the files it renders see.
         let procfs_spelling = self.procfs_spelling_at(guest, call.dirfd(), &path).await?;
+        crate::race_probe::delay(crate::race_probe::PROCFS_SPELLING_RESOLVED).await;
         if guest.config().record_host_inputs && call.flags().contains(OFlag::O_CREAT) {
             // It may create the file it opens. Reported before the open runs,
             // as `record_host_namespace_change` reports the other changes.
@@ -4419,6 +4441,42 @@ impl<T: RecordOrReplay> Detcore<T> {
                 } else {
                     None
                 };
+                // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4213):
+                // Review binding procfs directory provenance to the object the
+                // kernel opened, without sequentialized threads.
+                // Without sequentialized threads another guest thread can
+                // replace the descriptor (or move the working directory) that
+                // a relative lookup starts from, between Detcore naming it and
+                // the kernel's open. Provenance taken from the spelling then
+                // describes an object the new descriptor may not hold: a
+                // `/proc/self` mark on an ordinary directory would make a
+                // later relative `mountinfo` render a file Linux has no way to
+                // open there. So it is installed only if the descriptor the
+                // kernel returned holds a directory below `/proc`, as its own
+                // link names it (`descriptor_kernel_link`, one more injected
+                // `readlinkat`); for `O_PATH | O_NOFOLLOW` of a selector, only
+                // if it holds that selector link. With sequentialized threads
+                // no other thread runs in between, and nothing is checked.
+                let (reached, link_itself) = if (reached.is_some() || link_itself)
+                    && !path.is_absolute()
+                    && !guest.config().sequentialize_threads
+                {
+                    let held = Self::descriptor_kernel_link(guest, fd).await;
+                    let below_proc = |name: &Path| {
+                        use std::os::unix::ffi::OsStrExt;
+                        name.starts_with("/proc")
+                            && !name.as_os_str().as_bytes().ends_with(b" (deleted)")
+                    };
+                    let reached = reached.filter(|_| held.as_deref().is_some_and(below_proc));
+                    let link_itself = link_itself
+                        && held.as_deref().is_some_and(|name| {
+                            name == Path::new("/proc/self")
+                                || name == Path::new("/proc/thread-self")
+                        });
+                    (reached, link_itself)
+                } else {
+                    (reached, link_itself)
+                };
                 guest.thread_state().with_detfd(fd, |detfd| {
                     detfd.set_path(&recorded_path);
                     if let Some((reached, incarnation)) = reached.clone() {
@@ -5003,6 +5061,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         fd: RawFd,
     ) -> Option<PathBuf> {
+        let named = Self::descriptor_kernel_link(guest, fd).await?;
+        procfs_directory_link(&named).then_some(named)
+    }
+
+    /// The `/proc/thread-self/fd/<fd>` link of descriptor `fd`, which this
+    /// guest thread holds, as the kernel beneath the backend reads it (one
+    /// `readlinkat` injected in the guest thread; the host kernel under ptrace
+    /// and DBT, the KVM executor for its own `/proc`). `None` where the guest
+    /// stack scratch cannot hold the call's buffers, the call fails, or the
+    /// link does not fit in 256 bytes.
+    async fn descriptor_kernel_link<G: Guest<Self>>(guest: &mut G, fd: RawFd) -> Option<PathBuf> {
         const LINK_CAPACITY: usize = 40;
         const TARGET_CAPACITY: usize = 256;
         let mut stack = guest.stack().await;
@@ -5032,10 +5101,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             _ => None,
         };
         drop(stack_guard);
-        let named = PathBuf::from(
+        Some(PathBuf::from(
             <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes?),
-        );
-        procfs_directory_link(&named).then_some(named)
+        ))
     }
 
     /// What descriptor `fd` of the calling process names, as its

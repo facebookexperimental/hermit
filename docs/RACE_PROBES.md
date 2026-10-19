@@ -50,6 +50,7 @@ removes both from the guest's environment, as it does for its own
 | `bg_harvest_skip` | synchronous | `detcore/src/scheduler.rs`, `step2c_process_io_blockers`, per finished blocker in the scheduler's snapshot | the scheduler treats a finished call as still running for this one check |
 | `fifo_staging_mapped` | async wait | `detcore/src/syscalls/files.rs`, `open_waited_on_fifo`, after the staging page's `mmap` returns and before the path is written | a host process that kills the task in this wait leaves the page mapped and empty, as a kill during the `mmap` does |
 | `fifo_staging_reclaim` | async wait | `detcore/src/syscalls/files.rs`, `unmap_orphaned_staging_pages`, before a task unmaps a staging page that a killed task left | a host process that kills this task too leaves the page to the next task of the address space |
+| `procfs_spelling_resolved` | async wait | `detcore/src/syscalls/files.rs`, `handle_openat`, after Detcore names the directory a relative lookup starts from and before the kernel's open | without sequentialized threads, another guest thread can replace that directory's descriptor before the kernel uses it |
 
 The waits are `tokio::time::sleep`. They delay only the task that owns the call;
 the scheduler keeps running. A blocking sleep at these points would stall the

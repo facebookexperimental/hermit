@@ -1709,6 +1709,7 @@ impl DbtExecution {
             .with_dbt_mounts(self.statistics.borrow().as_slice(), Vec::new());
         let config = config.clone();
         let launched = self.launched.clone();
+        let launch_workdir = options.launch_workdir().map(std::path::Path::to_path_buf);
         let config_dir = self
             .options
             .uses_container()
@@ -1731,8 +1732,11 @@ impl DbtExecution {
                     // its common namespace baseline exactly once, before any
                     // coordinator task starts, just as the tracing paths do.
                     super::tracing::align_tracing_pid_baseline(hermit::Backend::Dbt);
-                    let mut config =
-                        super::run::complete_container_config(config.clone(), identity)?;
+                    let mut config = super::run::complete_container_config(
+                        config.clone(),
+                        identity,
+                        launch_workdir.as_deref(),
+                    )?;
                     if let Some((program, workdir, path)) = &launched {
                         hermit::record_dbt_launched_image(
                             &mut config,

@@ -53,14 +53,20 @@ pub(crate) const FIFO_STAGING_MAPPED: &str = "fifo_staging_mapped";
 /// An async wait before a task unmaps a staging page that a killed task left:
 /// a task killed by a host process then leaves the page to the next task.
 pub(crate) const FIFO_STAGING_RECLAIM: &str = "fifo_staging_reclaim";
+/// An async wait in `openat` after Detcore has named the directory a relative
+/// lookup starts from, before the kernel's open: without sequentialized
+/// threads another guest thread can replace that directory's descriptor in
+/// between, as host timing alone can let it.
+pub(crate) const PROCFS_SPELLING_RESOLVED: &str = "procfs_spelling_resolved";
 
 /// Every probe point, for validating a configuration.
-const POINTS: [&str; 5] = [
+const POINTS: [&str; 6] = [
     BG_PRE_CALL,
     BG_POST_CALL,
     BG_HARVEST_SKIP,
     FIFO_STAGING_MAPPED,
     FIFO_STAGING_RECLAIM,
+    PROCFS_SPELLING_RESOLVED,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq)]

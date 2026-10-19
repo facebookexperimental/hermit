@@ -85,6 +85,7 @@ mod verify_inputs;
 #[path = "common/startup_guards.rs"]
 mod startup_guards;
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
@@ -203,6 +204,8 @@ static RENDERED_PROCESS_AUXV_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_MOUNT_TABLE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_ONCE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DIRECTORY_OPENAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static RECEIVED_DIRECTORY_SWAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static STATX_MOUNT_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LISTINGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VIRTUAL_KERNEL_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1575,6 +1578,33 @@ fn received_directory_openat_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "received-directory-openat guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// The C guest `tests/c/<name>.c`, compiled once per test process with
+/// `-pthread` into this process's build root.
+fn compiled_c_guest(cell: &'static OnceLock<PathBuf>, name: &str) -> &'static Path {
+    cell.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root(name);
+        fs::create_dir_all(&build_root).expect("failed to create the guest's build directory");
+        let guest = build_root.join(name);
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join(format!("tests/c/{name}.c")))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to compile {name}: {error}"));
+        assert!(
+            output.status.success(),
+            "{name} compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -6621,7 +6651,9 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
 /// was asked, though the descriptor was open (DBT, which discovers it, opened
 /// the file). Below a received `/proc`, a name the run's `--proc` level omits
 /// (`interrupts` at the default `minimal`) is absent, as at its absolute
-/// spelling; below a received `/proc/self/ns` and `/proc/self/fd`, the
+/// spelling, and `mounts` and `self/mountinfo` read what their absolute
+/// spellings read (Detcore renders them; KVM keeps no copy, package K slice
+/// K3b); below a received `/proc/self/ns` and `/proc/self/fd`, the
 /// namespace, socket and pipe links read as their absolute spellings, which
 /// Detcore canonicalizes; below a received `/proc/self`, `limits` (which
 /// `minimal` omits) is absent; and a thread with a descriptor table of its
@@ -6635,7 +6667,9 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
 /// they are used; their own runs of the guest are not part of this test.
 /// KVM's own /proc cannot open a process's directory yet, and KVM gives no
 /// thread a descriptor table of its own, so its run skips those checks,
-/// each named as not checked.
+/// each named as not checked. KVM also runs the guest once with
+/// `--no-sequentialize-threads`, where Detcore names a received `/proc` the
+/// same way, and must print what its default run printed.
 #[test]
 fn a_name_below_a_received_directory_is_looked_up_on_ptrace_dbt_and_kvm() {
     let test = "a_name_below_a_received_directory_is_looked_up_on_ptrace_dbt_and_kvm";
@@ -6690,10 +6724,35 @@ fn a_name_below_a_received_directory_is_looked_up_on_ptrace_dbt_and_kvm() {
         );
         outputs.push((backend, stdout(&output)));
     }
+    // KVM in the relaxed mode: Detcore still names the received /proc and
+    // renders the mount tables below it, so the backend is never asked.
+    if let Some((_, kvm)) = outputs.iter().find(|(backend, _)| *backend == "kvm") {
+        let args = [
+            "--backend",
+            "kvm",
+            "run",
+            "--no-sequentialize-threads",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            "--hermit",
+            "--minimal",
+            "--no-process-directories",
+            "--no-private-tables",
+        ];
+        let relaxed = hermit(&args);
+        assert_success(&relaxed, &args);
+        assert_eq!(
+            &stdout(&relaxed),
+            kvm,
+            "kvm with --no-sequentialize-threads differs from its default run"
+        );
+    }
     let (first_backend, first) = &outputs[0];
     assert_eq!(
         first.lines().count(),
-        7,
+        8,
         "{first_backend} printed other lines: {first}"
     );
     for (backend, output) in &outputs[1..] {
@@ -7545,7 +7604,8 @@ fn detcore_follows_the_target_processs_root_for_its_mount_table() {
 /// (https://github.com/rrnewton/hermit/issues/4213). Before, the container's
 /// copy of the host's table showed it, and the row renumbered every row after
 /// it. Each run is Hermit in a user and mount namespace of its own, where the
-/// second first mounts a tmpfs below the test's directory.
+/// second first mounts a tmpfs below the test's directory. The same holds with
+/// `--no-namespace`, where the guest runs in that namespace itself (K3b).
 #[test]
 fn the_guest_mount_table_ignores_a_host_mount_made_before_the_run() {
     let _guard = hermit_run_guard();
@@ -7561,7 +7621,32 @@ fn the_guest_mount_table_ignores_a_host_mount_made_before_the_run() {
         fi
         exec "$@"
     "#;
-    let run = |mount_first: &str| {
+    // The same with `--no-namespace`, where the guest runs in the namespace
+    // the host mount is made in and Hermit makes none of its own (K3b): the
+    // table is that namespace's base mountpoints. `--strict` refuses
+    // `--no-namespace`, so that run is not strict, and reads the two files
+    // with `cat`.
+    let run = |mount_first: &str, no_namespace: bool| {
+        let hermit_args: &[&str] = if no_namespace {
+            &[
+                "run",
+                "--no-namespace",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--base-env=minimal",
+                "--",
+                "/bin/cat",
+                "/proc/self/mountinfo",
+                "/proc/self/mounts",
+            ]
+        } else {
+            &[
+                "run",
+                "--strict",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--base-env=minimal",
+                "--",
+            ]
+        };
         let mut command = Command::new("unshare");
         command
             .args([
@@ -7577,17 +7662,15 @@ fn the_guest_mount_table_ignores_a_host_mount_made_before_the_run() {
             .arg(mount_first)
             .args(["timeout", "--kill-after", "5s", "120s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
-            .args([
-                "run",
-                "--strict",
-                "--epoch=2026-01-01T00:00:00Z",
-                "--base-env=minimal",
-                "--",
-            ])
-            .arg(guest)
-            .arg("--hermit");
+            .args(hermit_args);
+        if !no_namespace {
+            command.arg(guest).arg("--hermit");
+        }
         let output = hermit_test::hermit_output(
-            &format!("hermit under unshare, host mount first: {mount_first}"),
+            &format!(
+                "hermit under unshare, host mount first: {mount_first}, \
+                 no namespace: {no_namespace}"
+            ),
             &mut command,
         );
         assert!(
@@ -7598,17 +7681,464 @@ fn the_guest_mount_table_ignores_a_host_mount_made_before_the_run() {
         );
         String::from_utf8(output.stdout).expect("the guest prints UTF-8")
     };
-    let quiet = run("no");
-    let churned = run("yes");
-    assert_eq!(
-        churned, quiet,
-        "a host mount changed the guest's mount table"
-    );
-    let extra = extra.to_str().expect("the mount point is UTF-8");
+    let extra_path = extra.to_str().expect("the mount point is UTF-8");
+    for no_namespace in [false, true] {
+        let quiet = run("no", no_namespace);
+        let churned = run("yes", no_namespace);
+        assert_eq!(
+            churned, quiet,
+            "a host mount changed the guest's mount table (no namespace: {no_namespace})"
+        );
+        assert!(
+            !churned.contains(extra_path),
+            "the guest sees the host mount (no namespace: {no_namespace}): {churned}"
+        );
+    }
+}
+
+/// The mountpoints of `mountinfo`'s rows, in order.
+fn mountinfo_mountpoints(mountinfo: &str) -> Vec<String> {
+    mountinfo
+        .lines()
+        .map(|row| {
+            row.split(' ')
+                .nth(4)
+                .unwrap_or_else(|| panic!("a mountinfo row without a mountpoint: {row:?}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+/// This test process's own mount rows (`/proc/thread-self/mountinfo`): each
+/// row's mount ID, parent ID and mountpoint, as the kernel escapes it.
+fn own_mount_rows() -> Vec<(u64, u64, String)> {
+    fs::read_to_string("/proc/thread-self/mountinfo")
+        .expect("read this thread's mountinfo")
+        .lines()
+        .map(|row| {
+            let fields = row.split(' ').collect::<Vec<_>>();
+            (
+                fields[0].parse().expect("a decimal mount ID"),
+                fields[1].parse().expect("a decimal parent ID"),
+                fields[4].to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// The mountpoints of the mount holding `path` in `rows` (the last row at
+/// the longest mountpoint above it, as the top of a stack is listed last)
+/// and of each of its ancestors.
+fn holding_mount_and_ancestors(rows: &[(u64, u64, String)], path: &Path) -> BTreeSet<String> {
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let holding = rows
+        .iter()
+        .filter(|(_, _, mountpoint)| path.starts_with(mountpoint))
+        .max_by_key(|(_, _, mountpoint)| Path::new(mountpoint).components().count());
+    let mut found = BTreeSet::new();
+    let mut current = holding;
+    while let Some((_, parent, mountpoint)) = current {
+        if !found.insert(mountpoint.clone()) {
+            break;
+        }
+        current = rows.iter().rev().find(|(row, _, _)| row == parent);
+    }
+    found
+}
+
+/// The table of a run in a namespace Hermit made no mount in (`--no-namespace`,
+/// a library KVM run), as `mountinfo` shows it, against this test process's
+/// own namespace, which is that one: `/` is shown; every base mountpoint
+/// mounted here is shown; so is the mount holding the guest's working
+/// directory `cwd`, and the one holding `/tmp`; and every row is one of
+/// those or an ancestor of a launch mount. Returns the rows' mountpoints.
+fn assert_unplanned_table(what: &str, mountinfo: &str, cwd: &Path) -> Vec<String> {
+    let shown = mountinfo_mountpoints(mountinfo);
+    let rows = own_mount_rows();
+    let here = rows
+        .iter()
+        .map(|(_, _, mountpoint)| mountpoint.as_str())
+        .collect::<BTreeSet<_>>();
+    let launch = holding_mount_and_ancestors(&rows, cwd)
+        .into_iter()
+        .chain(holding_mount_and_ancestors(&rows, Path::new("/tmp")))
+        .collect::<BTreeSet<_>>();
     assert!(
-        !churned.contains(extra),
-        "the guest sees the host mount: {churned}"
+        shown.iter().any(|mountpoint| mountpoint == "/"),
+        "{what} shows no / row: {mountinfo}"
     );
+    for base in detcore_model::container_mounts::BASE_MOUNTPOINTS {
+        if here.contains(base) {
+            assert!(
+                shown.iter().any(|mountpoint| mountpoint == base),
+                "{what} omits the base mountpoint {base}, which is mounted here: {mountinfo}"
+            );
+        }
+    }
+    for mountpoint in &launch {
+        assert!(
+            shown.contains(mountpoint),
+            "{what} omits the launch mount (or ancestor) {mountpoint}: {mountinfo}"
+        );
+    }
+    for mountpoint in &shown {
+        assert!(
+            detcore_model::container_mounts::BASE_MOUNTPOINTS.contains(&mountpoint.as_str())
+                || launch.contains(mountpoint),
+            "{what} shows {mountpoint}, which is neither a base mountpoint nor a launch \
+             mount: {mountinfo}"
+        );
+    }
+    shown
+}
+
+/// `--no-namespace` runs the guest in Hermit's own namespace, where Hermit
+/// installs no mount. Detcore still renders the guest's mount files there, on
+/// every backend, from the table of that namespace's launch mounts (the ones
+/// holding the guest's working directory and `/tmp`, with their ancestors)
+/// and base mountpoints (K3b of
+/// https://github.com/rrnewton/hermit/issues/4213); KVM keeps no mount table
+/// of its own. Checked on ptrace and KVM: exactly those rows are shown
+/// (`assert_unplanned_table`), `/proc/mounts` has `mountinfo`'s rows in
+/// order, a file's fdinfo `mnt_id` names a row, and the two backends show
+/// the same mountpoints. On KVM the run reaches bitwise parity under
+/// `--verify-strict` with nonzero equal INFO counts, without `--strict`
+/// (which refuses `--no-namespace`). On ptrace two runs print the same
+/// bytes: its logs name host thread IDs, which differ between runs without a
+/// PID namespace, so `--verify-strict` cannot match there, before this change
+/// as after it.
+#[test]
+fn no_namespace_runs_render_the_base_mount_table() {
+    let test = "no_namespace_runs_render_the_base_mount_table";
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut shown = Vec::new();
+    for backend in ["ptrace", "kvm"] {
+        if backend == "kvm" && kvm_unavailable(test) {
+            eprintln!("{test}: NOT COMPARED: kvm is not available on this host");
+            continue;
+        }
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let mut args = vec!["--backend", backend, "run", "--no-namespace"];
+        if backend == "kvm" {
+            args.extend(["--verify", "--verify-strict", "--verify-json", &report_arg]);
+        }
+        args.extend([
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            "/bin/sh",
+            "-c",
+            "exec 3</bin/sh; pwd -P; echo __MOUNTINFO__; cat /proc/self/mountinfo; \
+             echo __MOUNTS__; cat /proc/mounts; echo __FDINFO__; cat /proc/self/fdinfo/3",
+        ]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let text = stdout(&output);
+        if backend == "kvm" {
+            let verdict: serde_json::Value =
+                serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                    .expect("parse the verification report");
+            assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+            let compared = &verdict["compared_log_messages"];
+            assert!(
+                compared["left"].as_u64().is_some_and(|count| count > 0)
+                    && compared["left"] == compared["right"],
+                "{backend} compared no INFO messages: {verdict}"
+            );
+        } else {
+            let again = hermit(&args);
+            assert_success(&again, &args);
+            assert_eq!(
+                stdout(&again),
+                text,
+                "{backend}: a second run printed other bytes"
+            );
+        }
+        let (cwd, rest) = text
+            .split_once("\n__MOUNTINFO__\n")
+            .unwrap_or_else(|| panic!("{backend}: no mountinfo separator: {text}"));
+        let (mountinfo, rest) = rest
+            .split_once("__MOUNTS__\n")
+            .unwrap_or_else(|| panic!("{backend}: no mounts separator: {text}"));
+        let (mounts, fdinfo) = rest
+            .split_once("__FDINFO__\n")
+            .unwrap_or_else(|| panic!("{backend}: no fdinfo separator: {text}"));
+        let mountpoints = assert_unplanned_table(backend, mountinfo, Path::new(cwd));
+        let mounts_mountpoints = mounts
+            .lines()
+            .map(|row| row.split(' ').nth(1).unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mounts_mountpoints, mountpoints,
+            "{backend}: /proc/mounts' rows are not mountinfo's: {text}"
+        );
+        let mount_id = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("mnt_id:\t"))
+            .unwrap_or_else(|| panic!("{backend}: fdinfo has no mnt_id: {text}"));
+        assert!(
+            mountinfo
+                .lines()
+                .any(|row| row.split(' ').next() == Some(mount_id)),
+            "{backend}: /bin/sh's mnt_id {mount_id} names no row: {text}"
+        );
+        shown.push((backend, mountpoints));
+    }
+    if let [(_, ptrace), (_, kvm)] = shown.as_slice() {
+        assert_eq!(kvm, ptrace, "KVM shows other mountpoints than ptrace");
+    }
+}
+
+/// Under `--no-namespace`, a mount holding the guest's working directory is
+/// shown, and a host mount that is neither a base mountpoint nor a launch
+/// mount stays hidden: a file on it reports, in fdinfo `mnt_id`, the row of
+/// its nearest shown ancestor (K3b of
+/// https://github.com/rrnewton/hermit/issues/4213). Hermit runs in a user and
+/// mount namespace of the test's own, where two tmpfs mounts are made below
+/// the test's directory: one is the guest's working directory, the other
+/// holds the file. On ptrace and, where available, KVM.
+#[test]
+fn a_no_namespace_run_shows_its_working_mount_and_hides_another() {
+    let test = "a_no_namespace_run_shows_its_working_mount_and_hides_another";
+    let _guard = hermit_run_guard();
+    let root = process_build_root("no-namespace-launch-mounts");
+    let launch = root.join("launch");
+    let hidden = root.join("hidden");
+    fs::create_dir_all(&launch).expect("create the launch mount point");
+    fs::create_dir_all(&hidden).expect("create the hidden mount point");
+    let script = r#"
+        launch=$1; hidden=$2; shift 2
+        mount -t tmpfs none "$launch" || exit 3
+        mount -t tmpfs none "$hidden" || exit 4
+        echo hello > "$hidden/f" || exit 5
+        cd "$launch" || exit 6
+        exec "$@"
+    "#;
+    let statx_guest = compiled_c_guest(&STATX_MOUNT_ID_GUEST, "statx_mount_id");
+    let guest = format!(
+        "exec 3<{hidden}/f; echo __MOUNTINFO__; cat /proc/self/mountinfo; echo __FDINFO__; \
+         cat /proc/self/fdinfo/3; echo __STATX__; {statx} {hidden}/f",
+        hidden = hidden.display(),
+        statx = statx_guest.display(),
+    );
+    for backend in ["ptrace", "kvm"] {
+        if backend == "kvm" && kvm_unavailable(test) {
+            eprintln!("{test}: NOT COMPARED: kvm is not available on this host");
+            continue;
+        }
+        let mut command = Command::new("unshare");
+        command
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "sh",
+                "-c",
+                script,
+                "sh",
+            ])
+            .arg(&launch)
+            .arg(&hidden)
+            .args(["timeout", "--kill-after", "5s", "120s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "--backend",
+                backend,
+                "run",
+                "--no-namespace",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--base-env=minimal",
+                "--",
+                "/bin/sh",
+                "-c",
+                &guest,
+            ]);
+        let output = hermit_test::hermit_output(&format!("{test} on {backend}"), &mut command);
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "{backend}: {text}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (_, rest) = text
+            .split_once("__MOUNTINFO__\n")
+            .unwrap_or_else(|| panic!("{backend}: no mountinfo separator: {text}"));
+        let (mountinfo, rest) = rest
+            .split_once("__FDINFO__\n")
+            .unwrap_or_else(|| panic!("{backend}: no fdinfo separator: {text}"));
+        let (fdinfo, statx) = rest
+            .split_once("__STATX__\n")
+            .unwrap_or_else(|| panic!("{backend}: no statx separator: {text}"));
+        let rows = mountinfo
+            .lines()
+            .map(|row| {
+                let fields = row.split(' ').collect::<Vec<_>>();
+                (fields[0].to_owned(), fields[4].to_owned())
+            })
+            .collect::<Vec<_>>();
+        let launch = launch.to_str().expect("UTF-8 path");
+        let hidden = hidden.to_str().expect("UTF-8 path");
+        assert!(
+            rows.iter().any(|(_, mountpoint)| mountpoint == launch),
+            "{backend}: the working directory's mount {launch} is not shown: {mountinfo}"
+        );
+        assert!(
+            !rows.iter().any(|(_, mountpoint)| mountpoint == hidden),
+            "{backend}: the other host mount {hidden} is shown: {mountinfo}"
+        );
+        let nearest = rows
+            .iter()
+            .filter(|(_, mountpoint)| Path::new(hidden).starts_with(mountpoint))
+            .max_by_key(|(_, mountpoint)| Path::new(mountpoint).components().count())
+            .unwrap_or_else(|| panic!("{backend}: no shown row holds {hidden}: {mountinfo}"));
+        let mount_id = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("mnt_id:\t"))
+            .unwrap_or_else(|| panic!("{backend}: fdinfo has no mnt_id: {text}"));
+        assert_eq!(
+            mount_id, nearest.0,
+            "{backend}: a file on the hidden {hidden} reports mount {mount_id}, not its nearest \
+             shown ancestor {} at {}: {text}",
+            nearest.0, nearest.1
+        );
+        // STATX_MNT_ID names the same row, asked for or not, and statx sets
+        // its bit either way, as Linux's vfs_statx_path does.
+        assert_eq!(
+            statx,
+            format!(
+                "statx asked: {id} 1\nstatx unasked: {id} 1\nfdinfo: {id}\n",
+                id = nearest.0
+            ),
+            "{backend}: STATX_MNT_ID of a file on the hidden {hidden}: {text}"
+        );
+    }
+}
+
+/// Under `--no-namespace`, a run started from a working directory that was
+/// removed still starts when `--workdir` names an absolute directory: the
+/// mount table's launch mount is taken from that directory, and Hermit's own
+/// working directory is never asked for its name (K3b round 2, Codex P2).
+#[test]
+fn a_no_namespace_run_with_an_absolute_workdir_starts_from_a_deleted_directory() {
+    let directory = process_build_root("deleted-working-directory").join("gone");
+    fs::create_dir_all(&directory).expect("create the working directory to delete");
+    let script = r#"
+        cd "$1" || exit 3
+        rmdir "$1" || exit 4
+        shift
+        exec "$@"
+    "#;
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", script, "sh"])
+        .arg(&directory)
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "run",
+            "--no-namespace",
+            "--workdir=/",
+            "--manifest=never",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            "/bin/sh",
+            "-c",
+            "pwd",
+        ]);
+    let output = hermit_test::hermit_output("hermit from a deleted directory", &mut command);
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "/\n");
+}
+
+/// A directory opened below a received `/proc` descriptor that another
+/// thread replaces during the open behaves as the object the open returned
+/// (K3b round 2, Codex P1). Without sequentialized threads Detcore names the
+/// received descriptor before the kernel opens below it; the
+/// `procfs_spelling_resolved` race probe widens that window so the guest's
+/// second thread replaces the descriptor with an ordinary directory inside it,
+/// as host timing alone can. The returned descriptor then holds that
+/// directory's `self`, and must not carry `/proc/self` provenance: `marker`
+/// opens below it and `mountinfo` is ENOENT. A deterministic run cannot show
+/// this (no other thread runs between the two points), so the test uses the
+/// relaxed mode and the probe; the guest checks the same natively first.
+#[test]
+fn a_received_directory_replaced_during_an_open_is_what_the_open_returned() {
+    let guest = compiled_c_guest(&RECEIVED_DIRECTORY_SWAP_GUEST, "received_directory_swap");
+    let native = Command::new(guest)
+        .output()
+        .expect("run received-directory-swap natively");
+    assert!(native.status.success(), "native: {native:?}");
+    // The second thread busy-waits about 20 ms (natively) after the open
+    // starts, well inside the probe's 3 s wait after Detcore has named the
+    // descriptor, and well after that naming, which takes about a
+    // millisecond. Without a timeslice no preemption stop slows its loop.
+    let spin = "20000000";
+    let args = [
+        "run",
+        "--no-sequentialize-threads",
+        "--max-timeslice=disabled",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        spin,
+    ];
+    let mut command = hermit_command(&args);
+    command
+        .env("HERMIT_RACE_PROBE", "procfs_spelling_resolved=3000")
+        .env("HERMIT_RACE_PROBE_SEED", "1");
+    let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "replacement\n",
+        "the replacement did not land inside the probe's window: {}",
+        stderr(&output)
+    );
+}
+
+/// A library caller that builds no container gets the guest's mount files
+/// from Detcore on KVM too, whose backend keeps no mount table of its own: the
+/// table of this process's namespace's launch mounts and base mountpoints
+/// (K3b of https://github.com/rrnewton/hermit/issues/4213).
+#[test]
+fn a_library_kvm_run_without_a_container_renders_the_base_mount_table() {
+    if kvm_unavailable("a_library_kvm_run_without_a_container_renders_the_base_mount_table") {
+        return;
+    }
+    // A real run needs more stack than a test thread has in a debug build;
+    // the command is not `Send`, so it is built on that thread.
+    let output = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(|| {
+            let mut command = reverie::process::Command::new("/bin/cat");
+            command.arg("/proc/self/mountinfo");
+            let config = hermit::DetConfig {
+                max_timeslice: None,
+                ..Default::default()
+            };
+            hermit::run_with_output_backend(command, config, false, &None, hermit::Backend::Kvm)
+                .map_err(|error| format!("{error:#}"))
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+        .expect("the library KVM run");
+    let text = String::from_utf8(output.stdout).expect("mountinfo is UTF-8");
+    assert_eq!(
+        output.status,
+        reverie::process::ExitStatus::Exited(0),
+        "stdout:\n{text}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cwd = std::env::current_dir().expect("the test's working directory");
+    assert_unplanned_table("the library KVM run", &text, &cwd);
 }
 
 /// DBT launches through the same container as ptrace

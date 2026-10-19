@@ -1686,7 +1686,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +3 from 8c4d53e7: 1042.
     // Eight shared exec-stop command, ownership and refusal regressions: 1050.
     // And the R2b-2 stage 3 record-version test (https://github.com/rrnewton/hermit/issues/4273): 1051, listed.
-    ("test.hermit_unit", 1051),
+    // And the four K3b unit tests (unplanned table, thread mount namespace,
+    // launch capture order, missing launch mount;
+    // https://github.com/rrnewton/hermit/issues/4213): 1055.
+    ("test.hermit_unit", 1055),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3681,7 +3684,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 94d8ef71: 548.
     // And the fifteen R2b-2 stage 3 CLI tests, the A5 delivery-check test
     // among them (https://github.com/rrnewton/hermit/issues/4273): 563, listed.
-    ("test.cli", 563),
+    // And the five K3b CLI tests (no_namespace_runs_render_the_base_mount_table,
+    // a_library_kvm_run_without_a_container_renders_the_base_mount_table,
+    // a_no_namespace_run_shows_its_working_mount_and_hides_another,
+    // a_no_namespace_run_with_an_absolute_workdir_starts_from_a_deleted_directory,
+    // a_received_directory_replaced_during_an_open_is_what_the_open_returned;
+    // https://github.com/rrnewton/hermit/issues/4213): 568.
+    ("test.cli", 568),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4146,7 +4155,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two R2b-2 stage 2 tests: 478, listed.
     // And the same four 4505 signal tests: 482, listed.
     // And the same fifteen R2b-2 stage 3 CLI tests: 497, listed.
-    ("test.cli_on_host", 497),
+    // And the same five K3b CLI tests: 502.
+    ("test.cli_on_host", 502),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4786,7 +4796,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +3 from 8c4d53e7: 1042.
     // Eight shared exec-stop command, ownership and refusal regressions: 1050.
     // And the same R2b-2 stage 3 record-version test: 1051, listed.
-    ("test.hermit_unit_on_host", 1051),
+    // And the same four K3b unit tests: 1055.
+    ("test.hermit_unit_on_host", 1055),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

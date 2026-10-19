@@ -2899,8 +2899,11 @@ fn kvm_cwd_resolution_error(requested_cwd: &Path, error: &std::io::Error) -> Err
 /// ID on first observation, and a later kernel-view mountinfo that shows it is
 /// not an ordered subset and is refused. The container mount table never shows
 /// it.
-/// Library and no-namespace callers without provenance retain this capture.
-/// KVM does not permit guest namespace changes.
+/// A library caller that built no container and supplies no provenance gets
+/// this capture; `--no-namespace` runs supply it from Hermit's own namespace
+/// (`complete_container_config`). Either way Detcore renders the guest's mount
+/// files from the container mount table. KVM does not permit guest namespace
+/// changes.
 fn prepare_kvm_mountinfo_config(
     config: &mut DetConfig,
     namespace: impl FnOnce() -> Result<detcore_model::config::MountNamespaceIdentity, Error>,
@@ -3004,6 +3007,28 @@ async fn run_kvm(
     capture_output: bool,
 ) -> Result<Output, Error> {
     let dispatch_started = Instant::now();
+    // A caller that built no container (a library caller): the KVM guest's
+    // host file operations run in this process's namespace, whatever its
+    // command asks (the backend applies no chroot or mount of the command),
+    // so its table is this namespace's. A caller with no provenance at all
+    // takes the order from the same read; malformed provenance is still
+    // refused below.
+    if config.container_mount_table.is_none() {
+        let launch_cwd = command
+            .get_current_dir()
+            .map_or_else(|| Path::new(".").to_owned(), Path::to_owned);
+        let (table, order) = unplanned_container_mount_table(&launch_cwd)?;
+        if !config.mountinfo_mount_ids_captured
+            && config.mountinfo_mount_ids.is_empty()
+            && config.mount_id_assignment_order.is_empty()
+            && config.mountinfo_mount_namespace.is_none()
+        {
+            config.mountinfo_mount_namespace = Some(current_mount_namespace()?);
+            config.mountinfo_mount_ids = order;
+            config.mountinfo_mount_ids_captured = true;
+        }
+        config.container_mount_table = Some(table);
+    }
     let keep = config
         .container_mount_table
         .as_ref()
@@ -5131,16 +5156,19 @@ pub struct MountProvenance {
 /// `NS_GET_MNTNS_ID`, `_IOR(NSIO, 5, __u64)` in Linux's uapi/linux/nsfs.h.
 const NS_GET_MNTNS_ID: libc::c_ulong = (2 << 30) | (8 << 16) | (0xb7 << 8) | 5;
 
-/// This process's mount namespace (`DetConfig::mountinfo_mount_namespace`):
+/// The calling thread's mount namespace (`DetConfig::mountinfo_mount_namespace`):
 /// the kernel's namespace ID from `ioctl(NS_GET_MNTNS_ID)` on
-/// `/proc/self/ns/mnt`, and the descriptor's device and inode numbers. A
+/// `/proc/thread-self/ns/mnt`, and the descriptor's device and inode numbers.
+/// The calling thread's, not the thread group leader's: a library caller's
+/// thread can have a mount namespace of its own, and every capture here
+/// (`/proc/thread-self/mountinfo` and `fdinfo`) reads that same thread's. A
 /// kernel without the ioctl (ENOTTY or EINVAL) yields no ID; any other failure
 /// is an error.
 pub fn current_mount_namespace() -> Result<detcore_model::config::MountNamespaceIdentity, Error> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
-    let file = fs::File::open("/proc/self/ns/mnt")
-        .context("failed to open this process's mount namespace")?;
+    let file = fs::File::open("/proc/thread-self/ns/mnt")
+        .context("failed to open this thread's mount namespace")?;
     let metadata = file
         .metadata()
         .context("failed to read this process's mount namespace")?;
@@ -5167,10 +5195,49 @@ pub fn current_mount_namespace() -> Result<detcore_model::config::MountNamespace
     })
 }
 
-/// Capture the current mount namespace's raw IDs in the exact row/parent order
-/// used by Detcore's canonical mountinfo mapping.
+/// The calling thread's mount table (`/proc/thread-self/mountinfo`): the rows
+/// of the namespace [`current_mount_namespace`] names.
+pub fn thread_mountinfo() -> Result<Vec<u8>, Error> {
+    fs::read("/proc/thread-self/mountinfo")
+        .context("Failed to read this thread's mount table (/proc/thread-self/mountinfo)")
+}
+
+/// The raw mount ID of the mount `path` reaches in the calling thread's
+/// namespace, from the `fdinfo` of an `O_PATH` descriptor held on it; `None`
+/// where it cannot be opened. O_PATH pins the object without read
+/// permission.
+fn thread_mount_id_of(path: &Path) -> Option<u64> {
+    held_mount_id(&hold_path(path, false).ok()?)
+}
+
+/// An `O_PATH` descriptor held on `path` (a directory, with `directory`),
+/// resolved as `chdir` and `open` resolve it: following symbolic links, and
+/// a relative path from the calling thread's working directory, whose name is
+/// never asked for. Holding it pins the mount it reaches, and the lookup has
+/// already triggered any automount on the way.
+fn hold_path(path: &Path, directory: bool) -> nix::Result<std::os::fd::OwnedFd> {
+    use nix::fcntl::OFlag;
+    let flags = OFlag::O_PATH
+        | OFlag::O_CLOEXEC
+        | if directory {
+            OFlag::O_DIRECTORY
+        } else {
+            OFlag::empty()
+        };
+    nix::fcntl::open(path, flags, nix::sys::stat::Mode::empty())
+}
+
+/// The raw mount ID of the mount `held` reaches, from its
+/// `/proc/thread-self/fdinfo`.
+fn held_mount_id(held: &std::os::fd::OwnedFd) -> Option<u64> {
+    let fdinfo = fs::read(format!("/proc/thread-self/fdinfo/{}", held.as_raw_fd())).ok()?;
+    detcore_model::procfs::parse_fdinfo_mount_id(&fdinfo)
+}
+
+/// Capture the calling thread's mount namespace's raw IDs in the exact
+/// row/parent order used by Detcore's canonical mountinfo mapping.
 pub fn capture_mountinfo_identity_order() -> Result<Vec<u64>, Error> {
-    mountinfo_identity_order_from_raw(&fs::read("/proc/self/mountinfo")?)
+    mountinfo_identity_order_from_raw(&thread_mountinfo()?)
 }
 
 /// [`capture_mountinfo_identity_order`], keeping every row whose mount ID is
@@ -5180,7 +5247,127 @@ pub fn capture_mountinfo_identity_order() -> Result<Vec<u64>, Error> {
 pub fn capture_mountinfo_identity_order_keeping(
     keep: &std::collections::BTreeSet<u64>,
 ) -> Result<Vec<u64>, Error> {
-    mountinfo_identity_order_keeping_from_raw(&fs::read("/proc/self/mountinfo")?, keep)
+    mountinfo_identity_order_keeping_from_raw(&thread_mountinfo()?, keep)
+}
+
+/// Each of [`BASE_MOUNTPOINTS`](detcore_model::container_mounts::BASE_MOUNTPOINTS)
+/// that the calling thread can open, as the kernel escapes it in `mountinfo`,
+/// with the mount ID of a descriptor held on it: rule 2's proof of
+/// `ContainerMountTable::select`. The base mountpoints hold no byte the kernel
+/// escapes (space, tab, newline or backslash), so each is its own escaped form.
+pub fn base_mountpoint_mount_ids() -> Vec<(Vec<u8>, u64)> {
+    detcore_model::container_mounts::BASE_MOUNTPOINTS
+        .iter()
+        .filter_map(|mountpoint| {
+            let id = thread_mount_id_of(Path::new(mountpoint))?;
+            Some((mountpoint.as_bytes().to_vec(), id))
+        })
+        .collect()
+}
+
+/// A container mount table and the raw identity order Detcore validates it
+/// against ([`unplanned_container_mount_table`]).
+pub type UnplannedMountTable = (
+    detcore_model::container_mounts::ContainerMountTable,
+    Vec<u64>,
+);
+
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4213): Review
+// the container mount table of a run in a namespace Hermit did not make: the
+// membership rule of K3a with the launch mounts in place of Hermit's
+// installations.
+/// The container mount table of a run whose guest runs in the calling
+/// thread's own mount namespace, in which Hermit installed no mount
+/// (`--no-namespace`, or a library caller that built no container, on KVM),
+/// and the raw identity order Detcore validates it against, both from one
+/// read of the namespace's rows. Shown are:
+/// - the launch mounts: the mount holding `launch_cwd`, the guest's working
+///   directory at launch, and the mount holding the host's `/tmp`, which the
+///   guest shares, with their ancestors (rules 1 and 3 of
+///   `ContainerMountTable::select`, as for Hermit's installations), so that
+///   `df .` and `findmnt -T .` from a checkout find their row;
+/// - the base mountpoints mounted here (rule 2).
+///
+/// Both are facts of the launch, fixed before the guest starts, as the base
+/// mountpoints are. No other host mount is shown; a file on one reports its
+/// nearest shown ancestor. A shown row's parent is its nearest shown
+/// ancestor, as for every table.
+///
+/// `launch_cwd` may be relative (`.` for the inherited working directory):
+/// it is resolved from the calling thread's working directory as the guest's
+/// `chdir` will resolve it, without asking that directory for its name, so a
+/// removed working directory does not stop a launch with an absolute
+/// `--workdir`.
+pub fn unplanned_container_mount_table(launch_cwd: &Path) -> Result<UnplannedMountTable, Error> {
+    unplanned_container_mount_table_with(launch_cwd, thread_mountinfo)
+}
+
+/// [`unplanned_container_mount_table`], reading the mount table with `read`.
+/// The launch directories and the base mountpoints are resolved and held
+/// first, then the table is read, then the mount IDs are taken from the held
+/// descriptors: a mount that resolving a launch directory creates (an
+/// automount on its path) is already in the rows read, and one that leaves
+/// afterwards is still named by them. A launch mount the read does not list
+/// is refused, never dropped.
+fn unplanned_container_mount_table_with(
+    launch_cwd: &Path,
+    read: impl FnOnce() -> Result<Vec<u8>, Error>,
+) -> Result<UnplannedMountTable, Error> {
+    let working = hold_path(launch_cwd, true).with_context(|| {
+        format!(
+            "the guest's working directory {} cannot be opened for its mount table",
+            launch_cwd.display()
+        )
+    })?;
+    // The host /tmp, which the guest shares, if there is one.
+    let tmp = hold_path(Path::new("/tmp"), true).ok();
+    let base = detcore_model::container_mounts::BASE_MOUNTPOINTS
+        .iter()
+        .filter_map(|mountpoint| Some((*mountpoint, hold_path(Path::new(mountpoint), false).ok()?)))
+        .collect::<Vec<_>>();
+    let raw = read()?;
+    let launch = std::iter::once(&working)
+        .chain(tmp.as_ref())
+        .map(|held| {
+            held_mount_id(held)
+                .ok_or_else(|| anyhow!("a launch directory's mount ID cannot be read"))
+        })
+        .collect::<Result<std::collections::BTreeSet<_>, Error>>()?;
+    let base = base
+        .iter()
+        .filter_map(|(mountpoint, held)| {
+            Some((mountpoint.as_bytes().to_vec(), held_mount_id(held)?))
+        })
+        .collect::<Vec<_>>();
+    unplanned_container_mount_table_from(&raw, &launch, &base)
+}
+
+fn unplanned_container_mount_table_from(
+    raw: &[u8],
+    launch: &std::collections::BTreeSet<u64>,
+    base: &[(Vec<u8>, u64)],
+) -> Result<UnplannedMountTable, Error> {
+    use detcore_model::container_mounts::ContainerMountTable;
+    let rows = detcore_model::container_mounts::parse_container_mounts(raw)
+        .ok_or_else(|| anyhow!("this thread's mount table has a malformed row"))?;
+    if let Some(missing) = launch
+        .iter()
+        .find(|id| !rows.iter().any(|row| row.raw_mount_id == **id))
+    {
+        anyhow::bail!(
+            "the launch mount {missing} (holding the guest's working directory or /tmp) is not in \
+             this thread's mount table, read after it was resolved; refusing a table that would \
+             omit the mount the guest starts on"
+        );
+    }
+    let never = rows
+        .iter()
+        .filter(|row| row.is_ephemeral_host_seed())
+        .map(|row| row.raw_mount_id)
+        .collect();
+    let table = ContainerMountTable::select(&rows, launch, base, &never);
+    let order = mountinfo_identity_order_keeping_from_raw(raw, &table.shown_mount_ids())?;
+    Ok((table, order))
 }
 
 /// Producer provenance follows the guest mount model: ephemeral host seed rows
@@ -5218,7 +5405,7 @@ fn mountinfo_identity_order_from(contents: &[u8]) -> Result<Vec<u64>, Error> {
     use std::collections::BTreeSet;
 
     let rows = detcore_model::procfs::parse_mountinfo(contents)
-        .ok_or_else(|| anyhow!("malformed /proc/self/mountinfo"))?;
+        .ok_or_else(|| anyhow!("malformed mountinfo"))?;
     let mut visible = Vec::new();
     let mut parents = Vec::new();
     let mut seen = BTreeSet::new();
@@ -5883,7 +6070,7 @@ mod tests {
                 || mountinfo_identity_order_from(contents),
             )
             .unwrap_err();
-            assert!(format!("{error:#}").contains("malformed /proc/self/mountinfo"));
+            assert!(format!("{error:#}").contains("malformed mountinfo"));
             assert_eq!(serde_json::to_value(&candidate).unwrap(), before);
         }
         let mut candidate = config;
@@ -5959,6 +6146,181 @@ mod tests {
         let error =
             prepare_kvm_mountinfo_config(&mut stale, || Ok(NAMESPACE), snapshot).unwrap_err();
         assert!(error.to_string().contains("names mount 40"), "{error:#}");
+    }
+
+    /// A run in a namespace Hermit made no mount in shows only the base
+    /// mountpoints mounted at their very paths, maps a file on any other
+    /// mount to its nearest shown ancestor, and validates against an order
+    /// read from the same bytes (https://github.com/rrnewton/hermit/issues/4213).
+    #[test]
+    fn an_unplanned_table_shows_only_the_base_mountpoints() {
+        let namespace = b"10 1 8:1 / / rw - ext4 /dev/root rw\n\
+                          20 10 0:22 / /proc rw - proc proc rw\n\
+                          30 10 0:23 / /dev rw - devtmpfs dev rw\n\
+                          40 10 0:24 / /data/eden rw - fuse.edenfs eden rw\n\
+                          41 30 0:25 / /dev/shm rw - tmpfs tmpfs rw\n\
+                          50 10 0:26 / /run/user/1000 rw - tmpfs tmpfs rw\n";
+        // /run is no mount here: its descriptor reaches the root mount.
+        let base = [
+            (b"/".to_vec(), 10),
+            (b"/proc".to_vec(), 20),
+            (b"/dev".to_vec(), 30),
+            (b"/dev/shm".to_vec(), 41),
+            (b"/run".to_vec(), 10),
+        ];
+        for mountpoint in detcore_model::container_mounts::BASE_MOUNTPOINTS {
+            assert!(
+                !mountpoint.bytes().any(|byte| b" \t\n\\".contains(&byte)),
+                "{mountpoint} needs mountinfo escaping"
+            );
+        }
+        let no_launch = std::collections::BTreeSet::new();
+        let (table, order) =
+            unplanned_container_mount_table_from(namespace, &no_launch, &base).unwrap();
+        assert_eq!(table.shown_mount_ids(), [10, 20, 30, 41].into());
+        assert_eq!(table.shown_mount_id(40), 10);
+        assert_eq!(table.shown_mount_id(50), 10);
+        assert_eq!(order, [10, 20, 30, 40, 41, 50, 1]);
+        let rendered = String::from_utf8(table.mountinfo()).unwrap();
+        assert!(!rendered.contains("/data/eden") && !rendered.contains("/run/user"));
+        // A launch from a checkout on /data/eden shows that mount too; a
+        // file on the still hidden /run/user/1000 reports the root.
+        let launch = [40].into();
+        let (table, order) =
+            unplanned_container_mount_table_from(namespace, &launch, &base).unwrap();
+        assert_eq!(table.shown_mount_ids(), [10, 20, 30, 40, 41].into());
+        assert_eq!(table.shown_mount_id(40), 40);
+        assert_eq!(table.shown_mount_id(50), 10);
+        assert_eq!(order, [10, 20, 30, 40, 41, 50, 1]);
+    }
+
+    /// Runs test `name` again under `unshare --user --map-root-user
+    /// --mount`, where it may mount, and returns true in this process, which
+    /// then has nothing more to check; returns false in that child, which runs
+    /// the test's body. `unshare(CLONE_NEWUSER)` refuses a multithreaded
+    /// process, so the test cannot enter one itself. Where user namespaces
+    /// are unavailable the test is skipped, saying why.
+    fn rerun_in_user_namespace(name: &str) -> bool {
+        const CHILD: &str = "HERMIT_TEST_USER_NAMESPACE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return false;
+        }
+        let probe = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "true"])
+            .output();
+        if !probe.as_ref().is_ok_and(|probe| probe.status.success()) {
+            eprintln!("SKIPPED {name}: user namespaces are unavailable here: {probe:?}");
+            return true;
+        }
+        let output = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("run the test under unshare");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the child failed or ran no test:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    /// A library caller's thread with a mount namespace of its own captures
+    /// its own namespace's rows, identity and mount IDs (all through
+    /// `/proc/thread-self`), not the thread group leader's: otherwise the
+    /// leader's rows and the thread's descriptor mount IDs never meet, and
+    /// the table shows nothing, not even `/`. A thread may unshare its mount
+    /// namespace only with CAP_SYS_ADMIN, which an unprivileged test gets in
+    /// a user namespace of its own (`rerun_in_user_namespace`); there the test
+    /// thread, not the leader, unshares the mount namespace.
+    #[test]
+    fn a_thread_with_its_own_mount_namespace_captures_its_own_view() {
+        use std::os::unix::fs::MetadataExt;
+        if rerun_in_user_namespace(
+            "tests::a_thread_with_its_own_mount_namespace_captures_its_own_view",
+        ) {
+            return;
+        }
+        let checked = std::thread::spawn(|| {
+            // SAFETY: unshare takes no pointer.
+            assert_eq!(
+                unsafe { libc::unshare(libc::CLONE_NEWNS) },
+                0,
+                "unshare(CLONE_NEWNS): {}",
+                io::Error::last_os_error()
+            );
+            let own = current_mount_namespace().unwrap();
+            let leader = fs::metadata("/proc/self/ns/mnt").unwrap();
+            assert_ne!(
+                own.inode,
+                leader.ino(),
+                "the thread kept the leader's namespace"
+            );
+            let (table, order) = unplanned_container_mount_table(Path::new(".")).unwrap();
+            assert!(
+                table
+                    .mounts
+                    .iter()
+                    .any(|row| row.mountpoint.as_slice() == b"/"),
+                "the thread's table shows no /: {table:?}"
+            );
+            let root = thread_mount_id_of(Path::new("/")).unwrap();
+            assert!(table.shown_mount_ids().contains(&root));
+            assert!(table.shown_mount_ids().iter().all(|id| order.contains(id)));
+        })
+        .join();
+        assert!(checked.is_ok(), "the thread's checks failed");
+    }
+
+    /// The launch directory is resolved and held before the mount table is
+    /// read: a mount made on it between the two (here a tmpfs over it, in a
+    /// user and mount namespace of the test's own) is not the launch mount,
+    /// because the held directory is below it; the mount the directory was
+    /// on is, and it is in the rows read. Had the directory been resolved
+    /// after the read, it would have reached the new tmpfs. The same order
+    /// puts a mount that resolving the directory triggers (an automount on
+    /// its path) in the rows read.
+    #[test]
+    fn launch_directories_are_held_before_the_mount_table_is_read() {
+        if rerun_in_user_namespace(
+            "tests::launch_directories_are_held_before_the_mount_table_is_read",
+        ) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let launch = directory.path().join("launch");
+        fs::create_dir(&launch).unwrap();
+        let before = thread_mount_id_of(&launch).unwrap();
+        let target = launch.clone();
+        let (table, _) = unplanned_container_mount_table_with(&launch, move || {
+            let status = std::process::Command::new("mount")
+                .args(["-t", "tmpfs", "none"])
+                .arg(&target)
+                .status()
+                .expect("run mount");
+            assert!(status.success(), "mount a tmpfs over the launch directory");
+            thread_mountinfo()
+        })
+        .unwrap();
+        let over = thread_mount_id_of(&launch).unwrap();
+        assert_ne!(over, before, "the tmpfs did not cover the launch directory");
+        assert!(table.shown_mount_ids().contains(&before));
+        assert!(!table.shown_mount_ids().contains(&over));
+        let _ = std::process::Command::new("umount").arg(&launch).status();
+    }
+
+    /// A launch mount the mount table read does not list is refused, not
+    /// dropped from the table.
+    #[test]
+    fn a_launch_mount_missing_from_the_read_is_refused() {
+        let namespace = b"10 1 8:1 / / rw - ext4 /dev/root rw\n";
+        let error = unplanned_container_mount_table_from(namespace, &[99].into(), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("launch mount 99"), "{error}");
     }
 
     #[test]

@@ -28,6 +28,9 @@
  * canonicalized ones, which a run compared with --verify-strict must show
  * alike in both runs.
  *
+ * Below a received /proc, mounts and self/mountinfo read exactly what
+ * /proc/mounts and /proc/self/mountinfo read.
+ *
  * Below a received /proc/self directory, a name the --proc level omits
  * (limits at minimal) is absent too, through openat, fstatat and faccessat.
  *
@@ -183,6 +186,56 @@ static void check_link_below(int directory, const char* name, const char* absolu
   }
 }
 
+/* The whole of `path`, opened relative to `directory` (or absolutely where
+ * `directory` is AT_FDCWD), into `buffer`; its length, or -1. */
+static ssize_t read_whole(int directory, const char* path, char* buffer, size_t capacity) {
+  int fd = openat(directory, path, O_RDONLY);
+  if (fd < 0) {
+    return -1;
+  }
+  size_t length = 0;
+  for (;;) {
+    ssize_t got = read(fd, buffer + length, capacity - length);
+    if (got < 0 || (got == 0 && length == capacity)) {
+      close(fd);
+      return -1;
+    }
+    if (got == 0) {
+      break;
+    }
+    length += (size_t)got;
+    if (length == capacity) {
+      close(fd);
+      return -1;
+    }
+  }
+  close(fd);
+  return (ssize_t)length;
+}
+
+/* `name`, opened below the received directory `directory`, reads exactly
+ * what its absolute spelling `absolute` reads, and is not empty. */
+static void check_contents_below(int directory, const char* name, const char* absolute,
+                                 const char* what) {
+  enum { CAPACITY = 1 << 20 };
+  char* below = malloc(CAPACITY);
+  char* direct = malloc(CAPACITY);
+  CHECK(below != NULL && direct != NULL, "%s: malloc", what);
+  if (below == NULL || direct == NULL) {
+    free(below);
+    free(direct);
+    return;
+  }
+  ssize_t length = read_whole(directory, name, below, CAPACITY);
+  ssize_t expected = read_whole(AT_FDCWD, absolute, direct, CAPACITY);
+  CHECK(length > 0 && expected > 0, "%s: %s read %zd bytes, %s %zd: %s", what, name, length,
+        absolute, expected, strerror(errno));
+  CHECK(length == expected && memcmp(below, direct, (size_t)length) == 0,
+        "%s: %s does not read what %s reads", what, name, absolute);
+  free(below);
+  free(direct);
+}
+
 /* Names below `directory` that the --proc=minimal level omits are absent:
  * openat, fstatat and faccessat give ENOENT, as for `absolute`. */
 static void check_omitted_below(int directory, const char* name, const char* absolute,
@@ -326,6 +379,18 @@ int main(int argc, char** argv) {
   }
   say("a received /proc: openat, fstatat, statx, faccessat and readlinkat look names up "
       "below it");
+  /* The mount tables, below a received /proc: Detcore renders them, so the
+   * backend is never asked for them (package K, K3b). */
+  proc = open("/proc", O_RDONLY | O_DIRECTORY);
+  CHECK(proc >= 0, "open /proc: %s", strerror(errno));
+  received = pass_to_self(pair, proc);
+  close(proc);
+  if (received >= 0) {
+    check_contents_below(received, "mounts", "/proc/mounts", "a received /proc");
+    check_contents_below(received, "self/mountinfo", "/proc/self/mountinfo", "a received /proc");
+    close(received);
+  }
+  say("a received /proc: mounts and self/mountinfo read what their absolute spellings read");
   if (minimal) {
     say("a received /proc at minimal: interrupts is absent below it, as at its absolute "
         "spelling");

@@ -28,7 +28,6 @@ use std::sync::atomic::Ordering;
 
 use anyhow::anyhow;
 use detcore_model::config::MountInfoRootRewrite;
-use detcore_model::container_mounts::BASE_MOUNTPOINTS;
 use detcore_model::container_mounts::ContainerMountTable;
 use detcore_model::container_mounts::Installation;
 use detcore_model::container_mounts::assign_installed_rows;
@@ -88,7 +87,7 @@ fn open_path(path: &Path) -> io::Result<File> {
 }
 
 fn mount_id_for_fd(fd: i32) -> io::Result<u64> {
-    let contents = fs::read(format!("/proc/self/fdinfo/{fd}"))?;
+    let contents = fs::read(format!("/proc/thread-self/fdinfo/{fd}"))?;
     detcore_model::procfs::parse_fdinfo_mount_id(&contents).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -98,7 +97,7 @@ fn mount_id_for_fd(fd: i32) -> io::Result<u64> {
 }
 
 fn mountinfo_root_for_id(raw_mount_id: u64) -> io::Result<Vec<u8>> {
-    let contents = fs::read("/proc/self/mountinfo")?;
+    let contents = fs::read("/proc/thread-self/mountinfo")?;
     let rows = detcore_model::procfs::parse_mountinfo(&contents).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "mountinfo has a malformed row")
     })?;
@@ -138,7 +137,7 @@ struct MountRow {
 
 /// This process's mount table, as [`MountRow`]s.
 fn mount_rows() -> io::Result<Vec<MountRow>> {
-    let contents = fs::read("/proc/self/mountinfo")?;
+    let contents = fs::read("/proc/thread-self/mountinfo")?;
     contents
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
@@ -166,7 +165,7 @@ fn mount_rows() -> io::Result<Vec<MountRow>> {
 /// This process's mount namespace, every row of it (host FUSE seed rows
 /// included).
 fn namespace_rows() -> Result<Vec<detcore_model::container_mounts::ContainerMount>, Error> {
-    let contents = fs::read("/proc/self/mountinfo")
+    let contents = fs::read("/proc/thread-self/mountinfo")
         .context("Failed to read the guest mount table for its container mount table")?;
     detcore_model::container_mounts::parse_container_mounts(&contents)
         .ok_or_else(|| anyhow!("the guest mount table has a malformed row"))
@@ -767,7 +766,7 @@ impl IdentityGuard {
     /// between them. One read gives a table whose every row is in the order.
     pub(super) fn container_mount_view(&self) -> Result<ContainerMountView, Error> {
         let namespace = hermit::current_mount_namespace()?;
-        let contents = fs::read("/proc/self/mountinfo")
+        let contents = fs::read("/proc/thread-self/mountinfo")
             .context("Failed to read the guest mount table for its identity order")?;
         let table = match &self.plan {
             MountPlan::Unrecorded => None,
@@ -838,18 +837,7 @@ impl IdentityGuard {
             .map(|row| row.raw_mount_id)
             .chain(backend)
             .collect();
-        let reached = |path: &Path| {
-            open_path(path)
-                .ok()
-                .and_then(|file| mount_id_for_fd(file.as_raw_fd()).ok())
-        };
-        let base = BASE_MOUNTPOINTS
-            .iter()
-            .filter_map(|mountpoint| {
-                let path = Path::new(mountpoint);
-                Some((mountinfo_escape_path(path), reached(path)?))
-            })
-            .collect::<Vec<_>>();
+        let base = hermit::base_mountpoint_mount_ids();
         Ok(Some(ContainerMountTable::select(
             &rows, &installed, &base, &never,
         )))
