@@ -1188,6 +1188,7 @@ fn record_or_replay_config_with_timer_support(
         preemption_stacktrace_log_file: None,
         stop_after_turn: None,
         stop_after_iter: None,
+        signal_at: None,
         debug_externalize_sockets: false,
         debug_futex_mode: BlockingMode::Precise,
         sched_sticky_random_param: 0.0,

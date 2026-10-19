@@ -869,6 +869,17 @@ pub struct Config {
     #[clap(long, value_name = "iter_N")]
     pub stop_after_iter: Option<u64>,
 
+    /// Send SIGNAL to the run's root process once the scheduler has committed
+    /// turn N, as a timer expiry is sent (`turn=N:SIGNAL`, SIGNAL a name such
+    /// as `SIGUSR1` or a number). The turn is a deterministic point of the
+    /// run, so a process in the run that waits for the signal acts at the
+    /// same point every time: for example a controller that stops QEMU and
+    /// saves a snapshot there. The run itself goes on. Only with
+    /// `--sequentialize-threads`, where the scheduler numbers turns.
+    #[clap(long, value_name = "turn=N:SIGNAL", value_parser = parse_signal_at)]
+    #[serde(default)]
+    pub signal_at: Option<SignalAt>,
+
     /// **Internal:** Debugging option to treat all sockets as mysterious external, nondeterministic
     /// entities, rather than container-internal and determinstically scheduled.
     #[clap(long)]
@@ -1216,6 +1227,12 @@ impl Config {
             );
             self.stop_after_iter = None;
         }
+        if self.signal_at.is_some() && !self.sequentialize_threads {
+            eprintln!(
+                "WARNING: --signal-at will have no effect if --no-sequentialize-threads is enabled"
+            );
+            self.signal_at = None;
+        }
 
         if self.debug_externalize_sockets && !self.sequentialize_threads {
             eprintln!(
@@ -1537,6 +1554,9 @@ impl fmt::Display for Config {
         if let Some(i) = self.stop_after_iter {
             write!(f, " --stop-after-iter={}", i)?;
         }
+        if let Some(at) = self.signal_at {
+            write!(f, " --signal-at={}", at)?;
+        }
         if self.debug_externalize_sockets {
             write!(f, " --debug-externalize-sockets")?;
         }
@@ -1765,6 +1785,44 @@ pub type MaybeTimeslice = Option<NonZeroU64>;
 /// Deprecated name for an optional PMU-backed virtual-timeslice duration.
 #[deprecated(note = "use MaybeTimeslice")]
 pub type MaybePreemptionTimeout = MaybeTimeslice;
+
+/// A signal sent to the run's root process at a scheduler turn
+/// (`Config::signal_at`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalAt {
+    /// The scheduler turn after whose commit the signal is sent.
+    pub turn: u64,
+    /// The signal's number.
+    pub signal: i32,
+}
+
+impl std::fmt::Display for SignalAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "turn={}:{}", self.turn, self.signal)
+    }
+}
+
+/// Parse `turn=N:SIGNAL` (`Config::signal_at`).
+fn parse_signal_at(src: &str) -> Result<SignalAt, String> {
+    let rest = src
+        .strip_prefix("turn=")
+        .ok_or_else(|| format!("expected turn=N:SIGNAL, got {src:?}"))?;
+    let (turn, signal) = rest
+        .split_once(':')
+        .ok_or_else(|| format!("expected turn=N:SIGNAL, got {src:?}"))?;
+    let turn = turn
+        .parse::<u64>()
+        .map_err(|e| format!("the turn in {src:?} is not a non-negative integer: {e}"))?;
+    let signal = match signal.parse::<i32>() {
+        Ok(number) => nix::sys::signal::Signal::try_from(number),
+        Err(_) => signal.parse::<nix::sys::signal::Signal>(),
+    }
+    .map_err(|_| format!("{signal:?} in {src:?} names no signal"))?;
+    Ok(SignalAt {
+        turn,
+        signal: signal as i32,
+    })
+}
 
 fn parse_timeslice(src: &str) -> Result<MaybeTimeslice, ParseTimesliceError> {
     if let Ok(n) = src.parse::<u64>() {
@@ -2517,7 +2575,9 @@ mod legacy_backend_json {
     /// `work_span_report` came after it as well: the report is written by the
     /// scheduler, not the in-guest runtime, so it is never written and reads
     /// as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 20] = [
+    /// `signal_at` came after the form froze; the scheduler acts on it, not
+    /// the runtime, so it is never written and reads as unset.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 21] = [
         "backend",
         "record_host_inputs",
         "guest_may_inherit_a_terminal",
@@ -2538,6 +2598,7 @@ mod legacy_backend_json {
         "mountinfo_mount_namespace",
         "signal_delivery_check_fatal",
         "work_span_report",
+        "signal_at",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -2684,7 +2745,8 @@ mod legacy_backend_json {
                     | "pipe_wake_latency"
                     | "container_mount_table"
                     | "mountinfo_mount_namespace"
-                    | "work_span_report",
+                    | "work_span_report"
+                    | "signal_at",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
@@ -2966,7 +3028,8 @@ mod legacy_backend_json {
                 | "container_mount_table"
                 | "mountinfo_mount_namespace"
                 | "signal_delivery_check_fatal"
-                | "work_span_report" => Ok(()),
+                | "work_span_report"
+                | "signal_at" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -3620,7 +3683,8 @@ mod tests {
                 | "container_mount_table"
                 | "mountinfo_mount_namespace"
                 | "signal_delivery_check_fatal"
-                | "work_span_report" => {}
+                | "work_span_report"
+                | "signal_at" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -3637,11 +3701,11 @@ mod tests {
         // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
         // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`, `cpu_profile_source`,
         // `signal_state_copy`, `container_mount_table`,
-        // `mountinfo_mount_namespace`, `signal_delivery_check_fatal` and
-        // `work_span_report` none: fourteen more keys, and nineteen fewer, so
-        // five keys fewer than fields.
+        // `mountinfo_mount_namespace`, `signal_delivery_check_fatal`,
+        // `work_span_report` and `signal_at` none: fourteen more keys, and
+        // twenty fewer, so six keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 5);
+        assert_eq!(fields.len(), keys.len() + 6);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -4224,6 +4288,56 @@ mod tests {
                 bincode::serde::encode_to_vec(&decoded, bincode::config::legacy()).unwrap(),
                 wire
             );
+        }
+    }
+
+    /// `signal_at` came after the legacy form froze, so it never enters it,
+    /// and both the object and the array form read it back as unset.
+    #[test]
+    fn signal_at_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            signal_at: Some(SignalAt {
+                turn: 500,
+                signal: libc::SIGUSR1,
+            }),
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("signal_at"), "{json}");
+        assert_eq!(from_legacy_backend_json(&json).unwrap().signal_at, None);
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert_eq!(from_legacy_backend_json(&array).unwrap().signal_at, None);
+    }
+
+    /// `Config` crosses Reverie RPC as positional legacy bincode, so
+    /// `signal_at` is encoded whether set or not.
+    #[test]
+    fn signal_at_round_trips_through_reverie_bincode() {
+        for signal_at in [
+            None,
+            Some(SignalAt {
+                turn: 3000,
+                signal: libc::SIGUSR1,
+            }),
+        ] {
+            let config = Config {
+                signal_at,
+                ..Config::default()
+            };
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(decoded.signal_at, signal_at);
         }
     }
 

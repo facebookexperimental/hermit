@@ -209,6 +209,7 @@ static SIGCHLD_ONCE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DIRECTORY_OPENAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DIRECTORY_SWAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STATX_MOUNT_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SIGNAL_AT_TURN_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STATX_UNIQUE_MOUNT_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_HANDLER_TURN_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -8071,6 +8072,112 @@ fn systemd_sysusers_reads_its_configuration_as_natively() {
         log.contains(":: Success: deterministic. Determinism verified."),
         "verification failed:\n{log}"
     );
+}
+
+/// `hermit run --signal-at turn=N:SIGNAL` sends SIGNAL to the run's root
+/// process after scheduler turn N (minibeads dh-3w3ia). The guest counts
+/// 2000 `sched_yield` calls and notes at which one SIGUSR1 arrived: the same
+/// in two runs with the same turn (and under `--verify-strict`), later for a
+/// later turn (given as a number), never without the option. A value that is
+/// not `turn=N:SIGNAL` is refused before the run.
+#[test]
+fn signal_at_sends_the_root_process_its_signal_after_the_named_turn() {
+    let guest = compiled_c_guest(&SIGNAL_AT_TURN_GUEST, "signal_at_turn");
+    let guest = guest.to_str().unwrap();
+    let run = |extra: &[&str]| -> String {
+        let mut args = vec!["run", "--strict", "--verify", "--verify-strict"];
+        args.extend_from_slice(extra);
+        args.extend(["--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let log = stderr(&output);
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "{extra:?}: verification failed:\n{log}"
+        );
+        stdout(&output)
+    };
+    let iteration = |line: &str| -> i64 {
+        line.trim()
+            .strip_prefix("signal at iteration ")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected output {line:?}"))
+    };
+    assert_eq!(run(&[]), "signal at iteration -1\n");
+    let early = run(&["--signal-at=turn=500:SIGUSR1"]);
+    assert_eq!(run(&["--signal-at=turn=500:SIGUSR1"]), early);
+    let late = run(&["--signal-at=turn=900:10"]);
+    let (early, late) = (iteration(&early), iteration(&late));
+    assert!(
+        (0..late).contains(&early) && late < 2000,
+        "turn 500 gave iteration {early}, turn 900 gave {late}"
+    );
+    let args = ["run", "--strict", "--signal-at=turn=500", "--", guest];
+    let output = hermit(&args);
+    assert!(!output.status.success(), "{args:?} was accepted");
+    assert!(
+        stderr(&output).contains("expected turn=N:SIGNAL"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// `--signal-at` stops QEMU at the same point of two runs: the controller
+/// (tests/qemu-boot/signal_at_snapshot.py, the run's root process) starts a
+/// firmware-only QEMU machine with a QMP socket, and when SIGUSR1 arrives
+/// after turn 3000 it stops the machine and saves a migration snapshot. Both
+/// runs write the same file (minibeads dh-3w3ia). Not run where the host has
+/// no qemu-system-x86_64 or python3.
+#[test]
+fn signal_at_stops_qemu_at_the_same_point_in_two_runs() {
+    let test = "signal_at_stops_qemu_at_the_same_point_in_two_runs";
+    let Some(qemu) = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("qemu-system-x86_64"))
+            .find(|candidate| candidate.is_file())
+    }) else {
+        eprintln!("{test}: NOT RUN: qemu-system-x86_64 is not installed");
+        return;
+    };
+    let python = Path::new("/usr/bin/python3");
+    if !python.is_file() {
+        eprintln!("{test}: NOT RUN: /usr/bin/python3 is not installed");
+        return;
+    }
+    let controller = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("tests/qemu-boot/signal_at_snapshot.py");
+    // The two runs go side by side, in directories of their own: the
+    // controller gives QEMU paths relative to its directory.
+    let snapshots = std::thread::scope(|scope| {
+        let runs = ["first", "second"].map(|run| {
+            let (qemu, controller) = (&qemu, &controller);
+            scope.spawn(move || {
+                let dir = process_build_root(&format!("signal-at-qemu-{run}"));
+                fs::create_dir_all(&dir).expect("create the run's directory");
+                let workdir = format!("--workdir={}", dir.display());
+                let args = [
+                    "run",
+                    "--strict",
+                    workdir.as_str(),
+                    "--signal-at=turn=3000:SIGUSR1",
+                    "--",
+                    python.to_str().unwrap(),
+                    controller.to_str().unwrap(),
+                    qemu.to_str().unwrap(),
+                    dir.to_str().unwrap(),
+                ];
+                let output = hermit(&args);
+                assert_success(&output, &args);
+                let text = stdout(&output);
+                assert!(text.starts_with("snapshot bytes="), "{run}: {text}");
+                text
+            })
+        });
+        runs.map(|run| run.join().expect("a run panicked"))
+    });
+    assert_eq!(snapshots[0], snapshots[1]);
 }
 
 /// Under `--no-namespace`, a mount holding the guest's working directory is

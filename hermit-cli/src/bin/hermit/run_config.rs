@@ -1004,6 +1004,7 @@ mod tests {
             &["--sched-sticky-random-param=0.5"],
         ),
         ("stop-after-turn", &["--stop-after-turn=3"]),
+        ("signal-at", &["--signal-at=turn=3:SIGUSR1"]),
         ("stop-after-iter", &["--stop-after-iter=4"]),
         (
             "debug-externalize-sockets",

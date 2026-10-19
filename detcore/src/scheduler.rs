@@ -2011,6 +2011,10 @@ pub struct Scheduler {
 
     /// A cached copy of the same (immutable) field in Config.
     stop_after_turn: Option<u64>,
+
+    /// `Config::signal_at`: the turn after which the run's root process is
+    /// sent the signal, until it is sent.
+    signal_at: Option<detcore_model::config::SignalAt>,
     /// A cached copy of the same (immutable) field in Config.
     stop_after_iter: Option<u64>,
     /// A cached copy of the same (immutable) field in Config.
@@ -3892,6 +3896,7 @@ impl Scheduler {
             recorded_event_count: 0,
             stacktrace_events,
             stop_after_turn: cfg.stop_after_turn,
+            signal_at: cfg.signal_at,
             stop_after_iter: cfg.stop_after_iter,
             recordreplay_modes: cfg.recordreplay_modes,
             fast_timer_period: LogicalTime::from_nanos(
@@ -7216,6 +7221,31 @@ impl Scheduler {
             .is_some_and(|dettid| dettid.as_raw() == observed)
     }
 
+    /// `--signal-at` (`Config::signal_at`): once turn N has been committed,
+    /// send the signal to the run's root process as a timer expiry is sent.
+    /// It runs here, before the next thread is selected, where every thread
+    /// is parked, so the send lands at the same point of every run.
+    fn send_signal_at(&mut self) {
+        let Some(at) = self.signal_at else {
+            return;
+        };
+        if self.turn < at.turn {
+            return;
+        }
+        self.signal_at = None;
+        match Signal::try_from(at.signal) {
+            Ok(signal) => {
+                info!(
+                    "[scheduler] after turn {}: sending {} to the root process (--signal-at)",
+                    self.turn, signal
+                );
+                let root = crate::consts::ROOT_DETPID;
+                self.fire_alarm(root, DetTid::from_raw(root.as_raw()), signal);
+            }
+            Err(_) => warn!("[scheduler] --signal-at names no signal: {}", at.signal),
+        }
+    }
+
     /// Step: Before we select which thread to run, first we check if some internal data
     /// structure maintenance is necessary, i.e. moving timed events from the waiting pool
     /// to the run queue. It manipulates scheduler data structures accordingly.
@@ -7228,6 +7258,7 @@ impl Scheduler {
             return Err(SkipTurn);
         }
         self.flush_parent_death_signals();
+        self.send_signal_at();
         if self.sigkill_fence_holds() {
             // A SIGKILLed process was retired at the kill turn: select no
             // turn until its physical exit is accounted and published to its
