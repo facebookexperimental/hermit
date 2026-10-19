@@ -2145,7 +2145,16 @@ fi
 # neither is in the DBT dependency closure, whose locked packages are identical.
 # Native SDK recipe/source inputs, inventory 973, budgets and job limits carry
 # unchanged. This is not a claim that the whole workspace lock is unchanged.
-expected_pin=9ded00ff4ab82e48368e0113f65e954d3533bc3f
+# CARRY TO 63934937463458de93d43ed08038d256ae799c64 (2026-10-19): from
+# 9ded00ff4ab82e48368e0113f65e954d3533bc3f. One commit, 63934937 (reverie-kvm deletes the
+# backend's copy of the host mount table, proc_mounts.rs, now that Detcore
+# renders every process's mount files from the container mount table; package
+# K slice K3b). It changes only reverie-kvm/src/{elf,executor,lib}.rs,
+# deletes reverie-kvm/src/proc_mounts.rs and edits reverie-kvm/tests/static_elf.rs.
+# git diff is empty under reverie-dbt/ (DBT inventory 973), and the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged. All SDK
+# inputs, calibrated budget, job width and limits are unchanged.
+expected_pin=63934937463458de93d43ed08038d256ae799c64
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
