@@ -428,8 +428,11 @@ impl Control {
             handle.terminate(reverie::Error::Tool(Error::new(GuestTimedOut { limit })));
         }
     }
-    fn expire_if_due(&self) {
-        if !self.expired.get() && self.timeout.is_some_and(|(at, _)| Instant::now() >= at) {
+    /// Mark the run timed out if `now` is at or past its deadline. The caller
+    /// passes the same `now` it then compares deadlines against, so a deadline
+    /// can never be seen as passed while the timeout is still unexpired.
+    fn expire_if_due(&self, now: Instant) {
+        if !self.expired.get() && self.timeout.is_some_and(|(at, _)| now >= at) {
             self.expired.set(true);
             if !self.received_failure.get() {
                 let mut snapshot = self.snapshot.borrow_mut();
@@ -595,7 +598,7 @@ fn drive<T: 'static>(entry: Rc<Entry>, recovery: bool) -> Result<T, Error> {
         runtime.block_on(async {
             let mut timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
             poll_fn(|cx| {
-                control.expire_if_due();
+                control.expire_if_due(Instant::now());
                 if !recovery
                     && control.expired.get()
                     && control.stage.get() == HermitCleanupStage::Startup
@@ -604,8 +607,14 @@ fn drive<T: 'static>(entry: Rc<Entry>, recovery: bool) -> Result<T, Error> {
                 }
                 let polled = future.as_mut().poll(cx);
                 // A synchronous poll can cross the absolute deadline. Observe
-                // that fact on its return without claiming preemption.
-                control.expire_if_due();
+                // that fact on its return without claiming preemption. This one
+                // reading of the clock also decides the deadline check below:
+                // with a second reading, the timeout could pass between the two,
+                // and the check would end the poll with the timeout unexpired,
+                // reporting HermitCleanupUnconfirmed with the startup snapshot
+                // instead of a run timeout (dh-4s1xh).
+                let now = Instant::now();
+                control.expire_if_due(now);
                 if let Poll::Ready(result) = polled {
                     let result = match (result, control.timeout) {
                         (Ok(_), Some((_, limit))) if control.expired.get() => {
@@ -634,7 +643,7 @@ fn drive<T: 'static>(entry: Rc<Entry>, recovery: bool) -> Result<T, Error> {
                     .min()
                 };
                 if let Some(deadline) = deadline {
-                    if Instant::now() >= deadline {
+                    if now >= deadline {
                         return Poll::Ready(None);
                     }
                     let at = tokio::time::Instant::from_std(deadline);
