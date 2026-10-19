@@ -2205,7 +2205,31 @@ fi
 # tree and SDK/native recipe inputs are identical (inventory989).
 # Preserve the incoming K3b carry and the original a15e measurement above;
 # this source equality is not a new build or runtime-package receipt.
-expected_pin=97c6424a743f423e57d9dfaae15662e1cbcf5a01
+# CARRY TO 9e11cab435dde363c9f065d172da1754b8c25909 (2026-10-18): from
+# bfe01a465bd53a00eff185f3130e37344938982e. Correct only the README description of local
+# cache-context failure checks; no caller abort/recovery guarantee is claimed.
+# Executable, native, test and build-recipe sources are unchanged. Inventory989,
+# ABI12/80 and the qualified a15e SDK sample carry under the same CMake/generator/
+# epoch settings. Documentation, Git pin and lock metadata change; runtime receipts
+# remain bound to H1d2169da/Rbfe01a46, not this documentation successor. Portable1050,
+# default ratchet572, job width, limits, selectors and clock policy stay unchanged.
+# CARRY TO 00007ffab5bcec2f1635584aab98b8e934be4d71 (2026-10-19): exact replay of
+# 9e11cab435dde363c9f065d172da1754b8c25909, following a8c3ba366f72155ab37d423f4241d40ffda729ff.
+# Full reverie-dbt source equality preserves inventory989 and the a15e SDK
+# recipe. This carries the original measured sample; it is not a new runtime
+# or build result. Native/client changes remain covered by their own receipts.
+# CARRY TO 0cc79d6c15cdb43134dafef39d97ee67847492cb (2026-10-19): replay the same owned
+# change in order after 69efc09ebcc7bd3ea33bd033e9688500dc205191.
+# Full DBT source equals 00007ffab5bcec2f1635584aab98b8e934be4d71 (inventory989).
+# SDK/native recipe inputs carry; the a15e sample keeps its original attribution.
+# Incoming workspace dependency changes require fresh paired build/runtime evidence.
+# CARRY TO e7bf2d9b9d4f58c108b591b70ebf0e496de34f4b (2026-10-19): replay the same owned change
+# from 0cc79d6c15cdb43134dafef39d97ee67847492cb onto the K3b stack rooted at
+# published 63934937463458de93d43ed08038d256ae799c64. The owned DBT
+# tree and SDK/native recipe inputs are identical (inventory989).
+# Preserve the incoming K3b carry and the original a15e measurement above;
+# this source equality is not a new build or runtime-package receipt.
+expected_pin=e7bf2d9b9d4f58c108b591b70ebf0e496de34f4b
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
