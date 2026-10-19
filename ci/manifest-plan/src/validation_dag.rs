@@ -243,8 +243,11 @@ pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm", "liteinst", "in-
 
 /// `test.cli` cases the GitHub-hosted portable profile excludes by exact name.
 ///
-/// Each starts the in-guest LiteInst runtime, which needs CPUID faulting, a
-/// host capability like the PMU. GitHub-hosted runners have none: in portable
+/// These cases need actual CPUID faulting, a host capability like the PMU.
+/// The ptrace first-image-instruction sentinel requires its literal entry
+/// CPUID to reach Detcore and return the fixed table; a capability refusal
+/// fails it. The other cases start the in-guest LiteInst runtime, which needs
+/// the same facility. GitHub-hosted runners have none: in portable
 /// run 37383177918 the first 25 refused with `detcore-liteinst:
 /// initialization failed: CPUID faulting is unavailable: No such device`, and
 /// the runtime-staging case failed earlier only because the prebuilt tree did
@@ -265,6 +268,7 @@ pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm", "liteinst", "in-
 /// every one in the pinned root, and a test below holds both sides to this
 /// list.
 pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
+    "first_instruction_cpuid::ptrace_intercepts_cpuid_at_the_first_image_instruction",
     "liteinst_backend_stats_report_the_guests_own_dispatch_paths",
     "liteinst_in_guest_programs::in_guest_trap_dispatch_record_reports_no_patched_sites",
     "liteinst_in_guest_programs::in_guest_trap_keeps_site_patching_off_whatever_a_guest_library_does",

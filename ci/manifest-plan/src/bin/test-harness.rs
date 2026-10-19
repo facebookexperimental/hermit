@@ -49,6 +49,7 @@ use hermit_manifest_plan::runner::host_input_change_only;
 use hermit_manifest_plan::runner::host_strictness;
 use hermit_manifest_plan::runner::is_diagnostic_cell;
 use hermit_manifest_plan::runner::prepare_result_path;
+use hermit_manifest_plan::runner::ptrace_cell_capability;
 use hermit_manifest_plan::runner::refused_on_an_inexact_branch_counter;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::retries_product_failures;
@@ -758,8 +759,12 @@ fn cell_host_inapplicable_reason(
     verdicts: &HostCapabilities,
     exact_branch_counter: Option<&HostCapabilityVerdict>,
 ) -> Option<(Vec<String>, String)> {
+    let mut requires = cell.test.requires.clone();
+    if ptrace_cell_capability(cell).is_some() {
+        requires.push("cpuid".into());
+    }
     host_inapplicable_reason(
-        &cell.test.requires,
+        &requires,
         cell.id.backend.as_deref(),
         verdicts,
         exact_branch_counter.filter(|_| refused_on_an_inexact_branch_counter(cell)),
@@ -1404,6 +1409,7 @@ fn required_plan_rows(manifests: &ManifestSet) -> (usize, Vec<JsonValue>) {
                 // `requires` token does (see `host_inapplicable_reason`), so a
                 // consumer routing from this file must see it too.
                 .chain(cell.id.backend.as_deref().and_then(backend_capability))
+                .chain(ptrace_cell_capability(cell))
                 .collect::<BTreeSet<_>>();
             // `requires` and the base (unmultiplied) timeouts let a consumer that
             // cannot load the manifests, such as a Buck cell generator, route
@@ -8783,6 +8789,83 @@ sys.exit(1 if failed else 0)
             in_guest > 0,
             "the required plan has no in-guest LiteInst cell"
         );
+    }
+
+    #[test]
+    fn required_plan_routes_ptrace_cpuid_cells_to_capable_hosts() {
+        let (_, rows) = required_plan_rows(&ManifestSet::load(&super::root(None)).unwrap());
+        for (test, mode, required) in [
+            ("system-utils/record-getpid", "replay", true),
+            ("chaos-c/lock-granularity", "chaos", true),
+            ("determinism-stress/thread-interleaving", "chaos", true),
+            ("c-programs/io-uring-fallback", "custom", true),
+            ("system-utils/clock-determinism", "custom", false),
+            ("chaos-c/lock-granularity", "verify", false),
+        ] {
+            let row = rows
+                .iter()
+                .find(|row| {
+                    row["test"] == test && row["mode"] == mode && row["backend"] == "ptrace"
+                })
+                .unwrap_or_else(|| panic!("missing required cell {test}/{mode}/ptrace"));
+            let cpuid = row
+                .get("requires_host_capabilities")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|values| values.iter().any(|value| value == "cpuid-faulting"));
+            assert_eq!(cpuid, required, "{row}");
+        }
+    }
+
+    #[test]
+    fn ptrace_cpuid_cells_are_not_run_where_faulting_is_absent() {
+        let manifests = ManifestSet::load(&super::root(None)).unwrap();
+        for (test, mode, required) in [
+            ("system-utils/record-getpid", "replay", true),
+            ("chaos-c/lock-granularity", "chaos", true),
+            ("c-programs/io-uring-fallback", "custom", true),
+            ("system-utils/clock-determinism", "custom", false),
+            ("chaos-c/lock-granularity", "verify", false),
+        ] {
+            let mut cell = manifests
+                .select(&hermit_manifest_plan::runner::Selection {
+                    test: Some(test.into()),
+                    mode: Some(mode.into()),
+                    backend: Some("ptrace".into()),
+                    population: Some(hermit_manifest_plan::runner::Population::Required),
+                    ..hermit_manifest_plan::runner::Selection::default()
+                })
+                .unwrap()
+                .remove(0);
+            for backend in ["ptrace", "e9patch"] {
+                cell.id.backend = Some(backend.into());
+                for present in [false, true] {
+                    let verdicts = BTreeMap::from([(
+                        HostCapability::CpuidFaulting,
+                        HostCapabilityVerdict {
+                            present,
+                            evidence: "fixture ARCH_SET_CPUID qualification".into(),
+                        },
+                    )]);
+                    let reason = cell_host_inapplicable_reason(&cell, &verdicts, None);
+                    assert_eq!(
+                        reason.is_some(),
+                        required && !present,
+                        "{test}/{mode}/{backend}"
+                    );
+                    if let Some((capabilities, reason)) = reason {
+                        assert_eq!(capabilities, ["cpuid-faulting"]);
+                        assert!(
+                            reason.contains("NOT RUN, NOT a pass, no coverage"),
+                            "{reason}"
+                        );
+                        assert!(
+                            reason.contains("fixture ARCH_SET_CPUID qualification"),
+                            "{reason}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Where the hermit binary reports an inexact branch counter it refuses

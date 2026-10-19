@@ -328,6 +328,35 @@ pub fn backend_capability(backend: &str) -> Option<HostCapability> {
     }
 }
 
+/// CPUID faulting needed by a cell's ptrace execution, beyond its backend's
+/// unconditional requirements. Plan routing and runtime admission share this
+/// decision. Verify retains its existing host-dependent relaxed form; replay
+/// always subscribes to CPUID through the recorder/replayer subscription list.
+pub fn ptrace_cell_capability(cell: &SelectedCell) -> Option<HostCapability> {
+    if !matches!(cell.id.backend.as_deref(), Some("ptrace" | "e9patch")) {
+        return None;
+    }
+    let needs_cpuid = match cell.id.mode.as_str() {
+        "replay" | "chaos" => true,
+        "custom" => {
+            // Only Hermit options count: a guest argument after `--` cannot
+            // change the tracer's subscriptions or bypass its execution.
+            !cell.test.modes["custom"]
+                .args
+                .iter()
+                .take_while(|arg| arg.as_str() != "--")
+                .any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "--no-virtualize-cpuid" | "--namespace-only" | "--lite" | "--strace-only"
+                    )
+                })
+        }
+        _ => false,
+    };
+    needs_cpuid.then_some(HostCapability::CpuidFaulting)
+}
+
 /// Whether `hermit run --strict` on `backend` reads its virtual clock from the
 /// host's retired-conditional-branch counter, and so refuses where the hermit
 /// binary reports no `exact_branch_counter`.
@@ -7426,7 +7455,8 @@ fn stat_process_group(stat: &[u8]) -> Option<u32> {
 }
 
 /// How many times [`check_cgroup_membership`] reads again, [`FORK_WINDOW_PAUSE`]
-/// apart, a process whose cgroup reads as the root cgroup `/`.
+/// apart, a process whose cgroup reads as the root cgroup `/`, or as an
+/// ancestor-only path through a nested cgroup namespace.
 ///
 /// A child that `fork` is still creating is in the root cgroup for a moment:
 /// `cgroup_fork` points it at `init_css_set`, `copy_process` makes it visible
@@ -7436,10 +7466,19 @@ fn stat_process_group(stat: &[u8]) -> Option<u32> {
 /// in that window is not outside: c-programs/wait-on-child (verify/sabre) was
 /// refused that way in a box validation of hermit 6b31e9ae, and a probe that
 /// reads each child of a forking loop as soon as it appears saw 2 of 108171
-/// children in `/`. Nothing this user runs can move a process into the root
-/// cgroup, so one that stays there through the re-reads is refused.
+/// children in `/`. A reader in a nested cgroup namespace can see the same
+/// host root as `/../../..` instead. An ancestor-only spelling does not prove
+/// membership or even that this is the fork window: it gets the same bounded
+/// recheck, and a process that stays outside is still refused.
 const FORK_WINDOW_REREADS: u32 = 50;
 const FORK_WINDOW_PAUSE: Duration = Duration::from_millis(2);
+
+fn possible_fork_root_cgroup(path: &str) -> bool {
+    path == "/"
+        || path
+            .strip_prefix('/')
+            .is_some_and(|relative| relative.split('/').all(|part| part == ".."))
+}
 
 /// Check that every process the process-group scan could see for this
 /// invocation is in its cgroup `invocation` or a cgroup below it: the leader
@@ -7476,8 +7515,9 @@ fn check_cgroup_membership(
     {
         let mut cgroup = cgroup_of(member).map_err(unchecked)?;
         let mut rereads = 0;
-        while cgroup.as_deref() == Some("/")
-            && !within_cgroup("/", invocation)
+        while cgroup
+            .as_deref()
+            .is_some_and(|path| possible_fork_root_cgroup(path) && !within_cgroup(path, invocation))
             && rereads < FORK_WINDOW_REREADS
         {
             std::thread::sleep(FORK_WINDOW_PAUSE);
@@ -12692,6 +12732,66 @@ esac
         );
     }
 
+    #[test]
+    fn ptrace_cpuid_requirement_follows_the_execution_mode() {
+        for backend in ["ptrace", "e9patch"] {
+            for mode in ["replay", "chaos", "custom"] {
+                let mut cell = ptrace_cell(mode);
+                cell.id.backend = Some(backend.into());
+                assert_eq!(
+                    ptrace_cell_capability(&cell),
+                    Some(HostCapability::CpuidFaulting),
+                    "{backend}/{mode}"
+                );
+            }
+            for mode in ["verify", "naked"] {
+                let mut cell = ptrace_cell(mode);
+                cell.id.backend = Some(backend.into());
+                assert_eq!(ptrace_cell_capability(&cell), None, "{backend}/{mode}");
+                cell.host_level = relaxed_host();
+                assert_eq!(ptrace_cell_capability(&cell), None, "{backend}/{mode}");
+            }
+        }
+        for backend in ["kvm", "dbt", "sabre", "liteinst", "in-guest-trap"] {
+            let mut cell = ptrace_cell("replay");
+            cell.id.backend = Some(backend.into());
+            assert_eq!(ptrace_cell_capability(&cell), None, "{backend}");
+        }
+    }
+
+    #[test]
+    fn custom_cpuid_requirement_respects_only_hermit_subscription_options() {
+        for backend in ["ptrace", "e9patch"] {
+            let mut cell = ptrace_cell("custom");
+            cell.id.backend = Some(backend.into());
+            for flag in [
+                "--no-virtualize-cpuid",
+                "--namespace-only",
+                "--lite",
+                "--strace-only",
+            ] {
+                cell.test.modes.get_mut("custom").unwrap().args = vec![flag.into()];
+                assert_eq!(ptrace_cell_capability(&cell), None, "{backend}: {flag}");
+                cell.test.modes.get_mut("custom").unwrap().args = vec!["--".into(), flag.into()];
+                assert_eq!(
+                    ptrace_cell_capability(&cell),
+                    Some(HostCapability::CpuidFaulting),
+                    "guest argument {flag} must not disable {backend} interception"
+                );
+            }
+            cell.test.modes.get_mut("custom").unwrap().args = vec![
+                "--strict".into(),
+                "--base-env=minimal".into(),
+                "--max-timeslice=disabled".into(),
+            ];
+            assert_eq!(
+                ptrace_cell_capability(&cell),
+                Some(HostCapability::CpuidFaulting),
+                "disabling preemption must not disable CPUID interception"
+            );
+        }
+    }
+
     fn ptrace_cell(mode: &str) -> SelectedCell {
         let mut test = recipe(true);
         if mode != "verify" {
@@ -15703,6 +15803,38 @@ esac
         );
         // Gone before a re-read: not outside.
         assert_eq!(check(&[Some("/"), None]), (Ok(()), 2));
+        // A reader in a nested cgroup namespace sees the host root through
+        // parent components. It is still outside until a later read proves
+        // the child joined this invocation (or the child has exited).
+        for root in ["/..", "/../..", "/../../../../../.."] {
+            assert_eq!(check(&[Some(root), Some(invocation)]), (Ok(()), 2));
+            assert_eq!(
+                check(&[Some(root), Some("/runner/hermit-e2e-invocation-1/x")]),
+                (Ok(()), 2)
+            );
+            assert_eq!(check(&[Some(root), None]), (Ok(()), 2));
+            let (stays, reads) = check(&[Some(root)]);
+            assert!(stays.unwrap_err().contains("outside its invocation cgroup"));
+            assert_eq!(reads, 1 + FORK_WINDOW_REREADS as usize);
+        }
+        // Only the ancestor-only spelling receives the bounded fork check;
+        // neither a sibling nor a malformed path is a transient root claim.
+        for outside in [
+            "/../other",
+            "/../../other",
+            "/./..",
+            "/..//..",
+            "../..",
+            "/../",
+        ] {
+            let (result, reads) = check(&[Some(outside), Some(invocation)]);
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("outside its invocation cgroup")
+            );
+            assert_eq!(reads, 1, "{outside}");
+        }
         // Read again only for the root cgroup: a parent cgroup is refused at once.
         let (parent, reads) = check(&[Some("/runner"), Some(invocation)]);
         assert!(parent.unwrap_err().contains("process 8 (a member"));

@@ -2205,8 +2205,16 @@ fi
 # rust-toolchain.toml, so the inventory (973), SDK and native inputs,
 # calibrated budget, job width and limits are unchanged from the 45615034
 # carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != db0d0d92037af0a359589a301d41768eb26aa490 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie db0d0d92037af0a359589a301d41768eb26aa490 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 956522100b5f6dbd3bb5a105087aa450db8648aa (2026-10-19): from
+# db0d0d92037af0a359589a301d41768eb26aa490. One commit, the liteinst lane's verified ptrace CPUID
+# arming (its reviewed 1418122e) replayed onto the signals lane's SIGTRAP keep.
+# It changes reverie-ptrace (src/task.rs, Cargo.toml) and adds tests; git diff
+# is empty under reverie-dbt/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory (973), SDK and native inputs,
+# calibrated budget, job width and limits are unchanged from the 45615034
+# carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 956522100b5f6dbd3bb5a105087aa450db8648aa ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 956522100b5f6dbd3bb5a105087aa450db8648aa (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

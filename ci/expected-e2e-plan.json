@@ -236,6 +236,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/fp-reduction-nondeterminism",
       "timeout_seconds": 105
     },
@@ -2174,6 +2177,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/thread-sync-determinism",
       "timeout_seconds": 57
     },
@@ -2309,6 +2315,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "chaos-c/lock-granularity",
       "timeout_seconds": 57
@@ -2511,6 +2520,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "determinism-stress/thread-interleaving",
       "timeout_seconds": 57
     },
@@ -2662,6 +2674,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "determinism-stress-c/thread-contention",
       "timeout_seconds": 57
@@ -3365,6 +3380,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "system-utils/record-getpid",
       "timeout_seconds": 57
@@ -8636,6 +8654,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/ipc-determinism",
       "timeout_seconds": 57
     },
@@ -8720,6 +8741,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/random-readv-stream",
       "timeout_seconds": 57
@@ -9127,6 +9151,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/environment-and-workdir",
       "timeout_seconds": 57
@@ -12691,6 +12718,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/io-uring-fallback",
       "timeout_seconds": 57
     },
@@ -15769,6 +15799,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/poll-readiness",
       "timeout_seconds": 57
     },
@@ -15785,6 +15818,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/pselect6-simulation",
       "timeout_seconds": 57
@@ -39440,6 +39476,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/arch-prctl-determinism",
       "timeout_seconds": 57
     },
@@ -39456,6 +39495,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/epoll-determinism",
       "timeout_seconds": 57
@@ -39474,6 +39516,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/getcpu",
       "timeout_seconds": 57
     },
@@ -39490,6 +39535,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/hello-alarm",
       "timeout_seconds": 57
@@ -39508,6 +39556,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/hello-signals",
       "timeout_seconds": 57
     },
@@ -39524,6 +39575,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/io-uring-fallback",
       "timeout_seconds": 57
@@ -39542,6 +39596,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/ipc-determinism",
       "timeout_seconds": 57
     },
@@ -39558,6 +39615,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/just-spin",
       "timeout_seconds": 57
@@ -39576,6 +39636,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/madvise-determinism",
       "timeout_seconds": 57
     },
@@ -39592,6 +39655,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/memorypress",
       "timeout_seconds": 57
@@ -39610,6 +39676,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/mmap-determinism",
       "timeout_seconds": 57
     },
@@ -39626,6 +39695,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/nanosleep-par",
       "timeout_seconds": 57
@@ -39644,6 +39716,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/ppoll-simulation",
       "timeout_seconds": 57
     },
@@ -39660,6 +39735,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/print-memaddrs",
       "timeout_seconds": 57
@@ -39678,6 +39756,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/printf-with-threads",
       "timeout_seconds": 57
     },
@@ -39694,6 +39775,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/random-sources",
       "timeout_seconds": 57
@@ -39712,6 +39796,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/rcx-canonicalization",
       "timeout_seconds": 57
     },
@@ -39728,6 +39815,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/resource-determinism",
       "timeout_seconds": 57
@@ -39746,6 +39836,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/sched-yield-progress",
       "timeout_seconds": 57
     },
@@ -39762,6 +39855,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/setitimer-determinism",
       "timeout_seconds": 57
@@ -39780,6 +39876,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/signal-determinism",
       "timeout_seconds": 57
     },
@@ -39796,6 +39895,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/sigtimedwait-no-timeout",
       "timeout_seconds": 57
@@ -39814,6 +39916,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/sigtimedwait-timeout-0s",
       "timeout_seconds": 57
     },
@@ -39830,6 +39935,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/sigtimedwait-timeout-1s",
       "timeout_seconds": 57
@@ -39848,6 +39956,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/sysinfo-uptime",
       "timeout_seconds": 57
     },
@@ -39864,6 +39975,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/thread-sync-determinism",
       "timeout_seconds": 57
@@ -39882,6 +39996,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/threadexhaustion",
       "timeout_seconds": 57
     },
@@ -39898,6 +40015,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/timer-create-determinism",
       "timeout_seconds": 57
@@ -39916,6 +40036,9 @@
         "ptrace",
         "cc"
       ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
       "test": "c-programs/vforkexec",
       "timeout_seconds": 57
     },
@@ -39932,6 +40055,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/writev-determinism",
       "timeout_seconds": 57
@@ -40542,6 +40668,9 @@
         "userns",
         "ptrace",
         "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
       ],
       "test": "c-programs/print-memaddrs-threads",
       "timeout_seconds": 57
