@@ -2550,7 +2550,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // fdinfo-refusal unit: 2110, freshly listed.
     // And +13 from c1068de6: 2123.
     // And +1 from 7c9958d1: 2124.
-    ("test.detcore_unit", 2124),
+    // And a_delivery_that_continues_its_threads_sigreturn_runs_first,
+    // a_sigreturn_continuation_needs_a_queued_delivery and
+    // the_sigreturn_continuation_rule_reads_no_request_when_none_is_marked
+    // (https://github.com/rrnewton/hermit/issues/4505): 2127, freshly listed.
+    ("test.detcore_unit", 2127),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3661,7 +3665,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And restartable_calls_woken_by_two_signals_run_both_handlers and
     // restartable_two_signal_rows_under_record_and_replay (R2b-2 stage 2,
     // https://github.com/rrnewton/hermit/issues/4273): 543, listed.
-    ("test.cli", 543),
+    // And the four 4505 signal tests (a_reader_signaled_until_joined_gets_past_its_handler,
+    // a_reader_with_two_signals_pending_at_each_return_gets_past_its_handler,
+    // a_handler_that_raises_its_own_signal_does_not_hold_the_cpu,
+    // a_slice_that_ends_at_a_signal_stop_puts_its_delivery_behind_other_threads;
+    // https://github.com/rrnewton/hermit/issues/4505): 547, listed.
+    ("test.cli", 547),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4124,7 +4133,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same repeated-signal polled-read test: 475, listed.
     // And the same one-SIGCHLD-per-child-exit regression: 476.
     // And the same two R2b-2 stage 2 tests: 478, listed.
-    ("test.cli_on_host", 478),
+    // And the same four 4505 signal tests: 482, listed.
+    ("test.cli_on_host", 482),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4462,7 +4472,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same seven ledger and fdinfo-refusal units: 2110, freshly listed.
     // And +13 from c1068de6: 2123.
     // And +1 from 7c9958d1: 2124.
-    ("test.detcore_unit_on_host", 2124),
+    // And the same three sigreturn-continuation units: 2127, freshly listed.
+    ("test.detcore_unit_on_host", 2127),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
