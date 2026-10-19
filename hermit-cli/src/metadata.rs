@@ -753,7 +753,13 @@ impl RecordVersion {
 // nothing else can run, and record logs that readmission in the rejoin log at
 // step 2a. Every recording of a vfork now holds a different schedule, so an
 // older one would replay out of step at its first vfork.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x179);
+// 0x179 -> 0x17a (taken at land time as HIGHEST_SHIPPED + 1; reserved as
+// 0x17a): fresh-image DBT Tool start and postexec now run before the first
+// application instruction with its actual entry PC and live SP. Earlier images
+// admitted those hooks at their first syscall, after guest instructions had
+// executed. The lifecycle timing/context is observable even with an unchanged
+// wire layout, so recordings require a new behavior version.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17a);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -778,7 +784,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x179);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x179;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17a;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

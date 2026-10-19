@@ -13,6 +13,8 @@
 
 #![deny(missing_docs)]
 
+#[cfg(test)]
+mod first_instruction_observer;
 mod ofd_channel;
 
 use std::collections::HashMap;
@@ -1699,32 +1701,48 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
         };
         state.reseed_child_rngs(&parent.state, rng_entropy);
     }
-    let mut thread = Box::new(ThreadRuntime {
+    if inherited_parent.is_none() && parent.is_none() {
+        let Some(creator) = runtime.abi.open_file_creator(scratch.virtual_tid, host_tid) else {
+            return -1;
+        };
+        state.set_open_file_creator(creator);
+    }
+    let thread = Box::new(ThreadRuntime {
         tid: Pid::from_raw(det_tid.into()),
         state,
         initialized: false,
         post_exec_pending: host_tid == pid && inherited_parent.is_none(),
         prepared_exec: None,
     });
-    if reverie_dbt::run_tool_thread_start(
-        tool,
-        context as usize,
-        Pid::from_raw(det_tid.into()),
-        host_pid,
-        branch_count,
-        &mut thread.state,
-        &runtime.global,
-        &runtime.config,
-        invoke_syscall,
-        read_registers,
-        write_registers,
-    )
+    scratch.runtime_state = Box::into_raw(thread);
+    let Some(&emit) = DBT_DIAGNOSTIC_EMITTER.get() else {
+        return -1;
+    };
+    // The native admission gate must not release a fresh image between its
+    // thread-start and post-exec hooks. Child state keeps post_exec_pending
+    // false, so the same once-only helper preserves its existing lifecycle.
+    if unsafe {
+        start_thread_runtime(
+            scratch,
+            &runtime,
+            tool,
+            context,
+            host_tid,
+            Pid::from_raw(det_tid.into()),
+            Pid::from_raw(det_pid.into()),
+            host_pid,
+            branch_count,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+            emit,
+            false,
+        )
+    }
     .is_err()
     {
         return -1;
     }
-    thread.initialized = true;
-    scratch.runtime_state = Box::into_raw(thread);
     scratch.pending_clone_flags = 0;
     0
 }
@@ -2392,12 +2410,11 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
     unsafe { std::slice::from_raw_parts_mut(args, values.len()) }.copy_from_slice(&values);
 }
 
-/// Builds and starts this thread's Detcore state on its first runtime event:
-/// constructs it, runs the thread-start hook, then the post-exec hook. A
-/// syscall is usually that event, but an rdtsc can come first (the loader reads
-/// the TSC before its first syscall), so both callbacks start the thread here,
-/// in the same order. Returns `scratch.runtime_state`; `Err` carries the
-/// syscall result to install.
+/// Completes this thread's once-only lifecycle admission: constructs state
+/// when needed, runs thread-start, then the pending fresh-image post-exec hook.
+/// Native first-block admission and the syscall/RDTSC fallback paths share
+/// these flags and ordering. Returns `scratch.runtime_state`; `Err` carries
+/// the syscall result to install.
 ///
 /// # Safety
 ///
@@ -2458,6 +2475,8 @@ unsafe fn start_thread_runtime(
         if first_event {
             emit_lifecycle_marker(emit, b"detcore-dbt: running Detcore thread-start hook\n");
         }
+        #[cfg(test)]
+        first_instruction_observer::observe("start-enter", context, read_registers);
         if let Err(error) = reverie_dbt::run_tool_thread_start(
             tool,
             context as usize,
@@ -2475,6 +2494,8 @@ unsafe fn start_thread_runtime(
             unsafe { emit(message.as_ptr(), message.len()) };
             return Err(error_result(error));
         }
+        #[cfg(test)]
+        first_instruction_observer::observe("start-complete", context, read_registers);
         thread.initialized = true;
     }
     if thread.post_exec_pending {
@@ -2484,6 +2505,8 @@ unsafe fn start_thread_runtime(
                 b"detcore-dbt: thread-start hook completed; running post-exec\n",
             );
         }
+        #[cfg(test)]
+        first_instruction_observer::observe("post-exec-enter", context, read_registers);
         if let Err(errno) = reverie_dbt::run_tool_post_exec(
             tool,
             context as usize,
@@ -2502,6 +2525,8 @@ unsafe fn start_thread_runtime(
         if first_event {
             emit_lifecycle_marker(emit, b"detcore-dbt: post-exec hook completed\n");
         }
+        #[cfg(test)]
+        first_instruction_observer::observe("post-exec-complete", context, read_registers);
         thread.post_exec_pending = false;
     }
     Ok(scratch.runtime_state)
@@ -3081,6 +3106,10 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     // backtrace. Dropping this callback makes the adapter fall back to direct
     // self-process reads, which cannot distinguish a guest fault from a client
     // fault as reliably as dr_safe_read.
+    #[cfg(test)]
+    if first_event {
+        first_instruction_observer::observe("first-syscall", context, read_registers);
+    }
     let mut outcome = reverie_dbt::run_tool_syscall_with_memory_reader(
         tool,
         context as usize,
