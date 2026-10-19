@@ -2114,7 +2114,14 @@ fi
 # for the root Cargo.toml, Cargo.lock and rust-toolchain.toml in both steps, so
 # the inventory (973), SDK and native inputs, calibrated budget, job width and
 # limits are unchanged from the 45615034 carry.
-expected_pin=6bdd0533a38f68a5742b361df656e32b2237d78a
+# CARRY TO 50b0e681d2215a73c113e6c2200f589fa66db29f (2026-10-18): from
+# 6bdd0533a38f68a5742b361df656e32b2237d78a. One commit (signals lane, SIGTRAP-keep fixes). It
+# changes reverie-ptrace only (src/task.rs, its regression tests and their C
+# fixture); git diff is empty under reverie-dbt/ and for the root Cargo.toml,
+# Cargo.lock and rust-toolchain.toml, so the inventory (973), SDK and native
+# inputs, calibrated budget, job width and limits are unchanged from the
+# 45615034 carry.
+expected_pin=50b0e681d2215a73c113e6c2200f589fa66db29f
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
