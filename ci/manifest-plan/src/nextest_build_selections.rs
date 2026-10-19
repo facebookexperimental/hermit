@@ -897,7 +897,8 @@ mod tests {
             // And the staged-bind kernel-path and install-time bind tests
             // (+2, K3a of https://github.com/rrnewton/hermit/issues/4213).
             // And proc_locks_determinism's six new tests (+6): 586.
-            assert_eq!(population, 586);
+            // And its four descriptor-table ledger tests (+4): 590.
+            assert_eq!(population, 590);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

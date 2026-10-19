@@ -9169,6 +9169,13 @@ impl Scheduler {
     /// automatically reaped child, an orphan the namespace's init reaped, or
     /// a process with no guest parent, which Hermit itself reaps, is gone at
     /// its exit (`Self::exited_process_is_zombie`).
+    /// Whether process `leader` has not exited: it exists
+    /// (`Self::process_exists`) and is not a zombie. A process blocked in a
+    /// call, parked or not, is alive; one that exited, reaped or not, is not.
+    pub(crate) fn process_is_alive(&self, leader: DetPid) -> bool {
+        self.process_exists(leader) && self.exited_process_is_zombie(leader).is_none()
+    }
+
     pub fn process_exists(&self, leader: DetPid) -> bool {
         self.thread_tree.process_wait.contains_key(&leader)
             && match self.exited_process_is_zombie(leader) {

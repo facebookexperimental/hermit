@@ -3229,6 +3229,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             None
         };
         tool_global::mark_past_first_execve(guest, unprepared_exe).await;
+        // That request also took the process out of its old descriptor table
+        // in `procfs::locks::LockLedger`; name the descriptions whose locks
+        // Detcore follows that survived the exec (its close-on-exec slots are
+        // gone from this table). A failed exec reaches neither.
+        let surviving = guest.thread_state().lock_tracked_slots();
+        if !surviving.is_empty() {
+            tool_global::note_table_exec(guest, surviving).await;
+        }
         // The new image's auxiliary vector, as it finds it on its initial
         // stack, for its `/proc/<pid>/auxv` (package K slice K2 of
         // https://github.com/rrnewton/hermit/issues/4213). Not under record

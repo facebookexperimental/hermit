@@ -21,21 +21,24 @@
 //! not to its tasks, and the kernel lists exactly the locks held through one
 //! description in that description's `/proc/<pid>/fdinfo/<fd>` `lock:` lines,
 //! spelled as `/proc/locks` spells them. After every `F_OFD_SETLK`,
-//! `F_OFD_SETLKW` and `flock` call, Detcore reads the calling descriptor's
-//! fdinfo through the recorder ([`held_locks_in_fdinfo`]) and keeps, in its
-//! global state, which locks each description holds and which guest processes
-//! hold the description: a process stops holding it at its last close there,
-//! at its exit, and a fork's child starts holding what its parent holds. A
-//! description sent over `SCM_RIGHTS` stays held after its sender closes it,
-//! until a call through it shows it holds nothing.
+//! `F_OFD_SETLKW`, `flock` and `pidfd_getfd` call, and for a descriptor
+//! received over `SCM_RIGHTS` that Detcore models, Detcore reads that
+//! descriptor's fdinfo through the recorder ([`held_locks_in_fdinfo`]). Its
+//! global state keeps a [`LockLedger`]: which locks each such description
+//! holds and which guest descriptor tables reference it, with a slot count
+//! per table, kept as Linux keeps the references (close, replacement, fork,
+//! `CLONE_FILES`, a successful exec, exit). A description's locks are the
+//! guest's while some table it knows references it. If the fdinfo cannot be
+//! read, the run stops by name rather than take that to mean "no locks".
 //!
 //! Before the snapshot's identities are numbered, Detcore keeps only the
 //! groups of rows the guest owns ([`guest_lock_rows`]). A group is a granted
 //! lock and the waiters queued behind it, which share one sequence number. A
 //! group stays when its granted row stays:
 //! - an OFD or flock row whose class, mode, access, object and range are, field
-//!   for field, a lock a live guest description holds, no more such rows than
-//!   guest descriptions hold;
+//!   for field, a lock a guest description some guest table references holds,
+//!   at most one row per distinct such lock (a row a guest process owns claims
+//!   its match first);
 //! - a row owned by a positive pid that names a process of the guest, as the
 //!   container's `/proc` lists it (a live process, or a zombie until it is
 //!   reaped), translated from the kernel's numbering where a backend's differs
@@ -57,19 +60,33 @@
 //! owns it. A group whose granted row goes, goes whole, as Linux drops a whole
 //! group whose granted row's owner it cannot see.
 //!
-//! What still differs from Linux, named rather than hidden:
-//! - a host lock whose row is, field for field, one a guest description holds
-//!   (in practice a shared read lock on the same range of the same file, or a
-//!   file in another btrfs subvolume, whose rows print the one superblock
-//!   device, with the same inode number, range and access) is shown in place
-//!   of nothing, up to the number of such guest locks;
+//! What still differs from Linux, named rather than hidden. One case can show
+//! a host row; every other case hides a row of the guest's own, and none
+//! shows a host row:
+//! - a host lock whose row is, field for field, a lock a guest description
+//!   holds now (in practice a shared read lock on the same range of the same
+//!   file, or a file in another btrfs subvolume, whose rows print the one
+//!   superblock device, with the same inode number, range and access) takes
+//!   the place of the guest's row, at most once per distinct such lock: the
+//!   row shown is the same either way;
+//! - two guest descriptions holding identical shared read OFD locks (same
+//!   file, range and access) show one row, where Linux shows two;
 //! - the guest's own OFD waiter rows (`->` with owner -1) are not shown:
 //!   fdinfo lists no waiters, so Detcore cannot tell them from a host's;
-//! - a lock the guest's descriptions held before Detcore saw a call through
-//!   them (a description inherited already locked at the start, one received
-//!   over `SCM_RIGHTS` on a backend where Detcore keeps no model of it, or one
-//!   rebuilt by an in-guest backend's exec) is not shown until a call through
-//!   a modelled descriptor of it;
+//! - a lock the guest's descriptions held before Detcore read it is not shown
+//!   until a call through a modelled descriptor of it: a description
+//!   inherited already locked at the start; one received over `SCM_RIGHTS`
+//!   where Detcore keeps no model of the receiver's descriptor (ptrace), once
+//!   the sender's tables let go of it; one received through `recvmmsg`; one an
+//!   in-guest backend's exec rebuilds under a new identity;
+//! - fork before lock, for OFD locks: a table that referenced a description
+//!   before Detcore first read its locks (the parent of a child that then
+//!   locks it) is not followed, so once the tables Detcore did see let go of
+//!   it (the child exits), its lock is hidden though Linux keeps it. A flock
+//!   taken that way is shown while its taker lives, by its pid; after the
+//!   taker is reaped, Linux hides it too under a PID namespace;
+//! - a descriptor table several processes share (`CLONE_FILES`) is dropped
+//!   when the first of them exits, hiding locks the others still hold;
 //! - a lease set by a process that was then reaped, under `--no-namespace`,
 //!   is not shown; leases are kept by their owner's pid only;
 //! - the guest's own `F_GETLK`, `F_OFD_GETLK` and conflicting lock calls still
@@ -81,6 +98,9 @@ use std::collections::BTreeSet;
 
 use serde::Deserialize;
 use serde::Serialize;
+
+use crate::types::DetPid;
+use crate::types::OpenFileId;
 
 /// One row of `/proc/locks`, split into fields:
 ///     `SEQ: [->] CLASS MODE RW PID MAJOR:MINOR:INODE START END`
@@ -222,8 +242,11 @@ pub(crate) fn held_locks_in_fdinfo(contents: &[u8]) -> Vec<HeldLock> {
 }
 
 /// Which of `rows` the guest owns (see the module comment). `held` is every
-/// lock a live guest description holds, repeats included; `guest_process`
-/// answers for a positive owner.
+/// lock a guest description some guest table references holds; each distinct
+/// lock admits at most one row, so a lock listed by two descriptions the
+/// ledger cannot tell are one (an in-guest backend's receiver registers a
+/// description it received under an identity of its own) admits no host row
+/// beside the guest's. `guest_process` answers for a positive owner.
 pub(crate) fn guest_lock_rows(
     rows: &[LockRowFacts],
     mut guest_process: impl FnMut(i64) -> bool,
@@ -231,7 +254,23 @@ pub(crate) fn guest_lock_rows(
 ) -> Vec<bool> {
     let mut unclaimed: BTreeMap<&HeldLock, usize> = BTreeMap::new();
     for lock in held {
-        *unclaimed.entry(lock).or_default() += 1;
+        unclaimed.insert(lock, 1);
+    }
+    // A granted row a guest process owns is the guest's whatever it matches,
+    // and it claims its match first, so that a row another owner holds with
+    // the same fields (two shared flocks on one file, one the guest's and one
+    // a host process's, under `--no-namespace`) cannot claim it too.
+    let owned = rows
+        .iter()
+        .map(|row| !row.waiter && row.owner > 0 && guest_process(row.owner))
+        .collect::<Vec<_>>();
+    for (row, owned) in rows.iter().zip(&owned) {
+        if *owned
+            && row.lock.belongs_to_a_description()
+            && let Some(count) = unclaimed.get_mut(&row.lock)
+        {
+            *count = count.saturating_sub(1);
+        }
     }
     let mut kept_groups = BTreeSet::new();
     let mut keep = vec![false; rows.len()];
@@ -242,7 +281,7 @@ pub(crate) fn guest_lock_rows(
         // TEMPORARY EXEMPTION for KVM's backend-local `/proc/locks`
         // (`HeldLock::on_null_device`); removed with package K slice K8.
         keep[index] = row.lock.on_null_device()
-            || (row.owner > 0 && guest_process(row.owner))
+            || owned[index]
             || (row.lock.belongs_to_a_description()
                 && unclaimed.get_mut(&row.lock).is_some_and(|count| {
                     let available = *count > 0;
@@ -260,6 +299,218 @@ pub(crate) fn guest_lock_rows(
         }
     }
     keep
+}
+
+/// A descriptor table, as the ledger names it: a token it hands out, not the
+/// kernel's `files_struct` or Detcore's local `FilesId`, so that nothing in
+/// the ledger depends on a guest process computing a table's identity the
+/// same way the global state does.
+type Table = u64;
+
+/// Which guest descriptor tables reference each open file description whose
+/// OFD or flock locks Detcore has read, and which locks it holds
+/// (`GlobalState::lock_ledger`).
+///
+/// A description's locks count for `/proc/locks` only while some table
+/// references it. Every change comes from the guest's own turns:
+/// - a call through a descriptor that reads its fdinfo
+///   ([`LockLedger::note_locks`]) records the description's locks and how many
+///   slots of the caller's table name it;
+/// - a close, `dup2`/`dup3` over a slot or `close_range` of a description
+///   Detcore has read the locks of reports how many slots of that table still
+///   name it ([`LockLedger::release`]);
+/// - a fork copies the parent's table, and `CLONE_FILES` shares it
+///   ([`LockLedger::fork`]);
+/// - a successful exec leaves the process's table ([`LockLedger::exec`]) and
+///   then names the descriptions that survived it ([`LockLedger::exec_kept`]);
+///   a failed exec changes nothing;
+/// - a table any of whose processes has exited, reaped or not, is dropped
+///   ([`LockLedger::prune`]).
+///
+/// Where it cannot follow a reference exactly, the ledger forgets it, which
+/// hides the guest's own row; it never keeps one it has not seen, which would
+/// show a host's.
+#[derive(Debug, Default)]
+pub(crate) struct LockLedger {
+    next_table: Table,
+    process_table: BTreeMap<DetPid, Table>,
+    owners: BTreeMap<Table, BTreeSet<DetPid>>,
+    references: BTreeMap<OpenFileId, BTreeMap<Table, u32>>,
+    locks: BTreeMap<OpenFileId, Vec<HeldLock>>,
+    after_exec: BTreeMap<DetPid, BTreeMap<OpenFileId, Vec<HeldLock>>>,
+}
+
+impl LockLedger {
+    /// The table `process` uses, made for it if it has none yet.
+    fn table_of(&mut self, process: DetPid) -> Table {
+        if let Some(table) = self.process_table.get(&process) {
+            return *table;
+        }
+        let table = self.next_table;
+        self.next_table += 1;
+        self.process_table.insert(process, table);
+        self.owners.entry(table).or_default().insert(process);
+        table
+    }
+
+    fn set_references(&mut self, open_file: OpenFileId, table: Table, slots: u32) {
+        let references = self.references.entry(open_file).or_default();
+        if slots == 0 {
+            references.remove(&table);
+        } else {
+            references.insert(table, slots);
+        }
+        if references.is_empty() {
+            self.references.remove(&open_file);
+            self.locks.remove(&open_file);
+        }
+    }
+
+    /// `open_file` holds `locks` (perhaps none), as its fdinfo showed them
+    /// after a call through a descriptor of `process`'s table, `slots` of
+    /// which name it.
+    pub(crate) fn note_locks(
+        &mut self,
+        process: DetPid,
+        open_file: OpenFileId,
+        locks: Vec<HeldLock>,
+        slots: u32,
+    ) {
+        let table = self.table_of(process);
+        self.set_references(open_file, table, slots);
+        if self.references.contains_key(&open_file) {
+            self.locks.insert(open_file, locks);
+        }
+    }
+
+    /// `remaining` slots of `process`'s table name `open_file` after a close
+    /// or replacement there. A table the ledger has no record of has no
+    /// reference to drop.
+    pub(crate) fn release(&mut self, process: DetPid, open_file: OpenFileId, remaining: u32) {
+        if let Some(table) = self.process_table.get(&process).copied() {
+            self.set_references(open_file, table, remaining);
+        }
+    }
+
+    /// A new process `child` starts with a copy of `parent`'s table, or,
+    /// with `shares_table` (`CLONE_FILES`), with that table itself. Whatever an
+    /// earlier process with the same number left is not the child's.
+    pub(crate) fn fork(&mut self, parent: DetPid, child: DetPid, shares_table: bool) {
+        self.forget_process(child);
+        self.after_exec.remove(&child);
+        let Some(table) = self.process_table.get(&parent).copied() else {
+            return;
+        };
+        if shares_table {
+            self.owners.entry(table).or_default().insert(child);
+            self.process_table.insert(child, table);
+            return;
+        }
+        let copy = self.table_of(child);
+        for references in self.references.values_mut() {
+            if let Some(slots) = references.get(&table).copied() {
+                references.insert(copy, slots);
+            }
+        }
+    }
+
+    /// `process` completed an exec: it leaves its table (Linux unshares it
+    /// and closes its close-on-exec slots), and only the descriptions
+    /// [`Self::exec_kept`] names next remain referenced through it.
+    pub(crate) fn exec(&mut self, process: DetPid) {
+        let mut kept = BTreeMap::new();
+        if let Some(table) = self.process_table.get(&process).copied() {
+            for (open_file, references) in &self.references {
+                if references.contains_key(&table)
+                    && let Some(locks) = self.locks.get(open_file)
+                {
+                    kept.insert(*open_file, locks.clone());
+                }
+            }
+        }
+        self.forget_process(process);
+        self.after_exec.insert(process, kept);
+    }
+
+    /// The descriptions whose locks Detcore read that `process`'s table names
+    /// after the exec [`Self::exec`] recorded, with their slot counts.
+    pub(crate) fn exec_kept(&mut self, process: DetPid, surviving: &[(OpenFileId, u32)]) {
+        let kept = self.after_exec.remove(&process).unwrap_or_default();
+        for (open_file, slots) in surviving {
+            let Some(locks) = self
+                .locks
+                .get(open_file)
+                .or_else(|| kept.get(open_file))
+                .cloned()
+            else {
+                continue;
+            };
+            let table = self.table_of(process);
+            self.set_references(*open_file, table, *slots);
+            if self.references.contains_key(open_file) {
+                self.locks.insert(*open_file, locks);
+            }
+        }
+    }
+
+    /// Drop every table one of whose processes is no longer `alive` (has
+    /// exited, reaped or not; a process blocked in a call is alive). A
+    /// table processes share (`CLONE_FILES`) goes when the first of them
+    /// exits, which can only hide a row the survivors still hold.
+    pub(crate) fn prune(&mut self, mut alive: impl FnMut(DetPid) -> bool) {
+        let gone = self
+            .owners
+            .iter()
+            .filter(|(_, owners)| owners.iter().any(|process| !alive(*process)))
+            .map(|(table, _)| *table)
+            .collect::<Vec<_>>();
+        for table in gone {
+            self.drop_table(table);
+        }
+        let processes = self.after_exec.keys().copied().collect::<Vec<_>>();
+        for process in processes {
+            if !alive(process) {
+                self.after_exec.remove(&process);
+            }
+        }
+    }
+
+    fn forget_process(&mut self, process: DetPid) {
+        let Some(table) = self.process_table.remove(&process) else {
+            return;
+        };
+        let empty = self.owners.get_mut(&table).is_none_or(|owners| {
+            owners.remove(&process);
+            owners.is_empty()
+        });
+        if empty {
+            self.drop_table(table);
+        }
+    }
+
+    fn drop_table(&mut self, table: Table) {
+        if let Some(owners) = self.owners.remove(&table) {
+            for process in owners {
+                if self.process_table.get(&process) == Some(&table) {
+                    self.process_table.remove(&process);
+                }
+            }
+        }
+        let open_files = self.references.keys().copied().collect::<Vec<_>>();
+        for open_file in open_files {
+            self.set_references(open_file, table, 0);
+        }
+    }
+
+    /// Every lock a description some table references holds, repeats
+    /// included.
+    pub(crate) fn held(&self) -> Vec<HeldLock> {
+        self.locks
+            .iter()
+            .filter(|(open_file, _)| self.references.contains_key(open_file))
+            .flat_map(|(_, locks)| locks.iter().cloned())
+            .collect()
+    }
 }
 
 /// The rows of `contents` that `kept` keeps, in order. With no decision (a
@@ -398,7 +649,7 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
     }
 
     #[test]
-    fn identical_rows_are_kept_no_more_often_than_the_guest_holds_them() {
+    fn a_distinct_lock_admits_one_row() {
         // Two shared read locks with the same range on the same file: one the
         // guest's, one a host's. Linux prints the same row twice.
         let contents = b"\
@@ -408,8 +659,11 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         let rows = lock_rows(contents).unwrap();
         let held = held_locks_in_fdinfo(b"lock:\t1: OFDLCK ADVISORY READ -1 00:18:7 0 EOF\n");
         assert_eq!(guest_lock_rows(&rows, guest, &held), [true, false]);
+        // Listed twice (two guest descriptions, or one the ledger knows under
+        // two identities), it still admits one row: never a host's beside it,
+        // at the cost of hiding a second identical guest lock.
         let twice = [held.clone(), held].concat();
-        assert_eq!(guest_lock_rows(&rows, guest, &twice), [true, true]);
+        assert_eq!(guest_lock_rows(&rows, guest, &twice), [true, false]);
     }
 
     #[test]
@@ -461,6 +715,119 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
             String::from_utf8(rendered).unwrap(),
             "1: POSIX ADVISORY WRITE 1 00:00:1 0 EOF\n"
         );
+    }
+
+    #[test]
+    fn a_guest_processs_row_claims_its_match_before_another_owners() {
+        // Two shared flocks on one file, the guest's (pid 3) and a host
+        // process's (pid 4242), which `--no-namespace` shows both of.
+        let held = held_locks_in_fdinfo(b"lock:\t1: FLOCK ADVISORY READ 3 00:2a:5 0 EOF\n");
+        for (contents, want) in [
+            (
+                &b"1: FLOCK ADVISORY READ 3 00:2a:5 0 EOF\n2: FLOCK ADVISORY READ 4242 00:2a:5 0 EOF\n"[..],
+                [true, false],
+            ),
+            (
+                &b"1: FLOCK ADVISORY READ 4242 00:2a:5 0 EOF\n2: FLOCK ADVISORY READ 3 00:2a:5 0 EOF\n"[..],
+                [false, true],
+            ),
+        ] {
+            let rows = lock_rows(contents).unwrap();
+            assert_eq!(guest_lock_rows(&rows, guest, &held), want);
+        }
+    }
+
+    fn lock(start: &str) -> HeldLock {
+        held_locks_in_fdinfo(
+            format!("lock:\t1: OFDLCK ADVISORY READ -1 00:18:7 {start} {start}\n").as_bytes(),
+        )
+        .remove(0)
+    }
+
+    fn description(sequence: u64) -> OpenFileId {
+        OpenFileId::new(DetPid::from_raw(3), sequence)
+    }
+
+    #[test]
+    fn a_description_counts_while_a_table_references_it() {
+        let [parent, child] = [3, 4].map(DetPid::from_raw);
+        let mut ledger = LockLedger::default();
+        ledger.note_locks(parent, description(0), vec![lock("0")], 1);
+        assert_eq!(ledger.held(), [lock("0")]);
+        // An unlock keeps the description referenced, holding nothing.
+        ledger.note_locks(parent, description(0), Vec::new(), 1);
+        assert!(ledger.held().is_empty());
+        ledger.note_locks(parent, description(0), vec![lock("0")], 2);
+        // One of two slots closed: still referenced.
+        ledger.release(parent, description(0), 1);
+        assert_eq!(ledger.held(), [lock("0")]);
+        // The fork's copy keeps it after the parent's last close...
+        ledger.fork(parent, child, false);
+        ledger.release(parent, description(0), 0);
+        assert_eq!(ledger.held(), [lock("0")]);
+        // ...until the child has exited, reaped or not.
+        ledger.prune(|process| process != child);
+        assert!(ledger.held().is_empty());
+        // A release from a table the ledger never saw changes nothing.
+        ledger.release(DetPid::from_raw(9), description(0), 1);
+        assert!(ledger.held().is_empty());
+    }
+
+    #[test]
+    fn a_shared_table_closes_for_every_process_that_shares_it() {
+        let [parent, sibling] = [3, 4].map(DetPid::from_raw);
+        let mut ledger = LockLedger::default();
+        ledger.note_locks(parent, description(0), vec![lock("0")], 1);
+        ledger.fork(parent, sibling, true);
+        ledger.release(sibling, description(0), 0);
+        assert!(ledger.held().is_empty());
+        // A shared table goes when the first process sharing it exits.
+        ledger.note_locks(parent, description(1), vec![lock("1")], 1);
+        ledger.prune(|process| process != sibling);
+        assert!(ledger.held().is_empty());
+    }
+
+    #[test]
+    fn an_exec_keeps_only_the_descriptions_that_survive_it() {
+        let process = DetPid::from_raw(3);
+        let mut ledger = LockLedger::default();
+        ledger.note_locks(process, description(0), vec![lock("0")], 1);
+        ledger.note_locks(process, description(1), vec![lock("1")], 1);
+        ledger.exec(process);
+        assert!(ledger.held().is_empty());
+        // Description 1 was close-on-exec.
+        ledger.exec_kept(process, &[(description(0), 1)]);
+        assert_eq!(ledger.held(), [lock("0")]);
+        // An exec that names nothing surviving leaves nothing.
+        ledger.exec(process);
+        ledger.exec_kept(process, &[]);
+        assert!(ledger.held().is_empty());
+    }
+
+    #[test]
+    fn a_reused_process_number_starts_with_nothing() {
+        let [parent, child] = [3, 4].map(DetPid::from_raw);
+        let mut ledger = LockLedger::default();
+        ledger.note_locks(child, description(0), vec![lock("0")], 1);
+        // A new process takes the number of one that held a lock; its parent
+        // has no table the ledger knows.
+        ledger.fork(parent, child, false);
+        assert!(ledger.held().is_empty());
+    }
+
+    #[test]
+    fn a_reference_taken_before_any_lock_is_not_followed() {
+        // The parent opened the file before forking and never called through
+        // it; the child locks it and exits. Linux keeps the lock while the
+        // parent's slot stays open; the ledger never saw that slot, so the
+        // lock is hidden (a named residual).
+        let [parent, child] = [3, 4].map(DetPid::from_raw);
+        let mut ledger = LockLedger::default();
+        ledger.fork(parent, child, false);
+        ledger.note_locks(child, description(0), vec![lock("0")], 1);
+        assert_eq!(ledger.held(), [lock("0")]);
+        ledger.prune(|process| process != child);
+        assert!(ledger.held().is_empty());
     }
 
     #[test]

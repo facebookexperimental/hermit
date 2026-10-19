@@ -547,6 +547,13 @@ struct OpenFileDescription {
     /// descriptor whose channel Detcore does not know.
     #[serde(default)]
     channel: Option<crate::pipe_wake::ChannelEnd>,
+    /// True once Detcore read this description's OFD and flock locks from its
+    /// fdinfo after a call through it (`Detcore::refresh_description_locks`):
+    /// from then on, each table's last close or replacement of it is reported
+    /// to `procfs::locks::LockLedger`. Shared by every alias, as the
+    /// description is. Not printed, so descriptions log as before.
+    #[serde(default)]
+    lock_tracked: bool,
 }
 /// Written out, not derived, so that `channel` is printed only when it is set:
 /// a run without `--pipe-wake-latency` logs every description exactly as
@@ -824,6 +831,7 @@ impl DetFd {
                 flock_mode_ever_known: true,
                 timerfd: None,
                 channel: None,
+                lock_tracked: false,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             }))),
@@ -1739,6 +1747,17 @@ impl DetFd {
     /// Whether this open file was marked eligible, exported or not.
     pub(crate) fn is_accept_in_turn_eligible(&self) -> bool {
         self.with_description(|d| d.accept_in_turn_eligible)
+    }
+
+    /// Mark this open file description's locks as followed by
+    /// `procfs::locks::LockLedger`. Permanent.
+    pub(crate) fn set_lock_tracked(&self) {
+        self.with_description(|d| d.lock_tracked = true);
+    }
+
+    /// Whether `procfs::locks::LockLedger` follows this description's locks.
+    pub(crate) fn is_lock_tracked(&self) -> bool {
+        self.with_description(|d| d.lock_tracked)
     }
 
     /// Mark this open file as passed over `SCM_RIGHTS`. Permanent.

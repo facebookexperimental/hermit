@@ -1135,6 +1135,34 @@ pub(crate) fn may_write_process_memory(flags: OFlag, descriptor: Option<(&Path, 
         })
 }
 
+/// Why the run stops when Detcore cannot read descriptor `fd`'s fdinfo after
+/// a lock call: `step` (the open or a read) failed with `errno`. A failure says
+/// nothing about which locks the description holds (`Detcore::read_own_fdinfo`).
+fn fdinfo_refusal(fd: RawFd, step: &str, errno: Errno) -> String {
+    format!(
+        "fcntl/flock: Detcore could not {step} fd {fd}'s fdinfo ({errno}), which it needs \
+         to know which locks the guest holds"
+    )
+}
+
+#[cfg(test)]
+mod fdinfo_refusal_tests {
+    use super::*;
+
+    /// A guest at its descriptor limit gets EMFILE from Detcore's fdinfo
+    /// open after a lock call that needed no new descriptor; the run stops
+    /// with that named, rather than taking the description to hold nothing.
+    /// hermit-cli's `an_ofd_lock_with_a_full_descriptor_table_stops_the_run`
+    /// runs that end to end; this pins the reason's wording.
+    #[test]
+    fn a_failed_fdinfo_read_is_a_named_refusal_not_an_empty_one() {
+        let reason = fdinfo_refusal(7, "open", Errno::EMFILE);
+        assert!(reason.contains("could not open fd 7's fdinfo"), "{reason}");
+        assert!(reason.contains("EMFILE"), "{reason}");
+        assert!(fdinfo_refusal(7, "read", Errno::EIO).contains("could not read fd 7's"));
+    }
+}
+
 /// Writes back the guest bytes that a pre-call lookup buffer (utimensat's, or
 /// the removal lookup's) covered.
 fn restore_lookup_buffer<M: MemoryAccess>(memory: &mut M, buffer: StatPtr, saved: &[u8]) {
@@ -4388,12 +4416,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             return refusal;
         }
         let channel_end = self.pipe_channel_end(guest, fd);
+        let lock_tracked = self.lock_tracked_descriptions(guest, fd..=fd);
         let res = self.record_or_replay(guest, call).await;
         let fd_was_released = !matches!(res, Err(Errno::EBADF) | Err(Errno::ERESTARTSYS));
         if fd_was_released {
             if let Some(open_file_id) = guest.thread_state_mut().remove_fd(fd) {
                 self.release_port_for_open_file(guest, open_file_id).await;
             }
+            self.report_lock_references(guest, lock_tracked).await;
             if let Ok(fd) = u32::try_from(fd) {
                 crate::tool_global::descriptors_replaced(guest, fd, fd).await;
             }
@@ -4435,12 +4465,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let channel_ends = self.pipe_channel_ends_in(guest, first, last);
+        let lock_tracked = match (i32::try_from(first), i32::try_from(last)) {
+            (Ok(first), Ok(last)) => self.lock_tracked_descriptions(guest, first..=last),
+            (Ok(first), Err(_)) => self.lock_tracked_descriptions(guest, first..=RawFd::MAX),
+            _ => Vec::new(),
+        };
         let result = self.record_or_replay(guest, call).await;
         if result.is_ok() {
             let released = guest.thread_state_mut().remove_fd_range(first, last);
             for open_file_id in released {
                 self.release_port_for_open_file(guest, open_file_id).await;
             }
+            self.report_lock_references(guest, lock_tracked).await;
             crate::tool_global::descriptors_replaced(guest, first, last).await;
             for end in channel_ends {
                 self.note_channel_end_closed(guest, Some(end)).await;
@@ -8634,10 +8670,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             F_DUPFD(_) | F_DUPFD_CLOEXEC(_) => {
                 let newfd = self.record_or_replay(guest, call).await? as RawFd;
+                let lock_tracked = self.lock_tracked_descriptions(guest, newfd..=newfd);
                 let replaced = guest.thread_state_mut().dup_fd(fd, newfd, o_cloexec)?;
                 if let Some(open_file_id) = replaced {
                     self.release_port_for_open_file(guest, open_file_id).await;
                 }
+                self.report_lock_references(guest, lock_tracked).await;
                 Ok(newfd as i64)
             }
             F_SETFD(flags) => {
@@ -8720,29 +8758,79 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         fd: RawFd,
     ) -> Result<(), Error> {
-        let Ok(open_file) = guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.open_file_id())
-        else {
+        let Ok(open_file) = guest.thread_state().with_detfd(fd, |detfd| {
+            detfd.set_lock_tracked();
+            detfd.open_file_id()
+        }) else {
             return Ok(());
         };
         let fdinfo = self.read_own_fdinfo(guest, fd).await?;
         let locks = crate::procfs::locks::held_locks_in_fdinfo(&fdinfo);
-        crate::tool_global::note_description_locks(guest, open_file, locks).await;
+        let slots = guest.thread_state().slots_naming(open_file);
+        crate::tool_global::note_description_locks(guest, open_file, locks, slots).await;
         Ok(())
+    }
+
+    /// The descriptions named by the slots `fds` of this thread's table
+    /// whose locks `procfs::locks::LockLedger` follows, taken before a close
+    /// or replacement of those slots.
+    fn lock_tracked_descriptions<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        fds: std::ops::RangeInclusive<RawFd>,
+    ) -> Vec<OpenFileId> {
+        let thread = guest.thread_state();
+        let candidates = if fds.start() == fds.end() {
+            vec![*fds.start()]
+        } else {
+            thread
+                .open_fds()
+                .into_iter()
+                .filter(|fd| fds.contains(fd))
+                .collect()
+        };
+        let mut tracked = candidates
+            .into_iter()
+            .filter_map(|fd| {
+                thread
+                    .with_detfd(fd, |detfd| {
+                        detfd.is_lock_tracked().then(|| detfd.open_file_id())
+                    })
+                    .ok()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        tracked.sort();
+        tracked.dedup();
+        tracked
+    }
+
+    /// After a close or replacement of slots that named `descriptions`,
+    /// report how many slots of this thread's table still name each
+    /// (`procfs::locks::LockLedger::release`).
+    async fn report_lock_references<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        descriptions: Vec<OpenFileId>,
+    ) {
+        for open_file in descriptions {
+            let remaining = guest.thread_state().slots_naming(open_file);
+            crate::tool_global::note_table_released(guest, open_file, remaining).await;
+        }
     }
 
     /// The text of `/proc/self/fdinfo/<fd>`, read through the recorder
     /// ([`Self::record_or_replay`]) by an injected `openat`, reads and
     /// `close`, staged in a private page mapped for this call only and
-    /// unmapped before it returns. A file that cannot be opened or read
-    /// (a backend that serves no fdinfo for this descriptor) reads as empty.
+    /// unmapped before it returns.
     ///
-    /// The page is the one thing this needs that may be missing: a guest that
-    /// has mapped its whole address space away refuses the mapping.
-    /// Going on without the reads would leave the recording's events and
-    /// Detcore's record of the guest's locks depending on that, so the run
-    /// stops instead, by name, with the policy-refusal exit.
+    /// Every step can fail: a guest that has mapped its whole address space
+    /// away refuses the page, one at its descriptor limit refuses the open
+    /// (EMFILE), and a backend may serve no fdinfo. None of those says the
+    /// description holds no lock, and taking it to would hide the guest's own
+    /// locks at a moment its address space or descriptor table decided. So
+    /// the run stops instead, by name, with the policy-refusal exit
+    /// ([`fdinfo_refusal`]).
     async fn read_own_fdinfo<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -8770,17 +8858,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "fcntl/flock: Detcore could not map the page it reads fd {fd}'s fdinfo \
                  through ({mapped:?}), which it needs to know which locks the guest holds"
             );
-            error!("[detcore] {reason}");
-            crate::tool_global::report_policy_refusal(guest, reason).await;
-            crate::tool_global::unrecoverable_shutdown(
-                guest,
-                detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
-            )
-            .await;
+            self.refuse_lock_bookkeeping(guest, reason).await;
         };
         let path = format!("/proc/self/fdinfo/{fd}\0");
         let result = self
-            .read_staged_fdinfo(guest, page, &path, PATH_ROOM, PAGE)
+            .read_staged_fdinfo(guest, page, fd, &path, PATH_ROOM, PAGE)
             .await;
         if let Err(errno) = guest
             .inject_with_retry(Syscall::Munmap(
@@ -8795,19 +8877,33 @@ impl<T: RecordOrReplay> Detcore<T> {
                 errno
             );
         }
-        result
+        match result? {
+            Ok(contents) => Ok(contents),
+            Err(reason) => self.refuse_lock_bookkeeping(guest, reason).await,
+        }
+    }
+
+    /// Stop the run, by name, with the policy-refusal exit, because Detcore
+    /// cannot know which locks a guest description holds ([`Self::read_own_fdinfo`]).
+    async fn refuse_lock_bookkeeping<G: Guest<Self>>(&self, guest: &mut G, reason: String) -> ! {
+        error!("[detcore] {reason}");
+        crate::tool_global::report_policy_refusal(guest, reason).await;
+        crate::tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+            .await
     }
 
     /// [`Self::read_own_fdinfo`]'s reads, in the mapped `page`: the path at
-    /// its start, the read buffer from `path_room` to `page_len`.
+    /// its start, the read buffer from `path_room` to `page_len`. An open or
+    /// a read that fails is the inner error, the refusal's reason.
     async fn read_staged_fdinfo<G: Guest<Self>>(
         &self,
         guest: &mut G,
         page: usize,
+        fd: RawFd,
         path: &str,
         path_room: usize,
         page_len: usize,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<Result<Vec<u8>, String>, Error> {
         assert!(
             path.len() <= path_room,
             "fdinfo path {path:?} outgrew its room"
@@ -8822,10 +8918,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_mode(None);
         let opened = match self.record_or_replay(guest, Syscall::Openat(open)).await {
             Ok(opened) => opened as RawFd,
-            Err(errno) => {
-                warn!("[detcore] fdinfo {path:?} did not open: {errno}");
-                return Ok(Vec::new());
-            }
+            Err(errno) => return Ok(Err(fdinfo_refusal(fd, "open", errno))),
         };
         let scratch = AddrMut::<u8>::from_raw(page + path_room).ok_or(Errno::EFAULT)?;
         let read = self
@@ -8843,11 +8936,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             trace!("[detcore] closing fdinfo {path:?} failed: {errno}");
         }
         match read {
-            Ok(contents) => Ok(contents),
-            Err(Error::Errno(errno)) => {
-                warn!("[detcore] fdinfo {path:?} did not read: {errno}");
-                Ok(Vec::new())
-            }
+            Ok(contents) => Ok(Ok(contents)),
+            Err(Error::Errno(errno)) => Ok(Err(fdinfo_refusal(fd, "read", errno))),
             Err(error) => Err(error),
         }
     }
@@ -9341,12 +9431,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Errno> {
         let old_fd = call.oldfd();
         let new_fd = self.record_or_replay(guest, call).await? as RawFd;
+        let lock_tracked = self.lock_tracked_descriptions(guest, new_fd..=new_fd);
         let replaced = guest
             .thread_state_mut()
             .dup_fd(old_fd, new_fd, OFlag::empty())?;
         if let Some(open_file_id) = replaced {
             self.release_port_for_open_file(guest, open_file_id).await;
         }
+        self.report_lock_references(guest, lock_tracked).await;
         Ok(new_fd as i64)
     }
 
@@ -9377,12 +9469,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             crate::tool_global::descriptors_replaced(guest, new_fd, new_fd).await;
         }
+        let lock_tracked = if old_fd == new_fd {
+            Vec::new()
+        } else {
+            self.lock_tracked_descriptions(guest, new_fd..=new_fd)
+        };
         let replaced = guest
             .thread_state_mut()
             .dup_fd(old_fd, new_fd, OFlag::empty())?;
         if let Some(open_file_id) = replaced {
             self.release_port_for_open_file(guest, open_file_id).await;
         }
+        self.report_lock_references(guest, lock_tracked).await;
         self.note_channel_end_closed(guest, closed_end).await;
         Ok(res)
     }
@@ -9430,10 +9528,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Ok(new_fd) = u32::try_from(new_fd) {
             crate::tool_global::descriptors_replaced(guest, new_fd, new_fd).await;
         }
+        let lock_tracked = self.lock_tracked_descriptions(guest, new_fd..=new_fd);
         let replaced = guest.thread_state_mut().dup_fd(old_fd, new_fd, flags)?;
         if let Some(open_file_id) = replaced {
             self.release_port_for_open_file(guest, open_file_id).await;
         }
+        self.report_lock_references(guest, lock_tracked).await;
         self.note_channel_end_closed(guest, closed_end).await;
         Ok(res)
     }

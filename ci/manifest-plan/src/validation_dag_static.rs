@@ -2544,7 +2544,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // units, the drain-filter scheduler unit and the procfs SigBlk unit: 2094, listed.
     // And procfs::locks's nine units (the guest's own /proc/locks rows):
     // 2103, freshly listed.
-    ("test.detcore_unit", 2103),
+    // And the descriptor-table ledger's six procfs::locks units and the
+    // fdinfo-refusal unit: 2110, freshly listed.
+    ("test.detcore_unit", 2110),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2854,7 +2856,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // description-scenario tests (ptrace and DBT each), its address-space
     // refusal test and its record/replay test, in the second shard:
     // 61 + 269 + 256 = 586, listed.
-    ("test.hermit_integration_2", 269),
+    // And proc_locks_determinism's stale-ledger tests (ptrace and DBT), its
+    // shared-flock control and its full-descriptor-table refusal test:
+    // 61 + 273 + 256 = 590, listed.
+    ("test.hermit_integration_2", 273),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -4441,7 +4446,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (dev-hermit minibeads dh-l1fk): 2086.
     // And the same eight R2b-2 stage 2 units: 2094, listed.
     // And the same nine procfs::locks units: 2103, freshly listed.
-    ("test.detcore_unit_on_host", 2103),
+    // And the same seven ledger and fdinfo-refusal units: 2110, freshly listed.
+    ("test.detcore_unit_on_host", 2110),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4522,7 +4528,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And runtime-private maps target/alias/lifetime coverage: 578, listed.
     // And the 4213 staged-bind kernel-path and install-time bind tests: 580.
     // And proc_locks_determinism's six new tests: 586, listed.
-    ("test.hermit_integration_on_host", 586),
+    // And its four descriptor-table ledger tests: 590, listed.
+    ("test.hermit_integration_on_host", 590),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

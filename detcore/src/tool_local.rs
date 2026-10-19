@@ -5497,6 +5497,31 @@ impl<T> ThreadState<T> {
         self.metadata().remove_fd_range(first, last)
     }
 
+    /// How many slots of this thread's table name the open file description
+    /// `open_file` (`procfs::locks::LockLedger`).
+    pub(crate) fn slots_naming(&self, open_file: OpenFileId) -> u32 {
+        let count = self
+            .metadata()
+            .file_handles
+            .values()
+            .filter(|detfd| detfd.open_file_id() == open_file)
+            .count();
+        u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
+    /// The descriptions in this thread's table whose locks
+    /// `procfs::locks::LockLedger` follows, each with how many slots name it,
+    /// in description order.
+    pub(crate) fn lock_tracked_slots(&self) -> Vec<(OpenFileId, u32)> {
+        let mut slots: BTreeMap<OpenFileId, u32> = BTreeMap::new();
+        for detfd in self.metadata().file_handles.values() {
+            if detfd.is_lock_tracked() {
+                *slots.entry(detfd.open_file_id()).or_default() += 1;
+            }
+        }
+        slots.into_iter().collect()
+    }
+
     /// The descriptors Detcore's table holds for this thread, in order.
     pub(crate) fn open_fds(&self) -> Vec<RawFd> {
         let mut fds: Vec<RawFd> = self.metadata().file_handles.keys().copied().collect();

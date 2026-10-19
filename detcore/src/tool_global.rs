@@ -1218,12 +1218,11 @@ pub struct GlobalState {
     /// The auxiliary vector of each guest process's current image, for its
     /// `/proc/<pid>/auxv` ([`ProcessAuxvTable`]).
     process_auxv: Arc<Mutex<ProcessAuxvTable>>,
-    /// The OFD and flock locks each guest open file description holds, as
-    /// its fdinfo last showed them after a call through it, and which guest
-    /// processes hold the description, so that `/proc/locks` keeps exactly
-    /// the guest's own rows (`procfs::locks`). Locked after `sched`, never
-    /// before it.
-    guest_lock_descriptions: Mutex<BTreeMap<OpenFileId, LockedDescription>>,
+    /// Which guest descriptor tables reference each open file description
+    /// whose OFD or flock locks Detcore has read, and which locks it holds,
+    /// so that `/proc/locks` keeps exactly the guest's own rows
+    /// (`procfs::locks::LockLedger`). Locked after `sched`, never before it.
+    lock_ledger: Mutex<crate::procfs::locks::LockLedger>,
     /// The registered root thread, whose first image
     /// `Config::launch_image` names, and whether that image was completed.
     root_dettid: OnceLock<DetTid>,
@@ -1488,20 +1487,6 @@ impl ProcessAuxvTable {
     }
 }
 
-/// What `GlobalState::guest_lock_descriptions` keeps for one guest open file
-/// description: the OFD and flock locks its fdinfo showed after the last call
-/// through it, the guest processes that hold a descriptor of it (a process
-/// stops at its last close there and at its exit; a fork's child starts with
-/// its parent's), and whether a guest process sent it over `SCM_RIGHTS`, after
-/// which it stays held until a call through it shows no lock, since Detcore
-/// cannot see who received it.
-#[derive(Debug, Default)]
-struct LockedDescription {
-    locks: Vec<crate::procfs::locks::HeldLock>,
-    holders: BTreeSet<DetPid>,
-    sent: bool,
-}
-
 impl ProcessExitCleanup {
     /// Complete the exit `watch` observed, unless a later registration has
     /// replaced it. Nothing calls this in production yet; the daemon-point
@@ -1714,7 +1699,7 @@ impl GlobalState {
             post_exec_fd_blocking: process_exit_cleanup.post_exec_fd_blocking,
             exec_images: process_exit_cleanup.exec_images,
             process_auxv: process_exit_cleanup.process_auxv,
-            guest_lock_descriptions: Mutex::new(BTreeMap::new()),
+            lock_ledger: Mutex::new(Default::default()),
             root_dettid: OnceLock::new(),
             root_image_marked: AtomicBool::new(false),
             launcher_identity: OnceLock::new(),
@@ -1852,21 +1837,6 @@ impl GlobalState {
         }
         if let Some(loss) = loss {
             crate::detlog::write_loss_notice(&loss);
-        }
-    }
-
-    /// A new process `child` holds every open file description its parent's
-    /// process holds, as Linux copies the descriptor table at fork: their OFD
-    /// and flock locks stay the guest's after the parent closes them or exits.
-    /// The number is fresh: whatever an earlier process with the same number
-    /// held is not the child's.
-    fn inherit_lock_holders(&self, parent: DetPid, child: DetPid) {
-        let mut table = self.guest_lock_descriptions.lock().unwrap();
-        for entry in table.values_mut() {
-            entry.holders.remove(&child);
-            if entry.holders.contains(&parent) {
-                entry.holders.insert(child);
-            }
         }
     }
 
@@ -3115,6 +3085,9 @@ impl GlobalState {
                 kernel_image,
             ) => {
                 let mut sched = self.lock_rpc_scheduler(false).await;
+                // The exec leaves its process's descriptor table
+                // (`LockLedger::exec`); `TableExec` names what survived.
+                self.lock_ledger.lock().unwrap().exec(detpid);
                 // A backend preserving the leader's ThreadState does not use
                 // the identity-transfer RPC. This successful-exec edge still
                 // commits the frozen sibling cohort in scheduler order.
@@ -3388,13 +3361,7 @@ impl GlobalState {
                         )
                         .await
                     {
-                        SchedulerRpcResult::Continue(()) => {
-                            if !flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_THREAD))
-                            {
-                                self.inherit_lock_holders(parent_detpid, dettid);
-                            }
-                            R::CreateChildThread(None)
-                        }
+                        SchedulerRpcResult::Continue(()) => R::CreateChildThread(None),
                         SchedulerRpcResult::ThreadExited => R::ThreadExited,
                     }
                 }
@@ -3426,12 +3393,7 @@ impl GlobalState {
                 )
                 .await
             {
-                SchedulerRpcResult::Continue(()) => {
-                    if !flags.contains(CloneFlags::CLONE_THREAD) {
-                        self.inherit_lock_holders(parent_detpid, child_dettid);
-                    }
-                    R::CreateChildThread(None)
-                }
+                SchedulerRpcResult::Continue(()) => R::CreateChildThread(None),
                 SchedulerRpcResult::ThreadExited => R::ThreadExited,
             },
             // Requested by the child thread itself:
@@ -3990,33 +3952,32 @@ impl GlobalState {
                 let _sched = self.lock_rpc_scheduler(false).await;
                 R::RootChanged(self.process_auxv.lock().unwrap().root_changed(task))
             }
-            GlobalRequest::DescriptionLocks(open_file, locks) => {
+            GlobalRequest::DescriptionLocks(open_file, locks, slots) => {
                 let sched = self.lock_rpc_scheduler(false).await;
                 let process = sched.registered_process(dtid).unwrap_or(dtid);
-                let mut table = self.guest_lock_descriptions.lock().unwrap();
-                if locks.is_empty() {
-                    // Locks belong to the description, whichever process
-                    // released them: none is held through it now.
-                    table.remove(&open_file);
-                } else {
-                    let entry = table.entry(open_file).or_default();
-                    entry.locks = locks;
-                    entry.holders.insert(process);
-                }
+                self.lock_ledger
+                    .lock()
+                    .unwrap()
+                    .note_locks(process, open_file, locks, slots);
                 R::DescriptionLocks(())
             }
-            GlobalRequest::PinDescriptionLocks(open_files, every_held) => {
+            GlobalRequest::TableReleased(open_file, remaining) => {
                 let sched = self.lock_rpc_scheduler(false).await;
                 let process = sched.registered_process(dtid).unwrap_or(dtid);
-                let mut table = self.guest_lock_descriptions.lock().unwrap();
-                for (open_file, entry) in table.iter_mut() {
-                    if open_files.contains(open_file)
-                        || (every_held && entry.holders.contains(&process))
-                    {
-                        entry.sent = true;
-                    }
-                }
-                R::PinDescriptionLocks(())
+                self.lock_ledger
+                    .lock()
+                    .unwrap()
+                    .release(process, open_file, remaining);
+                R::TableReleased(())
+            }
+            GlobalRequest::TableExec(surviving) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let process = sched.registered_process(dtid).unwrap_or(dtid);
+                self.lock_ledger
+                    .lock()
+                    .unwrap()
+                    .exec_kept(process, &surviving);
+                R::TableExec(())
             }
             GlobalRequest::GuestLockRows(rows) => {
                 // A positive owner is the kernel's number for a process in the
@@ -4039,21 +4000,11 @@ impl GlobalState {
                     })
                     .map(|(owner, _)| i64::from(*owner))
                     .collect::<BTreeSet<_>>();
-                // A description a guest process held stops being held by it
-                // at that process's exit, which the scheduler orders in the
-                // guest's turns; a description no live guest process holds,
-                // and none was sent away, holds nothing of the guest's.
-                let mut table = self.guest_lock_descriptions.lock().unwrap();
-                table.retain(|_, entry| {
-                    entry
-                        .holders
-                        .retain(|holder| sched.exited_process_is_zombie(*holder).is_none());
-                    entry.sent || !entry.holders.is_empty()
-                });
-                let held = table
-                    .values()
-                    .flat_map(|entry| entry.locks.iter().cloned())
-                    .collect::<Vec<_>>();
+                // A table a process that exited used, reaped or not,
+                // references nothing (`LockLedger::prune`).
+                let mut ledger = self.lock_ledger.lock().unwrap();
+                ledger.prune(|process| sched.process_is_alive(process));
+                let held = ledger.held();
                 R::GuestLockRows(crate::procfs::locks::guest_lock_rows(
                     &rows,
                     |owner| guest_owners.contains(&owner),
@@ -4187,19 +4138,7 @@ impl GlobalState {
                 R::AddUsedPort
             }
             GlobalRequest::ReleasePort(open_file_id) => {
-                let sched = self.lock_rpc_scheduler(false).await;
-                // The sender's process closed its last descriptor of this
-                // description, so it holds none of the description's locks.
-                let process = sched.registered_process(dtid).unwrap_or(dtid);
-                {
-                    let mut table = self.guest_lock_descriptions.lock().unwrap();
-                    if let Some(entry) = table.get_mut(&open_file_id) {
-                        entry.holders.remove(&process);
-                        if entry.holders.is_empty() && !entry.sent {
-                            table.remove(&open_file_id);
-                        }
-                    }
-                }
+                let _sched = self.lock_rpc_scheduler(false).await;
                 let mut used_ports = self.used_ports.lock().unwrap();
                 let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
                 let port = open_file_to_port.remove(&open_file_id);
@@ -4652,6 +4591,16 @@ impl GlobalState {
                         .unwrap()
                         .inherit(parent_detpid, child_dettid);
                     sched.inherit_real_time_records(parent_detpid, child_dettid);
+                    // Its descriptor table: its creator's with CLONE_FILES, a
+                    // copy without. Recorded here, in the creator's turn and
+                    // before the child can run, so a lock the child takes
+                    // first is never overwritten by its own fork
+                    // (`procfs::locks::LockLedger::fork`).
+                    self.lock_ledger.lock().unwrap().fork(
+                        parent_detpid,
+                        child_dettid,
+                        flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_FILES)),
+                    );
                 }
             }
 
@@ -6299,17 +6248,20 @@ pub enum GlobalRequest {
     RootChanged(DetPid),
     /// The OFD and flock locks this open file description holds, as its
     /// fdinfo showed them after a call through one of the sender's
-    /// descriptors (`GlobalState::guest_lock_descriptions`); the sender's
-    /// process holds the description. Appended last.
-    DescriptionLocks(OpenFileId, Vec<crate::procfs::locks::HeldLock>),
-    /// The sender is about to send these descriptions over `SCM_RIGHTS`, or,
-    /// with `true`, descriptors it could not read the message for: their
-    /// locks stay the guest's after the sender closes them, until a call
-    /// through one shows none. Appended last.
-    PinDescriptionLocks(Vec<OpenFileId>, bool),
+    /// descriptors, and how many slots of the sender's descriptor table name
+    /// it (`procfs::locks::LockLedger::note_locks`). Appended last.
+    DescriptionLocks(OpenFileId, Vec<crate::procfs::locks::HeldLock>, u32),
+    /// How many slots of the sender's descriptor table still name this
+    /// description after a close or replacement there
+    /// (`procfs::locks::LockLedger::release`). Appended last.
+    TableReleased(OpenFileId, u32),
     /// Which rows of a `/proc/locks` snapshot the guest owns
     /// (`procfs::locks::guest_lock_rows`). Appended last.
     GuestLockRows(Vec<crate::procfs::locks::LockRowFacts>),
+    /// The descriptions whose locks Detcore read that the sender's process's
+    /// table still names after its successful exec, with their slot counts
+    /// (`procfs::locks::LockLedger::exec_kept`). Appended last.
+    TableExec(Vec<(OpenFileId, u32)>),
 }
 
 /// Responses from the global object
@@ -6524,9 +6476,11 @@ pub enum GlobalResponse {
     /// Appended last.
     DescriptionLocks(()),
     /// Appended last.
-    PinDescriptionLocks(()),
+    TableReleased(()),
     /// One answer per row, in row order. Appended last.
     GuestLockRows(Vec<bool>),
+    /// Appended last.
+    TableExec(()),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -9085,40 +9039,52 @@ where
 }
 
 /// Record the OFD and flock locks `open_file` holds, as its fdinfo showed
-/// them after a call through one of the sender's descriptors
-/// (`GlobalState::guest_lock_descriptions`).
+/// them after a call through one of the sender's descriptors, and that
+/// `slots` slots of the sender's table name it
+/// (`procfs::locks::LockLedger::note_locks`).
 pub(crate) async fn note_description_locks<G, T>(
     guest: &mut G,
     open_file: OpenFileId,
     locks: Vec<crate::procfs::locks::HeldLock>,
-) where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    let response = send_and_update_time(guest, GlobalRequest::DescriptionLocks(open_file, locks))
-        .await
-        .1;
-    assert_eq!(response, GlobalResponse::DescriptionLocks(()));
-}
-
-/// Keep the locks of `open_files`, which the sender is about to send over
-/// `SCM_RIGHTS` (with `every_held`, of every description its process holds),
-/// the guest's after the sender closes them (`GlobalState::guest_lock_descriptions`).
-pub(crate) async fn pin_description_locks<G, T>(
-    guest: &mut G,
-    open_files: Vec<OpenFileId>,
-    every_held: bool,
+    slots: u32,
 ) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
     let response = send_and_update_time(
         guest,
-        GlobalRequest::PinDescriptionLocks(open_files, every_held),
+        GlobalRequest::DescriptionLocks(open_file, locks, slots),
     )
     .await
     .1;
-    assert_eq!(response, GlobalResponse::PinDescriptionLocks(()));
+    assert_eq!(response, GlobalResponse::DescriptionLocks(()));
+}
+
+/// Record that `remaining` slots of the sender's table still name
+/// `open_file` (`procfs::locks::LockLedger::release`).
+pub(crate) async fn note_table_released<G, T>(guest: &mut G, open_file: OpenFileId, remaining: u32)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::TableReleased(open_file, remaining))
+        .await
+        .1;
+    assert_eq!(response, GlobalResponse::TableReleased(()));
+}
+
+/// Record which descriptions whose locks Detcore read the sender's table
+/// still names after its successful exec
+/// (`procfs::locks::LockLedger::exec_kept`).
+pub(crate) async fn note_table_exec<G, T>(guest: &mut G, surviving: Vec<(OpenFileId, u32)>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::TableExec(surviving))
+        .await
+        .1;
+    assert_eq!(response, GlobalResponse::TableExec(()));
 }
 
 /// Which of the rows of a `/proc/locks` snapshot the guest owns, in row order
