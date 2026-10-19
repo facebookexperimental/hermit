@@ -1373,13 +1373,13 @@ fn delivery_counters(mode: &str) -> Vec<String> {
     delivery_log(mode, &[]).0
 }
 
-/// The counter line of a thread whose one caught delivery is approved, with
-/// Detcore's syscall result compared with `rax`.
-const ONE_APPROVAL: &str =
-    "approved=1 result_checked=1 mismatched=0 interruption_from_registers=0 skipped={}";
+/// The counter line of a thread whose one caught delivery is approved, at
+/// the signal's own stop (not held), with Detcore's syscall result compared
+/// with `rax`, and which no signal reached unreported.
+const ONE_APPROVAL: &str = "approved=1 held=0 result_checked=1 mismatched=0 interruption_from_registers=0 skipped={} unreported={}";
 
 /// The counter line of a thread whose one signal is not caught.
-const NOT_CAUGHT: &str = r#"approved=0 result_checked=0 mismatched=0 interruption_from_registers=0 skipped={"not caught": 1}"#;
+const NOT_CAUGHT: &str = r#"approved=0 held=0 result_checked=0 mismatched=0 interruption_from_registers=0 skipped={"not caught": 1} unreported={}"#;
 
 fn assert_counters(mode: &str, expected: &[&str]) {
     let _guard = hermit_signal_lock();
@@ -1417,13 +1417,53 @@ fn ptrace_delivery_check_approves_a_signal_whose_handler_restarts_a_pipe_read() 
 fn ptrace_delivery_check_approves_a_signal_to_a_thread_in_user_code() {
     assert_counters(
         "spin",
-        &["approved=1 result_checked=0 mismatched=0 interruption_from_registers=0 skipped={}"],
+        &[
+            "approved=1 held=0 result_checked=0 mismatched=0 interruption_from_registers=0 skipped={} unreported={}",
+        ],
     );
 }
 
 #[test]
 fn ptrace_delivery_check_approves_a_signal_admitted_by_sigsuspend() {
     assert_counters("suspend", &[ONE_APPROVAL]);
+}
+
+/// Inside sigsuspend, SIGSEGV (a signal Linux can force-deliver) is blocked
+/// in the thread's own mask, which the frame saves, and not in the
+/// temporary mask. The check leaves SIGSEGV out of the frame's comparison
+/// only and approves the delivery (A5 step 3.2b). Before, a forced bit in
+/// one mask only left the delivery unchecked
+/// (`skipped={"forced bit in one mask only": 1}`).
+#[test]
+fn ptrace_delivery_check_approves_with_a_forced_bit_in_the_frame_mask_only() {
+    assert_counters("suspend-forced-frame", &[ONE_APPROVAL]);
+}
+
+/// As `..._in_the_frame_mask_only`, with SIGSEGV blocked in the temporary
+/// mask and not in the thread's own: left out of the current mask's
+/// comparison only.
+#[test]
+fn ptrace_delivery_check_approves_with_a_forced_bit_in_the_current_mask_only() {
+    assert_counters("suspend-forced-current", &[ONE_APPROVAL]);
+}
+
+/// A blocked SIGSYS with a kernel si_code, which the backend takes at the
+/// steps of syscalls it skips (Hermit's emulated sched_yield, then the
+/// unblocking rt_sigprocmask, which Detcore injects) and passes back
+/// unreported each time, while the mask blocks it, so the kernel requeues
+/// it: counted as two unreported passes by their reason (A5 step 3.2b). The
+/// first pass gives the copy up (the signal could have entered a handler the
+/// copy did not see), so the delivery at the unblock is not checked
+/// (`no copy`). The guest checks that the signal stays pending through
+/// sched_yield and its handler runs once, at the unblock, as natively.
+#[test]
+fn ptrace_delivery_check_counts_a_signal_passed_on_unreported_at_a_syscall_skip() {
+    assert_counters(
+        "skip-bypass",
+        &[
+            r#"approved=0 held=0 result_checked=0 mismatched=0 interruption_from_registers=0 skipped={"no copy": 1} unreported={"during a syscall skip": 2}"#,
+        ],
+    );
 }
 
 #[test]
@@ -1438,7 +1478,7 @@ fn ptrace_delivery_check_approves_an_sa_resethand_delivery_then_not_the_default(
     assert_counters(
         "resethand",
         &[
-            r#"approved=1 result_checked=1 mismatched=0 interruption_from_registers=0 skipped={"not caught": 1}"#,
+            r#"approved=1 held=0 result_checked=1 mismatched=0 interruption_from_registers=0 skipped={"not caught": 1} unreported={}"#,
         ],
     );
 }
@@ -1456,7 +1496,9 @@ fn ptrace_delivery_check_approves_two_coalesced_sends_once() {
 fn ptrace_delivery_check_approves_two_direct_realtime_sends() {
     assert_counters(
         "realtime-direct",
-        &["approved=2 result_checked=2 mismatched=0 interruption_from_registers=0 skipped={}"],
+        &[
+            "approved=2 held=0 result_checked=2 mismatched=0 interruption_from_registers=0 skipped={} unreported={}",
+        ],
     );
 }
 
@@ -1503,7 +1545,9 @@ fn ptrace_delivery_check_never_offers_an_ignored_signal() {
 fn ptrace_delivery_check_approves_two_signals_at_one_exit() {
     assert_counters(
         "two-pending",
-        &["approved=2 result_checked=1 mismatched=0 interruption_from_registers=0 skipped={}"],
+        &[
+            "approved=2 held=0 result_checked=1 mismatched=0 interruption_from_registers=0 skipped={} unreported={}",
+        ],
     );
 }
 
@@ -1534,7 +1578,9 @@ fn ptrace_delivery_check_never_offers_a_default_fatal_signal() {
 fn ptrace_delivery_check_approves_two_queued_realtime_instances_in_order() {
     assert_counters(
         "realtime-two",
-        &["approved=2 result_checked=1 mismatched=0 interruption_from_registers=1 skipped={}"],
+        &[
+            "approved=2 held=0 result_checked=1 mismatched=0 interruption_from_registers=1 skipped={} unreported={}",
+        ],
     );
 }
 
@@ -1549,7 +1595,7 @@ fn ptrace_delivery_check_approves_a_signal_that_interrupts_a_restarted_child_wai
     assert_eq!(
         counters,
         [
-            r#"approved=1 result_checked=1 mismatched=0 interruption_from_registers=0 skipped={"not caught": 1}"#,
+            r#"approved=1 held=0 result_checked=1 mismatched=0 interruption_from_registers=0 skipped={"not caught": 1} unreported={}"#,
         ]
     );
     assert!(
@@ -1567,7 +1613,7 @@ fn ptrace_delivery_check_gives_the_copy_up_quietly_after_a_frame_fault() {
     assert_counters(
         "frame-fault",
         &[
-            r#"approved=1 result_checked=1 mismatched=0 interruption_from_registers=0 skipped={"copy given up at this delivery": 1}"#,
+            r#"approved=1 held=0 result_checked=1 mismatched=0 interruption_from_registers=0 skipped={"copy given up at this delivery": 1} unreported={}"#,
         ],
     );
 }
@@ -1583,7 +1629,9 @@ fn ptrace_delivery_check_approves_the_sigsegv_of_a_frame_fault_under_sa_nodefer(
     let (counters, approvals) = delivery_log("frame-fault-nodefer", &[]);
     assert_eq!(
         counters,
-        ["approved=2 result_checked=1 mismatched=0 interruption_from_registers=1 skipped={}"]
+        [
+            "approved=2 held=0 result_checked=1 mismatched=0 interruption_from_registers=1 skipped={} unreported={}"
+        ]
     );
     assert!(
         approvals.len() == 2 && approvals[1].contains("KernelRun { syscall: 234 }"),
@@ -1599,7 +1647,7 @@ fn ptrace_delivery_check_gives_up_a_forced_signal_the_copy_blocks() {
     assert_counters(
         "forced-blocked",
         &[
-            r#"approved=0 result_checked=0 mismatched=0 interruption_from_registers=0 skipped={"forced while blocked": 1}"#,
+            r#"approved=0 held=0 result_checked=0 mismatched=0 interruption_from_registers=0 skipped={"forced while blocked": 1} unreported={}"#,
             NOT_CAUGHT,
         ],
     );
@@ -1613,7 +1661,7 @@ fn ptrace_delivery_check_gives_up_a_forced_signal_the_copy_ignores() {
     assert_counters(
         "forced-ignored",
         &[
-            r#"approved=0 result_checked=0 mismatched=0 interruption_from_registers=0 skipped={"forced while ignored": 1}"#,
+            r#"approved=0 held=0 result_checked=0 mismatched=0 interruption_from_registers=0 skipped={"forced while ignored": 1} unreported={}"#,
             NOT_CAUGHT,
         ],
     );
@@ -1683,7 +1731,9 @@ fn ptrace_delivery_check_does_not_deliver_a_sibling_signal_the_wait_blocks() {
     let _guard = hermit_signal_lock();
     assert_mt_counters(
         "mt-suspend-blocked",
-        &["approved=2 result_checked=2 mismatched=0 interruption_from_registers=0 skipped={}"],
+        &[
+            "approved=2 held=0 result_checked=2 mismatched=0 interruption_from_registers=0 skipped={} unreported={}",
+        ],
     );
 }
 

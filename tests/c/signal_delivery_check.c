@@ -278,6 +278,32 @@ int main(int argc, char** argv) {
     expect("sigsuspend errno", error, EINTR);
     expect("handler mask", (long long)handler_mask, (long long)(sa_mask | bit(SIGALRM)));
     expect("mask after sigsuspend", (long long)current_mask(), (long long)(own | bit(SIGALRM)));
+  } else if (!strcmp(mode, "suspend-forced-frame") || !strcmp(mode, "suspend-forced-current")) {
+    // As suspend, with SIGSEGV, which Linux can force-deliver and the
+    // delivery check therefore leaves unchecked where Detcore's copy blocks
+    // it, in only one of the two masks: the thread's own (the mask the
+    // frame saves), or the temporary one (the mask in effect during the
+    // wait) (A5 step 3.2b).
+    int in_frame = !strcmp(mode, "suspend-forced-frame");
+    catch_signal(SIGALRM, 0);
+    uint64_t saved = own | bit(SIGALRM) | (in_frame ? bit(SIGSEGV) : 0);
+    set_mask(saved);
+    arm_alarm();
+    sigset_t temporary;
+    sigemptyset(&temporary);
+    if (!in_frame) {
+      sigaddset(&temporary, SIGSEGV);
+    }
+    result = sigsuspend(&temporary);
+    error = errno;
+    expect("sigsuspend", result, -1);
+    expect("sigsuspend errno", error, EINTR);
+    expect(
+        "handler mask",
+        (long long)handler_mask,
+        (long long)(sa_mask | bit(SIGALRM) | (in_frame ? 0 : bit(SIGSEGV))));
+    expect("frame mask", (long long)handler_frame_mask, (long long)saved);
+    expect("mask after sigsuspend", (long long)current_mask(), (long long)saved);
   } else if (!strcmp(mode, "realtime")) {
     catch_signal(SIGRTMIN + 3, 0);
     union sigval value = {.sival_int = 7};
@@ -568,6 +594,30 @@ int main(int argc, char** argv) {
     expect("handler thread is the main thread", handler_tid, job.target);
     expect("handler mask", (long long)handler_mask, (long long)(own | sa_mask | bit(SIGUSR1)));
     expect("frame mask", (long long)handler_frame_mask, (long long)own);
+  } else if (!strcmp(mode, "skip-bypass")) {
+    // A caught SIGSYS that the thread blocks, queued to itself with a
+    // kernel si_code (1, SYS_SECCOMP) so that Linux treats it as
+    // synchronous, stays pending through a sched_yield, and its handler runs
+    // once, at the unblock. Under ptrace, Hermit emulates sched_yield and
+    // the backend skips the guest's call; the skip's step takes the queued
+    // SIGSYS, which the backend passes back to the guest unreported, so no
+    // delivery check sees it (A5 step 3.2b).
+    catch_signal(SIGSYS, 0);
+    set_mask(own | bit(SIGSYS));
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    info.si_signo = SIGSYS;
+    info.si_code = 1;
+    info.si_pid = getpid();
+    result = syscall(SYS_rt_tgsigqueueinfo, getpid(), syscall(SYS_gettid), SIGSYS, &info);
+    expect("rt_tgsigqueueinfo", result, 0);
+    expect("sched_yield", syscall(SYS_sched_yield), 0);
+    sigset_t pending;
+    sigpending(&pending);
+    expect("pending after sched_yield", sigismember(&pending, SIGSYS), 1);
+    expect("handled before the unblock", handled, 0);
+    set_mask(own);
+    expect("handler mask", (long long)handler_mask, (long long)(own | sa_mask | bit(SIGSYS)));
   } else if (!strcmp(mode, "ignored")) {
     signal(SIGUSR1, SIG_IGN);
     raise(SIGUSR1);

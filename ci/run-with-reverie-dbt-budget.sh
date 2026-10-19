@@ -2257,7 +2257,15 @@ fi
 # byte-identical and no reverie-dbt file is added or removed, so the
 # inventory (989), SDK recipe and resource budget carry without a cold SDK
 # build. This is not runtime-correctness or binary/package identity evidence.
-expected_pin=905b53dbdb37422fa5d1ea70c1e1df60e211cb18
+# CARRY TO 5041073ee5204c976aa3fdba76b16035bbf7ef76 (2026-10-19): from
+# 905b53dbdb37422fa5d1ea70c1e1df60e211cb18. One commit (signals lane, A5 step 3.2b part 2:
+# signal report path, unreported-signal reasons, per-mask exemptions). It
+# changes reverie/src (guest.rs, signal.rs, signal_delivery.rs, tool.rs),
+# reverie-ptrace/src/task.rs and reverie-ptrace tests only; git diff is empty
+# under reverie-dbt/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory (989), SDK and native inputs,
+# calibrated budget, job width and limits are unchanged from the 905b53db carry.
+expected_pin=5041073ee5204c976aa3fdba76b16035bbf7ef76
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

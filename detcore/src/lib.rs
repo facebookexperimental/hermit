@@ -476,6 +476,20 @@ pub fn virtual_cpuid_digest(cfg: &Config) -> [u8; 32] {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Whether `signal`, passed on to a guest thread without a report, could
+    /// have entered a handler the thread's signal-state copy never saw: where
+    /// the copy is kept against the kernel's own state, for any signal but
+    /// Reverie's preemption signal, SIGKILL and SIGSTOP, which never reach a
+    /// guest handler.
+    fn copy_misses_unreported(&self, signal: i32) -> bool {
+        self.cfg.signal_state_copy
+            && self.cfg.sequentialize_threads
+            && bundled_signal_facts::kernel_signal_state_is_guests(&self.cfg.backend)
+            && signal != reverie::PERF_EVENT_SIGNAL as i32
+            && signal != libc::SIGKILL
+            && signal != libc::SIGSTOP
+    }
+
     /// Rule 4 for the coalescing ITIMER_REAL: tell the scheduler about a
     /// committed guest SIGALRM send (https://github.com/rrnewton/hermit/issues/4139).
     async fn note_guest_sigalrm<G: Guest<Self>>(&self, guest: &mut G, target: GuestSigalrmTarget) {
@@ -2249,6 +2263,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         thread_state.returned_from_sigreturn = true;
     }
 
+    /// Counts each signal the backend passes on without reporting it, which
+    /// could reach a guest handler, so the delivery counters show what no
+    /// delivery check saw (A5 step 3.2b).
+    fn note_unreported_signal(
+        &self,
+        thread_state: &mut Self::ThreadState,
+        signal: &reverie::UnreportedSignal,
+        kept: bool,
+    ) {
+        if kept && self.copy_misses_unreported(signal.number()) {
+            let dettid = thread_state.dettid;
+            thread_state
+                .delivery_counters
+                .count_unreported(dettid, signal.reason());
+        }
+    }
+
     /// NOTE: these subscriptions are used ONLY for hermit run mode.  Hermit record has its own
     /// subscriptions specified in recorder/mod.rs.
     fn subscriptions(config: &Config) -> Subscription {
@@ -2792,17 +2823,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // The signal-state copy lives in this process wherever it is kept
         // (`syscalls::signal_shadow`); a signal that reaches a handler
         // unreported is one it never saw.
-        // Reverie's own preemption signal, SIGKILL and SIGSTOP never reach a
-        // guest handler.
         let signal = unreported.number();
-        if kept
-            && self.cfg.signal_state_copy
-            && self.cfg.sequentialize_threads
-            && bundled_signal_facts::kernel_signal_state_is_guests(&self.cfg.backend)
-            && signal != reverie::PERF_EVENT_SIGNAL as i32
-            && signal != libc::SIGKILL
-            && signal != libc::SIGSTOP
-        {
+        if kept && self.copy_misses_unreported(signal) {
             crate::syscalls::signal_shadow::note_unreported(
                 unreported.pid().as_raw(),
                 unreported.tid().as_raw(),

@@ -824,9 +824,12 @@ where
 }
 
 /// One thread's counts of the deliveries [`check_delivery`] saw (A5 step 3.2):
-/// approved, contradicted, checked with the interruption taken from the
-/// registers (`delivery_interruption`), and not checked, by reason. Logged at
-/// TRACE when the thread exits, below INFO so the logs that runs compare are
+/// approved (and of those, approved at a held signal's report), contradicted,
+/// checked with the interruption taken from the registers
+/// (`delivery_interruption`), and not checked, by reason; and the signals the
+/// backend passed on without reporting them, which no check saw, by the
+/// backend's reason ([`reverie::UnreportedSignalReason`]). Logged at TRACE
+/// when the thread exits, below INFO so the logs that runs compare are
 /// unchanged.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DeliveryCounters {
@@ -835,12 +838,25 @@ pub(crate) struct DeliveryCounters {
     /// identity they were taken under.
     owner: Option<crate::types::DetTid>,
     approved: u64,
+    /// Approved deliveries of a signal the backend held during an injection
+    /// and reported after the callback that held it
+    /// ([`reverie::SignalReportPath::Held`]).
+    held: u64,
     /// Approved deliveries whose interruption was a syscall result Detcore
     /// finished, so the backend compared `rax` with it.
     result_checked: u64,
     mismatched: u64,
     interruption_from_registers: u64,
     skipped: std::collections::BTreeMap<&'static str, u64>,
+    /// Signals the backend passed on without a report, by the backend's
+    /// reason: those that could reach a guest handler, as the copy notes them
+    /// (`note_unreported`). Each pass is counted: at that resume the kernel
+    /// delivers the signal, puts it back in the queue when the thread's mask
+    /// blocks it (a later stop can take the same instance again), queues a
+    /// new instance with a kernel siginfo (a syscall stop), or discards it
+    /// (an ignored signal, or a ptrace event stop or group stop). Signals the
+    /// filter dropped are not counted.
+    unreported: std::collections::BTreeMap<&'static str, u64>,
 }
 
 impl DeliveryCounters {
@@ -848,21 +864,37 @@ impl DeliveryCounters {
         *self.skipped.entry(reason).or_default() += 1;
     }
 
+    /// Counts a signal the backend passed on unreported for `reason`, taken
+    /// by thread `dettid`.
+    pub(crate) fn count_unreported(
+        &mut self,
+        dettid: crate::types::DetTid,
+        reason: reverie::UnreportedSignalReason,
+    ) {
+        self.owner.get_or_insert(dettid);
+        *self.unreported.entry(reason.name()).or_default() += 1;
+    }
+
     /// Logs the counts, if any delivery was seen, under the identity they
     /// were taken under (`dettid` if none was recorded).
     pub(crate) fn log(&self, dettid: crate::types::DetTid) {
-        if self.approved + self.mismatched == 0 && self.skipped.is_empty() {
+        if self.approved + self.mismatched == 0
+            && self.skipped.is_empty()
+            && self.unreported.is_empty()
+        {
             return;
         }
         let dettid = self.owner.unwrap_or(dettid);
         trace!(
             target: "detcore::signal_delivery",
-            "[dtid {dettid}] signal deliveries: approved={} result_checked={} mismatched={} interruption_from_registers={} skipped={:?}",
+            "[dtid {dettid}] signal deliveries: approved={} held={} result_checked={} mismatched={} interruption_from_registers={} skipped={:?} unreported={:?}",
             self.approved,
+            self.held,
             self.result_checked,
             self.mismatched,
             self.interruption_from_registers,
-            self.skipped
+            self.skipped,
+            self.unreported
         );
     }
 }
@@ -1072,17 +1104,13 @@ where
         return skip(guest, "too many frames");
     }
     let handler_mask = entered.blocked;
-    // Force-delivered bits are exempt only where both of the copy's masks
-    // hold them: a forced delivery the copy did not see can only have taken
-    // such a bit out of the kernel's masks, and the backend applies one
-    // exemption to both comparisons. A forced bit in only one of the two
-    // masks (a temporary-mask wait) would be exempt where it should be
-    // checked, so such a delivery is not checked.
+    // Force-delivered bits are exempt in each of the copy's masks that holds
+    // them, and only there: a forced delivery the copy did not see can only
+    // have taken such a bit out of the kernel's masks. Inside a
+    // temporary-mask wait the two masks differ, and a forced bit in only one
+    // of them stays checked in the other.
     let forced_frame = forced() & frame_mask & !sigbit(signal);
     let forced_current = forced() & current_mask & !sigbit(signal);
-    if forced_frame != forced_current {
-        return skip(guest, "forced bit in one mask only");
-    }
     let (interruption, from_registers) = delivery_interruption(guest).await;
     let action = reverie::SignalAction {
         handler: action.handler,
@@ -1097,14 +1125,17 @@ where
         current_mask,
         handler_mask,
         // Reverie's preemption signal, whose kernel state differs from the
-        // copy's by design, and the force-delivered signals the copy blocks
-        // in both masks: a forced delivery the copy did not see can only
-        // have unblocked one (`compare`), so one the copy holds unblocked
-        // stays checked. The delivered signal is always checked.
-        unchecked_mask: (reserved() | forced_frame) & !sigbit(signal),
+        // copy's by design; and in each mask, the force-delivered signals
+        // the copy blocks there: a forced delivery the copy did not see can
+        // only have unblocked one (`compare`), so one the copy holds
+        // unblocked stays checked. The delivered signal is always checked.
+        unchecked_mask: reserved() & !sigbit(signal),
+        unchecked_frame_mask: forced_frame,
+        unchecked_current_mask: forced_current,
         interruption,
     };
     let result_checked = matches!(interruption, reverie::Interruption::Return { .. });
+    let held = guest.signal_report_path() == Some(reverie::SignalReportPath::Held);
     let outcome = guest.deliver_signal(delivery).await;
     let not_delivered = matches!(
         outcome,
@@ -1126,6 +1157,7 @@ where
     match outcome {
         reverie::SignalDeliveryOutcome::Accepted => {
             counters.approved += 1;
+            counters.held += u64::from(held);
             counters.result_checked += u64::from(result_checked);
             trace!(
                 target: "detcore::signal_delivery",
@@ -1832,6 +1864,8 @@ mod tests {
         /// The siginfo `Guest::signal_info` reports, if any.
         signal_info: Option<[u8; reverie::SIGNAL_INFO_SIZE]>,
         asked: Vec<reverie::SignalDelivery>,
+        /// What `Guest::signal_report_path` answers.
+        report_path: Option<reverie::SignalReportPath>,
         orig_rax: Option<i64>,
         rip: u64,
         registers_read: usize,
@@ -1913,6 +1947,9 @@ mod tests {
             regs.orig_rax = orig_rax as u64;
             regs.rip = self.delivery.rip;
             regs
+        }
+        fn signal_report_path(&self) -> Option<reverie::SignalReportPath> {
+            self.delivery.report_path
         }
         fn signal_info(&self) -> Option<[u8; reverie::SIGNAL_INFO_SIZE]> {
             self.delivery.signal_info
@@ -3533,8 +3570,13 @@ mod tests {
         assert_eq!((d.frame_mask, d.current_mask), (int, int));
         assert_eq!(d.handler_mask, int | USR2 | USR1);
         assert_eq!(d.unchecked_mask, reserved());
+        assert_eq!((d.unchecked_frame_mask, d.unchecked_current_mask), (0, 0));
         assert_eq!(d.interruption, interruption);
         assert_eq!(guest.thread.delivery_counters.approved, 1);
+        assert_eq!(
+            guest.thread.delivery_counters.held, 0,
+            "the backend does not say the signal was held"
+        );
         // Checking changes the copy exactly as not checking does.
         assert_eq!(
             guest
@@ -3836,11 +3878,11 @@ mod tests {
     }
 
     /// A force-delivered bit that the copy holds in only one of the frame and
-    /// current masks (a temporary-mask wait) would be exempt in both
-    /// comparisons, so that delivery is not checked; the copy records it as
-    /// unchecked.
+    /// current masks (a temporary-mask wait) is exempt in that mask's
+    /// comparison only, and the delivery is checked; the copy records it as
+    /// it records an unchecked one.
     #[test]
-    fn a_forced_bit_in_only_one_mask_leaves_the_delivery_unchecked() {
+    fn a_forced_bit_in_only_one_mask_is_exempt_in_that_mask_only() {
         let kernel = Kernel::default();
         let _seam = kernel.install();
         let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
@@ -3856,15 +3898,21 @@ mod tests {
         kernel.set(0, 0, USR1);
         check(&mut guest, libc::SIGUSR1);
         record_delivery(&mut unchecked, libc::SIGUSR1);
-        assert!(guest.delivery.asked.is_empty());
+        let d = guest.delivery.asked[0];
         assert_eq!(
-            guest
-                .thread
-                .delivery_counters
-                .skipped
-                .get("forced bit in one mask only"),
-            Some(&1)
+            d.frame_mask & trap,
+            trap,
+            "the frame's mask holds the forced bit"
         );
+        assert_eq!(d.current_mask & trap, 0, "the wait's mask does not");
+        assert_eq!(d.unchecked_mask, reserved());
+        assert_eq!(
+            (d.unchecked_frame_mask, d.unchecked_current_mask),
+            (trap, 0),
+            "exempt in the frame's comparison only"
+        );
+        assert_eq!(guest.thread.delivery_counters.approved, 1);
+        assert!(guest.thread.delivery_counters.skipped.is_empty());
         assert_eq!(
             guest
                 .thread
@@ -3892,7 +3940,69 @@ mod tests {
         guest.delivery.orig_rax = Some(-1);
         guest.thread.delivery_interruption = Some(reverie::Interruption::NotInSyscall);
         check(&mut guest, libc::SIGUSR1);
-        assert_eq!(guest.delivery.asked[0].unchecked_mask, reserved() | trap);
+        let d = guest.delivery.asked[0];
+        assert_eq!(d.unchecked_mask, reserved());
+        assert_eq!(
+            (d.unchecked_frame_mask, d.unchecked_current_mask),
+            (trap, trap)
+        );
+    }
+
+    /// An approval at a held signal's report counts as held as well.
+    #[test]
+    fn an_approval_at_a_held_report_is_counted_as_held() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
+        guest.delivery.report_path = Some(reverie::SignalReportPath::Held);
+        guest.delivery.orig_rax = Some(-1);
+        guest.thread.delivery_interruption = Some(reverie::Interruption::NotInSyscall);
+        check(&mut guest, libc::SIGUSR1);
+        let counters = &guest.thread.delivery_counters;
+        assert_eq!((counters.approved, counters.held), (1, 1));
+        let mut refused = catching(
+            &kernel,
+            reverie::SignalDeliveryOutcome::Unavailable(
+                reverie::SignalDeliveryUnavailable::TracerFiltered,
+            ),
+        );
+        refused.delivery.report_path = Some(reverie::SignalReportPath::Held);
+        refused.delivery.orig_rax = Some(-1);
+        refused.thread.delivery_interruption = Some(reverie::Interruption::NotInSyscall);
+        check(&mut refused, libc::SIGUSR1);
+        let counters = &refused.thread.delivery_counters;
+        assert_eq!(
+            (counters.approved, counters.held),
+            (0, 0),
+            "only an approval counts"
+        );
+    }
+
+    /// A signal the backend passes on unreported is counted by its reason.
+    #[test]
+    fn unreported_signals_are_counted_by_reason() {
+        let mut counters = DeliveryCounters::default();
+        let dettid = crate::types::DetTid::from_raw(7);
+        let count = |counters: &mut DeliveryCounters, reason| {
+            counters.count_unreported(dettid, reason);
+        };
+        count(
+            &mut counters,
+            reverie::UnreportedSignalReason::HeldRestorePending,
+        );
+        count(
+            &mut counters,
+            reverie::UnreportedSignalReason::HeldRestorePending,
+        );
+        count(
+            &mut counters,
+            reverie::UnreportedSignalReason::DuringSyscallSkip,
+        );
+        assert_eq!(counters.owner, Some(dettid));
+        assert_eq!(
+            counters.unreported.into_iter().collect::<Vec<_>>(),
+            vec![("during a syscall skip", 1), ("held, restore pending", 2)]
+        );
     }
 
     /// A signal that is not caught, and a thread with no copy, are not

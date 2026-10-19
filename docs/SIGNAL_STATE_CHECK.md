@@ -127,12 +127,12 @@ only, through `Guest::deliver_signal`. On ptrace:
   rule over the same masks and action. The action itself is not read from
   the kernel; the copy checks it where the guest sets it.
 
-Force-delivered signals (faults) the copy blocks in both masks are left
-unchecked, since a forced delivery the copy did not see can only have
-unblocked them. One held in only one of the frame and current masks would
-be exempt where it should be checked, so such a delivery is not checked
-("forced bit in one mask only"). Checking it needs per-field exemptions
-from the backend, a later step.
+Force-delivered signals (faults) the copy blocks are left out of the
+comparison of each mask that holds them, and only that one, since a forced
+delivery the copy did not see can only have unblocked them (A5 step 3.2b).
+Inside a temporary-mask wait the two masks differ, so a forced signal the
+copy blocks in only one of them stays checked in the other. The handler's
+mask is the copy's own arithmetic and keeps every bit.
 
 The check also runs under e9patch preprocessing, whose guest runs on
 ptrace; the tests and the corpus measurement cover plain ptrace.
@@ -172,12 +172,22 @@ example a reproducer, carries `--strict`, so it ends the same way.
 
 Each thread logs its counts when it exits, at TRACE under the target
 `detcore::signal_delivery`, below the level that runs compare. The counts
-are approvals (frame and current masks matched the kernel's),
+are approvals (frame and current masks matched the kernel's), of those the
+ones made at a held signal's report (`held`: a signal that stopped one of
+Detcore's injections, reported after the callback that held it),
 contradictions, deliveries whose interruption was taken from
 the registers, approvals that compared Detcore's syscall result
 (`result_checked`), and deliveries not checked, by reason. A copy that this
 delivery's own reconciliation gave up is counted as "copy given up at this
 delivery", apart from a thread that had no copy at the stop ("no copy").
+Signals the backend passes on without reporting them, which no check sees,
+are counted by the backend's reason (`unreported`, for example "during a
+syscall skip" or "held, restore pending"). Each pass counts: the kernel
+then delivers the signal, requeues it when the mask blocks it (a later stop
+can pass the same instance again), queues a new instance with a kernel
+siginfo (a syscall stop), or discards it (an ignored signal, or a ptrace
+event stop or group stop). Reverie's preemption signal,
+SIGKILL and SIGSTOP are not counted, since none reaches a guest handler.
 Each approval is also logged at TRACE under the same target, with the
 interruption it was checked against. To see them:
 

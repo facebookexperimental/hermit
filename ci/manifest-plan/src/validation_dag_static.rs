@@ -2573,7 +2573,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +3 from d9351f50 (select tv_usec) and 14da9861 (race-probe hold),
     // which did not move this pin; nextest list: 2160.
     // And +1 from 1648d29d: 2161.
-    ("test.detcore_unit", 2146),
+    // And the held-approval and unreported-count units (A5 step 3.2b part
+    // 2): 2148, listed.
+    ("test.detcore_unit", 2148),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2915,7 +2917,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 291.
     // And five multithreaded ptrace_delivery_check_* tests (A5 step 3.2b),
     // listed: 296.
-    ("test.hermit_integration_3", 296),
+    // And three more (A5 step 3.2b part 2: a forced bit in one mask, twice,
+    // and a signal passed on unreported at a syscall skip), listed: 299.
+    ("test.hermit_integration_3", 299),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4537,7 +4541,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +3 from d9351f50 (select tv_usec) and 14da9861 (race-probe hold),
     // which did not move this pin; nextest list: 2160.
     // And +1 from 1648d29d: 2161.
-    ("test.detcore_unit_on_host", 2146),
+    // And the same two A5 step 3.2b part 2 units: 2148, listed.
+    ("test.detcore_unit_on_host", 2148),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4630,7 +4635,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 629.
     // And five multithreaded ptrace_delivery_check_* tests (A5 step 3.2b),
     // listed: 634.
-    ("test.hermit_integration_on_host", 634),
+    // And three A5 step 3.2b part 2 ptrace_delivery_check_* tests: 637.
+    ("test.hermit_integration_on_host", 637),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
