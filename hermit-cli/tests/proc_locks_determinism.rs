@@ -1975,7 +1975,7 @@ fn recordings_from_before_the_lock_ledger_are_refused_by_the_version_gate() {
     let mut metadata: serde_json::Value =
         serde_json::from_str(&text).expect("recording metadata is not JSON");
     assert_eq!(
-        metadata["version"], 0x172,
+        metadata["version"], 0x173,
         "RECORD_VERSION moved; point this test at the current version and the ledger's predecessor"
     );
     for older in [0x171, 0x16f] {
