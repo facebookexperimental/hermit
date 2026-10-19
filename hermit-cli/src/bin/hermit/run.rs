@@ -4717,6 +4717,54 @@ fn strict_rejects_every_route_to_host_networking() {
     }
 }
 
+/// `main`'s branch-counter check: a run without `--strict` on a host whose
+/// counter failed validation goes on and writes one warning line, even when
+/// Reverie's reason spans lines; with `--strict` it is refused and writes
+/// nothing; a counter that passed, or a run without a timeslice, writes
+/// nothing (https://github.com/rrnewton/hermit/issues/4515).
+#[test]
+fn a_run_on_an_inexact_branch_counter_warns_without_strict() {
+    let check = |argv: &[&str], inexact_branch_counter: fn() -> Option<String>| {
+        let mut options = run_opts_for(argv);
+        options.inexact_branch_counter = inexact_branch_counter;
+        let mut lines = Vec::new();
+        let result = options.admit_branch_counter(&mut |line: &str| lines.push(line.to_owned()));
+        (result, lines)
+    };
+    let multiline: fn() -> Option<String> = || {
+        Some(
+            "Hardware performance counters seem to not be working.\n  counted 0 branches\n  \
+             expected 500"
+                .to_string(),
+        )
+    };
+    let (result, lines) = check(&["hermit", "run", "fakeprog"], multiline);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let warning = &lines[0];
+    assert!(warning.starts_with("WARNING: "), "{warning}");
+    assert!(
+        warning.contains("counted 0 branches expected 500"),
+        "{warning}"
+    );
+    assert!(warning.contains("--strict"), "{warning}");
+    assert_eq!(warning.matches('\n').count(), 1, "one line: {warning:?}");
+    assert!(warning.ends_with('\n'), "{warning:?}");
+    let (result, lines) = check(&["hermit", "run", "--strict", "fakeprog"], multiline);
+    assert!(
+        result.is_err_and(|error| error.downcast_ref::<PolicyRefusal>().is_some()),
+        "--strict refuses"
+    );
+    assert!(lines.is_empty(), "{lines:?}");
+    let (result, lines) = check(&["hermit", "run", "fakeprog"], || None);
+    assert!(result.is_ok() && lines.is_empty(), "{lines:?}");
+    let (result, lines) = check(
+        &["hermit", "run", "--max-timeslice=disabled", "fakeprog"],
+        multiline,
+    );
+    assert!(result.is_ok() && lines.is_empty(), "{lines:?}");
+}
+
 #[test]
 fn strict_refuses_an_inexact_branch_counter_on_the_pmu_backends() {
     for backend in ["ptrace", "e9patch"] {
@@ -6550,7 +6598,7 @@ impl RunOpts {
             crate::verify::record_exact_branch_counter(branch_counter_verdict());
             crate::verify::write_pending_verification_json(path)?;
         }
-        self.refuse_strict_with_inexact_branch_counter()?;
+        self.admit_branch_counter(&mut crate::tracing::write_stderr_diagnostic)?;
         // The KVM backend reaches real reverie-kvm code from its dispatch path
         // and reports an accurate, program-specific error there, so it is not
         // pre-empted by the generic availability probe above. E9patch is a CLI
@@ -9900,6 +9948,41 @@ impl RunOpts {
             return Ok(());
         }
         refuse_an_inexact_branch_counter(self.selected_backend(), self.inexact_branch_counter)
+    }
+
+    /// The one-line stderr warning for a run that goes on without `--strict`
+    /// while reading a retired-branch counter that failed Reverie's validation,
+    /// which `--strict` refuses: the run proceeds on a degraded capability, so
+    /// it says so (https://github.com/rrnewton/hermit/issues/4515). Reverie
+    /// validates the counters once per process, on its first timer, so asking
+    /// here costs nothing more.
+    fn inexact_branch_counter_warning(&self) -> Option<String> {
+        // A `--strict` run never gets here with such a counter:
+        // `admit_branch_counter` refuses it first.
+        if !self.reads_the_branch_counter() {
+            return None;
+        }
+        (self.inexact_branch_counter)().map(|reason| {
+            // Reverie's message can span lines (`HardwareCountersNotWorking`
+            // embeds two newlines); the warning stays one line.
+            let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!(
+                "WARNING: this host's performance counters failed Reverie's validation \
+                 ({reason}); preemption by retired branches may not repeat, so a run may \
+                 not replay or verify. `hermit run --strict` refuses here.\n"
+            )
+        })
+    }
+
+    /// `main`'s branch-counter check: a `--strict` run on a counter that failed
+    /// Reverie's validation is refused, and any other run that reads it passes
+    /// [`Self::inexact_branch_counter_warning`] to `warn` (stderr in `main`).
+    fn admit_branch_counter(&self, warn: &mut dyn FnMut(&str)) -> Result<(), Error> {
+        self.refuse_strict_with_inexact_branch_counter()?;
+        if let Some(warning) = self.inexact_branch_counter_warning() {
+            warn(&warning);
+        }
+        Ok(())
     }
 
     /// Whether this run reads the retired-conditional-branch counter that
