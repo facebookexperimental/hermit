@@ -1135,7 +1135,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (pressure-test --parity-all's probe inputs): 1_786.
     // And the detcore-model work-span-report config test: 1_787, listed.
     // Add the first-image loader controls; retain main's full selection.
-    ("test.regular_crates", 1789),
+    // And detcore-model's signal_at_never_enters_the_legacy_form and
+    // signal_at_round_trips_through_reverie_bincode (minibeads dh-3w3ia):
+    // 1791, listed.
+    ("test.regular_crates", 1791),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3793,7 +3796,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the_work_span_report_leaves_signal_continuations_unchanged: 578,
     // listed.
     // Host CPUID profile coverage: https://github.com/rrnewton/hermit/issues/4534.
-    ("test.cli", 583),
+    // And signal_at_sends_the_root_process_its_signal_after_the_named_turn and
+    // signal_at_stops_qemu_at_the_same_point_in_two_runs (minibeads
+    // dh-3w3ia): 585, listed.
+    ("test.cli", 585),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4270,7 +4276,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same four 4510 tests: 511, listed.
     // And the same work-span-report identity test: 512.
     // Host CPUID profile coverage: https://github.com/rrnewton/hermit/issues/4534.
-    ("test.cli_on_host", 517),
+    // And the same two --signal-at tests: 519, listed.
+    ("test.cli_on_host", 519),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5146,7 +5153,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the local node: 1_772.
     // And the same detcore-model work-span-report config test: 1_773.
     // Add the first-image loader controls; retain main's full selection.
-    ("test.regular_crates_on_host", 1775),
+    // And the same two signal_at config tests: 1777, listed.
+    ("test.regular_crates_on_host", 1777),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
