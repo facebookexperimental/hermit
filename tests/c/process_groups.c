@@ -16,7 +16,12 @@
  * on how a backend numbers processes.
  *
  * Under Hermit every backend gives the same answers, from Detcore's model
- * (slice B3a-4c of https://github.com/rrnewton/hermit/issues/4266). */
+ * (slice B3a-4c of https://github.com/rrnewton/hermit/issues/4266).
+ *
+ * usage: process_groups [reaped [--host]]
+ *   --host: natively. A child reaped automatically can still be found for a
+ *   moment after wait reports no child, so the guest waits (up to 2 s) for
+ *   getpgid to stop finding it before it checks. */
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -59,7 +64,7 @@ static void must(int ok, const char* what) {
 /* A group leader that its parent reaps automatically: once it is gone, it
  * has no group or session, and its group, which had no other member, no
  * longer exists. Run as `process_groups reaped`. */
-static int reaped_group_leader(void) {
+static int reaped_group_leader(int host) {
   setvbuf(stdout, NULL, _IONBF, 0);
   long r;
   must(signal(SIGCHLD, SIG_IGN) != SIG_ERR, "signal");
@@ -81,6 +86,15 @@ static int reaped_group_leader(void) {
    * gone. */
   r = waitpid(e, NULL, 0);
   printf("waitpid(e)=%s\n", r == e ? "e" : outcome(r));
+  /* Linux reaps such a child asynchronously to its parent's wait: exit marks
+   * it EXIT_DEAD, which wait skips (so it reports ECHILD), and only then
+   * release_task detaches its pid, group and session (Linux v7.1.3
+   * kernel/exit.c:766, :777, :1465, :141-147). So natively getpgid can still
+   * find it for a moment; wait for that to end. Under Hermit the first
+   * answer must already be ESRCH. */
+  for (int tries = 0; host && tries < 2000 && getpgid(e) >= 0; tries++) {
+    usleep(1000);
+  }
   long g = getpgid(e);
   printf("getpgid(reaped e)=%s ", outcome(g));
   long s = getsid(e);
@@ -104,8 +118,8 @@ static int reaped_group_leader(void) {
 }
 
 int main(int argc, char** argv) {
-  if (argc == 2 && strcmp(argv[1], "reaped") == 0)
-    return reaped_group_leader();
+  if (argc >= 2 && strcmp(argv[1], "reaped") == 0)
+    return reaped_group_leader(argc == 3 && strcmp(argv[2], "--host") == 0);
   setvbuf(stdout, NULL, _IONBF, 0);
   pid_t self = getpid();
   printf(

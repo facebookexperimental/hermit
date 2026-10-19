@@ -1928,12 +1928,21 @@ fn process_groups_and_sessions_answer_as_linux_on_every_backend() {
                            setpgid(f, reaped e's group)=EPERM\n\
                            waitpid(f)=ECHILD\n";
     let guest_path = guest.to_str().expect("guest path is UTF-8");
-    let modes: [(&str, &[&str], &str); 2] = [
-        (test, &[], expected),
-        (reaped_test, &["reaped"], expected_reaped),
+    // The native arm of the reaped mode passes --host: Linux reaps the child
+    // asynchronously to the parent's wait, so natively the guest waits for
+    // getpgid to stop finding it (process_groups.c). Under Hermit it checks
+    // once.
+    let modes: [(&str, &[&str], &[&str], &str); 2] = [
+        (test, &[], &[], expected),
+        (
+            reaped_test,
+            &["reaped"],
+            &["reaped", "--host"],
+            expected_reaped,
+        ),
     ];
     let mut compared = Vec::new();
-    for (name, mode, expected) in modes {
+    for (name, mode, native_mode, expected) in modes {
         // The baseline is Linux itself: the guest in a new PID namespace
         // whose init is a shell, as Hermit's init is its own process, with
         // the group and session of its parent outside.
@@ -1948,7 +1957,7 @@ fn process_groups_and_sessions_answer_as_linux_on_every_backend() {
             ])
             .arg("\"$0\" \"$@\"; exit $?")
             .arg(guest_path)
-            .args(mode)
+            .args(native_mode)
             .output()
             .expect("failed to run the guest under unshare");
         assert!(

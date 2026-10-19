@@ -25,7 +25,9 @@
  *
  * usage: procfs_listings [--host] [--no-process-directories] [--no-autoreap]
  *                        [--recorded]
- *   --host: natively, check the same relations and print nothing.
+ *   --host: natively, check the same relations and print nothing. A child
+ *   reaped automatically may still be listed briefly after wait reports no
+ *   child, so natively the guest waits (up to 2 s) for it to go first.
  *   --no-process-directories: check only the root, whose process entries
  *   cannot be looked up either (a backend whose own /proc cannot open a
  *   process's directory yet, KVM).
@@ -370,8 +372,21 @@ int main(int argc, char** argv) {
     CHECK(wait(NULL) == -1 && errno == ECHILD, "wait with SIGCHLD ignored: %s",
         strerror(errno));
     signal(SIGCHLD, SIG_DFL);
-    list("/proc", &again);
     snprintf(name, sizeof name, "%d", ignored);
+    /* Linux reaps such a child asynchronously to its parent's wait: exit
+     * marks it EXIT_DEAD, which wait skips (so it reports ECHILD), and only
+     * then release_task unhashes its pid (Linux v7.1.3 kernel/exit.c:766,
+     * :777, :1465, :265). So natively it can still be listed for a moment;
+     * wait for that to end. Under Hermit the first listing must not list
+     * it. */
+    for (int tries = 0; host && tries < 2000; tries++) {
+      list("/proc", &again);
+      if (!has(&again, name)) {
+        break;
+      }
+      usleep(1000);
+    }
+    list("/proc", &again);
     CHECK(!has(&again, name),
         "/proc still lists the child %d reaped automatically", ignored);
   }
