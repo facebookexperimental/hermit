@@ -2257,8 +2257,32 @@ fi
 # tree and SDK/native recipe inputs are identical (inventory987).
 # Preserve the incoming K3b carry and the original a15e measurement above;
 # this source equality is not a new build or runtime-package receipt.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 99def63a0dd7be7e994857709d4ecb403eb100d6 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 99def63a0dd7be7e994857709d4ecb403eb100d6 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO bfe01a465bd53a00eff185f3130e37344938982e (2026-10-18): from
+# 2df22d5eb00ebfcf5fdecee67bbebbb1239d7081. Bind each task from its already
+# admitted birth so an unrelated sibling reservation cannot leave PendingOwner.
+# Two native regression-support paths are added (inventory987 -> 989).
+# Vendor/build.rs and SDK recipe inputs are unchanged; the qualified a15e SDK
+# sample above carries under the same CMake/generator/epoch settings. The native
+# client changes and requires a new build receipt. ABI12/80, portable1050 budget,
+# default ratchet572, job width, limits, selectors and clock policy stay unchanged.
+# CARRY TO a8c3ba366f72155ab37d423f4241d40ffda729ff (2026-10-19): exact replay of
+# bfe01a465bd53a00eff185f3130e37344938982e, following 3a17e3d04777f8cfee445ddac285ae0815f0f9d9.
+# Full reverie-dbt source equality preserves inventory989 and the a15e SDK
+# recipe. This carries the original measured sample; it is not a new runtime
+# or build result. Native/client changes remain covered by their own receipts.
+# CARRY TO 69efc09ebcc7bd3ea33bd033e9688500dc205191 (2026-10-19): replay the same owned
+# change in order after 64f05984c8da7f9de8c7433e18a8214d69277d9a.
+# Full DBT source equals a8c3ba366f72155ab37d423f4241d40ffda729ff (inventory989).
+# SDK/native recipe inputs carry; the a15e sample keeps its original attribution.
+# Incoming workspace dependency changes require fresh paired build/runtime evidence.
+# CARRY TO 97c6424a743f423e57d9dfaae15662e1cbcf5a01 (2026-10-19): replay the same owned change
+# from 69efc09ebcc7bd3ea33bd033e9688500dc205191 onto the K3b stack rooted at
+# published 63934937463458de93d43ed08038d256ae799c64. The owned DBT
+# tree and SDK/native recipe inputs are identical (inventory989).
+# Preserve the incoming K3b carry and the original a15e measurement above;
+# this source equality is not a new build or runtime-package receipt.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 97c6424a743f423e57d9dfaae15662e1cbcf5a01 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 97c6424a743f423e57d9dfaae15662e1cbcf5a01 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
