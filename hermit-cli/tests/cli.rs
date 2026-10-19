@@ -207,6 +207,7 @@ static SIGCHLD_ONCE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DIRECTORY_OPENAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DIRECTORY_SWAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STATX_MOUNT_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static STATX_UNIQUE_MOUNT_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LISTINGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VIRTUAL_KERNEL_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -7925,6 +7926,121 @@ fn no_namespace_runs_render_the_base_mount_table() {
     if let [(_, ptrace), (_, kvm)] = shown.as_slice() {
         assert_eq!(kvm, ptrace, "KVM shows other mountpoints than ptrace");
     }
+}
+
+/// `statx` asked for the classic mount ID (0x1101, systemd `chase()`'s first
+/// call) and for the unique one (0x5109, its follow-up, adding `STATX_UID` and
+/// `STATX_MNT_ID_UNIQUE`) answers as Linux does (`vfs_statx_path`, v6.12
+/// fs/stat.c:248-259): the classic ID with only `STATX_MNT_ID`, equal to the
+/// descriptor's fdinfo `mnt_id`; the unique ID with only
+/// `STATX_MNT_ID_UNIQUE`, above 2^31 and stable; both shared by a
+/// subdirectory and different on `/proc`. Hermit reported no mount ID at all
+/// for 0x5109, so `chase()` failed with `EUNATCH`
+/// (https://github.com/rrnewton/hermit/issues/4519). The guest prints
+/// host-independent lines, compared with its native run. Under Hermit the
+/// unique ID is the mountinfo ID plus 2^31, also for a procfs file Detcore
+/// renders (`/proc/cpuinfo`), which reported its classic ID as the unique one.
+#[test]
+fn statx_reports_the_classic_and_the_unique_mount_id_as_linux_does() {
+    let test = "statx_reports_the_classic_and_the_unique_mount_id_as_linux_does";
+    let guest = compiled_c_guest(&STATX_UNIQUE_MOUNT_ID_GUEST, "statx_unique_mount_id");
+    let dir = process_build_root("statx-unique-mount-id");
+    let sub = dir.join("sub");
+    fs::create_dir_all(&sub).expect("create the guest's directories");
+    let (guest, dir, sub) = (
+        guest.to_str().unwrap(),
+        dir.to_str().unwrap(),
+        sub.to_str().unwrap(),
+    );
+    // Under Hermit the unique ID is the classic one plus 2^31, on any host.
+    for path in [dir, "/proc/cpuinfo"] {
+        let args = ["run", "--strict", "--", guest, "raw", path];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let text = stdout(&output);
+        let ids = text
+            .trim()
+            .split(' ')
+            .map(|field| field.split_once('=').unwrap().1.parse::<u64>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2, "{path}: {text}");
+        assert_eq!(ids[1], ids[0] + (1 << 31), "{path}: {text}");
+    }
+    let native = Command::new(guest)
+        .args(["compare", dir, "/proc", sub])
+        .output()
+        .expect("run the guest natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let native = String::from_utf8(native.stdout).unwrap();
+    if !native.contains("requested=0x5109 mount_bits=0x4000") {
+        eprintln!(
+            "{test}: NOT COMPARED: this kernel has no unique mount IDs (Linux 6.8):\n{native}"
+        );
+        return;
+    }
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--",
+        guest,
+        "compare",
+        dir,
+        "/proc",
+        sub,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), native);
+    let log = stderr(&output);
+    assert!(
+        log.contains(":: Success: deterministic. Determinism verified."),
+        "verification failed:\n{log}"
+    );
+}
+
+/// `systemd-sysusers --cat-config` reads its configuration directories
+/// through `chase()`, which asks `statx` for the unique mount ID and fails with
+/// `EUNATCH` when the reply lacks it. Under Hermit it printed nothing and
+/// logged "Failed to chase and open directory" for each directory
+/// (https://github.com/rrnewton/hermit/issues/4519); now it prints what it
+/// prints natively. Not run where the host has no `systemd-sysusers`.
+#[test]
+fn systemd_sysusers_reads_its_configuration_as_natively() {
+    let test = "systemd_sysusers_reads_its_configuration_as_natively";
+    let tool = "/usr/bin/systemd-sysusers";
+    if !Path::new(tool).exists() {
+        eprintln!("{test}: NOT RUN: {tool} is not installed");
+        return;
+    }
+    let native = Command::new(tool)
+        .arg("--cat-config")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run systemd-sysusers natively");
+    if !native.status.success() || native.stdout.is_empty() {
+        eprintln!("{test}: NOT COMPARED: the native run printed nothing: {native:?}");
+        return;
+    }
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--",
+        tool,
+        "--cat-config",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let log = stderr(&output);
+    assert!(!log.contains("Failed to chase"), "{log}");
+    assert_eq!(stdout(&output), String::from_utf8(native.stdout).unwrap());
+    assert!(
+        log.contains(":: Success: deterministic. Determinism verified."),
+        "verification failed:\n{log}"
+    );
 }
 
 /// Under `--no-namespace`, a mount holding the guest's working directory is

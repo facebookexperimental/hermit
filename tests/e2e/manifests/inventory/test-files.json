@@ -2606,6 +2606,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/statx_unique_mount_id.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/statx_unique_mount_id.c is owned by hermit-cli/tests/cli.rs: the CLI test statx_reports_the_classic_and_the_unique_mount_id_as_linux_does compares its host-independent lines for statx masks 0x1101 and 0x5109 (STATX_MNT_ID and STATX_MNT_ID_UNIQUE) with its native run, and checks under Hermit that the unique mount ID is the mountinfo ID plus 2^31 (https://github.com/rrnewton/hermit/issues/4519). It stays a fixture because a generic manifest cannot run the native comparison or check that relation."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/stdio_lseek_identity.c",
       "runner": "hermit-cli/tests/cli.rs and hermit-cli/tests/run_evidence.rs",
       "why": "tests/c/stdio_lseek_identity.c is owned by hermit-cli/tests/cli.rs and hermit-cli/tests/run_evidence.rs: The dedicated suites compile the guest and control inherited output descriptors to assert unseekable standard-stream identity and its recorded execution evidence."

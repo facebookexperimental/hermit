@@ -1511,6 +1511,33 @@ fn rendered_entry(
     found.filter(|path| !crate::procfs::rendered_path_is_per_process(path))
 }
 
+/// `STATX_MNT_ID_UNIQUE` (include/uapi/linux/stat.h, since Linux 6.8). Reverie's
+/// `StatxMask` does not name it and drops it from a mask read through it, so
+/// Detcore reads a call's raw mask ([`statx_requested_mask`]).
+const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
+
+/// What Linux adds to every unique mount ID so that none equals a classic
+/// 32-bit one: `MNT_UNIQUE_ID_OFFSET` (v6.12 fs/namespace.c:73). Linux counts
+/// up from it and never reuses an ID, so the first mount's is the offset plus
+/// one (fs/namespace.c:74 and 244).
+const MNT_UNIQUE_ID_OFFSET: u64 = 1 << 31;
+
+/// The mask a `statx` call asks for, every bit kept.
+fn statx_requested_mask(call: syscalls::Statx) -> u32 {
+    syscalls::SyscallArgs::from(call).arg3 as u32
+}
+
+/// `call` asking the kernel for the classic mount ID (`STATX_MNT_ID`) where
+/// it asked for the unique one, and otherwise the same call.
+fn statx_asking_classic_mount_id(call: syscalls::Statx) -> syscalls::Statx {
+    let mut args = syscalls::SyscallArgs::from(call);
+    let mask = args.arg3 as u32;
+    if mask & STATX_MNT_ID_UNIQUE != 0 {
+        args.arg3 = ((mask & !STATX_MNT_ID_UNIQUE) | libc::STATX_MNT_ID) as usize;
+    }
+    syscalls::Statx::from(args)
+}
+
 /// Whether `statx` accepts these `flags` and `mask` (`vfs_statx`'s and the
 /// syscall's own checks): no reserved mask bit, known flags only (unless the
 /// call names no path), and not both synchronization types at once.
@@ -6043,7 +6070,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let statptr = call.statx().ok_or(Errno::EFAULT)?;
         let mut statx: libc::statx = stat.into();
         let raw_mount_id = rendered_procfs::guest_procfs_mount_id().ok();
-        self.fill_statx_mount_id(guest, &mut statx, raw_mount_id)
+        let unique = statx_requested_mask(call) & STATX_MNT_ID_UNIQUE != 0;
+        self.fill_statx_mount_id(guest, &mut statx, raw_mount_id, unique)
             .await;
         guest.memory().write_value(statptr.0, &statx)?;
         Ok(0)
@@ -6052,19 +6080,31 @@ impl<T: RecordOrReplay> Detcore<T> {
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4213):
     // Review STATX_MNT_ID numbered as fdinfo's mnt_id, a hidden mount's file
     // reporting its nearest shown ancestor.
-    /// Fill `statx`'s `STATX_MNT_ID` for a file on mount `raw_mount_id`, as
-    /// Linux fills it whether or not the caller asked for it (`vfs_statx`):
-    /// the number its fdinfo `mnt_id` and its `mountinfo` row show, through
-    /// the run's mount-ID pool, a hidden mount's file showing its nearest
-    /// shown ancestor's ([`Self::shown_mount_id`]). Where there is no such
-    /// number (no mount provenance to number it by, outside Hermit's
-    /// container, or no mount ID from the kernel), the field is 0 and its
-    /// mask bit is cleared, so no caller reads a number that names nothing.
+    /// Fill `statx`'s mount ID for a file on mount `raw_mount_id` (a classic
+    /// ID), as Linux fills it whether or not the caller asked for it
+    /// (`vfs_statx_path`, v6.12 fs/stat.c:248-259): the number its fdinfo
+    /// `mnt_id` and its `mountinfo` row show, through the run's mount-ID
+    /// pool, a hidden mount's file showing its nearest shown ancestor's
+    /// ([`Self::shown_mount_id`]), with `STATX_MNT_ID`. If the caller asked
+    /// for `STATX_MNT_ID_UNIQUE` (`unique`), Linux reports the mount's unique
+    /// ID and that bit instead; here that is the same number plus
+    /// [`MNT_UNIQUE_ID_OFFSET`], which is above every classic ID, the same
+    /// for every file of the mount, different for every other mount, and
+    /// the first valid unique ID for the first mount numbered. Where there is
+    /// no such number (no mount provenance to number it by, outside Hermit's
+    /// container, or no mount ID from the kernel), the field is 0 and both
+    /// mask bits are cleared, so no caller reads a number that names nothing.
+    ///
+    /// Where this differs from Linux: the pool is keyed by classic IDs, which
+    /// Linux can give a new mount after an unmount (an IDA), while a unique
+    /// ID is never reused. A mount made after another's unmount, on the
+    /// freed classic ID, shows that mount's unique ID here too.
     async fn fill_statx_mount_id<G: Guest<Self>>(
         &self,
         guest: &mut G,
         statx: &mut libc::statx,
         raw_mount_id: Option<u64>,
+        unique: bool,
     ) {
         let guest_mount_id = match raw_mount_id {
             Some(raw_mount_id) if guest.config().mountinfo_mount_ids_captured => {
@@ -6073,15 +6113,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             _ => None,
         };
-        match guest_mount_id {
-            Some(id) => {
+        let reported = match guest_mount_id {
+            Some(id) if unique => id
+                .checked_add(MNT_UNIQUE_ID_OFFSET)
+                .map(|id| (id, STATX_MNT_ID_UNIQUE)),
+            Some(id) => Some((id, libc::STATX_MNT_ID)),
+            None => None,
+        };
+        statx.stx_mask &= !(libc::STATX_MNT_ID | STATX_MNT_ID_UNIQUE);
+        match reported {
+            Some((id, bit)) => {
                 statx.stx_mnt_id = id;
-                statx.stx_mask |= libc::STATX_MNT_ID;
+                statx.stx_mask |= bit;
             }
-            None => {
-                statx.stx_mnt_id = 0;
-                statx.stx_mask &= !libc::STATX_MNT_ID;
-            }
+            None => statx.stx_mnt_id = 0,
         }
     }
 
@@ -8718,7 +8763,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ),
                 None => target,
             };
-            Self::inject_translated(guest, Syscall::from(call)).await?;
+            // A call that asks for the unique mount ID asks the kernel for the
+            // classic one: the run's mount-ID pool numbers classic IDs, the
+            // ones mountinfo and fdinfo show, and the guest's unique ID is
+            // derived from that number (`fill_statx_mount_id`). Linux fills
+            // both mount-ID fields in `vfs_statx_path` (v6.12
+            // fs/stat.c:248-259) after the filesystem's getattr, which sees
+            // `STATX_MNT_ID` in place of `STATX_MNT_ID_UNIQUE`.
+            let unique = statx_requested_mask(call) & STATX_MNT_ID_UNIQUE != 0;
+            Self::inject_translated(guest, Syscall::from(statx_asking_classic_mount_id(call)))
+                .await?;
             let statptr = call.statx().ok_or(Errno::EFAULT)?;
             let inode_override = target
                 .descriptor()
@@ -8749,7 +8803,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .determinize_stat(guest, stat, inode_override, procfs)
                 .await?;
             let mut statx: libc::statx = stat.into();
-            self.fill_statx_mount_id(guest, &mut statx, raw_mount_id)
+            self.fill_statx_mount_id(guest, &mut statx, raw_mount_id, unique)
                 .await;
             memory.write_value(statptr.0, &statx)?;
             Ok(0)
