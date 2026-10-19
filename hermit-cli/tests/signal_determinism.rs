@@ -1746,3 +1746,108 @@ fn ptrace_signal_state_kept_for_a_caught_blocked_sigtrap_but_its_sigblk_bit() {
 fn ptrace_signal_state_kept_for_a_default_blocked_sigtrap() {
     assert_state_kept("dfl-blocked", true, false);
 }
+
+static SIGSEGV_STATE_KEPT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// tests/c/sigsegv_state_kept.c, built once: SIGSEGV's state after trapped
+/// rdtsc and cpuid instructions, as each thread sees it.
+fn sigsegv_state_kept_guest() -> &'static Path {
+    SIGSEGV_STATE_KEPT_GUEST
+        .get_or_init(|| {
+            let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("hermit-cli should be inside the repository");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("sigsegv-state-kept-{}", std::process::id()));
+            fs::create_dir_all(&build_root)
+                .expect("failed to create sigsegv state kept build directory");
+            let binary = build_root.join("sigsegv_state_kept");
+            let mut command = Command::new("cc");
+            command
+                .args([
+                    "-O0",
+                    "-g",
+                    "-D_GNU_SOURCE",
+                    "-std=c11",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-pthread",
+                ])
+                .arg(repository.join("tests/c/sigsegv_state_kept.c"))
+                .arg("-o")
+                .arg(&binary);
+            command_output(command, "sigsegv state kept guest compilation");
+            binary
+        })
+        .as_path()
+}
+
+/// Runs the SIGSEGV state guest with SIGSEGV in `state`, natively and on
+/// ptrace under `--strict --verify --verify-strict`, in both of its modes,
+/// and requires Hermit's output to equal the native run's. The guest reads
+/// SIGSEGV's action, its `rt_sigprocmask` bit and its procfs status bits
+/// after a trapped rdtsc, a trapped cpuid, an rdtsc first thing in a SIGUSR1
+/// handler whose `sa_mask` blocks SIGSEGV, and an rdtsc right after that
+/// handler returns (`single`), and also in a joined thread and after the join
+/// (`threads`). Under ptrace, Hermit makes rdtsc and cpuid fault so that it
+/// can emulate them, and Linux reports each fault with a forced SIGSEGV,
+/// which resets a blocked or ignored SIGSEGV to `SIG_DFL` and unblocks it
+/// before Reverie suppresses the signal. Reverie puts back what it reset
+/// (<https://github.com/rrnewton/hermit/issues/4485>, A5 step 3.0b). On main,
+/// every line after the first rdtsc read `action=dfl` and unblocked for the
+/// ignored and blocked states, and the in-handler line read unblocked for
+/// all six.
+fn assert_sigsegv_state_kept(state: &str) {
+    let _guard = hermit_signal_lock();
+    for mode in ["single", "threads"] {
+        let mut native = Command::new(sigsegv_state_kept_guest());
+        native.arg(mode).arg(state);
+        let native = command_output(native, &format!("native sigsegv_state_kept {mode} {state}"));
+        let native = String::from_utf8_lossy(&native.stdout).into_owned();
+        assert!(native.ends_with("done\n"), "native run: {native}");
+
+        let mut hermit = Command::new(hermit_test::hermit_binary());
+        hermit.args(["run", "--strict", "--verify", "--verify-strict", "--"]);
+        hermit.arg(sigsegv_state_kept_guest()).arg(mode).arg(state);
+        let output = command_output(
+            hermit,
+            &format!("sigsegv_state_kept {mode} {state} under --verify-strict"),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            native,
+            "mode {mode}, state {state}"
+        );
+    }
+}
+
+#[test]
+fn ptrace_sigsegv_state_kept_for_an_ignored_sigsegv() {
+    assert_sigsegv_state_kept("ign");
+}
+
+#[test]
+fn ptrace_sigsegv_state_kept_for_an_ignored_blocked_sigsegv() {
+    assert_sigsegv_state_kept("ign-blocked");
+}
+
+#[test]
+fn ptrace_sigsegv_state_kept_for_a_caught_sigsegv() {
+    assert_sigsegv_state_kept("handler");
+}
+
+#[test]
+fn ptrace_sigsegv_state_kept_for_a_caught_blocked_sigsegv() {
+    assert_sigsegv_state_kept("handler-blocked");
+}
+
+#[test]
+fn ptrace_sigsegv_state_kept_for_a_default_sigsegv() {
+    assert_sigsegv_state_kept("dfl");
+}
+
+#[test]
+fn ptrace_sigsegv_state_kept_for_a_default_blocked_sigsegv() {
+    assert_sigsegv_state_kept("dfl-blocked");
+}

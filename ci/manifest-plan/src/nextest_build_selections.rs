@@ -907,7 +907,9 @@ mod tests {
             // And its fake-/proc-under-chroot test (+1): 618.
             // signal_determinism's five ptrace_signal_state_kept_* tests (A5
             // step 3.0a, +5): 623.
-            assert_eq!(population, 623);
+            // Its six ptrace_sigsegv_state_kept_* tests (A5 step 3.0b, +6):
+            // 629.
+            assert_eq!(population, 629);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

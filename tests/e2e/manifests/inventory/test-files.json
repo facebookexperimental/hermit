@@ -2366,6 +2366,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/sigsegv_state_kept.c",
+      "runner": "hermit-cli/tests/signal_determinism.rs",
+      "why": "tests/c/sigsegv_state_kept.c is owned by hermit-cli/tests/signal_determinism.rs: the ptrace_sigsegv_state_kept_* tests run it natively and under run --strict --verify --verify-strict, single-threaded and around a joined thread, and compare SIGSEGV's action, rt_sigprocmask bit and procfs SigBlk/SigIgn/SigCgt after a trapped rdtsc, a trapped cpuid, an rdtsc first thing in a handler whose sa_mask blocks SIGSEGV, and an rdtsc right after that handler returns, with the native run's, for an ignored, blocked-ignored, caught, blocked-caught, default and blocked-default SIGSEGV. Under ptrace both instructions fault so that Hermit can emulate them, and Linux's forced SIGSEGV resets a blocked or ignored SIGSEGV before Reverie suppresses it. A generic manifest cannot compare a guest's output with a native run of it (A5 step 3.0b, https://github.com/rrnewton/hermit/issues/4485)."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/sigsuspend_after_wnohang_wait.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/sigsuspend_after_wnohang_wait.c is owned by hermit-cli/tests/cli.rs: It copies dash's wait for a background job (wait4 with WNOHANG, then block every signal and rt_sigsuspend under the old mask) so the child-exit SIGCHLD reaches the parent while it is stopped at its rt_sigsuspend request, and the integration test requires the call to wake under run --strict --verify with the timeslice disabled. It remains a fixture because the test pins the timeslice off and checks Detcore's deadlock verdict, which the generic manifest does not express."
