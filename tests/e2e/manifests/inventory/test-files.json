@@ -2918,6 +2918,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/vfork_exec_resume.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/vfork_exec_resume.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_vfork_parent_resumes_at_its_childs_exec compiles this guest, in which a vfork child execs into a mode that yields and then writes while its parent writes as soon as it resumes, and a second vfork child exits at once before the parent's wait4(WNOHANG); it requires the native order 'parent resumed' before 'child done' and 'after exit: exited', bitwise parity under run --strict --verify --verify-strict, and a matching replay under record --verify --verify-strict; it remains a guest fixture because a generic manifest cannot assert this exact output together with both parity checks for a scheduler-ordering regression."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/vfork_kill_exec.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/vfork_kill_exec.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_vfork_child_that_kills_its_parent_and_execs_lets_its_own_child_run compiles this guest, in which a vfork child sends SIGKILL to its parent and execs into a program that forks and waits, and requires exit 0 with 'A killed by signal 9' then 'forkwait ok' (https://github.com/rrnewton/hermit/issues/3984); it remains a guest fixture because a generic manifest cannot bound the run with a deadline and assert this exact output for a scheduler-liveness regression."

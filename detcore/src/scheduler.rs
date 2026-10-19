@@ -1244,6 +1244,16 @@ pub struct Scheduler {
     /// not the parent's death has been seen keeps the drop independent of the
     /// order in which those host-timed events arrive.
     released_vfork_barriers: BTreeSet<DetTid>,
+    /// The subset of `released_vfork_barriers` whose release was the child's
+    /// successful exec or its `Exit` grant. Both are committed inside the
+    /// child's own turn before the kernel lets the parent go, so the parent's
+    /// continuation cannot be seen first; step2a readmits such a parent at its
+    /// continuation (`vfork_rejoin_readmit`). A logical kill is not in it: on
+    /// ptrace a vfork child killed by a signal is retired only when it
+    /// deregisters, after the kernel already released the parent, so which of
+    /// the two arrives first is host timing, and the parent keeps the late
+    /// readmission in either order.
+    vfork_rejoin_edges: BTreeSet<DetTid>,
 
     /// Processes a committed SIGKILL has doomed
     /// ([`Scheduler::record_committed_sigkill`]). They will die even if a
@@ -3874,6 +3884,7 @@ impl Scheduler {
             dead_vfork_parents: Default::default(),
             dead_parent_vfork_barriers: Default::default(),
             released_vfork_barriers: Default::default(),
+            vfork_rejoin_edges: Default::default(),
             sigkilled_processes: Default::default(),
             complete_child_lineage: cfg.backend.tracks_process_children,
             committed_exits: Default::default(),
@@ -4925,8 +4936,9 @@ impl Scheduler {
         // change the schedule after that child is gone
         // (https://github.com/rrnewton/hermit/issues/3984).
         self.retire_vfork_parent(*dtid);
-        // A killed vfork child is its own barrier's release edge.
-        self.release_vfork_child(*dtid);
+        // A killed vfork child is its own barrier's release edge; it does not
+        // readmit the parent early (`vfork_rejoin_edges`).
+        self.release_vfork_child(*dtid, false);
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
         self.published_masks.remove(dtid);
@@ -5718,6 +5730,7 @@ impl Scheduler {
         self.vfork_registration_origins.remove(&parent);
         self.dead_parent_vfork_barriers.remove(&parent);
         self.released_vfork_barriers.remove(&parent);
+        self.vfork_rejoin_edges.remove(&parent);
     }
 
     /// `parent` is being logically killed. With no child registered yet, its
@@ -5748,8 +5761,9 @@ impl Scheduler {
     /// (`record_successful_exec`), or its logical kill. A barrier whose parent
     /// has died goes now. Otherwise the barrier is marked released, and step2a
     /// waits, committing nothing, until the parent's continuation or
-    /// retirement, then drops it.
-    pub(crate) fn release_vfork_child(&mut self, child: DetTid) {
+    /// retirement, then drops it. `resumes_parent` marks an exec or `Exit`
+    /// edge, after which step2a readmits the parent (`vfork_rejoin_edges`).
+    pub(crate) fn release_vfork_child(&mut self, child: DetTid, resumes_parent: bool) {
         let parents: Vec<DetTid> = self
             .vfork_barriers
             .iter()
@@ -5761,6 +5775,9 @@ impl Scheduler {
                 self.drop_vfork_barrier(parent);
             } else {
                 self.released_vfork_barriers.insert(parent);
+                if resumes_parent {
+                    self.vfork_rejoin_edges.insert(parent);
+                }
             }
         }
     }
@@ -5774,6 +5791,8 @@ impl Scheduler {
         self.dead_parent_vfork_barriers
             .retain(|parent| self.vfork_barriers.contains_key(parent));
         self.released_vfork_barriers
+            .retain(|parent| self.vfork_barriers.contains_key(parent));
+        self.vfork_rejoin_edges
             .retain(|parent| self.vfork_barriers.contains_key(parent));
     }
 
@@ -6281,7 +6300,7 @@ impl Scheduler {
         // A vfork child is a single-threaded process, so the caller is
         // `process`; an exec that retires a vfork child as a sibling or a
         // non-leader caller goes through `remove_exec_vfork_barriers`.
-        self.release_vfork_child(process);
+        self.release_vfork_child(process, true);
     }
 
     /// The mask Linux's `blocked` holds for `dettid` while Detcore holds it
@@ -7615,6 +7634,47 @@ impl Scheduler {
         }
     }
 
+    /// Step 2a: readmit a vfork parent whose barrier ended at its
+    /// continuation, ahead of other work, where Linux resumes it: at its
+    /// child's successful exec or exit (`vfork(2)`). Before this, the
+    /// continuation stayed a background completion that was readmitted only
+    /// once nothing else could run, so a vfork parent such as make resumed
+    /// only after the child it started had finished, and its next
+    /// `wait4(WNOHANG)` always found that child exited.
+    ///
+    /// The readmission point is fixed by the child's committed release edge
+    /// and the barrier wait above, which commits no turn until the parent's
+    /// continuation arrives; host timing can only lengthen that wait. Record
+    /// logs the readmission in the rejoin log; replay applies it here too, at
+    /// the same point of the pass: everything later in the pass that reads the
+    /// run queue must see the parent queued in both, or the schedules part.
+    /// A logged entry due elsewhere stays with `step2c_replay_rejoin`, which
+    /// refuses one that does not match.
+    fn vfork_rejoin_readmit(&mut self, parent: DetTid) {
+        let Some(op_id) = self.blocked.external_io_blockers.get(&parent).copied() else {
+            return;
+        };
+        if let Some(rejoins) = self.rejoin_replay.as_mut() {
+            let point = (self.turn, self.empty_queue_wakes);
+            let due_here = rejoins.front().is_some_and(|next| {
+                next.point() == point && next.calls == [(parent, op_id.sequence)]
+            });
+            if !due_here {
+                return;
+            }
+            rejoins.pop_front();
+            self.rejoin_stalled_since = None;
+        } else {
+            self.log_rejoin(&[(parent, op_id, false)], &[parent]);
+        }
+        self.blocked.external_io_blockers.remove(&parent);
+        self.blocked.replay_log_served.remove(&parent);
+        let _ = self.blocked.out_of_scheduler_masks.remove(&parent);
+        // The message `step2c_process_io_blockers` logs for a readmission.
+        info!("[step2] Reschedule formerly backgrounded dtid {:?}", parent);
+        self.readmit_ready_thread(parent);
+    }
+
     /// Keep scheduling inside an active vfork until the parent can continue.
     /// Before child registration no guest may run; afterward step 3 selects the
     /// child first (see [`Self::step3_peek`]). A failed clone reaches the parent
@@ -7676,11 +7736,48 @@ impl Scheduler {
                     }
                     _ => false,
                 };
-                remove.then_some(*parent)
+                // The child's successful exec or exit released the parent in
+                // the kernel, which is the parent's continuation: Linux
+                // resumes a vfork parent then (`vfork(2)`), so readmit it
+                // now rather than when nothing else can run. Only after the
+                // child's committed exec or `Exit` edge (`vfork_rejoin_edges`):
+                // a continuation that comes first (a backend deferring the
+                // child's registration posts it before the child runs), or a
+                // release by the child's logical kill, keeps the old
+                // readmission.
+                let rejoins = remove
+                    && child_registered
+                    && self.vfork_rejoin_edges.contains(parent)
+                    && self
+                        .next_turns
+                        .get(parent)
+                        .and_then(|turn| turn.req.try_read())
+                        .and_then(|req| req.ok())
+                        .is_some_and(|resources| {
+                            resources.resources.keys().any(|resource| {
+                                matches!(resource, ResourceID::BlockedExternalContinue(_))
+                            })
+                        });
+                remove.then_some((*parent, rejoins))
             })
             .collect();
-        for parent in completed_parents {
+        // Rejoins go together: while any parent released to rejoin still
+        // waits for its continuation, the ready ones keep their barriers, so
+        // the whole set is admitted in one pass in DetTid order (the map's)
+        // and logged in that order. Admitting each as its continuation came
+        // would order the queue by host arrival.
+        let rejoin_waits = self
+            .vfork_rejoin_edges
+            .iter()
+            .any(|parent| !completed_parents.iter().any(|(done, _)| done == parent));
+        for (parent, rejoins) in completed_parents {
+            if rejoins && rejoin_waits {
+                continue;
+            }
             self.drop_vfork_barrier(parent);
+            if rejoins {
+                self.vfork_rejoin_readmit(parent);
+            }
         }
 
         // A pending barrier waits for its child's registration, a released one
@@ -11417,6 +11514,15 @@ impl Scheduler {
                 // Replay readmits each call at the turn the recording logged, not when
                 // it finishes (see `rejoin_log`).
                 if self.rejoin_replay.is_some() {
+                    // As record does below: with nothing to run and no
+                    // readmission due, a parent parked for its deferred
+                    // SIGCHLD goes to step2e.
+                    if self.run_queue.is_empty()
+                        && !self.blocked.sigchld_deferred.is_empty()
+                        && !self.rejoin_due_now()
+                    {
+                        return Ok(());
+                    }
                     return self.step2c_replay_rejoin(&blockers, &ready, requeue_ready);
                 }
 
@@ -11475,6 +11581,16 @@ impl Scheduler {
                     return Ok(());
                 }
 
+                // A parent parked for its deferred SIGCHLD is work: step2e
+                // admits it once nothing else can run, which is now. Spinning
+                // here instead never reached step2e, and hung a recording of
+                // make -jN once vfork parents resume at their child's exec:
+                // make waited in a backgrounded pselect6 for the SIGCHLD of a
+                // job whose driver waited for its own deferred SIGCHLD.
+                if !self.blocked.sigchld_deferred.is_empty() {
+                    return Ok(());
+                }
+
                 // No completed IO yet, and nothing to run. The
                 // blocking syscalls are executing in the host kernel; go around the loop
                 // and re-check readiness. (Still a busy-wait; see T137183027 for the
@@ -11504,6 +11620,10 @@ impl Scheduler {
             if !ready.is_empty() {
                 requeue_ready(self, &ready);
             }
+            // Unlike record and replay, this wait does not give way to a
+            // parent parked for its deferred SIGCHLD: nothing logs the turn
+            // here, so letting step2e run whenever the call has not finished
+            // yet would let host timing order the two.
             if self.run_queue.is_empty()
                 && self.blocked.timed_waiters.is_empty()
                 && !self.blocked.external_io_blockers.is_empty()
@@ -12880,7 +13000,7 @@ impl Scheduler {
                 }
                 // The grant is a vfork child's release edge: a barrier whose
                 // parent has died ends here, inside this committed turn.
-                self.release_vfork_child(dettid);
+                self.release_vfork_child(dettid, true);
                 // The thread leaves by its own committed exit, not by dying
                 // with its process (https://github.com/rrnewton/hermit/issues/3904).
                 self.committed_exits.insert(dettid);
@@ -18972,6 +19092,516 @@ mod test {
         assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
         assert!(scheduler.vfork_barriers.is_empty());
         assert!(scheduler.released_vfork_barriers.is_empty());
+    }
+
+    /// Vfork parent 3 backgrounded in its injected clone (call 7), its
+    /// registered child 5, and worker 9 queued: the rejoin tests below.
+    fn backgrounded_vfork_pair() -> (Scheduler, ExternalOpId, DetTid, DetTid) {
+        let (mut scheduler, parent, child) = live_vfork_pair();
+        let op_id = ExternalOpId::new(parent, 7);
+        background(&mut scheduler, op_id, false);
+        queue_worker(&mut scheduler, DetTid::from_raw(9));
+        (scheduler, op_id, parent, child)
+    }
+
+    /// The parent's injected clone returns: its continuation is posted.
+    fn post_vfork_continuation(scheduler: &mut Scheduler, op_id: ExternalOpId) {
+        let mut continuation = Resources::new(op_id.tid);
+        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+        scheduler.next_turns[&op_id.tid].req.put(Ok(continuation));
+    }
+
+    fn assert_rejoined(scheduler: &Scheduler, parent: DetTid) {
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(scheduler.released_vfork_barriers.is_empty());
+        assert!(!scheduler.blocked.external_io_blockers.contains_key(&parent));
+        assert!(scheduler.run_queue.contains_tid(parent));
+        assert!(scheduler.run_queue.contains_tid(DetTid::from_raw(9)));
+    }
+
+    /// Linux resumes a vfork parent when its child execs (`vfork(2)`). Step2a
+    /// waits for the parent's continuation after the exec edge and then
+    /// readmits the parent, though worker 9 is runnable, instead of leaving
+    /// the continuation in the background until nothing else can run.
+    #[test]
+    fn a_vfork_parent_rejoins_at_its_childs_exec_while_work_is_runnable() {
+        let (mut scheduler, op_id, parent, child) = backgrounded_vfork_pair();
+        scheduler.record_successful_exec(child);
+        assert!(
+            scheduler.step2a_wait_for_vfork_barrier().is_err(),
+            "waits for the parent's continuation"
+        );
+        assert!(scheduler.blocked.external_io_blockers.contains_key(&parent));
+
+        post_vfork_continuation(&mut scheduler, op_id);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert_rejoined(&scheduler, parent);
+    }
+
+    /// The child's `Exit` grant is the other release edge (`vfork(2)`): the
+    /// parent rejoins at its continuation after it too.
+    #[test]
+    fn a_vfork_parent_rejoins_at_its_childs_exit_while_work_is_runnable() {
+        let (mut scheduler, op_id, parent, child) = backgrounded_vfork_pair();
+        assert!(
+            scheduler
+                .block_for_one_resource(
+                    child,
+                    &ResourceID::Exit {
+                        group: true,
+                        process: child,
+                        mm: MmId::initial(child),
+                    },
+                    &Permission::RW,
+                    None,
+                    None,
+                    &Ivar::new(),
+                )
+                .is_ok()
+        );
+        assert!(scheduler.released_vfork_barriers.contains(&parent));
+
+        post_vfork_continuation(&mut scheduler, op_id);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert_rejoined(&scheduler, parent);
+    }
+
+    /// A failed clone has no child and no release edge: the barrier ends at
+    /// the continuation and the parent keeps the background readmission.
+    #[test]
+    fn a_failed_vfork_keeps_the_background_readmission() {
+        let (mut scheduler, op_id, parent, _) = backgrounded_vfork_pair();
+        scheduler.vfork_barriers.insert(parent, None);
+        post_vfork_continuation(&mut scheduler, op_id);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(scheduler.blocked.external_io_blockers.contains_key(&parent));
+        assert!(!scheduler.run_queue.contains_tid(parent));
+    }
+
+    /// A continuation that comes before the child's release edge (a backend
+    /// deferring the child's registration posts it before the child runs)
+    /// ends the barrier as before but readmits nothing: the parent cannot
+    /// resume ahead of the child it is waiting for.
+    #[test]
+    fn a_continuation_before_the_release_edge_keeps_the_background_readmission() {
+        let config = Config::default().with_backend(|backend| {
+            backend.defers_vfork_child_registration = true;
+        });
+        let mut scheduler = Scheduler::new(&config);
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        let op_id = ExternalOpId::new(parent, 7);
+        background(&mut scheduler, op_id, false);
+        queue_worker(&mut scheduler, DetTid::from_raw(9));
+        scheduler.vfork_barriers.insert(parent, None);
+        post_vfork_continuation(&mut scheduler, op_id);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+
+        scheduler.complete_vfork_registration(parent, child);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(scheduler.blocked.external_io_blockers.contains_key(&parent));
+        assert!(!scheduler.run_queue.contains_tid(parent));
+    }
+
+    /// A parent killed after its child's exec edge takes its barrier with it;
+    /// there is no continuation and nothing to readmit.
+    #[test]
+    fn a_dead_vfork_parent_is_not_readmitted_at_its_childs_exec() {
+        let (mut scheduler, _, parent, child) = backgrounded_vfork_pair();
+        scheduler.record_successful_exec(child);
+        scheduler.logically_kill_thread(&parent, &parent, MmId::initial(parent));
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(!scheduler.run_queue.contains_tid(parent));
+    }
+
+    /// Nested vfork: P (3) vforks C (5), and C vforks G (11). G's exec
+    /// resumes C only; P's barrier still stands, unreleased, so step 3 still
+    /// selects C, P's vfork child, as Linux keeps P blocked until C itself
+    /// execs or exits.
+    #[test]
+    fn a_nested_vfork_child_rejoins_at_its_own_childs_exec() {
+        let (mut scheduler, outer, parent, middle) = backgrounded_vfork_pair();
+        let grandchild = DetTid::from_raw(11);
+        let inner = ExternalOpId::new(middle, 2);
+        background(&mut scheduler, inner, false);
+        scheduler.vfork_barriers.insert(middle, Some(grandchild));
+        scheduler
+            .thread_tree
+            .add_child(grandchild, grandchild, true);
+
+        scheduler.record_successful_exec(grandchild);
+        post_vfork_continuation(&mut scheduler, inner);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.run_queue.contains_tid(middle));
+        assert!(!scheduler.blocked.external_io_blockers.contains_key(&middle));
+        assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&Some(middle)));
+        assert!(!scheduler.released_vfork_barriers.contains(&parent));
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&parent),
+            Some(&outer)
+        );
+        let (selected, _, _) = scheduler.step3_peek().expect("C runs");
+        assert_eq!(selected, middle);
+    }
+
+    /// Record logs the rejoin at the turn step2a readmits the parent.
+    #[test]
+    fn record_logs_a_vfork_parents_rejoin_at_its_childs_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut scheduler, op_id, parent, child) = backgrounded_vfork_pair();
+        scheduler.recordreplay_modes = true;
+        scheduler.rejoin_writer = Some(RejoinWriter::create(dir.path()).unwrap());
+        scheduler.turn = 12;
+        scheduler.record_successful_exec(child);
+        post_vfork_continuation(&mut scheduler, op_id);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert_rejoined(&scheduler, parent);
+        assert_eq!(
+            rejoin_log::read(dir.path()).unwrap(),
+            std::collections::VecDeque::from([Rejoin {
+                turn: 12,
+                wakes: 0,
+                calls: vec![(parent, 7)],
+            }])
+        );
+    }
+
+    /// Replay applies a rejoin logged for this point at step2a, as record
+    /// did; one logged elsewhere leaves the parent parked and the entry for
+    /// `step2c_replay_rejoin`, which follows or refuses it.
+    #[test]
+    fn replay_applies_a_vfork_parents_rejoin_at_step2a() {
+        let logged = Rejoin {
+            turn: 12,
+            wakes: 0,
+            calls: vec![(DetTid::from_raw(3), 7)],
+        };
+        let make = |turn| {
+            let (mut scheduler, op_id, _, child) = backgrounded_vfork_pair();
+            scheduler.recordreplay_modes = true;
+            replaying(&mut scheduler, std::slice::from_ref(&logged));
+            scheduler.turn = turn;
+            scheduler.record_successful_exec(child);
+            post_vfork_continuation(&mut scheduler, op_id);
+            scheduler
+        };
+
+        let mut due = make(12);
+        assert!(due.step2a_wait_for_vfork_barrier().is_ok());
+        assert_rejoined(&due, DetTid::from_raw(3));
+        assert!(due.rejoin_replay.as_ref().unwrap().is_empty());
+
+        let mut early = make(11);
+        assert!(early.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(early.vfork_barriers.is_empty());
+        assert!(
+            early
+                .blocked
+                .external_io_blockers
+                .contains_key(&DetTid::from_raw(3))
+        );
+        assert_eq!(early.rejoin_replay.as_ref().unwrap().len(), 1);
+    }
+
+    /// Record, with nothing queued and a call still running, lets a parent
+    /// parked for its deferred SIGCHLD reach step2e instead of spinning; replay
+    /// does the same unless a logged rejoin is due now.
+    #[test]
+    fn a_deferred_sigchld_parent_is_not_starved_by_a_running_background_call() {
+        let waiter = DetTid::from_raw(13);
+        let running = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let make = || {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.recordreplay_modes = true;
+            background(&mut scheduler, running, false);
+            scheduler.blocked.sigchld_deferred.insert(waiter);
+            scheduler
+        };
+
+        let mut spinning = make();
+        spinning.blocked.sigchld_deferred.clear();
+        assert!(spinning.step2c_process_io_blockers().is_err());
+
+        let mut recording = make();
+        assert!(recording.step2c_process_io_blockers().is_ok());
+        assert!(
+            recording
+                .blocked
+                .external_io_blockers
+                .contains_key(&running.tid)
+        );
+
+        let mut replay = make();
+        replaying(&mut replay, &[]);
+        assert!(replay.step2c_process_io_blockers().is_ok());
+    }
+
+    /// A vfork child's logical kill releases its barrier, but on ptrace it is
+    /// processed when the child deregisters, after the kernel let the parent
+    /// go, so it can come before or after the parent's continuation. In
+    /// either order the parent keeps the background readmission.
+    #[test]
+    fn a_killed_vfork_child_keeps_the_background_readmission_in_either_order() {
+        for kill_first in [true, false] {
+            let (mut scheduler, op_id, parent, child) = backgrounded_vfork_pair();
+            if kill_first {
+                scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
+                post_vfork_continuation(&mut scheduler, op_id);
+            } else {
+                post_vfork_continuation(&mut scheduler, op_id);
+                assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+                scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
+            }
+            assert!(
+                scheduler.step2a_wait_for_vfork_barrier().is_ok(),
+                "kill first: {kill_first}"
+            );
+            assert!(
+                scheduler.vfork_barriers.is_empty(),
+                "kill first: {kill_first}"
+            );
+            assert!(
+                scheduler.blocked.external_io_blockers.contains_key(&parent),
+                "kill first: {kill_first}"
+            );
+            assert!(
+                !scheduler.run_queue.contains_tid(parent),
+                "kill first: {kill_first}"
+            );
+        }
+    }
+
+    /// Two vfork parents, 3 (call 7) and 13 (call 4), each backgrounded in
+    /// its injected clone with its registered child (5 and 15), and worker 9
+    /// queued: the simultaneous-release tests below.
+    fn two_backgrounded_vfork_pairs() -> (Scheduler, [(ExternalOpId, DetTid); 2]) {
+        let (mut scheduler, first, _, first_child) = backgrounded_vfork_pair();
+        let parent = DetTid::from_raw(13);
+        let child = DetTid::from_raw(15);
+        for tid in [parent, child] {
+            scheduler.thread_tree.add_child(tid, tid, true);
+            scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                tid,
+                ThreadNextTurn {
+                    dettid: tid,
+                    child_tid_addr: 0,
+                    req: Ivar::full(Ok(Resources::new(tid))),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+        }
+        scheduler.vfork_barriers.insert(parent, Some(child));
+        let second = ExternalOpId::new(parent, 4);
+        background(&mut scheduler, second, false);
+        (scheduler, [(first, first_child), (second, child)])
+    }
+
+    /// Releases both pairs' children with `release`, posts the parents'
+    /// continuations in `order`, running step2a after each, and returns the
+    /// thread step 3 then selects.
+    fn release_two_vfork_pairs(
+        scheduler: &mut Scheduler,
+        pairs: [(ExternalOpId, DetTid); 2],
+        release: impl Fn(&mut Scheduler, DetTid),
+        order: [usize; 2],
+    ) -> DetTid {
+        for (_, child) in pairs {
+            release(scheduler, child);
+        }
+        let (first, _) = pairs[order[0]];
+        post_vfork_continuation(scheduler, first);
+        let _ = scheduler.step2a_wait_for_vfork_barrier();
+        let (second, _) = pairs[order[1]];
+        post_vfork_continuation(scheduler, second);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        let (selected, _, _) = scheduler.step3_peek().expect("a thread runs");
+        scheduler.run_queue.undo_tentative_pop();
+        selected
+    }
+
+    /// Two parents released to rejoin at once (both children's exec edges)
+    /// are admitted together, so the queue does not depend on which
+    /// continuation came first: until both have arrived neither is queued,
+    /// and either arrival order gives the same next thread (Codex review of
+    /// 180ffa2c, P1).
+    #[test]
+    fn two_vfork_parents_released_together_rejoin_in_one_order() {
+        let exec = |scheduler: &mut Scheduler, child| scheduler.record_successful_exec(child);
+        let mut selections = Vec::new();
+        for order in [[0, 1], [1, 0]] {
+            let (mut scheduler, pairs) = two_backgrounded_vfork_pairs();
+            for (_, child) in pairs {
+                exec(&mut scheduler, child);
+            }
+            post_vfork_continuation(&mut scheduler, pairs[order[0]].0);
+            assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+            for (op_id, _) in pairs {
+                assert!(
+                    !scheduler.run_queue.contains_tid(op_id.tid),
+                    "order {order:?}"
+                );
+            }
+            post_vfork_continuation(&mut scheduler, pairs[order[1]].0);
+            assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+            for (op_id, _) in pairs {
+                assert!(
+                    scheduler.run_queue.contains_tid(op_id.tid),
+                    "order {order:?}"
+                );
+            }
+            let (selected, _, _) = scheduler.step3_peek().expect("a thread runs");
+            scheduler.run_queue.undo_tentative_pop();
+            selections.push(selected);
+        }
+        assert_eq!(selections[0], selections[1]);
+    }
+
+    /// Codex's case: one committed group SIGKILL retires both vfork children.
+    /// A kill does not readmit a parent early, so in either arrival order both
+    /// parents keep the background readmission and the next thread is the same.
+    #[test]
+    fn a_group_kill_of_two_vfork_children_rejoins_no_parent_in_either_order() {
+        let kill = |scheduler: &mut Scheduler, child| {
+            scheduler.logically_kill_thread(&child, &child, MmId::initial(child))
+        };
+        let mut selections = Vec::new();
+        for order in [[0, 1], [1, 0]] {
+            let (mut scheduler, pairs) = two_backgrounded_vfork_pairs();
+            selections.push(release_two_vfork_pairs(&mut scheduler, pairs, kill, order));
+            assert!(scheduler.vfork_barriers.is_empty());
+            for (op_id, _) in pairs {
+                assert!(
+                    scheduler
+                        .blocked
+                        .external_io_blockers
+                        .contains_key(&op_id.tid),
+                    "order {order:?}"
+                );
+                assert!(
+                    !scheduler.run_queue.contains_tid(op_id.tid),
+                    "order {order:?}"
+                );
+            }
+        }
+        assert_eq!(selections[0], selections[1]);
+    }
+
+    /// Record logs two simultaneous rejoins in DetTid order whichever
+    /// continuation came first, and replay applies exactly that set in that
+    /// order at step2a, in either arrival order.
+    #[test]
+    fn two_simultaneous_vfork_rejoins_record_and_replay_in_one_order() {
+        let exec = |scheduler: &mut Scheduler, child| scheduler.record_successful_exec(child);
+        let logged = std::collections::VecDeque::from([
+            Rejoin {
+                turn: 12,
+                wakes: 0,
+                calls: vec![(DetTid::from_raw(3), 7)],
+            },
+            Rejoin {
+                turn: 12,
+                wakes: 0,
+                calls: vec![(DetTid::from_raw(13), 4)],
+            },
+        ]);
+        let mut selections = Vec::new();
+        for order in [[0, 1], [1, 0]] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut recording, pairs) = two_backgrounded_vfork_pairs();
+            recording.recordreplay_modes = true;
+            recording.rejoin_writer = Some(RejoinWriter::create(dir.path()).unwrap());
+            recording.turn = 12;
+            selections.push(release_two_vfork_pairs(&mut recording, pairs, exec, order));
+            assert_eq!(
+                rejoin_log::read(dir.path()).unwrap(),
+                logged,
+                "order {order:?}"
+            );
+
+            let (mut replay, pairs) = two_backgrounded_vfork_pairs();
+            replay.recordreplay_modes = true;
+            replay.rejoin_replay = Some(logged.clone());
+            replay.turn = 12;
+            selections.push(release_two_vfork_pairs(&mut replay, pairs, exec, order));
+            assert!(
+                replay.rejoin_replay.as_ref().unwrap().is_empty(),
+                "order {order:?}"
+            );
+            for (op_id, _) in pairs {
+                assert!(replay.run_queue.contains_tid(op_id.tid), "order {order:?}");
+            }
+        }
+        assert!(
+            selections.windows(2).all(|pair| pair[0] == pair[1]),
+            "{selections:?}"
+        );
+    }
+
+    /// With nothing queued and a parent parked for its deferred SIGCHLD,
+    /// replay still applies a rejoin logged for this point before step2e.
+    #[test]
+    fn replay_applies_a_due_rejoin_before_a_deferred_sigchld_parent() {
+        let call = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.recordreplay_modes = true;
+        background(&mut scheduler, call, true);
+        scheduler
+            .blocked
+            .sigchld_deferred
+            .insert(DetTid::from_raw(13));
+        scheduler.turn = 12;
+        replaying(
+            &mut scheduler,
+            &[Rejoin {
+                turn: 12,
+                wakes: 0,
+                calls: vec![(call.tid, 9)],
+            }],
+        );
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.run_queue.contains_tid(call.tid));
+        assert!(scheduler.rejoin_replay.as_ref().unwrap().is_empty());
+        assert!(scheduler.rejoin_refusal.is_none());
+    }
+
+    /// Two rejoins logged at one point, a vfork parent's at step2a and another
+    /// call's at step2c: replay applies them in that order in the same pass.
+    #[test]
+    fn replay_applies_a_step2a_and_a_step2c_rejoin_logged_at_one_point() {
+        let (mut scheduler, op_id, parent, child) = backgrounded_vfork_pair();
+        let other = ExternalOpId::new(DetTid::from_raw(21), 9);
+        background(&mut scheduler, other, true);
+        scheduler.recordreplay_modes = true;
+        scheduler.turn = 12;
+        replaying(
+            &mut scheduler,
+            &[
+                Rejoin {
+                    turn: 12,
+                    wakes: 0,
+                    calls: vec![(parent, 7)],
+                },
+                Rejoin {
+                    turn: 12,
+                    wakes: 0,
+                    calls: vec![(other.tid, 9)],
+                },
+            ],
+        );
+        scheduler.record_successful_exec(child);
+        post_vfork_continuation(&mut scheduler, op_id);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.run_queue.contains_tid(parent));
+        assert_eq!(scheduler.rejoin_replay.as_ref().unwrap().len(), 1);
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.run_queue.contains_tid(other.tid));
+        assert!(scheduler.rejoin_replay.as_ref().unwrap().is_empty());
+        assert!(scheduler.rejoin_refusal.is_none());
     }
 
     /// Backdates the start of step2a's wait past its valve: an injected clock,
