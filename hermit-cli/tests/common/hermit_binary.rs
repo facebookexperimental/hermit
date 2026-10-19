@@ -196,6 +196,28 @@ pub fn pin_canonical_epoch(command: &mut Command) {
     {
         command.env("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH);
     }
+    isolate_cache_home(command);
+}
+
+/// Point a Hermit command's `XDG_CACHE_HOME` at a directory of this test
+/// process's own, unless the test set one itself, so that Hermit's host
+/// qualification cache (`~/.cache/hermit/`) never carries a verdict from one
+/// test, or from the developer's own runs, into another test
+/// (<https://github.com/rrnewton/hermit/issues/4515>). Nextest runs each test
+/// in its own process, so each test starts with an empty cache.
+pub fn isolate_cache_home(command: &mut Command) {
+    static CACHE_HOME: OnceLock<PathBuf> = OnceLock::new();
+    if command.get_envs().any(|(key, _)| key == "XDG_CACHE_HOME") {
+        return;
+    }
+    let home = CACHE_HOME.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("xdg-cache-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("create this test process's cache directory")
+            .keep()
+    });
+    command.env("XDG_CACHE_HOME", home);
 }
 
 /// Insert the validate v3 guest arguments into a direct or timeout-wrapped

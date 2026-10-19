@@ -656,7 +656,7 @@ static ADMITTED: std::sync::OnceLock<Qualification> = std::sync::OnceLock::new()
 /// refusals are checked every time; the host qualification runs once per
 /// process.
 pub fn admit(request: &AdmissionRequest<'_>) -> Result<Qualification, AdmissionRefusal> {
-    admit_with(request, qualify_host)
+    admit_with(request, qualify_host_cached)
 }
 
 /// [`admit`] with its host qualification as a parameter, so that a test can
@@ -750,8 +750,138 @@ pub fn refuse_unadmitted_launch(
 /// The host half of [`admit`], run once per process: the kernel, the
 /// every-bit CPUID check, the dynamic-feature refusal, the probe and the host
 /// facts. `hermit host-capabilities --cpu-profile x86-64-v3` runs it alone.
+/// It always measures and never reads or writes the cache [`admit`] uses.
 #[cfg(target_arch = "x86_64")]
 pub fn qualify_host() -> Result<Qualification, AdmissionRefusal> {
+    qualify_host_with(|_| xstate_probe::qualify(xstate_probe::ProbeOptions::default()))
+}
+
+/// [`admit`]'s host half: the same qualification, with the XINUSE probe
+/// through the per-host cache ([`cached_probe`]).
+#[cfg(target_arch = "x86_64")]
+fn qualify_host_cached() -> Result<Qualification, AdmissionRefusal> {
+    qualify_host_with(cached_probe)
+}
+
+/// The name of the XINUSE probe's file in the host qualification cache.
+#[cfg(target_arch = "x86_64")]
+const PROBE_CACHE_NAME: &str = "cpu-profile-x86-64-v3-probe";
+
+#[cfg(target_arch = "x86_64")]
+fn probe_cache_path() -> Option<std::path::PathBuf> {
+    crate::host_qualification::default_path(PROBE_CACHE_NAME)
+}
+
+/// The probe's inputs besides the host: its options. XCR0 is checked on the
+/// report itself ([`cached_report_matches`]).
+#[cfg(target_arch = "x86_64")]
+fn probe_cache_inputs() -> String {
+    format!("options={:?}", xstate_probe::ProbeOptions::default())
+}
+
+/// The XINUSE probe for [`admit`]: its passing report cached for this host
+/// (`crate::host_qualification`), or else a fresh probe, announced on stderr
+/// because it takes seconds, and cached if it passes. The probe certifies the
+/// CPU's and kernel's XSAVE behavior, which no sandbox changes, so the host
+/// key suffices; the checks that depend on the caller's sandbox run on every
+/// run (<https://github.com/rrnewton/hermit/issues/4515>). Under a hypervisor
+/// nothing is cached: a live migration keeps the boot, the kernel and CPUID
+/// but moves the guest to a host the forced-exit arm never certified.
+#[cfg(target_arch = "x86_64")]
+fn cached_probe(xcr0: u64) -> Result<xstate_probe::ProbeReport, AdmissionRefusal> {
+    let hypervisor = std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
+    cached_probe_at(
+        cache_path_for(hypervisor).as_deref(),
+        &crate::host_qualification::HostKey::current(),
+        xcr0,
+        &mut |line: &str| eprint!("{line}"),
+        || xstate_probe::qualify(xstate_probe::ProbeOptions::default()),
+    )
+}
+
+/// The probe's cache file, or `None` under a hypervisor, where nothing is
+/// cached ([`cached_probe`]).
+#[cfg(target_arch = "x86_64")]
+fn cache_path_for(hypervisor: bool) -> Option<std::path::PathBuf> {
+    if hypervisor {
+        return None;
+    }
+    probe_cache_path()
+}
+
+/// Whether a cached report is one this host's probe would produce: it binds
+/// `cases` and `forced_exit` into a recording (`HostXstate::probe_cases` and
+/// `probe_forced_exit`), so they are derived again here, from XCR0 and from
+/// the cache's use only off a hypervisor, and a report that disagrees is a
+/// miss. Its repetitions and pair count must be the default probe's too.
+#[cfg(target_arch = "x86_64")]
+fn cached_report_matches(report: &xstate_probe::ProbeReport, xcr0: u64) -> bool {
+    let options = xstate_probe::ProbeOptions::default();
+    report.xcr0 == xcr0
+        && report.cases == xstate_probe::expected_case_count(xcr0)
+        && !report.forced_exit
+        && report.repetitions == options.repetitions
+        && report.certified_pairs == report.cells as u64 * u64::from(report.repetitions)
+}
+
+/// [`cached_probe`] with its cache path (`None`: no cache), host key, warning
+/// writer and probe as parameters, for the tests.
+#[cfg(target_arch = "x86_64")]
+fn cached_probe_at(
+    path: Option<&std::path::Path>,
+    host: &crate::host_qualification::HostKey,
+    xcr0: u64,
+    warn: &mut dyn FnMut(&str),
+    probe: impl FnOnce() -> Result<xstate_probe::ProbeReport, xstate_probe::ProbeRefusal>,
+) -> Result<xstate_probe::ProbeReport, AdmissionRefusal> {
+    let Some(path) = path else {
+        warn(
+            "WARNING: qualifying this host for --cpu-profile x86-64-v3, which takes seconds; \
+             with no cache to use it is measured again on every run.\n",
+        );
+        return probe();
+    };
+    let inputs = probe_cache_inputs();
+    let cached = || {
+        crate::host_qualification::load::<xstate_probe::ProbeReport>(path, host, &inputs)
+            .filter(|report| cached_report_matches(report, xcr0))
+    };
+    if let Some(report) = cached() {
+        return Ok(report);
+    }
+    // Checked again under the lock: another process that missed at the same
+    // time may have measured and stored a pass while this one waited.
+    crate::host_qualification::locked(path, || {
+        if let Some(report) = cached() {
+            return Ok(report);
+        }
+        warn(&if crate::host_qualification::writable(path) {
+            format!(
+                "WARNING: qualifying this host for --cpu-profile x86-64-v3, which takes \
+                 seconds; a pass is cached in {} until the kernel, CPU, microcode, boot or \
+                 Hermit binary changes.\n",
+                path.display()
+            )
+        } else {
+            format!(
+                "WARNING: qualifying this host for --cpu-profile x86-64-v3, which takes \
+                 seconds; {} cannot be written, so it is measured again on every run.\n",
+                path.display()
+            )
+        });
+        let report = probe()?;
+        crate::host_qualification::store(path, host, &inputs, &report);
+        Ok(report)
+    })
+}
+
+/// [`qualify_host`] with the XINUSE probe as a parameter, given XCR0: the
+/// kernel, the every-bit CPUID check and the dynamic-feature refusal run every
+/// time, and the host facts are captured from this host every time.
+#[cfg(target_arch = "x86_64")]
+fn qualify_host_with(
+    probe: impl FnOnce(u64) -> Result<xstate_probe::ProbeReport, AdmissionRefusal>,
+) -> Result<Qualification, AdmissionRefusal> {
     let release = nix::sys::utsname::uname()
         .map_err(|e| format!("uname failed: {e}"))?
         .release()
@@ -762,7 +892,7 @@ pub fn qualify_host() -> Result<Qualification, AdmissionRefusal> {
     // SAFETY: OSXSAVE was checked above.
     let xcr0 = unsafe { std::arch::x86_64::_xgetbv(0) };
     refuse_dynamic_features(xcr0, 0)?;
-    let probe = xstate_probe::qualify(xstate_probe::ProbeOptions::default())?;
+    let probe = probe(xcr0)?;
     let host = capture(&probe)?;
     Ok((probe, host))
 }
@@ -823,6 +953,164 @@ fn non_x86_refusal() -> AdmissionRefusal {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
+    /// A report the default probe could produce for `xcr0`.
+    fn probe_report(xcr0: u64) -> xstate_probe::ProbeReport {
+        let cases = xstate_probe::expected_case_count(xcr0);
+        let repetitions = xstate_probe::ProbeOptions::default().repetitions;
+        xstate_probe::ProbeReport {
+            cpu: 3,
+            xcr0,
+            cases,
+            cells: cases * 12,
+            repetitions,
+            certified_pairs: (cases * 12) as u64 * u64::from(repetitions),
+            forced_exit: false,
+            reload_bound: 0,
+            cpuid_min_cycles: 0,
+            calibration: "cached".into(),
+            retried_references: 0,
+            retried_reloads: 0,
+            retried_exits: 0,
+            counter_reopens: 0,
+        }
+    }
+
+    fn cache_host() -> crate::host_qualification::HostKey {
+        crate::host_qualification::HostKey {
+            kernel_release: "7.1.3".into(),
+            boot_id: "boot-a".into(),
+            cpu: "AuthenticAMD family 0x1a model 0x11 stepping 0x0".into(),
+            microcode: "0xb101054".into(),
+            hermit_binary: "64768:123:456:789.0".into(),
+        }
+    }
+
+    /// Runs [`cached_probe_at`] once and returns its result, whether the probe
+    /// ran and what it warned.
+    fn probe_through_cache(
+        path: Option<&std::path::Path>,
+        xcr0: u64,
+        answer: Result<xstate_probe::ProbeReport, xstate_probe::ProbeRefusal>,
+    ) -> (
+        Result<xstate_probe::ProbeReport, AdmissionRefusal>,
+        bool,
+        Vec<String>,
+    ) {
+        let mut ran = false;
+        let mut warnings = Vec::new();
+        let result = cached_probe_at(
+            path,
+            &cache_host(),
+            xcr0,
+            &mut |line: &str| warnings.push(line.to_owned()),
+            || {
+                ran = true;
+                answer
+            },
+        );
+        (result, ran, warnings)
+    }
+
+    /// The first v3 admission on a host measures, warning once on stderr, and
+    /// caches the passing report; later ones reuse it without measuring or
+    /// warning (<https://github.com/rrnewton/hermit/issues/4515>).
+    #[test]
+    fn a_passing_probe_is_measured_once_and_announced() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hermit").join("probe.json");
+        let (result, ran, warnings) =
+            probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
+        assert_eq!(result, Ok(probe_report(0x2e7)));
+        assert!(ran);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("WARNING: "), "{warnings:?}");
+        assert!(
+            warnings[0].contains(&path.display().to_string()),
+            "{warnings:?}"
+        );
+        assert_eq!(warnings[0].matches('\n').count(), 1, "{warnings:?}");
+        let (result, ran, warnings) =
+            probe_through_cache(Some(&path), 0x2e7, Err("must not probe".into()));
+        assert_eq!(result, Ok(probe_report(0x2e7)));
+        assert!(!ran);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// A refusal is not cached, and a different XCR0 measures again.
+    #[test]
+    fn a_refusal_or_a_new_xcr0_measures_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("probe.json");
+        let (result, ran, _) = probe_through_cache(Some(&path), 0x2e7, Err("refused".into()));
+        assert_eq!(result, Err("refused".into()));
+        assert!(ran);
+        let (result, ran, _) = probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
+        assert!(ran && result.is_ok());
+        let (result, ran, _) = probe_through_cache(Some(&path), 0x207, Ok(probe_report(0x207)));
+        assert_eq!(result, Ok(probe_report(0x207)));
+        assert!(ran, "XCR0 is part of the key");
+    }
+
+    /// A cached report whose recorded fields this host's probe would not
+    /// produce is a miss: the case count and the forced-exit arm are bound
+    /// into recordings, so an edited or foreign file never supplies them.
+    #[test]
+    fn a_cached_report_that_disagrees_with_this_host_is_a_miss() {
+        type Edit = fn(&mut xstate_probe::ProbeReport);
+        let edits: [(&str, Edit); 5] = [
+            ("cases", |r| r.cases = 1),
+            ("forced exit", |r| r.forced_exit = true),
+            ("repetitions", |r| r.repetitions += 1),
+            ("certified pairs", |r| r.certified_pairs += 1),
+            ("xcr0", |r| r.xcr0 ^= 1 << 9),
+        ];
+        for (field, edit) in edits {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("probe.json");
+            let mut edited = probe_report(0x2e7);
+            edit(&mut edited);
+            crate::host_qualification::store(&path, &cache_host(), &probe_cache_inputs(), &edited);
+            let (result, ran, _) = probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
+            assert!(ran, "{field}: a disagreeing report was reused");
+            assert_eq!(result, Ok(probe_report(0x2e7)), "{field}");
+        }
+    }
+
+    /// Under a hypervisor nothing is cached; elsewhere the cache file is used.
+    #[test]
+    fn nothing_is_cached_under_a_hypervisor() {
+        assert_eq!(cache_path_for(true), None);
+        assert_eq!(cache_path_for(false), probe_cache_path());
+    }
+
+    /// When the cache cannot be written the warning says it is measured again,
+    /// not that it is cached.
+    #[test]
+    fn an_unwritable_cache_is_announced_as_such() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocker = directory.path().join("hermit");
+        std::fs::write(&blocker, b"a file where the directory would go").unwrap();
+        let path = blocker.join("probe.json");
+        let (result, ran, warnings) =
+            probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
+        assert!(ran && result.is_ok());
+        assert!(warnings[0].contains("cannot be written"), "{warnings:?}");
+        assert!(!warnings[0].contains("is cached"), "{warnings:?}");
+    }
+
+    /// Without a cache directory every admission measures, and says so.
+    #[test]
+    fn without_a_cache_directory_every_admission_measures() {
+        for _ in 0..2 {
+            let (result, ran, warnings) = probe_through_cache(None, 0x2e7, Ok(probe_report(0x2e7)));
+            assert!(ran && result.is_ok());
+            assert!(
+                warnings[0].contains("measured again on every run"),
+                "{warnings:?}"
+            );
+        }
+    }
 
     /// A host with AMX TILEDATA in XCR0 or in the supported mask is refused by
     /// name; one without it is not.

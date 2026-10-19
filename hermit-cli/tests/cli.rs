@@ -46816,6 +46816,76 @@ fn assert_cpuinfo_matches_cpuid(backend: &[&str]) {
 /// is generated from the v3 table, so its flags must match the v3 CPUID
 /// (https://github.com/rrnewton/hermit/issues/4243). A host that does not
 /// qualify must refuse the run by name.
+/// The first `--cpu-profile x86-64-v3` run on a host measures the XINUSE
+/// probe, says so in one stderr warning and caches the pass under
+/// `XDG_CACHE_HOME`; a second run reuses it, warning nothing and rewriting
+/// nothing (https://github.com/rrnewton/hermit/issues/4515). A host that
+/// `hermit host-capabilities --cpu-profile x86-64-v3` refuses skips the test.
+#[test]
+fn cpu_profile_v3_qualifies_the_host_once_and_reuses_the_verdict() {
+    let cache_home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = cache_home
+        .path()
+        .join("hermit")
+        .join("cpu-profile-x86-64-v3-probe.json");
+    let args = ["run", "--cpu-profile", "x86-64-v3", "--", "/bin/true"];
+    let run = || {
+        let mut command = hermit_command(&args);
+        command
+            .env("XDG_CACHE_HOME", cache_home.path())
+            .stdin(Stdio::null());
+        let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+        (output.status.code(), stdout(&output), stderr(&output), ())
+    };
+    let Some((_, first, ())) = v3_run_or_refusal(run) else {
+        eprintln!(
+            "cpu_profile_v3_qualifies_the_host_once_and_reuses_the_verdict: SKIPPED: this host does \
+             not qualify for x86-64-v3"
+        );
+        return;
+    };
+    let warning = "WARNING: qualifying this host for --cpu-profile x86-64-v3";
+    assert_eq!(first.matches(warning).count(), 1, "{first}");
+    let written = std::fs::read(&path).expect("the first v3 run caches its probe");
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let (_, second, ()) = v3_run_or_refusal(run).expect("the host qualified a moment ago");
+    assert!(
+        !second.contains(warning),
+        "a cached verdict is not measured again:\n{second}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), written);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        modified
+    );
+}
+
+/// Every Hermit command a test builds points `XDG_CACHE_HOME` at this test
+/// process's own directory, so Hermit's host qualification cache never carries
+/// a verdict between tests or from the developer's runs
+/// (https://github.com/rrnewton/hermit/issues/4515); a test that sets its own
+/// keeps it.
+#[test]
+fn every_test_command_gets_its_own_cache_directory() {
+    let cache_home = |command: &Command| {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == "XDG_CACHE_HOME")
+            .and_then(|(_, value)| value.map(PathBuf::from))
+    };
+    let first = cache_home(&hermit_command(&["run", "--", "/bin/true"]))
+        .expect("hermit_command sets XDG_CACHE_HOME");
+    assert!(first.starts_with(env!("CARGO_TARGET_TMPDIR")), "{first:?}");
+    assert!(first.is_dir(), "{first:?}");
+    assert_eq!(
+        cache_home(&hermit_command(&["--version"])),
+        Some(first.clone())
+    );
+    let mut chosen = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    chosen.env("XDG_CACHE_HOME", "/chosen");
+    hermit_test::pin_canonical_epoch(&mut chosen);
+    assert_eq!(cache_home(&chosen), Some(PathBuf::from("/chosen")));
+
 #[test]
 fn cpu_profile_v3_cpuinfo_matches_cpuid() {
     let Some((stdout, log, report)) =

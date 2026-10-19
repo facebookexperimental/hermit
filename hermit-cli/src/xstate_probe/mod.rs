@@ -395,7 +395,8 @@ pub fn parse_schedstat_timeslices(text: &str, cpu: usize) -> Result<u64, ProbeRe
 }
 
 /// What the probe found, bound into a run's manifest and printed on request.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Serialized into the host qualification cache.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProbeReport {
     pub cpu: usize,
     pub xcr0: u64,
