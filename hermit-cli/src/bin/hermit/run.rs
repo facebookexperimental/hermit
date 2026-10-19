@@ -1734,6 +1734,7 @@ fn apply_base_and_explicit_environment(
             command.env_remove(super::verify::VERIFY_TMPDIR_ENV);
             command.env_remove(detcore::race_probe::RACE_PROBE_ENV);
             command.env_remove(detcore::race_probe::RACE_PROBE_SEED_ENV);
+            command.env_remove(detcore::race_probe::RACE_PROBE_HOLD_DIR_ENV);
             command.env_remove(DAP_LISTEN_INNER_ENV);
         }
     }

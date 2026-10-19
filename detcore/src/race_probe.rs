@@ -17,6 +17,12 @@
 //! the host clock. Either way the configuration and seed are printed once to
 //! stderr, so a failing run names its seed.
 //!
+//! `point=hold` makes every visit to an async point wait, without a time
+//! limit, until a file named after the point exists in
+//! [`RACE_PROBE_HOLD_DIR_ENV`]: a test can then act on a task while it is
+//! known to be at the point, and release it after. A held visit prints one
+//! line to stderr naming the file it waits for.
+//!
 //! Unset, every point is one read of an initialized `OnceLock` and a branch;
 //! nothing is logged, and no tracing event is emitted.
 //!
@@ -28,6 +34,8 @@
 //! visits before the deciding one does not itself depend on host timing.
 
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -38,6 +46,12 @@ pub const RACE_PROBE_ENV: &str = "HERMIT_RACE_PROBE";
 
 /// The variable that fixes the seed of the race probes' choices.
 pub const RACE_PROBE_SEED_ENV: &str = "HERMIT_RACE_PROBE_SEED";
+
+/// The directory whose files release held points (`point=hold`).
+pub const RACE_PROBE_HOLD_DIR_ENV: &str = "HERMIT_RACE_PROBE_HOLD_DIR";
+
+/// How often a held visit looks for its release file.
+const HOLD_POLL: Duration = Duration::from_millis(10);
 
 /// An async wait just before a backgrounded blocking call runs.
 pub(crate) const BG_PRE_CALL: &str = "bg_pre_call";
@@ -74,6 +88,8 @@ struct Spec {
     lo_ms: u64,
     hi_ms: u64,
     probability: f64,
+    /// Every visit waits for the point's release file (`point=hold`).
+    hold: bool,
 }
 
 #[derive(Debug)]
@@ -81,6 +97,16 @@ struct Probes {
     seed: u64,
     counter: AtomicU64,
     points: BTreeMap<String, Spec>,
+    hold_dir: Option<PathBuf>,
+}
+
+/// What a perturbed visit does.
+#[derive(Clone, Debug, PartialEq)]
+enum Perturbation {
+    /// An async point waits this long; a synchronous point takes its branch.
+    Wait(Duration),
+    /// An async point waits until this file exists.
+    Hold(PathBuf),
 }
 
 fn parse_item(item: &str) -> Result<(String, Spec), String> {
@@ -89,6 +115,17 @@ fn parse_item(item: &str) -> Result<(String, Spec), String> {
         .ok_or_else(|| format!("{item:?} is not point=LO[-HI][@P]"))?;
     if !POINTS.contains(&name) {
         return Err(format!("unknown point {name:?}; points are {POINTS:?}"));
+    }
+    if rest == "hold" {
+        return Ok((
+            name.to_owned(),
+            Spec {
+                lo_ms: 0,
+                hi_ms: 0,
+                probability: 1.0,
+                hold: true,
+            },
+        ));
     }
     let (range, probability) = match rest.split_once('@') {
         Some((range, p)) => (
@@ -120,15 +157,22 @@ fn parse_item(item: &str) -> Result<(String, Spec), String> {
             lo_ms,
             hi_ms,
             probability,
+            hold: false,
         },
     ))
 }
 
 impl Probes {
-    /// The probes `config` and `seed` (the two variables' values) describe:
-    /// `None` when probes are off. A malformed item is reported and skipped.
-    fn from_settings(config: Option<&str>, seed: Option<&str>) -> Option<Self> {
+    /// The probes `config`, `seed` and `hold_dir` (the three variables'
+    /// values) describe: `None` when probes are off. A malformed item is
+    /// reported and skipped, as is a hold without a hold directory.
+    fn from_settings(
+        config: Option<&str>,
+        seed: Option<&str>,
+        hold_dir: Option<&str>,
+    ) -> Option<Self> {
         let config = config?;
+        let hold_dir = hold_dir.filter(|dir| !dir.is_empty()).map(PathBuf::from);
         // A disabled probe must not create randomized hash state: even an
         // empty HashMap initializes RandomState's thread-local random keys.
         // These few exact names need no hashing, and insert still makes the
@@ -136,6 +180,11 @@ impl Probes {
         let mut points = BTreeMap::new();
         for item in config.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             match parse_item(item) {
+                Ok((_, spec)) if spec.hold && hold_dir.is_none() => {
+                    eprintln!(
+                        "race_probe: ignoring {item:?}: {RACE_PROBE_HOLD_DIR_ENV} is not set"
+                    );
+                }
                 Ok((name, spec)) => {
                     points.insert(name, spec);
                 }
@@ -158,13 +207,18 @@ impl Probes {
             seed,
             counter: AtomicU64::new(0),
             points,
+            hold_dir,
         })
     }
 
     /// The decision at `point` for this visit: `None` when the point is not
-    /// configured or this visit is not perturbed, otherwise the wait.
-    fn choose(&self, point: &str) -> Option<Duration> {
+    /// configured or this visit is not perturbed, otherwise what it does.
+    fn choose(&self, point: &str) -> Option<Perturbation> {
         let spec = self.points.get(point)?;
+        if spec.hold {
+            // Configured only with a hold directory (`from_settings`).
+            return Some(Perturbation::Hold(self.hold_dir.as_ref()?.join(point)));
+        }
         let visit = self.counter.fetch_add(1, Ordering::Relaxed);
         let r = splitmix(self.seed ^ splitmix(visit));
         let unit = (r >> 11) as f64 / (1u64 << 53) as f64;
@@ -178,7 +232,7 @@ impl Probes {
             } else {
                 splitmix(r) % (span + 1)
             };
-        Some(Duration::from_millis(ms))
+        Some(Perturbation::Wait(Duration::from_millis(ms)))
     }
 }
 
@@ -188,7 +242,9 @@ fn probes() -> Option<&'static Probes> {
         .get_or_init(|| {
             let config = std::env::var(RACE_PROBE_ENV).ok()?;
             let seed = std::env::var(RACE_PROBE_SEED_ENV).ok();
-            let probes = Probes::from_settings(Some(&config), seed.as_deref())?;
+            let hold_dir = std::env::var(RACE_PROBE_HOLD_DIR_ENV).ok();
+            let probes =
+                Probes::from_settings(Some(&config), seed.as_deref(), hold_dir.as_deref())?;
             eprintln!(
                 "race_probe: {RACE_PROBE_ENV}={config} {RACE_PROBE_SEED_ENV}={}",
                 probes.seed
@@ -205,18 +261,32 @@ fn splitmix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn choose(point: &str) -> Option<Duration> {
-    let wait = probes()?.choose(point)?;
-    tracing::debug!(target: "race_probe", "race_probe: {point} perturbed ({wait:?})");
-    Some(wait)
+fn choose(point: &str) -> Option<Perturbation> {
+    let perturbation = probes()?.choose(point)?;
+    tracing::debug!(target: "race_probe", "race_probe: {point} perturbed ({perturbation:?})");
+    Some(perturbation)
 }
 
 /// An async wait at `point`, when configured.
 pub(crate) async fn delay(point: &str) {
-    if let Some(wait) = choose(point)
-        && !wait.is_zero()
-    {
-        tokio::time::sleep(wait).await;
+    match choose(point) {
+        Some(Perturbation::Wait(wait)) if !wait.is_zero() => tokio::time::sleep(wait).await,
+        Some(Perturbation::Hold(release)) => hold(point, &release).await,
+        _ => {}
+    }
+}
+
+/// Waits until `release` exists, saying so on stderr unless it already does.
+async fn hold(point: &str, release: &Path) {
+    if release.exists() {
+        return;
+    }
+    eprintln!(
+        "race_probe: {point} holding until {} exists",
+        release.display()
+    );
+    while !release.exists() {
+        tokio::time::sleep(HOLD_POLL).await;
     }
 }
 
@@ -233,11 +303,11 @@ mod tests {
     fn race_probes_are_off_unless_configured() {
         // Unset, empty, or naming no valid point: no probes, so every point
         // returns before drawing a decision.
-        assert!(Probes::from_settings(None, None).is_none());
-        assert!(Probes::from_settings(None, Some("7")).is_none());
-        assert!(Probes::from_settings(Some(""), Some("7")).is_none());
-        assert!(Probes::from_settings(Some(" , "), None).is_none());
-        assert!(Probes::from_settings(Some("no_such_point=5"), None).is_none());
+        assert!(Probes::from_settings(None, None, None).is_none());
+        assert!(Probes::from_settings(None, Some("7"), None).is_none());
+        assert!(Probes::from_settings(Some(""), Some("7"), None).is_none());
+        assert!(Probes::from_settings(Some(" , "), None, None).is_none());
+        assert!(Probes::from_settings(Some("no_such_point=5"), None, None).is_none());
         // This test process does not set the variable, so the process-wide
         // probes are off and no point perturbs.
         assert!(std::env::var_os(RACE_PROBE_ENV).is_none());
@@ -257,7 +327,8 @@ mod tests {
                 Spec {
                     lo_ms: 300,
                     hi_ms: 300,
-                    probability: 1.0
+                    probability: 1.0,
+                    hold: false,
                 }
             ))
         );
@@ -268,7 +339,8 @@ mod tests {
                 Spec {
                     lo_ms: 0,
                     hi_ms: 50,
-                    probability: 0.25
+                    probability: 0.25,
+                    hold: false,
                 }
             ))
         );
@@ -283,8 +355,12 @@ mod tests {
             assert!(parse_item(bad).is_err(), "{bad} parsed");
         }
         // A bad item is skipped, the good ones stay.
-        let probes =
-            Probes::from_settings(Some("bg_pre_call=x, bg_harvest_skip=0@0.5"), Some("1")).unwrap();
+        let probes = Probes::from_settings(
+            Some("bg_pre_call=x, bg_harvest_skip=0@0.5"),
+            Some("1"),
+            None,
+        )
+        .unwrap();
         assert_eq!(probes.points.len(), 1);
         assert!(probes.points.contains_key(BG_HARVEST_SKIP));
 
@@ -293,6 +369,7 @@ mod tests {
         let probes = Probes::from_settings(
             Some("bg_pre_call=10@0,bg_pre_call=20@1,bg_pre_call=x,bg_harvest_skip=0@0.5"),
             Some("7"),
+            None,
         )
         .unwrap();
         assert_eq!(probes.points.len(), 2);
@@ -302,15 +379,19 @@ mod tests {
                 lo_ms: 20,
                 hi_ms: 20,
                 probability: 1.0,
+                hold: false,
             })
         );
-        assert_eq!(probes.choose(BG_PRE_CALL), Some(Duration::from_millis(20)));
+        assert_eq!(
+            probes.choose(BG_PRE_CALL),
+            Some(Perturbation::Wait(Duration::from_millis(20)))
+        );
     }
 
     #[test]
     fn race_probe_choices_follow_probability_range_and_seed() {
         let draw = |config: &str, seed: &str, point: &str| {
-            let probes = Probes::from_settings(Some(config), Some(seed)).unwrap();
+            let probes = Probes::from_settings(Some(config), Some(seed), None).unwrap();
             (0..1000).map(|_| probes.choose(point)).collect::<Vec<_>>()
         };
         assert!(
@@ -321,7 +402,7 @@ mod tests {
         assert!(
             draw("bg_harvest_skip=0@1", "1", BG_HARVEST_SKIP)
                 .iter()
-                .all(|wait| *wait == Some(Duration::ZERO))
+                .all(|wait| *wait == Some(Perturbation::Wait(Duration::ZERO)))
         );
         // A point that is not configured never perturbs.
         assert!(
@@ -333,7 +414,8 @@ mod tests {
         let taken = half.iter().flatten().count();
         assert!((400..600).contains(&taken), "{taken} of 1000 at 0.5");
         assert!(half.iter().flatten().all(|wait| {
-            (Duration::from_millis(10)..=Duration::from_millis(20)).contains(wait)
+            matches!(wait, Perturbation::Wait(wait)
+                if (Duration::from_millis(10)..=Duration::from_millis(20)).contains(wait))
         }));
         // The same seed draws the same sequence; another seed does not.
         assert_eq!(half, draw("bg_pre_call=10-20@0.5", "3", BG_PRE_CALL));
@@ -342,8 +424,8 @@ mod tests {
         // Missing-point lookups must not consume a visit before the actual
         // seeded draws, including when configured points are interleaved.
         let config = Some("bg_pre_call=10-20@0.5,bg_harvest_skip=0@0.5");
-        let with_missing = Probes::from_settings(config, Some("3")).unwrap();
-        let direct = Probes::from_settings(config, Some("3")).unwrap();
+        let with_missing = Probes::from_settings(config, Some("3"), None).unwrap();
+        let direct = Probes::from_settings(config, Some("3"), None).unwrap();
         for _ in 0..1000 {
             assert_eq!(with_missing.choose("no_such_point"), None);
             assert_eq!(with_missing.choose(BG_POST_CALL), None);
@@ -353,5 +435,74 @@ mod tests {
                 direct.choose(BG_HARVEST_SKIP)
             );
         }
+    }
+
+    #[test]
+    fn a_hold_needs_a_hold_directory_and_names_its_release_file() {
+        assert_eq!(
+            parse_item("fifo_staging_mapped=hold"),
+            Ok((
+                FIFO_STAGING_MAPPED.to_owned(),
+                Spec {
+                    lo_ms: 0,
+                    hi_ms: 0,
+                    probability: 1.0,
+                    hold: true,
+                }
+            ))
+        );
+        for bad in ["fifo_staging_mapped=hold@0.5", "fifo_staging_mapped=holds"] {
+            assert!(parse_item(bad).is_err(), "{bad} parsed");
+        }
+        // Without a directory the hold is skipped, and the other items stay.
+        let probes = Probes::from_settings(
+            Some("fifo_staging_mapped=hold,bg_harvest_skip=0"),
+            Some("1"),
+            None,
+        )
+        .unwrap();
+        assert!(!probes.points.contains_key(FIFO_STAGING_MAPPED));
+        assert!(Probes::from_settings(Some("fifo_staging_mapped=hold"), None, Some("")).is_none());
+        // With one, every visit holds on the point's own file, and draws no
+        // visit from the seeded sequence of the other points.
+        let config = Some("fifo_staging_mapped=hold,fifo_staging_reclaim=hold,bg_pre_call=1-9@0.5");
+        let holding = Probes::from_settings(config, Some("5"), Some("/hold")).unwrap();
+        let direct = Probes::from_settings(Some("bg_pre_call=1-9@0.5"), Some("5"), None).unwrap();
+        for _ in 0..100 {
+            assert_eq!(
+                holding.choose(FIFO_STAGING_MAPPED),
+                Some(Perturbation::Hold(PathBuf::from(
+                    "/hold/fifo_staging_mapped"
+                )))
+            );
+            assert_eq!(
+                holding.choose(FIFO_STAGING_RECLAIM),
+                Some(Perturbation::Hold(PathBuf::from(
+                    "/hold/fifo_staging_reclaim"
+                )))
+            );
+            assert_eq!(holding.choose(BG_PRE_CALL), direct.choose(BG_PRE_CALL));
+        }
+    }
+
+    /// A held visit returns only once its release file exists, and at once
+    /// when it already does.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_visit_waits_for_its_release_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join(FIFO_STAGING_MAPPED);
+        let mut held = Box::pin(hold(FIFO_STAGING_MAPPED, &release));
+        // A minute of (paused, auto-advancing) time does not release it.
+        tokio::select! {
+            _ = &mut held => panic!("released before its file existed"),
+            _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+        }
+        std::fs::write(&release, b"").unwrap();
+        tokio::time::timeout(Duration::from_secs(1), held)
+            .await
+            .expect("released once its file exists");
+        tokio::time::timeout(Duration::ZERO, hold(FIFO_STAGING_MAPPED, &release))
+            .await
+            .expect("an existing file releases at once");
     }
 }

@@ -24,12 +24,21 @@ HERMIT_RACE_PROBE=bg_harvest_skip=0@0.5 HERMIT_RACE_PROBE_SEED=7 \
   points ignore it; write `0`.
 - `@P` is the probability, in `[0, 1]`, that one visit to the point is perturbed. It
   defaults to 1.
+- `point=hold` instead makes every visit to an async point wait, with no time
+  limit, until a file named `point` exists in the directory
+  `HERMIT_RACE_PROBE_HOLD_DIR` names. A held visit prints
+  `race_probe: point holding until DIR/point exists` to Hermit's stderr. A test
+  can then act on the task while it is known to be at the point (kill it, for
+  example) and create the file to let it go on. A hold without that variable is
+  reported and skipped.
 - An item naming an unknown point, or one that does not parse, is reported on stderr
   and skipped.
 
 `HERMIT_RACE_PROBE_SEED` (a `u64`) fixes the choices. Without it a seed is drawn
 from the host clock. Either way Hermit prints one line to its stderr on the first
-visit to a configured point, so a failing run names its seed:
+visit to any point, configured or not, so a failing run names its seed. The line
+says that probes are on, not that a configured point was reached; a test that
+must act at a point uses `hold` and waits for its holding line:
 
 ```text
 race_probe: HERMIT_RACE_PROBE=bg_harvest_skip=0@0.5 HERMIT_RACE_PROBE_SEED=7
@@ -37,8 +46,8 @@ race_probe: HERMIT_RACE_PROBE=bg_harvest_skip=0@0.5 HERMIT_RACE_PROBE_SEED=7
 
 Each perturbed visit is also logged at DEBUG under the `race_probe` target.
 
-Neither variable reaches the guest. Under the default `--base-env=host`, Hermit
-removes both from the guest's environment, as it does for its own
+None of the variables reaches the guest. Under the default `--base-env=host`,
+Hermit removes all three from the guest's environment, as it does for its own
 `HERMIT_VERIFY_TMPDIR`. So turning probes on changes no guest-visible input.
 
 ## The points

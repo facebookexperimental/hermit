@@ -40662,6 +40662,16 @@ fn a_blocking_fifo_open_completes_for_a_guest_that_cannot_reach_the_tracer() {
 /// completes on the FIFO (Claude's LOW-C at revision 5, LOW-H at revision 6).
 #[test]
 fn a_blocking_fifo_open_leaves_nothing_in_the_guest() {
+    /// Releases every race-probe hold when dropped, so a failed assertion
+    /// cannot leave a Hermit waiting at a probe for good.
+    struct ReleaseHolds<'a>(&'a Path);
+    impl Drop for ReleaseHolds<'_> {
+        fn drop(&mut self) {
+            for point in ["fifo_staging_mapped", "fifo_staging_reclaim"] {
+                let _ = fs::write(self.0.join(point), b"");
+            }
+        }
+    }
     let guest = fifo_peer_guest().to_str().unwrap();
     let scratch = process_build_root("fifo-peer").join("open-leaves-nothing-runs");
     for (mode, expected) in [
@@ -40702,8 +40712,10 @@ fn a_blocking_fifo_open_leaves_nothing_in_the_guest() {
     // The kill comes from the host, once the child waits in the kernel's
     // FIFO open, or (under the `fifo_staging_mapped` race probe) once the
     // staging page is mapped and still empty, as a kill during its `mmap`
-    // leaves it (Codex re-check at revision 6, P2). These runs are not
-    // verified.
+    // leaves it (Codex re-check at revision 6, P2). The probe holds the
+    // child there until the test has killed it and released the hold, so the
+    // kill lands in that window however loaded the host is. These runs are
+    // not verified.
     for (mode, probe, expected) in [
         (
             "open-killed-beside-a-sharer",
@@ -40717,7 +40729,7 @@ fn a_blocking_fifo_open_leaves_nothing_in_the_guest() {
         ),
         (
             "open-killed-beside-a-sharer",
-            Some("fifo_staging_mapped=3000"),
+            Some("fifo_staging_mapped=hold"),
             "child killed by signal 9; maps unchanged: 1\n",
         ),
     ] {
@@ -40729,9 +40741,15 @@ fn a_blocking_fifo_open_leaves_nothing_in_the_guest() {
         // The log goes to a file: a pipe nobody reads while the test waits
         // would fill and stop Hermit.
         let log_path = scratch.join(format!("{mode}-{}.log", probe.is_some()));
+        let hold_dir = scratch.join(format!("{mode}-hold"));
+        let _ = fs::remove_dir_all(&hold_dir);
+        fs::create_dir_all(&hold_dir).expect("failed to create the hold directory");
+        let _release = ReleaseHolds(&hold_dir);
         let mut command = hermit_command(&args);
         if let Some(probe) = probe {
-            command.env("HERMIT_RACE_PROBE", probe);
+            command
+                .env("HERMIT_RACE_PROBE", probe)
+                .env("HERMIT_RACE_PROBE_HOLD_DIR", &hold_dir);
         }
         let mut child = command
             .stdin(Stdio::null())
@@ -40754,8 +40772,8 @@ fn a_blocking_fifo_open_leaves_nothing_in_the_guest() {
                 let ready = match probe {
                     None => fs::read_to_string(proc_dir.join("wchan"))
                         .is_ok_and(|wchan| wchan == "wait_for_partner"),
-                    // The guest whose parent is the guest, once the probe is
-                    // reached.
+                    // The guest whose parent is the guest, once the probe
+                    // holds it.
                     Some(_) => {
                         fs::read_to_string(proc_dir.join("stat"))
                             .ok()
@@ -40764,14 +40782,18 @@ fn a_blocking_fifo_open_leaves_nothing_in_the_guest() {
                                 Some(Path::new("/proc").join(parent))
                             })
                             .is_some_and(|parent| is_guest(&parent))
-                            && fs::read_to_string(&log_path)
-                                .is_ok_and(|log| log.contains("race_probe: HERMIT_RACE_PROBE="))
+                            && fs::read_to_string(&log_path).is_ok_and(|log| {
+                                log.contains("race_probe: fifo_staging_mapped holding until")
+                            })
                     }
                 };
                 if is_guest(&proc_dir) && ready {
                     // SAFETY: kill takes no pointers; the target is the guest
                     // child this test found waiting in the kernel.
                     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+                    // The kill is pending once kill(2) returns: the held
+                    // task runs no further guest code.
+                    fs::write(hold_dir.join("fifo_staging_mapped"), b"").expect("release the hold");
                     killed = true;
                     break;
                 }
@@ -40803,6 +40825,8 @@ fn a_blocking_fifo_open_leaves_nothing_in_the_guest() {
     // reclaims: the page passes to the next task (Codex re-check at revision
     // 7, P2). Two `CLONE_VM` children, named by their command names: the
     // opener is killed with its page mapped, the cleaner before its unmap.
+    // Each is held at its point until the test has killed it and released
+    // the hold.
     let mode = "open-killed-then-its-cleaner-killed";
     let dir = scratch.join(mode);
     let _ = fs::remove_dir_all(&dir);
@@ -40810,11 +40834,16 @@ fn a_blocking_fifo_open_leaves_nothing_in_the_guest() {
     let dir = dir.to_str().unwrap().to_owned();
     let args = ["--log", "info", "run", "--strict", "--", guest, mode, &dir];
     let log_path = scratch.join(format!("{mode}.log"));
+    let hold_dir = scratch.join(format!("{mode}-hold"));
+    let _ = fs::remove_dir_all(&hold_dir);
+    fs::create_dir_all(&hold_dir).expect("failed to create the hold directory");
+    let _release = ReleaseHolds(&hold_dir);
     let mut child = hermit_command(&args)
         .env(
             "HERMIT_RACE_PROBE",
-            "fifo_staging_mapped=3000,fifo_staging_reclaim=3000",
+            "fifo_staging_mapped=hold,fifo_staging_reclaim=hold",
         )
+        .env("HERMIT_RACE_PROBE_HOLD_DIR", &hold_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(fs::File::create(&log_path).expect("create the log file"))
@@ -40839,19 +40868,21 @@ fn a_blocking_fifo_open_leaves_nothing_in_the_guest() {
         false
     };
     let mut stages = [
-        ("race_probe: HERMIT_RACE_PROBE=", "opener"),
-        (
-            "unmapping a FIFO open's path page that a killed task left",
-            "cleaner",
-        ),
+        ("fifo_staging_mapped", "opener"),
+        ("fifo_staging_reclaim", "cleaner"),
     ]
     .into_iter()
     .peekable();
     let deadline = Instant::now() + Duration::from_secs(30);
-    while let Some((marker, name)) = stages.peek().copied()
+    while let Some((point, name)) = stages.peek().copied()
         && Instant::now() < deadline
     {
-        if fs::read_to_string(&log_path).is_ok_and(|log| log.contains(marker)) && kill_named(name) {
+        let marker = format!("race_probe: {point} holding until");
+        if fs::read_to_string(&log_path).is_ok_and(|log| log.contains(&marker)) && kill_named(name)
+        {
+            // The kill is pending once kill(2) returns: the held task runs
+            // no further guest code.
+            fs::write(hold_dir.join(point), b"").expect("release the hold");
             stages.next();
         }
         thread::sleep(Duration::from_millis(20));
@@ -40863,6 +40894,10 @@ fn a_blocking_fifo_open_leaves_nothing_in_the_guest() {
     let output = child.wait_with_output().expect("wait for hermit");
     let log = fs::read_to_string(&log_path).unwrap_or_default();
     assert!(killed_both, "{args:?}: a stage was never reached:\n{log}");
+    assert!(
+        log.contains("unmapping a FIFO open's path page that a killed task left"),
+        "{args:?}: no reclaim of the killed open's page in:\n{log}"
+    );
     assert!(
         output.status.success(),
         "{args:?}: {:?}\n{log}",
