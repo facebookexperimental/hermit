@@ -731,7 +731,15 @@ impl RecordVersion {
 // beneath it (RESOLVE_BENEATH | RESOLVE_NO_XDEV), that entry's fstat, the
 // reads and two closes, where an older recording holds one openat of
 // /proc/thread-self/fdinfo/<fd>, so it would replay out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x176);
+// 0x176 -> 0x177 (reserved as 0x175; taken at land time as HIGHEST_SHIPPED + 1
+// after 0x176 shipped first): record/replay retains ptrace's actual
+// timer-delivery capability, so its stored Config and preemption.timer_enabled
+// summary report the supported mechanism. The shared timer gate preserves
+// capable ptrace arming and logical expiry, while timerless configurations no
+// longer issue physical arms/rearms or manufacture skid state. This
+// observable-behavior correction takes a new label even though the event
+// layout is unchanged.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x177);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -756,7 +764,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x176);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x176;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x177;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -952,6 +960,13 @@ impl Metadata {
 }
 
 pub fn record_or_replay_config(data: &Path) -> detcore::Config {
+    record_or_replay_config_with_timer_support(data, record_timer_support())
+}
+
+fn record_or_replay_config_with_timer_support(
+    data: &Path,
+    timer_support: Result<(), String>,
+) -> detcore::Config {
     // NOTE: Record and replay should use the exact same Detcore configuration.
     // Callers add the completed producer namespace's mountinfo order and
     // mount-ID assignment order after this common base is built, so replay
@@ -1127,10 +1142,9 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     }
     .with_backend(|backend| {
         backend.supports_blocked_wait_signal_interruption = true;
-        backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
     });
-    if let Err(reason) = record_timer_support() {
+    if let Err(reason) = timer_support {
         disable_timeslice_without_a_timer(&mut config, &reason);
     }
     config
@@ -1191,6 +1205,29 @@ mod tests {
             no_perf.contains("perf counters are not supported"),
             "{no_perf}"
         );
+        let supported = record_or_replay_config_with_timer_support(
+            Path::new("replay-data"),
+            timer_support_from(true, Ok(())),
+        );
+        assert_eq!(
+            supported.backend.delivers_preemption_timer_events,
+            <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities()
+                .delivers_preemption_timer_events,
+            "record and replay use ptrace's timer mechanism"
+        );
+        assert_eq!(
+            supported.max_timeslice,
+            detcore::Config::default().max_timeslice
+        );
+        assert!(supported.use_preemption_timer());
+        assert!(!supported.chaos);
+        for reason in [no_perf, no_profile] {
+            let unavailable =
+                record_or_replay_config_with_timer_support(Path::new("replay-data"), Err(reason));
+            assert_eq!(unavailable.max_timeslice, None);
+            assert!(!unavailable.use_preemption_timer());
+            assert_eq!(unavailable.backend, supported.backend);
+        }
         let mut config = detcore::Config::default();
         assert!(config.max_timeslice.is_some());
         disable_timeslice_without_a_timer(

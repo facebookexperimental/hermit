@@ -89,7 +89,7 @@ fn requires_cpuid_faulting(test: &str) -> bool {
 fn run(virtualize_cpuid: bool) {
     let (output, _) = detcore_testutils::test_fn_with_config::<Detcore, _>(
         move || guest(virtualize_cpuid),
-        config(virtualize_cpuid),
+        detcore_testutils::prepare_ptrace_timer_config(config(virtualize_cpuid)),
         true,
     )
     .unwrap();

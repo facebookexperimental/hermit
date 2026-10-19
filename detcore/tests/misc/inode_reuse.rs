@@ -325,7 +325,7 @@ fn removing_a_last_name_retires_its_number_and_nothing_else() {
     };
     let (output, state) = detcore_testutils::test_fn_with_config::<Detcore, _>(
         || removals_guest(&root),
-        config,
+        detcore_testutils::prepare_ptrace_timer_config(config),
         true,
     )
     .unwrap();
@@ -374,7 +374,7 @@ fn nothing_is_retired_without_sequentialized_threads() {
             ino_of_path(&path);
             std::fs::remove_file(&path).unwrap();
         },
-        config,
+        detcore_testutils::prepare_ptrace_timer_config(config),
         true,
     )
     .unwrap();
@@ -583,7 +583,7 @@ fn run_reuse_guest(reach: FirstReach) -> u64 {
         });
         let run = detcore_testutils::test_fn_with_config::<Detcore, _>(
             || reuse_guest(mount_point, fifos, reach),
-            config,
+            detcore_testutils::prepare_ptrace_timer_config(config),
             true,
         );
         // Ends the remount thread.

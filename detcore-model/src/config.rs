@@ -1212,6 +1212,13 @@ impl Config {
         }
     }
 
+    /// Whether configured preemption can use this backend's timer mechanism.
+    ///
+    /// This is independent of RCB accounting and does not certify a clock.
+    pub fn use_preemption_timer(&self) -> bool {
+        self.max_timeslice.is_some() && self.backend.delivers_preemption_timer_events
+    }
+
     /// Should we use RCB in computing logical time?
     ///
     /// The answer is NO either if `--no-rcb-time` is specified or if HW counters are disabled by

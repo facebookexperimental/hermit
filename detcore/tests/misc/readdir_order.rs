@@ -102,7 +102,7 @@ fn run_five_times_under<S: Sync>(setup: impl Fn() -> S, guest: impl Fn(&S) + Syn
         let value = setup();
         let (output, _state) = detcore_testutils::test_fn_with_config::<Detcore, _>(
             || guest(&value),
-            config.clone(),
+            detcore_testutils::prepare_ptrace_timer_config(config.clone()),
             true,
         )
         .unwrap_or_else(|error| panic!("readdir guest run {run} failed: {error:#}"));

@@ -53,8 +53,12 @@ fn under_detcore(guest: impl FnOnce() + Send) {
 /// Run `guest` under Detcore configured by `config` and require that it
 /// exits 0.
 fn under_detcore_with(config: Config, guest: impl FnOnce() + Send) {
-    let (output, _) =
-        detcore_testutils::test_fn_with_config::<Detcore, _>(guest, config, true).unwrap();
+    let (output, _) = detcore_testutils::test_fn_with_config::<Detcore, _>(
+        guest,
+        detcore_testutils::prepare_ptrace_timer_config(config),
+        true,
+    )
+    .unwrap();
     assert_eq!(
         output.status,
         ExitStatus::Exited(0),

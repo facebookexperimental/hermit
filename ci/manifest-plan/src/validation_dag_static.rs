@@ -2563,7 +2563,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +4 from 16eca47a: 2131.
     // And the five R2b-2 stage 3 private-SIGCHLD units (https://github.com/rrnewton/hermit/issues/4273): 2136, listed.
     // And the fdinfo procfs-anchor classification unit: 2137, freshly listed.
-    ("test.detcore_unit", 2137),
+    // And +4 from 83100c02: 2141.
+    ("test.detcore_unit", 2141),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4500,7 +4501,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +4 from 16eca47a: 2131.
     // And the same five R2b-2 stage 3 units: 2136, listed.
     // And the same fdinfo procfs-anchor unit: 2137, freshly listed.
-    ("test.detcore_unit_on_host", 2137),
+    // And +4 from 83100c02: 2141.
+    ("test.detcore_unit_on_host", 2141),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

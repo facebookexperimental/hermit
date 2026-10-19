@@ -292,7 +292,7 @@ mod mem_print_race {
     #[allow(dead_code)]
     pub fn detcore(cfg: &detcore::Config) {
         eprintln!("Running detcore test with {} chunks", CHUNKS);
-        let cfg = cfg.clone();
+        let cfg = detcore_testutils::prepare_ptrace_timer_config(cfg.clone());
         let (output, _state) = if cfg.sequentialize_threads {
             // Due to fair round-robin scheduling we interleave on almost every write.
             // There are some boundary conditions that prevent this from hitting exactly 2*CHUNKS:

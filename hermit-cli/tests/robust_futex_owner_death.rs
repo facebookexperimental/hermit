@@ -1576,11 +1576,13 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // deferred fdinfo refusal,
     // 0x173 a recorded private SIGCHLD ends a gated wait for R2b-2 stage 3 of
     // https://github.com/rrnewton/hermit/issues/4273, re-landed,
-    // 0x176 the fdinfo read through an anchor proved to be procfs),
+    // 0x176 the fdinfo read through an anchor proved to be procfs, and
+    // 0x177 truthful timer capability and physical-arm separation, reserved
+    // as 0x175 and taken at land as HIGHEST_SHIPPED + 1),
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x176,
+        metadata["version"], 0x177,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);

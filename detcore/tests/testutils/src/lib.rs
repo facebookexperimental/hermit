@@ -82,6 +82,16 @@ struct DetTestState {
     test_run_num: u64,
 }
 
+/// Bind the timer mechanism provided by the ptrace launcher used by these tests.
+/// Keep each test's configured maximum (including `None`) and every other
+/// backend fact unchanged; the generic helpers also serve non-Detcore tools.
+pub fn prepare_ptrace_timer_config(mut config: Config) -> Config {
+    config.backend.delivers_preemption_timer_events =
+        <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities()
+            .delivers_preemption_timer_events;
+    config
+}
+
 static DEFAULT_CFG: LazyLock<Config> = LazyLock::new(Default::default);
 
 /// Standardized test config: all options off.
@@ -181,7 +191,6 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
     }
     .with_backend(|backend| {
         backend.supports_blocked_wait_signal_interruption = false;
-        backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
     })
 });
@@ -283,7 +292,6 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
     }
     .with_backend(|backend| {
         backend.supports_blocked_wait_signal_interruption = false;
-        backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
     })
 });
@@ -385,7 +393,6 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
     }
     .with_backend(|backend| {
         backend.supports_blocked_wait_signal_interruption = false;
-        backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
     })
 });
@@ -724,6 +731,7 @@ pub fn det_test_fn_with_config_repetitions<F, O>(
     O: Fn(&Output, <Detcore as Tool>::GlobalState),
 {
     assert!(repetitions > 0, "at least one test repetition is required");
+    let config = prepare_ptrace_timer_config(config);
     // Borrow the caller's values: only child-created configs/runtime/state are
     // consumed in children, and the caller drops its originals after the wait.
     run_function_test_driver(|| {
@@ -885,6 +893,7 @@ pub fn det_test_cmd_with_config<O>(program: &str, args: &[&str], oracle: O, conf
 where
     O: Fn(&Output, <Detcore as Tool>::GlobalState),
 {
+    let config = prepare_ptrace_timer_config(config);
     LazyLock::force(&GLOBAL_TEST_SUBSCRIBER);
     let mut dts = DetTestState::default();
     for _ in 1..(TEST_REPS - 1) {

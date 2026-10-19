@@ -1326,7 +1326,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// host-timed stop came, and no logical time is charged here, so the stop
     /// stays invisible to the schedule.
     fn keep_timer_across_dropped_signal<G: Guest<Self>>(&self, guest: &mut G) {
-        if self.cfg.max_timeslice.is_none() {
+        if !self.cfg.use_preemption_timer() {
             return;
         }
         let thread_state = guest.thread_state();
@@ -1620,26 +1620,33 @@ impl<T: RecordOrReplay> Detcore<T> {
                 );
             }
             assert!(rcbs_remaining > 0);
-            trace!(
-                "posthook [dtid {}] Resetting timer to {:?} RCBs in the future (current {})",
-                dettid,
-                rcbs_remaining,
-                guest.thread_state().thread_logical_time.rcbs()
-            );
-            {
-                let thread_state = guest.thread_state_mut();
-                thread_state.last_rcb_timer = Some(rcbs_remaining);
-                thread_state.last_rcb_timer_is_max = timer_is_max;
-            }
+            // The maximum also governs logical expiry and instruction traps.
+            // Delivery capability gates only the physical arm and its record.
+            if guest.config().use_preemption_timer() {
+                trace!(
+                    "posthook [dtid {}] Resetting timer to {:?} RCBs in the future (current {})",
+                    dettid,
+                    rcbs_remaining,
+                    guest.thread_state().thread_logical_time.rcbs()
+                );
+                {
+                    let thread_state = guest.thread_state_mut();
+                    thread_state.last_rcb_timer = Some(rcbs_remaining);
+                    thread_state.last_rcb_timer_is_max = timer_is_max;
+                }
 
-            if guest.config().imprecise_timers {
-                guest
-                    .set_timer(TimerSchedule::Rcbs(rcbs_remaining))
-                    .expect("Failed to set timer");
+                if guest.config().imprecise_timers {
+                    guest
+                        .set_timer(TimerSchedule::Rcbs(rcbs_remaining))
+                        .expect("Failed to set timer");
+                } else {
+                    guest
+                        .set_timer_precise(TimerSchedule::Rcbs(rcbs_remaining))
+                        .expect("Failed to set timer");
+                }
             } else {
-                guest
-                    .set_timer_precise(TimerSchedule::Rcbs(rcbs_remaining))
-                    .expect("Failed to set timer");
+                guest.thread_state_mut().last_rcb_timer = None;
+                guest.thread_state_mut().last_rcb_timer_is_max = false;
             }
         } else {
             assert!(guest.config().max_timeslice.is_none());

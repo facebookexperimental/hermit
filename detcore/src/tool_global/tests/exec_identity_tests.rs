@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::task::Poll;
@@ -205,6 +206,10 @@ impl Fixture {
     }
 
     async fn configured(retire_leader: bool) -> Self {
+        Self::configured_with_timer(retire_leader, false).await
+    }
+
+    async fn configured_with_timer(retire_leader: bool, delivers_timer: bool) -> Self {
         let config = Config {
             sequentialize_threads: true,
             max_timeslice: std::num::NonZeroU64::new(200_000_000),
@@ -212,6 +217,7 @@ impl Fixture {
         }
         .with_backend(|backend| {
             backend.needs_killed_thread_rpc_cancellation = false;
+            backend.delivers_preemption_timer_events = delivers_timer;
         });
         assert!(config.use_rcb_time());
         let state = GlobalState::initialize(&config, false);
@@ -1308,57 +1314,126 @@ async fn retired_exec_former_rpc_cannot_recreate_clock_or_account_twice() {
 
 #[tokio::test]
 async fn exec_continuation_applies_relative_grant_once_at_the_carried_current_clock() {
-    let fixture = Fixture::prepared().await;
-    let mut guest = fixture.guest(Gate::AfterCommit);
-    let duration = LogicalTime::from_nanos(1_000_000);
-    let now = guest.thread.thread_logical_time.as_nanos();
-    let old_deadline = fixture.before_tail + duration;
-    guest.thread.end_of_timeslice = Some(old_deadline);
-    guest.thread.max_timeslice_end = Some(old_deadline);
-    guest.thread.last_rcb_timer = Some(1_234);
-    let release = guest.rpc.release.clone();
-    {
-        let mut reconnect = Box::pin(super::super::reconnect_exec(&mut guest));
-        assert!(futures::poll!(&mut reconnect).is_pending());
-        // Scheduler replay tests separately prove how the cursor stages this
-        // duration. Here a real Go(Value) must reach the preserved local state.
-        fixture
-            .state
-            .sched
-            .lock()
-            .unwrap()
-            .timeslices
-            .insert(LEADER, Some(duration));
-        release.put(());
-        assert!(futures::poll!(&mut reconnect).is_pending());
-        let turn = crate::scheduler::do_a_turn_blocking(
-            fixture.state.sched.clone(),
-            fixture.state.global_time.clone(),
-            &Err(crate::scheduler::SkipTurn),
-        )
-        .await
-        .expect("replacement must receive its duration grant");
-        assert_eq!(turn.tid, LEADER);
-        assert_eq!(reconnect.await, Ok(()));
+    for delivers_timer in [true, false] {
+        for shorter_hint in [false, true] {
+            let fixture = Fixture::configured_with_timer(true, delivers_timer).await;
+            let mut guest = fixture.guest(Gate::AfterCommit);
+            let duration =
+                LogicalTime::from_nanos(if shorter_hint { 5_000_000 } else { 1_000_000 });
+            let now = guest.thread.thread_logical_time.as_nanos();
+            let old_deadline = fixture.before_tail + duration;
+            guest.thread.end_of_timeslice = Some(old_deadline);
+            guest.thread.max_timeslice_end = Some(old_deadline);
+            guest.thread.last_rcb_timer = delivers_timer.then_some(1_234);
+            let clock = serde_json::to_value(&guest.thread.thread_logical_time).unwrap();
+            let cpu = Arc::clone(&guest.thread.process_cpu_time);
+            let floor = Arc::clone(&guest.thread.guest_clock);
+            let cpu_before = serde_json::to_value(&*cpu.lock().unwrap()).unwrap();
+            let floor_before = serde_json::to_value(&*floor.lock().unwrap()).unwrap();
+            let mut expected_logical = now + duration;
+            let release = guest.rpc.release.clone();
+            {
+                let mut reconnect = Box::pin(super::super::reconnect_exec(&mut guest));
+                assert!(futures::poll!(&mut reconnect).is_pending());
+                // Scheduler replay tests separately prove how the cursor stages this
+                // duration. Here a real Go(Value) must reach the preserved local state.
+                fixture
+                    .state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .timeslices
+                    .insert(LEADER, Some(duration));
+                release.put(());
+                assert!(futures::poll!(&mut reconnect).is_pending());
+                assert!(futures::poll!(&mut reconnect).is_pending());
+                let alarm_deadline = if shorter_hint {
+                    // A real pending alarm makes the scheduler attach a shorter hint
+                    // to the actual grant. Do not fabricate WithDeadline or consume it.
+                    let global_now = fixture.state.global_time.lock().unwrap().as_nanos();
+                    let remaining = LogicalTime::from_nanos(2_000_000);
+                    assert_eq!(
+                        fixture.state.sched.lock().unwrap().register_alarm(
+                            PARENT,
+                            PARENT,
+                            global_now,
+                            remaining,
+                            LogicalTime::ZERO,
+                            Signal::SIGALRM,
+                        ),
+                        (LogicalTime::ZERO, LogicalTime::ZERO),
+                    );
+                    Some(global_now + remaining)
+                } else {
+                    None
+                };
+                let turn = crate::scheduler::do_a_turn_blocking(
+                    fixture.state.sched.clone(),
+                    fixture.state.global_time.clone(),
+                    &Err(crate::scheduler::SkipTurn),
+                )
+                .await
+                .expect("replacement must receive its duration grant");
+                assert_eq!(turn.tid, LEADER);
+                if let Some(deadline) = alarm_deadline {
+                    let committed = fixture.state.sched.lock().unwrap().committed_time;
+                    let remaining = deadline - committed;
+                    assert!(
+                        remaining
+                            > LogicalTime::from_nanos(
+                                fixture.state.cfg.scheduler_turn_charge().unwrap()
+                            )
+                    );
+                    assert!(remaining < duration);
+                    expected_logical = now + remaining;
+                }
+                assert_eq!(reconnect.await, Ok(()));
+            }
+            assert_eq!(guest.thread.dettid, LEADER);
+            assert_eq!(guest.thread.thread_logical_time.as_nanos(), now);
+            assert_eq!(guest.thread.end_of_timeslice, Some(expected_logical));
+            assert_eq!(guest.thread.last_grant_deadline, None);
+            assert_eq!(guest.thread.max_timeslice_end, Some(now + duration));
+            assert_ne!(guest.thread.end_of_timeslice, Some(old_deadline));
+            assert_ne!(guest.thread.end_of_timeslice, Some(old_deadline + duration));
+            assert_eq!(guest.thread.last_rcb_timer, delivers_timer.then_some(1_234));
+            assert_eq!(
+                serde_json::to_value(&guest.thread.thread_logical_time).unwrap(),
+                clock
+            );
+            assert!(Arc::ptr_eq(&cpu, &guest.thread.process_cpu_time));
+            assert!(Arc::ptr_eq(&floor, &guest.thread.guest_clock));
+            assert_eq!(
+                serde_json::to_value(&*cpu.lock().unwrap()).unwrap(),
+                cpu_before
+            );
+            assert_eq!(
+                serde_json::to_value(&*floor.lock().unwrap()).unwrap(),
+                floor_before
+            );
+            assert_eq!(
+                *guest.rpc.requests.lock().unwrap(),
+                vec![
+                    GlobalRequest::ReconnectExec {
+                        former: WORKER,
+                        process: LEADER
+                    },
+                    GlobalRequest::ResumeExec(LEADER)
+                ],
+            );
+            assert_eq!(fixture.state.sched.lock().unwrap().turn, 1);
+            assert!(
+                !fixture
+                    .state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .timeslices
+                    .contains_key(&LEADER)
+            );
+            fixture.assert_final_clock(LEADER);
+        }
     }
-    assert_eq!(guest.thread.dettid, LEADER);
-    assert_eq!(guest.thread.thread_logical_time.as_nanos(), now);
-    assert_eq!(guest.thread.end_of_timeslice, Some(now + duration));
-    assert_eq!(guest.thread.max_timeslice_end, Some(now + duration));
-    assert_ne!(guest.thread.end_of_timeslice, Some(old_deadline));
-    assert_ne!(guest.thread.end_of_timeslice, Some(old_deadline + duration));
-    assert_eq!(guest.thread.last_rcb_timer, Some(1_234));
-    assert_eq!(fixture.state.sched.lock().unwrap().turn, 1);
-    assert!(
-        !fixture
-            .state
-            .sched
-            .lock()
-            .unwrap()
-            .timeslices
-            .contains_key(&LEADER)
-    );
-    fixture.assert_final_clock(LEADER);
 }
 
 #[tokio::test]

@@ -24,8 +24,38 @@ use detcore::types::NANOS_PER_RCB;
 use detcore::types::NANOS_PER_SYSCALL;
 use reverie::Rdtsc;
 use reverie::RdtscResult;
-use reverie_ptrace::testing::check_fn_with_config;
-use reverie_ptrace::testing::test_fn_with_config;
+
+// Preserve Reverie's original single-run path while binding the ptrace timer
+// fact. Test policy and the helper's logging/allocation context stay unchanged.
+fn test_fn_with_config<T, F>(
+    f: F,
+    config: detcore::Config,
+    capture_output: bool,
+) -> Result<(reverie::process::Output, T::GlobalState), reverie::Error>
+where
+    T: reverie::Tool + 'static,
+    T::GlobalState: reverie::GlobalTool<Config = detcore::Config>,
+    F: FnOnce(),
+{
+    reverie_ptrace::testing::test_fn_with_config::<T, F>(
+        f,
+        detcore_testutils::prepare_ptrace_timer_config(config),
+        capture_output,
+    )
+}
+
+fn check_fn_with_config<T, F>(f: F, config: detcore::Config, capture_output: bool) -> T::GlobalState
+where
+    T: reverie::Tool + 'static,
+    T::GlobalState: reverie::GlobalTool<Config = detcore::Config>,
+    F: FnOnce(),
+{
+    reverie_ptrace::testing::check_fn_with_config::<T, F>(
+        f,
+        detcore_testutils::prepare_ptrace_timer_config(config),
+        capture_output,
+    )
+}
 
 // Keep this synchronized with the clock-query category in `syscall_time`.
 const NANOS_PER_CLOCK_GETTIME: f64 = 10_000.0;
