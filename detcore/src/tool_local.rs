@@ -3705,6 +3705,16 @@ fn default_timer_slack_ns() -> u64 {
     DEFAULT_TIMER_SLACK_NS
 }
 
+/// The most deliveries in a row that continue their thread's own
+/// `rt_sigreturn` (`ThreadState::consecutive_continuations`): as many as
+/// Linux has standard signals, so no set of signals pending when a run
+/// begins is cut short, as one pending behind another restarted the cycle
+/// <https://github.com/rrnewton/hermit/issues/4505> fixes (Claude re-check of
+/// https://github.com/rrnewton/hermit/pull/4509). Nothing else runs during
+/// such a run, so it can outgrow the cap only through signals the thread
+/// raises itself, which the cap then hands back to the other threads.
+pub(crate) const MAX_SIGRETURN_CONTINUATIONS: u8 = 32;
+
 /// The Detcore per-thread state.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ThreadState<T> {
@@ -4027,13 +4037,14 @@ pub struct ThreadState<T> {
     /// <https://github.com/rrnewton/hermit/issues/4505>).
     #[serde(default)]
     pub(crate) returned_from_sigreturn: bool,
-    /// Whether this thread's last scheduler request was a delivery marked
-    /// `Resources::continues_sigreturn`. A thread gets at most one such
-    /// continuation in a row: with no timeslice end (as under
+    /// How many of this thread's latest scheduler requests in a row were
+    /// deliveries marked `Resources::continues_sigreturn`; any other request
+    /// resets it. A delivery is marked only while it is below
+    /// [`MAX_SIGRETURN_CONTINUATIONS`]: with no timeslice end (as under
     /// `--max-timeslice=disabled`) nothing else would stop a handler that
     /// raises its own signal from holding the CPU for ever.
     #[serde(default)]
-    pub(crate) previous_request_continued: bool,
+    pub(crate) consecutive_continuations: u8,
 
     /// Thread state associated with record/replay.
     pub record_or_replay: T,
@@ -4741,7 +4752,7 @@ impl<T> ThreadState<T> {
             pipe_handoff_due: None,
             own_signal_turn_hold: None,
             returned_from_sigreturn: false,
-            previous_request_continued: false,
+            consecutive_continuations: 0,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
             // AUTONOMOUS-BOT-IMPLEMENTED

@@ -31383,6 +31383,35 @@ fn a_reader_signaled_until_joined_gets_past_its_handler() {
     }
 }
 
+/// The reader of `a_reader_signaled_until_joined_gets_past_its_handler` with
+/// two signals pending when a handler returns: its own 100 us POSIX timer
+/// (`repeat-join-timer`), or a sender that sends SIGUSR1 and SIGUSR2 each
+/// time (`repeat-join-two`). Each delivery after the first must continue
+/// the `rt_sigreturn` too; with at most one continuation in a row the second
+/// waited behind the sender, whose next turn sent again, and the guest gave
+/// up after 1000 signals (Claude re-check of
+/// https://github.com/rrnewton/hermit/pull/4509). In the default mode and
+/// with no timeslice. The expected line is the native run's.
+#[test]
+fn a_reader_with_two_signals_pending_at_each_return_gets_past_its_handler() {
+    let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
+    for mode in ["repeat-join-timer", "repeat-join-two"] {
+        for extra in [None, Some("--max-timeslice=disabled")] {
+            let mut args = vec!["run", "--strict", "--verify", "--verify-strict"];
+            args.extend(extra);
+            args.extend(["--", guest.as_str(), mode]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), "joined, handled 1\n", "{mode} {extra:?}");
+            let log = stderr(&output);
+            assert!(
+                log.contains(":: Success: deterministic. Determinism verified."),
+                "{mode} {extra:?}: verification failed:\n{log}"
+            );
+        }
+    }
+}
+
 /// A thread whose handler raises its own signal again takes the next one at
 /// every `rt_sigreturn`. Those deliveries continue its turn at most once in
 /// a row and only until its timeslice ends, so the main thread still runs,

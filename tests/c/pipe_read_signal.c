@@ -78,6 +78,14 @@
  *                  ended (https://github.com/rrnewton/hermit/issues/4505).
  *                  After REPEAT_LIMIT signals the main thread gives up,
  *                  releases the reader with a byte and says so.
+ *   repeat-join-timer  as repeat-join, and the reader also has its own
+ *                  POSIX timer that sends it SIGUSR2 every 100 us
+ *                  (SIGEV_THREAD_ID), so two signals can be pending when a
+ *                  handler returns.
+ *   repeat-join-two    as repeat-join, sending SIGUSR1 and SIGUSR2 each time.
+ *                  With two signals pending at one rt_sigreturn, the second
+ *                  must not wait behind the sender either (Claude re-check of
+ *                  https://github.com/rrnewton/hermit/pull/4509).
  *   repeat-join-spin  as repeat-join with a handler that spins 1000
  *                  iterations, and the line names how many signals were sent.
  *                  Not a native comparison: under Hermit with
@@ -103,7 +111,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t handled;
@@ -267,6 +277,27 @@ static int repeat_mode(void) {
   return 0;
 }
 
+static volatile sig_atomic_t reader_timer;
+
+static void* timed_looping_reader(void* unused) {
+  struct sigevent event;
+  memset(&event, 0, sizeof(event));
+  event.sigev_notify = SIGEV_THREAD_ID;
+  event.sigev_signo = SIGUSR2;
+  event._sigev_un._tid = (pid_t)syscall(SYS_gettid);
+  timer_t timer;
+  if (timer_create(CLOCK_MONOTONIC, &event, &timer) != 0) {
+    fail("timer_create");
+  }
+  struct itimerspec period = {{0, 100000}, {0, 100000}};
+  if (timer_settime(timer, 0, &period, NULL) != 0) {
+    fail("timer_settime");
+  }
+  looping_reader(unused);
+  timer_delete(timer);
+  return NULL;
+}
+
 static void spinning_handler(int signal) {
   (void)signal;
   for (volatile int i = 0; i < 1000; i++) {
@@ -274,10 +305,22 @@ static void spinning_handler(int signal) {
   handled++;
 }
 
-static int repeat_join_mode(int spin) {
-  install(0, spin ? spinning_handler : handler);
+enum repeat_join_kind { JOIN_PLAIN, JOIN_SPIN, JOIN_TIMER, JOIN_TWO };
+
+static int repeat_join_mode(enum repeat_join_kind kind) {
+  install(0, kind == JOIN_SPIN ? spinning_handler : handler);
+  if (kind == JOIN_TIMER || kind == JOIN_TWO) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handler;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGUSR2, &sa, NULL) != 0) {
+      fail("sigaction");
+    }
+  }
   pthread_t thread;
-  if (pthread_create(&thread, NULL, looping_reader, NULL) != 0) {
+  if (pthread_create(&thread, NULL, kind == JOIN_TIMER ? timed_looping_reader : looping_reader,
+                     NULL) != 0) {
     fail("pthread_create");
   }
   await_ready();
@@ -292,6 +335,9 @@ static int repeat_join_mode(int spin) {
     }
     /* A reader that has exited but is not yet joined is not an error. */
     (void)pthread_kill(thread, SIGUSR1);
+    if (kind == JOIN_TWO) {
+      (void)pthread_kill(thread, SIGUSR2);
+    }
     sent++;
     struct timespec pause = {0, 100000};
     nanosleep(&pause, NULL);
@@ -303,7 +349,7 @@ static int repeat_join_mode(int spin) {
       fail("pthread_join");
     }
   }
-  if (spin) {
+  if (kind == JOIN_SPIN) {
     printf("joined after %d signals, handled %d\n", sent, handled > 0);
   } else {
     printf("joined, handled %d\n", handled > 0);
@@ -596,7 +642,7 @@ int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(stderr,
             "usage: %s eintr|restart|ignored|blocked|ready|eof|ready2|cancel|process|write-zero|write-room|write-partial|"
-            "write-partial-blocked|write-partial-ignored|waitpid|repeat|repeat-join|repeat-join-spin|resignal\n",
+            "write-partial-blocked|write-partial-ignored|waitpid|repeat|repeat-join|repeat-join-timer|repeat-join-two|repeat-join-spin|resignal\n",
             argv[0]);
     return 2;
   }
@@ -621,10 +667,16 @@ int main(int argc, char** argv) {
     return repeat_mode();
   }
   if (strcmp(mode, "repeat-join") == 0) {
-    return repeat_join_mode(0);
+    return repeat_join_mode(JOIN_PLAIN);
+  }
+  if (strcmp(mode, "repeat-join-timer") == 0) {
+    return repeat_join_mode(JOIN_TIMER);
+  }
+  if (strcmp(mode, "repeat-join-two") == 0) {
+    return repeat_join_mode(JOIN_TWO);
   }
   if (strcmp(mode, "repeat-join-spin") == 0) {
-    return repeat_join_mode(1);
+    return repeat_join_mode(JOIN_SPIN);
   }
   if (strcmp(mode, "resignal") == 0) {
     return resignal_mode();
