@@ -6,7 +6,20 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::path::Path;
 use std::path::PathBuf;
+
+/// Resolve a guest program the way `execvp(3)` does, against this process's
+/// working directory: a name without a path separator stays a guest PATH
+/// lookup, while any other relative path becomes absolute, because the
+/// container replaces the working directory it would otherwise resolve against.
+fn absolutize_guest_program(guest_program: &Path, current_dir: &Path) -> PathBuf {
+    if guest_program.is_absolute() || guest_program.parent() == Some(Path::new("")) {
+        guest_program.to_owned()
+    } else {
+        current_dir.join(guest_program)
+    }
+}
 
 #[derive(Default)]
 pub struct HermitRunBuilder {
@@ -207,7 +220,14 @@ impl HermitRunBuilder {
 
         command_args.push(String::from("--"));
 
-        command_args.push(guest_program.display().to_string());
+        command_args.push(
+            match std::env::current_dir() {
+                Ok(current_dir) => absolutize_guest_program(&guest_program, &current_dir),
+                Err(_) => guest_program,
+            }
+            .display()
+            .to_string(),
+        );
 
         for guest_arg in guest_args.into_iter() {
             command_args.push(guest_arg);
@@ -263,6 +283,25 @@ mod test {
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn relative_guest_path_is_absolutized_while_bare_name_stays_a_path_lookup() {
+        let current_dir = Path::new("/re/workdir");
+        for (guest_program, expected) in [
+            ("hexdump", "hexdump"),
+            ("/bin/true", "/bin/true"),
+            (
+                "fbcode/hermetic_infra/hermit/tests/shell/devrand.sh",
+                "/re/workdir/fbcode/hermetic_infra/hermit/tests/shell/devrand.sh",
+            ),
+            ("./devrand.sh", "/re/workdir/./devrand.sh"),
+        ] {
+            assert_eq!(
+                absolutize_guest_program(Path::new(guest_program), current_dir),
+                PathBuf::from(expected)
+            );
+        }
     }
 
     #[test]
