@@ -1957,6 +1957,16 @@ pub struct Scheduler {
     /// (<https://github.com/rrnewton/hermit/issues/4121>).
     deadline_hints: BTreeMap<DetTid, Duration>,
 
+    /// The threads the scheduler resumed from a wait since their current
+    /// request arrived: granted a turn ([`Scheduler::unblock_guest`]), or a
+    /// parked wait resumed to observe a signal before its grant
+    /// (`ObserveSignal`, `parked.rs`). `GlobalState::receive_rpc` clears a
+    /// thread's mark when its request arrives and takes it with the reply,
+    /// which then tells the thread that it was handed to the scheduler and
+    /// resumed (`ThreadState::note_scheduler_handoff`), whatever the request
+    /// was.
+    granted: BTreeSet<DetTid>,
+
     /// Per-thread distribution of completed timeslice durations (virtual ns),
     /// collected from each thread as it deregisters at exit. Aggregated into the
     /// final run report. BTreeMap for deterministic iteration order.
@@ -4050,6 +4060,7 @@ impl Scheduler {
             priorities: Default::default(),
             timeslices: Default::default(),
             deadline_hints: Default::default(),
+            granted: Default::default(),
             per_thread_timeslice: Default::default(),
             per_thread_syscalls: Default::default(),
             transferred_exec_syscall_offsets: Default::default(),
@@ -10237,9 +10248,10 @@ impl Scheduler {
         }))
     }
 
-    /// The queued thread whose filed request is a signal delivery it reached
-    /// straight from its own `rt_sigreturn`, in a timeslice that stop did not
-    /// end (`Resources::continues_sigreturn`), if any, in run-queue order.
+    /// The queued thread whose filed request is a signal delivery that
+    /// continues its previous one (`Resources::continues_sigreturn`: no
+    /// scheduling point of the thread in between, in a timeslice that stop
+    /// did not end), if any, in run-queue order.
     /// Step 3 grants it before any other ordinary thread: Linux makes that
     /// delivery on the same return to user space as the `rt_sigreturn`,
     /// before any instruction of the interrupted code runs. Putting it behind
@@ -13930,6 +13942,7 @@ impl Scheduler {
             Some(remaining) => self.deadline_hints.insert(dtid, remaining),
             None => self.deadline_hints.remove(&dtid),
         };
+        self.granted.insert(dtid);
         self.parked.running = Some(dtid);
         resp.put(answer);
         Ok(())
@@ -14053,6 +14066,12 @@ impl Scheduler {
     /// while its own request was pending.
     pub fn take_deadline_hint(&mut self, dtid: DetTid) -> Option<Duration> {
         self.deadline_hints.remove(&dtid)
+    }
+
+    /// Whether `dtid` was granted a turn since its mark was last taken
+    /// ([`Self::granted`]), taking the mark.
+    pub fn take_grant(&mut self, dtid: DetTid) -> bool {
+        self.granted.remove(&dtid)
     }
 
     fn inbound_signals(&self, dettid: DetTid) -> Vec<SigWrapper> {
@@ -27607,7 +27626,7 @@ mod test {
         }
     }
 
-    /// A signal delivery a thread reached straight from its own `rt_sigreturn`
+    /// A signal delivery that continues the thread's previous one
     /// (`Resources::continues_sigreturn`), filed through `request_put`, is
     /// selected before a thread queued ahead of it; the same request without
     /// the mark waits its turn (https://github.com/rrnewton/hermit/issues/4505).

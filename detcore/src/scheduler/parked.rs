@@ -1430,6 +1430,10 @@ impl Scheduler {
         current.req = Ivar::new();
         current.resp = Ivar::new();
         self.runqueue_push_back(tid);
+        // The parked wait leaves the scheduler to observe the signal: other
+        // threads may have run since it parked, as at a grant
+        // (`Scheduler::granted`).
+        self.granted.insert(tid);
         turn.resp
             .put(SchedResponse::ObserveSignal(Box::new(control)));
         Ok(())

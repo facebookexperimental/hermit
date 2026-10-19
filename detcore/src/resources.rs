@@ -581,11 +581,15 @@ pub struct Resources {
     /// (<https://github.com/rrnewton/hermit/issues/4187>).
     #[serde(default)]
     pub(crate) decides_signal_interruption_itself: bool,
-    /// Set on an `InboundSignal` request whose signal stop the thread reached
-    /// straight from its own `rt_sigreturn`, in a timeslice that stop did not
-    /// end. Linux makes that delivery on the same return to user space, with
-    /// no instruction of the interrupted code in between, so step 3 grants it
-    /// before any other thread runs (`Scheduler::first_sigreturn_continuation`,
+    /// Set on an `InboundSignal` request whose signal stop came before the
+    /// thread's next hand-off to the scheduler since its previous handler's
+    /// delivery was granted (`ThreadState::delivered_since_request` and
+    /// `ThreadState::note_scheduler_handoff`), in a timeslice that
+    /// stop did not end, at most `MAX_SIGRETURN_CONTINUATIONS` times in a
+    /// row: typically the delivery Linux makes on the return from that
+    /// handler's `rt_sigreturn`, before any instruction of the interrupted
+    /// code. Step 3 grants it before any other thread runs
+    /// (`Scheduler::first_sigreturn_continuation`,
     /// <https://github.com/rrnewton/hermit/issues/4505>). Never set for
     /// `SIGCHLD`, whose delivery the host-async rules place.
     #[serde(default)]

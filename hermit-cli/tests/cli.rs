@@ -208,6 +208,7 @@ static RECEIVED_DIRECTORY_OPENAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DIRECTORY_SWAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STATX_MOUNT_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STATX_UNIQUE_MOUNT_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_HANDLER_TURN_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LISTINGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VIRTUAL_KERNEL_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -32205,31 +32206,229 @@ fn a_reader_with_two_signals_pending_at_each_return_gets_past_its_handler() {
     }
 }
 
+/// A reader whose handler calls `sched_yield` (pipe_read_signal
+/// `repeat-join-yield`) while the main thread re-signals it at every turn.
+/// The yield is a scheduler turn inside every handler, so the delivery made
+/// on the handler's return continues the reader only because the backend
+/// reported that `rt_sigreturn` (`ThreadState::returned_from_sigreturn`);
+/// the reader then gets past its handler at the main thread's next slice
+/// end. A 100 us target slice makes that quick (16 signals for the
+/// reproducer); without the report the main thread gave up after 1000
+/// signals, as it still does at the default slice even with it (https://github.com/rrnewton/hermit/issues/4505,
+/// https://github.com/rrnewton/hermit/pull/4510).
+#[test]
+fn a_reader_whose_handler_yields_gets_past_it_at_the_senders_slice_end() {
+    let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--target-timeslice=100000",
+        "--",
+        guest.as_str(),
+        "repeat-join-yield",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "joined, handled 1\n");
+    let log = stderr(&output);
+    assert!(
+        log.contains(":: Success: deterministic. Determinism verified."),
+        "verification failed:\n{log}"
+    );
+}
+
+/// A grant to a signal handler's thread (here a blocking futex wait, or the
+/// parent's continuation after a fork) is a hand-off to the scheduler, so the
+/// delivery made on the handler's return is an ordinary one
+/// (`ThreadState::note_scheduler_handoff`). Under `hermit record`, which reads
+/// no `rt_sigreturn` report, `futex_handler_turn wait` and `fork` then let the
+/// main thread's older `sched_yield` run first, and the second handler reads
+/// its publication (1, as natively). Both used to leave the window open and
+/// the delivery overtook it (0; Codex's reviews of
+/// https://github.com/rrnewton/hermit/pull/4510 at 9012f37e and ae195713).
+/// `nowait` is the positive control: a handler that makes no syscall still
+/// has the next delivery continue it (0).
+#[test]
+fn a_grant_inside_a_handler_ends_its_delivery_continuation_under_record() {
+    let guest = compiled_c_guest(&FUTEX_HANDLER_TURN_GUEST, "futex_handler_turn");
+    let guest = guest.to_str().unwrap();
+    for (mode, publication) in [("wait", 1), ("fork", 1), ("nowait", 0)] {
+        let args = [
+            "record",
+            "start",
+            "--verify",
+            "--verify-strict",
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            format!("futex-handler: a=1 b=1 order=ok publication={publication}\n"),
+            "{mode}"
+        );
+        let log = stderr(&output);
+        assert!(
+            log.contains("Success: replay matched recording."),
+            "{mode}: the replay must match the recording:\n{log}"
+        );
+    }
+}
+
+/// On KVM, which reads no `rt_sigreturn` report, a handler's `nanosleep`
+/// waits at a parked site; its grant is a hand-off to the scheduler like any
+/// other (`Scheduler::unblock_guest`), so `futex_handler_turn sleep` lets the
+/// main thread's older `sched_yield` run before the next delivery
+/// (publication 1, as natively), and the no-syscall `nowait` control still
+/// continues (0). Claude's review of
+/// https://github.com/rrnewton/hermit/pull/4510 at ae195713 found the parked
+/// path untested. In `alarm` the handler's parked sleep is resumed to observe
+/// a SIGALRM before its grant, whose handler then runs nested; that
+/// resumption is a hand-off too (1; it was 0 at 576cf05f, codex-sol's
+/// review).
+#[test]
+fn run_kvm_a_grant_inside_a_handler_ends_its_delivery_continuation() {
+    let test = "run_kvm_a_grant_inside_a_handler_ends_its_delivery_continuation";
+    if kvm_unavailable(test) {
+        return;
+    }
+    let guest = compiled_c_guest(&FUTEX_HANDLER_TURN_GUEST, "futex_handler_turn");
+    let guest = guest.to_str().unwrap();
+    for (mode, publication) in [("sleep", 1), ("alarm", 1), ("nowait", 0)] {
+        let args = [
+            "--backend",
+            "kvm",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            format!("futex-handler: a=1 b=1 order=ok publication={publication}\n"),
+            "{mode}"
+        );
+        let log = stderr(&output);
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "{mode}: verification failed:\n{log}"
+        );
+    }
+}
+
+/// The 4505 guests under `hermit record`: a reader signaled until it can be
+/// joined, with one or two signals pending at each handler return, and a
+/// handler that raises its own signal, each print the native line and
+/// replay to a match. Record never intercepted the guest's `rt_sigreturn`
+/// (its signal-state copy is off and it does not probe for an inherited
+/// seccomp filter, and either kept sigreturn reports off), so no delivery
+/// continued one and the reader gave up after 1000 signals (dh-3gj4l,
+/// follow-up of https://github.com/rrnewton/hermit/pull/4509).
+#[test]
+fn the_4505_signal_guests_get_past_their_handlers_under_record() {
+    let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
+    for (mode, expected) in [
+        ("repeat-join", "joined, handled 1\n"),
+        ("repeat-join-two", "joined, handled 1\n"),
+        ("resignal", "stopped, resignaled 1\n"),
+    ] {
+        let args = [
+            "record",
+            "start",
+            "--verify",
+            "--verify-strict",
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{mode}");
+        let log = stderr(&output);
+        assert!(
+            log.contains("Success: replay matched recording."),
+            "{mode}: the replay must match the recording:\n{log}"
+        );
+    }
+}
+
+/// The 4505 guests recorded and then replayed under gdb
+/// (`record start --verify-with-gdbex continue`), the default way to replay a
+/// recording. A gdbserver's replay gets no report of the guest's
+/// `rt_sigreturn` from the backend, so a continuation keyed to those reports
+/// was taken in the recording and not in the replay, which diverged (Claude
+/// review of https://github.com/rrnewton/hermit/pull/4510). Keyed to the
+/// thread's own scheduling points it is the same in both; each guest prints
+/// its native line and runs to its normal exit under gdb.
+#[test]
+fn the_4505_signal_guests_replay_under_gdb() {
+    let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
+    for (mode, expected) in [
+        ("repeat-join", "joined, handled 1\n"),
+        ("repeat-join-two", "joined, handled 1\n"),
+        ("resignal", "stopped, resignaled 1\n"),
+    ] {
+        let args = [
+            "record",
+            "start",
+            "--verify-with-gdbex",
+            "continue",
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let out = stdout(&output);
+        assert!(out.starts_with(expected), "{mode}: {out}");
+        assert!(out.contains("exited normally"), "{mode}: {out}");
+    }
+}
+
 /// A thread whose handler raises its own signal again takes the next one at
 /// every `rt_sigreturn`. Those deliveries continue its turn at most
 /// `MAX_SIGRETURN_CONTINUATIONS` (32) times in a row, so the main thread
 /// still runs, stops it and joins it, and the run verifies at bitwise parity
 /// (https://github.com/rrnewton/hermit/issues/4505). The cap is what bounds
-/// the run of deliveries in every mode: in the default mode no timeslice end
-/// interrupted it in practice either, and with no timeslice
+/// the run of deliveries in every mode: a `raise` takes no scheduler turn, no
+/// timeslice end interrupted the run in practice, and with no timeslice
 /// (`--max-timeslice=disabled`) there is none; without the cap this hung
-/// (Claude reviews of https://github.com/rrnewton/hermit/pull/4509). The
-/// expected line is the native run's.
+/// (Claude reviews of https://github.com/rrnewton/hermit/pull/4509). Also
+/// with a handler that makes a syscall first: `getpid`, which takes no turn
+/// (the deliveries still continue, up to the cap), and `sched_yield`, which
+/// does (the next delivery is an ordinary one; the difference from Linux the
+/// `delivered_since_request` doc states). The expected line is the native
+/// run's.
 #[test]
 fn a_handler_that_raises_its_own_signal_does_not_hold_the_cpu() {
     let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
-    for extra in [None, Some("--max-timeslice=disabled")] {
-        let mut args = vec!["run", "--strict", "--verify", "--verify-strict"];
-        args.extend(extra);
-        args.extend(["--", guest.as_str(), "resignal"]);
-        let output = hermit(&args);
-        assert_success(&output, &args);
-        assert_eq!(stdout(&output), "stopped, resignaled 1\n", "{extra:?}");
-        let log = stderr(&output);
-        assert!(
-            log.contains(":: Success: deterministic. Determinism verified."),
-            "{extra:?}: verification failed:\n{log}"
-        );
+    for mode in ["resignal", "resignal-getpid", "resignal-yield"] {
+        for extra in [None, Some("--max-timeslice=disabled")] {
+            let mut args = vec!["run", "--strict", "--verify", "--verify-strict"];
+            args.extend(extra);
+            args.extend(["--", guest.as_str(), mode]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(
+                stdout(&output),
+                "stopped, resignaled 1\n",
+                "{mode} {extra:?}"
+            );
+            let log = stderr(&output);
+            assert!(
+                log.contains(":: Success: deterministic. Determinism verified."),
+                "{mode} {extra:?}: verification failed:\n{log}"
+            );
+        }
     }
 }
 

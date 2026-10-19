@@ -620,6 +620,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/futex_handler_turn.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/futex_handler_turn.c is owned by hermit-cli/tests/cli.rs: the CLI test a_grant_inside_a_handler_ends_its_delivery_continuation_under_record records it in its wait, fork and nowait modes, and run_kvm_a_grant_inside_a_handler_ends_its_delivery_continuation runs its sleep, alarm and nowait modes on KVM; both require the second handler's publication to be 1 when the first handler blocked (FUTEX_WAIT, nanosleep) or forked (a scheduler grant ends the delivery continuation) and 0 when it made no syscall (https://github.com/rrnewton/hermit/pull/4510). It stays a fixture because the expected values are Hermit's scheduling policy under record, not a native comparison."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/futex_keyed_access.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/futex_keyed_access.c is owned by hermit-cli/tests/cli.rs: FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and FUTEX_WAKE_OP key and access their words as Linux does (counts before addresses, key-only words never read, NULL a valid private key, CMP_REQUEUE compared with guest permissions, WAKE_OP changing exactly four bytes or failing with EFAULT); the integration test requires every line to match native under run --strict (https://github.com/rrnewton/hermit/pull/4020)."

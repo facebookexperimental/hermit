@@ -92,12 +92,20 @@
  *                  --target-timeslice=1000 the handler ends the reader's
  *                  slice at a signal stop, and the count pins where that
  *                  delivery waits (https://github.com/rrnewton/hermit/issues/4505).
+ *   repeat-join-yield  as repeat-join with a handler that calls sched_yield
+ *                  before it notes the signal, which gives the main thread a
+ *                  turn inside every handler.
  *   resignal       not a read: a sibling raises SIGUSR1 at itself, and its
  *                  handler raises it again until the main thread, after a
  *                  1 ms sleep, tells it to stop. Every rt_sigreturn takes the
  *                  next signal at once; under Hermit those deliveries continue
  *                  the sibling's turn only until its timeslice ends, so the
  *                  main thread still runs and the program ends.
+ *   resignal-getpid  as resignal, the handler calling getpid before it raises
+ *                  the signal again: a syscall that takes no scheduler turn.
+ *   resignal-yield   as resignal, the handler calling sched_yield first: a
+ *                  syscall that takes a scheduler turn, so under Hermit the
+ *                  next delivery is not taken ahead of the other threads.
  *
  * Each mode prints one line per observation, which equals the native run's.
  */
@@ -107,6 +115,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -305,10 +314,18 @@ static void spinning_handler(int signal) {
   handled++;
 }
 
-enum repeat_join_kind { JOIN_PLAIN, JOIN_SPIN, JOIN_TIMER, JOIN_TWO };
+static void yielding_handler(int signal) {
+  (void)signal;
+  sched_yield();
+  handled++;
+}
+
+enum repeat_join_kind { JOIN_PLAIN, JOIN_SPIN, JOIN_TIMER, JOIN_TWO, JOIN_YIELD };
 
 static int repeat_join_mode(enum repeat_join_kind kind) {
-  install(0, kind == JOIN_SPIN ? spinning_handler : handler);
+  install(0, kind == JOIN_SPIN    ? spinning_handler
+             : kind == JOIN_YIELD ? yielding_handler
+                                  : handler);
   if (kind == JOIN_TIMER || kind == JOIN_TWO) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -360,9 +377,16 @@ static int repeat_join_mode(enum repeat_join_kind kind) {
 static volatile sig_atomic_t stop_resignal;
 static volatile sig_atomic_t resignals;
 
+static int resignal_syscall; /* 0 none, 1 getpid, 2 sched_yield */
+
 static void resignal_handler(int signal) {
   if (!stop_resignal) {
     resignals++;
+    if (resignal_syscall == 1) {
+      (void)getpid();
+    } else if (resignal_syscall == 2) {
+      sched_yield();
+    }
     raise(signal);
   }
 }
@@ -642,7 +666,7 @@ int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(stderr,
             "usage: %s eintr|restart|ignored|blocked|ready|eof|ready2|cancel|process|write-zero|write-room|write-partial|"
-            "write-partial-blocked|write-partial-ignored|waitpid|repeat|repeat-join|repeat-join-timer|repeat-join-two|repeat-join-spin|resignal\n",
+            "write-partial-blocked|write-partial-ignored|waitpid|repeat|repeat-join|repeat-join-timer|repeat-join-two|repeat-join-spin|repeat-join-yield|resignal|resignal-getpid|resignal-yield\n",
             argv[0]);
     return 2;
   }
@@ -678,7 +702,18 @@ int main(int argc, char** argv) {
   if (strcmp(mode, "repeat-join-spin") == 0) {
     return repeat_join_mode(JOIN_SPIN);
   }
+  if (strcmp(mode, "repeat-join-yield") == 0) {
+    return repeat_join_mode(JOIN_YIELD);
+  }
   if (strcmp(mode, "resignal") == 0) {
+    return resignal_mode();
+  }
+  if (strcmp(mode, "resignal-getpid") == 0) {
+    resignal_syscall = 1;
+    return resignal_mode();
+  }
+  if (strcmp(mode, "resignal-yield") == 0) {
+    resignal_syscall = 2;
     return resignal_mode();
   }
   if (strcmp(mode, "eintr") == 0 || strcmp(mode, "restart") == 0 ||

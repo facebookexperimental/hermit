@@ -2350,24 +2350,42 @@ impl GlobalTool for GlobalState {
         // Only a request whose reply resumes the thread from a grant, or arms
         // a timer, touches the hint: control messages sent on another task's
         // behalf must neither consume nor carry it.
-        if !resumes_from_grant(&gr.2) {
-            return self.dispatch_rpc(from, gr).await;
-        }
+        //
+        // Whether the scheduler resumed the thread from a wait while its
+        // request was pending rides on the reply too (`GlobalResponse::Granted`),
+        // whatever the request: the scheduler marks where it resumes a waiting
+        // thread (`Scheduler::granted`: a grant, or a parked wait resumed to
+        // observe a signal), so no request kind has to be listed for it. A
+        // request answered without either carries no mark.
         let dtid = DetTid::from_raw(from.as_raw());
-        self.sched.lock().unwrap().take_deadline_hint(dtid);
-        let (time, response) = self.dispatch_rpc(from, gr).await;
-        let hint = self.sched.lock().unwrap().take_deadline_hint(dtid);
-        match hint {
-            Some(remaining)
-                if response != GlobalResponse::ThreadExited
-                    && response != GlobalResponse::Retired =>
-            {
-                (
-                    time,
-                    GlobalResponse::WithDeadline(remaining, Box::new(response)),
-                )
+        self.sched.lock().unwrap().take_grant(dtid);
+        let (time, response) = if !resumes_from_grant(&gr.2) {
+            self.dispatch_rpc(from, gr).await
+        } else {
+            self.sched.lock().unwrap().take_deadline_hint(dtid);
+            let (time, response) = self.dispatch_rpc(from, gr).await;
+            let hint = self.sched.lock().unwrap().take_deadline_hint(dtid);
+            match hint {
+                Some(remaining)
+                    if response != GlobalResponse::ThreadExited
+                        && response != GlobalResponse::Retired =>
+                {
+                    (
+                        time,
+                        GlobalResponse::WithDeadline(remaining, Box::new(response)),
+                    )
+                }
+                _ => (time, response),
             }
-            _ => (time, response),
+        };
+        let granted = self.sched.lock().unwrap().take_grant(dtid);
+        if granted
+            && response != GlobalResponse::ThreadExited
+            && response != GlobalResponse::Retired
+        {
+            (time, GlobalResponse::Granted(Box::new(response)))
+        } else {
+            (time, response)
         }
     }
 }
@@ -6330,6 +6348,11 @@ pub enum GlobalResponse {
     /// armed a timer (`Scheduler::deadline_remaining_from`). Unwrapped by
     /// `send_and_update_time`, which caps the thread's slice there.
     WithDeadline(Duration, Box<GlobalResponse>),
+    /// A reply to a request while which the thread was granted a turn
+    /// (`Scheduler::take_grant`): other threads may have run since it was
+    /// sent. Unwrapped by `send_and_update_time`, which notes the hand-off
+    /// (`ThreadState::note_scheduler_handoff`).
+    Granted(Box<GlobalResponse>),
     RequestResources(ResumeStatus),
     ParkedRequest(ResourceReply),
     ResumeParkedRequest(ResourceReply),
@@ -7134,7 +7157,16 @@ where
     }
     let mytime = guest.thread_state().thread_logical_time.clone();
     let mm = guest.thread_state().mm_id;
+    let continues_sigreturn = request_continues_sigreturn(&request);
     let mut resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
+    // A grant while the request was pending is a hand-off to the scheduler,
+    // the one place every hand-off is noted (`ThreadState::note_scheduler_handoff`).
+    if let GlobalResponse::Granted(response) = resp.1 {
+        resp.1 = *response;
+        guest
+            .thread_state_mut()
+            .note_scheduler_handoff(continues_sigreturn);
+    }
     let deadline = match resp.1 {
         GlobalResponse::WithDeadline(remaining, response) => {
             resp.1 = *response;
@@ -7349,6 +7381,17 @@ async fn wait_for_process_exit(pidfd: std::os::fd::OwnedFd, valve: Duration) -> 
 /// whose replies carry a deadline hint
 /// (<https://github.com/rrnewton/hermit/issues/4121>). Every handler that
 /// awaits a grant is reached from one of these.
+/// Whether `request` is a signal delivery that continues the thread's previous
+/// one (`Resources::continues_sigreturn`), as an ordinary or a parked request.
+fn request_continues_sigreturn(request: &GlobalRequest) -> bool {
+    match request {
+        GlobalRequest::WithForwardedCount(_, request) => request_continues_sigreturn(request),
+        GlobalRequest::RequestResources(resources, _)
+        | GlobalRequest::ParkedRequest(resources, ..) => resources.continues_sigreturn,
+        _ => false,
+    }
+}
+
 fn resumes_from_grant(request: &GlobalRequest) -> bool {
     match request {
         GlobalRequest::WithForwardedCount(_, request) => resumes_from_grant(request),
@@ -7414,15 +7457,6 @@ where
     // Any turn of its own is a hand-off under `--pipe-wake-latency`: the
     // thread goes back behind the pollers it readied (`crate::pipe_wake`).
     guest.thread_state_mut().pipe_handoff_due = None;
-    // Count consecutive continuations; any other request, a turn in which
-    // other threads may run, starts the count again
-    // (`ThreadState::consecutive_continuations`).
-    let count = &mut guest.thread_state_mut().consecutive_continuations;
-    *count = if r.continues_sigreturn {
-        count.saturating_add(1)
-    } else {
-        0
-    };
     if guest.config().sequentialize_threads {
         if let Some(lease) = guest.signal_observation_lease() {
             if let Some(site) = guest.parked_signal_site() {
@@ -9633,6 +9667,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// `response` as `receive_rpc` returns it after a turn was granted
+    /// (`GlobalResponse::Granted`).
+    fn granted(response: super::GlobalResponse) -> super::GlobalResponse {
+        super::GlobalResponse::Granted(Box::new(response))
+    }
+
     /// A process reads its current image's vector; a forked child its
     /// creator's until it execs; an exec replaces it; a forgotten process
     /// (gone, or an exec with no recorded vector) has none.
@@ -13189,12 +13229,12 @@ mod tests {
         if child_first {
             assert_eq!(
                 startup.as_mut().await,
-                (None, GlobalResponse::StartNewThread(None))
+                (None, granted(GlobalResponse::StartNewThread(None)))
             );
         } else {
             assert_eq!(
                 registration.as_mut().await,
-                (None, GlobalResponse::CreateChildThread(None))
+                (None, granted(GlobalResponse::CreateChildThread(None)))
             );
         }
         let first_time = state.sched.lock().unwrap().committed_time;
@@ -13238,10 +13278,13 @@ mod tests {
         if child_first {
             assert_eq!(
                 registration.await,
-                (None, GlobalResponse::CreateChildThread(None))
+                (None, granted(GlobalResponse::CreateChildThread(None)))
             );
         } else {
-            assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
+            assert_eq!(
+                startup.await,
+                (None, granted(GlobalResponse::StartNewThread(None)))
+            );
         }
         let mut scheduler = state.sched.lock().unwrap();
         let next_time = scheduler.committed_time;
@@ -13294,7 +13337,10 @@ mod tests {
         assert!(background.is_err());
         assert_eq!(
             blocking.await,
-            (None, GlobalResponse::RequestResources(ResumeStatus::Normal))
+            (
+                None,
+                granted(GlobalResponse::RequestResources(ResumeStatus::Normal))
+            )
         );
         let before_child = state.global_time.lock().unwrap().as_nanos();
         assert_eq!(before_child, epoch + LogicalTime::from_nanos(1_001));
@@ -13343,7 +13389,10 @@ mod tests {
         .await
         .expect("vfork child must receive its first turn");
         assert_eq!(first.tid, child);
-        assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
+        assert_eq!(
+            startup.await,
+            (None, granted(GlobalResponse::StartNewThread(None)))
+        );
         assert_eq!(state.global_time.lock().unwrap().as_nanos(), before_child);
     }
 
@@ -13530,7 +13579,10 @@ mod tests {
         .await
         .expect("replacement leader must run");
         assert_eq!(first.tid, leader);
-        assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
+        assert_eq!(
+            startup.await,
+            (None, granted(GlobalResponse::StartNewThread(None)))
+        );
         assert_eq!(state.global_time.lock().unwrap().as_nanos(), total);
 
         fresh.advance_to(fresh.as_nanos() + LogicalTime::from_nanos(1));
@@ -14159,7 +14211,7 @@ mod tests {
             start_response,
             (
                 Some(worker_clock.as_nanos()),
-                GlobalResponse::StartNewThread(None)
+                granted(GlobalResponse::StartNewThread(None))
             )
         );
         {

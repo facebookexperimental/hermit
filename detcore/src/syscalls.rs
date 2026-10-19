@@ -48,6 +48,7 @@ pub(crate) use threads::KernelSignalState;
 pub(crate) use threads::default_action_ends_process;
 pub(crate) use threads::host_signal_state_reads_refused;
 pub(crate) use threads::ignored_at_generation;
+pub(crate) use threads::kernel_sigset_bit;
 pub(crate) use threads::read_kernel_signal_state;
 pub(crate) use threads::read_thread_signal_state;
 pub(crate) use threads::real_uid;

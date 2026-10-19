@@ -1383,6 +1383,22 @@ mod tests {
         assert!(!config.shutdown_on_unsupported_syscall);
     }
 
+    /// A recording, its autopilot replay and its gdb-served replay take the
+    /// same signal continuations only if none of them reads the backend's
+    /// `rt_sigreturn` reports, which a gdbserver turns off
+    /// (https://github.com/rrnewton/hermit/pull/4510).
+    #[test]
+    fn record_and_replay_never_read_sigreturn_reports() {
+        let record = record_or_replay_config(Path::new("replay-data"));
+        let mut replay = record.clone();
+        replay.replaying = true;
+        let mut gdb_replay = replay.clone();
+        gdb_replay.gdbserver = true;
+        for (name, config) in [("record", record), ("replay", replay), ("gdb", gdb_replay)] {
+            assert!(!detcore::observes_sigreturns(&config), "{name}");
+        }
+    }
+
     /// Record mode never hands the turn to a readied pipe poller, whatever
     /// the default (https://github.com/rrnewton/hermit/issues/4380).
     #[test]

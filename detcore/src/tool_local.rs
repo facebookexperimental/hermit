@@ -4147,14 +4147,69 @@ pub struct ThreadState<T> {
     /// maximum or in a timer callback (<https://github.com/rrnewton/hermit/issues/4034>).
     #[serde(default)]
     pub(crate) own_signal_turn_hold: Option<libc::c_int>,
-    /// Set when this thread's `rt_sigreturn` passes through, cleared by its
-    /// next event of any other kind (`pre_handler_hook`). A signal stop that
-    /// finds it set is the thread's first Detcore event since that
-    /// `rt_sigreturn`: usually the delivery Linux makes on that same return
-    /// to user space of a signal the restored mask unblocks, and otherwise a
-    /// fault or host signal its user code met with no intercepted event in
-    /// between (`Resources::continues_sigreturn`,
-    /// <https://github.com/rrnewton/hermit/issues/4505>).
+    /// Set when one of this thread's signal deliveries that runs a handler is
+    /// granted (`delivery_runs_handler`), cleared at the thread's next
+    /// grant by the scheduler, whatever request it came through
+    /// (`note_scheduler_handoff`). A signal stop that finds it set
+    /// comes before this thread made any scheduling point since that
+    /// delivery: in particular the
+    /// delivery Linux makes, on the return from that handler's
+    /// `rt_sigreturn`, of a signal the restored mask unblocks, or a second
+    /// delivery on the same return to user space. Its turn continues this
+    /// thread's (`Resources::continues_sigreturn`,
+    /// <https://github.com/rrnewton/hermit/issues/4505>). It needs no report
+    /// of the `rt_sigreturn` itself, so a recording and every replay of it
+    /// (one a gdbserver serves too, where the backend reports no sigreturn)
+    /// mark the same deliveries. Where the reports are reliable, a run also
+    /// continues after a reported `rt_sigreturn` (`returned_from_sigreturn`).
+    ///
+    /// Where this differs from Linux. On Linux a signal the restored mask
+    /// unblocks is delivered on the return from `rt_sigreturn`
+    /// (`SYSCALL_DEFINE0(rt_sigreturn)`, v6.12 arch/x86/kernel/signal_64.c:246)
+    /// by `arch_do_signal_or_restart` (arch/x86/kernel/signal.c:333, called
+    /// from kernel/entry/common.c:111) whatever the handler did before it
+    /// returned. Under `hermit record` and every replay, where no report is
+    /// read, a handler that took a scheduler turn (a syscall that files a
+    /// scheduler request, such as `sched_yield` or a write to a device;
+    /// `getpid` files none) makes its next delivery an ordinary one, which
+    /// waits behind the other runnable threads. The guest can observe which
+    /// thread runs next: a sibling may run, and read or write shared memory,
+    /// between the handler's return and that delivery, and a thread whose
+    /// handler yields while a sibling re-signals it at every turn progresses
+    /// only as fast as it did before continuations existed. It cannot observe
+    /// a different signal, mask, handler, `siginfo` or restart decision: the
+    /// delivery is still made before the thread runs any code of its own, as
+    /// if the thread were preempted at the rescheduling point that precedes
+    /// signal work on the same exit (common.c:101-102), which Linux permits.
+    /// It is deterministic, and the same in a recording and its replays.
+    ///
+    /// A delivery that runs no handler (`SIG_IGN`, or a default action that
+    /// ignores) does not set it. Linux dequeues the next pending signal on
+    /// the same exit after discarding one (`get_signal`, v6.12
+    /// kernel/signal.c:2815-2816 and 2831-2832), so here too the stop that
+    /// follows is ordered as if preempted at that exit, with the same
+    /// consequence: only which thread runs next changes. Continuing it
+    /// would let a thread that dequeues an ignored `ITIMER_REAL` copy run
+    /// on to the end of its slice instead of waiting at its next dequeue,
+    /// so the following expiry's copy stays queued while a sibling runs a
+    /// whole slice, and the timer, which re-arms at the dequeue, reads 0
+    /// for that slice (`itimer_mixed_masks_keep_the_timer_running`).
+    #[serde(default)]
+    pub(crate) delivered_since_request: bool,
+    /// Set when the backend reports this thread's `rt_sigreturn`
+    /// (`Tool::handle_sigreturn`), cleared by its next event of any other
+    /// kind (`pre_handler_hook`). A signal stop that finds it set is the
+    /// delivery Linux makes on that return to user space, and it continues
+    /// the thread's turn even when the handler took a scheduler turn and so
+    /// cleared `delivered_since_request`: without it, a reader whose handler
+    /// calls `sched_yield` while a sibling re-signals it at every turn did
+    /// not get past its handler within 900 s, where the report trigger alone
+    /// took about 32,000 sends
+    /// (<https://github.com/rrnewton/hermit/issues/4505>). It is read only
+    /// where `signal_shadow::observes_sigreturns` holds, which it never does
+    /// under `hermit record` or any replay (their signal-state copy is off,
+    /// and a gdbserver turns the reports off), so a recording and every
+    /// replay of it decide continuations by `delivered_since_request` alone.
     #[serde(default)]
     pub(crate) returned_from_sigreturn: bool,
     /// How many of this thread's latest scheduler requests in a row were
@@ -4167,6 +4222,11 @@ pub struct ThreadState<T> {
     /// there is none.
     #[serde(default)]
     pub(crate) consecutive_continuations: u8,
+    /// How many times the scheduler has granted this thread a turn
+    /// (`note_scheduler_handoff`). A signal stop compares it before and after
+    /// its own awaits, so a grant among them ends the delivery window too.
+    #[serde(default)]
+    pub(crate) scheduler_grants: u64,
 
     /// Thread state associated with record/replay.
     pub record_or_replay: T,
@@ -4387,6 +4447,30 @@ pub(crate) fn chaos_per_thread_slowdown_factor(
 }
 
 impl<T> ThreadState<T> {
+    /// Account one hand-off of this thread to the scheduler for a grant, in
+    /// which other threads may run: it ends the window in which a signal stop
+    /// continues the thread's last delivery (`delivered_since_request`), and
+    /// a request that is itself such a continuation (`continues_sigreturn`)
+    /// counts toward `consecutive_continuations`, which any other resets.
+    /// Called by `tool_global::send_and_update_time` when the reply says the
+    /// thread was granted a turn while its request was pending
+    /// (`GlobalResponse::Granted`). The scheduler marks every point where it
+    /// resumes a waiting thread (`Scheduler::granted`: a grant, or a parked
+    /// wait resumed to observe a signal before its grant, whose nested signal
+    /// hook then runs), so every hand-off is noted
+    /// whatever the request (an ordinary or parked request, a futex wait, a
+    /// parent's continuation after a fork, a schedule-replay trace, an exec's
+    /// continuation), and an RPC answered without a grant is none.
+    pub(crate) fn note_scheduler_handoff(&mut self, continues_sigreturn: bool) {
+        self.scheduler_grants = self.scheduler_grants.wrapping_add(1);
+        self.delivered_since_request = false;
+        self.consecutive_continuations = if continues_sigreturn {
+            self.consecutive_continuations.saturating_add(1)
+        } else {
+            0
+        };
+    }
+
     /// What `observe_guest_clock(raw)` would return, without raising the
     /// clock's floor: the guest clock as of a raw observation.
     pub(crate) fn peek_guest_clock(&self, raw: LogicalTime) -> LogicalTime {
@@ -4873,8 +4957,10 @@ impl<T> ThreadState<T> {
             yield_after_futex_wake: false,
             pipe_handoff_due: None,
             own_signal_turn_hold: None,
+            delivered_since_request: false,
             returned_from_sigreturn: false,
             consecutive_continuations: 0,
+            scheduler_grants: 0,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
             // AUTONOMOUS-BOT-IMPLEMENTED
