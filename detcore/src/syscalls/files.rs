@@ -5159,13 +5159,14 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Read the host file to EOF through `scratch`, `chunk` bytes at a time.
     ///
-    /// For `/proc/locks` (`lists_locks`), the bytes that reads after the one
-    /// that provably reached the end of the kernel's lock list return are
-    /// dropped (`procfs::locks::locks_capture_kept_bytes`): they are rows the
-    /// kernel repeats when the host adds a lock between two reads, at moments
-    /// the host decides. Those reads are still made, through the recorder,
-    /// until one returns 0, so the recorded calls are the same as before and a
-    /// replay drops the same bytes.
+    /// For `/proc/locks` (`lists_locks`), each record that reads after the one
+    /// whose length shows it reached the end of the kernel's lock list return
+    /// is dropped, waiters and all, when its granted lock is one already read
+    /// (`procfs::locks::locks_capture_without_repeats`): such records are rows
+    /// the kernel prints again when the host adds a lock between two reads, at
+    /// moments the host decides. Any other record is kept. Those reads are still made,
+    /// through the recorder, until one returns 0, and the decision reads only
+    /// their recorded lengths and bytes, so a replay drops the same bytes.
     async fn drain_procfs<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -5193,17 +5194,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             reads.push(bytes_read);
         }
         if lists_locks {
-            let kept = crate::procfs::locks::locks_capture_kept_bytes(&reads, chunk);
-            if kept < contents.len() {
+            let kept =
+                crate::procfs::locks::locks_capture_without_repeats(&contents, &reads, chunk);
+            if kept.len() < contents.len() {
                 // Not INFO: whether the host moved a lock between the reads is
                 // host-timed, and INFO is compared between verified runs.
                 tracing::debug!(
-                    "[detcore] /proc/locks capture: dropped {} bytes that reads after the end \
-                     of the kernel's list returned (reads {:?})",
-                    contents.len() - kept,
+                    "[detcore] /proc/locks capture: dropped {} bytes of rows that reads after \
+                     the end of the kernel's list printed again (reads {:?})",
+                    contents.len() - kept.len(),
                     reads
                 );
-                contents.truncate(kept);
+                return Ok(kept);
             }
         }
         Ok(contents)

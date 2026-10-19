@@ -791,7 +791,20 @@ impl RecordVersion {
 // (https://github.com/rrnewton/hermit/issues/4505). A recording whose guest
 // is signaled again before a handler returns now has a different schedule,
 // and an older recording would replay out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x180);
+// 0x180 -> 0x181 (reserved in minibeads dh-gxmvo as 0x17e; 0x17e, 0x17f and
+// 0x180 were taken at land by c4de94bb, 4de8f523 and 1e5ebe34, so this takes
+// HIGHEST_SHIPPED + 1): after the read whose length shows it reached the end
+// of the kernel's lock list, the /proc/locks capture drops only the records
+// whose granted lock is one already captured (the rows the kernel prints
+// again, renumbered, when the host adds a lock between two reads, whatever
+// their waiters) and keeps every other record; main 50727c68 dropped all the
+// bytes after that read, at 0x17d. The recorded calls and their layout are
+// unchanged, but replay recomputes the guest's bytes from the recorded
+// reads, as for the /proc/locks filter at 0x171 -> 0x172 above: a 0x17d,
+// 0x17e, 0x17f or 0x180 recording (0x17d from before or after 50727c68)
+// whose capture caught the race would replay different guest bytes, so it
+// is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x181);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -816,7 +829,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x180);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x180;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x181;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

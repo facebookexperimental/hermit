@@ -1585,13 +1585,14 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // 0x17b the vfork rejoin reverted,
     // 0x17c a readmitted thread keeps its call's mask until its continuation,
     // 0x17d the vfork rejoin re-landed,
-    // 0x17e and 0x17f calls whose mask probe a signal stopped restart, and
+    // 0x17e and 0x17f calls whose mask probe a signal stopped restart,
     // 0x180 sigreturn continuations under record and replay for
-    // https://github.com/rrnewton/hermit/issues/4505),
+    // https://github.com/rrnewton/hermit/issues/4505, and
+    // 0x181 the /proc/locks capture drops only repeated rows),
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x180,
+        metadata["version"], 0x181,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);

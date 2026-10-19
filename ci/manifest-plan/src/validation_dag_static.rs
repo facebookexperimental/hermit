@@ -2591,7 +2591,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four vfork flock-guard narrowing units (three in tool_local,
     // one in fd) and the flock owner-rule unit in procfs::locks: 2174,
     // listed.
-    ("test.detcore_unit", 2174),
+    // Minus the /proc/locks end-of-list unit
+    // (a_short_read_that_reached_the_end_drops_what_the_closing_reads_repeat)
+    // and plus the seven /proc/locks capture units that replace it
+    // (the_race_repeats_are_dropped_and_an_added_lock_stays,
+    // a_row_nobody_read_is_kept_although_the_lengths_pass,
+    // an_identical_row_is_dropped_only_as_a_repeat_after_a_provable_end,
+    // a_repeat_is_its_granted_lock_whatever_its_waiters,
+    // a_lease_that_started_breaking_is_a_repeat,
+    // a_guest_root_whose_host_waiters_gave_up_shows_once_through_the_filter,
+    // only_a_short_read_below_a_page_can_end_the_capture): 2180.
+    ("test.detcore_unit", 2180),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4591,7 +4601,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from e1446c0a: 2169.
     // And the same four vfork flock-guard narrowing units and flock
     // owner-rule unit: 2174, listed.
-    ("test.detcore_unit_on_host", 2174),
+    // Minus the /proc/locks end-of-list unit and plus the seven /proc/locks
+    // capture units (the same as test.detcore_unit): 2180.
+    ("test.detcore_unit_on_host", 2180),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

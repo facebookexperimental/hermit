@@ -705,12 +705,20 @@ fn inode_suffix(path: &Path) -> String {
 /// Whether the host's own `/proc/locks` shows an OFD lock on `path`. The
 /// control is real only if it does: a host lock nothing could see would
 /// prove nothing about the guest's view.
+///
+/// The host's file is longer than a page here, and the kernel returns at most
+/// about a page per read, restarting its walk at an index each time; a lock
+/// another host process drops ahead of that index between two reads makes the
+/// next read skip a row, which can be this one. The lock is held throughout,
+/// so a read that misses it raced; read again, a bounded number of times.
 fn host_sees_ofd_lock(path: &Path) -> bool {
     let suffix = inode_suffix(path);
-    fs::read_to_string("/proc/locks")
-        .expect("read the host's /proc/locks")
-        .lines()
-        .any(|line| line.contains("OFDLCK") && line.contains(" -1 ") && line.contains(&suffix))
+    (0..20).any(|_| {
+        fs::read_to_string("/proc/locks")
+            .expect("read the host's /proc/locks")
+            .lines()
+            .any(|line| line.contains("OFDLCK") && line.contains(" -1 ") && line.contains(&suffix))
+    })
 }
 
 /// The guest's snapshots: each must hold exactly its two rows, its own OFD
@@ -784,28 +792,63 @@ fn unseen_directory(fallback: &Path) -> tempfile::TempDir {
 /// up once in a loaded validation run; pinned, 24 of 30 runs caught it before
 /// the capture dropped those bytes.
 fn pin_to_the_last_allowed_cpu() {
-    // SAFETY: an all-zero cpu_set_t is the empty set, and both calls read or
-    // write exactly one set of the size passed.
-    unsafe {
-        let mut allowed: libc::cpu_set_t = std::mem::zeroed();
-        assert_eq!(
-            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut allowed),
-            0,
-            "sched_getaffinity: {}",
-            std::io::Error::last_os_error()
-        );
-        let last = (0..libc::CPU_SETSIZE as usize)
+    // A CPU can leave the allowed set between the two calls; read it again.
+    for _ in 0..3 {
+        let mut allowed = allowed_cpu_mask();
+        let word_bits = u64::BITS as usize;
+        let last = (0..allowed.len() * word_bits)
             .rev()
-            .find(|cpu| libc::CPU_ISSET(*cpu, &allowed))
+            .find(|cpu| allowed[cpu / word_bits] & (1 << (cpu % word_bits)) != 0)
             .expect("this thread may run on no CPU");
-        let mut only: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(last, &mut only);
+        allowed.fill(0);
+        allowed[last / word_bits] = 1 << (last % word_bits);
+        // SAFETY: the kernel reads `allowed.len() * 8` bytes from `allowed`,
+        // which owns them; glibc passes a mask of any size through.
+        let result = unsafe {
+            libc::sched_setaffinity(
+                0,
+                allowed.len() * std::mem::size_of::<u64>(),
+                allowed.as_ptr().cast::<libc::cpu_set_t>(),
+            )
+        };
+        if result == 0 {
+            return;
+        }
+        let error = std::io::Error::last_os_error();
         assert_eq!(
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &only),
-            0,
-            "sched_setaffinity to CPU {last}: {}",
-            std::io::Error::last_os_error()
+            error.raw_os_error(),
+            Some(libc::EINVAL),
+            "sched_setaffinity to CPU {last}: {error}"
         );
+    }
+    panic!("the last allowed CPU kept leaving the allowed set");
+}
+
+/// This thread's allowed CPUs, as a bit mask in 64-bit words, sized for the
+/// kernel's CPU count however large: the kernel refuses (`EINVAL`) a mask
+/// smaller than its possible CPUs, so the mask doubles until it fits.
+fn allowed_cpu_mask() -> Vec<u64> {
+    let mut words = 16;
+    loop {
+        let mut mask = vec![0_u64; words];
+        // SAFETY: the kernel writes at most `words * 8` bytes into `mask`,
+        // which owns them; glibc passes a mask of any size through.
+        let result = unsafe {
+            libc::sched_getaffinity(
+                0,
+                words * std::mem::size_of::<u64>(),
+                mask.as_mut_ptr().cast::<libc::cpu_set_t>(),
+            )
+        };
+        if result == 0 {
+            return mask;
+        }
+        let error = std::io::Error::last_os_error();
+        assert!(
+            error.raw_os_error() == Some(libc::EINVAL) && words < 1 << 16,
+            "sched_getaffinity with {words} words: {error}"
+        );
+        words *= 2;
     }
 }
 
@@ -2096,8 +2139,10 @@ fn a_full_descriptor_table_refuses_the_next_proc_locks_read() {
 /// different `/proc/locks` bytes, since replay recomputes which recorded rows
 /// are the guest's, and one from before the procfs anchor (0x172, 0x173) or
 /// from before its entry recheck (0x176, 0x177) holds a different fdinfo
-/// read, so the version gate refuses each label; the same recording at the
-/// current version replays.
+/// read, and one from before the capture dropped only repeated rows (0x180,
+/// 0x17f, 0x17e, 0x17d, 0x17c) would replay a capture that caught the host's
+/// race to different bytes, so the version gate refuses each label; the same
+/// recording at the current version replays.
 #[test]
 fn recordings_from_before_the_lock_ledger_are_refused_by_the_version_gate() {
     let root = tempfile::Builder::new()
@@ -2157,12 +2202,16 @@ fn recordings_from_before_the_lock_ledger_are_refused_by_the_version_gate() {
     let mut metadata: serde_json::Value =
         serde_json::from_str(&text).expect("recording metadata is not JSON");
     assert_eq!(
-        metadata["version"], 0x180,
+        metadata["version"], 0x181,
         "RECORD_VERSION moved; point this test at the current version and the ledger's predecessor"
     );
-    // 0x177 (dbt's) and 0x176 do not recheck the entry as procfs; 0x173 and
-    // 0x172 read the fdinfo by path, without the procfs anchor.
-    for older in [0x177, 0x176, 0x173, 0x172, 0x171, 0x16f] {
+    // 0x180, 0x17f, 0x17e, 0x17d and 0x17c keep, or drop by length alone, the
+    // rows a closing read repeats; 0x177 (dbt's) and 0x176 do not recheck the
+    // entry as procfs; 0x173 and 0x172 read the fdinfo by path, without the
+    // procfs anchor.
+    for older in [
+        0x180, 0x17f, 0x17e, 0x17d, 0x17c, 0x177, 0x176, 0x173, 0x172, 0x171, 0x16f,
+    ] {
         metadata["version"] = serde_json::json!(older);
         fs::write(
             &metadata_path,

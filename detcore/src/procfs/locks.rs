@@ -714,44 +714,163 @@ impl LockLedger {
 /// The smallest buffer a kernel `seq_file` such as `/proc/locks` fills in one
 /// `read`: one page (`seq_read_iter` starts with `PAGE_SIZE` and only grows).
 /// 4096 is the smallest page Linux uses, so a larger one only makes the rule
-/// in [`locks_capture_kept_bytes`] keep more.
+/// in [`locks_capture_without_repeats`] keep more.
 const SEQ_FILE_MIN_BUFFER_BYTES: usize = 4096;
 
-/// How many leading bytes of a `/proc/locks` capture to keep, given the
-/// lengths of its nonzero reads, in order, each through a buffer of `chunk`
-/// bytes, and the read that returned 0 after them. The bytes past the read
-/// that provably reached the end of the kernel's list in its own walk are
-/// dropped: the reads that follow it repeat or reorder rows the host moved.
+/// A `/proc/locks` capture, `contents`, without the records that the kernel
+/// printed again after the end of its list, given the lengths of the
+/// capture's nonzero reads, in order, each through a buffer of `chunk` bytes,
+/// and the read that returned 0 after them.
 ///
-/// Each `read` of a `seq_file` restarts the walk of the kernel's global lock
-/// list at the index where the last one stopped (`start(m->index)`). When the
-/// host adds a lock ahead of that index between two reads, the restarted walk
-/// lands on the last row the previous read returned and prints it again, and
-/// the drain to EOF that a capture needs appends that duplicate. One read
-/// stops before the end of the list only when the caller's buffer is full (it
-/// returns `chunk` bytes) or when the next record does not fit in the
-/// kernel's buffer of at least [`SEQ_FILE_MIN_BUFFER_BYTES`]. A record is a
-/// granted lock and every waiter queued behind it, so it has no fixed bound;
-/// but that record is the first thing the next read prints, so the reads
-/// after a read of `n < chunk` bytes that stopped there return at least
-/// `SEQ_FILE_MIN_BUFFER_BYTES - n` bytes. Reads after it that return fewer in
-/// total cannot be that continuation: that read reached the end, and what
-/// follows is the host's change.
+/// After the first read whose length shows it reached the end of the
+/// kernel's list in its own walk, each record a later read returned is
+/// dropped, its waiter lines with it, when its granted lock is a lock already
+/// in the capture ([`lock_identity`]). Every other record is kept, where it
+/// came. When no read passes the length test, or the bytes after it are not
+/// whole records, the capture is returned as the kernel gave it.
 ///
-/// That holds while the list stays still between the reads that span one
-/// record. Content the kernel returns over several reads stays exposed to the
-/// host's changes at every boundary before the last.
-pub(crate) fn locks_capture_kept_bytes(reads: &[usize], chunk: usize) -> usize {
-    let mut later: usize = reads.iter().sum();
-    let mut kept = 0;
+/// Why repeats appear. Each `read` of a `seq_file` restarts the walk of the
+/// kernel's global lock list at the index where the last one stopped
+/// (`start(m->index)`). The list is a list per CPU, walked in CPU order, each
+/// newest lock first. When the host adds locks ahead of that index between
+/// two reads, the restarted walk prints the records that slid past it: the
+/// last records the previous read returned, renumbered, and any added lock
+/// that landed between the index and them (a lock added on the same CPU as
+/// the guest's, ahead of the guest's own rows). The added locks are real and
+/// stay; the repeats go. A repeat need not be byte for byte the record it
+/// repeats: between the reads the host can queue a waiter behind the lock or
+/// give one up, a lease can start breaking, and a waiter's owner can leave
+/// the reader's view. None of that moves the list's index, and it is still
+/// the one lock, so a repeat is recognized by its granted lock alone, and
+/// the earlier record, which one walk printed, is the one kept.
+///
+/// The length test. One read stops before the end of the list only when the
+/// caller's buffer is full (it returns `chunk` bytes) or when the next record
+/// does not fit in the kernel's buffer of at least
+/// [`SEQ_FILE_MIN_BUFFER_BYTES`]. A record is a granted lock and every waiter
+/// queued behind it, so it has no fixed bound; but that record is the first
+/// thing the next read prints, so while the list stays still, the reads after
+/// a read of `n < chunk` bytes that stopped there return at least
+/// `SEQ_FILE_MIN_BUFFER_BYTES - n` bytes.
+///
+/// Why the length test alone is not enough. The list does not stay still: the
+/// record that stopped a read can lose its waiters or go between the reads,
+/// and a removal ahead of the index moves the walk. The next read then
+/// returns records nobody has read yet, few enough bytes to pass the length
+/// test. So only repeats are dropped.
+///
+/// What this can still get wrong, named. A later record whose granted lock
+/// prints the same identity as a lock already captured, and which is
+/// genuinely another lock, is dropped, whenever the bytes after the end are
+/// shorter than the length test allows: either the list changed between the
+/// reads in a way the length test cannot see and the record was never read,
+/// or the host added it. Identical identities of distinct locks exist
+/// natively, per class:
+/// - POSIX: one owner's locks on two files in two btrfs subvolumes with the
+///   same inode number (every subvolume prints its one superblock device);
+///   two descriptor tables of one thread group (identical shared locks);
+/// - FLOCK: two descriptions under one pid holding identical shared flocks,
+///   and the btrfs case;
+/// - OFD: two descriptions holding identical shared ranges (the guest filter
+///   already shows such a lock once), and the btrfs case;
+/// - LEASE and DELEG: two descriptions under one pid holding identical
+///   leases, and the btrfs case.
+///
+/// The snapshot then shows one of two identical rows. A record added by the
+/// host that matches a guest lock is the host's, and the guest filter would
+/// keep at most one row for it anyway. Content the kernel returns over
+/// several reads stays exposed to the host's changes at every boundary before
+/// the last, and duplicates are kept whenever no read passes the length test.
+///
+/// Matching only the records that could have slid past the index (the last
+/// few of the capture) would narrow the residual, but it is not provably
+/// enough: a removal between the reads can drop one of those records and let
+/// an earlier one slide in, so the whole capture is searched.
+pub(crate) fn locks_capture_without_repeats(
+    contents: &[u8],
+    reads: &[usize],
+    chunk: usize,
+) -> Vec<u8> {
+    if reads.iter().sum::<usize>() != contents.len() {
+        return contents.to_vec();
+    }
+    let mut later = contents.len();
+    let mut end = 0;
     for &read in reads {
-        kept += read;
+        end += read;
         later -= read;
-        if read > 0 && read < chunk && read + later < SEQ_FILE_MIN_BUFFER_BYTES {
-            return kept;
+        if later > 0 && read < chunk && read + later < SEQ_FILE_MIN_BUFFER_BYTES {
+            return without_repeats(contents, end).unwrap_or_else(|| contents.to_vec());
         }
     }
-    kept
+    contents.to_vec()
+}
+
+/// `contents` with each record past `end` dropped whose granted lock is one
+/// an earlier record holds; `None` when the bytes are not whole records.
+fn without_repeats(contents: &[u8], end: usize) -> Option<Vec<u8>> {
+    let mut seen = lock_records(&contents[..end])?
+        .into_iter()
+        .map(|(identity, _)| identity)
+        .collect::<BTreeSet<_>>();
+    let mut out = contents[..end].to_vec();
+    for (identity, bytes) in lock_records(&contents[end..])? {
+        if seen.insert(identity) {
+            out.extend_from_slice(bytes.as_bytes());
+        }
+    }
+    Some(out)
+}
+
+/// `contents` as whole `/proc/locks` records, each a granted lock's line and
+/// the lines of the waiters queued behind it: the identity of the record's
+/// granted lock ([`lock_identity`]) and the record's bytes. A waiter's line is
+/// `SEQ: -> ...`, indented between the colon and the arrow by its depth in the
+/// waiter tree (`lock_get_status`). `None` when the bytes are not whole lines
+/// that each begin with a sequence number, or begin with a waiter.
+fn lock_records(contents: &[u8]) -> Option<Vec<(Vec<String>, &str)>> {
+    let text = std::str::from_utf8(contents).ok()?;
+    if !text.is_empty() && !text.ends_with('\n') {
+        return None;
+    }
+    let mut records: Vec<(Vec<String>, std::ops::Range<usize>)> = Vec::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let (sequence, rest) = line.split_once(':')?;
+        if sequence.is_empty() || !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let span = offset..offset + line.len();
+        offset = span.end;
+        if rest.trim_start().starts_with("->") {
+            records.last_mut()?.1.end = span.end;
+        } else {
+            records.push((lock_identity(rest), span));
+        }
+    }
+    Some(
+        records
+            .into_iter()
+            .map(|(identity, bytes)| (identity, &text[bytes]))
+            .collect(),
+    )
+}
+
+/// The fields of a granted lock's `/proc/locks` line, its `SEQ:` removed,
+/// that stay the same while it is the one lock: every field
+/// (`CLASS MODE ACCESS PID MAJOR:MINOR:INODE START END`) for POSIX, OFD,
+/// FLOCK and the rest; for a lease or delegation (`LEASE`/`DELEG`), all but
+/// its state (`ACTIVE`, `BREAKING`, `BREAKER`) and its access, which a break
+/// changes to the type it is breaking to (`target_leasetype`).
+fn lock_identity(line: &str) -> Vec<String> {
+    let mut fields = line
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if matches!(fields.first().map(String::as_str), Some("LEASE" | "DELEG")) && fields.len() > 3 {
+        fields.drain(1..3);
+    }
+    fields
 }
 
 /// The rows of `contents` that `kept` keeps, in order. With no decision (a
@@ -1192,39 +1311,232 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         assert_eq!(keep_lock_rows(contents, Some(&[true][..])), b"");
     }
 
+    /// `rows` rows of 50 bytes each, as a host's OFD locks print, numbered
+    /// from `first`: the part of a capture other tests do not care about.
+    fn filler(first: usize, rows: usize) -> String {
+        let mut out = String::new();
+        for sequence in first..first + rows {
+            let base = format!("{sequence}: OFDLCK ADVISORY  WRITE -1 00:2a: 0 EOF\n").len();
+            out.push_str(&format!(
+                "{sequence}: OFDLCK ADVISORY  WRITE -1 00:2a:{inode:0width$} 0 EOF\n",
+                inode = 7000 + sequence,
+                width = 50 - base,
+            ));
+        }
+        assert_eq!(out.len(), rows * 50);
+        out
+    }
+
+    const CHUNK: usize = 64 * 1024;
+
+    /// What the capture keeps of `parts`, each part one read.
+    fn kept(parts: &[&str]) -> String {
+        let contents = parts.concat();
+        let reads = parts.iter().map(|part| part.len()).collect::<Vec<_>>();
+        String::from_utf8(locks_capture_without_repeats(
+            contents.as_bytes(),
+            &reads,
+            CHUNK,
+        ))
+        .expect("the capture stays text")
+    }
+
+    /// The guest's own rows, in one read.
+    const GUEST: &str = "\
+238: OFDLCK ADVISORY  WRITE -1 00:2a:3843038210 0 EOF
+239: POSIX  ADVISORY  WRITE 3 00:2a:3843038209 0 EOF
+";
+    /// The guest's POSIX row printed again by a closing read, renumbered.
+    const REPEAT: &str = "243: POSIX  ADVISORY  WRITE 3 00:2a:3843038209 0 EOF\n";
+    /// A lock the host added between the reads.
+    const ADDED: &str = "241: OFDLCK ADVISORY  WRITE -1 00:2a:3843038208 0 0\n";
+
     #[test]
-    fn a_short_read_that_reached_the_end_drops_what_the_closing_reads_repeat() {
-        const CHUNK: usize = 64 * 1024;
-        // The failure this rule closes: the guest's two rows (82 bytes) in one
-        // read, then the closing read returns its POSIX row (40 bytes) again
-        // because the host added a lock between the two reads; or several
-        // copies, over several closing reads.
-        assert_eq!(locks_capture_kept_bytes(&[82, 40], CHUNK), 82);
-        assert_eq!(locks_capture_kept_bytes(&[82, 40, 40, 40], CHUNK), 82);
+    fn the_race_repeats_are_dropped_and_an_added_lock_stays() {
+        // The shape the pinned host_locks test caught (reads of 107 and 159
+        // bytes): the host added four locks on the guest's CPU, ahead of the
+        // guest's rows; the closing read printed the one visible added lock
+        // and both guest rows again, renumbered.
+        let closing =
+            format!("{ADDED}242: OFDLCK ADVISORY  WRITE -1 00:2a:3843038210 0 EOF\n{REPEAT}");
+        assert_eq!((GUEST.len(), closing.len()), (107, 159));
+        assert_eq!(kept(&[GUEST, &closing]), format!("{GUEST}{ADDED}"));
+        // One addition behind the guest's rows: the last row again; or
+        // several closing reads, several times.
+        assert_eq!(kept(&[GUEST, REPEAT]), GUEST);
+        assert_eq!(kept(&[GUEST, REPEAT, REPEAT, REPEAT]), GUEST);
+        // An added lock repeated by a later closing read goes too.
+        assert_eq!(
+            kept(&[GUEST, ADDED, REPEAT, ADDED]),
+            format!("{GUEST}{ADDED}")
+        );
         // Nothing after the read: nothing to drop.
-        assert_eq!(locks_capture_kept_bytes(&[82], CHUNK), 82);
-        assert_eq!(locks_capture_kept_bytes(&[], CHUNK), 0);
-        // A read that filled the caller's buffer may have stopped anywhere,
-        // so everything after it is the file's.
-        assert_eq!(locks_capture_kept_bytes(&[512, 40], 512), 552);
-        // A read that stopped where the next record did not fit in one page:
-        // that record, a lock and its waiters, follows, and it is at least
-        // what the page had left.
-        assert_eq!(locks_capture_kept_bytes(&[3000, 1096], CHUNK), 4096);
-        assert_eq!(locks_capture_kept_bytes(&[3000, 1095], CHUNK), 3000);
-        // A host list over several pages (each read stops at a page), whose
-        // last read reached the end, followed by a repeated row.
-        assert_eq!(
-            locks_capture_kept_bytes(&[4040, 4065, 3737, 74], CHUNK),
-            4040 + 4065 + 3737
+        assert_eq!(kept(&[GUEST]), GUEST);
+        assert_eq!(kept(&[]), "");
+    }
+
+    #[test]
+    fn a_row_nobody_read_is_kept_although_the_lengths_pass() {
+        // Codex's case: a 3000-byte read stops at a guest lock whose host
+        // waiters need at least 1096 bytes; they cancel before the next read,
+        // which returns the guest's root row alone, 80 bytes. The lengths
+        // pass (3000 + 80 < 4096), but the row was never read, so it stays.
+        let prefix = filler(1, 60);
+        let shrunk = format!("61: POSIX  ADVISORY  WRITE 1 00:2a:{:038} 0 EOF\n", 1002);
+        assert_eq!((prefix.len(), shrunk.len()), (3000, 80));
+        assert_eq!(kept(&[&prefix, &shrunk]), format!("{prefix}{shrunk}"));
+        // DS's case: a 4050-byte read stops at a host record the host then
+        // releases, and the next read returns the guest's last POSIX row,
+        // about 40 bytes (4050 + 41 < 4096).
+        let prefix = filler(1, 81);
+        let row = "82: POSIX  ADVISORY  WRITE 1 00:2a:1 0 0\n";
+        assert_eq!((prefix.len(), row.len()), (4050, 41));
+        assert_eq!(kept(&[&prefix, row]), format!("{prefix}{row}"));
+        // A row nobody read beside a repeat: the row stays, the repeat goes.
+        let new = "4: FLOCK  ADVISORY  WRITE 1 00:2a:1003 0 EOF\n";
+        assert_eq!(kept(&[GUEST, REPEAT, new]), format!("{GUEST}{new}"));
+        assert_eq!(kept(&[GUEST, new, REPEAT]), format!("{GUEST}{new}"));
+    }
+
+    #[test]
+    fn an_identical_row_is_dropped_only_as_a_repeat_after_a_provable_end() {
+        // Two identical shared OFD rows exist natively (two descriptions, one
+        // range of one file). When the second stopped the first read by not
+        // fitting in the page, the reads after it return at least what the
+        // page had left, so the lengths keep it though it repeats the first.
+        let row = "OFDLCK ADVISORY  READ  -1 00:2a:1009 0 EOF\n";
+        let second = format!("82: {row}");
+        let first_read = format!("{}81: {row}", filler(1, 80));
+        // Widen one filler row so that the first read and the second row
+        // together are exactly a page: the second row did not fit.
+        let pad = 4096 - first_read.len() - second.len();
+        let widened = format!(
+            "{}80: OFDLCK ADVISORY  WRITE -1 00:2a:{:0width$} 0 EOF\n81: {row}",
+            filler(1, 79),
+            1,
+            width = 50 + pad - "80: OFDLCK ADVISORY  WRITE -1 00:2a: 0 EOF\n".len(),
         );
-        // The same without the repeat keeps all of it.
+        assert_eq!(widened.len() + second.len(), 4096);
+        assert_eq!(kept(&[&widened, &second]), format!("{widened}{second}"));
+        // Below the page, the same row after the same prefix can only be a
+        // repeat past the end, which is what the closing read prints: dropped.
+        // Were it genuine, the list changed between the reads (the residual
+        // the function documents): the snapshot shows one of the two rows.
+        assert!(first_read.len() + second.len() < 4096);
+        assert_eq!(kept(&[&first_read, &second]), first_read);
+    }
+
+    #[test]
+    fn a_repeat_is_its_granted_lock_whatever_its_waiters() {
+        let tree = "\
+5: POSIX  ADVISORY  WRITE 3 00:2a:1004 0 EOF
+5: -> POSIX  ADVISORY  WRITE 0 00:2a:1004 0 EOF
+5:  -> POSIX  ADVISORY  WRITE 0 00:2a:1004 0 EOF
+";
+        // The tree again, renumbered.
+        let repeat = tree.replace("5:", "9:");
+        assert_eq!(kept(&[tree, &repeat]), tree);
+        // The same granted lock with fewer waiters (one gave up between the
+        // reads), or none, or more: still the one lock, so a repeat, and the
+        // tree one walk printed is the one kept.
+        let fewer = "9: POSIX  ADVISORY  WRITE 3 00:2a:1004 0 EOF\n\
+                     9: -> POSIX  ADVISORY  WRITE 0 00:2a:1004 0 EOF\n";
+        assert_eq!(kept(&[tree, fewer]), tree);
+        let root = "9: POSIX  ADVISORY  WRITE 3 00:2a:1004 0 EOF\n";
+        assert_eq!(kept(&[tree, root]), tree);
+        assert_eq!(kept(&[root, tree]), root);
+        // A repeated tree beside a lock nobody read: the tree goes, the new
+        // lock stays.
+        let other = "10: POSIX  ADVISORY  WRITE 3 00:2a:1005 0 EOF\n";
         assert_eq!(
-            locks_capture_kept_bytes(&[4040, 4065, 3737], CHUNK),
-            4040 + 4065 + 3737
+            kept(&[tree, &format!("{fewer}{other}")]),
+            format!("{tree}{other}")
         );
-        // The 512-byte stack-scratch chunk: a short read below a page with
-        // little after it reached the end; a full read did not.
-        assert_eq!(locks_capture_kept_bytes(&[512, 300, 40], 512), 812);
+        // A different range, access or owner is another lock: kept.
+        for changed in [
+            "9: POSIX  ADVISORY  WRITE 3 00:2a:1004 0 9\n",
+            "9: POSIX  ADVISORY  READ  3 00:2a:1004 0 EOF\n",
+            "9: POSIX  ADVISORY  WRITE 4 00:2a:1004 0 EOF\n",
+            "9: FLOCK  ADVISORY  WRITE 3 00:2a:1004 0 EOF\n",
+        ] {
+            assert_eq!(kept(&[tree, changed]), format!("{tree}{changed}"));
+        }
+        // A tail that begins with a waiter is not whole records: all kept.
+        let orphan = "9: -> POSIX  ADVISORY  WRITE 0 00:2a:1004 0 EOF\n";
+        assert_eq!(kept(&[tree, orphan]), format!("{tree}{orphan}"));
+    }
+
+    #[test]
+    fn a_lease_that_started_breaking_is_a_repeat() {
+        // A host open of the file starts a break between the reads: the
+        // lease prints BREAKING, the access it breaks to, and the breaker
+        // queued behind it. It is the same lease.
+        let active = "7: LEASE  ACTIVE    WRITE 3 00:2a:1006 0 EOF\n";
+        let breaking = "\
+11: LEASE  BREAKING  READ  3 00:2a:1006 0 EOF
+11: -> LEASE  BREAKER   UNLCK 0 00:2a:1006 0 EOF
+";
+        assert_eq!(kept(&[active, breaking]), active);
+        // Another file's lease is another lease.
+        let elsewhere = "11: LEASE  ACTIVE    WRITE 3 00:2a:1007 0 EOF\n";
+        assert_eq!(kept(&[active, elsewhere]), format!("{active}{elsewhere}"));
+    }
+
+    #[test]
+    fn a_guest_root_whose_host_waiters_gave_up_shows_once_through_the_filter() {
+        // Codex's round-2 case: read 1 reaches the end with the guest's POSIX
+        // root (pid 3) and two host waiters (pid 0, outside the namespace);
+        // the waiters give up and the host adds hidden locks ahead of the
+        // root, so the closing read prints the root again without them.
+        let first = "\
+239: POSIX  ADVISORY  WRITE 3 00:2a:1004 0 EOF
+239: -> POSIX  ADVISORY  WRITE 0 00:2a:1004 0 EOF
+239:  -> POSIX  ADVISORY  WRITE 0 00:2a:1004 0 EOF
+";
+        let closing = "243: POSIX  ADVISORY  WRITE 3 00:2a:1004 0 EOF\n";
+        let capture = kept(&[first, closing]);
+        let rows = lock_rows(capture.as_bytes()).expect("the capture parses");
+        let keep = guest_lock_rows(&rows, guest, &[]);
+        let shown = String::from_utf8(keep_lock_rows(capture.as_bytes(), Some(keep.as_slice())))
+            .expect("the rows stay text");
+        assert_eq!(shown, "239: POSIX  ADVISORY  WRITE 3 00:2a:1004 0 EOF\n");
+    }
+
+    #[test]
+    fn only_a_short_read_below_a_page_can_end_the_capture() {
+        let capture = |contents: &str, reads: &[usize], chunk: usize| {
+            String::from_utf8(locks_capture_without_repeats(
+                contents.as_bytes(),
+                reads,
+                chunk,
+            ))
+            .expect("the capture stays text")
+        };
+        // A read that filled the caller's buffer may have stopped anywhere.
+        let contents = format!("{GUEST}{REPEAT}");
+        assert_eq!(
+            capture(&contents, &[GUEST.len(), REPEAT.len()], GUEST.len()),
+            contents
+        );
+        // A host list over several pages, each read stopping at a page, whose
+        // last read reached the end, followed by a repeat of its last row.
+        let (one, two) = (filler(1, 81), filler(82, 81));
+        let three = format!("{}{GUEST}", filler(163, 70));
+        let all = format!("{one}{two}{three}");
+        assert_eq!(kept(&[&one, &two, &three, REPEAT]), all);
+        assert_eq!(kept(&[&one, &two, &three]), all);
+        // A burst of additions too large for the length test, in one closing
+        // read with the repeat: all kept.
+        let burst = format!("{}{REPEAT}", filler(400, 80));
+        assert_eq!(kept(&[GUEST, &burst]), format!("{GUEST}{burst}"));
+        // Lengths that disagree with the bytes decide nothing.
+        assert_eq!(capture(&contents, &[GUEST.len()], CHUNK), contents);
+        // Bytes that are not whole lock rows are never dropped.
+        assert_eq!(kept(&[GUEST, "garbage\n"]), format!("{GUEST}garbage\n"));
+        let unterminated = REPEAT.trim_end();
+        assert_eq!(
+            kept(&[GUEST, unterminated]),
+            format!("{GUEST}{unterminated}")
+        );
     }
 }
