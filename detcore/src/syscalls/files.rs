@@ -5050,13 +5050,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         // kernel may write, such as a PROT_WRITE-only page that the save
         // cannot read. The caller's buffer sees only the sanitized
         // publication, which checks its protection as the kernel's copy does.
-        let lists_address_space = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_lists_address_space())?;
+        let (lists_address_space, lists_locks) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.procfs_lists_address_space(),
+                    detfd.procfs_lists_locks(),
+                )
+            })?;
         if lists_address_space {
-            self.capture_procfs_on_stack(guest, call).await
+            self.capture_procfs_on_stack(guest, call, lists_locks).await
         } else {
-            self.capture_procfs_in_mapping(guest, call).await
+            self.capture_procfs_in_mapping(guest, call, lists_locks)
+                .await
         }
     }
 
@@ -5066,6 +5071,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: syscalls::Read,
+        lists_locks: bool,
     ) -> Result<Vec<u8>, Error> {
         const CAPTURE_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -5085,7 +5091,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .and_then(AddrMut::<u8>::from_raw)
             .ok_or(Errno::EFAULT)?;
         let result = self
-            .drain_procfs(guest, call, mapping, CAPTURE_CHUNK_BYTES)
+            .drain_procfs(guest, call, mapping, CAPTURE_CHUNK_BYTES, lists_locks)
             .await;
         guest
             .inject_with_retry(Syscall::Munmap(
@@ -5116,6 +5122,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: syscalls::Read,
+        lists_locks: bool,
     ) -> Result<Vec<u8>, Error> {
         const CAPTURE_CHUNK_BYTES: usize = 512;
 
@@ -5128,7 +5135,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 && let Ok(guard) = stack.commit()
             {
                 let result = self
-                    .drain_procfs(guest, call, scratch, CAPTURE_CHUNK_BYTES)
+                    .drain_procfs(guest, call, scratch, CAPTURE_CHUNK_BYTES, lists_locks)
                     .await;
                 guest.memory().write_exact(scratch, &original)?;
                 drop(guard);
@@ -5140,7 +5147,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         for chunk in [call.len().min(CAPTURE_CHUNK_BYTES), 1] {
             let original = &mut original[..chunk];
             if save_procfs_scratch(&mut guest.memory(), buffer, original) {
-                let result = self.drain_procfs(guest, call, buffer, chunk).await;
+                let result = self
+                    .drain_procfs(guest, call, buffer, chunk, lists_locks)
+                    .await;
                 guest.memory().write_exact(buffer, original)?;
                 return result;
             }
@@ -5149,21 +5158,31 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Read the host file to EOF through `scratch`, `chunk` bytes at a time.
+    ///
+    /// For `/proc/locks` (`lists_locks`), the bytes that reads after the one
+    /// that provably reached the end of the kernel's lock list return are
+    /// dropped (`procfs::locks::locks_capture_kept_bytes`): they are rows the
+    /// kernel repeats when the host adds a lock between two reads, at moments
+    /// the host decides. Those reads are still made, through the recorder,
+    /// until one returns 0, so the recorded calls are the same as before and a
+    /// replay drops the same bytes.
     async fn drain_procfs<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Read,
         scratch: AddrMut<'_, u8>,
         chunk: usize,
+        lists_locks: bool,
     ) -> Result<Vec<u8>, Error> {
         const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 
         let capture = call.with_buf(Some(scratch)).with_len(chunk);
         let mut contents = Vec::new();
+        let mut reads = Vec::new();
         loop {
             let bytes_read = self.record_or_replay(guest, capture).await? as usize;
             if bytes_read == 0 {
-                return Ok(contents);
+                break;
             }
             if contents.len() + bytes_read > MAX_SNAPSHOT_BYTES {
                 return Err(Errno::EFBIG.into());
@@ -5171,7 +5190,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             let start = contents.len();
             contents.resize(start + bytes_read, 0);
             read_guest_exact(&guest.memory(), scratch, &mut contents[start..])?;
+            reads.push(bytes_read);
         }
+        if lists_locks {
+            let kept = crate::procfs::locks::locks_capture_kept_bytes(&reads, chunk);
+            if kept < contents.len() {
+                // Not INFO: whether the host moved a lock between the reads is
+                // host-timed, and INFO is compared between verified runs.
+                tracing::debug!(
+                    "[detcore] /proc/locks capture: dropped {} bytes that reads after the end \
+                     of the kernel's list returned (reads {:?})",
+                    contents.len() - kept,
+                    reads
+                );
+                contents.truncate(kept);
+            }
+        }
+        Ok(contents)
     }
 
     /// The procfs directory that the kernel beneath the backend names for
@@ -9411,6 +9446,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 syscalls::Read::new().with_fd(opened),
                 scratch,
                 FDINFO_PAGE - FDINFO_READ,
+                false,
             )
             .await
         {

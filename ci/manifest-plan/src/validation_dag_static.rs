@@ -2580,7 +2580,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_continuation_mask_follows_what_the_kernel_did and
     // an_rt_sigsuspend_continuation_is_unknown_and_picks_alike_in_record_and_replay: 2152.
     // And the fifteen vfork-rejoin scheduler units, re-landed: 2167.
-    ("test.detcore_unit", 2167),
+    // And the /proc/locks capture end-of-list unit
+    // (procfs::locks::tests::a_short_read_that_reached_the_end_drops_what_the_closing_reads_repeat):
+    // 2168, listed.
+    ("test.detcore_unit", 2168),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4554,7 +4557,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_continuation_mask_follows_what_the_kernel_did and
     // an_rt_sigsuspend_continuation_is_unknown_and_picks_alike_in_record_and_replay: 2152.
     // And the fifteen vfork-rejoin scheduler units, re-landed: 2167.
-    ("test.detcore_unit_on_host", 2167),
+    // And the same /proc/locks capture end-of-list unit: 2168, listed.
+    ("test.detcore_unit_on_host", 2168),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -663,6 +663,49 @@ impl LockLedger {
     }
 }
 
+/// The smallest buffer a kernel `seq_file` such as `/proc/locks` fills in one
+/// `read`: one page (`seq_read_iter` starts with `PAGE_SIZE` and only grows).
+/// 4096 is the smallest page Linux uses, so a larger one only makes the rule
+/// in [`locks_capture_kept_bytes`] keep more.
+const SEQ_FILE_MIN_BUFFER_BYTES: usize = 4096;
+
+/// How many leading bytes of a `/proc/locks` capture to keep, given the
+/// lengths of its nonzero reads, in order, each through a buffer of `chunk`
+/// bytes, and the read that returned 0 after them. The bytes past the read
+/// that provably reached the end of the kernel's list in its own walk are
+/// dropped: the reads that follow it repeat or reorder rows the host moved.
+///
+/// Each `read` of a `seq_file` restarts the walk of the kernel's global lock
+/// list at the index where the last one stopped (`start(m->index)`). When the
+/// host adds a lock ahead of that index between two reads, the restarted walk
+/// lands on the last row the previous read returned and prints it again, and
+/// the drain to EOF that a capture needs appends that duplicate. One read
+/// stops before the end of the list only when the caller's buffer is full (it
+/// returns `chunk` bytes) or when the next record does not fit in the
+/// kernel's buffer of at least [`SEQ_FILE_MIN_BUFFER_BYTES`]. A record is a
+/// granted lock and every waiter queued behind it, so it has no fixed bound;
+/// but that record is the first thing the next read prints, so the reads
+/// after a read of `n < chunk` bytes that stopped there return at least
+/// `SEQ_FILE_MIN_BUFFER_BYTES - n` bytes. Reads after it that return fewer in
+/// total cannot be that continuation: that read reached the end, and what
+/// follows is the host's change.
+///
+/// That holds while the list stays still between the reads that span one
+/// record. Content the kernel returns over several reads stays exposed to the
+/// host's changes at every boundary before the last.
+pub(crate) fn locks_capture_kept_bytes(reads: &[usize], chunk: usize) -> usize {
+    let mut later: usize = reads.iter().sum();
+    let mut kept = 0;
+    for &read in reads {
+        kept += read;
+        later -= read;
+        if read > 0 && read < chunk && read + later < SEQ_FILE_MIN_BUFFER_BYTES {
+            return kept;
+        }
+    }
+    kept
+}
+
 /// The rows of `contents` that `kept` keeps, in order. With no decision (a
 /// snapshot whose rows do not parse, which the sanitizer refuses anyway, or a
 /// caller that made none) every row is kept. A decision for a different
@@ -1078,5 +1121,41 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         assert_eq!(keep_lock_rows(contents, Some(&[false; 3][..])), b"");
         assert_eq!(keep_lock_rows(contents, None), contents);
         assert_eq!(keep_lock_rows(contents, Some(&[true][..])), b"");
+    }
+
+    #[test]
+    fn a_short_read_that_reached_the_end_drops_what_the_closing_reads_repeat() {
+        const CHUNK: usize = 64 * 1024;
+        // The failure this rule closes: the guest's two rows (82 bytes) in one
+        // read, then the closing read returns its POSIX row (40 bytes) again
+        // because the host added a lock between the two reads; or several
+        // copies, over several closing reads.
+        assert_eq!(locks_capture_kept_bytes(&[82, 40], CHUNK), 82);
+        assert_eq!(locks_capture_kept_bytes(&[82, 40, 40, 40], CHUNK), 82);
+        // Nothing after the read: nothing to drop.
+        assert_eq!(locks_capture_kept_bytes(&[82], CHUNK), 82);
+        assert_eq!(locks_capture_kept_bytes(&[], CHUNK), 0);
+        // A read that filled the caller's buffer may have stopped anywhere,
+        // so everything after it is the file's.
+        assert_eq!(locks_capture_kept_bytes(&[512, 40], 512), 552);
+        // A read that stopped where the next record did not fit in one page:
+        // that record, a lock and its waiters, follows, and it is at least
+        // what the page had left.
+        assert_eq!(locks_capture_kept_bytes(&[3000, 1096], CHUNK), 4096);
+        assert_eq!(locks_capture_kept_bytes(&[3000, 1095], CHUNK), 3000);
+        // A host list over several pages (each read stops at a page), whose
+        // last read reached the end, followed by a repeated row.
+        assert_eq!(
+            locks_capture_kept_bytes(&[4040, 4065, 3737, 74], CHUNK),
+            4040 + 4065 + 3737
+        );
+        // The same without the repeat keeps all of it.
+        assert_eq!(
+            locks_capture_kept_bytes(&[4040, 4065, 3737], CHUNK),
+            4040 + 4065 + 3737
+        );
+        // The 512-byte stack-scratch chunk: a short read below a page with
+        // little after it reached the end; a full read did not.
+        assert_eq!(locks_capture_kept_bytes(&[512, 300, 40], 512), 812);
     }
 }

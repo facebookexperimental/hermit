@@ -771,6 +771,44 @@ fn unseen_directory(fallback: &Path) -> tempfile::TempDir {
     directory
 }
 
+/// Pin this thread, and so the Hermit runs it starts and the threads it
+/// spawns, to the highest-numbered CPU it may run on.
+///
+/// The kernel walks `/proc/locks` one CPU's list after another, in CPU order,
+/// each newest lock first, and each `read` restarts that walk at the index
+/// where the last one stopped. A guest pinned to the last CPU therefore holds
+/// the last row of the walk (its first lock, unless an older lock is still on
+/// that CPU's list), and any lock the host adds between Detcore's capture reads
+/// makes the closing read print that row again. Unpinned, the guest's rows
+/// land there only when Hermit happens to pick that CPU, and the race showed
+/// up once in a loaded validation run; pinned, 24 of 30 runs caught it before
+/// the capture dropped those bytes.
+fn pin_to_the_last_allowed_cpu() {
+    // SAFETY: an all-zero cpu_set_t is the empty set, and both calls read or
+    // write exactly one set of the size passed.
+    unsafe {
+        let mut allowed: libc::cpu_set_t = std::mem::zeroed();
+        assert_eq!(
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut allowed),
+            0,
+            "sched_getaffinity: {}",
+            std::io::Error::last_os_error()
+        );
+        let last = (0..libc::CPU_SETSIZE as usize)
+            .rev()
+            .find(|cpu| libc::CPU_ISSET(*cpu, &allowed))
+            .expect("this thread may run on no CPU");
+        let mut only: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(last, &mut only);
+        assert_eq!(
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &only),
+            0,
+            "sched_setaffinity to CPU {last}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 /// Host locks taken outside the guest change nothing it sees in
 /// `/proc/locks`, on `backend`:
 /// 1. `run --strict` prints the same bytes with the host's locks held as
@@ -779,6 +817,7 @@ fn unseen_directory(fallback: &Path) -> tempfile::TempDir {
 ///    host thread takes and drops the locks about every millisecond;
 /// 3. the guest's own OFD and POSIX rows are still there.
 fn host_locks_stay_out_of_the_guests_proc_locks(backend: &str) {
+    pin_to_the_last_allowed_cpu();
     let root = tempfile::Builder::new()
         .prefix("proc-locks-host-control-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
