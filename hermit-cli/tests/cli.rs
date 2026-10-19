@@ -153,7 +153,6 @@ static POLL_RECHECK_PARTIAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_TIMER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_ENTRY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RESTARTABLE_TWO_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static PRIVATE_SIGCHLD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_BOOKKEEPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_POSTHOOK_FUTEX_INTERRUPT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_PIPE_READ_HELD_WRITER_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -41148,7 +41147,6 @@ fn poll_recheck_guest(name: &str) -> String {
         "guest_poll_recheck_timer" => &POLL_RECHECK_TIMER_GUEST,
         "guest_poll_recheck_entry" => &POLL_RECHECK_ENTRY_GUEST,
         "guest_restartable_two_signals" => &RESTARTABLE_TWO_SIGNALS_GUEST,
-        "guest_private_sigchld_waits" => &PRIVATE_SIGCHLD_WAITS_GUEST,
         other => panic!("unknown guest {other}"),
     };
     poll_recheck_c_guest(cell, name)
@@ -41810,7 +41808,7 @@ fn pipe_wake_rows_under_record_and_replay() {
 /// The rows of the R2b-2 stage 2 tests (`guest_restartable_two_signals`):
 /// arguments and the line Hermit prints. Natively (Linux 7.1.3, 3 of 3 each)
 /// a row's line is the same unless a comment says otherwise.
-const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 22] = [
+const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 19] = [
     (
         &["read", "chld", "winch"],
         "read: -1 EINTR, handlers before return: 28 17, after join: 28 17",
@@ -41846,46 +41844,56 @@ const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 22] = [
         &["tight", "chld", "winch"],
         "tight: -1 EINTR, handlers before return: 28 17, after join: 28 17",
     ),
-    // Linux ends the read for the SIGCHLD, before the SIGUSR1 is sent. So
-    // does Hermit, since R2b-2 stage 3
-    // (https://github.com/rrnewton/hermit/issues/4273): a SIGCHLD a guest
-    // sent the reader, recorded in its private queue, ends a pipe read.
-    // Before, the read held it and ended at the SIGUSR1 (`17 10`).
+    // Native `-1 EINTR, handlers before return: 17, after join: 17`: Linux
+    // ends the read for the SIGCHLD. Hermit holds a SIGCHLD whoever sent it
+    // until R2b-2 stage 3 (https://github.com/rrnewton/hermit/issues/4273),
+    // so the read blocks for it and ends at the SIGUSR1, which a later turn
+    // decides under the guest's own mask (Codex review of the R2b-2 design
+    // rev3, P2-1).
     (
         &["twoturn"],
-        "twoturn: -1 EINTR, handlers before return: 17, after join: 17",
+        "twoturn: -1 EINTR, handlers before return: 17 10, after join: 17 10",
     ),
-    // As `twoturn`: the SIGCHLD ends the read, before the process-directed
-    // SIGALRM fires, as on Linux (before stage 3, `14 17`).
+    // Native `-1 EINTR, handlers before return: 17, after join: 17`, as for
+    // `twoturn`. The process-directed SIGALRM still reaches the reader, which
+    // blocks every signal for the held SIGCHLD.
     (
         &["alarmheld"],
-        "alarmheld: -1 EINTR, handlers before return: 17, after join: 17",
+        "alarmheld: -1 EINTR, handlers before return: 14 17, after join: 14 17",
     ),
-    // As `twoturn`: the SIGCHLD ends the read before the SIGUSR2 is sent
-    // while SIG_IGN, as on Linux (before stage 3 the read held the SIGCHLD,
-    // and that discarded copy's late handler gave `1 0, ... 17 12`,
-    // https://github.com/rrnewton/hermit/issues/3995).
+    // Native `-1 EINTR, handlers before return: 17, after join: 17`, as for
+    // `twoturn`. The SIGUSR2 sent while SIG_IGN is discarded at send, as on
+    // Linux, because the scheduler decides against the guest mask the reader
+    // publishes while it blocks every signal, not the full mask then installed
+    // (Claude review of the R2b-2 design rev4, L3); the late handler is that
+    // copy, still delivered as the call returns
+    // (https://github.com/rrnewton/hermit/issues/3995). Unpublished, the copy
+    // was counted as kept and ended the read with EINTR.
     (
         &["ignheld"],
-        "ignheld: -1 EINTR, handlers before return: 17, after join: 17",
+        "ignheld: 1 0, handlers before return: 17 12, after join: 17 12",
     ),
-    // On a socketpair, where Hermit still holds the SIGCHLD: a socket read is
-    // outside the calls a recorded private SIGCHLD ends (R2b-2 stage 3, rev4
-    // 1e, https://github.com/rrnewton/hermit/issues/4273), so the read blocks
-    // every signal for it, which is what this row exercises. A sibling reads
-    // the worker's SigBlk while the read waits, with SIGCHLD's SA_RESTART
-    // handler run: the guest's own mask, SIGUSR2 alone, as on Linux. procfs
-    // reports the mask the read published instead of the kernel's (Codex
+    // Native `-1 EINTR, handlers before return: 17, after join: 17, returned
+    // during the spin: yes`, as for `twoturn`. The SIGUSR1 sent while the read
+    // blocks every signal for the held SIGCHLD wakes it at once, while a
+    // sibling spins with no syscall: the scheduler's drain filters by the
+    // guest mask the read publishes. Filtered by the kernel's full mask, the
+    // wake was dropped, and the read ended only at its backed-off poll turn,
+    // after about 1.3 billion iterations of the spin (Claude review of R2b-2
+    // stage 2, F1).
+    // A sibling reads the worker's SigBlk while the read waits, with SIGCHLD's
+    // SA_RESTART handler run: the guest's own mask, SIGUSR2 alone, as on
+    // Linux. The read blocks every signal for the held SIGCHLD meanwhile, and
+    // procfs reports the mask it published instead of the kernel's (Codex
     // review of R2b-2 stage 2, P2), which read fffffffe7ffb7eef.
     (
         &["maskvis"],
         "maskvis: 1 0, handlers before return: 17, after join: 17, sibling saw SigBlk 0000000000000800",
     ),
-    // As `maskvis` (on a socketpair, held as there), through a
-    // /proc/thread-self/status descriptor the worker opened and main reads:
-    // the file describes the worker, which opened it, so it reports the
-    // worker's published mask too (Codex re-check of R2b-2 stage 2, P2),
-    // which read fffffffe7ffb7eef.
+    // As `maskvis`, through a /proc/thread-self/status descriptor the worker
+    // opened and main reads: the file describes the worker, which opened it,
+    // so it reports the worker's published mask too (Codex re-check of R2b-2
+    // stage 2, P2), which read fffffffe7ffb7eef.
     (
         &["maskvisfd"],
         "maskvisfd: 1 0, handlers before return: 17, after join: 17, sibling saw SigBlk 0000000000000800",
@@ -41900,33 +41908,9 @@ const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 22] = [
         &["maskvisfork"],
         "maskvisfork: child saw SigBlk 0000000000000800\nmaskvisfork: parent read 1",
     ),
-    // On a socketpair, where Hermit still holds the SIGCHLD (rev4 1e, as for
-    // `maskvis`). Native `-1 EINTR, handlers before return: 17, after join:
-    // 17, returned during the spin: yes`: Linux ends the read for the
-    // SIGCHLD. Under Hermit the SIGUSR1 sent while the read blocks every
-    // signal for the held SIGCHLD wakes it at once, while a sibling spins with
-    // no syscall: the scheduler's drain filters by the guest mask the read
-    // publishes. Filtered by the kernel's full mask, the wake was dropped, and
-    // the read ended only at its backed-off poll turn, after about 1.3 billion
-    // iterations of the spin (Claude review of R2b-2 stage 2, F1).
     (
         &["spinwake"],
         "spinwake: -1 EINTR, handlers before return: 17 10, after join: 17 10, returned during the spin: yes",
-    ),
-    // The same three rows on a pipe, where the SIGCHLD a guest sent the
-    // reader, recorded in its private queue, ends the read as on Linux (R2b-2
-    // stage 3): the native lines.
-    (
-        &["spinwakepipe"],
-        "spinwakepipe: -1 EINTR, handlers before return: 17, after join: 17, returned during the spin: yes",
-    ),
-    (
-        &["maskvispipe"],
-        "maskvispipe: 1 0, handlers before return: 17, after join: 17, sibling saw SigBlk 0000000000000800",
-    ),
-    (
-        &["maskvisfdpipe"],
-        "maskvisfdpipe: 1 0, handlers before return: 17, after join: 17, sibling saw SigBlk 0000000000000800",
     ),
     (
         &["read"],
@@ -41949,564 +41933,6 @@ const RESTARTABLE_TWO_SIGNAL_ROWS: [(&[&str], &str); 22] = [
         "tight: 1 0, handlers before return: none, after join: none",
     ),
 ];
-
-/// Each row of `guest_private_sigchld_waits` (family, call, variant) and the
-/// line it prints. A row's line is Linux's (Linux 7.1.3, 3 of 3 each) unless a
-/// comment gives the native one.
-const PRIVATE_SIGCHLD_WAIT_ROWS: [(&[&str], &str); 85] = [
-    (
-        &["thread", "read", "caught"],
-        "read caught: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    (
-        &["thread", "poll", "caught"],
-        "poll caught: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    (
-        &["thread", "ppoll", "caught"],
-        "ppoll caught: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    (
-        &["thread", "epoll_wait", "caught"],
-        "epoll_wait caught: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    (
-        &["thread", "epoll_pwait", "caught"],
-        "epoll_pwait caught: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    (
-        &["thread", "select", "caught"],
-        "select caught: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    (
-        &["thread", "sigtimedwait", "caught"],
-        "sigtimedwait caught: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    (
-        &["thread", "futex", "caught"],
-        "futex caught: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    (
-        &["thread", "read", "restart"],
-        "read restart: 1 0, handled before wake 1, ended before wake 0, handled after join 1",
-    ),
-    (
-        &["thread", "poll", "restart"],
-        "poll restart: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    (
-        &["thread", "ppoll", "restart"],
-        "ppoll restart: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    (
-        &["thread", "epoll_wait", "restart"],
-        "epoll_wait restart: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    (
-        &["thread", "epoll_pwait", "restart"],
-        "epoll_pwait restart: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    (
-        &["thread", "select", "restart"],
-        "select restart: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    (
-        &["thread", "sigtimedwait", "restart"],
-        "sigtimedwait restart: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    (
-        &["thread", "futex", "restart"],
-        "futex restart: 0 0, handled before wake 1, ended before wake 0, handled after join 1",
-    ),
-    (
-        &["thread", "read", "blocked"],
-        "read blocked: 1 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "poll", "blocked"],
-        "poll blocked: 1 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "ppoll", "blocked"],
-        "ppoll blocked: 1 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "epoll_wait", "blocked"],
-        "epoll_wait blocked: 1 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "epoll_pwait", "blocked"],
-        "epoll_pwait blocked: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    (
-        &["thread", "select", "blocked"],
-        "select blocked: 1 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "sigtimedwait", "blocked"],
-        "sigtimedwait blocked: N 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "futex", "blocked"],
-        "futex blocked: 0 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "read", "default"],
-        "read default: 1 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "poll", "default"],
-        "poll default: 1 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "ppoll", "default"],
-        "ppoll default: 1 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "epoll_wait", "default"],
-        "epoll_wait default: 1 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "epoll_pwait", "default"],
-        "epoll_pwait default: 1 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "select", "default"],
-        "select default: 1 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "sigtimedwait", "default"],
-        "sigtimedwait default: N 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "futex", "default"],
-        "futex default: 0 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "readv", "none"],
-        "readv none: 1 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "recv", "none"],
-        "recv none: 1 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "send", "none"],
-        "send none: N 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "accept4", "none"],
-        "accept4 none: N 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "recv-timeo", "none"],
-        "recv-timeo none: 1 0, handled before wake 0, ended before wake 0, handled after join 0",
-    ),
-    (
-        &["thread", "readv", "caught"],
-        "readv caught: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-    ),
-    // Native `recv caught: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1`: a socket call still holds the SIGCHLD
-    // (rev4 1e, https://github.com/rrnewton/hermit/issues/4273).
-    (
-        &["thread", "recv", "caught"],
-        "recv caught: 1 0, handled before wake 0, ended before wake 0, handled after join 1",
-    ),
-    // Native `send caught: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1`: a socket call still holds the SIGCHLD
-    // (rev4 1e, https://github.com/rrnewton/hermit/issues/4273).
-    (
-        &["thread", "send", "caught"],
-        "send caught: N 0, handled before wake 0, ended before wake 0, handled after join 1",
-    ),
-    // Native `accept4 caught: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1`: a socket call still holds the SIGCHLD
-    // (rev4 1e, https://github.com/rrnewton/hermit/issues/4273).
-    (
-        &["thread", "accept4", "caught"],
-        "accept4 caught: N 0, handled before wake 0, ended before wake 0, handled after join 1",
-    ),
-    // Native `recv-timeo caught: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1`: a socket call still holds the SIGCHLD
-    // (rev4 1e, https://github.com/rrnewton/hermit/issues/4273).
-    (
-        &["thread", "recv-timeo", "caught"],
-        "recv-timeo caught: 1 0, handled before wake 0, ended before wake 0, handled after join 1",
-    ),
-    (
-        &["thread", "readv", "restart"],
-        "readv restart: 1 0, handled before wake 1, ended before wake 0, handled after join 1",
-    ),
-    // Native `recv restart: 1 0, handled before wake 1, ended before wake 0, handled after join 1`: a socket call still holds the SIGCHLD
-    // (rev4 1e, https://github.com/rrnewton/hermit/issues/4273).
-    (
-        &["thread", "recv", "restart"],
-        "recv restart: 1 0, handled before wake 0, ended before wake 0, handled after join 1",
-    ),
-    // Native `send restart: N 0, handled before wake 1, ended before wake 0, handled after join 1`: a socket call still holds the SIGCHLD
-    // (rev4 1e, https://github.com/rrnewton/hermit/issues/4273).
-    (
-        &["thread", "send", "restart"],
-        "send restart: N 0, handled before wake 0, ended before wake 0, handled after join 1",
-    ),
-    // Native `accept4 restart: N 0, handled before wake 1, ended before wake 0, handled after join 1`: a socket call still holds the SIGCHLD
-    // (rev4 1e, https://github.com/rrnewton/hermit/issues/4273).
-    (
-        &["thread", "accept4", "restart"],
-        "accept4 restart: N 0, handled before wake 0, ended before wake 0, handled after join 1",
-    ),
-    // Native `recv-timeo restart: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1`: a socket call still holds the SIGCHLD
-    // (rev4 1e, https://github.com/rrnewton/hermit/issues/4273).
-    (
-        &["thread", "recv-timeo", "restart"],
-        "recv-timeo restart: 1 0, handled before wake 0, ended before wake 0, handled after join 1",
-    ),
-    (
-        &["fork", "read", "caught"],
-        "read caught: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "readv", "caught"],
-        "readv caught: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "write", "caught"],
-        "write caught: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "writev", "caught"],
-        "writev caught: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "poll", "caught"],
-        "poll caught: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "ppoll", "caught"],
-        "ppoll caught: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "epoll_wait", "caught"],
-        "epoll_wait caught: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "epoll_pwait", "caught"],
-        "epoll_pwait caught: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "sigtimedwait", "caught"],
-        "sigtimedwait caught: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "read", "restart"],
-        "read restart: 1 0, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "readv", "restart"],
-        "readv restart: 1 0, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "write", "restart"],
-        "write restart: 1 0, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "writev", "restart"],
-        "writev restart: 1 0, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "poll", "restart"],
-        "poll restart: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "ppoll", "restart"],
-        "ppoll restart: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "epoll_wait", "restart"],
-        "epoll_wait restart: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "epoll_pwait", "restart"],
-        "epoll_pwait restart: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "sigtimedwait", "restart"],
-        "sigtimedwait restart: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "read", "blocked"],
-        "read blocked: 1 0, handled before return 0, after 2",
-    ),
-    (
-        &["fork", "readv", "blocked"],
-        "readv blocked: 1 0, handled before return 0, after 2",
-    ),
-    (
-        &["fork", "write", "blocked"],
-        "write blocked: 1 0, handled before return 0, after 2",
-    ),
-    (
-        &["fork", "writev", "blocked"],
-        "writev blocked: 1 0, handled before return 0, after 2",
-    ),
-    (
-        &["fork", "poll", "blocked"],
-        "poll blocked: 1 0, handled before return 0, after 2",
-    ),
-    (
-        &["fork", "ppoll", "blocked"],
-        "ppoll blocked: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "epoll_wait", "blocked"],
-        "epoll_wait blocked: 1 0, handled before return 0, after 2",
-    ),
-    (
-        &["fork", "epoll_pwait", "blocked"],
-        "epoll_pwait blocked: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "sigtimedwait", "blocked"],
-        "sigtimedwait blocked: -1 Resource temporarily unavailable, handled before return 0, after 2",
-    ),
-    (&["pending", "chld"], "pending chld: -1 EINTR, handled 1"),
-    (
-        &["fork", "epoll_pwait2", "caught"],
-        "epoll_pwait2 caught: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "epoll_pwait2", "restart"],
-        "epoll_pwait2 restart: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    (
-        &["fork", "epoll_pwait2", "blocked"],
-        "epoll_pwait2 blocked: -1 Interrupted system call, handled before return 1, after 2",
-    ),
-    // A ready descriptor and the admitted copy in the same turn: the
-    // completion wins, as Linux takes a ready descriptor before it checks for
-    // a signal (the design's `ends_wait` rule, rev4 1c). Natively this is a
-    // race: 98 of 100 runs give this line and 2 give `poll -1 EINTR,
-    // handled 1`, where the woken worker scanned before the write landed.
-    // Both are Linux-permitted; Hermit decides it in one turn and gives the
-    // common one.
-    (&["edge", "both"], "both: poll 1 0, handled 1"),
-    // An argument error wins over a pending copy the temporary mask lets in.
-    (
-        &["edge", "ebadf"],
-        "ebadf: -1 Bad file descriptor, handled at return 0, after 1",
-    ),
-    // The copy sigwaitinfo took, or SIG_IGN discarded, ends nothing later: a
-    // stale record never ends a wait on its own (rev4 1f, 1g).
-    (
-        &["edge", "insetpoll"],
-        "insetpoll: first 17 0, poll 1 0, handled before byte 0, after 0",
-    ),
-    (
-        &["edge", "flushpoll"],
-        "flushpoll: first 0 0, poll 1 0, handled before byte 0, after 0",
-    ),
-    // Two copies, each restarting an SA_RESTART read: two handlers.
-    (
-        &["edge", "twice"],
-        "twice: 1 0, handled before byte 2, after 2",
-    ),
-    // Native `tightpoll: -1 EINTR, handled before byte 1, after 1`. On a stack
-    // with no room below the stack pointer the wait's injected block fails
-    // (https://github.com/rrnewton/hermit/issues/3328), so no block holds and
-    // the copy is not admitted: it is held and delivered as the call returns,
-    // a known limitation (the design's fallback, rev4 1f;
-    // https://github.com/rrnewton/hermit/issues/4273). It is the guard that a
-    // copy is never admitted without a block in force: admitting it anyway
-    // gives the native line here. A two-signal form (SIGCHLD and SIGWINCH back
-    // to back) gives the native `-1 EINTR, handled before byte 2` with and
-    // without that guard, since the unheld SIGWINCH ends the wait, so it is
-    // not a row.
-    (
-        &["edge", "tightpoll"],
-        "tightpoll: 1 0, handled before byte 0, after 1",
-    ),
-    (&["pending", "usr1"], "pending usr1: -1 EINTR, handled 1"),
-];
-
-/// A `SIGCHLD` a guest sends a thread with `tgkill`, which the schedule records
-/// in the thread's private queue, ends the thread's `poll`, `ppoll`,
-/// `epoll_wait`, `epoll_pwait` or `rt_sigtimedwait`, and its restartable pipe
-/// `read`, `readv` or `write`, as on Linux: `-1 EINTR` with the handler first,
-/// or with `SA_RESTART` a pipe read or write restarted after it (R2b-2 stage 3,
-/// https://github.com/rrnewton/hermit/issues/4273). Before, Hermit held every
-/// such `SIGCHLD` until the call returned: the call completed and the handler
-/// ran late, and a pending one that an `epoll_pwait`'s temporary mask let in
-/// hung the call. The `fork` rows wait in a single-threaded process, which
-/// keeps Detcore's signal-state copy. A socket call still holds the `SIGCHLD`
-/// (rev4 1e). Each row runs under `--strict --verify --verify-strict` at
-/// canonical parity.
-#[test]
-fn a_private_sigchld_ends_gated_waits_and_pipe_calls_as_on_linux() {
-    let _guard = hermit_run_guard();
-    let guest = poll_recheck_guest("guest_private_sigchld_waits");
-    for (args, line) in PRIVATE_SIGCHLD_WAIT_ROWS {
-        let mut command = vec![
-            "run",
-            "--strict",
-            "--verify",
-            "--verify-strict",
-            "--",
-            guest.as_str(),
-        ];
-        command.extend_from_slice(args);
-        let output = hermit(&command);
-        assert_success(&output, &command);
-        assert_eq!(
-            stdout(&output),
-            format!("{line}\n"),
-            "{args:?}: stderr:\n{}",
-            stderr(&output)
-        );
-    }
-}
-
-/// The caught, `SA_RESTART` and pending rows of
-/// `a_private_sigchld_ends_gated_waits_and_pipe_calls_as_on_linux`, under
-/// `record start --verify --verify-strict`: every replay matches its
-/// recording. The rows Hermit decides in every mode give the run-mode line
-/// too: a pipe `read`, `readv`, `write` or `writev` (internal polling under
-/// record too), `rt_sigtimedwait` (the gated loop in every mode), and the
-/// `pending` rows, whose signal is pending before the call. A `poll`,
-/// `ppoll`, `epoll_*` or `select` wait is the kernel's own under record (the
-/// R2b-2 design's record map), so its line follows host timing there, and a
-/// futex wait parks in the scheduler; only their replay is checked. The
-/// socket rows are left out: they hold the SIGCHLD by design (rev4 1e).
-#[test]
-fn private_sigchld_wait_rows_under_record_and_replay() {
-    let _guard = hermit_run_guard();
-    let guest = poll_recheck_guest("guest_private_sigchld_waits");
-    let decided =
-        |call: &str| matches!(call, "read" | "readv" | "write" | "writev" | "sigtimedwait");
-    let socket = |call: &str| matches!(call, "recv" | "send" | "accept4" | "recv-timeo");
-    for (args, line) in PRIVATE_SIGCHLD_WAIT_ROWS.iter().filter(|(args, _)| {
-        args[0] == "pending"
-            || (matches!(args[0], "thread" | "fork")
-                && matches!(args[2], "caught" | "restart")
-                && !socket(args[1]))
-    }) {
-        let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-        let data_dir = format!("--data-dir={}", data.path().display());
-        let mut command = vec![
-            "record",
-            "start",
-            "--verify",
-            "--verify-strict",
-            data_dir.as_str(),
-            "--",
-            guest.as_str(),
-        ];
-        command.extend_from_slice(args);
-        let output = hermit(&command);
-        let log = stderr(&output);
-        assert_success(&output, &command);
-        if args[0] == "pending" || decided(args[1]) {
-            assert_eq!(
-                stdout(&output),
-                format!("{line}\n"),
-                "{args:?}: stderr:\n{log}"
-            );
-        }
-        assert!(
-            log.contains("Success: replay matched recording"),
-            "{args:?}: replay did not match:\n{log}"
-        );
-    }
-}
-
-/// Under DBT the schedule records no private `SIGCHLD` (`private_sent` is kept
-/// only where Detcore models signal targets), so a pipe read and a poll still
-/// hold a `SIGCHLD` a guest sent with `tgkill` until they return: a known
-/// limitation of R2b-2 stage 3 (https://github.com/rrnewton/hermit/issues/4273).
-/// Native: `-1 EINTR, handled before wake 1, ended before wake 1, handled
-/// after join 1` for both.
-#[test]
-fn run_dbt_still_holds_a_private_sigchld_as_a_known_limitation() {
-    if dbt_unavailable("run_dbt_still_holds_a_private_sigchld_as_a_known_limitation") {
-        return;
-    }
-    let guest = poll_recheck_guest("guest_private_sigchld_waits");
-    for call in ["read", "poll"] {
-        let command = [
-            "--backend",
-            "dbt",
-            "run",
-            "--strict",
-            "--verify",
-            "--verify-strict",
-            "--",
-            guest.as_str(),
-            "thread",
-            call,
-            "caught",
-        ];
-        let output = hermit(&command);
-        assert_success(&output, &command);
-        assert_eq!(
-            stdout(&output),
-            format!(
-                "{call} caught: 1 0, handled before wake 0, ended before wake 0, handled after join 1\n"
-            ),
-            "{call}: stderr:\n{}",
-            stderr(&output)
-        );
-    }
-}
-
-/// `--debug-futex-mode=polling` (not the default) polls a futex wait through
-/// the same gated loop, so a recorded private `SIGCHLD` ends it too (R2b-2
-/// stage 3). Polling mode can return `EAGAIN` where Linux would wait: the word
-/// changed before the poll that saw it, which Linux permits (a waiter that
-/// enters `futex` after the store and wake gets `EAGAIN`), and which happens
-/// with no signal at all. These lines are observations of that mode, with the
-/// native line in each comment; a line Linux would not permit is a defect.
-#[test]
-fn polling_mode_futex_waits_with_a_private_sigchld() {
-    let _guard = hermit_run_guard();
-    let guest = poll_recheck_guest("guest_private_sigchld_waits");
-    let rows: [(&str, &str); 3] = [
-        // Native: the same.
-        (
-            "caught",
-            "futex caught: -1 EINTR, handled before wake 1, ended before wake 1, handled after join 1",
-        ),
-        // Native `futex restart: 0 0, handled before wake 1, ended before wake
-        // 0, handled after join 1`: the restarted wait saw the stored word.
-        (
-            "restart",
-            "futex restart: -1 Resource temporarily unavailable, handled before wake 1, ended before wake 0, handled after join 1",
-        ),
-        // Native `futex blocked: 0 0, handled before wake 0, ended before wake
-        // 0, handled after join 0`: the poll saw the stored word.
-        (
-            "blocked",
-            "futex blocked: -1 Resource temporarily unavailable, handled before wake 0, ended before wake 0, handled after join 0",
-        ),
-    ];
-    for (variant, line) in rows {
-        let command = [
-            "run",
-            "--strict",
-            "--verify",
-            "--verify-strict",
-            "--debug-futex-mode=polling",
-            "--",
-            guest.as_str(),
-            "thread",
-            "futex",
-            variant,
-        ];
-        let output = hermit(&command);
-        assert_success(&output, &command);
-        assert_eq!(
-            stdout(&output),
-            format!("{line}\n"),
-            "{variant}: stderr:\n{}",
-            stderr(&output)
-        );
-    }
-}
 
 /// Two caught signals sent to a thread parked in a restartable call on an
 /// internal pipe or socket run both handlers, the higher-numbered first, as
@@ -42572,9 +41998,6 @@ fn restartable_two_signal_rows_under_record_and_replay() {
                     | "maskvis"
                     | "maskvisfd"
                     | "maskvisfork"
-                    | "spinwakepipe"
-                    | "maskvispipe"
-                    | "maskvisfdpipe"
             )
     }) {
         let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();

@@ -698,15 +698,7 @@ impl RecordVersion {
 // recorder (an openat, its reads and a close), and replay matches the
 // recorded /proc/locks rows against those recorded bytes. An older recording
 // has no such events there and would replay out of step.
-// 0x16f -> 0x170 (number to be set at land): a `SIGCHLD` a guest sent a
-// thread, which the schedule recorded in its private queue, ends that
-// thread's gated wait (poll, ppoll, epoll_wait, epoll_pwait, rt_sigtimedwait)
-// and its restartable pipe read, readv or scalar write, as on Linux, where it
-// was held until the call returned (R2b-2 stage 3,
-// https://github.com/rrnewton/hermit/issues/4273). Such a turn also blocks
-// signals in place before its timerfd publication. The recorded decisions
-// change, so an older recording containing one would replay out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x170);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x16f);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -731,7 +723,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x170);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x170;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x16f;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1756,21 +1748,6 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_restartable_calls_block_first() {
         for older in 0x163..=0x16d {
-            assert!(
-                !RECORD_VERSION.compatible_with(&RecordVersion(older)),
-                "{older:#x}"
-            );
-        }
-        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
-    }
-
-    /// A recording older than 0x170 held a `SIGCHLD` a guest sent a thread,
-    /// recorded in its private queue, until the thread's gated wait or
-    /// restartable pipe call returned, where it now ends the call (R2b-2
-    /// stage 3, https://github.com/rrnewton/hermit/issues/4273).
-    #[test]
-    fn record_version_rejects_streams_from_before_a_private_sigchld_ends_a_wait() {
-        for older in 0x163..=0x16f {
             assert!(
                 !RECORD_VERSION.compatible_with(&RecordVersion(older)),
                 "{older:#x}"

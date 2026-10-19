@@ -26,17 +26,14 @@
  *       sends it, installs its handler again, waits 50 ms and writes a byte:
  *       Linux discards a signal that is ignored when sent and that the
  *       thread's own mask does not block.
- *   spinwake  On a socketpair: main sends a caught SIGCHLD, waits 50 ms,
- *       sends a caught SIGUSR1, then spins with no syscall, for at most
- *       SPIN_BOUND iterations, until the worker's call returns, and prints
- *       whether it did during the spin. Under Hermit the scheduler's drain
- *       must wake the parked read for the SIGUSR1 at once, though the read
- *       blocks every signal for the held SIGCHLD; it must not wait for the
- *       read's backed-off poll turn while the spinning thread holds the CPU.
- *       Hermit holds this SIGCHLD only because a socket read is outside the
- *       calls a recorded private SIGCHLD ends (R2b-2 stage 3, rev4 1e).
- *   maskvis  On a socketpair, held as for spinwake. The worker blocks SIGUSR2
- *       and reads; SIGCHLD's handler has
+ *   spinwake  Main sends a caught SIGCHLD, waits 50 ms, sends a caught SIGUSR1,
+ *       then spins with no syscall, for at most SPIN_BOUND iterations, until
+ *       the worker's call returns, and prints whether it did during the spin.
+ *       Under Hermit the scheduler's drain must wake the parked read for the
+ *       SIGUSR1 at once, though the read blocks every signal for the held
+ *       SIGCHLD; it must not wait for the read's backed-off poll turn while
+ *       the spinning thread holds the CPU.
+ *   maskvis  The worker blocks SIGUSR2 and reads; SIGCHLD's handler has
  *       SA_RESTART, so Linux restarts the read after it. Main sends SIGCHLD,
  *       waits 50 ms, reads the worker's SigBlk from
  *       /proc/self/task/<tid>/status while the read waits, and writes a byte.
@@ -46,9 +43,6 @@
  *   maskvisfd  As maskvis, but the worker opens /proc/thread-self/status
  *       before it reads, and main reads SigBlk through that shared
  *       descriptor: the file still describes the worker, which opened it.
- *   spinwakepipe | maskvispipe | maskvisfdpipe  The same on an empty pipe,
- *       where Hermit lets the SIGCHLD end the read as Linux does (R2b-2
- *       stage 3, https://github.com/rrnewton/hermit/issues/4273).
  *   maskvisfork  Across processes: process A blocks SIGUSR2, opens
  *       /proc/self/status, forks B and reads an empty pipe; B sends A a
  *       caught SIGCHLD (SA_RESTART), waits 50 ms, reads A's SigBlk through
@@ -103,11 +97,6 @@ __asm__(
     ".size read_on_stack,.-read_on_stack\n");
 
 static const char *mode;
-/* The mode as given, which the result line names; `mode` drops a `pipe`
- * suffix. */
-static const char *label;
-/* A spinwake, maskvis or maskvisfd row on a pipe rather than a socketpair. */
-static int on_pipe;
 static int fds[2];
 static atomic_int order[8];
 static atomic_int handled;
@@ -221,7 +210,7 @@ static void *worker(void *unused)
     int error = ret < 0 ? errno : 0;
     atomic_store(&before_return, atomic_load(&handled));
     atomic_store(&returned, 1);
-    printf("%s: %ld %s, handlers before return:", label, ret, error ? strerrorname_np(error) : "0");
+    printf("%s: %ld %s, handlers before return:", mode, ret, error ? strerrorname_np(error) : "0");
     print_handlers(atomic_load(&before_return));
     fflush(stdout);
     return NULL;
@@ -283,15 +272,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s MODE [FIRST SECOND]\n", argv[0]);
         return 2;
     }
-    mode = label = argv[1];
-    static const char *const piped[] = {"spinwake", "maskvis", "maskvisfd"};
-    for (size_t i = 0; i < sizeof piped / sizeof piped[0]; i++) {
-        size_t length = strlen(piped[i]);
-        if (!strncmp(mode, piped[i], length) && !strcmp(mode + length, "pipe")) {
-            mode = piped[i];
-            on_pipe = 1;
-        }
-    }
+    mode = argv[1];
     if (!strcmp(mode, "maskvisfork"))
         return mask_visibility_across_fork();
     struct sigaction action;
@@ -308,8 +289,7 @@ int main(int argc, char **argv)
         if (sigaction(SIGCHLD, &restart, NULL) != 0)
             die("sigaction");
     }
-    int socket_row = !strcmp(mode, "spinwake") || !strcmp(mode, "maskvis") || !strcmp(mode, "maskvisfd");
-    if (!strcmp(mode, "recv") || (socket_row && !on_pipe)) {
+    if (!strcmp(mode, "recv")) {
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
             die("socketpair");
     } else if (pipe(fds) != 0) {

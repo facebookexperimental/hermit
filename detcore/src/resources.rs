@@ -581,17 +581,6 @@ pub struct Resources {
     /// (<https://github.com/rrnewton/hermit/issues/4187>).
     #[serde(default)]
     pub(crate) decides_signal_interruption_itself: bool,
-    /// Set on a restartable internal IO poll on a pipe (`FdType::Pipe`:
-    /// pipes, and FIFOs that joined internal polling) by its `read`, `readv`
-    /// and scalar `write`: a `SIGCHLD` a guest sent the thread, which the
-    /// schedule recorded in its private queue (`Scheduler::private_sigchld`),
-    /// ends the call there as on Linux, where every other restartable call
-    /// holds it until it returns (R2b-2 stage 3,
-    /// <https://github.com/rrnewton/hermit/issues/4273>). `false` for every
-    /// other request, a socket call and a parked pipe `writev` (which decides
-    /// interruption itself) included.
-    #[serde(default)]
-    pub(crate) private_sigchld_decides: bool,
 }
 
 impl fmt::Debug for Resources {
@@ -644,9 +633,6 @@ impl fmt::Debug for Resources {
         if self.decides_signal_interruption_itself {
             debug.field("decides_signal_interruption_itself", &true);
         }
-        if self.private_sigchld_decides {
-            debug.field("private_sigchld_decides", &true);
-        }
         debug.finish()
     }
 }
@@ -685,7 +671,6 @@ impl Resources {
             in_guest_sleep_sigalrm: None,
             signal_state_task: None,
             decides_signal_interruption_itself: false,
-            private_sigchld_decides: false,
         }
     }
 
@@ -724,7 +709,6 @@ impl Resources {
             self.signal_state_task = other.signal_state_task;
         }
         self.decides_signal_interruption_itself |= other.decides_signal_interruption_itself;
-        self.private_sigchld_decides |= other.private_sigchld_decides;
         self.replay_served_from_log |= other.replay_served_from_log;
         self.polls_guest_state_only |= other.polls_guest_state_only;
         self.waits_until_nothing_else_can_run |= other.waits_until_nothing_else_can_run;

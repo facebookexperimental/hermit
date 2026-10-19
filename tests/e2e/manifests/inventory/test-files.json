@@ -782,12 +782,6 @@
     },
     {
       "disposition": "guest-fixture",
-      "path": "tests/c/guest_private_sigchld_waits.c",
-      "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/guest_private_sigchld_waits.c is owned by hermit-cli/tests/cli.rs: the CLI tests a_private_sigchld_ends_gated_waits_and_pipe_calls_as_on_linux, private_sigchld_wait_rows_under_record_and_replay, polling_mode_futex_waits_with_a_private_sigchld and run_dbt_still_holds_a_private_sigchld_as_a_known_limitation run it under Hermit and pin each row's line (Linux's, or a commented known limitation), and require that a SIGCHLD a guest sends a waiting thread with tgkill ends its poll, ppoll, epoll wait, sigtimedwait or pipe read or write as on Linux (R2b-2 stage 3, https://github.com/rrnewton/hermit/issues/4273). It stays a fixture because a generic manifest cannot assert the result, errno and handler timing line."
-    },
-    {
-      "disposition": "guest-fixture",
       "path": "tests/c/guest_restartable_two_signals.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/guest_restartable_two_signals.c is owned by hermit-cli/tests/cli.rs: the CLI tests restartable_calls_woken_by_two_signals_run_both_handlers and restartable_two_signal_rows_under_record_and_replay run it natively and under Hermit, and require that two caught signals sent to a thread parked in a restartable call run both handlers, higher-numbered first, and end the call as on Linux (R2b-2 stage 2, https://github.com/rrnewton/hermit/issues/4273). It stays a fixture because a generic manifest cannot assert the handler order and the call's result line."

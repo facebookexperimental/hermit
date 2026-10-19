@@ -1570,13 +1570,11 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // https://github.com/rrnewton/hermit/issues/4213, 0x16e a restartable call
     // blocks signals before its recorded attempt for R2b-2 stage 2 of
     // https://github.com/rrnewton/hermit/issues/4273, 0x16f a recorded fstat
-    // after each OFD lock, for the guest's own /proc/locks rows, 0x170 a
-    // recorded private SIGCHLD ends a gated wait for R2b-2 stage 3 of
-    // https://github.com/rrnewton/hermit/issues/4273),
+    // after each OFD lock, for the guest's own /proc/locks rows),
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x170,
+        metadata["version"], 0x16f,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);
