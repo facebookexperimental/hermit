@@ -17613,7 +17613,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "88");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "89");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -17681,17 +17681,19 @@ mod nextest_timeout_tests {
         // (https://github.com/rrnewton/reverie/issues/1069): 85. And
         // run_kvm_cpuid_rows_match_ptrace (KVM keeps no CPUID profile): 86.
         // And run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills
-        // (https://github.com/rrnewton/hermit/issues/4485): 87.
-        // The disabled-maximum acceptance case makes 88 declarations. The
+        // (https://github.com/rrnewton/hermit/issues/4485): 87. And
+        // run_kvm_a_grant_inside_a_handler_ends_its_delivery_continuation
+        // (https://github.com/rrnewton/hermit/pull/4510): 88.
+        // The disabled-maximum acceptance case makes 89 declarations. The
         // spinner is retained but ignored and excluded because its explicit
-        // maximum requests an unavailable timer: 87 selected CLI tests remain.
+        // maximum requests an unavailable timer: 88 selected CLI tests remain.
         assert_eq!(
             names.len(),
-            88,
+            89,
             "update the exact CI inventory with new KVM tests"
         );
         names.retain(|name| name != excluded);
-        assert_eq!(names.len(), 87);
+        assert_eq!(names.len(), 88);
         let required_cases = [
             "run_kvm_self_sigkill_from_nonleader_is_group_fatal",
             "run_kvm_synchronous_root_segv_preserves_guest_exit",
