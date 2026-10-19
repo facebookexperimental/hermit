@@ -123,7 +123,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-cdylib, hermit-detcore, hermit-detcore-tests, hermit-record, hermit-record-format, hermit-replay, hermit-run-ptrace, hermit-verify.",
+      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-cdylib, hermit-detcore, hermit-detcore-tests, hermit-record, hermit-record-format, hermit-replay, hermit-run-kvm, hermit-run-ptrace, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -241,7 +241,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-cdylib, hermit-detcore, hermit-detcore-tests, hermit-manifest-plan, hermit-record, hermit-record-format, hermit-replay, hermit-run-ptrace, hermit-verify.",
+      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-cdylib, hermit-detcore, hermit-detcore-tests, hermit-manifest-plan, hermit-record, hermit-record-format, hermit-replay, hermit-run-kvm, hermit-run-ptrace, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -620,6 +620,31 @@
       "paths": [
         "hermit-resources/**/*.rs",
         "hermit-resources/Cargo.toml"
+      ]
+    },
+    {
+      "_why": "@generated: Cargo package `hermit-run-kvm`; reverse-dependent closure: hermit, hermit-cdylib, hermit-run-kvm.",
+      "nodes": [
+        "build.workspace_on_host",
+        "doc.doctests_on_host",
+        "doc.rustdoc_on_host",
+        "lint.clippy_on_host",
+        "lint.rustfmt",
+        "test.app_strict_verify_on_host",
+        "test.arbitrary_binaries_on_host",
+        "test.cli_on_host",
+        "test.command_strict_verify_on_host",
+        "test.hermit_integration_on_host",
+        "test.hermit_modes_on_host",
+        "test.hermit_unit_on_host",
+        "test.ignored_syscall_regressions_on_host",
+        "test.regular_crates_on_host",
+        "test.rr_suite_contract_on_host",
+        "test.sabre_examples_on_host"
+      ],
+      "paths": [
+        "hermit-run-kvm/**/*.rs",
+        "hermit-run-kvm/Cargo.toml"
       ]
     },
     {

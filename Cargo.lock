@@ -993,6 +993,7 @@ dependencies = [
  "hermit-record-format",
  "hermit-replay",
  "hermit-resources",
+ "hermit-run-kvm",
  "hermit-run-ptrace",
  "hermit-test-workdir",
  "iced-x86",
@@ -1185,6 +1186,14 @@ dependencies = [
 [[package]]
 name = "hermit-resources"
 version = "0.4.1"
+
+[[package]]
+name = "hermit-run-kvm"
+version = "0.4.1"
+dependencies = [
+ "hermit-detcore",
+ "reverie-kvm",
+]
 
 [[package]]
 name = "hermit-run-ptrace"

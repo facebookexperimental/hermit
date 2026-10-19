@@ -3142,8 +3142,7 @@ async fn run_kvm(
     }
 
     let execution_started = Instant::now();
-    let completion = backend
-        .run_static_elf_with_tool_completion::<Detcore>(config, capture_output)
+    let completion = hermit_run_kvm::run_detcore(&mut backend, config, capture_output)
         .await
         .map_err(|error| kvm_execution_error(error, None))?;
     let cleanup_started = Instant::now();
