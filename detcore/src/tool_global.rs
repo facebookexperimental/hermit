@@ -4793,6 +4793,7 @@ impl GlobalState {
                     in_guest_sleep_sigalrm: None,
                     signal_state_task: None,
                     decides_signal_interruption_itself: false,
+                    continues_sigreturn: false,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {

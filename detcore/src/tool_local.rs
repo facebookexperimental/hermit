@@ -4017,6 +4017,14 @@ pub struct ThreadState<T> {
     /// maximum or in a timer callback (<https://github.com/rrnewton/hermit/issues/4034>).
     #[serde(default)]
     pub(crate) own_signal_turn_hold: Option<libc::c_int>,
+    /// Set when this thread's `rt_sigreturn` passes through, cleared by the
+    /// next event of any kind (`pre_handler_hook`). A signal stop that finds
+    /// it set is a delivery Linux makes on that same return to user space,
+    /// before any instruction of the interrupted code runs, so its turn
+    /// continues this thread's (`Resources::continues_sigreturn`,
+    /// <https://github.com/rrnewton/hermit/issues/4505>).
+    #[serde(default)]
+    pub(crate) returned_from_sigreturn: bool,
 
     /// Thread state associated with record/replay.
     pub record_or_replay: T,
@@ -4723,6 +4731,7 @@ impl<T> ThreadState<T> {
             yield_after_futex_wake: false,
             pipe_handoff_due: None,
             own_signal_turn_hold: None,
+            returned_from_sigreturn: false,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5181,6 +5190,7 @@ impl<T> ThreadState<T> {
             in_guest_sleep_sigalrm: None,
             signal_state_task: None,
             decides_signal_interruption_itself: false,
+            continues_sigreturn: false,
         }
     }
 

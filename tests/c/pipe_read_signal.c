@@ -69,6 +69,21 @@
  *                  (https://github.com/rrnewton/hermit/issues/4504). After
  *                  REPEAT_LIMIT signals the main thread gives up, releases
  *                  the reader with a byte and says so.
+ *   repeat-join    as repeat, but the main thread sends SIGUSR1 every
+ *                  100 us until it can join the reader
+ *                  (pthread_tryjoin_np), as the original jobserver reduction
+ *                  does. After the handler, rt_sigreturn took the signal the
+ *                  main thread had sent meanwhile before the reader ran any of
+ *                  its own code, every time, until the main thread's timeslice
+ *                  ended (https://github.com/rrnewton/hermit/issues/4505).
+ *                  After REPEAT_LIMIT signals the main thread gives up,
+ *                  releases the reader with a byte and says so.
+ *   resignal       not a read: a sibling raises SIGUSR1 at itself, and its
+ *                  handler raises it again until the main thread, after a
+ *                  1 ms sleep, tells it to stop. Every rt_sigreturn takes the
+ *                  next signal at once; under Hermit those deliveries continue
+ *                  the sibling's turn only until its timeslice ends, so the
+ *                  main thread still runs and the program ends.
  *
  * Each mode prints one line per observation, which equals the native run's.
  */
@@ -243,6 +258,71 @@ static int repeat_mode(void) {
     fail("pthread_join");
   }
   printf("joined, handled %d\n", handled > 0);
+  return 0;
+}
+
+static int repeat_join_mode(void) {
+  install(0, handler);
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, looping_reader, NULL) != 0) {
+    fail("pthread_create");
+  }
+  await_ready();
+  settle();
+  stop_reading = 1;
+  int sent = 0;
+  int joined = 0;
+  while (sent < REPEAT_LIMIT) {
+    if (pthread_tryjoin_np(thread, NULL) == 0) {
+      joined = 1;
+      break;
+    }
+    /* A reader that has exited but is not yet joined is not an error. */
+    (void)pthread_kill(thread, SIGUSR1);
+    sent++;
+    struct timespec pause = {0, 100000};
+    nanosleep(&pause, NULL);
+  }
+  if (!joined) {
+    printf("no join after %d signals\n", sent);
+    write_byte();
+    if (pthread_join(thread, NULL) != 0) {
+      fail("pthread_join");
+    }
+  }
+  printf("joined, handled %d\n", handled > 0);
+  return 0;
+}
+
+static volatile sig_atomic_t stop_resignal;
+static volatile sig_atomic_t resignals;
+
+static void resignal_handler(int signal) {
+  if (!stop_resignal) {
+    resignals++;
+    raise(signal);
+  }
+}
+
+static void* resignaling_thread(void* unused) {
+  (void)unused;
+  raise(SIGUSR1);
+  return NULL;
+}
+
+static int resignal_mode(void) {
+  install(0, resignal_handler);
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, resignaling_thread, NULL) != 0) {
+    fail("pthread_create");
+  }
+  struct timespec pause = {0, 1000000};
+  nanosleep(&pause, NULL);
+  stop_resignal = 1;
+  if (pthread_join(thread, NULL) != 0) {
+    fail("pthread_join");
+  }
+  printf("stopped, resignaled %d\n", resignals > 0);
   return 0;
 }
 
@@ -499,7 +579,7 @@ int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(stderr,
             "usage: %s eintr|restart|ignored|blocked|ready|eof|ready2|cancel|process|write-zero|write-room|write-partial|"
-            "write-partial-blocked|write-partial-ignored|waitpid|repeat\n",
+            "write-partial-blocked|write-partial-ignored|waitpid|repeat|repeat-join|resignal\n",
             argv[0]);
     return 2;
   }
@@ -522,6 +602,12 @@ int main(int argc, char** argv) {
   }
   if (strcmp(mode, "repeat") == 0) {
     return repeat_mode();
+  }
+  if (strcmp(mode, "repeat-join") == 0) {
+    return repeat_join_mode();
+  }
+  if (strcmp(mode, "resignal") == 0) {
+    return resignal_mode();
   }
   if (strcmp(mode, "eintr") == 0 || strcmp(mode, "restart") == 0 ||
       strcmp(mode, "ignored") == 0 || strcmp(mode, "blocked") == 0 ||

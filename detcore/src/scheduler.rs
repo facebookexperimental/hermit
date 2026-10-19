@@ -10106,6 +10106,34 @@ impl Scheduler {
         }))
     }
 
+    /// The queued thread whose filed request is a signal delivery it reached
+    /// straight from its own `rt_sigreturn`, in a timeslice that stop did not
+    /// end (`Resources::continues_sigreturn`), if any, in run-queue order.
+    /// Step 3 grants it before any other ordinary thread: Linux makes that
+    /// delivery on the same return to user space as the `rt_sigreturn`,
+    /// before any instruction of the interrupted code runs. Putting it behind
+    /// the other runnable threads let a sibling that signals it once per turn
+    /// re-arm the signal at every `rt_sigreturn`, so the thread never ran its
+    /// own code (<https://github.com/rrnewton/hermit/issues/4505>). A thread
+    /// held at a happens-before gate is not preferred; the gate decides it.
+    fn first_sigreturn_continuation(&self) -> Option<DetTid> {
+        self.run_queue.tids().copied().find(|&thread| {
+            self.run_queue.contains_non_polling_tid(thread)
+                && !self
+                    .happens_before
+                    .as_ref()
+                    .is_some_and(|hb| hb.parked.contains(&thread))
+                && self
+                    .next_turns
+                    .get(&thread)
+                    .and_then(|next_turn| next_turn.req.try_read())
+                    .and_then(Result::ok)
+                    .is_some_and(|request| {
+                        request.continues_sigreturn && Self::is_inbound_signal_turn(&request)
+                    })
+        })
+    }
+
     /// The `sigchld_takers` thread step 3 resumes first, if any (see there).
     /// A taker leaves the set once its copy is gone from the shared queue
     /// (the send window is closed: it, or another thread, took it) and its
@@ -12307,7 +12335,15 @@ impl Scheduler {
             // caller), so it is the thread that takes the process-directed
             // copy (`sigchld_takers`).
             let taker = self.first_sigchld_taker();
-            let next_dtid = match self.queued_group_exit_decider().or(taker).or(gated_child) {
+            // Then a delivery that continues its thread's own `rt_sigreturn`
+            // (`first_sigreturn_continuation`), after a vfork child, which
+            // Linux runs while it suspends only the caller.
+            let next_dtid = match self
+                .queued_group_exit_decider()
+                .or(taker)
+                .or(gated_child)
+                .or_else(|| self.first_sigreturn_continuation())
+            {
                 Some(child) => self
                     .run_queue
                     .tentative_pop_tid(child)
@@ -26593,6 +26629,48 @@ mod test {
                 }),
                 "decides_itself {decides_itself}"
             );
+        }
+    }
+
+    /// A signal delivery a thread reached straight from its own `rt_sigreturn`
+    /// (`Resources::continues_sigreturn`) is selected before a thread queued
+    /// ahead of it; the same request without the mark waits its turn
+    /// (https://github.com/rrnewton/hermit/issues/4505).
+    #[test]
+    fn a_delivery_that_continues_its_threads_sigreturn_runs_first() {
+        for continues in [false, true] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            let sender = DetTid::from_raw(100);
+            let target = DetTid::from_raw(101);
+            register_known_thread(&mut scheduler, sender);
+            register_known_thread(&mut scheduler, target);
+            let mut other = Resources::new(sender);
+            other.insert(
+                ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR2)),
+                Permission::RW,
+            );
+            let mut delivery = Resources::new(target);
+            delivery.insert(
+                ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
+                Permission::RW,
+            );
+            delivery.continues_sigreturn = continues;
+            scheduler.next_turns.get_mut(&sender).unwrap().req = Ivar::full(Ok(other));
+            scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(delivery));
+            scheduler.runqueue_push_back(sender);
+            scheduler.runqueue_push_back(target);
+
+            assert_eq!(
+                scheduler.first_sigreturn_continuation(),
+                continues.then_some(target)
+            );
+            let (selected, _, _) = scheduler.step3_peek().unwrap();
+            assert_eq!(
+                selected,
+                if continues { target } else { sender },
+                "continues {continues}"
+            );
+            scheduler.run_queue.undo_tentative_pop();
         }
     }
 

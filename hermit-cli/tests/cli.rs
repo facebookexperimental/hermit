@@ -31351,6 +31351,68 @@ fn a_polled_read_signaled_again_and_again_is_interrupted() {
     );
 }
 
+/// A reader that a sibling signals every 100 us until it can join the reader
+/// (`pthread_tryjoin_np`) gets past its handler and exits, and the run
+/// verifies at bitwise parity. After each handler, `rt_sigreturn` took the
+/// signal the sibling had sent meanwhile before the reader ran any of its own
+/// code: the delivery waited behind the sibling's next turn, which sent
+/// another. The guest gave up after 1000 signals
+/// (https://github.com/rrnewton/hermit/issues/4505). The expected line is the
+/// native run's.
+#[test]
+fn a_reader_signaled_until_joined_gets_past_its_handler() {
+    let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--",
+        guest.as_str(),
+        "repeat-join",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "joined, handled 1\n");
+    let log = stderr(&output);
+    assert!(
+        log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+        "comparison was not canonical:\n{log}"
+    );
+    assert!(
+        log.contains(":: Success: deterministic. Determinism verified."),
+        "verification failed:\n{log}"
+    );
+}
+
+/// A thread whose handler raises its own signal again takes the next one at
+/// every `rt_sigreturn`; those deliveries continue its turn only until its
+/// timeslice ends, so the main thread still runs, stops it and joins it, and
+/// the run verifies at bitwise parity
+/// (https://github.com/rrnewton/hermit/issues/4505). The expected line is the
+/// native run's.
+#[test]
+fn a_handler_that_raises_its_own_signal_does_not_hold_the_cpu() {
+    let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--",
+        guest.as_str(),
+        "resignal",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "stopped, resignaled 1\n");
+    let log = stderr(&output);
+    assert!(
+        log.contains(":: Success: deterministic. Determinism verified."),
+        "verification failed:\n{log}"
+    );
+}
+
 /// A process-directed signal a thread sends to its own multi-threaded process
 /// goes to the sender, before `kill` returns, exactly as Linux delivers it,
 /// when the schedule fixes the kernel's choice and the sender's dequeue

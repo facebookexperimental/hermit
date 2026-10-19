@@ -581,6 +581,15 @@ pub struct Resources {
     /// (<https://github.com/rrnewton/hermit/issues/4187>).
     #[serde(default)]
     pub(crate) decides_signal_interruption_itself: bool,
+    /// Set on an `InboundSignal` request whose signal stop the thread reached
+    /// straight from its own `rt_sigreturn`, in a timeslice that stop did not
+    /// end. Linux makes that delivery on the same return to user space, with
+    /// no instruction of the interrupted code in between, so step 3 grants it
+    /// before any other thread runs (`Scheduler::first_sigreturn_continuation`,
+    /// <https://github.com/rrnewton/hermit/issues/4505>). Never set for
+    /// `SIGCHLD`, whose delivery the host-async rules place.
+    #[serde(default)]
+    pub(crate) continues_sigreturn: bool,
 }
 
 impl fmt::Debug for Resources {
@@ -633,6 +642,9 @@ impl fmt::Debug for Resources {
         if self.decides_signal_interruption_itself {
             debug.field("decides_signal_interruption_itself", &true);
         }
+        if self.continues_sigreturn {
+            debug.field("continues_sigreturn", &true);
+        }
         debug.finish()
     }
 }
@@ -671,6 +683,7 @@ impl Resources {
             in_guest_sleep_sigalrm: None,
             signal_state_task: None,
             decides_signal_interruption_itself: false,
+            continues_sigreturn: false,
         }
     }
 
@@ -709,6 +722,8 @@ impl Resources {
             self.signal_state_task = other.signal_state_task;
         }
         self.decides_signal_interruption_itself |= other.decides_signal_interruption_itself;
+        // A combined operation is a continuation only if both parts are.
+        self.continues_sigreturn &= other.continues_sigreturn;
         self.replay_served_from_log |= other.replay_served_from_log;
         self.polls_guest_state_only |= other.polls_guest_state_only;
         self.waits_until_nothing_else_can_run |= other.waits_until_nothing_else_can_run;

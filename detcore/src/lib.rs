@@ -1023,6 +1023,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         signal: SigWrapper,
     ) -> Result<Option<SigWrapper>, Errno> {
+        // Whether this stop comes straight from the thread's own
+        // `rt_sigreturn`, taken before any hook of this event clears it.
+        let from_sigreturn = std::mem::take(&mut guest.thread_state_mut().returned_from_sigreturn);
         if signal.signal() == Some(Signal::SIGINT) && self.cfg.sigint_instakill {
             warn!("Fatal: Exiting hermit container immediately upon SIGINT");
             // ⚠️ NOT A REFUSAL. The operator interrupted the run; hermit examined
@@ -1108,7 +1111,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             if guest.thread_state().own_signal_turn_hold == Some(signal.raw()) {
                 guest.thread_state_mut().own_signal_turn_hold = None;
             }
+            let timeslice = guest.thread_state().stats.timeslice_count;
             self.pre_handler_hook(guest, false, CheckIn::Event).await;
+            // The delivery continues the thread's turn only while the slice
+            // that ran its `rt_sigreturn` is still open: a slice this stop
+            // ended has already yielded, so the delivery waits its turn as
+            // any other does, and a thread whose handlers keep raising
+            // signals cannot hold the CPU past its slice.
+            let continues_sigreturn = from_sigreturn
+                && signal.signal() != Some(Signal::SIGCHLD)
+                && guest.thread_state().stats.timeslice_count == timeslice;
 
             // For `hermit run --verify`: a guest that faulted on an illegal
             // instruction may have run code that made syscalls Detcore never
@@ -1169,9 +1181,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Read-write marks this as the delivery itself, which the
             // scheduler's write-only wakes of a signaled sleeper are not
             // (`Scheduler::thread_timer_copies`).
-            let request = guest
+            let mut request = guest
                 .thread_state_mut()
                 .mk_request(ResourceID::InboundSignal(signal), Permission::RW);
+            request.continues_sigreturn = continues_sigreturn;
             resource_request(guest, request).await;
             // Under `--pipe-wake-latency`, a delivery that ends the process
             // dooms its threads at this committed turn, before their
@@ -1411,6 +1424,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // and a wake that syscall made no longer ends the slice.
         guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
         guest.thread_state_mut().yield_after_futex_wake = false;
+        // Any event ends the window right after an `rt_sigreturn`; a signal
+        // stop reads the flag before calling this hook.
+        guest.thread_state_mut().returned_from_sigreturn = false;
         let dettid = guest.thread_state().dettid;
         let evs = self.update_logical_time_rcbs(guest, precise_branch).await;
 
@@ -2207,6 +2223,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         report: reverie::SigreturnReport,
     ) {
         crate::syscalls::signal_shadow::record_sigreturn_report(thread_state, report);
+        // Where the backend reports the call instead of passing it to
+        // `handle_syscall_event` (ptrace), this is the thread's last event
+        // before a signal its restored mask unblocks is delivered
+        // (`returned_from_sigreturn`).
+        thread_state.returned_from_sigreturn = true;
     }
 
     /// NOTE: these subscriptions are used ONLY for hermit run mode.  Hermit record has its own
@@ -3016,6 +3037,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     yield_after_futex_wake: false,
                     pipe_handoff_due: None,
                     own_signal_turn_hold: None,
+                    returned_from_sigreturn: false,
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,
@@ -4729,6 +4751,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::PassThrough if call.number() == Sysno::rt_sigreturn => {
                 crate::syscalls::signal_shadow::record_rt_sigreturn(guest).await;
                 self.observe_sigreturn_mask(guest).await;
+                // A signal the restored mask unblocks is delivered on this
+                // same return to user space (`returned_from_sigreturn`).
+                guest.thread_state_mut().returned_from_sigreturn = true;
                 self.passthrough(guest, call).await
             }
             SyscallClassification::PassThrough => self.passthrough(guest, call).await,

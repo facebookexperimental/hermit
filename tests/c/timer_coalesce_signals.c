@@ -999,7 +999,12 @@ static void resend_while_delivering(void) {
   pthread_t t;
   pthread_create(&t, NULL, rs_spinner, NULL);
   while (!atomic_load(&rs_ready)) sched_yield();
-  for (int i = 0; i < 300; i++) {
+  /* 40 sends, not 300: since the delivery that continues an rt_sigreturn
+   * runs at once (https://github.com/rrnewton/hermit/issues/4505), the
+   * spinner runs its own loop for a whole timeslice after every other
+   * delivery, about 140 ms of wall time under a debug Hermit. 40 sends still
+   * land in a delivery's wait about 20 times. */
+  for (int i = 0; i < 40; i++) {
     syscall(SYS_tgkill, getpid(), atomic_load(&rs_tid), SIGUSR1);
     sched_yield();
   }
