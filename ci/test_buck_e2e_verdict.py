@@ -517,6 +517,39 @@ class RunTest(unittest.TestCase):
                 self.assertEqual(x_rows, [(rerun["rows"][0]["outcome"], 1)])
                 self.assertEqual(len(calls_in(self.calls)), 1, "the run was not judged once, after the rerun")
 
+    def test_a_cell_whose_retry_was_withheld_on_re_runs_that_retry_locally_once(self):
+        """Attempt 1 failed on RE and the retry Tpx gave it landed on a worker that
+        withheld the cell (c-programs/sigreturn-preemption on 2026-10-19): the cell
+        runs once more locally without a Tpx retry, and that run is its attempt 2."""
+        buck2_calls = self.root / "buck2-calls.jsonl"
+        x_on_re = [ingest_test.execution(ingest_test.X, 100, "FAIL", "rx1"),
+                   ingest_test.withheld_on("re", ingest_test.X, 110, "rx2")]
+        for name, rerun, status in (
+            ("the local attempt passes", ingest_test.execution(ingest_test.X, 200, "PASS", "rx3"), 0),
+            ("the local attempt fails", ingest_test.execution(ingest_test.X, 200, "FAIL", "rx3"), 1),
+        ):
+            with self.subTest(name):
+                for directory in ("import", "work"):
+                    shutil.rmtree(self.root / directory, ignore_errors=True)
+                buck2_calls.unlink(missing_ok=True)
+                self.calls.unlink(missing_ok=True)
+                runs = {"re": x_on_re, "local": [ingest_test.Y_PASSES], ingest_test.X_SLUG: [rerun]}
+                process = self.run_buck_e2e("hybrid", runs, buck2_status=0, FAKE_BUCK2_CALLS=str(buck2_calls))
+                self.assertEqual(process.returncode, status, process.stdout + process.stderr)
+                self.assertIn("1 cell(s) had their retry withheld on RE; running that attempt locally: "
+                              f"{ingest_test.X_SLUG}\n", process.stderr)
+                self.assertNotIn("withheld on every RE worker", process.stderr)
+                reruns = [args for args in calls_in(buck2_calls) if f"//ci/buck-e2e:{ingest_test.X_SLUG}" in args]
+                self.assertEqual(len(reruns), 1, calls_in(buck2_calls))
+                self.assertIn("hermit_e2e.routing=local", reruns[0])
+                self.assertEqual(reruns[0][reruns[0].index("--retry") + 1], "0")
+                self.assertEqual(len(calls_in(buck2_calls)), 3)
+                rows = [json.loads(line) for path in (self.root / "import").rglob("results.jsonl")
+                        for line in path.read_text().splitlines()]
+                x_rows = [(row["outcome"], row["attempt"]) for row in rows if row["test"] == "t/x"]
+                self.assertEqual(x_rows, [("FAIL", 1), (rerun["rows"][0]["outcome"], 2)])
+                self.assertEqual(len(calls_in(self.calls)), 1, "the run was not judged once, after the rerun")
+
     def test_a_checkout_that_changes_during_the_local_rerun_has_no_verdict(self):
         runs = {"re": [ingest_test.withheld_on("re", ingest_test.X, 100, "rx1")], "local": [ingest_test.Y_PASSES],
                 ingest_test.X_SLUG: [ingest_test.execution(ingest_test.X, 200, "PASS", "rx2")]}

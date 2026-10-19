@@ -39,7 +39,6 @@ use hermit_manifest_plan::runner::append_result;
 use hermit_manifest_plan::runner::backend_capability;
 use hermit_manifest_plan::runner::cell_declared_stdout;
 use hermit_manifest_plan::runner::cell_expected_guest_exit;
-use hermit_manifest_plan::runner::cell_relaxations;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::checked_add_cpu_usage;
@@ -53,6 +52,7 @@ use hermit_manifest_plan::runner::ptrace_cell_capability;
 use hermit_manifest_plan::runner::refused_on_an_inexact_branch_counter;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::retries_product_failures;
+use hermit_manifest_plan::runner::row_records_cell_relaxations;
 use hermit_manifest_plan::runner::run_cell;
 use hermit_manifest_plan::runner::skid_overshoot_only_reports;
 use hermit_manifest_plan::runner::validate_source_snapshot;
@@ -2944,10 +2944,12 @@ fn attempt_retry_cause(
     // cell's manifest declares; an imported row recorded under another
     // declaration or recipe does not choose its own. An executed row either
     // rule can admit always records its cell's declarations.
+    // The level relaxations are the producing host's
+    // ([`row_records_cell_relaxations`]).
     let records_this_cell = || {
         result.expected_guest_exit == cell_expected_guest_exit(cell)
             && result.declared_stdout.as_ref() == Some(&cell_declared_stdout(cell))
-            && result.relaxations == cell_relaxations(cell)
+            && row_records_cell_relaxations(cell, result)
     };
     if host_input_change_only(result) && records_this_cell() {
         return Some(RetryCause::HostInputChanged);
@@ -4750,7 +4752,9 @@ rundir.mkdir()
     /// divergence and then an overshoot, that is the divergence's FAIL.
     /// Imported (`E2E_IMPORT_RESULTS`), the skid-then-pass history earns the
     /// same counted SKID-RETRY and selects the same PASS as executed, with no
-    /// producer retry dropped. An imported skid row its retained evidence does
+    /// producer retry dropped. So does one whose producer ran at the relaxed level
+    /// (as a Buck RE worker without CPUID faulting does) and recorded that
+    /// level's flag, imported at this host's level. An imported skid row its retained evidence does
     /// not decide as typed skid-only (a report that does not match its digest,
     /// another stdout declaration, a vacuous comparison, other relaxations, an
     /// undecided SaBRe path), and an imported ERROR that is not a skid at all,
@@ -4888,6 +4892,7 @@ rundir.mkdir()
         for (scenario, succeeds, launched, skid_retries, product_retries) in [
             ("skid-then-match", true, 2, 1, 0),
             ("skid-then-match-sabre", true, 2, 1, 0),
+            ("skid-then-match-relaxed-producer", true, 2, 1, 0),
             ("skid-twice", false, 2, 1, 0),
             ("skid-no-retry", false, 1, 0, 0),
             ("unmarked-skid", false, 1, 0, 0),
@@ -4992,6 +4997,7 @@ calls=root/'invocations'
 n=len(calls.read_text().splitlines()) if calls.exists() else 0
 with calls.open('a') as f:f.write(json.dumps(a)+'\n')
 plan={'skid-then-match':['skid','matched'],'skid-then-match-sabre':['skid','matched'],
+ 'skid-then-match-relaxed-producer':['skid','matched'],
  'skid-twice':['skid','skid'],
  'skid-no-retry':['skid'],'unmarked-skid':['unmarked'],'diverged-marked':['diverged','diverged'],
  'diverged-then-skid':['diverged','skid'],'rejected-guest-skid':['rejected'],
@@ -5026,6 +5032,13 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                 .env("E2E_KERNEL_VERSION", "skid-control")
                 .env("E2E_KEEP_VERIFY_LOGS", "1")
                 .env("DAGRUN_TEST_COUNTS_PATH", path.join("counts.json"))
+                // A producer at the relaxed level, as a Buck RE worker without
+                // CPUID faulting is; its rows are imported below by a child at
+                // this host's level.
+                .envs(
+                    (scenario == "skid-then-match-relaxed-producer")
+                        .then_some(("E2E_STRICTNESS_LEVEL", "relaxed")),
+                )
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
@@ -5078,7 +5091,10 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             );
             let first = &rows[0];
             match scenario {
-                "skid-then-match" | "skid-then-match-sabre" | "skid-twice" => {
+                "skid-then-match"
+                | "skid-then-match-sabre"
+                | "skid-then-match-relaxed-producer"
+                | "skid-twice" => {
                     let final_outcome = if succeeds { "PASS" } else { "ERROR" };
                     assert_eq!(first.outcome, "ERROR", "{scenario}");
                     assert_eq!(rows[1].outcome, final_outcome, "{scenario}");
@@ -5625,7 +5641,27 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                     observations.binding.outer_attempt = row.attempt;
                     serde_json::to_value(row).unwrap()
                 };
-                let variants = if backend == "sabre" {
+                if scenario == "skid-then-match-relaxed-producer" {
+                    // The producer recorded the relaxed level and its flag.
+                    assert_eq!(
+                        first.strictness.as_ref().map(|strictness| strictness.level),
+                        Some(hermit_manifest_plan::runner::StrictnessLevel::Relaxed),
+                        "{rows:#?}"
+                    );
+                    assert!(
+                        first
+                            .relaxations
+                            .iter()
+                            .any(|relaxation| relaxation.starts_with("--no-virtualize-cpuid: ")),
+                        "{rows:#?}"
+                    );
+                }
+                let variants = if scenario == "skid-then-match-relaxed-producer" {
+                    // Imported by a child at this host's level, the skid row
+                    // still earns its retry: its level relaxations are its
+                    // producer's. The other variants are the plain history's.
+                    vec![("import-control", Expect::Retried)]
+                } else if backend == "sabre" {
                     vec![
                         ("import-control", Expect::Retried),
                         ("import-pathless-pass", Expect::Retried),
@@ -10523,7 +10559,8 @@ sys.exit(1 if failed else 0)
                 "declared_stdout": {"exact": null, "contains": null}
             });
             // The cell's relaxations, as an executed row of it records them.
-            row["relaxations"] = serde_json::json!(super::cell_relaxations(&compat_cat));
+            row["relaxations"] =
+                serde_json::json!(hermit_manifest_plan::runner::cell_relaxations(&compat_cat));
             row["attempts"] = serde_json::json!([attempt]);
             serde_json::from_value(row).unwrap()
         };

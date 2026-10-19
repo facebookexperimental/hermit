@@ -38,7 +38,10 @@
 # executed no cell, fails, so Tpx retries it on another worker. ingest.py numbers no
 # withheld execution as an attempt. A cell withheld on every RE execution is run once
 # more, locally (-c hermit_e2e.routing=local, only those targets), and the run is
-# ingested again, so import mode never judges a claim this machine did not make.
+# ingested again, so import mode never judges a claim this machine did not make. A cell
+# whose retry after a failed attempt was withheld runs once more locally too, without a
+# Tpx retry (--retry 0), so that execution is the attempt Tpx gave it and the cell keeps
+# at most two attempts.
 # The release hermit is built unstamped (-c hermit_release.unstamped=true: no commit
 # hash or build date in the binary), so a commit that changes no compiled source
 # rebuilds nothing and its cells stay cached. Only scripts/build-buck-release.rs stamps.
@@ -157,9 +160,10 @@ collect() { # collect NAME...: append each invocation's test-run id to ids, or e
     done
 }
 
-ingest() { # ingest: rows for every invocation in ids, and the cells withheld on every RE execution
+ingest() { # ingest: rows for every invocation in ids, and the cells withheld on RE that run again locally
     python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" --work "$work/artifacts" \
-        --local-artifacts "$root/buck-out/v2/test/execution" --withheld-on-re "$work/withheld-on-re" "${failed_logs[@]}" \
+        --local-artifacts "$root/buck-out/v2/test/execution" --withheld-on-re "$work/withheld-on-re" \
+        --withheld-retries "$work/withheld-retries" "${failed_logs[@]}" \
         --buck2 "$buck2" "${event_logs[@]}" "${ids[@]}" || {
         echo "ci/buck-e2e/run: ingest.py could not turn the run's results into rows (above); the run has no verdict" >&2
         exit 1
@@ -177,14 +181,32 @@ else
 fi
 require_staged_source "after the run" 1
 ingest
-if [[ -s $work/withheld-on-re ]]; then
-    mapfile -t withheld <"$work/withheld-on-re"
-    echo "ci/buck-e2e/run: ${#withheld[@]} cell(s) were withheld on every RE worker that ran them; running them locally:" \
-        "${withheld[*]}" >&2
-    invoke rerun-local "${withheld[@]/#/"//ci/buck-e2e:"}" -c hermit_e2e.routing=local
-    collect rerun-local
+if [[ -s $work/withheld-on-re || -s $work/withheld-retries ]]; then
+    reruns=()
+    if [[ -s $work/withheld-on-re ]]; then
+        mapfile -t withheld <"$work/withheld-on-re"
+        echo "ci/buck-e2e/run: ${#withheld[@]} cell(s) were withheld on every RE worker that ran them; running them locally:" \
+            "${withheld[*]}" >&2
+        invoke rerun-local "${withheld[@]/#/"//ci/buck-e2e:"}" -c hermit_e2e.routing=local
+        reruns+=(rerun-local)
+    fi
+    if [[ -s $work/withheld-retries ]]; then
+        mapfile -t retries <"$work/withheld-retries"
+        echo "ci/buck-e2e/run: ${#retries[@]} cell(s) had their retry withheld on RE; running that attempt locally:" \
+            "${retries[*]}" >&2
+        tpx=(-- --retry 0 --no-retry-on-skip)
+        invoke retry-local "${retries[@]/#/"//ci/buck-e2e:"}" -c hermit_e2e.routing=local
+        tpx=(-- --retry 1 --no-retry-on-skip)
+        reruns+=(retry-local)
+    fi
+    collect "${reruns[@]}"
     require_staged_source "after the local rerun" 1
     ingest
+    if [[ -s $work/withheld-retries ]]; then
+        echo "ci/buck-e2e/run: after the local rerun, cells still end with a retry withheld on RE: $(paste -sd' ' "$work/withheld-retries");" \
+            "the run has no verdict" >&2
+        exit 1
+    fi
     if [[ -s $work/withheld-on-re ]]; then
         echo "ci/buck-e2e/run: after the local rerun, cells still have only RE claims: $(paste -sd' ' "$work/withheld-on-re");" \
             "the run has no verdict" >&2

@@ -201,6 +201,8 @@ class IngestTest(unittest.TestCase):
             str(work / "fetched"),
             "--withheld-on-re",
             str(work / "withheld-on-re"),
+            "--withheld-retries",
+            str(work / "withheld-retries"),
         ]
         if local:
             buck_out = work / "buck-out-test-execution"
@@ -219,13 +221,15 @@ class IngestTest(unittest.TestCase):
         self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
         self.assertIn(reason, process.stderr)
 
-    def accepted(self, runs, local=(), withheld_on_re=()):
+    def accepted(self, runs, local=(), withheld_on_re=(), withheld_retries=()):
         """Return ingest.py's printed summary, the bucket's rows as (cell,
         attempt, outcome, run id), and the bucket's summary.json. The cells it
-        lists as withheld on RE by every execution must be WITHHELD_ON_RE."""
+        lists as withheld on RE by every execution must be WITHHELD_ON_RE, and
+        those whose retry after an attempt was withheld WITHHELD_RETRIES."""
         work, process = self.ingest(runs, local)
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual((work / "withheld-on-re").read_text(), "".join(f"{slug}\n" for slug in withheld_on_re))
+        self.assertEqual((work / "withheld-retries").read_text(), "".join(f"{slug}\n" for slug in withheld_retries))
         bucket = work / "out" / "portable" / "manifest_cat"
         written = [json.loads(line) for line in (bucket / "results.jsonl").read_text().splitlines()]
         rows = [
@@ -442,16 +446,42 @@ class IngestTest(unittest.TestCase):
         self.assertEqual(rows, [(X, 1, "FAIL", "rx1"), (X, 2, "PASS", "rx2"), (Y, 1, "PASS", "ry1")])
         self.assertEqual(printed["withheld_on_re_executions"], 0)
 
-    def test_a_claim_on_re_after_a_row_leaves_the_row_and_the_claim_for_import_mode(self):
-        """Import mode refuses a cell with both a row and a claim; skipping the
-        claim's number must not hide either."""
+    def test_a_retry_withheld_on_re_after_a_failed_attempt_is_rerun_locally(self):
+        """The withheld retry is not an attempt, so its claim is not the cell's
+        outcome: the failed attempt's row stays, nothing claims the cell, and
+        the cell is listed for the local rerun that gives it its retry. Before
+        2026-10-19 the claim joined summary.json and import mode refused the
+        cell for holding both a row and a claim, hiding the attempt's own
+        failure (a skid overshoot) behind that conflict."""
         printed, rows, summary = self.accepted(
-            {"RUN": [execution(X, 100, "FAIL", "rx1"), withheld_on("re", X, 200, "rx2"), Y_PASSES]}
+            {"RUN": [execution(X, 100, "FAIL", "rx1"), withheld_on("re", X, 200, "rx2"), Y_PASSES]},
+            withheld_retries=[X_SLUG],
         )
         self.assertEqual(rows, [(X, 1, "FAIL", "rx1"), (Y, 1, "PASS", "ry1")])
-        self.assertEqual(summary["host_inapplicable_cells"], [claim(X)])
-        self.assertEqual(printed["final_outcomes"], {"HOST-INAPPLICABLE": 1, "PASS": 1})
+        self.assertNotIn(claim(X), summary.get("host_inapplicable_cells") or [])
+        self.assertEqual(printed["final_outcomes"], {"FAIL": 1, "PASS": 1})
+        self.assertEqual(printed["withheld_on_re_executions"], 1)
         self.assertEqual(printed["withheld_on_re_every_execution"], 0)
+        self.assertEqual(printed["withheld_retries_on_re"], 1)
+        # The local rerun is the failed attempt's retry: attempt 2.
+        for outcome in ("PASS", "FAIL"):
+            with self.subTest(rerun=outcome):
+                printed, rows, summary = self.accepted(
+                    {
+                        "RUN": [execution(X, 100, "FAIL", "rx1"), withheld_on("re", X, 200, "rx2"), Y_PASSES],
+                        "RERUN": [execution(X, 300, outcome, "rx3")],
+                    }
+                )
+                self.assertEqual(rows, [(X, 1, "FAIL", "rx1"), (X, 2, outcome, "rx3"), (Y, 1, "PASS", "ry1")])
+                self.assertNotIn(claim(X), summary.get("host_inapplicable_cells") or [])
+                self.assertEqual(printed["final_outcomes"], {outcome: 1, "PASS": 1} if outcome == "FAIL"
+                                 else {"PASS": 2})
+        # A claim before a row is still skipped, and the cell is not listed.
+        printed, rows, summary = self.accepted(
+            {"RUN": [withheld_on("re", X, 100, "rx1"), execution(X, 200, "FAIL", "rx2"), Y_PASSES]}
+        )
+        self.assertEqual(rows, [(X, 1, "FAIL", "rx2"), (Y, 1, "PASS", "ry1")])
+        self.assertEqual(printed["withheld_retries_on_re"], 0)
 
     def test_a_cell_withheld_on_re_by_every_execution_is_listed_for_a_local_rerun(self):
         printed, rows, summary = self.accepted(

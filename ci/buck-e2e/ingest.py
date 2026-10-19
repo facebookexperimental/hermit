@@ -20,7 +20,9 @@ then publishes the result files the cargo flow's e2e nodes write. Read directly,
 files skip all of those checks, and summary.json's counts leave out every cell whose
 final execution wrote no summary.json.
 summary.json aggregates each cell's final execution: counts are summed and cell lists
-joined, which is what one harness process over the bucket writes.
+joined, which is what one harness process over the bucket writes. A cell's final
+execution is its last one that did not withhold the cell on an RE worker (below), when it
+has one: such an execution is not an attempt, so its claim is not the cell's outcome.
 summary.json's evidence_complete_executions lists each execution whose result.json
 (written by cell.sh) records complete evidence, by its run id; import mode refuses a
 PASS whose own execution is not listed. An execution's rows, result.json and run_id.
@@ -50,6 +52,11 @@ or without it, and a missing or unreadable event log only makes the cause say so
 has no row and was withheld on RE by every one of its executions, one per line. Import
 mode would judge such a cell's claim against the machine that imports it, which did not
 make it, so ci/buck-e2e/run runs these cells again locally and ingests once more.
+--withheld-retries FILE: likewise, each cell whose last execution withheld it on RE after
+an earlier execution ran it: the retry Tpx gave a failed attempt never ran (on 2026-10-19
+c-programs/sigreturn-preemption failed attempt 1 with a skid overshoot on RE and its retry
+landed on a worker without an exact branch counter). ci/buck-e2e/run runs these once more
+locally without a Tpx retry, so that execution is the cell's next attempt.
 A cell with no rows is host-inapplicable only if it ran and every one of its executions
 says so in its own summary.json. Any other plan cell with no rows is an error, and so is
 a cell outside the plan. Executions of one cell that end in the same second are refused:
@@ -480,6 +487,7 @@ def main():
     ap.add_argument("--failed-verify-logs", metavar="DIR", help="keep the verify logs of every execution that did not pass here")
     ap.add_argument("--failed-log-max-bytes", type=int, default=FAILED_LOG_MAX_BYTES, help=argparse.SUPPRESS)  # tests only
     ap.add_argument("--withheld-on-re", help="write the target name of each cell withheld on RE by every execution here")
+    ap.add_argument("--withheld-retries", help="write the target name of each cell whose retry after an attempt was withheld on RE here")
     ap.add_argument("--event-log", action="append", default=[], help="an invocation's Buck event log, read to name why an execution wrote no row")
     ap.add_argument("--buck2", default=os.environ.get("BUCK2", "buck2"), help="the buck2 that reads --event-log")
     ap.add_argument("run_ids", nargs="+")
@@ -682,9 +690,13 @@ def main():
     no_row_entries = collections.defaultdict(list)  # (lane, category) -> [(cell, attempt, testx end time)]
     withheld = 0  # executions that withheld their cell on an RE worker, which take no attempt number
     rerun_locally = []  # cells withheld on RE by every execution
+    retry_locally = []  # cells whose retry after an attempt was withheld on RE
     for cell, runs in per_cell.items():
         lane, category = want[cell]["lane"], want[cell]["category"]
-        final_rows, final_summary, _ = runs[-1]
+        # A withheld execution is not an attempt, so its claim is not the cell's
+        # outcome when another execution ran the cell.
+        ran = [run for run in runs if not withheld_on_re(cell, *run)]
+        final_rows, final_summary, _ = (ran or runs)[-1]
         if final_summary:
             summaries[(lane, category)].append(final_summary)
         c = want[cell]
@@ -692,8 +704,10 @@ def main():
             evidence_complete[(lane, category)].append(
                 {"test": c["test"], "mode": c["mode"], "backend": None if c["backend"] == "native" else c["backend"],
                  "run_id": run_id})
-        if all(withheld_on_re(cell, *run) for run in runs):
+        if not ran:
             rerun_locally.append(cell_slug(want[cell]))
+        elif withheld_on_re(cell, *runs[-1]):
+            retry_locally.append(cell_slug(want[cell]))
         attempt = 0
         for (rows, summary, route), end in zip(runs, per_cell_ends[cell]):
             if withheld_on_re(cell, rows, summary, route):
@@ -745,6 +759,9 @@ def main():
         with open(os.path.join(d, "summary.json"), "w") as f:
             json.dump(total, f, indent=2, sort_keys=True)
             f.write("\n")
+    if a.withheld_retries:
+        with open(a.withheld_retries, "w") as f:
+            f.writelines(slug + "\n" for slug in sorted(retry_locally))
     if a.withheld_on_re:
         with open(a.withheld_on_re, "w") as f:
             f.writelines(slug + "\n" for slug in sorted(rerun_locally))
@@ -768,6 +785,7 @@ def main():
                       "attempts": dict(attempts), "final_outcomes": dict(final),
                       "no_row_executions": len(no_row), "no_row_examples": sorted(no_row)[:20],
                       "withheld_on_re_executions": withheld, "withheld_on_re_every_execution": len(rerun_locally),
+                      "withheld_retries_on_re": len(retry_locally),
                       "evidence_complete_executions": sum(len(v) for v in evidence_complete.values()),
                       "verify_logs_restored": len(index) - len(unrestored), "verify_logs_unrestored": len(unrestored),
                       "verify_logs_unrestored_examples": unrestored[:5],

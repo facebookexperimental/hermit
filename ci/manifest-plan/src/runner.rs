@@ -2649,6 +2649,40 @@ fn supports_test_workdir(mode: &str, _backend: &str) -> bool {
     matches!(mode, "verify" | "replay" | "chaos" | "custom")
 }
 
+/// Whether `result` records the relaxations `cell` runs with on the host that
+/// produced it: [`cell_relaxations`] with that host's strictness level.
+///
+/// A level relaxation names its host's level ([`host_strictness`]), and a row
+/// imported from another host does not share the importing host's: a Buck RE
+/// worker without CPUID faulting runs `--no-virtualize-cpuid` where this host
+/// does not (on 2026-10-19 that refused the skid-overshoot retry of
+/// c-programs/sigreturn-preemption whose retry had passed). The producing
+/// host's level is the one the row's own capability verdicts give, or, when
+/// the row records an uncapped relaxed level, the forced relaxed level
+/// ([`STRICTNESS_LEVEL_ENV`]). Every relaxation the manifest declares is still
+/// the cell's own, and a row this host produced is held to this host's level.
+pub fn row_records_cell_relaxations(cell: &SelectedCell, result: &CellResult) -> bool {
+    let at_level = |forced: Option<&str>| {
+        host_strictness(
+            &result.host_capabilities,
+            result.exact_branch_counter.as_ref(),
+            forced,
+        )
+        .ok()
+        .map(|host_level| {
+            let mut producer = cell.clone();
+            producer.host_level = host_level;
+            cell_relaxations(&producer)
+        })
+    };
+    let recorded_relaxed = result.strictness.as_ref().is_some_and(|strictness| {
+        strictness.level == StrictnessLevel::Relaxed && !strictness.capped
+    });
+    result.relaxations == cell_relaxations(cell)
+        || at_level(None).as_ref() == Some(&result.relaxations)
+        || (recorded_relaxed && at_level(Some("relaxed")).as_ref() == Some(&result.relaxations))
+}
+
 /// The relaxations a row of `cell` records ([`CellResult::relaxations`]): each
 /// weaker-than-default setting its manifest recipe selects, with its reason.
 /// A retained row whose relaxations differ was recorded under another recipe,
@@ -11525,6 +11559,59 @@ corpus:
             }
             assert_eq!(cell_relaxations(&cell), relaxations, "{mode}");
         }
+    }
+
+    /// A row is held to its producing host's level: one from a host without
+    /// CPUID faulting (a Buck RE worker) records the relaxed level's flag,
+    /// which this strict host's cell does not, and still records its cell, as
+    /// does one from a producer forced to the relaxed level. The same
+    /// relaxations from a row whose own verdicts give the strict level, a
+    /// forced reason without a recorded relaxed level, and a relaxation the
+    /// manifest does not declare are refused.
+    #[test]
+    fn a_row_records_its_cells_relaxations_at_its_producers_level() {
+        let cell = verify_cell("ptrace", true, BTreeMap::new(), None);
+        assert_eq!(cell.host_level.level, StrictnessLevel::Strict);
+        let mut row = cell_result_that_located_nothing();
+        row.relaxations = cell_relaxations(&cell);
+        row.strictness = cell.strictness();
+        assert!(row_records_cell_relaxations(&cell, &row));
+
+        let mut remote = row.clone();
+        remote.host_capabilities.insert(
+            HostCapability::CpuidFaulting,
+            HostCapabilityVerdict {
+                present: false,
+                evidence: "fixture: no CPUID faulting".into(),
+            },
+        );
+        let mut producer = cell.clone();
+        producer.host_level = host_strictness(&remote.host_capabilities, None, None).unwrap();
+        assert_eq!(producer.host_level.level, StrictnessLevel::Relaxed);
+        remote.relaxations = cell_relaxations(&producer);
+        remote.strictness = producer.strictness();
+        assert_ne!(remote.relaxations, cell_relaxations(&cell));
+        assert!(row_records_cell_relaxations(&cell, &remote));
+
+        let mut claimed = remote.clone();
+        claimed.host_capabilities = row.host_capabilities.clone();
+        assert!(!row_records_cell_relaxations(&cell, &claimed));
+
+        let mut forced_cell = cell.clone();
+        forced_cell.host_level =
+            host_strictness(&row.host_capabilities, None, Some("relaxed")).unwrap();
+        let mut forced = row.clone();
+        forced.relaxations = cell_relaxations(&forced_cell);
+        forced.strictness = forced_cell.strictness();
+        assert!(row_records_cell_relaxations(&cell, &forced));
+        forced.strictness = cell.strictness();
+        assert!(!row_records_cell_relaxations(&cell, &forced));
+
+        let mut undeclared = remote.clone();
+        undeclared
+            .relaxations
+            .push("--no-rcb-time: fixture reason".into());
+        assert!(!row_records_cell_relaxations(&cell, &undeclared));
     }
 
     #[test]
