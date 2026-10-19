@@ -3709,7 +3709,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4515): 569, listed.
     // And select_timeout_folds_microseconds_into_seconds_as_linux: 570.
     // And +1 from a84cd832: 571.
-    ("test.cli", 571),
+    // And statx_reports_the_classic_and_the_unique_mount_id_as_linux_does and
+    // systemd_sysusers_reads_its_configuration_as_natively
+    // (https://github.com/rrnewton/hermit/issues/4519): 573, listed.
+    ("test.cli", 573),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4178,7 +4181,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same denied-user-namespace test: 503, listed.
     // And select_timeout_folds_microseconds_into_seconds_as_linux: 504.
     // And +1 from a84cd832: 505.
-    ("test.cli_on_host", 505),
+    // And the same two statx mount-ID tests: 507, listed.
+    ("test.cli_on_host", 507),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
