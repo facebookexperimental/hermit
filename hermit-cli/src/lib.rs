@@ -4476,23 +4476,18 @@ async fn dispatch_backend(
     ensure_backend_dispatch(backend)?;
 
     let stats_request = backend_stats::request(print_summary_to_json_file);
-    let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
-    if config.gdbserver {
-        builder = builder.gdbserver(config.gdbserver_port);
-        if config.sequentialize_threads {
-            // Inform gdbserver not to serialize guests because this is
-            // done by detcore already. Without this the gdbserver freezes
-            // the other threads around a breakpoint stop and waits for each
-            // to report, but under detcore they are parked in its scheduler
-            // rather than blocked in the kernel, so they cannot answer until
-            // the scheduler runs them -- which it cannot while the stopped
-            // thread holds its turn. The replay path already does this.
-            builder = builder.sequentialized_guest();
-        }
-    }
     let control = control
         .ok_or_else(|| Error::msg("ordinary ptrace requires its retained operation owner"))?;
-    let tracer = builder.backend_stats(stats_request).spawn().await?;
+    // A sequentialized guest tells gdbserver not to serialize its threads;
+    // see hermit_run_ptrace::spawn_tracer.
+    let tracer = hermit_run_ptrace::spawn_tracer(
+        command,
+        config.clone(),
+        config.gdbserver.then_some(config.gdbserver_port),
+        config.sequentialize_threads,
+        stats_request,
+    )
+    .await?;
     let stats_source = tracer.backend_stats();
     let (exit_status, global_state) = ptrace_completion::wait(tracer, control).await?;
     let dispatch_stats =
@@ -4798,23 +4793,18 @@ async fn dispatch_output_backend(
     command.stdin(output_backend_stdin()?);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
-    if config.gdbserver {
-        builder = builder.gdbserver(config.gdbserver_port);
-        if config.sequentialize_threads {
-            // Inform gdbserver not to serialize guests because this is
-            // done by detcore already. Without this the gdbserver freezes
-            // the other threads around a breakpoint stop and waits for each
-            // to report, but under detcore they are parked in its scheduler
-            // rather than blocked in the kernel, so they cannot answer until
-            // the scheduler runs them -- which it cannot while the stopped
-            // thread holds its turn. The replay path already does this.
-            builder = builder.sequentialized_guest();
-        }
-    }
     let control = control
         .ok_or_else(|| Error::msg("ordinary ptrace requires its retained operation owner"))?;
-    let tracer = builder.backend_stats(stats_request).spawn().await?;
+    // A sequentialized guest tells gdbserver not to serialize its threads;
+    // see hermit_run_ptrace::spawn_tracer.
+    let tracer = hermit_run_ptrace::spawn_tracer(
+        command,
+        config.clone(),
+        config.gdbserver.then_some(config.gdbserver_port),
+        config.sequentialize_threads,
+        stats_request,
+    )
+    .await?;
     let stats_source = tracer.backend_stats();
     let (output, global_state) = ptrace_completion::wait_with_output(tracer, control).await?;
     let dispatch_stats =

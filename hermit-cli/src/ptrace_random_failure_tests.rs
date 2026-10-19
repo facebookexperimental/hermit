@@ -279,10 +279,14 @@ mod real_random {
                 };
                 config.validate();
                 let config = crate::prepare_backend_config(config, crate::Backend::Ptrace);
-                let tracer = reverie_ptrace::TracerBuilder::<detcore::Detcore>::new(command)
-                    .config(config)
-                    .spawn()
-                    .await?;
+                let tracer = hermit_run_ptrace::spawn_tracer(
+                    command,
+                    config,
+                    None,
+                    false,
+                    reverie::BackendStatsRequest::DISABLED,
+                )
+                .await?;
                 let root = tracer.guest_pid().as_raw();
                 {
                     let mut facts = future_facts.borrow_mut();
