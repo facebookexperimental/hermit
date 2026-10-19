@@ -1120,8 +1120,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             // delivery waits its place behind them instead of being taken
             // right after the yield. And at most
             // `MAX_SIGRETURN_CONTINUATIONS` in a row
-            // (`consecutive_continuations`): with no timeslice end at all, a
-            // handler that raises its own signal would otherwise hold the
+            // (`consecutive_continuations`): in every mode, that cap is what
+            // stops a handler that raises its own signal from holding the
             // CPU for ever.
             let continues_sigreturn = from_sigreturn
                 && guest.thread_state().consecutive_continuations

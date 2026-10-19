@@ -3706,13 +3706,16 @@ fn default_timer_slack_ns() -> u64 {
 }
 
 /// The most deliveries in a row that continue their thread's own
-/// `rt_sigreturn` (`ThreadState::consecutive_continuations`): as many as
-/// Linux has standard signals, so no set of signals pending when a run
-/// begins is cut short, as one pending behind another restarted the cycle
-/// <https://github.com/rrnewton/hermit/issues/4505> fixes (Claude re-check of
-/// https://github.com/rrnewton/hermit/pull/4509). Nothing else runs during
-/// such a run, so it can outgrow the cap only through signals the thread
-/// raises itself, which the cap then hands back to the other threads.
+/// `rt_sigreturn` (`ThreadState::consecutive_continuations`). A chosen,
+/// bounded preference budget: as many as Linux has standard signals, so any
+/// set of distinct standard signals pending when a run begins is delivered
+/// before other threads run. A cap of 1 cut short a second pending signal
+/// and restarted the cycle <https://github.com/rrnewton/hermit/issues/4505>
+/// fixes (Claude re-check of https://github.com/rrnewton/hermit/pull/4509).
+/// It is not a promise that every backlog drains first: realtime signals
+/// queue several instances and a periodic timer can re-arm during a run
+/// (v6.12 kernel/signal.c:1070 and :695). Reaching the cap only drops the
+/// preference; no signal is lost, and the next delivery waits its turn.
 pub(crate) const MAX_SIGRETURN_CONTINUATIONS: u8 = 32;
 
 /// The Detcore per-thread state.
@@ -4040,9 +4043,11 @@ pub struct ThreadState<T> {
     /// How many of this thread's latest scheduler requests in a row were
     /// deliveries marked `Resources::continues_sigreturn`; any other request
     /// resets it. A delivery is marked only while it is below
-    /// [`MAX_SIGRETURN_CONTINUATIONS`]: with no timeslice end (as under
-    /// `--max-timeslice=disabled`) nothing else would stop a handler that
-    /// raises its own signal from holding the CPU for ever.
+    /// [`MAX_SIGRETURN_CONTINUATIONS`]. That cap is what stops a handler that
+    /// raises its own signal from holding the CPU for ever, in every mode: a
+    /// timeslice end did not interrupt such a run in practice (7,773
+    /// deliveries in 15 s without one), and under `--max-timeslice=disabled`
+    /// there is none.
     #[serde(default)]
     pub(crate) consecutive_continuations: u8,
 

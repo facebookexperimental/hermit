@@ -31413,14 +31413,15 @@ fn a_reader_with_two_signals_pending_at_each_return_gets_past_its_handler() {
 }
 
 /// A thread whose handler raises its own signal again takes the next one at
-/// every `rt_sigreturn`. Those deliveries continue its turn at most once in
-/// a row and only until its timeslice ends, so the main thread still runs,
-/// stops it and joins it, and the run verifies at bitwise parity
-/// (https://github.com/rrnewton/hermit/issues/4505). With no timeslice
-/// (`--max-timeslice=disabled`) only the once-in-a-row bound stops the run
-/// of deliveries; without it this hung (Claude review of
-/// https://github.com/rrnewton/hermit/pull/4509). The expected line is the
-/// native run's.
+/// every `rt_sigreturn`. Those deliveries continue its turn at most
+/// `MAX_SIGRETURN_CONTINUATIONS` (32) times in a row, so the main thread
+/// still runs, stops it and joins it, and the run verifies at bitwise parity
+/// (https://github.com/rrnewton/hermit/issues/4505). The cap is what bounds
+/// the run of deliveries in every mode: in the default mode no timeslice end
+/// interrupted it in practice either, and with no timeslice
+/// (`--max-timeslice=disabled`) there is none; without the cap this hung
+/// (Claude reviews of https://github.com/rrnewton/hermit/pull/4509). The
+/// expected line is the native run's.
 #[test]
 fn a_handler_that_raises_its_own_signal_does_not_hold_the_cpu() {
     let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
