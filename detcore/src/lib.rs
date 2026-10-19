@@ -2434,6 +2434,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         ecx: u32,
     ) -> Result<CpuIdResult, Errno> {
         trace!("handle_cpuid_event: eax: {}, ecx: {}", eax, ecx);
+        // A trapped instruction stops the guest in user code (A5 step 3.2).
+        guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::NotInSyscall);
         if self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled {
             self.sync_sigalrm_eligibility(guest).await;
         }
@@ -2490,6 +2492,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         request: Rdtsc,
     ) -> Result<RdtscResult, Errno> {
         trace!("handle_rdtsc_event: {:?}", request);
+        // A trapped instruction stops the guest in user code (A5 step 3.2).
+        guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::NotInSyscall);
         if self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled {
             self.sync_sigalrm_eligibility(guest).await;
         }
@@ -2563,7 +2567,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             tool_global::discarded_signal(guest, control).await;
         }
         if delivered.is_some() {
-            crate::syscalls::signal_shadow::record_delivery(guest, signal as i32);
+            crate::syscalls::signal_shadow::check_and_record_delivery(guest, signal as i32).await;
         }
         Ok(delivered.map(|_| signal))
     }
@@ -2580,7 +2584,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .handle_inbound_signal(guest, SigWrapper(signal))
             .await?;
         if delivered.is_some() {
-            crate::syscalls::signal_shadow::record_delivery(guest, signal);
+            crate::syscalls::signal_shadow::check_and_record_delivery(guest, signal).await;
         }
         Ok(delivered.map(|signal| signal.raw()))
     }
@@ -2929,6 +2933,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // again; a child denied a copy for a quiet reason is
                     // seeded at its exec.
                     signal_shadow_lost: pts.1.signal_shadow_lost,
+                    // A new thread's first stop is at the exit of the call
+                    // that made it, which Detcore did not finish for it.
+                    delivery_interruption: None,
+                    delivery_frame_handler: 0,
+                    delivery_counters: Default::default(),
                     // The threads of a process share the record of what the
                     // scheduler holds for it; a new process has nothing
                     // published.
@@ -3103,6 +3112,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     }
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        // The new image's first stop is at the exit of the exec Detcore did not
+        // finish (A5 step 3.2). The old image's delivery counts are logged
+        // under the identity they were taken under, and the new image counts
+        // afresh.
+        guest.thread_state_mut().delivery_interruption = None;
+        let dettid = guest.thread_state().dettid;
+        let counters = std::mem::take(&mut guest.thread_state_mut().delivery_counters);
+        counters.log(dettid);
         // The new image's table may hold placeholders it rediscovered before
         // this, the image's first guest callback.
         self.decide_cpuinfo_placeholders(guest)?;
@@ -3316,6 +3333,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     /// A timer fires to preempt the guest and give other threads a turn.
     async fn handle_timer_event<G: Guest<Self>>(&self, guest: &mut G) {
+        // A preemption stops the guest in user code (A5 step 3.2).
+        guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::NotInSyscall);
         info!(
             "[detcore, dtid {}] inbound timer preemption event",
             guest.thread_state().dettid
@@ -3436,6 +3455,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // that was waiting returns).
         Self::unmap_orphaned_staging_pages(guest).await;
         crate::syscalls::signal_shadow::at_syscall_entry(guest);
+        // Until Detcore finishes it, the kernel may run it (A5 step 3.2).
+        guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::KernelRun {
+            syscall: call.number() as i64,
+        });
         // Signal controls an in-guest runtime refused since this process's
         // last report, which Detcore did not see as calls.
         crate::refused_signal_controls::report(guest).await;
@@ -4735,6 +4758,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             self.refuse_exit_dependencies(guest, &call, ret).await;
         }
 
+        // The guest resumes with this result in its return register (A5 step
+        // 3.2). An error that is not an errno names no register value.
+        let finished = match &res {
+            Ok(value) => Some(*value),
+            Err(Error::Errno(errno)) => Some(-(errno.into_raw() as i64)),
+            Err(_) => None,
+        };
+        if let Some(result) = finished {
+            guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::Return {
+                syscall: call.number() as i64,
+                result,
+            });
+        }
         detlog!(
             event = crate::detlog::DetLogEvent::SyscallResult {
                 finished_syscall_number: new_count,
@@ -4840,6 +4876,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
         let dettid = thread_state.dettid;
+        thread_state.delivery_counters.log(dettid);
         // Cancellation can consume the backend's transferred state before the
         // successful-exec callback has rebound its logical identity.
         let current = DetTid::from_raw(tid.as_raw());

@@ -3880,6 +3880,26 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) signal_shadow_lost: bool,
 
+    /// What this thread was doing at its last guest event, for checking a
+    /// signal delivery against the kernel's syscall registers (A5 step 3.2,
+    /// `signal_shadow::check_delivery`): the syscall it entered, the result
+    /// Detcore finished it with, a handler frame just approved, or no
+    /// syscall. `None` is unknown (a new thread or image), and the check then
+    /// takes the registers' own answer.
+    #[serde(skip)]
+    pub(crate) delivery_interruption: Option<reverie::Interruption>,
+
+    /// With `delivery_interruption` `AfterFrame`, the handler address the
+    /// kernel's frame jumps to: a further delivery at the same exit, before
+    /// any guest instruction, stops with the instruction pointer there.
+    #[serde(skip)]
+    pub(crate) delivery_frame_handler: u64,
+
+    /// This thread's counts of checked signal deliveries (A5 step 3.2),
+    /// logged when it exits.
+    #[serde(skip)]
+    pub(crate) delivery_counters: crate::syscalls::signal_shadow::DeliveryCounters,
+
     /// The process's record of its dispositions publications (A5 step 2b,
     /// `signal_shadow::publish_dispositions`): what the scheduler holds, the
     /// latest generation used, and the latest one the scheduler took. Shared
@@ -4678,6 +4698,9 @@ impl<T> ThreadState<T> {
             sigalrm_handled: false,
             signal_shadow: None,
             signal_shadow_lost: false,
+            delivery_interruption: None,
+            delivery_frame_handler: 0,
+            delivery_counters: Default::default(),
             published_mask: Some(None),
             published_dispositions: Arc::default(),
             sigalrm_blocked_published: false,

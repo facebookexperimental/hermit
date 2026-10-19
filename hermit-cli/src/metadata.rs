@@ -1045,6 +1045,8 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         // recording did, and recordings made before the copy was on by
         // default (A5 step 2d) read the kernel's `/proc` view throughout.
         signal_state_copy: false,
+        // The copy is off, so no delivery is checked.
+        signal_delivery_check_fatal: false,
         chaos: false,
         sigint_instakill: false,
         warn_non_zero_binds: false,

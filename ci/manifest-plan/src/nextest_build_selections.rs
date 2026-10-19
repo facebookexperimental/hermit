@@ -898,7 +898,11 @@ mod tests {
             // (+2, K3a of https://github.com/rrnewton/hermit/issues/4213).
             // And proc_locks_determinism's six new tests (+6): 586.
             // And its four descriptor-table ledger tests (+4): 590.
-            assert_eq!(population, 590);
+            // signal_determinism's eighteen ptrace_delivery_check_* tests (A5
+            // step 3.2) add eighteen, and six more add six, less the spin
+            // case, which test.pmu_integration_cases runs, and forced-blocked
+            // adds one (+24): 614.
+            assert_eq!(population, 614);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

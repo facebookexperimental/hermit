@@ -2269,6 +2269,12 @@
       "why": "tests/c/sigmask_preemption.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/signal_delivery_check.c",
+      "runner": "hermit-cli/tests/signal_determinism.rs",
+      "why": "tests/c/signal_delivery_check.c is owned by hermit-cli/tests/signal_determinism.rs: the ptrace_delivery_check_* tests run each of its single-threaded delivery shapes (interrupted calls, a partial write, user code, sigsuspend, realtime and coalesced sends, SA_RESETHAND, SA_NODEFER, frame faults, a forced signal the copy ignores or blocks, an interrupted and restarted child wait, uncaught signals) under run --strict --verify --verify-strict and again under run --strict with Detcore's delivery counters logged (RUST_LOG=detcore::signal_delivery=trace), and require the guest's own OK line, the exact counter lines and, for some modes, the approved interruption. A generic manifest cannot read Detcore's TRACE counter line (A5 step 3.2, https://github.com/rrnewton/hermit/issues/4485)."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/signal_delivery_sequence.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify mode; ci=true, ptrace only)",
