@@ -534,6 +534,35 @@ struct OpenFileDescription {
     /// wrong. Only the second is a reason to refuse `vfork`.
     #[serde(default)]
     flock_mode_ever_known: bool,
+    /// Whether Detcore may ever have granted a `flock(2)` `LOCK_SH` or
+    /// `LOCK_EX` through this Detcore model of the description.
+    ///
+    /// Set by every successful grant Detcore serves through the description,
+    /// INCLUDING while `flock_mode_known` is false: a forgotten description no
+    /// longer records which mode it holds, but it still records that it may
+    /// hold one. Descriptions Detcore never observed (`mark_flock_mode_unobserved`)
+    /// set it as well, since a lock may have been taken before Detcore saw
+    /// them. Never cleared, and copied with the description at fork.
+    ///
+    /// It records only grants Detcore served through THIS model of the
+    /// description. A lock taken natively (by a copied `vfork` child), by a
+    /// sibling process whose copy of the model was split from this one at a
+    /// fork, or through another model of the same kernel description (an
+    /// `SCM_RIGHTS` receiver's) does not set it. False therefore does NOT
+    /// mean unlocked; it means no grant through this model, so no Detcore
+    /// claim about this description can exist here.
+    ///
+    /// `has_unsafe_vfork_flock_state` uses it to tell an invalidated
+    /// description through which this process's Detcore granted a lock from
+    /// one that was invalidated by a fork without such a grant (a pipe a
+    /// `make` created before forking a job). In the second case no process
+    /// holds a known mode for the description, so a copied `vfork` child that
+    /// changes its lock natively makes no Detcore claim stale. A serialized
+    /// description without the field reads as true, the conservative value;
+    /// that default applies only to self-describing (map-based) formats.
+    /// Not printed, so descriptions log as before.
+    #[serde(default = "flock_ever_granted_when_absent")]
+    flock_ever_granted: bool,
     /// A timerfd's expirations as a function of virtual time, once the guest
     /// has armed or disarmed it through Detcore (`VirtualTimerfd`). `None` for
     /// every other description, and for a timerfd Detcore leaves to the host
@@ -686,6 +715,12 @@ impl VirtualTimerfd {
         });
         (left, self.interval_ns)
     }
+}
+
+/// `OpenFileDescription::flock_ever_granted` for a serialized description
+/// that lacks the field: may have been granted, the conservative answer.
+fn flock_ever_granted_when_absent() -> bool {
+    true
 }
 
 impl PartialEq for DetFd {
@@ -841,6 +876,7 @@ impl DetFd {
                 flock_mode: None,
                 flock_mode_known: true,
                 flock_mode_ever_known: true,
+                flock_ever_granted: false,
                 timerfd: None,
                 channel: None,
                 lock_tracked: false,
@@ -1841,8 +1877,15 @@ impl DetFd {
     /// Record the `flock(2)` mode this open file description now holds. Every
     /// `dup`/`fork` alias observes the change, matching the kernel, where one
     /// `flock` lock belongs to the whole open file description.
+    ///
+    /// A grant (`Some`) also marks the description as one that may hold a lock
+    /// ([`Self::flock_may_have_been_granted`]), even while its mode is unknown
+    /// and the mode itself is therefore not recorded.
     pub(crate) fn set_flock_mode(&self, mode: Option<i32>) {
         self.with_description(|description| {
+            if mode.is_some() {
+                description.flock_ever_granted = true;
+            }
             if description.flock_mode_known {
                 description.flock_mode = mode;
             }
@@ -1866,7 +1909,17 @@ impl DetFd {
         self.forget_flock_mode();
         self.with_description(|description| {
             description.flock_mode_ever_known = false;
+            // A lock may have been taken before Detcore saw the description.
+            description.flock_ever_granted = true;
         })
+    }
+
+    /// True when a `flock` lock may ever have been granted through this open
+    /// file description, so that it may still hold one. False only for a
+    /// description Detcore created and through which it never served a
+    /// successful `LOCK_SH` or `LOCK_EX`.
+    pub(crate) fn flock_may_have_been_granted(&self) -> bool {
+        self.with_description(|description| description.flock_ever_granted)
     }
 
     /// True when a cached lock claim existed and may now be wrong.
@@ -2612,6 +2665,31 @@ mod tests {
         );
         assert_eq!(channel.takes(id), 4);
         assert_eq!(original.open_file_alias_count(), 3);
+    }
+
+    /// A promoted description has one canonical model, so a grant through a
+    /// handle another process forked from it is a grant every handle sees.
+    /// `has_unsafe_vfork_flock_state` therefore keeps refusing on a lock a
+    /// sibling took after the fork, without any per-process copy of the fact.
+    #[test]
+    fn promoted_description_shares_its_grant_fact_with_forked_handles() {
+        let _channel = MemoryChannel::installed();
+        let id = OpenFileId::new(DetTid::from_raw(9041), 0);
+        let parent = DetFd::new(3, OFlag::O_RDONLY, FdType::Rng, id);
+        parent.promote().unwrap();
+        let sibling = parent.fork_shared_handle();
+        parent.forget_local_flock_mode_at_fork();
+        sibling.forget_local_flock_mode_at_fork();
+        assert_eq!(parent.known_flock_mode(), Some(None));
+        assert!(!parent.flock_mode_may_be_stale());
+        assert!(!parent.flock_may_have_been_granted());
+
+        sibling.set_flock_mode(Some(libc::LOCK_SH));
+        assert_eq!(parent.known_flock_mode(), Some(Some(libc::LOCK_SH)));
+        assert!(parent.flock_may_have_been_granted());
+        sibling.set_flock_mode(None);
+        assert_eq!(parent.known_flock_mode(), Some(None));
+        assert!(parent.flock_may_have_been_granted());
     }
 
     #[test]

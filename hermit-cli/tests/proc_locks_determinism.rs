@@ -1556,6 +1556,66 @@ static int lock_after_fork_scenario(const char* path, int use_flock) {
   return 0;
 }
 
+// The parent opens `path` and forks before any lock; the child takes an OFD
+// read lock on byte 0 (with `use_flock`, a shared flock) and stays alive, so only the child's split copy of the
+// description's model recorded the lock and the child's table keeps it the
+// guest's in the `/proc/locks` ledger. The parent then vforks, and the vfork
+// child unlocks it; the parent snapshots before letting the child exit.
+static int lock_after_fork_vfork_unlock_scenario(const char* path, int use_flock) {
+  int fd = open_path(path, O_RDWR);
+  int ready[2];
+  int go[2];
+  if (pipe(ready) != 0 || pipe(go) != 0) {
+    die("pipe");
+  }
+  fflush(stdout);
+  pid_t child = fork();
+  if (child < 0) {
+    die("fork");
+  }
+  if (child == 0) {
+    if (use_flock) {
+      if (flock(fd, LOCK_SH | LOCK_NB) != 0) {
+        die("flock");
+      }
+    } else {
+      ofd(fd, F_RDLCK, 0, 1);
+    }
+    byte_out(ready[1]);
+    byte_in(go[0]);
+    _exit(0);
+  }
+  byte_in(ready[0]);
+  snapshot("child-holds");
+  pid_t unlocker = vfork();
+  if (unlocker < 0) {
+    die("vfork");
+  }
+  if (unlocker == 0) {
+    if (use_flock) {
+      _exit(flock(fd, LOCK_UN) == 0 ? 0 : 3);
+    }
+    struct flock lock = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1};
+    if (fcntl(fd, F_OFD_SETLK, &lock) == 0) {
+      _exit(0);
+    }
+    _exit(errno == ENOLCK ? 10 : 3);
+  }
+  int status = 0;
+  if (waitpid(unlocker, &status, 0) != unlocker || !WIFEXITED(status) ||
+      (WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != 10)) {
+    die("unlocker");
+  }
+  // 10: the unlock was refused with ENOLCK and the lock is still held (DBT
+  // under --allow-unsupported-syscalls). Reported on stderr, outside the
+  // snapshots.
+  fprintf(stderr, "unlocker-status=%d\n", WEXITSTATUS(status));
+  snapshot("after-vfork-unlock");
+  byte_out(go[1]);
+  wait_for(child);
+  return 0;
+}
+
 static int shared_flock_scenario(const char* path) {
   if (flock(open_path(path, O_RDWR), LOCK_SH | LOCK_NB) != 0) {
     die("flock");
@@ -1723,6 +1783,12 @@ int main(int argc, char** argv) {
   }
   if (strcmp(mode, "shared-flock") == 0) {
     return shared_flock_scenario(where);
+  }
+  if (strcmp(mode, "ofd-after-fork-vfork-unlock") == 0) {
+    return lock_after_fork_vfork_unlock_scenario(where, 0);
+  }
+  if (strcmp(mode, "flock-after-fork-vfork-unlock") == 0) {
+    return lock_after_fork_vfork_unlock_scenario(where, 1);
   }
   return 2;
 }
@@ -2440,10 +2506,188 @@ fn a_vfork_after_an_ofd_lock_is_refused_on_dbt_and_runs_on_ptrace() {
     );
 }
 
+/// A sibling's OFD lock, then a copied child's native unlock of it, with a
+/// host process holding the identical OFD read lock the whole time. The
+/// parent's up-front OFD vfork guard cannot see a lock a forked child took
+/// through its own copy of the description's model. Natively on DBT the
+/// copied child's unlock would leave the `/proc/locks` ledger claiming the
+/// guest's lock, which admits the host's identical row (OFD rows print owner
+/// -1 in every namespace). DBT never runs the copied child's `F_OFD_SETLK`:
+/// under `--strict` it ends the run by name before any later snapshot; under
+/// the `--allow-unsupported-syscalls` opt-out it names the refusal and
+/// answers ENOLCK, so the lock is still held, and still the guest's, in the
+/// later snapshot. ptrace sees the unlock and runs the scenario at L2 with
+/// nothing shown after it.
+#[test]
+fn a_copied_childs_ofd_unlock_is_refused_on_dbt_and_seen_on_ptrace() {
+    let root = tempfile::Builder::new()
+        .prefix("proc-locks-sibling-ofd-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create sibling-ofd directory");
+    let guest = compile_embedded_guest(root.path(), "lock-scenarios", LOCK_SCENARIOS_SOURCE);
+    let file = root.path().join("sibling-ofd");
+    fs::write(&file, b"sibling\n").expect("create the sibling-ofd lock file");
+    let host = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&file)
+        .expect("open the sibling-ofd lock file");
+    record_lock(&host, libc::F_OFD_SETLK, libc::F_RDLCK, 0, 1);
+    assert!(
+        host_sees_ofd_lock(&file),
+        "the host's /proc/locks does not show the control's OFD lock"
+    );
+    let report = root.path().join("ptrace-verify.json");
+    let output = run_guest_on(
+        "ptrace",
+        &guest,
+        &[OsStr::new("ofd-after-fork-vfork-unlock"), file.as_os_str()],
+        Some(&report),
+    );
+    assert_bitwise_parity("ptrace ofd-after-fork-vfork-unlock", &report, &output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        sections(&stdout),
+        expected(vec![
+            ("child-holds", vec!["OFDLCK"]),
+            ("after-vfork-unlock", vec![]),
+        ]),
+        "{stdout}"
+    );
+    if dbt_unavailable() {
+        drop(host);
+        return;
+    }
+    // At log level info, where DBT prints its refusals.
+    for (policy, refused_with_errno) in [
+        (&["--strict", "--panic-on-unsupported-syscalls"][..], false),
+        (&["--allow-unsupported-syscalls"][..], true),
+    ] {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after", "5s", "90s"])
+            .arg(hermit_test::hermit_binary())
+            .args(["--log=info", "--backend=dbt", "run"])
+            .args(policy)
+            .args([
+                "--proc=standard",
+                "--no-virtualize-cpuid",
+                "--max-timeslice=disabled",
+                "--base-env=minimal",
+                "--",
+            ])
+            .arg(&guest)
+            .arg("ofd-after-fork-vfork-unlock")
+            .arg(&file);
+        hermit_test::configure_guest_execution(&mut command);
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let refusal =
+            stderr.contains("detcore-dbt: refusing fcntl F_OFD_SETLK/F_OFD_SETLKW in copied child");
+        if refused_with_errno {
+            assert!(
+                output.status.success()
+                    && refusal
+                    && stderr.contains("unlocker-status=10")
+                    && sections(&stdout)
+                        == expected(vec![
+                            ("child-holds", vec!["OFDLCK"]),
+                            ("after-vfork-unlock", vec!["OFDLCK"]),
+                        ]),
+                "{policy:?}: DBT did not refuse a copied child's OFD unlock with ENOLCK\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+        } else {
+            assert!(
+                output.status.code() == Some(DBT_REFUSAL_EXIT)
+                    && refusal
+                    && stdout.contains("--- child-holds ---")
+                    && !stdout.contains("--- after-vfork-unlock ---"),
+                "{policy:?}: DBT let a copied child unlock a sibling's OFD lock natively\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+        }
+    }
+    drop(host);
+}
+
+/// Codex's flock control for the same shape: a forked sibling takes
+/// `LOCK_SH|LOCK_NB` through Detcore after the fork and stays alive, so the
+/// `/proc/locks` ledger records the description's flock; the parent vforks
+/// and the vfork child runs `LOCK_UN` on its inherited descriptor; a host
+/// process holds the identical shared flock throughout. Under
+/// `--no-namespace` the guest's procfs shows the host's flock row. On DBT the
+/// copied child's unlock is native, so the ledger's record of the sibling's
+/// flock goes stale; a flock row is kept only by its taker's pid, so the
+/// host's row stays out anyway. On ptrace the unlock is mediated; the same
+/// shape checks the owner rule there. Both backends show the sibling's flock
+/// (its taker is a guest process) and then nothing.
+///
+/// Relaxation: `--strict` refuses `--no-namespace`, so these runs are not
+/// strict, and their task ids are the host's; the sections are compared,
+/// not logs.
+#[test]
+fn a_stale_flock_record_admits_no_host_row_without_a_namespace() {
+    let root = tempfile::Builder::new()
+        .prefix("proc-locks-sibling-flock-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create sibling-flock directory");
+    let guest = compile_embedded_guest(root.path(), "lock-scenarios", LOCK_SCENARIOS_SOURCE);
+    let file = root.path().join("sibling-flock");
+    fs::write(&file, b"sibling\n").expect("create the sibling-flock file");
+    let host = File::open(&file).expect("open the sibling-flock file");
+    // SAFETY: `host` owns a valid descriptor.
+    assert_eq!(
+        unsafe { libc::flock(host.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+        0,
+        "host flock: {}",
+        std::io::Error::last_os_error()
+    );
+    let suffix = inode_suffix(&file);
+    assert!(
+        fs::read_to_string("/proc/locks")
+            .expect("read the host's /proc/locks")
+            .lines()
+            .any(|line| line.contains("FLOCK") && line.contains(&suffix)),
+        "the host's /proc/locks does not show the control's flock"
+    );
+    let mut backends = vec!["ptrace"];
+    if !dbt_unavailable() {
+        backends.push("dbt");
+    }
+    for backend in backends {
+        let output = run_guest_on_with(
+            backend,
+            &["--no-namespace"],
+            &guest,
+            &[
+                OsStr::new("flock-after-fork-vfork-unlock"),
+                file.as_os_str(),
+            ],
+            None,
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{backend}: run failed\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            sections(&stdout),
+            expected(vec![
+                ("child-holds", vec!["FLOCK"]),
+                ("after-vfork-unlock", vec![]),
+            ]),
+            "{backend}: the host's identical flock reached the guest\n{stdout}"
+        );
+    }
+    drop(host);
+}
+
 /// Under `--no-namespace` the guest sees a host process's flock rows too.
 /// When the guest and the host hold identical shared flocks on one file, the
-/// guest's row claims the guest's match and the host's finds none: one row,
-/// not two, whether the host holds its flock or not.
+/// guest's row is kept by its taker's pid and the host's, whose pid names no
+/// guest process, is not: one row, not two, whether the host holds its flock
+/// or not.
 #[test]
 fn identical_shared_flocks_show_the_guests_row_once() {
     let root = tempfile::Builder::new()

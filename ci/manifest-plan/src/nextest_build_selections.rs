@@ -914,7 +914,11 @@ mod tests {
             // Three more ptrace_delivery_check_* tests (A5 step 3.2b part 2,
             // +3): 637.
             // Five arrived-first ptrace_delivery_check_* tests (+5): 642.
-            assert_eq!(population, 642);
+            // flock_exclusion's three pipe-fork-vfork tests, copied-child
+            // pidfd_getfd and recvmsg-import refusals and native-lock control,
+            // and proc_locks_determinism's copied-child OFD unlock and
+            // stale-flock-record tests (+8): 650.
+            assert_eq!(population, 650);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

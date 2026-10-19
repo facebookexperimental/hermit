@@ -897,9 +897,38 @@ impl FileMetadata {
     /// The hazard is a STALE CACHE: a copied runtime mutating a lock that this
     /// side still has a claim about. A description Detcore never observed
     /// carries no claim, so there is nothing about it that can go stale.
+    ///
+    /// ⚠️ AN INVALIDATED DESCRIPTION WITH NO GRANT THROUGH IT IS NOT UNSAFE
+    /// EITHER. Every ordinary fork invalidates every description the process
+    /// created, so refusing on invalidation alone refused `vfork` in every
+    /// process that had forked once while holding any descriptor at all --
+    /// measured: a pipe, a fork whose child exits, then `vfork` was refused,
+    /// and that refusal stopped every DBT `make -j4` cell in run 1, although
+    /// `make` never calls `flock`. An invalidated description is refused only
+    /// when this process's Detcore granted a lock through it
+    /// (`DetFd::flock_may_have_been_granted`), before or after the fork.
+    ///
+    /// The invariant is "no process holds a known mode for an admitted
+    /// description", not "an admitted description holds no lock": a sibling
+    /// may have locked it through its own split copy of the model, and the
+    /// copied child may change that lock natively. That is Linux behaviour
+    /// and no Detcore flock cache can go stale from it. The routes by which
+    /// a copied child could reach a description another process DOES hold a
+    /// claim about, or change an OFD lock the `/proc/locks` ledger records,
+    /// are refused in the copied child itself, whatever the
+    /// unsupported-syscall policy: the run ends by name under the default
+    /// fail-closed policy and the call answers an errno without executing
+    /// under `--allow-unsupported-syscalls` (`pidfd_getfd`, `recvmsg` and
+    /// `recvmmsg`, which can import a description over `SCM_RIGHTS`, and OFD
+    /// `fcntl` lock changes: `reverie_dbt_runtime_copied_syscall` in
+    /// detcore-dbt). A
+    /// native flock change can leave the ledger's recorded flock stale, but
+    /// that record admits no `/proc/locks` row: flock rows are kept only by
+    /// their taker's pid (`procfs::locks`).
     fn has_unsafe_vfork_flock_state(&self) -> bool {
         self.file_handles.values().any(|detfd| {
-            matches!(detfd.known_flock_mode(), Some(Some(_))) || detfd.flock_mode_may_be_stale()
+            matches!(detfd.known_flock_mode(), Some(Some(_)))
+                || (detfd.flock_mode_may_be_stale() && detfd.flock_may_have_been_granted())
         })
     }
 
@@ -2856,7 +2885,89 @@ mod file_metadata_tests {
         assert_eq!(metadata.file_handles[&fd].open_file_id(), description);
         assert_eq!(metadata.file_handles[&fd].known_flock_mode(), None);
         assert!(metadata.file_handles[&fd].flock_mode_may_be_stale());
+        assert!(metadata.file_handles[&fd].flock_may_have_been_granted());
         assert!(metadata.has_unsafe_vfork_flock_state());
+    }
+
+    /// The converse of the case above: a description Detcore created, never
+    /// locked through Detcore, then invalidated by a fork (a `make` job pipe)
+    /// has no Detcore claim in any process that a copied `vfork` child's
+    /// native lock call could make stale, so it must not refuse `vfork`.
+    #[test]
+    fn invalidated_description_never_locked_does_not_refuse_vfork() {
+        let owner = DetTid::from_raw(9);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, 3, OFlag::empty(), FdType::Pipe, None)
+            .expect("register a pipe end");
+        assert!(!metadata.file_handles[&3].flock_may_have_been_granted());
+
+        let child = metadata.fork_for(DetTid::from_raw(10));
+        for table in [&metadata, &child] {
+            let detfd = &table.file_handles[&3];
+            assert_eq!(detfd.known_flock_mode(), None);
+            assert!(detfd.flock_mode_may_be_stale());
+            assert!(!detfd.flock_may_have_been_granted());
+            assert!(
+                !table.has_unsafe_vfork_flock_state(),
+                "an invalidated description with no grant through it holds no Detcore claim"
+            );
+        }
+
+        // A grant after the invalidation is still a grant: the mode stays
+        // unknown, but the description may now hold a lock.
+        metadata.file_handles[&3].set_flock_mode(Some(libc::LOCK_EX));
+        assert_eq!(metadata.file_handles[&3].known_flock_mode(), None);
+        assert!(metadata.file_handles[&3].flock_may_have_been_granted());
+        assert!(metadata.has_unsafe_vfork_flock_state());
+    }
+
+    /// A serialized description that predates `flock_ever_granted` reads it
+    /// as true in a self-describing format, so an invalidated description
+    /// from such a table still refuses `vfork`.
+    #[test]
+    fn a_description_serialized_without_the_grant_fact_reads_it_as_granted() {
+        let owner = DetTid::from_raw(9);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, 3, OFlag::empty(), FdType::Pipe, None)
+            .expect("register a pipe end");
+        let child = metadata.fork_for(DetTid::from_raw(10));
+        assert!(!child.has_unsafe_vfork_flock_state());
+        let encoded = serde_json::to_string(&child).expect("serialize the table");
+        assert_eq!(encoded.matches("\"flock_ever_granted\":false").count(), 1);
+        let without = encoded.replace("\"flock_ever_granted\":false,", "");
+        assert_ne!(without, encoded, "the field must have been removed");
+        let restored: FileMetadata = serde_json::from_str(&without).expect("deserialize the table");
+        assert!(restored.file_handles[&3].flock_mode_may_be_stale());
+        assert!(restored.file_handles[&3].flock_may_have_been_granted());
+        assert!(restored.has_unsafe_vfork_flock_state());
+    }
+
+    /// A lock granted before a fork travels with the description: both
+    /// tables refuse `vfork` after the fork. The fact is deliberately sticky,
+    /// so a lock released before the fork still counts: the guard stays a
+    /// single monotone fact rather than a second lock-state cache.
+    #[test]
+    fn lock_granted_before_fork_still_refuses_vfork_after_it() {
+        let owner = DetTid::from_raw(9);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, 3, OFlag::empty(), FdType::Regular, None)
+            .expect("register descriptor");
+        metadata.file_handles[&3].set_flock_mode(Some(libc::LOCK_SH));
+        metadata.file_handles[&3].set_flock_mode(None);
+        assert_eq!(metadata.file_handles[&3].known_flock_mode(), Some(None));
+        assert!(
+            !metadata.has_unsafe_vfork_flock_state(),
+            "a known-unlocked description is safe while its mode is known"
+        );
+
+        let child = metadata.fork_for(DetTid::from_raw(10));
+        for table in [&metadata, &child] {
+            assert!(table.file_handles[&3].flock_may_have_been_granted());
+            assert!(table.has_unsafe_vfork_flock_state());
+        }
     }
 
     /// A table carried through serialization (in-guest LiteInst's fork) keeps
@@ -5541,7 +5652,9 @@ impl<T> ThreadState<T> {
         self.metadata().has_loopback_peer()
     }
 
-    /// Whether any open file description is held or not proven unlocked.
+    /// Whether some open file description holds a flock mode Detcore knows,
+    /// or was invalidated by a process copy after a flock was granted through
+    /// it (`FileMetadata::has_unsafe_vfork_flock_state`).
     pub fn has_unsafe_vfork_flock_state(&self) -> bool {
         self.metadata().has_unsafe_vfork_flock_state()
     }

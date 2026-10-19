@@ -2586,7 +2586,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (procfs::locks::tests::a_short_read_that_reached_the_end_drops_what_the_closing_reads_repeat):
     // 2168, listed.
     // And +1 from e1446c0a: 2169.
-    ("test.detcore_unit", 2169),
+    // And the four vfork flock-guard narrowing units (three in tool_local,
+    // one in fd) and the flock owner-rule unit in procfs::locks: 2174,
+    // listed.
+    ("test.detcore_unit", 2174),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2903,7 +2906,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // without a /proc/locks read; the next read refuses), its pre-ledger
     // version-gate test and its vfork-after-OFD-lock test: 276, listed.
     // And its fake-/proc-under-chroot test: 277, listed.
-    ("test.hermit_integration_2", 277),
+    // And flock_exclusion's pipe-fork-vfork L2 tests (ptrace and DBT), its
+    // DBT locked-pipe negative controls and its copied-child pidfd_getfd
+    // and recvmsg-import refusals and native-lock control, and
+    // proc_locks_determinism's copied-child OFD unlock and stale-flock-record
+    // tests: 285, listed.
+    ("test.hermit_integration_2", 285),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -4565,7 +4573,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the fifteen vfork-rejoin scheduler units, re-landed: 2167.
     // And the same /proc/locks capture end-of-list unit: 2168, listed.
     // And +1 from e1446c0a: 2169.
-    ("test.detcore_unit_on_host", 2169),
+    // And the same four vfork flock-guard narrowing units and flock
+    // owner-rule unit: 2174, listed.
+    ("test.detcore_unit_on_host", 2174),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4661,7 +4671,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And three A5 step 3.2b part 2 ptrace_delivery_check_* tests: 637.
     // And five arrived-first ptrace_delivery_check_* tests: 642.
     // And +5 from e1446c0a: 642.
-    ("test.hermit_integration_on_host", 642),
+    // And flock_exclusion's three pipe-fork-vfork tests and its copied-child
+    // pidfd_getfd and recvmsg-import refusals and native-lock control, and
+    // proc_locks_determinism's copied-child OFD unlock and stale-flock-record
+    // tests: 650, listed.
+    ("test.hermit_integration_on_host", 650),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

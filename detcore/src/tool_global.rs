@@ -4020,8 +4020,11 @@ impl GlobalState {
                 let mut ledger = self.lock_ledger.lock().unwrap();
                 ledger.prune(|process| sched.process_is_alive(process));
                 // A referenced description whose locks are unknown could own
-                // any OFD or flock row: the snapshot is refused
-                // (`LockLedger::unknown`).
+                // any OFD row (OFD rows are kept by field match against what a
+                // description holds): the snapshot is refused
+                // (`LockLedger::unknown`). Flock rows are kept by their taker's
+                // pid alone, so for a description that only ever held flocks
+                // this refusal is conservative.
                 if let Some(reason) = ledger.unknown() {
                     R::GuestLockRows(Err(reason.to_string()))
                 } else {

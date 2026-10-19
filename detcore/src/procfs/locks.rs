@@ -40,15 +40,25 @@
 //! groups of rows the guest owns ([`guest_lock_rows`]). A group is a granted
 //! lock and the waiters queued behind it, which share one sequence number. A
 //! group stays when its granted row stays:
-//! - an OFD or flock row whose class, mode, access, object and range are, field
-//!   for field, a lock a guest description some guest table references holds,
-//!   at most one row per distinct such lock (a row a guest process owns claims
-//!   its match first);
+//! - an OFD row whose class, mode, access, object and range are, field for
+//!   field, a lock a guest description some guest table references holds, at
+//!   most one row per distinct such lock. An OFD row has no owning task (owner
+//!   `-1` from every namespace), so this field match is the only way to tell
+//!   the guest's from a host's;
 //! - a row owned by a positive pid that names a process of the guest, as the
 //!   container's `/proc` lists it (a live process, or a zombie until it is
 //!   reaped), translated from the kernel's numbering where a backend's differs
-//!   (`Scheduler::procfs_ids`). This also hides another process's POSIX and
-//!   flock rows where the guest's procfs is not namespace-private;
+//!   (`Scheduler::procfs_ids`). This is the ONLY rule that keeps a POSIX or a
+//!   flock row: Linux prints a flock row with the pid of the process that took
+//!   it, so a flock row is kept when that pid is a guest process's. This is
+//!   guest-pid membership, not proof of identity: a pid says who holds that
+//!   number now, not who took the lock (see the host-row cases below). A
+//!   field match against a description's recorded flock is not
+//!   used: that record can go stale where Detcore does not see the unlock (a
+//!   copied DBT `vfork` child runs `LOCK_UN` natively), and a stale record
+//!   would admit a host process's identical flock where the guest's procfs is
+//!   not namespace-private (`--no-namespace`). This also hides another
+//!   process's POSIX and flock rows there;
 //! - TEMPORARY EXEMPTION, for KVM only in practice: a row whose object is on
 //!   device `00:00`. KVM keeps a backend-local copy of `/proc/locks`, built
 //!   from the supervisor's fdinfo `lock:` lines for the guest's own files, and
@@ -65,25 +75,45 @@
 //! owns it. A group whose granted row goes, goes whole, as Linux drops a whole
 //! group whose granted row's owner it cannot see.
 //!
-//! What still differs from Linux, named rather than hidden. One case can show
-//! a host row; every other case hides a row of the guest's own, and none
-//! shows a host row:
-//! - a host lock whose row is, field for field, a lock a guest description
-//!   holds now (in practice a shared read lock on the same range of the same
-//!   file, or a file in another btrfs subvolume, whose rows print the one
-//!   superblock device, with the same inode number, range and access) takes
-//!   the place of the guest's row, at most once per distinct such lock: the
-//!   row shown is the same either way;
+//! What still differs from Linux, named rather than hidden. Three cases can
+//! show a host row (the first, and the two pid-identity cases right after
+//! it); every other case hides a row of the guest's own, and none shows a
+//! host row:
+//! - a host OFD lock whose row is, field for field, an OFD lock a guest
+//!   description holds now (in practice a shared read lock on the same range
+//!   of the same file, or a file in another btrfs subvolume, whose rows print
+//!   the one superblock device, with the same inode number, range and access)
+//!   takes the place of the guest's row, at most once per distinct such lock:
+//!   the row shown is the same either way;
+//! - a host flock whose taker has exited, its description kept by another
+//!   host process, prints the taker's freed pid under `--no-namespace`; when
+//!   that number is later given to a guest process, the row is kept as the
+//!   guest's. When the timing of that reuse is the host's, so is the row;
+//! - on DBT, when a guest process is killed from outside and reaped
+//!   automatically before Detcore retires its pid, a host process can take
+//!   that number while it is still in Detcore's list of guest processes, and
+//!   that host process's POSIX or flock rows are kept until it is retired;
 //! - two guest descriptions holding identical shared read OFD locks (same
 //!   file, range and access) show one row, where Linux shows two;
 //! - the guest's own OFD waiter rows (`->` with owner -1) are not shown:
 //!   fdinfo lists no waiters, so Detcore cannot tell them from a host's;
-//! - a lock the guest's descriptions held before Detcore read it is not shown
-//!   until a call through a modelled descriptor of it: a description
+//! - an OFD lock the guest's descriptions held before Detcore read it is not
+//!   shown until a call through a modelled descriptor of it: a description
 //!   inherited already locked at the start; one received over `SCM_RIGHTS`
 //!   where Detcore keeps no model of the receiver's descriptor (ptrace), once
 //!   the sender's tables let go of it; one received through `recvmmsg`; one an
 //!   in-guest backend's exec rebuilds under a new identity;
+//! - a flock whose taker is not a guest process, while a guest description
+//!   holds it: a taker that has exited (its descriptor was inherited), or one
+//!   outside the guest from the start (a launcher that took the flock and
+//!   handed the guest that description). Linux keeps the original taker's
+//!   pid in the row, even after the guest itself takes the same mode on the
+//!   description (a same-mode flock changes nothing), so the row names no
+//!   guest process and is hidden, whatever call the guest makes. Inside a
+//!   PID namespace Linux hides such a row itself (the taker is outside the
+//!   namespace, or reaped), so the visible difference is only under
+//!   `--no-namespace`; a zombie taker, which the guest's `/proc` still lists,
+//!   stays shown;
 //! - fork before lock, for OFD locks: a table that referenced a description
 //!   before Detcore first read its locks (the parent of a child that then
 //!   locks it) is not followed, so once the tables Detcore did see let go of
@@ -112,9 +142,13 @@
 //! from the kernel's state at the snapshot: a description an in-guest
 //! backend's exec rebuilds under a new identity, whose lock changes through
 //! the new identity leave the old one's entry stale in a table forked before
-//! the exec; and a lock change the guest makes without Detcore seeing the call
-//! at all (DBT refuses the one known case, a copied `vfork` child, while the
-//! parent's descriptions may hold an OFD lock).
+//! the exec; and an OFD lock change the guest makes without Detcore seeing the
+//! call at all. DBT refuses the one known case, a copied `vfork` child's
+//! `F_OFD_SETLK`/`F_OFD_SETLKW`, at the call, and also refuses the `vfork`
+//! up front while the parent's own descriptions may hold an OFD lock. A
+//! flock change Detcore does not see (a copied child's native `LOCK_UN` or
+//! `LOCK_NB`) can leave a description's recorded flock stale, but that record
+//! admits no row: flock rows are kept by their taker's pid.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -214,7 +248,20 @@ impl HeldLock {
     /// Whether Linux ties this lock to an open file description rather than
     /// to a task: an OFD lock or a flock.
     fn belongs_to_a_description(&self) -> bool {
-        self.class == "OFDLCK" || self.class == "FLOCK"
+        self.class == "OFDLCK" || self.is_flock()
+    }
+
+    /// Whether this is a flock, which Linux prints with its taker's pid.
+    fn is_flock(&self) -> bool {
+        self.class == "FLOCK"
+    }
+
+    /// Whether a row of this lock is kept by matching it, field for field,
+    /// against a lock a guest description holds: an OFD lock only, whose row
+    /// has no owner to decide by. A flock row is kept only by its taker's pid
+    /// (see the module comment).
+    fn kept_by_field_match(&self) -> bool {
+        self.belongs_to_a_description() && !self.is_flock()
     }
 }
 
@@ -281,15 +328,16 @@ pub(crate) fn guest_lock_rows(
     }
     // A granted row a guest process owns is the guest's whatever it matches,
     // and it claims its match first, so that a row another owner holds with
-    // the same fields (two shared flocks on one file, one the guest's and one
-    // a host process's, under `--no-namespace`) cannot claim it too.
+    // the same fields cannot claim it too. Only an OFD lock is kept by field
+    // match, and an OFD row has no owner, so in practice this claims nothing;
+    // it keeps the rule whole should another field-matched class appear.
     let owned = rows
         .iter()
         .map(|row| !row.waiter && row.owner > 0 && guest_process(row.owner))
         .collect::<Vec<_>>();
     for (row, owned) in rows.iter().zip(&owned) {
         if *owned
-            && row.lock.belongs_to_a_description()
+            && row.lock.kept_by_field_match()
             && let Some(count) = unclaimed.get_mut(&row.lock)
         {
             *count = count.saturating_sub(1);
@@ -305,7 +353,7 @@ pub(crate) fn guest_lock_rows(
         // (`HeldLock::on_null_device`); removed with package K slice K8.
         keep[index] = row.lock.on_null_device()
             || owned[index]
-            || (row.lock.belongs_to_a_description()
+            || (row.lock.kept_by_field_match()
                 && unclaimed.get_mut(&row.lock).is_some_and(|count| {
                     let available = *count > 0;
                     *count = count.saturating_sub(1);
@@ -814,7 +862,11 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
                 true,  // the guest's OFD lock on 1002 at byte 0
                 false, // a host OFD lock on another file
                 false, // a host OFD lock on the guest's own file, another range
-                true,  // the flock a guest description holds, whose taker is gone
+                // The flock a guest description holds, whose taker (4242) is
+                // gone: hidden, since a flock row is kept only by its taker's
+                // pid. A declared residual (module comment); Linux hides it too
+                // under a PID namespace once the taker is reaped.
+                false, // that flock
                 false, // a host POSIX lock
                 false, // the guest's waiter behind it: the group goes whole
                 true,  // the guest's OFD lock on 1003
@@ -928,6 +980,23 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
             let rows = lock_rows(contents).unwrap();
             assert_eq!(guest_lock_rows(&rows, guest, &held), want);
         }
+    }
+
+    /// A description's recorded flock does not admit a row by its fields: a
+    /// copied DBT `vfork` child can release it natively, leaving the record
+    /// stale, and a host process's identical shared flock (shown under
+    /// `--no-namespace`) would then pass for the guest's. Only the taker's
+    /// pid keeps a flock row.
+    #[test]
+    fn a_recorded_flock_admits_no_row_whose_taker_is_not_the_guests() {
+        let held = held_locks_in_fdinfo(b"lock:\t1: FLOCK ADVISORY READ 3 00:2a:5 0 EOF\n");
+        // The guest's lock is gone (released natively); the host's remains.
+        let rows = lock_rows(b"1: FLOCK ADVISORY READ 4242 00:2a:5 0 EOF\n").unwrap();
+        assert_eq!(guest_lock_rows(&rows, guest, &held), [false]);
+        // A flock its guest taker holds is shown whether or not it was recorded.
+        let rows = lock_rows(b"1: FLOCK ADVISORY READ 3 00:2a:5 0 EOF\n").unwrap();
+        assert_eq!(guest_lock_rows(&rows, guest, &held), [true]);
+        assert_eq!(guest_lock_rows(&rows, guest, &[]), [true]);
     }
 
     fn lock(start: &str) -> HeldLock {

@@ -26,6 +26,12 @@
 //! | [`pidfd_getfd_alias_mutation_invalidates_source_flock_authority`] | a pidfd_getfd duplicate unlocked its source OFD while the source cache stayed stale and restored the released lock |
 //! | [`transferred_lock_state_is_unknown_to_the_sender`] | the sender restored stale state after the receiver unlocked the OFD |
 //! | [`dbt_vfork_child_flock_fails_closed_without_deadlock`] | a copied vfork child blocked in the kernel while its parent was suspended |
+//! | [`pipe_fork_then_vfork_runs_at_l2`] | every fork invalidated every description, so DBT refused any later vfork, `make -jN` included |
+//! | [`dbt_pipe_fork_then_vfork_runs_at_l2`] | the same, on DBT, where the guard runs |
+//! | [`dbt_vfork_after_a_pipe_lock_and_a_fork_fails_closed`] | narrowing the guard to granted locks would lose a grant made before or after the fork |
+//! | [`dbt_copied_child_pidfd_getfd_is_refused_under_every_policy`] | a copied vfork child duplicated a sibling's locked description with native pidfd_getfd and unlocked it under the sibling's held claim |
+//! | [`dbt_copied_child_recvmsg_import_is_refused_under_every_policy`] | a copied vfork child received a sibling's locked shared description over SCM_RIGHTS under the allow policy and unlocked it under the sibling's held claim |
+//! | [`dbt_copied_child_ofd_getlk_and_posix_locks_stay_native`] | the copied-child OFD refusal overmatched a read-only F_OFD_GETLK or a POSIX F_SETLK |
 //! | [`dbt_clone_vfork_forms_fail_closed_before_copy`] | clone and clone3 with `CLONE_VFORK` bypassed the vfork pre-copy guard |
 //! | [`dbt_process_clone_files_is_refused_before_copied_child_mutation`] | a copied process shared the kernel fd table while Detcore copied its metadata |
 //! | [`replay_reissues_every_flock_for_a_materialized_file`] | replay consumed the recorded return and took no lock |
@@ -52,6 +58,10 @@ static RECORD_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(feature = "dbt")]
 const DBT_VFORK_FLOCK_REFUSAL: &str =
     "detcore-dbt: refusing vfork/CLONE_VFORK while an open file description may hold a flock";
+#[cfg(feature = "dbt")]
+const DBT_COPIED_PIDFD_GETFD_REFUSAL: &str = "detcore-dbt: refusing pidfd_getfd in copied child";
+#[cfg(feature = "dbt")]
+const DBT_COPIED_RECVMSG_REFUSAL: &str = "detcore-dbt: refusing recvmsg/recvmmsg in copied child";
 #[cfg(feature = "dbt")]
 const DBT_PROCESS_CLONE_FILES_REFUSAL: &str =
     "detcore-dbt: refusing process clone with CLONE_FILES without CLONE_THREAD";
@@ -672,9 +682,11 @@ fn dbt_vfork_child_flock_fails_closed_without_deadlock() {
     );
 }
 
-/// A successful process fork makes inherited flock state unknown. Unknown can
-/// still mean held, so the same vfork guard must refuse rather than let the
-/// unobservable child block in the kernel.
+/// A successful process fork makes inherited flock state unknown. Unknown
+/// alone no longer refuses; this scenario took `LOCK_SH|LOCK_NB` before the
+/// fork, so a lock was granted through the description and may still be held,
+/// and the same vfork guard must refuse rather than let the unobservable child
+/// block in the kernel or change that lock natively.
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_vfork_with_unknown_flock_state_fails_closed_without_deadlock() {
@@ -705,6 +717,231 @@ fn dbt_vfork_without_flock_state_still_runs() {
         run.status.code(),
         Some(0),
         "DBT vfork without possible flock state must remain available\n{}",
+        run.combined()
+    );
+}
+
+/// Run `pipe-fork-vfork` at L2 on `backend`: `--strict --verify
+/// --verify-strict`, requiring bitwise parity over a nonzero, equal number of
+/// compared INFO messages.
+fn assert_pipe_fork_then_vfork_runs_at_l2(backend: &str) {
+    let report_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create the verification report directory");
+    let report = report_dir.path().join("verify.json");
+    let report_arg = report.to_str().expect("UTF-8 report path");
+    let run = hermit_run_backend(
+        backend,
+        "info",
+        &[
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
+        ],
+        "pipe-fork-vfork",
+    );
+    assert!(
+        run.status.success(),
+        "{backend}: a pipe, a fork, then vfork must run under strict verification\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stdout.contains("flock-pipe-fork-vfork-ok lock=0"),
+        "{backend}: the guest did not reach its marker\n{}",
+        run.combined()
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).unwrap_or_else(|error| {
+            panic!(
+                "{backend}: no verification report: {error}\n{}",
+                run.combined()
+            )
+        }))
+        .unwrap_or_else(|error| panic!("{backend}: the verification report is not JSON: {error}"));
+    assert_eq!(
+        report["bitwise_parity"],
+        serde_json::Value::Bool(true),
+        "{backend}: {report}"
+    );
+    let compared = &report["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "{backend}: verification compared no INFO messages: {report}"
+    );
+}
+
+/// A pipe, an ordinary fork whose child exits, then vfork and exec: the shape
+/// every `make -jN` reaches, and one that never calls `flock`. The ptrace
+/// backend has no vfork flock guard; this is the reference the DBT case below
+/// must match.
+#[test]
+fn pipe_fork_then_vfork_runs_at_l2() {
+    assert_pipe_fork_then_vfork_runs_at_l2("ptrace");
+}
+
+/// The same guest on DBT. Before the guard asked whether a lock was ever
+/// granted, the fork invalidated the pipe's flock cache, and an invalidated
+/// description refused the vfork with exit 101 and
+/// [`DBT_VFORK_FLOCK_REFUSAL`]: every DBT `make -j4` and `make -j8` cell
+/// stopped there in its first run.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_pipe_fork_then_vfork_runs_at_l2() {
+    assert_pipe_fork_then_vfork_runs_at_l2("dbt");
+}
+
+/// The negative controls for the two cases above: the same guest with a
+/// `LOCK_EX` taken on the pipe, before the fork (a mode the fork then makes
+/// unknown) or after it (a grant served while the mode was already unknown).
+/// Either way the description may hold a lock a copied vfork child could
+/// change behind Detcore's back, so the vfork must still be refused.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_vfork_after_a_pipe_lock_and_a_fork_fails_closed() {
+    for scenario in ["locked-pipe-fork-vfork", "pipe-fork-locked-vfork"] {
+        let run = hermit_run_backend_timeout("dbt", "info", &[], scenario, "8s");
+        assert_eq!(
+            run.status.code(),
+            Some(101),
+            "DBT {scenario} must fail closed with exit 101, not time out or run\n{}",
+            run.combined()
+        );
+        assert!(
+            run.stderr.contains(DBT_VFORK_FLOCK_REFUSAL),
+            "DBT {scenario} missed the vfork flock refusal\n{}",
+            run.combined()
+        );
+        assert!(
+            !run.stdout.contains("flock-pipe-fork-vfork-ok"),
+            "DBT {scenario} completed the vfork it must refuse\n{}",
+            run.combined()
+        );
+    }
+}
+
+/// A forked holder takes `LOCK_SH` on a fresh description, so its Detcore
+/// holds a known mode for it. The parent's vfork passes the up-front guard
+/// (nothing the parent holds was ever locked), and its copied child calls
+/// `pidfd_getfd` on the holder's descriptor, then `LOCK_UN`. Natively that
+/// would release the holder's lock under its held claim. DBT never runs the
+/// copied child's `pidfd_getfd`, under any policy (base refused this shape at
+/// the vfork under every policy): `run --strict` ends the run with exit 101
+/// and the named refusal; the `--allow-unsupported-syscalls` opt-out names
+/// the refusal and answers EPERM, and the guest goes on. Not `--verify`:
+/// evidence capture refuses the call on its own in verify runs, which would
+/// hide a missing refusal.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_copied_child_pidfd_getfd_is_refused_under_every_policy() {
+    let run = hermit_run_backend_timeout("dbt", "info", &["--strict"], "copied-pidfd-getfd", "30s");
+    assert_eq!(
+        run.status.code(),
+        Some(101),
+        "--strict: a copied child's pidfd_getfd must fail closed with exit 101\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr.contains(DBT_COPIED_PIDFD_GETFD_REFUSAL),
+        "--strict: the copied child's pidfd_getfd missed its named refusal\n{}",
+        run.combined()
+    );
+    assert!(
+        !run.stdout.contains("reached pidfd_getfd") && !run.stdout.contains("refused errno"),
+        "--strict: the copied child's pidfd_getfd ran or returned\n{}",
+        run.combined()
+    );
+    let run = hermit_run_backend_timeout(
+        "dbt",
+        "info",
+        &["--allow-unsupported-syscalls"],
+        "copied-pidfd-getfd",
+        "30s",
+    );
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "--allow-unsupported-syscalls: the copied child's pidfd_getfd must answer EPERM\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr.contains(DBT_COPIED_PIDFD_GETFD_REFUSAL)
+            && run
+                .stdout
+                .contains("flock-copied-pidfd-getfd-refused errno=EPERM"),
+        "--allow-unsupported-syscalls: the copied child's pidfd_getfd was not refused with EPERM\n{}",
+        run.combined()
+    );
+}
+
+/// Codex's SCM_RIGHTS sequence: the parent opens `/dev/urandom` (promoted to
+/// DBT's shared model at the fork), a forked holder takes `LOCK_SH` on it, so
+/// the shared model holds a known mode, and sends it over a socketpair; the
+/// parent closes its own copy and vforks, which the up-front guard admits
+/// (nothing the parent still holds was locked through it). The copied child
+/// would receive the description natively and unlock it under the holder's
+/// claim. DBT never runs the copied child's `recvmsg`: `--strict` ends the
+/// run with exit 101 and the named refusal; `--allow-unsupported-syscalls`
+/// names the refusal and answers EPERM.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_copied_child_recvmsg_import_is_refused_under_every_policy() {
+    let run =
+        hermit_run_backend_timeout("dbt", "info", &["--strict"], "copied-recvmsg-import", "30s");
+    assert_eq!(
+        run.status.code(),
+        Some(101),
+        "--strict: a copied child's recvmsg must fail closed with exit 101\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr.contains(DBT_COPIED_RECVMSG_REFUSAL)
+            && !run.stdout.contains("reached recvmsg")
+            && !run.stdout.contains("refused errno"),
+        "--strict: the copied child's recvmsg was not refused by name\n{}",
+        run.combined()
+    );
+    let run = hermit_run_backend_timeout(
+        "dbt",
+        "info",
+        &["--allow-unsupported-syscalls"],
+        "copied-recvmsg-import",
+        "30s",
+    );
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "--allow-unsupported-syscalls: the copied child's recvmsg must answer EPERM\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr.contains(DBT_COPIED_RECVMSG_REFUSAL)
+            && run
+                .stdout
+                .contains("flock-copied-recvmsg-import-refused errno=EPERM"),
+        "--allow-unsupported-syscalls: the copied child's recvmsg was not refused with EPERM\n{}",
+        run.combined()
+    );
+}
+
+/// The copied-child OFD refusal covers only lock changes. A copied vfork
+/// child's `F_OFD_GETLK` (a query) and POSIX `F_SETLK` (a process-owned lock
+/// the ledger does not record) still run natively under `--strict`.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_copied_child_ofd_getlk_and_posix_locks_stay_native() {
+    let run =
+        hermit_run_backend_timeout("dbt", "info", &["--strict"], "copied-native-locks", "30s");
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "a copied child's F_OFD_GETLK and POSIX F_SETLK must run\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stdout.contains("flock-copied-native-locks-ok"),
+        "the copied child's native lock calls did not complete\n{}",
         run.combined()
     );
 }

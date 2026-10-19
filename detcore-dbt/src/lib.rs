@@ -2182,6 +2182,19 @@ fn copied_child_flock_action(operation: Option<i32>) -> i32 {
     }
 }
 
+/// Whether a copied child's `fcntl` with these arguments sets or clears an OFD
+/// lock (`F_OFD_SETLK`, `F_OFD_SETLKW`, whatever the lock type). Missing
+/// arguments count as a change, so the strict refusal fails closed.
+fn copied_child_fcntl_changes_ofd_lock(args: *const u64) -> bool {
+    if args.is_null() {
+        return true;
+    }
+    // SAFETY: Reverie's DBT client passes its live six-element syscall
+    // argument array for the duration of this callback.
+    let command = unsafe { args.add(1).read() } as i32;
+    matches!(command, libc::F_OFD_SETLK | libc::F_OFD_SETLKW)
+}
+
 /// Whether `sysno` reads the clock or a resource limit, which the DBT client no
 /// longer answers from a table of its own (Reverie A8 step 2) and which a copied
 /// child cannot take to Detcore. A relative `clock_nanosleep` on a wall or
@@ -2264,8 +2277,9 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
     }
     // TODO-HUMAN-REVIEW(PR-981): Copied DBT children cannot enter the Rust
     // Detcore Tool. Strict mode therefore fails closed for receive syscalls that
-    // can expose native socket timestamps. Non-strict mode retains native
-    // behavior.
+    // can expose native socket timestamps. Non-strict mode retained native
+    // behavior until the descriptor-import arm below, which now answers
+    // recvmsg and recvmmsg with EPERM there.
     // TODO-HUMAN-REVIEW(PR-972): readlink identity canonicalization also requires
     // Detcore mediation. This ABI has neither syscall arguments nor a memory
     // writer, so a copied child must fail closed rather than expose native
@@ -2277,11 +2291,94 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
         let operation = (!args.is_null()).then(|| unsafe { args.add(1).read() as i32 });
         return copied_child_flock_action(operation);
     }
-    if matches!(
-        sysno,
-        Sysno::recvmsg | Sysno::recvmmsg | Sysno::readlink | Sysno::readlinkat
-    ) && strict
-    {
+    // pidfd_getfd NEVER RUNS NATIVELY IN A COPIED CHILD because it is the one native
+    // route by which a copied child can reach an open file description that
+    // ANOTHER guest process holds a Detcore claim about. A sibling that took
+    // LOCK_SH through Detcore holds a known mode for its description; a
+    // copied child that duplicates that description with pidfd_getfd and
+    // runs LOCK_UN natively (the flock arm above lets unlock through) makes
+    // the sibling's claim stale, and its next refused blocking upgrade would
+    // "restore" a lock it no longer holds. The instrumented root mediates
+    // pidfd_getfd (self only); a copied child cannot enter that handler.
+    // Evidence capture refuses this call too, but only in verify runs. The
+    // protection does not depend on the unsupported-syscall policy: a stale
+    // claim corrupts flock semantics (a "restored" lock the guest released),
+    // not only determinism, and before copied children could be admitted
+    // after a fork the up-front vfork guard, which is not policy-gated,
+    // refused this shape under --allow-unsupported-syscalls too. Only the
+    // form of the refusal follows the policy: the default fail-closed policy
+    // ends the run by name; the --allow-unsupported-syscalls opt-out
+    // answers EPERM without executing the call (the errno Linux gives when
+    // ptrace access to the target is denied), as the root answers an
+    // unserviceable call with an errno under that opt-out. Ending the run
+    // there is not an option: a copied child's fail-closed exit under the
+    // opt-out left the run hung (measured: the vfork parent stayed in
+    // kernel_clone and the tree never ended). SCM_RIGHTS reception, the
+    // other import route, is refused by the recvmsg arm below the same way.
+    if sysno == Sysno::pidfd_getfd {
+        if let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get() {
+            emit_marker(
+                *emit,
+                b"detcore-dbt: refusing pidfd_getfd in copied child: a native duplicate of another process's open file description could change a lock that process's Detcore state holds a claim about\n",
+            );
+        }
+        return if strict { 1 } else { -libc::EPERM };
+    }
+    // An OFD lock change NEVER RUNS NATIVELY IN A COPIED CHILD because the
+    // `/proc/locks` ledger in Detcore's global state records which OFD locks
+    // each description holds, and a copied child's native F_OFD_SETLK or
+    // F_OFD_SETLKW (an unlock included) changes the kernel's lock without
+    // updating that record. An OFD row prints owner -1 in every PID
+    // namespace, and the ledger keeps such a row by field match, so a stale
+    // entry admits a host process's identical lock into the guest's
+    // /proc/locks. The parent's up-front OFD vfork guard cannot see a lock a
+    // sibling took through its own split copy of the description's model, so
+    // the refusal belongs at the call. F_OFD_GETLK changes nothing and stays
+    // native, as in the root, where it also sees host locks. POSIX
+    // F_SETLK/F_SETLKW stay native: POSIX rows are not in the ledger (it
+    // keeps OFD and flock rows only) and are kept by their owner pid, and
+    // Detcore caches no POSIX lock state. The protection does not depend on
+    // the unsupported-syscall policy, for the reason the pidfd_getfd arm
+    // gives: the up-front OFD and flock vfork guards it stands in for are not
+    // policy-gated. Under the --allow-unsupported-syscalls opt-out the call
+    // is answered ENOLCK without executing, as a copied child's blocking
+    // flock is (`copied_child_flock_action`), so the kernel's lock and the
+    // ledger's record stay in agreement.
+    if sysno == Sysno::fcntl && copied_child_fcntl_changes_ofd_lock(args) {
+        if let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get() {
+            emit_marker(
+                *emit,
+                b"detcore-dbt: refusing fcntl F_OFD_SETLK/F_OFD_SETLKW in copied child: a native OFD lock change would leave the /proc/locks ledger's record of that description stale\n",
+            );
+        }
+        return if strict { 1 } else { -libc::ENOLCK };
+    }
+    // recvmsg and recvmmsg NEVER RUN NATIVELY IN A COPIED CHILD, under any
+    // policy, because an SCM_RIGHTS message is the other native route by
+    // which a copied child can import an open file description another guest
+    // process holds a Detcore claim about. A sibling's promoted description
+    // (OpenFileState::Shared) keeps its canonical known mode across the
+    // sender's sendmsg; a copied child that receives it and runs LOCK_UN
+    // natively makes that claim stale, as with pidfd_getfd above. Whether a
+    // call carries a control buffer cannot be told here: the msghdr is guest
+    // memory and this ABI has no reader (a fault in the runtime would take
+    // the place of the guest's EFAULT), so every call is refused, including
+    // one without a control buffer that would import nothing. Strict
+    // execution already refused both for native socket timestamps. Under the
+    // default fail-closed policy the run ends by name; under the
+    // --allow-unsupported-syscalls opt-out the call answers EPERM without
+    // executing (a security module can refuse a receive with it), for the
+    // reason the pidfd_getfd arm gives.
+    if matches!(sysno, Sysno::recvmsg | Sysno::recvmmsg) {
+        if let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get() {
+            emit_marker(
+                *emit,
+                b"detcore-dbt: refusing recvmsg/recvmmsg in copied child: an SCM_RIGHTS message could import an open file description another process's Detcore state holds a claim about\n",
+            );
+        }
+        return if strict { 1 } else { -libc::EPERM };
+    }
+    if matches!(sysno, Sysno::readlink | Sysno::readlinkat) && strict {
         return 1;
     }
     // setpgid FAILS CLOSED IN STRICT MODE BECAUSE THE COPIED CHILD CAN PERFORM
