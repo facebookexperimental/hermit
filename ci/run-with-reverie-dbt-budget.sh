@@ -2361,7 +2361,12 @@ fi
 # This carries only SDK/build-resource calibration, not runtime/package identity.
 # The opted-in loader union requires a fresh link and INFO, memory, RCB and
 # cancellation qualification after landing under the approved soft-green rule.
-expected_pin=214727781526adb7c42f1f303f87264c9a38d6aa
+# CARRY TO 364e5ea289b6e9d5d019615ff5b2a4ca576f5256 (2026-10-20): from
+# 214727781526adb7c42f1f303f87264c9a38d6aa. Only the private-loader feature boundary,
+# exact allocator return contract and declared source digest change. DBT tree, SDK inputs, root manifests
+# and toolchain are identical; inventory997 and resource budgets carry unchanged.
+# This carries no runtime evidence or artifact identity.
+expected_pin=364e5ea289b6e9d5d019615ff5b2a4ca576f5256
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
