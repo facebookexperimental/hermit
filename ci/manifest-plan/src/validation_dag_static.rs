@@ -294,12 +294,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from a3a9c83a: 9.
     // The private-source transaction checks both Result paths: +1.
     // The shared qualifier's two child-stream reader controls: +2 = 12.
-    ("test.liteinst_allocator", 12),
+    // And 177 more unit tests of reverie-liteinst-artifact, which this binary
+    // #[path]-includes (13 -> 190 #[test]s at Reverie 21472778, pinned by
+    // 059e069b; 185 of them selected here): 189, listed.
+    ("test.liteinst_allocator", 189),
     // Eleven unchanged M2 cases plus one constructor row and two refusal controls.
     // The same measured native-exec TLS recipe control adds one identity.
     // And +1 from a3a9c83a: 15.
     // The shared qualifier's two child-stream reader controls: +2 = 17.
-    ("test.liteinst_stacks", 17),
+    // And the same 177 reverie-liteinst-artifact unit tests: 194, listed.
+    ("test.liteinst_stacks", 194),
     // run_dbt_binds_in_a_user_namespace_of_its_own retains both prior
     // identities: 2 + 1 = 3.
     ("test.isolated_dbt_workdir", 3),
