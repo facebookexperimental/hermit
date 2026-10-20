@@ -1,16 +1,10 @@
 # Enabled E2E cells that are not required (ci: false): <test> <mode> <backend>.
 # Generated from tests/e2e/manifests by ci/sync-cell-config.sh; do not edit.
-applications/example-timed-progress-bar verify kvm
-applications/example-timed-progress-bar verify ptrace
-applications/kvm-python-examples verify kvm
 c-programs/dbt-execveat-unsupported verify dbt
 c-programs/dbt-execveat-unsupported verify sabre
 c-programs/dbt-unsupported-syscall verify ptrace
 c-programs/get-robust-list-thread verify sabre
-c-programs/hardware-trap-identity verify dbt
-c-programs/just-spin verify kvm
 c-programs/just-spin verify sabre
-c-programs/nanosleep-par verify sabre
 c-programs/nanosleep-threads-nocrash verify sabre
 c-programs/ppoll-simulation verify sabre
 c-programs/printf-with-threads verify sabre
@@ -21,16 +15,12 @@ c-programs/sched-yield-progress verify sabre
 c-programs/sigmask-preemption verify sabre
 c-programs/signal-waitstatus-identity verify dbt
 c-programs/sigtimedwait-timeout-0s verify sabre
-c-programs/syscall-file-metadata verify kvm
 c-programs/thread-self-procfs-handoff verify sabre
 c-programs/threadexhaustion verify sabre
 c-programs/writev-determinism custom ptrace
 chaos-c/lock-granularity verify sabre
 data-handling/jq-json-transform naked -
 data-handling/sqlite-query-determinism naked -
-determinism-stress-c/fork-tree verify sabre
-determinism-stress-c/mmap-fork-shared verify sabre
-determinism-stress-c/pipe-chain verify sabre
 determinism-stress-c/producer-consumer naked -
 determinism-stress-c/thread-stress verify sabre
 determinism-stress/example-race verify sabre
@@ -38,7 +28,6 @@ determinism-stress/order-violation chaos ptrace
 determinism-stress/thread-contention naked -
 language-runtimes/bash-random naked -
 language-runtimes/cpp-stl-determinism naked -
-language-runtimes/example-python-random verify sabre
 language-runtimes/gawk-random naked -
 language-runtimes/lua-random naked -
 language-runtimes/m4-macro-mkstemp naked -
@@ -49,7 +38,6 @@ language-runtimes/python-hash-determinism naked -
 language-runtimes/python-hashseed naked -
 language-runtimes/python-random naked -
 language-runtimes/ruby-random naked -
-language-runtimes/ruby-random verify kvm
 language-runtimes/rust-hashmap-iteration naked -
 language-runtimes/tcl-rand-clock naked -
 shared-futex-c/qemu-exec-init verify ptrace
@@ -70,5 +58,4 @@ system-utils/random-device naked -
 system-utils/shuf-permutation naked -
 system-utils/sort-random naked -
 system-utils/ssh-keygen-ed25519 naked -
-system-utils/startup-tls-guards verify sabre
 system-utils/uuidgen-random naked -
