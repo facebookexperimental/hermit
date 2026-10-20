@@ -11096,11 +11096,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mask = match call.mask().and_then(|mask| Addr::from_raw(mask.as_raw())) {
             Some(mask) => {
                 // The call's first injection (`restart_if_first_probe_not_run`).
-                match crate::syscalls::signal::restart_if_first_probe_not_run(
-                    crate::syscalls::signal::read_kernel_sigset(guest, mask).await,
-                ) {
-                    Err(Error::Errno(Errno::ERESTARTNOINTR)) => {
-                        return Err(Errno::ERESTARTNOINTR.into());
+                match crate::syscalls::signal::read_kernel_sigset(guest, mask).await {
+                    Err(error @ Error::Errno(Errno::ERESTARTSYS)) => {
+                        return crate::syscalls::signal::restart_if_first_probe_not_run(Err(error));
                     }
                     read => read.ok(),
                 }

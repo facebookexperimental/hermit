@@ -2941,7 +2941,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And four arrived-first ptrace_delivery_check_* tests (A5 step 3.2b,
     // https://github.com/rrnewton/hermit/issues/4526), listed: 303.
     // And a fifth, for pselect6: 304.
-    ("test.hermit_integration_3", 304),
+    // And arrived-first epoll_pwait2 and zero-timeout ppoll tests
+    // (https://github.com/rrnewton/hermit/issues/4526), listed: 306.
+    ("test.hermit_integration_3", 306),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4675,7 +4677,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // pidfd_getfd and recvmsg-import refusals and native-lock control, and
     // proc_locks_determinism's copied-child OFD unlock and stale-flock-record
     // tests: 650, listed.
-    ("test.hermit_integration_on_host", 650),
+    // And +2 from 7b5d1ef2: 652.
+    ("test.hermit_integration_on_host", 652),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

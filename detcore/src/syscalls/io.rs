@@ -355,23 +355,41 @@ where
 /// in Linux's order (Claude review of
 /// https://github.com/rrnewton/hermit/pull/4166). `None` too when the call
 /// has no mask, its wrapper cannot be read, or the size is not the kernel's.
+///
+/// The read is the call's first injection: a signal that stops it restarts
+/// the call (`restart_if_first_probe_not_run`), the only error returned.
 async fn entry_pselect6_temporary_mask<G, T>(
     guest: &mut G,
     call: syscalls::Pselect6,
-) -> Option<KernelSigset>
+) -> Result<Option<KernelSigset>, Error>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let wrapper = call.sigmask()?;
-    let argument: Pselect6SigmaskArg = guest.memory().read_value(wrapper.cast()).ok()?;
+    let Some(wrapper) = call.sigmask() else {
+        return Ok(None);
+    };
+    let Ok(argument) = guest
+        .memory()
+        .read_value::<_, Pselect6SigmaskArg>(wrapper.cast())
+    else {
+        return Ok(None);
+    };
     if argument.sigsetsize != KERNEL_SIGSET_SIZE {
-        return None;
+        return Ok(None);
     }
-    let mask_addr = Addr::<libc::sigset_t>::from_raw(argument.sigmask)?;
-    let mask = read_kernel_sigset(guest, mask_addr).await.ok()?;
+    let Some(mask_addr) = Addr::<libc::sigset_t>::from_raw(argument.sigmask) else {
+        return Ok(None);
+    };
+    let mask = match read_kernel_sigset(guest, mask_addr).await {
+        Ok(mask) => mask,
+        Err(error @ Error::Errno(Errno::ERESTARTSYS)) => {
+            return crate::syscalls::signal::restart_if_first_probe_not_run(Err(error));
+        }
+        Err(_) => return Ok(None),
+    };
     super::signal_shadow::note_wait_mask(guest, mask);
-    Some(mask)
+    Ok(Some(mask))
 }
 
 /// The temporary mask a replayed zero-timeout pselect6 sleeps under, read
@@ -610,6 +628,51 @@ pub(super) fn ppoll_timeout_duration(timeout: Timespec) -> Result<Duration, Errn
         return Err(Errno::EINVAL);
     }
     Ok(Duration::new(seconds, nanoseconds))
+}
+
+/// The start time and deadline of a wait for `timeout`, or neither without
+/// one. Observing the virtual clock asks the scheduler, which publishes the
+/// thread's signal state and can end its turn, so a call whose first mask probe
+/// may restart it (`restart_if_first_probe_not_run`) calls this after the
+/// probe. `LogicalTime + Duration` saturates, where a nanosecond count cast to
+/// u64 would wrap a 2^64 ns timeout to none at all (Claude review of
+/// https://github.com/rrnewton/hermit/pull/4235).
+async fn ppoll_start<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    timeout: Option<Duration>,
+) -> (Option<LogicalTime>, Option<LogicalTime>) {
+    match timeout {
+        Some(timeout) => {
+            let started_at = thread_observe_time(guest).await;
+            (Some(started_at), Some(started_at + timeout))
+        }
+        None => (None, None),
+    }
+}
+
+/// The temporary mask `call` names, if any, read by a kernel-access probe;
+/// EINVAL for a size the kernel rejects. `first` says the read is the call's
+/// first injection, so a signal that stops it restarts the call
+/// (`restart_if_first_probe_not_run`).
+async fn read_ppoll_mask<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    call: syscalls::Ppoll,
+    first: bool,
+) -> Result<Option<KernelSigset>, Error> {
+    let Some(signal_mask) = call.sigmask() else {
+        return Ok(None);
+    };
+    if call.sigsetsize() != KERNEL_SIGSET_SIZE {
+        return Err(Errno::EINVAL.into());
+    }
+    let read = read_kernel_sigset(guest, signal_mask).await;
+    let signal_mask = if first {
+        crate::syscalls::signal::restart_if_first_probe_not_run(read)?
+    } else {
+        read?
+    };
+    super::signal_shadow::note_wait_mask(guest, signal_mask);
+    Ok(Some(signal_mask))
 }
 
 /// `select`'s timeout as Linux reads it. In Linux v7.1 `kern_select`
@@ -1034,6 +1097,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             // installs the mask and ends the call with ERESTARTNOHAND for a
             // pending signal it unblocks
             // (https://github.com/rrnewton/hermit/issues/4054).
+            //
+            // The entry read is the call's first injection, which a signal can
+            // stop and restart (`restart_if_first_probe_not_run`), so it comes
+            // before the refusal check: that logs, and the restarted call would
+            // log again.
+            // `None` inside when the call names no mask, or one the kernel
+            // rejects or the tracer cannot read, though the kernel can: such a
+            // call keeps the guest's own wrapper.
+            let entry_mask = if call.sigmask().is_some() && !zero_timeout {
+                Some(entry_pselect6_temporary_mask(guest, call).await?)
+            } else {
+                None
+            };
             if !replayed_pselect6_delivery_fits(guest, call).await
                 && let Some(refused) = self.refuse_undeliverable_pselect6_mask(guest).await
             {
@@ -1041,11 +1117,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             let read_mask = self.cfg.replaying && call.sigmask().is_some();
             let mut temporary_mask = None;
-            let result = if call.sigmask().is_some() && !zero_timeout {
-                // `None` when the call names no mask, or one the kernel rejects
-                // or the tracer cannot read, though the kernel can: such a call
-                // keeps the guest's own wrapper.
-                let entry_mask = entry_pselect6_temporary_mask(guest, call).await;
+            let result = if let Some(entry_mask) = entry_mask {
                 if read_mask {
                     temporary_mask = entry_mask;
                 }
@@ -1144,10 +1216,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(argument) = sigmask_argument
             && argument.sigmask != 0
         {
+            // After the wrapper's validation: not the call's first injection.
             self.observe_under_temporary_mask(
                 guest,
                 Addr::<libc::sigset_t>::from_raw(argument.sigmask),
                 argument.sigsetsize,
+                false,
             )
             .await?;
         }
@@ -1931,6 +2005,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
 
         let result: Result<i64, Error> = if timeout == Some(Duration::ZERO) {
+            // In run mode the mask's read below is the call's first injection
+            // unless a virtual timerfd's expiration is published first, which
+            // can inject only for a process holding an armed one. Under record
+            // and replay a scheduler request comes first, which changes
+            // scheduler state (it publishes the thread's signal state and can
+            // grant another thread a turn), so a restart would repeat it: the
+            // read keeps the not-run report there
+            // (https://github.com/rrnewton/hermit/issues/4526).
+            let first = !self.cfg.recordreplay_modes
+                && !crate::syscalls::timerfd::holds_armed_virtual_timerfd(guest);
             if self.cfg.recordreplay_modes {
                 resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
             } else {
@@ -1939,9 +2023,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // probe's copies take the scratch stack.
                 crate::syscalls::timerfd::publish_expired(guest).await;
             }
-            // A virtual timerfd's expiration is published first, so the
-            // mask's read is not the call's first step.
-            let (probe, staged) = match self.prepare_ppoll_probe(guest, call, false).await? {
+            let (probe, staged) = match self.prepare_ppoll_probe(guest, call, first).await? {
                 Some((probe, staged)) => (probe, Some(staged)),
                 None => {
                     if let Some(refused) = self.refuse_unstageable_ppoll_copy(guest).await {
@@ -2104,18 +2186,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         )>,
         Error,
     > {
-        let signal_mask = match call.sigmask() {
+        let signal_mask = read_ppoll_mask(guest, call, first).await?;
+        self.stage_ppoll_probe(guest, call, signal_mask).await
+    }
+
+    /// `prepare_ppoll_probe` after the mask's read: `signal_mask` is the
+    /// mask `read_ppoll_mask` read, if the call names one.
+    async fn stage_ppoll_probe<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Ppoll,
+        signal_mask: Option<KernelSigset>,
+    ) -> Result<
+        Option<(
+            syscalls::Ppoll,
+            StagedCells<<G::Stack as Stack>::StackGuard>,
+        )>,
+        Error,
+    > {
+        let signal_mask = match signal_mask {
             Some(signal_mask) => {
-                if call.sigsetsize() != KERNEL_SIGSET_SIZE {
-                    return Err(Errno::EINVAL.into());
-                }
-                let read = read_kernel_sigset(guest, signal_mask).await;
-                let signal_mask = if first {
-                    crate::syscalls::signal::restart_if_first_probe_not_run(read)?
-                } else {
-                    read?
-                };
-                super::signal_shadow::note_wait_mask(guest, signal_mask);
                 // The probe's temporary mask lets the kernel take a pending
                 // real-time timer expiration that every thread blocked when it
                 // expired (https://github.com/rrnewton/hermit/issues/4089).
@@ -2179,16 +2269,6 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         debug_assert_ne!(timeout, Some(Duration::ZERO));
         let timeout_address = call.timeout();
-        let started_at = if timeout.is_some() {
-            Some(thread_observe_time(guest).await)
-        } else {
-            None
-        };
-        let deadline = match (timeout, started_at) {
-            (Some(duration), Some(started_at)) => Some(started_at + duration),
-            (None, None) => None,
-            _ => unreachable!(),
-        };
 
         // Every zero-timeout probe carries a private copy of the call's temporary
         // mask, so the kernel applies it atomically, as pselect6's probes do
@@ -2202,9 +2282,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         // block used to return ENOSYS here
         // (https://github.com/rrnewton/hermit/issues/4042).
         if call.sigmask().is_some() {
-            // Only the virtual clock was read before: the mask's read is the
-            // call's first injection.
-            let Some((probe, staged)) = self.prepare_ppoll_probe(guest, call, true).await? else {
+            // Only memory was read before: the mask's read is the call's
+            // first injection. The virtual clock is observed right after it
+            // (`ppoll_start`), before the observation under the mask, which
+            // can ask the scheduler too: Linux takes the end time before it
+            // installs the mask.
+            let signal_mask = read_ppoll_mask(guest, call, true).await?;
+            let (started_at, deadline) = ppoll_start(guest, timeout).await;
+            let Some((probe, staged)) = self.stage_ppoll_probe(guest, call, signal_mask).await?
+            else {
                 // The guest's own mask could block Hermit's timer signal while
                 // the call is parked, so a run that allows unsupported
                 // operations gets the same answer as a mask it cannot honor.
@@ -2248,6 +2334,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return result;
         }
 
+        let (started_at, deadline) = ppoll_start(guest, timeout).await;
         let mut rsrc = Resources::new(guest.thread_state().dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("ppoll");
@@ -2543,7 +2630,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self.handle_internal_masked_epoll_pwait(guest, call).await;
         }
         if call.sigmask().is_some() {
-            self.observe_under_temporary_mask(guest, call.sigmask(), call.sigsetsize())
+            self.observe_under_temporary_mask(guest, call.sigmask(), call.sigsetsize(), true)
                 .await?;
             let dettid = guest.thread_state().dettid;
             resource_request(guest, Resources::new(dettid)).await; // empty request
@@ -2801,12 +2888,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         // epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize)
         let (_, args) = call.into_parts();
-        self.observe_under_temporary_mask(
-            guest,
-            Addr::<libc::sigset_t>::from_raw(args.arg4),
-            args.arg5,
-        )
-        .await?;
+        // The call's first injection, if it makes one; when it does not, the
+        // mask's read below is the first.
+        let observed = self
+            .observe_under_temporary_mask(
+                guest,
+                Addr::<libc::sigset_t>::from_raw(args.arg4),
+                args.arg5,
+                true,
+            )
+            .await?;
         // A NULL timeout waits forever; a zero timespec cannot wait and keeps
         // the turn.
         let zero_timeout = args.arg3 != 0
@@ -2820,7 +2911,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if self.cfg.recordreplay_modes {
             if !zero_timeout {
                 return if args.arg4 != 0 {
-                    self.record_or_replay_masked_epoll_pwait2(guest, args).await
+                    self.record_or_replay_masked_epoll_pwait2(guest, args, !observed)
+                        .await
                 } else {
                     self.record_or_replay_blocking(guest, call).await
                 };
@@ -2835,7 +2927,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             // (https://github.com/rrnewton/hermit/issues/4228). A masked call
             // on a backend whose kernel does not report the guest's signal
             // state keeps the turn, as a masked epoll_pwait does there.
-            return self.handle_internal_epoll_pwait2(guest, args).await;
+            return self
+                .handle_internal_epoll_pwait2(guest, args, !observed)
+                .await;
         }
         let dettid = guest.thread_state().dettid;
         resource_request(guest, Resources::new(dettid)).await; // empty request
@@ -2862,20 +2956,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// thread's turn, so it returned 0 at its timeout, or never, when only
     /// another guest thread could make an event ready
     /// (https://github.com/rrnewton/hermit/issues/4228).
+    /// `first` says the mask's read is the call's first injection
+    /// (`restart_if_first_probe_not_run`).
     async fn handle_internal_epoll_pwait2<G: Guest<Self>>(
         &self,
         guest: &mut G,
         args: SyscallArgs,
+        first: bool,
     ) -> Result<i64, Error> {
-        let deadline = match Addr::<Timespec>::from_raw(args.arg3) {
+        let timeout = match Addr::<Timespec>::from_raw(args.arg3) {
             Some(timeout) => {
                 let timeout: Timespec = guest.memory().read_value(timeout)?;
-                let timeout = ppoll_timeout_duration(timeout)?;
-                // As for ppoll: `LogicalTime + Duration` saturates, where a
-                // nanosecond count cast to u64 would wrap a 2^64 ns timeout to
-                // none at all (Claude review of
-                // https://github.com/rrnewton/hermit/pull/4235).
-                Some(thread_observe_time(guest).await + timeout)
+                Some(ppoll_timeout_duration(timeout)?)
             }
             None => None,
         };
@@ -2887,6 +2979,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_sigmask(None)
             .with_sigsetsize(args.arg5);
         if args.arg4 == 0 {
+            let (_, deadline) = ppoll_start(guest, timeout).await;
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi("epoll_pwait2");
@@ -2896,8 +2989,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EINVAL.into());
         }
         let mask_address = Addr::<libc::sigset_t>::from_raw(args.arg4).ok_or(Errno::EFAULT)?;
-        let mask = read_kernel_sigset(guest, mask_address).await?;
+        let read = read_kernel_sigset(guest, mask_address).await;
+        let mask = if first {
+            crate::syscalls::signal::restart_if_first_probe_not_run(read)?
+        } else {
+            read?
+        };
         super::signal_shadow::note_wait_mask(guest, mask);
+        let (_, deadline) = ppoll_start(guest, timeout).await;
         // A pending real-time timer expiration that the mask lets the kernel
         // deliver or discard (https://github.com/rrnewton/hermit/issues/4089).
         observe_under_mask(guest, mask).await?;
@@ -2912,32 +3011,46 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// it expired, and discard the ones it lets the kernel discard
     /// (https://github.com/rrnewton/hermit/issues/4089). A mask the kernel would
     /// reject fails the call itself, which then observes nothing.
+    ///
+    /// Returns whether it made an injection, which it does only while a
+    /// real-time expiration is kept pending. With `first`, its mask read is
+    /// the call's first injection, so a signal that stops it restarts the call
+    /// (`restart_if_first_probe_not_run`); any other failed read is left to
+    /// the call itself, as before.
     async fn observe_under_temporary_mask<G: Guest<Self>>(
         &self,
         guest: &mut G,
         mask: Option<Addr<'_, libc::sigset_t>>,
         sigsetsize: usize,
-    ) -> Result<(), Error> {
+        first: bool,
+    ) -> Result<bool, Error> {
         let Some(mask) = mask else {
-            return Ok(());
+            return Ok(false);
         };
         if sigsetsize != KERNEL_SIGSET_SIZE
             || !crate::scheduler::real_time_expiration_kept_pending()
         {
-            return Ok(());
+            return Ok(false);
         }
-        let Ok(mask) = read_kernel_sigset(guest, mask).await else {
-            return Ok(());
-        };
-        observe_under_mask(guest, mask).await
+        match read_kernel_sigset(guest, mask).await {
+            Ok(mask) => observe_under_mask(guest, mask).await?,
+            Err(error @ Error::Errno(Errno::ERESTARTSYS)) if first => {
+                return crate::syscalls::signal::restart_if_first_probe_not_run(Err(error));
+            }
+            Err(_) => {}
+        }
+        Ok(true)
     }
 
     /// `record_or_replay_masked_epoll_pwait` for `epoll_pwait2`, whose mask
     /// pointer and size are its fifth and sixth arguments.
+    /// `first` says the mask's read is the call's first injection
+    /// (`restart_if_first_probe_not_run`).
     async fn record_or_replay_masked_epoll_pwait2<G: Guest<Self>>(
         &self,
         guest: &mut G,
         args: SyscallArgs,
+        first: bool,
     ) -> Result<i64, Error> {
         // Linux copies and checks the timespec before the mask, so an
         // unreadable timeout is EFAULT and an invalid one EINVAL whatever the
@@ -2951,7 +3064,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EINVAL.into());
         }
         let mask_address = Addr::<libc::sigset_t>::from_raw(args.arg4).ok_or(Errno::EFAULT)?;
-        let mask = read_kernel_sigset(guest, mask_address).await?;
+        let read = read_kernel_sigset(guest, mask_address).await;
+        let mask = if first {
+            crate::syscalls::signal::restart_if_first_probe_not_run(read)?
+        } else {
+            read?
+        };
         super::signal_shadow::note_wait_mask(guest, mask);
         // The copy may go in the red zone on a stack with no scratch below it,
         // clear of the events buffer the kernel writes and of the timeout it

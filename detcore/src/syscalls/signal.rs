@@ -189,19 +189,15 @@ fn without_perf_event_signal(mask: KernelSigset) -> KernelSigset {
 /// Only for a call's first injection. A probe after an earlier injection
 /// keeps the not-run report, since a restart would repeat that injection
 /// (pselect6's mask read after its wrapper validation and its observation of
-/// a pending real-time timer expiration, for example). Some first injections
-/// still keep it, because whether they come first depends on an earlier
-/// phase that usually injects nothing
-/// (https://github.com/rrnewton/hermit/issues/4526):
-/// - raw epoll_pwait and epoll_pwait2: the mask read inside
-///   `observe_under_temporary_mask`, which swallows any error, and the mask
-///   reads after it when the observation injected nothing;
-/// - a zero-timeout ppoll's mask read (`prepare_ppoll_probe(.., false)`):
-///   in run mode it follows `publish_expired`, which usually injects
-///   nothing; under record and replay only a scheduler request comes first,
-///   so there it is always the first injection, and still unmapped;
-/// - record/replay pselect6's entry read (`entry_pselect6_temporary_mask`),
-///   which swallows any error.
+/// a pending real-time timer expiration, for example), and so does one after
+/// a scheduler request, which changes scheduler state (a record/replay
+/// zero-timeout ppoll). Where an earlier phase injects only sometimes, the
+/// caller says whether it did or can: epoll_pwait and epoll_pwait2's
+/// observation (`observe_under_temporary_mask`, which reports whether it
+/// injected), and a run-mode zero-timeout ppoll's publication of virtual
+/// timerfd expirations, which can inject only for a process holding an armed
+/// virtual timerfd. Record/replay pselect6's entry read is always the call's
+/// first injection (https://github.com/rrnewton/hermit/issues/4526).
 pub(crate) fn restart_if_first_probe_not_run<V>(result: Result<V, Error>) -> Result<V, Error> {
     match result {
         Err(Error::Errno(Errno::ERESTARTSYS)) => Err(Errno::ERESTARTNOINTR.into()),
@@ -1602,13 +1598,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let dettid = guest.thread_state().dettid;
 
-        let maybe_timeout = if let Some(timeout) = call.timeout() {
+        let ns_delta = if let Some(timeout) = call.timeout() {
             let ts: Timespec = guest.memory().read_value(timeout)?;
-            let ns_delta =
-                Duration::from_secs(ts.tv_sec as u64) + Duration::from_nanos(ts.tv_nsec as u64);
-            let base_time = thread_observe_time(guest).await;
-            let target_time = base_time + ns_delta;
-            Some(target_time)
+            Some(Duration::from_secs(ts.tv_sec as u64) + Duration::from_nanos(ts.tv_nsec as u64))
         } else {
             None
         };
@@ -1621,14 +1613,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (`Scheduler::own_process_signal_inputs`). An unreadable set fails in
         // the kernel at the first poll.
         let waited = match call.set() {
-            Some(set) => {
-                match restart_if_first_probe_not_run(read_kernel_sigset(guest, set.into()).await) {
-                    Err(Error::Errno(Errno::ERESTARTNOINTR)) => {
-                        return Err(Errno::ERESTARTNOINTR.into());
-                    }
-                    read => read.ok(),
+            Some(set) => match read_kernel_sigset(guest, set.into()).await {
+                Err(error @ Error::Errno(Errno::ERESTARTSYS)) => {
+                    return restart_if_first_probe_not_run(Err(error));
                 }
-            }
+                read => read.ok(),
+            },
+            None => None,
+        };
+        // After the set's probe, the call's first injection: observing the
+        // virtual clock asks the scheduler, which a restart would repeat.
+        let maybe_timeout = match ns_delta {
+            Some(ns_delta) => Some(thread_observe_time(guest).await + ns_delta),
             None => None,
         };
         if waited.is_some() {

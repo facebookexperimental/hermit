@@ -779,7 +779,13 @@ impl RecordVersion {
 // first (https://github.com/rrnewton/hermit/issues/4526), where the call failed
 // with the probe's -ERESTARTSYS. A recording made before this holds that EINTR
 // and would replay out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17e);
+// 0x17e -> 0x17f (taken at land time, HIGHEST_SHIPPED + 1): the remaining
+// first-probe sites restart too (masked epoll_pwait2, zero-timeout masked ppoll,
+// record/replay pselect6's entry read), and masked ppoll, epoll_pwait2 and
+// rt_sigtimedwait read the virtual clock after their first probe instead of
+// before it (https://github.com/rrnewton/hermit/issues/4526). A recording made
+// before this can hold the not-run probe's EINTR at those entries.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17f);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -804,7 +810,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17e);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17e;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17f;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

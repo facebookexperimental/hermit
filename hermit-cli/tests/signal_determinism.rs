@@ -1796,6 +1796,33 @@ fn ptrace_delivery_check_restarts_a_pselect6_a_signal_reaches_at_its_entry() {
     );
 }
 
+/// The mask read of an epoll_pwait2 whose observation of pending real-time
+/// timer expirations injected nothing is its first injection
+/// (https://github.com/rrnewton/hermit/issues/4526).
+#[test]
+fn ptrace_delivery_check_restarts_an_epoll_pwait2_a_signal_reaches_at_its_entry() {
+    assert_arrived_first(
+        "epoll_pwait2",
+        1,
+        "Return { syscall: 441, result: -513 }",
+        "Return { syscall: 441, result: -4 }",
+    );
+}
+
+/// A zero-timeout ppoll returns at once: the signal that came before it runs
+/// its handler under the thread's own mask, and the restarted ppoll returns
+/// 0. Its mask read is its first injection in a process holding no armed
+/// virtual timerfd (https://github.com/rrnewton/hermit/issues/4526).
+#[test]
+fn ptrace_delivery_check_restarts_a_zero_timeout_ppoll_a_signal_reaches_at_its_entry() {
+    assert_arrived_first(
+        "ppoll0",
+        1,
+        "Return { syscall: 271, result: -513 }",
+        "Return { syscall: 202, result: -512 }",
+    );
+}
+
 #[test]
 fn ptrace_delivery_check_restarts_an_rt_sigprocmask_a_signal_reaches_at_its_entry() {
     assert_arrived_first(

@@ -1588,7 +1588,7 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x17e,
+        metadata["version"], 0x17f,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);

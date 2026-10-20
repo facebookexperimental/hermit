@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/select.h>
@@ -571,8 +572,12 @@ int main(int argc, char** argv) {
     // Neither returns EINTR from a wait whose temporary mask the handler
     // did not see, nor from rt_sigprocmask or rt_sigaction.
     const char* call = mode + strlen("mt-arrived-first-");
-    int waits = !strcmp(call, "suspend") || !strcmp(call, "ppoll") || !strcmp(call, "pselect");
-    if (!waits && strcmp(call, "sigprocmask") && strcmp(call, "sigaction")) {
+    int waits = !strcmp(call, "suspend") || !strcmp(call, "ppoll") || !strcmp(call, "pselect")
+        || !strcmp(call, "epoll_pwait2");
+    // A zero-timeout ppoll returns at once: 0 if the signal came before it,
+    // EINTR with the handler under the temporary mask if it came during it.
+    int probes = !strcmp(call, "ppoll0");
+    if (!waits && !probes && strcmp(call, "sigprocmask") && strcmp(call, "sigaction")) {
       printf("unknown call %s\n", call);
       return 2;
     }
@@ -584,6 +589,16 @@ int main(int argc, char** argv) {
     if (sigaction(SIGUSR2, &late, NULL) != 0) {
       perror("sigaction");
       return 2;
+    }
+    // Anything the call needs is made before the sibling starts, so the call
+    // is the spin's next syscall.
+    int epfd = -1;
+    if (!strcmp(call, "epoll_pwait2")) {
+      epfd = epoll_create1(0);
+      if (epfd < 0) {
+        perror("epoll_create1");
+        return 2;
+      }
     }
     struct sibling job = {.target = (pid_t)syscall(SYS_gettid)};
     pthread_t thread;
@@ -607,6 +622,13 @@ int main(int argc, char** argv) {
     } else if (!strcmp(call, "pselect")) {
       struct timespec timeout = {5, 0};
       result = pselect(0, NULL, NULL, NULL, &timeout, &temporary);
+    } else if (!strcmp(call, "epoll_pwait2")) {
+      struct epoll_event event;
+      struct timespec timeout = {5, 0};
+      result = syscall(SYS_epoll_pwait2, epfd, &event, 1, &timeout, &temporary, 8);
+    } else if (!strcmp(call, "ppoll0")) {
+      struct timespec timeout = {0, 0};
+      result = ppoll(NULL, 0, &timeout, &temporary);
     } else if (!strcmp(call, "sigprocmask")) {
       // Sets the mask to the thread's own plus SIGQUIT, which no one sends;
       // the call cannot fail. SIG_SETMASK, not SIG_BLOCK, so that Hermit
@@ -647,6 +669,16 @@ int main(int argc, char** argv) {
         expect("SIGUSR2 handled before the wait returned (signal during the wait)", late_at_return, 0);
       }
       expect("mask after the wait", (long long)current_mask(), (long long)own);
+    } else if (probes) {
+      expect("frame mask", (long long)handler_frame_mask, (long long)own);
+      if ((long long)handler_mask == own_shape) {
+        expect("probe (signal before the call)", result, 0);
+      } else {
+        expect("handler mask (signal during the probe)", (long long)handler_mask, wait_shape);
+        expect("probe (signal during the probe)", result, -1);
+        expect("probe errno (signal during the probe)", error, EINTR);
+      }
+      expect("mask after the probe", (long long)current_mask(), (long long)own);
     } else {
       // The signal came before or after the call: the frame restores the
       // mask then in force, and the handler runs under it.
