@@ -1140,7 +1140,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1791, listed.
     // And detcore-model's signal_at_parses_a_turn_and_a_catchable_signal
     // (review of https://github.com/rrnewton/hermit/pull/4532): 1792, listed.
-    ("test.regular_crates", 1792),
+    // And hermit-verify's guest_program_keeps_path_lookup_and_slash_semantics and
+    // relative_guest_runs_after_builder_changes_workdir, added by 028b1192
+    // without a pin change: 1794, listed.
+    ("test.regular_crates", 1794),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5167,7 +5170,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Add the first-image loader controls; retain main's full selection.
     // And the same two signal_at config tests: 1777, listed.
     // And the same signal_at parser test: 1778, listed.
-    ("test.regular_crates_on_host", 1778),
+    // And the same two hermit-verify tests of 028b1192: 1780, listed.
+    ("test.regular_crates_on_host", 1780),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
