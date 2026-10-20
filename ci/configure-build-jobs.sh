@@ -2447,8 +2447,13 @@ fi
 # reverie-dbt, third-party, root Cargo.toml, Cargo.lock and rust-toolchain.toml
 # are unchanged. Inventory 997 and existing resource limits carry unchanged.
 
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 9b1ba3cfbea21152a11b190112757c2274d9bca3 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 9b1ba3cfbea21152a11b190112757c2274d9bca3 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 0788cb09b05af851704a7b9ce7a2a86882ef4d51 (2026-10-20): from
+# 9b1ba3cfbea21152a11b190112757c2274d9bca3. Add one exact 0.5.1 TLS-source declaration.
+# Only the artifact qualifier changes; reverie-dbt, third-party, root manifests,
+# lock and toolchain are byte-identical. Inventory 997 and budgets carry.
+# No runtime or performance evidence carries with this source-only pin.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0788cb09b05af851704a7b9ce7a2a86882ef4d51 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0788cb09b05af851704a7b9ce7a2a86882ef4d51 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
