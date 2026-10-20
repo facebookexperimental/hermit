@@ -2966,7 +2966,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a fault at a handler's first instruction (A5 step 3.2b part 4): 307.
     // And two chained deliveries at rt_sigreturn's exit: 309.
     // And a wait mask differing only in forced signals: 310.
-    ("test.hermit_integration_3", 310),
+    // And the dedicated pselect6 wrapper-validation fixture: 311.
+    ("test.hermit_integration_3", 311),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence

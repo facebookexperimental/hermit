@@ -922,7 +922,9 @@ mod tests {
             // A fault at a handler's first instruction (+1): 653.
             // Two chained deliveries at rt_sigreturn's exit (+2): 655.
             // A wait mask differing only in forced signals (+1): 656.
-            assert_eq!(population, 656);
+            // The dedicated pselect6 wrapper-validation fixture adds one
+            // integration identity beyond the landed signals tests: 657.
+            assert_eq!(population, 657);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
