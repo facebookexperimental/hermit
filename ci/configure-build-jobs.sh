@@ -2378,8 +2378,23 @@ fi
 # Native and SDK inputs match the reviewed R72 afterimages; inventory stays989.
 # The historical calibration is unchanged, not a new source-build measurement.
 # This budget carry does not substitute for current source/runtime validation.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != edb27ebed0310674972a7d7e63f24ad180441b76 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie edb27ebed0310674972a7d7e63f24ad180441b76 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 96951274fa047bb859cac9147a6703257876dc7f (2026-10-20): from
+# 9b015a747751c4ba83ca79745f21177ca0df9217. Only the standalone qualifier's reviewed
+# host-adapter size/hash literals change; the 24 API/native/adapter files in
+# the preceding carry remain byte-identical. SDK/native source and inventory
+# (989), calibrated budgets, jobs and limits are unchanged. The source-catalog
+# positive and tamper-refusal control passes; this is not package identity or
+# runtime acceptance evidence.
+# REBASE TO 72f646c5f6252873c1c6a51e089d749f0bf52ae5 (2026-10-20): the same reviewed catalog
+# tuple follows the unchanged API13 replay above on published R229e1fad.
+# All owned functional afterimages are unchanged; incoming differences are
+# documentation only. This preserves calibration, not old runtime identity.
+# REBASE TO 39bc362bbaad7a6eae5598654c644eab5122900d (2026-10-20): retain the same reviewed
+# host-adapter tuple on the API13 replay above. The incoming a778f36c reader
+# correction is preserved; native/SDK inputs and inventory989 stay unchanged.
+# No new budget calibration or runtime identity is inferred from this replay.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 39bc362bbaad7a6eae5598654c644eab5122900d ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 39bc362bbaad7a6eae5598654c644eab5122900d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

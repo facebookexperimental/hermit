@@ -9,5 +9,5 @@ publish = false
 
 [dependencies]
 detcore = { package = "hermit-detcore", version = "0.4.1", path = "../detcore" }
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "edb27ebed0310674972a7d7e63f24ad180441b76" }
-reverie-ptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "edb27ebed0310674972a7d7e63f24ad180441b76" }
+reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "39bc362bbaad7a6eae5598654c644eab5122900d" }
+reverie-ptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "39bc362bbaad7a6eae5598654c644eab5122900d" }
