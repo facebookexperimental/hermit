@@ -18796,7 +18796,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // declarations, 87 selected.
         // run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills
         // (https://github.com/rrnewton/hermit/issues/4485): 87 declarations, 88 selected.
-        ("privileged-only-test.cli_kvm", 88usize),
+        ("privileged-only-test.cli_kvm", 89usize),
     ] {
         let step = privileged
             .steps
