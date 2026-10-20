@@ -157,6 +157,11 @@ pub const STRICT_COMPAT_FOLD_2026_10_01_EVIDENCE_SHA: &str =
 /// parity compares them (<https://github.com/rrnewton/hermit/issues/4269>):
 /// 189 + 25.
 pub const STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT: usize = 214;
+/// Since 2026-10-20 the full run also has the compat corpus's ptrace replay
+/// cells (`replay.full` in `tests/e2e/manifests/compat.yaml`), with the rr run
+/// type's 59/60 s bounds: 212 selected after two clean nightly pressure sweeps,
+/// and 3 enabled with `ci: false` (lsof, cscope and zip-unzip).
+pub const COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT: usize = 215;
 /// Ptrace replay cells selected when
 /// <https://github.com/rrnewton/hermit/pull/3580> taught the recorder and
 /// replayer `select` and `pselect6`. Before it, replay of both programs

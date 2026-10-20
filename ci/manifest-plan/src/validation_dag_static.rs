@@ -1137,7 +1137,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And hermit-verify's guest_program_keeps_path_lookup_and_slash_semantics and
     // relative_guest_runs_after_builder_changes_workdir, added by 028b1192
     // without a pin change: 1794, listed.
-    ("test.regular_crates", 1794),
+    // And hermit-manifest-plan's a_full_replay_run_type_labels_its_cells_with_the_full_validation_too
+    // and the_corpus_full_run_type_is_the_default_run_type (replay into full): 1796, listed.
+    ("test.regular_crates", 1796),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5165,7 +5167,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two signal_at config tests: 1777, listed.
     // And the same signal_at parser test: 1778, listed.
     // And the same two hermit-verify tests of 028b1192: 1780, listed.
-    ("test.regular_crates_on_host", 1780),
+    // And the same two replay-into-full manifest-plan tests: 1782, listed.
+    ("test.regular_crates_on_host", 1782),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

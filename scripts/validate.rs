@@ -13012,15 +13012,17 @@ fn build_release_hermit_node(gate: &str, bin: &str) -> dagrun::model::Step {
 /// Each row of the strict compatibility corpus (tests/e2e/manifests/compat.yaml),
 /// keyed by its corpus label (the last backquoted word of the description the
 /// expansion writes; `g++` has the test id `compat/gxx`): the row's required
-/// cell on the corpus backend, ptrace. A row's verify cells on the corpus's
-/// additional backends (liteinst and in-guest-trap) run the same argv and are
-/// not rows of their own.
+/// verify cell on the corpus backend, ptrace. A row's verify cells on the
+/// corpus's additional backends (liteinst and in-guest-trap) run the same argv
+/// and are not rows of their own, and neither is its replay cell, which the
+/// full validation also requires since 2026-10-20.
 fn compat_manifest_rows(
     root: &Path,
     run_state: &Path,
 ) -> Result<BTreeMap<String, Vec<std::ffi::OsString>>, String> {
     let cells = ManifestSet::load(root)?.select(&hermit_manifest_plan::runner::Selection {
         category: Some("compat".into()),
+        mode: Some("verify".into()),
         backend: Some("ptrace".into()),
         population: Some(hermit_manifest_plan::runner::Population::Required),
         ..Default::default()

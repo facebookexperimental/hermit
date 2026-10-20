@@ -11395,7 +11395,10 @@ sys.exit(1 if failed else 0)
         backend: &str,
     ) -> String {
         use serde_yaml::Value;
-        assert_eq!(mode, "verify", "{test}: a corpus flip is a verify cell");
+        assert!(
+            mode == "verify" || mode == "replay",
+            "{test}: a corpus flip is a verify or replay cell"
+        );
         let suffix = test.split_once('/').map_or(test, |(_, suffix)| suffix);
         let label = manifest["corpus"]["rows"]
             .as_sequence()
@@ -11411,6 +11414,33 @@ sys.exit(1 if failed else 0)
             .as_str()
             .unwrap()
             .to_owned();
+        // A replay cell is full's while the replay section says `full: true`.
+        // The section has no per-row run type, so excepting the row takes its
+        // one cell out of the plan, which is all the round trip observes.
+        if mode == "replay" {
+            let replay = manifest["corpus"]["replay"].as_mapping_mut().unwrap();
+            assert_eq!(
+                replay.get("full").and_then(Value::as_bool),
+                Some(true),
+                "{test}: the replay cells are not full's"
+            );
+            let mut group = serde_yaml::Mapping::new();
+            group.insert(
+                Value::from("reason"),
+                Value::from("un-flipped by the sync-cells round-trip test"),
+            );
+            group.insert(
+                Value::from("rows"),
+                Value::Sequence(vec![Value::from(label.as_str())]),
+            );
+            replay
+                .entry(Value::from("except"))
+                .or_insert_with(|| Value::Sequence(Vec::new()))
+                .as_sequence_mut()
+                .unwrap()
+                .push(Value::Mapping(group));
+            return serde_yaml::to_string(&manifest).unwrap();
+        }
         // A row's cell on the corpus's own backend is full's while the row
         // names no run type; naming a focused one takes it out of full, as
         // https://github.com/rrnewton/hermit/issues/4269 put it in by removing

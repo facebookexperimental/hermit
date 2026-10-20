@@ -76,6 +76,8 @@ use crate::stress_series::HostCapability;
 #[cfg(test)]
 use crate::stress_series::HostCapabilityVerdict;
 #[cfg(test)]
+use crate::timeouts::COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT;
+#[cfg(test)]
 use crate::timeouts::DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS;
 #[cfg(test)]
 use crate::timeouts::DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS;
@@ -12249,6 +12251,13 @@ esac
     /// strict level it carries neither relaxation: since 2026-10-13 the
     /// level, not the row, owns them
     /// (https://github.com/rrnewton/hermit/issues/4276).
+    /// manifest_corpus spells the default run type itself, for the
+    /// rust-scripts that include it without this module.
+    #[test]
+    fn the_corpus_full_run_type_is_the_default_run_type() {
+        assert_eq!(crate::manifest_corpus::FULL_RUN_TYPE, DEFAULT_RUN_TYPE);
+    }
+
     #[test]
     fn a_shipped_compat_row_runs_at_the_hosts_strictness_level() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -12257,7 +12266,9 @@ esac
             .select(&Selection {
                 test: Some("compat/cat".into()),
                 // The lane's cell; the row's in-guest cells (the corpus's
-                // `additional` backends) carry their own flags.
+                // `additional` backends) carry their own flags, and its replay
+                // cell none of the verify settings.
+                mode: Some("verify".into()),
                 backend: Some("ptrace".into()),
                 population: Some(Population::Required),
                 ..Selection::default()
@@ -13788,6 +13799,19 @@ esac
         let (compat, observed): (BTreeMap<_, _>, BTreeMap<_, _>) = observed
             .into_iter()
             .partition(|((test, _, _), _)| test.starts_with("compat/"));
+        // Its replay cells, the full run's since 2026-10-20, keep the rr run
+        // type's identical bounds.
+        let (compat_replay, compat): (BTreeMap<_, _>, BTreeMap<_, _>) = compat
+            .into_iter()
+            .partition(|((_, mode, _), _)| *mode == "replay");
+        assert_eq!(
+            compat_replay.len(),
+            COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT
+        );
+        for ((test, _, backend), bounds) in &compat_replay {
+            assert_eq!(*backend, "ptrace", "{test}");
+            assert_eq!(*bounds, (59, 60), "{test}");
+        }
         assert_eq!(
             compat.len(),
             STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT

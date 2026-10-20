@@ -55,26 +55,38 @@ struct Corpus {
     #[serde(default)]
     unselected: Vec<CorpusUnselected>,
     /// A replay cell on the corpus backend that a focused run type adds to
-    /// each row's own test; the default (full) validation does not select
-    /// it.
+    /// each row's own test; the default (full) validation selects it too
+    /// only when the section says `full: true`.
     #[serde(default)]
     replay: Option<CorpusReplay>,
     rows: Vec<CorpusRow>,
 }
 
+/// The default (full) validation's run type, `runner::DEFAULT_RUN_TYPE`, which
+/// a `full` replay cell carries beside its own. It is spelled here because the
+/// rust-scripts that include this file have no `runner` module; a runner test
+/// ties the two.
+pub(crate) const FULL_RUN_TYPE: &str = "full";
+
 /// One focused run type's replay cell (`hermit record start --verify`) on the
 /// corpus backend, in the own test of every row except the named ones, so a
-/// program's verify and replay cells are two cells of one test. The cell
-/// records and replays the row's argv with none of the corpus's verify
-/// settings: no Hermit flags or comparator, which the harness accepts only
-/// on verify, no environment (it declares an empty one rather than
-/// inheriting verify's), and one attempt, as the harness gives every replay
-/// cell. It is never a diagnostic, and its budget is its own.
+/// program's verify and replay cells are two cells of one test. With `full`
+/// the cell belongs to the default (full) validation as well, which then
+/// requires every selected replay cell, while the run type still selects them
+/// alone. The cell records and replays the row's argv with none of the
+/// corpus's verify settings: no Hermit flags or comparator, which the harness
+/// accepts only on verify, no environment (it declares an empty one rather
+/// than inheriting verify's), and one attempt, as the harness gives every
+/// replay cell. It is never a diagnostic, and its budget is its own.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CorpusReplay {
     /// The run type, written as the replay cell's label (runner::cell_labels).
     label: String,
+    /// Whether the default (full) validation also selects the replay cells:
+    /// their labels are then [`FULL_RUN_TYPE`] and `label`.
+    #[serde(default)]
+    full: bool,
     timeout_seconds: u64,
     cpu_timeout_seconds: u64,
     slow_reason: String,
@@ -672,11 +684,15 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             let backends = names(&mut focused.iter().map(|cell| cell.backend.as_str()));
             also.push(format!("a focused run type's verify cell on {backends}"));
         }
-        if replay.is_some() {
-            also.push(format!(
-                "a focused run type's replay cell on {}",
-                corpus.backend
-            ));
+        if let Some(replay) = replay {
+            also.push(if replay.full {
+                format!(
+                    "a replay cell on {} that the full validation and the {} run type select",
+                    corpus.backend, replay.label
+                )
+            } else {
+                format!("a focused run type's replay cell on {}", corpus.backend)
+            });
         }
         let off_reason = match also.as_slice() {
             [] => off_reason.clone(),
@@ -893,10 +909,12 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
                     )),
                 ));
             }
-            recipe.push((
-                "labels",
-                per_cell(strings(std::slice::from_ref(&replay.label))),
-            ));
+            let mut labels = Vec::with_capacity(2);
+            if replay.full {
+                labels.push(FULL_RUN_TYPE.to_string());
+            }
+            labels.push(replay.label.clone());
+            recipe.push(("labels", per_cell(strings(&labels))));
             // Declared empty, so the cell does not inherit the verify cell's
             // environment (runner::cell_mode_env).
             recipe.push(("env", Value::Mapping(Mapping::new())));
@@ -1272,9 +1290,10 @@ mod tests {
     /// guard held before ci/compat/corpus-rr.json was retired) and, since a
     /// three-run survey on 2026-10-09, 76 of the 77 rows the rr lane never
     /// listed as passing. Each is the replay cell of its row's own test,
-    /// carrying the rr run type alone and none of the verify cell's settings.
-    /// 214 are selected, and the 1 the survey saw fail stays enabled with
-    /// `ci: false` and the issue of their failure (`UNSELECTED_REPLAY`).
+    /// carrying the full and rr run types (the full validation selects them
+    /// since 2026-10-20) and none of the verify cell's settings. 212 are
+    /// selected, and the 3 seen to fail stay enabled with `ci: false` and the
+    /// issue of their failure (`UNSELECTED_REPLAY`).
     /// A row moved into or out of the run type, a second test for a program,
     /// the rr run type reaching a verify cell, or a cell quietly unselected or
     /// reselected, fails here.
@@ -1302,7 +1321,11 @@ mod tests {
                 continue;
             }
             assert_eq!(replay["backends_enabled"], seq("[ptrace]"), "{id}");
-            assert_eq!(replay["labels"], seq("{ptrace: [rr-compat-only]}"), "{id}");
+            assert_eq!(
+                replay["labels"],
+                seq("{ptrace: [full, rr-compat-only]}"),
+                "{id}"
+            );
             assert_eq!(replay["env"], seq("{}"), "{id}");
             assert_eq!(replay["timeout_seconds"], seq("{ptrace: 60}"), "{id}");
             for absent in ["hermit_args", "comparator", "no_retry_reason", "diagnostic"] {
@@ -1321,17 +1344,29 @@ mod tests {
                 }
             }
         }
-        assert_eq!((gated, refused), (214, UNSELECTED_REPLAY.len()));
+        assert_eq!((gated, refused), (212, UNSELECTED_REPLAY.len()));
     }
 
-    /// The replay cells the 2026-10-09 survey saw fail, each with its issue.
-    /// compat/flex and compat/timeout, two more, are selected since their
+    /// The replay cells seen to fail, each with its issue: lsof in the
+    /// 2026-10-09 survey, cscope and zip-unzip in the nightly pressure sweeps
+    /// of 2026-10-19 and 2026-10-20, where concurrent repetitions collided in a
+    /// shared /tmp. compat/flex and compat/timeout are selected since their
     /// replay stall (https://github.com/rrnewton/hermit/issues/3964) and false
     /// deadlock (https://github.com/rrnewton/hermit/issues/3963) were fixed.
-    const UNSELECTED_REPLAY: [(&str, &str); 1] = [(
-        "compat/lsof",
-        "https://github.com/rrnewton/hermit/issues/3966",
-    )];
+    const UNSELECTED_REPLAY: [(&str, &str); 3] = [
+        (
+            "compat/lsof",
+            "https://github.com/rrnewton/hermit/issues/3966",
+        ),
+        (
+            "compat/cscope",
+            "https://github.com/rrnewton/hermit/issues/4536",
+        ),
+        (
+            "compat/zip-unzip",
+            "https://github.com/rrnewton/hermit/issues/4536",
+        ),
+    ];
 
     #[test]
     fn a_corpus_row_expands_into_one_verify_cell_with_the_lane_settings() {
@@ -1958,6 +1993,63 @@ mod tests {
         assert_eq!(big["replay"]["labels"], seq("{ptrace: [rr-compat-only]}"));
         assert_eq!(big["replay"]["ci"], true);
         assert_eq!(big["verify"]["ci"], seq("{ptrace: false, sabre: true}"));
+    }
+
+    /// With `full: true` every replay cell also carries the default run type,
+    /// ahead of its own, and the reason the other backends are off says the
+    /// full validation selects it; nothing else about the cell changes.
+    #[test]
+    fn a_full_replay_run_type_labels_its_cells_with_the_full_validation_too() {
+        let full = replay_corpus().replace(
+            "    label: rr-compat-only\n",
+            "    label: rr-compat-only\n    full: true\n",
+        );
+        assert_ne!(full, replay_corpus());
+        let expanded = expand_corpus(document(&full)).unwrap();
+        let focused_only = expand_corpus(document(&replay_corpus())).unwrap();
+        let seq = |text: &str| serde_yaml::from_str::<Value>(text).unwrap();
+        let replay_of = |tests: &[Value], id: &str| {
+            tests
+                .iter()
+                .find(|test| test["id"] == id)
+                .unwrap_or_else(|| panic!("{id}"))["modes"]["replay"]
+                .clone()
+        };
+        let (tests, before) = (tests_of(&expanded), tests_of(&focused_only));
+        for id in ["fixture/gxx", "fixture/slow", "fixture/big"] {
+            let replay = replay_of(tests, id);
+            assert_eq!(
+                replay["labels"],
+                seq("{ptrace: [full, rr-compat-only]}"),
+                "{id}"
+            );
+            assert_eq!(
+                replay["backends_disabled"]["dbt"].as_str().map(|reason| reason
+                    .ends_with("a replay cell on ptrace that the full validation and the rr-compat-only run type select")),
+                Some(true),
+                "{id}"
+            );
+            let mut unchanged = replay.clone();
+            let original = replay_of(before, id);
+            unchanged["labels"] = original["labels"].clone();
+            unchanged["backends_disabled"] = original["backends_disabled"].clone();
+            assert_eq!(unchanged, original, "{id}");
+        }
+        // The red replay cell stays unselected by both run types.
+        assert_eq!(
+            replay_of(tests, "fixture/slow")["ci"],
+            seq("{ptrace: false}")
+        );
+        // The excepted row still has no replay cell.
+        assert_eq!(
+            replay_of(tests, "fixture/echo")["backends_enabled"],
+            seq("[]")
+        );
+        assert!(
+            expand_corpus(document(&full.replace("full: true", "full: yes please")))
+                .unwrap_err()
+                .contains("invalid corpus section")
+        );
     }
 
     #[test]

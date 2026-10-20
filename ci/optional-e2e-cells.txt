@@ -22,6 +22,9 @@ c-programs/thread-self-procfs-handoff verify sabre
 c-programs/threadexhaustion verify sabre
 c-programs/writev-determinism custom ptrace
 chaos-c/lock-granularity verify sabre
+compat/cscope replay ptrace
+compat/lsof replay ptrace
+compat/zip-unzip replay ptrace
 data-handling/jq-json-transform naked -
 data-handling/sqlite-query-determinism naked -
 determinism-stress-c/producer-consumer naked -

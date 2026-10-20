@@ -13366,14 +13366,13 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
 }
 
 /// Red cells the default run type does not select: a row label on the verify
-/// cells (compat/java on ptrace, compat/comm on SaBRe) and the rr-compat
-/// replay cell of a row's own test (compat/awk, whose verify cell on ptrace is
-/// of the default run type). No test carries a test-level label since the
-/// compat/strict-<row> tests were retired
-/// (<https://github.com/rrnewton/hermit/issues/4276>).
+/// cells (compat/java on ptrace, compat/comm on SaBRe). No test carries a
+/// test-level label since the compat/strict-<row> tests were retired
+/// (<https://github.com/rrnewton/hermit/issues/4276>), and no replay cell is
+/// the rr run type's alone since the full validation selects them too
+/// (2026-10-20; compat/awk's was the one named here).
 /// [`focused_red_cells`] puts an [`ordinary_red_cell`] beside them.
-const FOCUSED_LABELLED_RED_CELLS: [(&str, &str, &str); 3] = [
-    ("compat/awk", "replay", "ptrace"),
+const FOCUSED_LABELLED_RED_CELLS: [(&str, &str, &str); 2] = [
     ("compat/comm", "verify", "sabre"),
     ("compat/java", "verify", "ptrace"),
 ];

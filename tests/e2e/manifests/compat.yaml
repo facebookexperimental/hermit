@@ -9,7 +9,7 @@ bucket: compat
 # rows into the full run, so that parity compares them), and the liteinst and in-guest-trap verify cells of the rows
 # each `additional` entry names. The rr lane's rows also have a replay cell
 # (`replay`) that records and replays the program on ptrace, for the rr run
-# type alone. Each row is one test: its ptrace verify cell runs at the
+# type and, since 2026-10-20, the full validation. Each row is one test: its ptrace verify cell runs at the
 # host's strictness level (tests/e2e/manifests/README.md, "Strictness level"),
 # strict with CPUID virtualization and the preemption timer on where the host
 # has CPUID faulting and an exact branch counter, relaxed elsewhere. Until
@@ -1625,8 +1625,15 @@ corpus:
   # three survey runs and joined, and 4 stay unselected under their issues.
   # Like the rr lane's command, the replay cell runs without the verify
   # settings above: no Hermit flags, comparator or TMPDIR, and one attempt.
+  # Since 2026-10-20 the full validation selects these cells too (`full`):
+  # 212 of them ran clean in 3 of 3 repetitions on both the 2026-10-19 and
+  # 2026-10-20 nightly pressure sweeps, and their cost was estimated
+  # from the full validation of 6123fef1 at about +20 s of its 492 s wall
+  # (the Buck cell stage is queue-bound: 2,223 local cells in 185.5 s) and
+  # +475 to +680 local CPU seconds.
   replay:
     label: rr-compat-only
+    full: true
     timeout_seconds: 60
     cpu_timeout_seconds: 59
     slow_reason: >-
@@ -1663,6 +1670,15 @@ corpus:
           Replay reads a different 11-byte readlink target than the recording
           at scheduler turn 112, in 3 of 3 runs
         rows: [lsof]
+      - result: replay-failure
+        evidence: https://github.com/rrnewton/hermit/issues/4536
+        reason: >-
+          Concurrent repetitions share the guest's /tmp: in the nightly
+          pressure sweeps of 2026-10-19 and 2026-10-20, one of three
+          concurrent repetitions passed and the others failed, cscope unable
+          to create /tmp/cscope.9 (the guest's deterministic pid) and zip-unzip
+          finding /tmp/hermit-compat-zip removed under it
+        rows: [cscope, zip-unzip]
   rows:
     - {label: "echo", argv: ["/bin/echo", "hermit-compat"]}
     - {label: "true", argv: ["/usr/bin/true"]}
