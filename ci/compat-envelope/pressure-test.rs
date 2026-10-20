@@ -1668,6 +1668,25 @@ impl FreshCheckout {
                     "fresh pressure-test checkout resolved to {observed}, expected {sha}"
                 ));
             }
+            // The clone's origin/main is the source's main when the clone was
+            // made, and main keeps moving during a nightly. The Reverie pin
+            // check (pre.reverie_pin) refuses a pin older than origin/main's,
+            // which is a landing rule: on 2026-10-20 main bumped Reverie at
+            // 06:48Z and every part cloned after it was refused for measuring
+            // 1e5ebe34, a commit already on main. The measured commit is the
+            // only base this run has, so the check compares the pin with
+            // itself and its other clauses still run.
+            command_ok(
+                fresh_checkout_git()
+                    .args([
+                        "-C",
+                        &checkout.path.to_string_lossy(),
+                        "update-ref",
+                        "refs/remotes/origin/main",
+                    ])
+                    .arg(sha),
+                "point the fresh checkout's origin/main at the measured commit",
+            )?;
             command_ok(
                 fresh_checkout_git().args([
                     "-C",
@@ -14408,6 +14427,27 @@ fn inherited_location_fresh_checkout_self_test(source: &Path, sha: &str) -> Resu
     Ok(())
 }
 
+/// A generated checkout's origin/main names the measured commit even when the
+/// source has moved past it, so the Reverie pin check cannot refuse a commit
+/// already on main as a regression. The inherited-location self-test has
+/// already advanced SOURCE past SHA.
+fn fresh_checkout_base_self_test(source: &Path, sha: &str) -> Result<(), String> {
+    let advanced = git_output(source, &["rev-parse", "HEAD"])?;
+    if advanced == sha {
+        return Err("base self-test needs a source that has moved past the prepared commit".into());
+    }
+    let fresh = FreshCheckout::prepare(source, sha)?;
+    let base = git_output(&fresh.path, &["rev-parse", "refs/remotes/origin/main"]);
+    fresh.cleanup()?;
+    let base = base?;
+    if base != sha {
+        return Err(format!(
+            "generated checkout's origin/main is {base}, not the measured commit {sha}"
+        ));
+    }
+    Ok(())
+}
+
 /// The bytes of a repository's HEAD, index, config, packed refs and loose refs,
 /// keyed by path. An absent file maps to `None`.
 fn repository_location_state(git_dir: &Path) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>, String> {
@@ -15898,6 +15938,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("generated-checkout cleanup left its source fixture dirty".into());
     }
     inherited_location_fresh_checkout_self_test(&clone_source, &clone_sha)?;
+    fresh_checkout_base_self_test(&clone_source, &clone_sha)?;
     fs::write(scratch.join("old-row"), "stale\n")
         .map_err(|e| format!("cannot write self-test stale row: {e}"))?;
     if require_empty_result_dir(&scratch).is_ok() {
