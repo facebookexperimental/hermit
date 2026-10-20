@@ -35,8 +35,8 @@ libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
 raw-cpuid = "10.7.0"
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "a61244297e040b9ec908dd35f65b004204fa0ea4" }
-reverie-ptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "a61244297e040b9ec908dd35f65b004204fa0ea4" }
+reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2" }
+reverie-ptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 tempfile = "3.27.0"
 test-allocator = { version = "0.4.0", path = "../../common/test-allocator" }

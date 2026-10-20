@@ -2348,7 +2348,12 @@ fi
 # complete DBT tree, SDK recipe and inventory997 equal reviewed afb616c4.
 # Keep both histories and calibrated limits. This source equality carries
 # the SDK budget only, not prior runtime identity or exact-head test results.
-expected_pin=a61244297e040b9ec908dd35f65b004204fa0ea4
+# REBASE TO 90329dd5be334d5e486891656e2652a8af3934b2 (2026-10-20): the incoming change adds three
+# Tool hooks for a two-phase signal delivery and SignalAnnouncement in
+# reverie-core (tool.rs, guest.rs and signal.rs only). No DBT, SDK or native
+# input changes; calibrated budgets, jobs, limits and inventory989 are
+# unchanged.
+expected_pin=90329dd5be334d5e486891656e2652a8af3934b2
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

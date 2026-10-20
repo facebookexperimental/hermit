@@ -2424,8 +2424,13 @@ fi
 # complete DBT tree, SDK recipe and inventory997 equal reviewed afb616c4.
 # Keep both histories and calibrated limits. This source equality carries
 # the SDK budget only, not prior runtime identity or exact-head test results.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a61244297e040b9ec908dd35f65b004204fa0ea4 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a61244297e040b9ec908dd35f65b004204fa0ea4 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# REBASE TO 90329dd5be334d5e486891656e2652a8af3934b2 (2026-10-20): the incoming change adds three
+# Tool hooks for a two-phase signal delivery and SignalAnnouncement in
+# reverie-core (tool.rs, guest.rs and signal.rs only). No DBT, SDK or native
+# input changes; calibrated budgets, jobs, limits and inventory989 are
+# unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 90329dd5be334d5e486891656e2652a8af3934b2 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 90329dd5be334d5e486891656e2652a8af3934b2 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

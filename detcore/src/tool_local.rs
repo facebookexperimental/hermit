@@ -3835,6 +3835,38 @@ fn default_timer_slack_ns() -> u64 {
 /// preference; no signal is lost, and the next delivery waits its turn.
 pub(crate) const MAX_SIGRETURN_CONTINUATIONS: u8 = 32;
 
+/// What a signal delivery knows before anything of it can hand the thread
+/// to the scheduler (`Detcore::inbound_stop`).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(crate) struct InboundStop {
+    /// The stop follows a reported `rt_sigreturn` (`returned_from_sigreturn`).
+    pub(crate) reported: bool,
+    /// The thread's scheduler grants at the stop.
+    pub(crate) grants_at_stop: u64,
+}
+
+/// What a delivery's turn leaves for what the granted delivery settles
+/// (`Detcore::inbound_turn`, `Detcore::inbound_delivered`).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(crate) struct InboundTurn {
+    /// The delivering thread.
+    pub(crate) dettid: DetTid,
+    /// The thread's signal count before this delivery.
+    pub(crate) mycount: u64,
+}
+
+/// One delivery announced to `Tool::announce_signal_event` and not yet
+/// settled.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(crate) struct SignalAnnouncementState {
+    /// The announcement's token.
+    pub(crate) token: u64,
+    /// The raw signal.
+    pub(crate) signal: i32,
+    /// What its turn left for its commit.
+    pub(crate) turn: InboundTurn,
+}
+
 /// The Detcore per-thread state.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ThreadState<T> {
@@ -4224,6 +4256,15 @@ pub struct ThreadState<T> {
     /// replay of it decide continuations by `delivered_since_request` alone.
     #[serde(default)]
     pub(crate) returned_from_sigreturn: bool,
+    /// Deliveries announced to `Tool::announce_signal_event` and neither
+    /// committed nor withdrawn yet, with what each one's turn left for its
+    /// commit. A backend settles every announcement before it returns to
+    /// guest code, so this is empty at any other point.
+    #[serde(default)]
+    pub(crate) signal_announcements: Vec<SignalAnnouncementState>,
+    /// The token the next announcement gets.
+    #[serde(default)]
+    pub(crate) next_signal_announcement: u64,
     /// How many of this thread's latest scheduler requests in a row were
     /// deliveries marked `Resources::continues_sigreturn`; any other request
     /// resets it. A delivery is marked only while it is below
@@ -4529,6 +4570,11 @@ impl<T> ThreadState<T> {
         }
         if self.claimed_sigchld {
             return Err(NativeExecCutError::LiveCapability("claimed SIGCHLD"));
+        }
+        if !self.signal_announcements.is_empty() {
+            return Err(NativeExecCutError::LiveCapability(
+                "unsettled signal announcement",
+            ));
         }
         if self.clone_flags.is_some() || self.pending_vfork.is_some() {
             return Err(NativeExecCutError::LiveCapability("clone/vfork"));
@@ -4973,6 +5019,8 @@ impl<T> ThreadState<T> {
             own_signal_turn_hold: None,
             delivered_since_request: false,
             returned_from_sigreturn: false,
+            signal_announcements: Vec::new(),
+            next_signal_announcement: 0,
             consecutive_continuations: 0,
             scheduler_grants: 0,
             end_of_timeslice: None, // Temporary/bogus.
