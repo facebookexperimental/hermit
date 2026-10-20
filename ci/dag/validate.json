@@ -953,21 +953,7 @@
           "category": "applications",
           "test": "applications/example-timed-progress-bar",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "applications",
-          "test": "applications/example-timed-progress-bar",
-          "mode": "verify",
           "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "applications",
-          "test": "applications/example-timed-progress-bar",
-          "mode": "verify",
-          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -3501,13 +3487,6 @@
           "category": "c-programs",
           "test": "c-programs/hardware-trap-identity",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/hardware-trap-identity",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -3998,13 +3977,6 @@
           "category": "c-programs",
           "test": "c-programs/just-spin",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/just-spin",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -5511,13 +5483,6 @@
           "test": "c-programs/nanosleep-par",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/nanosleep-par",
-          "mode": "verify",
-          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -10236,13 +10201,6 @@
           "test": "c-programs/syscall-file-metadata",
           "mode": "verify",
           "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/syscall-file-metadata",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20718,13 +20676,6 @@
         {
           "lane": "portable",
           "category": "determinism-stress-c",
-          "test": "determinism-stress-c/fork-tree",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "determinism-stress-c",
           "test": "determinism-stress-c/lock-free",
           "mode": "verify",
           "backend": "kvm"
@@ -20770,13 +20721,6 @@
           "test": "determinism-stress-c/mmap-fork-shared",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "determinism-stress-c",
-          "test": "determinism-stress-c/mmap-fork-shared",
-          "mode": "verify",
-          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -20840,13 +20784,6 @@
           "test": "determinism-stress-c/pipe-chain",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "determinism-stress-c",
-          "test": "determinism-stress-c/pipe-chain",
-          "mode": "verify",
-          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -21214,13 +21151,6 @@
         {
           "lane": "portable",
           "category": "language-runtimes",
-          "test": "language-runtimes/example-python-random",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
           "test": "language-runtimes/gawk-random",
           "mode": "verify",
           "backend": "kvm"
@@ -21385,13 +21315,6 @@
           "test": "language-runtimes/python-random",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/ruby-random",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -22386,13 +22309,6 @@
           "test": "system-utils/startup-tls-guards",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/startup-tls-guards",
-          "mode": "verify",
-          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -25254,13 +25170,6 @@
         {
           "lane": "privileged",
           "category": "applications",
-          "test": "applications/kvm-python-examples",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "privileged",
-          "category": "applications",
           "test": "applications/kvm-shell-environment",
           "mode": "verify",
           "backend": "kvm"
@@ -25740,13 +25649,6 @@
           "lane": "portable",
           "category": "applications",
           "test": "applications/c-toolchain-workflow",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "applications",
-          "test": "applications/example-timed-progress-bar",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -29864,13 +29766,6 @@
         {
           "lane": "privileged",
           "category": "applications",
-          "test": "applications/kvm-python-examples",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "privileged",
-          "category": "applications",
           "test": "applications/kvm-shell-environment",
           "mode": "verify",
           "backend": "kvm"
@@ -30817,13 +30712,6 @@
           "test": "applications/example-timed-progress-bar",
           "mode": "verify",
           "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "applications",
-          "test": "applications/example-timed-progress-bar",
-          "mode": "verify",
-          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -32146,13 +32034,6 @@
           "category": "c-programs",
           "test": "c-programs/hardware-trap-identity",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/hardware-trap-identity",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -33204,13 +33085,6 @@
           "test": "c-programs/nanosleep-par",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/nanosleep-par",
-          "mode": "verify",
-          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -38053,13 +37927,6 @@
         {
           "lane": "portable",
           "category": "determinism-stress-c",
-          "test": "determinism-stress-c/fork-tree",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "determinism-stress-c",
           "test": "determinism-stress-c/lock-free",
           "mode": "verify",
           "backend": "ptrace"
@@ -38077,13 +37944,6 @@
           "test": "determinism-stress-c/mmap-fork-shared",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "determinism-stress-c",
-          "test": "determinism-stress-c/mmap-fork-shared",
-          "mode": "verify",
-          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -38112,13 +37972,6 @@
           "test": "determinism-stress-c/pipe-chain",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "determinism-stress-c",
-          "test": "determinism-stress-c/pipe-chain",
-          "mode": "verify",
-          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -38350,13 +38203,6 @@
           "test": "language-runtimes/example-python-random",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/example-python-random",
-          "mode": "verify",
-          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -39012,13 +38858,6 @@
         {
           "lane": "portable",
           "category": "system-utils",
-          "test": "system-utils/startup-tls-guards",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
           "test": "system-utils/true-exit-zero",
           "mode": "verify",
           "backend": "dbt"
@@ -39514,13 +39353,6 @@
         "category": "applications"
       },
       "result_manifests": [
-        {
-          "lane": "privileged",
-          "category": "applications",
-          "test": "applications/kvm-python-examples",
-          "mode": "verify",
-          "backend": "kvm"
-        },
         {
           "lane": "privileged",
           "category": "applications",
@@ -47278,21 +47110,7 @@
           "category": "applications",
           "test": "applications/example-timed-progress-bar",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "applications",
-          "test": "applications/example-timed-progress-bar",
-          "mode": "verify",
           "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "applications",
-          "test": "applications/example-timed-progress-bar",
-          "mode": "verify",
-          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -49773,13 +49591,6 @@
           "category": "c-programs",
           "test": "c-programs/hardware-trap-identity",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/hardware-trap-identity",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -50270,13 +50081,6 @@
           "category": "c-programs",
           "test": "c-programs/just-spin",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/just-spin",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -51783,13 +51587,6 @@
           "test": "c-programs/nanosleep-par",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/nanosleep-par",
-          "mode": "verify",
-          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -56508,13 +56305,6 @@
           "test": "c-programs/syscall-file-metadata",
           "mode": "verify",
           "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/syscall-file-metadata",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -61801,13 +61591,6 @@
         {
           "lane": "portable",
           "category": "determinism-stress-c",
-          "test": "determinism-stress-c/fork-tree",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "determinism-stress-c",
           "test": "determinism-stress-c/lock-free",
           "mode": "verify",
           "backend": "kvm"
@@ -61853,13 +61636,6 @@
           "test": "determinism-stress-c/mmap-fork-shared",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "determinism-stress-c",
-          "test": "determinism-stress-c/mmap-fork-shared",
-          "mode": "verify",
-          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -61923,13 +61699,6 @@
           "test": "determinism-stress-c/pipe-chain",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "determinism-stress-c",
-          "test": "determinism-stress-c/pipe-chain",
-          "mode": "verify",
-          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -62280,13 +62049,6 @@
         {
           "lane": "portable",
           "category": "language-runtimes",
-          "test": "language-runtimes/example-python-random",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
           "test": "language-runtimes/gawk-random",
           "mode": "verify",
           "backend": "kvm"
@@ -62451,13 +62213,6 @@
           "test": "language-runtimes/python-random",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/ruby-random",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -63438,13 +63193,6 @@
         {
           "lane": "portable",
           "category": "system-utils",
-          "test": "system-utils/startup-tls-guards",
-          "mode": "verify",
-          "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
           "test": "system-utils/true-exit-zero",
           "mode": "verify",
           "backend": "dbt"
@@ -63627,13 +63375,6 @@
         "category": "applications"
       },
       "result_manifests": [
-        {
-          "lane": "privileged",
-          "category": "applications",
-          "test": "applications/kvm-python-examples",
-          "mode": "verify",
-          "backend": "kvm"
-        },
         {
           "lane": "privileged",
           "category": "applications",

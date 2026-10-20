@@ -21,7 +21,7 @@ test:
       verify:
         ci:
           ptrace: true
-          sabre: true
+          sabre: false
           kvm: true
           dbt: true
           liteinst: true
@@ -34,6 +34,8 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -167,7 +169,7 @@ test:
       verify:
         ci:
           ptrace: true
-          sabre: true
+          sabre: false
           dbt: true
           liteinst: true
           in-guest-trap: true
@@ -180,6 +182,8 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -373,7 +377,7 @@ test:
         ci:
           ptrace: true
           kvm: true
-          sabre: true
+          sabre: false
           dbt: true
           liteinst: true
           in-guest-trap: true
@@ -385,6 +389,8 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled

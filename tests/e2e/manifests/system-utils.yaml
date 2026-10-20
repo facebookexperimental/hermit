@@ -1740,8 +1740,10 @@ test:
         ci:
           ptrace: true
           kvm: true
-          sabre: true
+          sabre: false
           dbt: true
+        ci_disabled_reason:
+          sabre: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 117, 117, 117.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
         backends_enabled:
           - ptrace
           - kvm
