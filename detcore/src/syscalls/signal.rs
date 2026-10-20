@@ -172,6 +172,43 @@ fn without_perf_event_signal(mask: KernelSigset) -> KernelSigset {
     mask & !(1_u64 << bit)
 }
 
+/// The result of a kernel-access probe that is a call's first injection,
+/// made before anything of the call happens (`read_kernel_sigset`,
+/// `read_kernel_sigaction`, pselect6's wrapper validation), with the
+/// backend's not-run report, `-ERESTARTSYS` (which no probe returns
+/// itself), turned into `-ERESTARTNOINTR`. The report means a signal reached
+/// the thread at the call's entry and stopped the probe before its `syscall`
+/// instruction; the backend holds it. The call then restarts once the signal
+/// is delivered, as if the signal had come before the call: its handler runs
+/// under the thread's own mask, and the call runs. Ending the call with the
+/// not-run report instead returned EINTR, from a wait whose temporary mask
+/// the handler never saw and from calls that never fail with EINTR
+/// (`rt_sigprocmask`, `rt_sigaction`), which no Linux run produces
+/// (https://github.com/rrnewton/hermit/issues/4526).
+///
+/// Only for a call's first injection. A probe after an earlier injection
+/// keeps the not-run report, since a restart would repeat that injection
+/// (pselect6's mask read after its wrapper validation and its observation of
+/// a pending real-time timer expiration, for example). Some first injections
+/// still keep it, because whether they come first depends on an earlier
+/// phase that usually injects nothing
+/// (https://github.com/rrnewton/hermit/issues/4526):
+/// - raw epoll_pwait and epoll_pwait2: the mask read inside
+///   `observe_under_temporary_mask`, which swallows any error, and the mask
+///   reads after it when the observation injected nothing;
+/// - a zero-timeout ppoll's mask read (`prepare_ppoll_probe(.., false)`):
+///   in run mode it follows `publish_expired`, which usually injects
+///   nothing; under record and replay only a scheduler request comes first,
+///   so there it is always the first injection, and still unmapped;
+/// - record/replay pselect6's entry read (`entry_pselect6_temporary_mask`),
+///   which swallows any error.
+pub(crate) fn restart_if_first_probe_not_run<V>(result: Result<V, Error>) -> Result<V, Error> {
+    match result {
+        Err(Error::Errno(Errno::ERESTARTSYS)) => Err(Errno::ERESTARTNOINTR.into()),
+        other => other,
+    }
+}
+
 /// Read one raw kernel signal mask while preserving the kernel's user-access check.
 ///
 /// `safeptrace::Stopped::read` deliberately uses `PTRACE_PEEKDATA` for reads of
@@ -1030,7 +1067,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EFAULT.into());
         };
 
-        let temporary_mask = read_kernel_sigset(guest, mask_addr).await?;
+        let temporary_mask =
+            restart_if_first_probe_not_run(read_kernel_sigset(guest, mask_addr).await)?;
         super::signal_shadow::note_wait_mask(guest, temporary_mask);
         // The temporary mask lets the kernel take a pending real-time timer
         // expiration that every thread blocked when it expired
@@ -1136,7 +1174,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // writing old_action. This preserves Linux's action-before-old_action
         // pointer ordering, including when both arguments alias.
         let kernel_action = match call.action() {
-            Some(action) => Some(read_kernel_sigaction(guest, action).await?),
+            Some(action) => Some(restart_if_first_probe_not_run(
+                read_kernel_sigaction(guest, action).await,
+            )?),
             None => None,
         };
 
@@ -1423,6 +1463,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         validate_kernel_sigset_size(call.sigsetsize())?;
 
         let (result, validated_set) = self.rt_sigprocmask_inner(guest, call).await;
+        let set_not_read = matches!(validated_set, ValidatedSet::NotRun);
         if guest.thread_state().signal_shadow.is_some() {
             use super::signal_shadow::SetInput;
             let errno_result = match &result {
@@ -1470,6 +1511,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 );
             }
         }
+        // The set's probe did not run, and the call restarts
+        // (`restart_if_first_probe_not_run`): nothing changed, so nothing
+        // follows from a change; the restarted call does the rest.
+        if set_not_read && matches!(result, Err(Error::Errno(Errno::ERESTARTNOINTR))) {
+            return result;
+        }
         if call.how() != libc::SIG_BLOCK && call.set().is_some() {
             // The new mask may unblock a pending real-time timer expiration
             // that every thread blocked when it expired, which the kernel then
@@ -1507,10 +1554,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             let result = guest.inject_with_retry(call).await;
             (result.map_err(Into::into), ValidatedSet::NotValidated)
         } else if let Some(set) = call.set() {
-            let set_mask = match read_kernel_sigset(guest, set).await {
-                Ok(set_mask) => set_mask,
-                Err(error) => return (Err(error), ValidatedSet::NotRun),
-            };
+            let set_mask =
+                match restart_if_first_probe_not_run(read_kernel_sigset(guest, set).await) {
+                    Ok(set_mask) => set_mask,
+                    Err(error) => return (Err(error), ValidatedSet::NotRun),
+                };
             let mut stack = guest.stack().await;
             let new_set = stack.push(without_perf_event_signal(set_mask));
             let _stack_guard = match stack.commit() {
@@ -1573,7 +1621,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (`Scheduler::own_process_signal_inputs`). An unreadable set fails in
         // the kernel at the first poll.
         let waited = match call.set() {
-            Some(set) => read_kernel_sigset(guest, set.into()).await.ok(),
+            Some(set) => {
+                match restart_if_first_probe_not_run(read_kernel_sigset(guest, set.into()).await) {
+                    Err(Error::Errno(Errno::ERESTARTNOINTR)) => {
+                        return Err(Errno::ERESTARTNOINTR.into());
+                    }
+                    read => read.ok(),
+                }
+            }
             None => None,
         };
         if waited.is_some() {
@@ -4804,6 +4859,29 @@ fn held_wake_ends_sleep(
 
 #[cfg(test)]
 mod tests {
+    /// A first probe's not-run report restarts the call; any other result,
+    /// errno or value, passes through unchanged.
+    #[test]
+    fn a_first_probe_not_run_restarts_the_call() {
+        let restart = |result: Result<u64, Error>| restart_if_first_probe_not_run(result);
+        assert!(matches!(
+            restart(Err(Errno::ERESTARTSYS.into())),
+            Err(Error::Errno(Errno::ERESTARTNOINTR))
+        ));
+        for errno in [
+            Errno::EFAULT,
+            Errno::EINVAL,
+            Errno::EINTR,
+            Errno::ERESTARTNOHAND,
+        ] {
+            assert!(
+                matches!(restart(Err(errno.into())), Err(Error::Errno(e)) if e == errno),
+                "{errno} passes through"
+            );
+        }
+        assert!(matches!(restart(Ok(7)), Ok(7)));
+    }
+
     use super::*;
 
     fn timeval(seconds: libc::time_t, micros: libc::suseconds_t) -> libc::timeval {

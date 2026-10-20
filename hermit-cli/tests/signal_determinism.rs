@@ -1722,6 +1722,100 @@ fn ptrace_delivery_check_approves_a_sibling_signal_that_arrives_during_sigsuspen
     assert_detlog_order("mt-suspend-late", (3, "rt_sigsuspend"), (5, "tgkill"));
 }
 
+/// The arrived-first cases (A5 step 3.2b, https://github.com/rrnewton/hermit/issues/4526):
+/// a sibling's SIGUSR1, caught and admitted by the main thread's own mask,
+/// reaches the main thread at the entry of `call` (a `mt-arrived-first-*`
+/// mode), before Hermit's first injection for it, a kernel-access probe of
+/// the call's mask or action. The scheduler, not host timing, places the
+/// send there (the guest's comment says how). The probe's step stops for the
+/// signal before it runs, so the backend holds the signal and reports it
+/// after the callback (`held`). The call restarts once the signal is
+/// delivered (Detcore's `-ERESTARTNOINTR`, -513, which is what the held
+/// delivery is approved against), as if the signal had come before the
+/// call: the handler runs under the thread's own mask, and the call then
+/// runs (a wait then waits for the later SIGUSR2). The guest checks that
+/// outcome against Linux's rules; before, the call returned EINTR, from a
+/// wait whose temporary mask the handler never saw, and from
+/// `rt_sigprocmask` and `rt_sigaction`, none of which a Linux run produces.
+/// `second` is the later SIGUSR2's approval, and `held` the counter's
+/// `held=` (a ppoll's SIGUSR2 is held too).
+fn assert_arrived_first(call: &str, held: u32, first: &str, second: &str) {
+    let _guard = hermit_signal_lock();
+    let mode = format!("mt-arrived-first-{call}");
+    let (counters, approvals, log) =
+        delivery_log_with(&mode, &[], "detcore=warn,detcore::signal_delivery=trace");
+    assert_eq!(
+        counters,
+        [format!(
+            "approved=2 held={held} result_checked=2 mismatched=0 interruption_from_registers=0 skipped={{}} unreported={{}}"
+        )],
+        "mode {mode}"
+    );
+    assert_eq!(
+        approvals,
+        [
+            format!("the delivery of signal 10 is approved, interrupting {first}"),
+            format!("the delivery of signal 12 is approved, interrupting {second}"),
+        ],
+        "mode {mode}"
+    );
+    let noise: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains(" WARN ") || line.contains(" ERROR "))
+        .collect();
+    assert!(noise.is_empty(), "mode {mode}: {noise:#?}");
+}
+
+#[test]
+fn ptrace_delivery_check_restarts_a_sigsuspend_a_signal_reaches_at_its_entry() {
+    assert_arrived_first(
+        "suspend",
+        1,
+        "Return { syscall: 130, result: -513 }",
+        "Return { syscall: 130, result: -514 }",
+    );
+}
+
+#[test]
+fn ptrace_delivery_check_restarts_a_ppoll_a_signal_reaches_at_its_entry() {
+    assert_arrived_first(
+        "ppoll",
+        2,
+        "Return { syscall: 271, result: -513 }",
+        "Return { syscall: 271, result: -514 }",
+    );
+}
+
+#[test]
+fn ptrace_delivery_check_restarts_a_pselect6_a_signal_reaches_at_its_entry() {
+    assert_arrived_first(
+        "pselect",
+        1,
+        "Return { syscall: 270, result: -513 }",
+        "Return { syscall: 270, result: -514 }",
+    );
+}
+
+#[test]
+fn ptrace_delivery_check_restarts_an_rt_sigprocmask_a_signal_reaches_at_its_entry() {
+    assert_arrived_first(
+        "sigprocmask",
+        1,
+        "Return { syscall: 14, result: -513 }",
+        "Return { syscall: 202, result: -512 }",
+    );
+}
+
+#[test]
+fn ptrace_delivery_check_restarts_an_rt_sigaction_a_signal_reaches_at_its_entry() {
+    assert_arrived_first(
+        "sigaction",
+        1,
+        "Return { syscall: 13, result: -513 }",
+        "Return { syscall: 202, result: -512 }",
+    );
+}
+
 /// Must not deliver: a sibling's SIGUSR1 that the wait's temporary mask also
 /// blocks stays pending through sigsuspend, which the sibling's next signal,
 /// an admitted SIGWINCH, ends. Two approvals: SIGWINCH at the wait, then

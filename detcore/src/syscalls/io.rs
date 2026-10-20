@@ -1118,7 +1118,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_sigmask(Some(argument));
                 match guest.inject(validation).await {
                     Err(Errno::EINVAL) => {}
-                    Err(errno) => return Err(errno.into()),
+                    // The call's first injection
+                    // (`restart_if_first_probe_not_run`).
+                    Err(errno) => {
+                        return crate::syscalls::signal::restart_if_first_probe_not_run(Err(
+                            errno.into()
+                        ));
+                    }
                     // Success would mean the backend did not validate the probe.
                     Ok(_) => return Err(Errno::EIO.into()),
                 }
@@ -1933,7 +1939,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // probe's copies take the scratch stack.
                 crate::syscalls::timerfd::publish_expired(guest).await;
             }
-            let (probe, staged) = match self.prepare_ppoll_probe(guest, call).await? {
+            // A virtual timerfd's expiration is published first, so the
+            // mask's read is not the call's first step.
+            let (probe, staged) = match self.prepare_ppoll_probe(guest, call, false).await? {
                 Some((probe, staged)) => (probe, Some(staged)),
                 None => {
                     if let Some(refused) = self.refuse_unstageable_ppoll_copy(guest).await {
@@ -2000,7 +2008,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if call.sigsetsize() != KERNEL_SIGSET_SIZE {
                     return Err(Errno::EINVAL.into());
                 }
-                let signal_mask = read_kernel_sigset(guest, signal_mask).await?;
+                let signal_mask = crate::syscalls::signal::restart_if_first_probe_not_run(
+                    read_kernel_sigset(guest, signal_mask).await,
+                )?;
                 super::signal_shadow::note_wait_mask(guest, signal_mask);
                 let signal_mask = sanitize_ppoll_signal_mask(signal_mask);
                 blocked_signal_mask = Some(kernel_installed_signal_mask(signal_mask));
@@ -2079,11 +2089,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `stage_private_cells` clear of the pollfd array that Linux writes. So
     /// neither a sibling's write nor the guest's own mask can make the probe
     /// sleep or block Hermit's timer signal. `None` when the copies have
-    /// nowhere to go (`refuse_unstageable_ppoll_copy`).
+    /// nowhere to go (`refuse_unstageable_ppoll_copy`). `first` says the
+    /// mask's read is the call's first injection, so a signal that stops it
+    /// restarts the call (`restart_if_first_probe_not_run`).
     async fn prepare_ppoll_probe<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Ppoll,
+        first: bool,
     ) -> Result<
         Option<(
             syscalls::Ppoll,
@@ -2096,7 +2109,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if call.sigsetsize() != KERNEL_SIGSET_SIZE {
                     return Err(Errno::EINVAL.into());
                 }
-                let signal_mask = read_kernel_sigset(guest, signal_mask).await?;
+                let read = read_kernel_sigset(guest, signal_mask).await;
+                let signal_mask = if first {
+                    crate::syscalls::signal::restart_if_first_probe_not_run(read)?
+                } else {
+                    read?
+                };
                 super::signal_shadow::note_wait_mask(guest, signal_mask);
                 // The probe's temporary mask lets the kernel take a pending
                 // real-time timer expiration that every thread blocked when it
@@ -2184,7 +2202,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // block used to return ENOSYS here
         // (https://github.com/rrnewton/hermit/issues/4042).
         if call.sigmask().is_some() {
-            let Some((probe, staged)) = self.prepare_ppoll_probe(guest, call).await? else {
+            // Only the virtual clock was read before: the mask's read is the
+            // call's first injection.
+            let Some((probe, staged)) = self.prepare_ppoll_probe(guest, call, true).await? else {
                 // The guest's own mask could block Hermit's timer signal while
                 // the call is parked, so a run that allows unsupported
                 // operations gets the same answer as a mask it cannot honor.
@@ -2576,7 +2596,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EINVAL.into());
         }
         let mask_address = call.sigmask().ok_or(Errno::EFAULT)?;
-        let mask = read_kernel_sigset(guest, mask_address.cast()).await?;
+        let mask = crate::syscalls::signal::restart_if_first_probe_not_run(
+            read_kernel_sigset(guest, mask_address.cast()).await,
+        )?;
         super::signal_shadow::note_wait_mask(guest, mask);
         // A pending real-time timer expiration that the mask lets the kernel
         // deliver or discard (https://github.com/rrnewton/hermit/issues/4089).
@@ -2661,7 +2683,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EINVAL.into());
         }
         let mask_address = call.sigmask().ok_or(Errno::EFAULT)?;
-        let mask = read_kernel_sigset(guest, mask_address.cast()).await?;
+        let mask = crate::syscalls::signal::restart_if_first_probe_not_run(
+            read_kernel_sigset(guest, mask_address.cast()).await,
+        )?;
         super::signal_shadow::note_wait_mask(guest, mask);
         // The copy may go in the red zone on a stack with no scratch below it,
         // clear of the events buffer the kernel writes (`stage_private_cells`;

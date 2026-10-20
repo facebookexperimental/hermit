@@ -773,7 +773,13 @@ impl RecordVersion {
 // re-lands on the continuation-mask fix: a vfork parent again resumes at its
 // child's successful exec or exit (`vfork(2)`), with the readmission logged at
 // step 2a, so every recording of a vfork holds a different schedule.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17d);
+// 0x17d -> 0x17e (taken at land time, HIGHEST_SHIPPED + 1): a signal that stops
+// a call's first injection (its mask or action probe) before the probe runs now
+// makes the call restart after delivery (-ERESTARTNOINTR), as if the signal came
+// first (https://github.com/rrnewton/hermit/issues/4526), where the call failed
+// with the probe's -ERESTARTSYS. A recording made before this holds that EINTR
+// and would replay out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17e);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -798,7 +804,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17d);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17d;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17e;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

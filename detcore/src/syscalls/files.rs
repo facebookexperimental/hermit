@@ -11094,9 +11094,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (https://github.com/rrnewton/hermit/issues/4089). A mask the kernel
         // cannot read fails the call below.
         let mask = match call.mask().and_then(|mask| Addr::from_raw(mask.as_raw())) {
-            Some(mask) => crate::syscalls::signal::read_kernel_sigset(guest, mask)
-                .await
-                .ok(),
+            Some(mask) => {
+                // The call's first injection (`restart_if_first_probe_not_run`).
+                match crate::syscalls::signal::restart_if_first_probe_not_run(
+                    crate::syscalls::signal::read_kernel_sigset(guest, mask).await,
+                ) {
+                    Err(Error::Errno(Errno::ERESTARTNOINTR)) => {
+                        return Err(Errno::ERESTARTNOINTR.into());
+                    }
+                    read => read.ok(),
+                }
+            }
             None => None,
         };
         if let Some(mask) = mask {

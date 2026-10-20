@@ -2585,7 +2585,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the /proc/locks capture end-of-list unit
     // (procfs::locks::tests::a_short_read_that_reached_the_end_drops_what_the_closing_reads_repeat):
     // 2168, listed.
-    ("test.detcore_unit", 2168),
+    // And +1 from e1446c0a: 2169.
+    ("test.detcore_unit", 2169),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2929,7 +2930,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed: 296.
     // And three more (A5 step 3.2b part 2: a forced bit in one mask, twice,
     // and a signal passed on unreported at a syscall skip), listed: 299.
-    ("test.hermit_integration_3", 299),
+    // And four arrived-first ptrace_delivery_check_* tests (A5 step 3.2b,
+    // https://github.com/rrnewton/hermit/issues/4526), listed: 303.
+    // And a fifth, for pselect6: 304.
+    ("test.hermit_integration_3", 304),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4560,7 +4564,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_rt_sigsuspend_continuation_is_unknown_and_picks_alike_in_record_and_replay: 2152.
     // And the fifteen vfork-rejoin scheduler units, re-landed: 2167.
     // And the same /proc/locks capture end-of-list unit: 2168, listed.
-    ("test.detcore_unit_on_host", 2168),
+    // And +1 from e1446c0a: 2169.
+    ("test.detcore_unit_on_host", 2169),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4654,7 +4659,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And five multithreaded ptrace_delivery_check_* tests (A5 step 3.2b),
     // listed: 634.
     // And three A5 step 3.2b part 2 ptrace_delivery_check_* tests: 637.
-    ("test.hermit_integration_on_host", 637),
+    // And five arrived-first ptrace_delivery_check_* tests: 642.
+    // And +5 from e1446c0a: 642.
+    ("test.hermit_integration_on_host", 642),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
