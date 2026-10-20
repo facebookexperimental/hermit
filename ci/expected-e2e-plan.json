@@ -41226,6 +41226,185 @@
       ],
       "test": "compat/mountpoint",
       "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/hardware-trap-identity",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "c-programs/just-spin",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "sabre",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/nanosleep-par",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "c-programs/syscall-file-metadata",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "sabre",
+      "category": "determinism-stress-c",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "determinism-stress-c/fork-tree",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "sabre",
+      "category": "determinism-stress-c",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "determinism-stress-c/mmap-fork-shared",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "sabre",
+      "category": "determinism-stress-c",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "determinism-stress-c/pipe-chain",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "sabre",
+      "category": "language-runtimes",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "python3"
+      ],
+      "test": "language-runtimes/example-python-random",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "ruby"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "language-runtimes/ruby-random",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "sabre",
+      "category": "system-utils",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "system-utils/startup-tls-guards",
+      "timeout_seconds": 57
     }
   ],
   "schema": 1
