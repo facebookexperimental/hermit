@@ -2401,8 +2401,15 @@ fi
 # and third-party/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so inventory 997, SDK and native inputs, calibrated
 # budget, job width and limits carry unchanged from the 9c993c85 entry.
+# CARRY TO 94f126befc69990655a48c41b070f1d252609dd6 (2026-10-21): from
+# 87c88c0dd13ea91d8b764370da8c70f447c2ee7b. One commit (signals lane, A5
+# 3c.0's capability split: four BackendCapabilities fields). It changes
+# reverie/src/capabilities.rs only; git diff is empty under reverie-dbt/ and
+# third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so inventory 997, SDK and native inputs, calibrated
+# budget, job width and limits carry unchanged from the 87c88c0d entry.
 
-expected_pin=87c88c0dd13ea91d8b764370da8c70f447c2ee7b
+expected_pin=94f126befc69990655a48c41b070f1d252609dd6
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

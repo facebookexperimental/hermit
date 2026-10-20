@@ -880,11 +880,7 @@ async fn transferred_exec_publishes_the_new_images_dispositions_before_its_turn(
     use crate::syscalls::signal_shadow::PublishedDispositions;
 
     let mut fixture = Fixture::prepared().await;
-    fixture
-        .state
-        .cfg
-        .backend
-        .supports_blocked_wait_signal_interruption = true;
+    detcore_model::config::set_kernel_signal_facts(&mut fixture.state.cfg.backend, true);
     let usr1 = 1 << (libc::SIGUSR1 - 1);
     let caught = CopiedDispositions {
         ignored: 0,

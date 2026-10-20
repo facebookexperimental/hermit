@@ -2904,9 +2904,7 @@ pub(crate) async fn publish_wait_mask<T, G>(
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    if mask == published.0
-        || !detcore_model::bundled_signal_facts::models_signal_targets(guest.config())
-    {
+    if mask == published.0 || !guest.config().models_signal_targets() {
         return;
     }
     crate::tool_global::set_saved_guest_sigmask(guest, mask).await;
@@ -6755,10 +6753,7 @@ mod kernel_signal_wait_failures {
     fn caught_sigchld_guest(gated_backend: bool) -> (WaitGuest, Kernel) {
         let (mut guest, kernel) = WaitGuest::live(guest_mask());
         guest.config.sequentialize_threads = gated_backend;
-        guest
-            .config
-            .backend
-            .supports_blocked_wait_signal_interruption = gated_backend;
+        detcore_model::config::set_kernel_signal_facts(&mut guest.config.backend, gated_backend);
         {
             let mut kernel = kernel.lock().unwrap();
             kernel.pending = kernel_sigset_bit(libc::SIGCHLD);

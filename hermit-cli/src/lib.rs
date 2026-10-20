@@ -434,7 +434,6 @@ pub use detcore_dbt::reverie_dbt_runtime_thread_init;
 #[doc(hidden)]
 #[cfg(feature = "dbt")]
 pub use detcore_dbt::reverie_dbt_runtime_totals;
-use detcore_model::bundled_signal_facts;
 pub use error::Context;
 pub use error::Error;
 pub use error::FailureKind;
@@ -4181,13 +4180,11 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // not derived from its name here (audit step A9 of
     // https://github.com/rrnewton/hermit/issues/4485).
     // Only backends where Detcore treats a terminal's signals as reaching the
-    // guest from the host read it (`Config::guest_may_inherit_a_terminal`, the
-    // legacy bundled condition
-    // `bundled_signal_facts::host_timed_signal_sources_are_physical`), so the
-    // host is asked only for them.
+    // guest from the host read it (`Config::guest_may_inherit_a_terminal`, and
+    // `BackendCapabilities::host_timed_signals_are_physical`), so the host is
+    // asked only for them.
     config.guest_may_inherit_a_terminal =
-        bundled_signal_facts::host_timed_signal_sources_are_physical(&config.backend)
-            && launcher_may_pass_a_terminal();
+        config.backend.host_timed_signals_are_physical && launcher_may_pass_a_terminal();
     config
 }
 
@@ -7922,6 +7919,15 @@ mod tests {
             // A Config field Hermit set from the backend's name before it was
             // a stated capability. e9patch runs on ptrace and has its value.
             "supports_blocked_wait_signal_interruption":
+                matches!(backend, Backend::Ptrace | Backend::E9patch),
+            // Readings of the field above until A5 step 3c.0 split them out,
+            // with its value on every backend.
+            "kernel_signal_state_is_guests": matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "kernel_signal_targets_are_predictable":
+                matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "host_task_reads_reach_guest_threads":
+                matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "host_timed_signals_are_physical":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "delivers_preemption_timer_events":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),

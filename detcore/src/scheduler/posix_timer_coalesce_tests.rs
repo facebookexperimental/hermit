@@ -56,7 +56,7 @@ fn family() -> Family {
         sequentialize_threads: true,
         ..Config::default()
     };
-    config.backend.supports_blocked_wait_signal_interruption = true;
+    detcore_model::config::set_kernel_signal_facts(&mut config.backend, true);
     config.backend.delivers_preemption_timer_events = false;
     let mut sched = Scheduler::new(&config);
     assert!(sched.coalesces_alarms());

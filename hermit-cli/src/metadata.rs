@@ -1687,11 +1687,38 @@ mod tests {
         let run =
             crate::prepare_backend_config(crate::DetConfig::default(), crate::Backend::Ptrace);
         assert!(record.sequentialize_threads);
-        assert!(record.backend.supports_blocked_wait_signal_interruption);
-        assert_eq!(
-            record.backend.supports_blocked_wait_signal_interruption,
-            run.backend.supports_blocked_wait_signal_interruption
-        );
+        assert!(record.models_signal_targets());
+        // `run` is a default configuration, whose threads are not serialized
+        // until the command line asks; its backend facts are ptrace's.
+        let facts = |config: &crate::DetConfig| {
+            let backend = &config.backend;
+            [
+                (
+                    "supports_blocked_wait_signal_interruption",
+                    backend.supports_blocked_wait_signal_interruption,
+                ),
+                (
+                    "kernel_signal_state_is_guests",
+                    backend.kernel_signal_state_is_guests,
+                ),
+                (
+                    "kernel_signal_targets_are_predictable",
+                    backend.kernel_signal_targets_are_predictable,
+                ),
+                (
+                    "host_task_reads_reach_guest_threads",
+                    backend.host_task_reads_reach_guest_threads,
+                ),
+                (
+                    "host_timed_signals_are_physical",
+                    backend.host_timed_signals_are_physical,
+                ),
+            ]
+        };
+        for ((name, recorded), (_, ran)) in facts(&record).into_iter().zip(facts(&run)) {
+            assert!(recorded, "{name}");
+            assert_eq!(recorded, ran, "{name}");
+        }
         assert!(!record.guest_may_inherit_a_terminal);
     }
 

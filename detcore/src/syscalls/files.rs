@@ -19,7 +19,6 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
-use detcore_model::bundled_signal_facts;
 use nix::fcntl::AtFlags;
 use nix::fcntl::OFlag;
 use rand::RngExt as _;
@@ -4235,9 +4234,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // Skipped under record and replay: Replayer's descriptor is a
                 // placeholder that never becomes a terminal, so the two runs
                 // would not record alike.
-                if bundled_signal_facts::host_timed_signal_sources_are_physical(
-                    &guest.config().backend,
-                ) && !self.cfg.recordreplay_modes
+                if guest.config().backend.host_timed_signals_are_physical
+                    && !self.cfg.recordreplay_modes
                     && open_can_acquire_controlling_terminal(call.flags())
                     && opened_controlling_terminal(guest.pid().as_raw(), fd, host_stat.as_ref())
                 {
@@ -8974,9 +8972,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if matches!(call.cmd(), F_SETLEASE(lease) if lease != libc::F_UNLCK) {
             refuse_sigalrm(guest, SigalrmControl::ArmProducer).await?;
         }
-        if signals != 0
-            && bundled_signal_facts::host_timed_signal_sources_are_physical(&guest.config().backend)
-        {
+        if signals != 0 && guest.config().backend.host_timed_signals_are_physical {
             record_host_timed_signals(guest, HostTimedSignalScope::Container, signals).await;
         }
         let o_cloexec = match call.cmd() {
@@ -9707,9 +9703,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // controlling terminal hangs up, are signalled at a moment set by host
         // timing, so hold their signals in every process.
         let signals = ioctl_host_timed_signals(call.request());
-        if signals != 0
-            && bundled_signal_facts::host_timed_signal_sources_are_physical(&guest.config().backend)
-        {
+        if signals != 0 && guest.config().backend.host_timed_signals_are_physical {
             record_host_timed_signals(guest, HostTimedSignalScope::Container, signals).await;
         }
         let (cloexec, nonblocking) = match call.request() {
@@ -11473,9 +11467,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         ProcessDirectoryDescriptor::Unknown(
                             "record and replay do not read what a descriptor names",
                         )
-                    } else if !bundled_signal_facts::host_task_reads_enabled(
-                        &guest.config().backend,
-                    ) {
+                    } else if !guest.config().backend.host_task_reads_reach_guest_threads {
                         // Only on ptrace are the guest's thread ids the host's, so
                         // that its descriptors can be read through /proc/<tid>.
                         ProcessDirectoryDescriptor::Unknown(

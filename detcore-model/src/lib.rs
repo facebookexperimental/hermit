@@ -10,7 +10,6 @@
 
 pub mod backend_engagement;
 pub mod build_info;
-pub mod bundled_signal_facts;
 pub mod canonical_test_epoch;
 pub mod cpu_profile;
 pub mod host_capability;

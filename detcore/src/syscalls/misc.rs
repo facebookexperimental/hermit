@@ -12,7 +12,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 
-use detcore_model::bundled_signal_facts;
 use reverie::BackendCapabilities;
 use reverie::Error;
 use reverie::Guest;
@@ -92,7 +91,7 @@ fn seccomp_result(op: u32, flags: u32, has_args: bool) -> Result<i64, Errno> {
 /// exit reaches the scheduler in order (sequentialized threads) and the
 /// guest's tasks are host tasks it can signal (ptrace).
 fn emulates_parent_death_signal(config: &crate::config::Config) -> bool {
-    config.sequentialize_threads && bundled_signal_facts::host_task_reads_enabled(&config.backend)
+    config.sequentialize_threads && config.backend.host_task_reads_reach_guest_threads
 }
 
 /// Whether parent-death signal `signal` is one Detcore sends itself: a
@@ -566,9 +565,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     return Ok(0);
                 }
                 if (1..=64).contains(&signal)
-                    && bundled_signal_facts::host_timed_signal_sources_are_physical(
-                        &guest.config().backend,
-                    )
+                    && guest.config().backend.host_timed_signals_are_physical
                 {
                     record_host_timed_signals(
                         guest,

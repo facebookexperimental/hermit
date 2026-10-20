@@ -348,7 +348,7 @@ async fn configurations_the_commit_cannot_keep_are_refused_before_any_turn() {
     type Adjust = fn(&mut Config);
     let refused: [(&str, Adjust); 8] = [
         ("discarded-at-send record", |config| {
-            config.backend.supports_blocked_wait_signal_interruption = true;
+            config.backend.kernel_signal_targets_are_predictable = true;
         }),
         ("kernel child-exit signals", |config| {
             config.backend.reports_kernel_child_exit_signals = true;

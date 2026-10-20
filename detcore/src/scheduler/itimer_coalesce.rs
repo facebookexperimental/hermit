@@ -452,7 +452,7 @@ mod tests {
                 ..Config::default()
             }
             .with_backend(|backend| {
-                backend.supports_blocked_wait_signal_interruption = true;
+                detcore_model::config::set_kernel_signal_facts(backend, true);
                 backend.delivers_preemption_timer_events = false;
                 backend.runs_guest_code_between_injections = false;
             }),

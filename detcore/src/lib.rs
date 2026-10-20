@@ -117,11 +117,11 @@ pub use config::config_wire_fingerprint;
 pub use config::decode_backend_config_json;
 pub use config::encode_backend_config_json;
 pub use config::from_legacy_backend_json;
+pub use config::set_kernel_signal_facts;
 pub use config::to_legacy_backend_json;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
 pub use consts::ROOT_DETPID;
-use detcore_model::bundled_signal_facts;
 pub use digest::Digest;
 #[cfg(test)]
 use rand::RngExt as _;
@@ -571,7 +571,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     fn copy_misses_unreported(&self, signal: i32) -> bool {
         self.cfg.signal_state_copy
             && self.cfg.sequentialize_threads
-            && bundled_signal_facts::kernel_signal_state_is_guests(&self.cfg.backend)
+            && self.cfg.backend.kernel_signal_state_is_guests
             && signal != reverie::PERF_EVENT_SIGNAL as i32
             && signal != libc::SIGKILL
             && signal != libc::SIGSTOP

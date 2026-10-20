@@ -37,13 +37,18 @@ const fn default_backend_capabilities() -> BackendCapabilities {
 
 /// The capabilities a [`Config`] has before the host prepares it for the
 /// backend that runs it: ptrace's, the backend Detcore's own tests use, except
-/// that four facts stay off (`supports_blocked_wait_signal_interruption`,
-/// `delivers_preemption_timer_events`, `runs_guest_code_between_injections`,
-/// `reports_sigreturns`). Until the first three became backend capabilities
-/// they were `Config` fields that only the host set, for the backend it had
-/// selected, and were false otherwise; a configuration nobody prepared keeps
-/// that behaviour. A configuration nobody prepared cannot know that sigreturns
-/// are reported, so the fourth is off too (the DBT runtime's standalone
+/// that eight facts stay off (`supports_blocked_wait_signal_interruption` and
+/// the four split out of it, which [`set_kernel_signal_facts`] clears
+/// together, `delivers_preemption_timer_events`,
+/// `runs_guest_code_between_injections`, `reports_sigreturns`). Until
+/// `supports_blocked_wait_signal_interruption`,
+/// `delivers_preemption_timer_events` and
+/// `runs_guest_code_between_injections` became backend capabilities they were
+/// `Config` fields that only the host set, for the backend it had selected,
+/// and were false otherwise; a configuration nobody prepared keeps that
+/// behaviour, and the four readings of the first with it. A configuration
+/// nobody prepared cannot know that sigreturns are reported, so that is off
+/// too (the DBT runtime's standalone
 /// fallback starts from these). `reports_kernel_child_exit_signals` keeps
 /// ptrace's value, as `reports_child_exit_publication` does: it took over the
 /// child-exit ledger's gates from that field, so such a configuration behaves
@@ -51,12 +56,27 @@ const fn default_backend_capabilities() -> BackendCapabilities {
 /// these before a run.
 pub const DEFAULT_BACKEND_CAPABILITIES: BackendCapabilities = {
     let mut backend = BackendCapabilities::PTRACE;
-    backend.supports_blocked_wait_signal_interruption = false;
+    set_kernel_signal_facts(&mut backend, false);
     backend.delivers_preemption_timer_events = false;
     backend.runs_guest_code_between_injections = false;
     backend.reports_sigreturns = false;
     backend
 };
+
+/// Sets `supports_blocked_wait_signal_interruption` and the four capabilities
+/// Detcore read from it until A5 step 3c.0 split them out
+/// (`kernel_signal_state_is_guests`, `kernel_signal_targets_are_predictable`,
+/// `host_task_reads_reach_guest_threads`, `host_timed_signals_are_physical`)
+/// to `on`, together. Every backend has the five equal, so a configuration
+/// that set or cleared the one field before the split sets or clears all five
+/// with this, and behaves as it did.
+pub const fn set_kernel_signal_facts(backend: &mut BackendCapabilities, on: bool) {
+    backend.supports_blocked_wait_signal_interruption = on;
+    backend.kernel_signal_state_is_guests = on;
+    backend.kernel_signal_targets_are_predictable = on;
+    backend.host_task_reads_reach_guest_threads = on;
+    backend.host_timed_signals_are_physical = on;
+}
 
 /// One mount row whose kernel-private root must be replaced before it becomes
 /// guest-visible.
@@ -254,9 +274,8 @@ pub struct Config {
     /// interrupt, quit and suspend characters, SIGWINCH when it is resized, and
     /// SIGTTIN and SIGTTOU for a background process group's reads and writes.
     /// The guest makes no traced call that arms them, so where Detcore treats
-    /// such signals as reaching the guest from the host (the legacy bundled
-    /// condition
-    /// [`crate::bundled_signal_facts::host_timed_signal_sources_are_physical`])
+    /// such signals as reaching the guest from the host
+    /// (`BackendCapabilities::host_timed_signals_are_physical`)
     /// the scheduler records all eight as host-timed for every process before the
     /// guest's first instruction, and no gated wait ends for them
     /// (<https://github.com/rrnewton/hermit/issues/3146>).
@@ -1125,6 +1144,19 @@ fn try_parse_memory(from_str: &str) -> anyhow::Result<u64> {
 }
 
 impl Config {
+    /// Whether the scheduler models which thread the kernel gives a signal,
+    /// from the signal masks it reads from the kernel, and keeps the
+    /// per-process ledger of signals discarded at send time; the guest side
+    /// publishes a waiting thread's mask and records handler-restored
+    /// real-time signals for it (`publish_wait_mask`,
+    /// `record_handler_restore_mask`). It needs serialized threads, so that a
+    /// mask it reads cannot change before the kernel acts on it, and a backend
+    /// whose kernel signal targets a tool can predict
+    /// (`BackendCapabilities::kernel_signal_targets_are_predictable`).
+    pub fn models_signal_targets(&self) -> bool {
+        self.sequentialize_threads && self.backend.kernel_signal_targets_are_predictable
+    }
+
     /// This configuration with `change` applied to its backend capabilities.
     /// [`BackendCapabilities`] cannot be built field by field outside Reverie,
     /// so a caller that needs to adjust individual facts starts from the value
@@ -2114,8 +2146,8 @@ impl Default for Config {
 /// form never had, is left out too, and reads back as false: this form serves
 /// only DBT, whose launcher collects no host inputs. So is
 /// [`Config::guest_may_inherit_a_terminal`], which is read only where
-/// [`crate::bundled_signal_facts::host_timed_signal_sources_are_physical`]
-/// holds, false for DBT, and [`Config::in_guest_detlog_forward_policy`] and
+/// `BackendCapabilities::host_timed_signals_are_physical` holds, false for
+/// DBT, and [`Config::in_guest_detlog_forward_policy`] and
 /// [`Config::in_guest_site_patching_off`], which is unset for DBT, and
 /// [`Config::launch_image`], which came after it. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
@@ -2243,13 +2275,18 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// can express, which includes every backend's own constant except for
 /// capabilities added after the legacy form froze: those never enter it, as
 /// `record_host_inputs` does not, and read back as their default. There are
-/// six. `process_exits_complete_asynchronously` and
+/// ten. `process_exits_complete_asynchronously` and
 /// `virtualizes_guest_sigalrm` are true only for in-guest LiteInst, which
 /// never travels through this DBT-only form.
 /// `supports_blocked_wait_signal_interruption`,
 /// `delivers_preemption_timer_events` and
 /// `runs_guest_code_between_injections` read back as false, the value DBT
-/// has and the value their earlier `Config` fields read back as.
+/// has and the value their earlier `Config` fields read back as; so do
+/// `reports_sigreturns` and the four capabilities split out of
+/// `supports_blocked_wait_signal_interruption` (`kernel_signal_state_is_guests`,
+/// `kernel_signal_targets_are_predictable`,
+/// `host_task_reads_reach_guest_threads`, `host_timed_signals_are_physical`),
+/// false for DBT too.
 ///
 /// `cpuid_virtualized_by_backend` supplies no capability either: it said the
 /// backend installed a CPUID policy of its own, which no backend does any
@@ -2500,9 +2537,11 @@ impl LegacyBackendKeys {
         backend.promotes_open_files_before_native_lifecycle =
             self.backend_requires_thread_directed_process_signals;
         // Added after the legacy form froze. Each was a `Config` field with no
-        // legacy key that read back as false, and each is false for DBT, the
-        // form's only reader, so a DBT configuration stays exact.
-        backend.supports_blocked_wait_signal_interruption = false;
+        // legacy key that read back as false (or, for the four split out of
+        // `supports_blocked_wait_signal_interruption`, a reading of one), and
+        // each is false for DBT, the form's only reader, so a DBT
+        // configuration stays exact.
+        set_kernel_signal_facts(&mut backend, false);
         backend.reports_sigreturns = false;
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
@@ -2554,7 +2593,7 @@ mod legacy_backend_json {
     /// form serves only DBT, whose launcher collects no host inputs, so it is
     /// never written and always reads as false.
     /// So is `guest_may_inherit_a_terminal`, which is read only where
-    /// `bundled_signal_facts::host_timed_signal_sources_are_physical` holds;
+    /// `BackendCapabilities::host_timed_signals_are_physical` holds;
     /// that is false for DBT.
     /// `target_timeslice_syscalls_only` came after the legacy form froze; the
     /// legacy form never carried it, so it is never written and reads as false,
@@ -3068,6 +3107,66 @@ mod legacy_backend_json {
 mod tests {
     use super::*;
 
+    /// The four capabilities split out of
+    /// `supports_blocked_wait_signal_interruption` in A5 step 3c.0 equal it
+    /// on every backend, as the readings they replace did, so no backend's
+    /// behaviour moves; and `models_signal_targets` is serialized threads and
+    /// `kernel_signal_targets_are_predictable`, under both thread modes.
+    #[test]
+    fn split_signal_facts_equal_their_former_bundle_on_every_backend() {
+        // Only ptrace and e9patch set the bundle today.
+        let backends = [
+            ("ptrace", BackendCapabilities::PTRACE, true),
+            ("e9patch", BackendCapabilities::E9PATCH, true),
+            ("liteinst", BackendCapabilities::LITEINST_IN_GUEST, false),
+            ("sabre", BackendCapabilities::SABRE, false),
+            ("dbt", BackendCapabilities::DBT, false),
+            ("kvm", BackendCapabilities::KVM, false),
+            ("unprepared", DEFAULT_BACKEND_CAPABILITIES, false),
+        ];
+        for (name, backend, expected) in backends {
+            assert_eq!(
+                backend.supports_blocked_wait_signal_interruption, expected,
+                "{name}"
+            );
+            assert_eq!(backend.kernel_signal_state_is_guests, expected, "{name}");
+            assert_eq!(
+                backend.kernel_signal_targets_are_predictable, expected,
+                "{name}"
+            );
+            assert_eq!(
+                backend.host_task_reads_reach_guest_threads, expected,
+                "{name}"
+            );
+            assert_eq!(backend.host_timed_signals_are_physical, expected, "{name}");
+            // It sets exactly those five: the whole struct after the call
+            // equals `backend` with only them flipped by hand.
+            let mut flipped = backend;
+            flipped.supports_blocked_wait_signal_interruption = !expected;
+            flipped.kernel_signal_state_is_guests = !expected;
+            flipped.kernel_signal_targets_are_predictable = !expected;
+            flipped.host_task_reads_reach_guest_threads = !expected;
+            flipped.host_timed_signals_are_physical = !expected;
+            let mut toggled = backend;
+            set_kernel_signal_facts(&mut toggled, !expected);
+            assert_eq!(toggled, flipped, "{name}");
+            set_kernel_signal_facts(&mut toggled, expected);
+            assert_eq!(toggled, backend, "{name}");
+            for sequentialize_threads in [false, true] {
+                let cfg = Config {
+                    sequentialize_threads,
+                    backend,
+                    ..Config::default()
+                };
+                assert_eq!(
+                    cfg.models_signal_targets(),
+                    sequentialize_threads && expected,
+                    "{name}, sequentialize_threads={sequentialize_threads}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn default_epoch_is_2026() {
         assert_eq!(DEFAULT_EPOCH_STR, "2026-01-01T00:00:00Z");
@@ -3109,6 +3208,10 @@ mod tests {
             "the default configuration must not write a controlled-run legacy key"
         );
         assert!(!config.backend.supports_blocked_wait_signal_interruption);
+        assert!(!config.backend.kernel_signal_state_is_guests);
+        assert!(!config.backend.kernel_signal_targets_are_predictable);
+        assert!(!config.backend.host_task_reads_reach_guest_threads);
+        assert!(!config.backend.host_timed_signals_are_physical);
         assert!(!config.backend.delivers_preemption_timer_events);
         assert!(!config.backend.runs_guest_code_between_injections);
         assert!(!config.guest_may_inherit_a_terminal);
@@ -3177,7 +3280,7 @@ mod tests {
     fn legacy_expressible(mut backend: BackendCapabilities) -> BackendCapabilities {
         backend.process_exits_complete_asynchronously = false;
         backend.virtualizes_guest_sigalrm = false;
-        backend.supports_blocked_wait_signal_interruption = false;
+        set_kernel_signal_facts(&mut backend, false);
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
         backend.reports_sigreturns = false;
@@ -3785,8 +3888,8 @@ mod tests {
 
     /// The capabilities added after the legacy form froze that a legacy
     /// configuration reads back as false
-    /// (`supports_blocked_wait_signal_interruption`,
-    /// `delivers_preemption_timer_events`,
+    /// (`supports_blocked_wait_signal_interruption` and the four split out of
+    /// it, `delivers_preemption_timer_events`,
     /// `runs_guest_code_between_injections`, `reports_sigreturns`) never enter
     /// it, whatever their
     /// value: the guest-visible string stays the legacy bytes, and they read
@@ -3798,7 +3901,7 @@ mod tests {
             ..Config::default()
         };
         let mut on = off.clone();
-        on.backend.supports_blocked_wait_signal_interruption = true;
+        set_kernel_signal_facts(&mut on.backend, true);
         on.backend.delivers_preemption_timer_events = true;
         on.backend.runs_guest_code_between_injections = true;
         on.backend.reports_sigreturns = true;
@@ -3806,6 +3909,10 @@ mod tests {
         assert_eq!(json, to_legacy_backend_json(&off).unwrap());
         for key in [
             "supports_blocked_wait_signal_interruption",
+            "kernel_signal_state_is_guests",
+            "kernel_signal_targets_are_predictable",
+            "host_task_reads_reach_guest_threads",
+            "host_timed_signals_are_physical",
             "delivers_preemption_timer_events",
             "runs_guest_code_between_injections",
             "reports_sigreturns",
@@ -3820,6 +3927,10 @@ mod tests {
         for decoded in [&json, &array] {
             let backend = from_legacy_backend_json(decoded).unwrap().backend;
             assert!(!backend.supports_blocked_wait_signal_interruption);
+            assert!(!backend.kernel_signal_state_is_guests);
+            assert!(!backend.kernel_signal_targets_are_predictable);
+            assert!(!backend.host_task_reads_reach_guest_threads);
+            assert!(!backend.host_timed_signals_are_physical);
             assert!(!backend.delivers_preemption_timer_events);
             assert!(!backend.runs_guest_code_between_injections);
             assert!(!backend.reports_sigreturns);
