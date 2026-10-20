@@ -6,6 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#![allow(
+    unexpected_cfgs,
+    reason = "`fbcode_build` is supplied by the internal Buck build"
+)]
+
 #[path = "common/exec_posix_timers.rs"]
 mod exec_posix_timers;
 
@@ -425,7 +430,21 @@ fn version_names_a_revision_only_when_the_build_was_stamped() {
     let info: detcore_model::build_info::BuildInfo =
         serde_json::from_slice(&json.stdout).expect("version --json is not BuildInfo");
 
-    if option_env!("HERMIT_STAMP_GIT_SHA") == Some("1") {
+    if cfg!(fbcode_build) {
+        let revision = info.git_sha.as_str();
+        assert!(
+            revision == "unknown"
+                || (revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())),
+            "an fbcode build must embed the fbsource revision or none, got {revision:?}"
+        );
+        assert!(
+            text.trim_end().ends_with(&format!(
+                "(fbsource: {}, fbpkg: hermit:{})",
+                revision, info.version
+            )),
+            "--version must name the fbcode build's provenance: {text:?}"
+        );
+    } else if option_env!("HERMIT_STAMP_GIT_SHA") == Some("1") {
         let sha = info.git_sha.strip_suffix("-dirty").unwrap_or(&info.git_sha);
         assert!(
             sha.len() == 12 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
