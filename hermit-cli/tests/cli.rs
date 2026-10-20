@@ -32359,6 +32359,49 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
             "{mode}: the replay must match the recording:\n{log}"
         );
     }
+    // A recording made before continuations took effect under record
+    // (RECORD_VERSION 0x17f) has a different schedule, and is refused by the
+    // version gate rather than replayed out of step (Codex review of
+    // https://github.com/rrnewton/hermit/pull/4510).
+    let data = tempfile::tempdir().unwrap();
+    let directory = data.path().to_str().unwrap();
+    let record_args = [
+        "record",
+        "--data-dir",
+        directory,
+        "--",
+        guest.as_str(),
+        "repeat-join",
+    ];
+    let record = hermit(&record_args);
+    assert_success(&record, &record_args);
+    let metadata_path = {
+        let mut found = None;
+        for entry in fs::read_dir(data.path()).unwrap() {
+            let candidate = entry.unwrap().path().join("metadata.json");
+            if candidate.is_file() {
+                found = Some(candidate);
+            }
+        }
+        found.expect("no recording metadata.json")
+    };
+    let mut metadata: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
+    assert_eq!(metadata["version"], 0x180, "RECORD_VERSION moved");
+    metadata["version"] = serde_json::json!(0x17f);
+    fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+    let replay_args = ["replay", "--autopilot", "--data-dir", directory];
+    let replay = hermit(&replay_args);
+    assert!(
+        !replay.status.success(),
+        "a 0x17f recording was replayed:\n{}",
+        stderr(&replay)
+    );
+    assert!(
+        stderr(&replay).contains("Version mismatch"),
+        "a 0x17f recording was not refused by the version gate:\n{}",
+        stderr(&replay)
+    );
 }
 
 /// The 4505 guests recorded and then replayed under gdb
