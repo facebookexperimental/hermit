@@ -25025,6 +25025,14 @@ struct RunSummary {
     /// receipt unciteable). `None` on a path that stopped before cleanup; `main`
     /// then measures live rather than printing nothing.
     cpu_wall: Option<(f64, f64, f64)>,
+    /// The run's local CPU from the cgroups that held its work, read at the same
+    /// point as `cpu_wall`. `None` when this process is not in a run cgroup; the
+    /// CPU line then says `cpu_wall` is getrusage only.
+    whole_cpu: Option<validate_runtime::WholeRunCpu>,
+    /// Who ran the E2E cells (`cargo`, `buck-local`, `buck-hybrid`), and the
+    /// release builder when it is not Cargo. `None` on a path that stopped before
+    /// a plan, which prints the bare wall+CPU line.
+    mode: Option<String>,
     /// Bookkeeping performed after the validation verdict was finalized.
     /// Failure remains a loud command error but cannot rewrite that verdict.
     scorecard_writeback: Option<ScorecardWriteback>,
@@ -25063,6 +25071,8 @@ impl RunSummary {
             log: None,
             ledger: None,
             cpu_wall: None,
+            whole_cpu: None,
+            mode: None,
             scorecard_writeback: None,
             memory_caps: None,
         }
@@ -25806,9 +25816,12 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
     }
     // ALWAYS printed, on success, failure, refusal, timeout and interruption
     // alike (validate.sh:1751). Wall alone cannot tell a busy run from a wedged
-    // one; CPU (user+sys, this process plus every child it reaped) against wall
-    // can, and that ratio is how the 53-minute pre-gate wedge was identified on
-    // 2026-08-07 — the wall clock said "still going", the ratio said "waiting".
+    // one; CPU against wall can, and that ratio is how the 53-minute pre-gate
+    // wedge was identified on 2026-08-07 — the wall clock said "still going",
+    // the ratio said "waiting". A run that reached its graph prints its mode and
+    // the CPU of the cgroups that held its work (`run_cpu_line`); getrusage
+    // (this process plus every child it reaped) misses the pinned-root
+    // containers and the Buck daemon, two thirds of the CPU at c4de94bb.
     let (wall, user, sys) = s.cpu_wall.unwrap_or_else(|| {
         let (u, sy) = validate_runtime::process_cpu_seconds();
         (started.elapsed().as_secs_f64(), u, sy)
@@ -25816,10 +25829,18 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
     let host_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    lines.push(format!(
-        "   {}",
-        validate_runtime::cpu_wall_line(human_duration, wall, user, sys, host_cpus)
-    ));
+    let cpu_line = match &s.mode {
+        Some(mode) => validate_runtime::run_cpu_line(
+            human_duration,
+            mode,
+            wall,
+            (user, sys),
+            s.whole_cpu.as_ref(),
+            host_cpus,
+        ),
+        None => validate_runtime::cpu_wall_line(human_duration, wall, user, sys, host_cpus),
+    };
+    lines.push(format!("   {cpu_line}"));
     lines.extend(s.epilogue.iter().cloned());
     if let Some(status) = final_validate_status(s.verdict) {
         // LAST by contract. A wrapper, guest, fixture or quoted diagnostic may
@@ -28114,6 +28135,14 @@ fn run(
             std::time::Duration::from_secs(2),
         ))
     };
+    // A Buck runner's cells run in the buck2 daemon's own systemd scope, outside
+    // this run's cgroup, and the scope is gone once e2e.buck_cells kills the
+    // daemon: sample it while it lives, for the summary's CPU line.
+    let buck_cpu = if args.e2e_runner == E2E_RUNNER_CARGO {
+        None
+    } else {
+        validate_runtime::BuckDaemonCpuMonitor::start(&root, std::time::Duration::from_secs(2))
+    };
     if nesting.nested {
         match nesting.outer_pid {
             Some(outer) => println!(
@@ -28376,6 +28405,17 @@ fn run(
     // Whole-run CPU, taken once in THIS process (a worker thread would see only
     // its own accounting, exactly as a bash subshell's `times` would).
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
+    let whole_cpu = validate_runtime::own_run_cgroup()
+        .and_then(|cgroup| validate_runtime::cgroup_cpu(&cgroup))
+        .map(|in_box| validate_runtime::WholeRunCpu {
+            in_box,
+            buck_daemon: buck_cpu.as_ref().map(|daemon| daemon.finish()),
+        });
+    let mode = if release_builder == RELEASE_BUILDER_CARGO {
+        args.e2e_runner.to_string()
+    } else {
+        format!("{} (release builder {release_builder})", args.e2e_runner)
+    };
     let run_counts = derive_run_counts(&outcomes, &attempts, plan.compat, plan.compat_prefix);
     let executed_tests = run_counts.executed_tests;
     let passed_tests = run_counts.passed_tests;
@@ -28647,6 +28687,8 @@ fn run(
         s.jobs = Some(jobs);
         s.log = Some(log_path);
         s.cpu_wall = Some((wall, cpu_user, cpu_sys));
+        s.whole_cpu = whole_cpu;
+        s.mode = Some(mode.clone());
         if !nesting.nested && !args.allow_local_off_the_record_run {
             s.ledger = Some(ledger);
         }
@@ -29248,6 +29290,8 @@ fn run(
     s.jobs = Some(jobs);
     s.log = Some(log_path);
     s.cpu_wall = Some((wall, cpu_user, cpu_sys));
+    s.whole_cpu = whole_cpu;
+    s.mode = Some(mode);
     if !nesting.nested && !args.allow_local_off_the_record_run {
         s.ledger = Some(ledger);
     }
@@ -31801,6 +31845,48 @@ mod memory_cap_near_miss_tests {
         summary.cpu_wall = Some((57.0, 30.0, 5.0));
         summary.memory_caps = memory_caps;
         summary
+    }
+
+    #[test]
+    fn whole_run_cpu_account_reads_cgroups_and_the_buck_daemon_scope() {
+        validate_runtime::whole_run_cpu_self_test().unwrap();
+    }
+
+    #[test]
+    fn a_run_with_a_plan_prints_its_mode_and_cgroup_cpu() {
+        let started = std::time::Instant::now();
+        let mut summary = green_summary(None);
+        let bare = run_summary_lines(&summary, started).join("\n");
+        assert!(bare.contains("| CPU/wall ") && !bare.contains("mode "), "{bare}");
+        summary.mode = Some("buck-hybrid".into());
+        summary.whole_cpu = Some(validate_runtime::WholeRunCpu {
+            in_box: validate_runtime::CgroupCpu {
+                user: 80.0,
+                sys: 20.0,
+            },
+            buck_daemon: Some((
+                validate_runtime::CgroupCpu {
+                    user: 9.0,
+                    sys: 5.0,
+                },
+                1,
+            )),
+        });
+        let rendered = run_summary_lines(&summary, started).join("\n");
+        let line = rendered
+            .lines()
+            .find(|line| line.trim_start().starts_with("mode buck-hybrid | wall "))
+            .unwrap_or_else(|| panic!("no mode line in {rendered}"));
+        // The cgroups' 114 s lead; the getrusage 35 s the ledger carries is last.
+        assert!(
+            line.contains(&format!("| CPU {} (user", human_duration(114.0))),
+            "{line}"
+        );
+        assert!(line.contains("CPU/wall 2.0x"), "{line}");
+        assert!(
+            line.ends_with(&format!("validate-reaped only {}", human_duration(35.0))),
+            "{line}"
+        );
     }
 
     #[test]

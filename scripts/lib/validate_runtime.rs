@@ -362,6 +362,253 @@ pub fn cpu_wall_line(
     )
 }
 
+// ------------------------------------------------------------------ whole-run CPU
+
+/// User and system CPU seconds from a cgroup v2 `cpu.stat`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CgroupCpu {
+    pub user: f64,
+    pub sys: f64,
+}
+
+impl CgroupCpu {
+    pub fn total(self) -> f64 {
+        self.user + self.sys
+    }
+
+    fn plus(self, other: CgroupCpu) -> CgroupCpu {
+        CgroupCpu {
+            user: self.user + other.user,
+            sys: self.sys + other.sys,
+        }
+    }
+
+    fn since(self, base: CgroupCpu) -> CgroupCpu {
+        CgroupCpu {
+            user: (self.user - base.user).max(0.0),
+            sys: (self.sys - base.sys).max(0.0),
+        }
+    }
+}
+
+/// `user_usec` and `system_usec` of a `cpu.stat`, in seconds.
+pub fn parse_cpu_stat(text: &str) -> Option<CgroupCpu> {
+    let field = |name: &str| {
+        text.lines().find_map(|line| {
+            let (key, value) = line.split_once(' ')?;
+            (key == name)
+                .then(|| value.trim().parse::<u64>().ok())
+                .flatten()
+        })
+    };
+    Some(CgroupCpu {
+        user: field("user_usec")? as f64 / 1e6,
+        sys: field("system_usec")? as f64 / 1e6,
+    })
+}
+
+pub fn cgroup_cpu(dir: &Path) -> Option<CgroupCpu> {
+    parse_cpu_stat(&std::fs::read_to_string(dir.join("cpu.stat")).ok()?)
+}
+
+/// The cgroup holding this run's whole DAG, when this process is dagrun's
+/// `supervisor` leaf: that leaf's parent, the run's scope (or delegated root).
+/// Every node is a child of it, and so is every process a node starts that does
+/// not move itself out, including the pinned-root containers (`podman run
+/// --cgroups=disabled`), which `getrusage` never sees because conmon detaches
+/// from the node and is reaped by validate-lock's subreaper instead.
+pub fn own_run_cgroup() -> Option<PathBuf> {
+    run_cgroup_from(&std::fs::read_to_string("/proc/self/cgroup").ok()?)
+}
+
+fn run_cgroup_from(proc_self_cgroup: &str) -> Option<PathBuf> {
+    let relative = proc_self_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let leaf = Path::new("/sys/fs/cgroup").join(relative.trim().trim_start_matches('/'));
+    if leaf.file_name()? != "supervisor" {
+        return None;
+    }
+    leaf.parent().map(Path::to_path_buf)
+}
+
+/// The systemd user manager's cgroup (`.../user@UID.service`) above `cgroup`.
+fn user_manager_cgroup(cgroup: &Path) -> Option<PathBuf> {
+    let mut path = PathBuf::new();
+    for component in cgroup.components() {
+        path.push(component);
+        let name = component.as_os_str().to_string_lossy();
+        if name.starts_with("user@") && name.ends_with(".service") {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// The name prefix of the buck2 daemon scope for the Buck project at `checkout`.
+/// The host's buck2 runs with `buck2_resource_control` on (`~/.buckconfig.d`), so
+/// its daemon, and every local action it runs, live in a systemd scope of their
+/// own, `buck2.slice/buck2_daemon.<project>.<isolation>.<id>.scope`, named for
+/// the project root with `-` as `_`: outside the node that started it and outside
+/// the run's scope.
+pub fn buck_daemon_scope_prefix(checkout: &Path) -> Option<String> {
+    let name = checkout.file_name()?.to_str()?;
+    Some(format!("buck2_daemon.{}.", name.replace('-', "_")))
+}
+
+/// Per scope: (its CPU when first seen, if it was there at the first sweep; its
+/// latest CPU).
+type ScopeSamples = BTreeMap<String, (CgroupCpu, CgroupCpu)>;
+
+fn sample_buck_daemon_scopes(
+    parents: &[PathBuf],
+    prefix: &str,
+    first_sweep: bool,
+    scopes: &mut ScopeSamples,
+) {
+    for parent in parents {
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            let Some(cpu) = cgroup_cpu(&entry.path()) else {
+                continue;
+            };
+            let base = if first_sweep {
+                cpu
+            } else {
+                CgroupCpu::default()
+            };
+            scopes.entry(name).or_insert((base, cpu)).1 = cpu;
+        }
+    }
+}
+
+fn buck_daemon_total(scopes: &ScopeSamples) -> (CgroupCpu, usize) {
+    let total = scopes
+        .values()
+        .fold(CgroupCpu::default(), |sum, (base, last)| {
+            sum.plus(last.since(*base))
+        });
+    (total, scopes.len())
+}
+
+/// Samples the CPU of this checkout's buck2 daemon scope(s) for the whole run.
+/// A scope is gone once `ci/buck-e2e/validate-node` kills its daemon, so it is
+/// read while it lives; a daemon's last `period` before its kill is lost, and it
+/// is idle then.
+pub struct BuckDaemonCpuMonitor {
+    scopes: Arc<std::sync::Mutex<ScopeSamples>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BuckDaemonCpuMonitor {
+    /// `None` when this process is not in a dagrun run cgroup below a systemd
+    /// user manager, where the daemon scopes cannot be found.
+    pub fn start(checkout: &Path, period: Duration) -> Option<BuckDaemonCpuMonitor> {
+        let prefix = buck_daemon_scope_prefix(checkout)?;
+        let manager = user_manager_cgroup(&own_run_cgroup()?)?;
+        let parents = vec![manager.join("buck2.slice"), manager];
+        let monitor = BuckDaemonCpuMonitor {
+            scopes: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let (scopes, stop) = (monitor.scopes.clone(), monitor.stop.clone());
+        std::thread::spawn(move || {
+            let mut first_sweep = true;
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(mut scopes) = scopes.lock() {
+                    sample_buck_daemon_scopes(&parents, &prefix, first_sweep, &mut scopes);
+                }
+                first_sweep = false;
+                std::thread::sleep(period);
+            }
+        });
+        Some(monitor)
+    }
+
+    /// Stop sampling; the CPU the scopes used during the run and how many there were.
+    pub fn finish(&self) -> (CgroupCpu, usize) {
+        self.stop.store(true, Ordering::Relaxed);
+        match self.scopes.lock() {
+            Ok(scopes) => buck_daemon_total(&scopes),
+            Err(_) => (CgroupCpu::default(), 0),
+        }
+    }
+}
+
+/// The run's local CPU from the cgroups that held its work.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WholeRunCpu {
+    /// The run's scope: validate itself, every node, the pinned-root containers.
+    pub in_box: CgroupCpu,
+    /// `Some` when the E2E cells ran under Buck: its daemon scope(s) and their count.
+    pub buck_daemon: Option<(CgroupCpu, usize)>,
+}
+
+impl WholeRunCpu {
+    pub fn total(&self) -> CgroupCpu {
+        self.buck_daemon
+            .map_or(self.in_box, |(daemon, _)| self.in_box.plus(daemon))
+    }
+}
+
+/// The summary's CPU line: the mode, and the run's local CPU from its cgroups
+/// when they could be read. `waited` is `getrusage` (self + reaped children),
+/// what the ledger's `cpu_user_s`/`cpu_sys_s` carry; at c4de94bb it was 2h04m of
+/// 6h33m, missing the containers (3h13m) and the Buck daemon (1h14m), so it is
+/// printed last and named for what it counts.
+pub fn run_cpu_line(
+    human: fn(f64) -> String,
+    mode: &str,
+    wall: f64,
+    waited: (f64, f64),
+    whole: Option<&WholeRunCpu>,
+    host_cpus: usize,
+) -> String {
+    let Some(whole) = whole else {
+        return format!(
+            "mode {mode} | {} | getrusage only (no run cgroup to read): misses containers \
+             and daemons validate never reaped",
+            cpu_wall_line(human, wall, waited.0, waited.1, host_cpus)
+        );
+    };
+    let total = whole.total();
+    let parts = match whole.buck_daemon {
+        None => format!("in box {}", human(whole.in_box.total())),
+        Some((_, 0)) => format!(
+            "in box {} + Buck daemon NOT FOUND (its CPU is missing)",
+            human(whole.in_box.total())
+        ),
+        Some((daemon, _)) => format!(
+            "in box {} + Buck daemon {}",
+            human(whole.in_box.total()),
+            human(daemon.total())
+        ),
+    };
+    let ratio = if wall > 0.0 {
+        format!("{:.1}", total.total() / wall)
+    } else {
+        "n/a".to_string()
+    };
+    let hint = cpu_wall_hint(total.total(), wall, host_cpus)
+        .map(|h| format!("  ({h})"))
+        .unwrap_or_default();
+    format!(
+        "mode {mode} | wall {} | CPU {} (user {}, sys {}) = {parts} | CPU/wall {ratio}x across \
+         {host_cpus} cores | validate-reaped only {}{hint}",
+        human(wall),
+        human(total.total()),
+        human(total.user),
+        human(total.sys),
+        human(waited.0 + waited.1),
+    )
+}
+
 // ------------------------------------------------------------------ nesting
 
 /// Environment marker naming the live top-level validate, inherited by every
@@ -1270,6 +1517,165 @@ pub fn enter_cleanup_critical_section() {
 
 // ------------------------------------------------------------------ self-test
 
+/// The whole-run CPU account against the shapes measured at c4de94bb (validate
+/// claude-coord-c4de94bb16b3-...-54695dd8): getrusage 7,465 s, the 100 nodes'
+/// cgroups 18,900 s, validate-lock's COST ACTUAL 23,559 s.
+pub fn whole_run_cpu_self_test() -> Result<(), String> {
+    let stat = "usage_usec 30146781\nuser_usec 20000000\nsystem_usec 10146781\nnr_periods 0\n";
+    if parse_cpu_stat(stat)
+        != Some(CgroupCpu {
+            user: 20.0,
+            sys: 10.146781,
+        })
+    {
+        return Err(format!("cpu.stat: user/system not read from {stat:?}"));
+    }
+    if parse_cpu_stat("usage_usec 5\n").is_some() {
+        return Err("cpu.stat: a stat without user_usec/system_usec must read as unknown".into());
+    }
+    let boxed =
+        "0::/user.slice/user-1.slice/user@1.service/dagrun.slice/dagrun-7.scope/supervisor\n";
+    let run = run_cgroup_from(boxed);
+    if run.as_deref()
+        != Some(Path::new(
+            "/sys/fs/cgroup/user.slice/user-1.slice/user@1.service/dagrun.slice/dagrun-7.scope",
+        ))
+    {
+        return Err(format!(
+            "run cgroup: the supervisor leaf's parent, got {run:?}"
+        ));
+    }
+    if run_cgroup_from("0::/user.slice/user-1.slice/session-3.scope\n").is_some() {
+        return Err(
+            "run cgroup: a process outside dagrun's supervisor leaf has no run cgroup".into(),
+        );
+    }
+    if user_manager_cgroup(run.as_deref().unwrap_or(Path::new("/")))
+        != Some(PathBuf::from(
+            "/sys/fs/cgroup/user.slice/user-1.slice/user@1.service",
+        ))
+    {
+        return Err("run cgroup: the user manager above the run cgroup was not found".into());
+    }
+    let prefix =
+        buck_daemon_scope_prefix(Path::new("/w/validate-fresh-c4de94bb16b3-1064238-c98b8b6a"));
+    if prefix.as_deref() != Some("buck2_daemon.validate_fresh_c4de94bb16b3_1064238_c98b8b6a.") {
+        return Err(format!("buck daemon scope prefix: got {prefix:?}"));
+    }
+
+    // A scope there at the first sweep counts from that sweep; one that appears
+    // later counts from zero; another checkout's daemon is not counted.
+    let dir =
+        std::env::temp_dir().join(format!("validate-buck-cpu-selftest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let scope = |name: &str, user: u64, sys: u64| -> Result<(), String> {
+        let path = dir.join(name);
+        std::fs::create_dir_all(&path).map_err(|e| format!("buck daemon self-test: {e}"))?;
+        std::fs::write(
+            path.join("cpu.stat"),
+            format!(
+                "usage_usec {}\nuser_usec {user}\nsystem_usec {sys}\n",
+                user + sys
+            ),
+        )
+        .map_err(|e| format!("buck daemon self-test: {e}"))
+    };
+    let prefix = "buck2_daemon.validate_fresh_x.";
+    let mut scopes = ScopeSamples::new();
+    scope(
+        "buck2_daemon.validate_fresh_x.v2.a.scope",
+        5_000_000,
+        1_000_000,
+    )?;
+    scope("buck2_daemon.fbsource.v2.b.scope", 900_000_000, 0)?;
+    sample_buck_daemon_scopes(std::slice::from_ref(&dir), prefix, true, &mut scopes);
+    scope(
+        "buck2_daemon.validate_fresh_x.v2.a.scope",
+        65_000_000,
+        11_000_000,
+    )?;
+    scope(
+        "buck2_daemon.validate_fresh_x.v2.c.scope",
+        3_000_000,
+        2_000_000,
+    )?;
+    sample_buck_daemon_scopes(std::slice::from_ref(&dir), prefix, false, &mut scopes);
+    // The daemon is killed and its scope removed: the last sample stands.
+    let _ = std::fs::remove_dir_all(dir.join("buck2_daemon.validate_fresh_x.v2.c.scope"));
+    sample_buck_daemon_scopes(std::slice::from_ref(&dir), prefix, false, &mut scopes);
+    let _ = std::fs::remove_dir_all(&dir);
+    let (daemon, count) = buck_daemon_total(&scopes);
+    if count != 2
+        || daemon
+            != (CgroupCpu {
+                user: 63.0,
+                sys: 12.0,
+            })
+    {
+        return Err(format!(
+            "buck daemon total: want 63 s user + 12 s sys over 2 scopes, got {daemon:?} over {count}"
+        ));
+    }
+
+    let secs = |s: f64| format!("{}s", s.round() as i64);
+    let whole = WholeRunCpu {
+        in_box: CgroupCpu {
+            user: 12_000.0,
+            sys: 7_000.0,
+        },
+        buck_daemon: Some((
+            CgroupCpu {
+                user: 2_500.0,
+                sys: 1_900.0,
+            },
+            1,
+        )),
+    };
+    let line = run_cpu_line(
+        secs,
+        "buck-hybrid",
+        525.0,
+        (6_200.0, 1_265.0),
+        Some(&whole),
+        284,
+    );
+    let want = "mode buck-hybrid | wall 525s | CPU 23400s (user 14500s, sys 8900s) = in box 19000s + \
+                Buck daemon 4400s | CPU/wall 44.6x across 284 cores | validate-reaped only 7465s";
+    if line != want {
+        return Err(format!("run cpu line:\n want {want:?}\n  got {line:?}"));
+    }
+    let missing = WholeRunCpu {
+        buck_daemon: Some((CgroupCpu::default(), 0)),
+        ..whole
+    };
+    if !run_cpu_line(secs, "buck-local", 525.0, (1.0, 1.0), Some(&missing), 284)
+        .contains("= in box 19000s + Buck daemon NOT FOUND (its CPU is missing) |")
+    {
+        return Err(
+            "run cpu line: a Buck run whose daemon was never seen must say its CPU is missing"
+                .into(),
+        );
+    }
+    let cargo = WholeRunCpu {
+        buck_daemon: None,
+        ..whole
+    };
+    if !run_cpu_line(secs, "cargo", 525.0, (1.0, 1.0), Some(&cargo), 284)
+        .contains("CPU 19000s (user 12000s, sys 7000s) = in box 19000s |")
+    {
+        return Err("run cpu line: a Cargo run counts its box alone".into());
+    }
+    let unboxed = run_cpu_line(secs, "cargo", 600.0, (30.0, 10.0), None, 316);
+    if !unboxed.starts_with("mode cargo | wall 600s | CPU 40s")
+        || !unboxed.contains("getrusage only")
+    {
+        return Err(format!(
+            "run cpu line: an unboxed run must say it is getrusage only, got {unboxed:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Inert two-sided brackets for everything in this module.
 ///
 /// Nothing here runs a gate, publishes a label, writes the real ledger, or claims
@@ -1648,6 +2054,7 @@ pub fn self_test() -> Result<String, String> {
             "cpu/wall: line must carry ratio AND hint, got {line:?}"
         ));
     }
+    whole_run_cpu_self_test()?;
 
     // ---- process CPU accounting must be live, not a stub ----
     let (u, s) = process_cpu_seconds();
