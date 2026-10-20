@@ -36,21 +36,33 @@ const CONTROLLER_TARGET: &str = "hermit::controller";
 
 /// Hermit provides a sandbox for deterministic and reproducible execution.
 /// Arbitrary programs run inside (guests) become deterministic
-/// functions of their inputs. Configuration flags control the initial
-/// environment.
+/// functions of their controlled inputs. Configuration flags control the
+/// initial environment.
 ///
 /// See the "run" and "record" subcommands to run programs within hermit.
 /// In both modes, the host file system is visible
 /// to the command run inside hermit, and the results will depend on the contents
 /// (but not timestamps or inode numbers) of those inputs.
 ///
-/// In run mode, networking is disallowed.  Run mode guarantees that if you
-/// run twice with the same input files, you will receive bitwise identical
-/// outputs from the computation.
+/// In run mode, the guest's clock is virtual and starts at the epoch given by
+/// `--epoch` or `HERMIT_EPOCH`. If neither is given, `hermit run` starts it at
+/// the host's current time, so time values differ from one invocation to the
+/// next. Pass a fixed epoch (for example `--epoch=2026-01-01T00:00:00Z`) when
+/// two runs must produce identical time values.
 ///
-/// In record mode, inputs (both files and network traffic) are captured
-/// in a content addressible store (CAS).  In this preview version of
-/// hermit, the CAS is stored locally in your home directory (~/.hermit).
+/// In run and record mode, by default (`--network=local`), the guest gets its
+/// own network namespace with only a loopback interface. `--network=host`
+/// exposes the host network, which gives up isolation and reproducibility. A
+/// recording stores its choice, and `hermit replay --autopilot` replays in the
+/// same network; `hermit record start --verify-with-gdbex` defaults to, and
+/// requires, `--network=host`. The DBT backend does not apply `--network` yet:
+/// its guest sees the host network
+/// (https://github.com/rrnewton/hermit/issues/3543).
+///
+/// In record mode, the guest's system call results are saved so that
+/// `hermit replay` can reproduce the execution. Recordings are stored in
+/// `$XDG_CACHE_HOME/hermit`, which is `~/.cache/hermit` when XDG_CACHE_HOME is
+/// unset; `--data-dir` or `HERMIT_DATA_DIR` selects another directory.
 ///
 /// Below are options common to all subcommands.
 #[derive(Debug, Parser, Clone)]

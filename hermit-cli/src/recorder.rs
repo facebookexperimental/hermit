@@ -400,6 +400,8 @@ impl Tool for Recorder {
             Sysno::pwritev,
             Sysno::pwritev2,
             Sysno::access,
+            Sysno::faccessat,
+            Sysno::faccessat2,
             Sysno::lseek,
             Sysno::stat,
             Sysno::fstat,
@@ -425,11 +427,41 @@ impl Tool for Recorder {
             Sysno::symlinkat,
             Sysno::fchmodat,
             Sysno::utimensat,
+            Sysno::rename,
+            Sysno::link,
+            Sysno::symlink,
+            Sysno::chmod,
+            Sysno::chown,
+            Sysno::lchown,
+            Sysno::mknod,
+            Sysno::rmdir,
+            Sysno::chdir,
             Sysno::fchdir,
+            Sysno::getcwd,
             Sysno::close_range,
             Sysno::fadvise64,
             Sysno::flock,
             Sysno::ftruncate,
+            // Descriptor syncs, metadata changes and xattr calls: replay
+            // returns the recorded results, because a replayed descriptor may
+            // be a placeholder, and reapplies changes inside the replay root.
+            Sysno::fsync,
+            Sysno::fdatasync,
+            Sysno::syncfs,
+            Sysno::fchmod,
+            Sysno::fchown,
+            Sysno::fsetxattr,
+            Sysno::fremovexattr,
+            Sysno::setxattr,
+            Sysno::lsetxattr,
+            Sysno::removexattr,
+            Sysno::lremovexattr,
+            Sysno::getxattr,
+            Sysno::lgetxattr,
+            Sysno::fgetxattr,
+            Sysno::listxattr,
+            Sysno::llistxattr,
+            Sysno::flistxattr,
             Sysno::dup,
             Sysno::dup2,
             Sysno::dup3,
@@ -448,6 +480,8 @@ impl Tool for Recorder {
             Sysno::sendmsg,
             Sysno::poll,
             Sysno::ppoll,
+            Sysno::select,
+            Sysno::pselect6,
             Sysno::epoll_wait,
             Sysno::getsockopt,
             Sysno::getpeername,
@@ -521,7 +555,12 @@ impl Tool for Recorder {
             Syscall::Writev(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Pwritev(syscall) => self.handle_write_family(guest, syscall.into()).await,
             Syscall::Pwritev2(syscall) => self.handle_write_family(guest, syscall.into()).await,
-            Syscall::Access(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3598): faccessat/faccessat2 are pure queries;
+            // recording their result keeps replay off the replay chroot's files.
+            Syscall::Access(_) | Syscall::Faccessat(_) | Syscall::Other(Sysno::faccessat2, _) => {
+                self.handle_simple(guest, syscall).await
+            }
             Syscall::Lseek(_) => self.handle_simple(guest, syscall).await,
             Syscall::Stat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Fstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
@@ -539,6 +578,8 @@ impl Tool for Recorder {
             Syscall::Getdents(syscall) => self.handle_getdents(guest, syscall).await,
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Madvise(syscall) => self.handle_madvise(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
             Syscall::Open(_) | Syscall::Openat(_) => self.handle_open(guest, syscall).await,
             Syscall::Close(_) => self.handle_fd_table_mutation(guest, syscall).await,
@@ -553,8 +594,51 @@ impl Tool for Recorder {
             | Syscall::Symlinkat(_)
             | Syscall::Fchmodat(_)
             | Syscall::Utimensat(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Fchdir(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3598): legacy path mutations share the *at
+            // forms' result-only recording.
+            Syscall::Rename(_)
+            | Syscall::Link(_)
+            | Syscall::Symlink(_)
+            | Syscall::Chmod(_)
+            | Syscall::Chown(_)
+            | Syscall::Lchown(_)
+            | Syscall::Mknod(_)
+            | Syscall::Rmdir(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3598)
+            Syscall::Chdir(_) | Syscall::Fchdir(_) => {
+                self.handle_working_directory_change(guest, syscall).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Getcwd(syscall) => self.handle_getcwd(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3601): descriptor syncs and metadata changes
+            // record only their result. Replay returns it for a placeholder
+            // descriptor and reapplies a change to a file in the replay root.
+            Syscall::Fsync(_)
+            | Syscall::Fdatasync(_)
+            | Syscall::Syncfs(_)
+            | Syscall::Fchmod(_)
+            | Syscall::Fchown(_)
+            | Syscall::Fsetxattr(_)
+            | Syscall::Fremovexattr(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3601): path xattr changes share the other
+            // path mutations' result-only recording.
+            Syscall::Setxattr(_)
+            | Syscall::Lsetxattr(_)
+            | Syscall::Removexattr(_)
+            | Syscall::Lremovexattr(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3601)
+            Syscall::Getxattr(_)
+            | Syscall::Lgetxattr(_)
+            | Syscall::Fgetxattr(_)
+            | Syscall::Listxattr(_)
+            | Syscall::Llistxattr(_)
+            | Syscall::Flistxattr(_) => self.handle_xattr_query(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
             Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall).await,
             Syscall::Dup(_) => self.handle_simple(guest, syscall).await,
@@ -583,6 +667,8 @@ impl Tool for Recorder {
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
             Syscall::Ppoll(syscall) => self.handle_ppoll(guest, syscall).await,
+            Syscall::Select(syscall) => self.handle_select(guest, syscall).await,
+            Syscall::Pselect6(syscall) => self.handle_pselect6(guest, syscall).await,
             Syscall::EpollWait(syscall) => self.handle_epoll_wait(guest, syscall).await,
             Syscall::Getsockopt(syscall) => self.handle_sockopt_family(guest, syscall.into()).await,
             Syscall::Getpeername(syscall) => {

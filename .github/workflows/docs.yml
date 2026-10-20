@@ -125,6 +125,44 @@ jobs:
         channel=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("_website_source/hermit/rust-toolchain.toml").read_text())["toolchain"]["channel"])')
         rustup toolchain install "$channel" --profile minimal
         RUSTUP_TOOLCHAIN="$channel" cargo install rust-script --version 0.36.0 --locked
+    - name: Add swap for the compatibility rebuild
+      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      timeout-minutes: 5
+      # The rebuild's projection child peaked at 13.85 GB on 2026-10-03 (9.77 GB
+      # on 2026-10-01), and the step's cgroup reached ~16.2 GB of the runner's
+      # 16.77 GB. The next two runs ran out of memory in stage1.projection
+      # (https://github.com/rrnewton/dev-hermit/issues/515). This swap is the
+      # stopgap until the projection streams its input; remove it then.
+      run: |
+        set -euo pipefail
+        swapfile=/mnt/compatibility-rebuild.swap
+        free -g
+        df -h /mnt "$RUNNER_TEMP"
+        # The swapfile is never removed. On the current hosted image /mnt and
+        # $RUNNER_TEMP share /dev/root (145 GB, 82 GB free on 2026-10-03), so
+        # require room for the swapfile plus 40 GiB left for the rebuild's
+        # scratch and target directories under $RUNNER_TEMP.
+        required_kib=$(( 16 * 1024 * 1024 ))
+        if [[ $(stat -c %d /mnt) == $(stat -c %d "$RUNNER_TEMP") ]]; then
+          required_kib=$(( required_kib + 40 * 1024 * 1024 ))
+        fi
+        available_kib=$(df --output=avail -k /mnt | tail -n 1 | tr -d ' ')
+        if [[ ! "$available_kib" =~ ^[0-9]+$ ]] || (( available_kib < required_kib )); then
+          echo "::error::/mnt has ${available_kib} KiB available; the swapfile needs ${required_kib} KiB there"
+          exit 1
+        fi
+        sudo fallocate -l 16G "$swapfile"
+        sudo chmod 600 "$swapfile"
+        sudo mkswap "$swapfile"
+        sudo swapon "$swapfile"
+        size=$(swapon --show=NAME,SIZE --bytes --noheadings | awk -v f="$swapfile" '$1 == f { print $2 }')
+        if [[ ! "$size" =~ ^[0-9]+$ ]] || (( size < 16 * 1024 * 1024 * 1024 - 4096 )); then
+          echo "::error::swapfile $swapfile is not active at 16 GiB (swapon reports '${size}')"
+          swapon --show
+          exit 1
+        fi
+        swapon --show
+        free -g
     - name: Rebuild from the current published cell ledger
       id: website-rebuild
       if: github.event_name == 'schedule' || inputs.rebuild_compatibility
@@ -160,6 +198,20 @@ jobs:
           jq -r '"Cell ledger: `" + .ledger_commit + "`", "Built identity: `" + .identity + "`", "Canonical validation history: `" + .validation_history_commit + "`"' "$RUNNER_TEMP/compatibility-rebuild.json"
           echo 'No Hermit tests ran. Measurement timestamps and unavailable evidence remain unchanged. Pages byte verification follows deployment.'
         } >> "$GITHUB_STEP_SUMMARY"
+    - name: Record swap use by the compatibility rebuild
+      if: always() && (github.event_name == 'schedule' || inputs.rebuild_compatibility)
+      # The rebuild's resource receipt does not count swapped-out pages, so its
+      # memory peaks stop near physical RAM once swap is on. Log the swap the
+      # rebuild actually used (https://github.com/rrnewton/dev-hermit/issues/515).
+      run: |
+        set -uo pipefail
+        swapon --show --bytes || true
+        grep -E '^Swap(Total|Free):' /proc/meminfo || true
+        cgroup=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)
+        for name in memory.peak memory.swap.peak memory.swap.current; do
+          printf '%s %s %s\n' "$cgroup" "$name" "$(cat "$cgroup/$name" 2>/dev/null || echo unavailable)"
+        done
+        free -g
     - name: Build documentation
       id: rustdoc
       # A documentation lint must not throw away a finished website rebuild.

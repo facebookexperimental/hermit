@@ -1,9 +1,15 @@
 schema: 3
 bucket: compat
 # The portable strict compatibility corpus: real programs installed on the
-# validation host, each run under Hermit's verify. The four heavy rows the
-# scheduled super suite runs (rustc, javac, java, node) are not here yet; they
-# are still generated from ci/compat/corpus-strict.json. Lane settings are stated
+# validation host, each run under Hermit's verify. The rows labelled
+# sabre-compat-only, and every row's SaBRe cell (`focused`), belong to the SaBRe
+# run type alone; the full validation runs the ptrace cells of the other rows.
+# The `variants` entries repeat the strict corpus's rows as strict-<row> tests
+# for the strict run type alone, on ptrace with none of the relaxations below,
+# and the rr lane's rows as rr-<row> tests whose one cell records and replays
+# the program on ptrace, for the rr run type alone.
+# The scheduled super suite still runs its four heavy rows (rustc, javac, java,
+# node) on ptrace from ci/compat/corpus-strict.json. Lane settings are stated
 # once below and every row is expanded into an ordinary test recipe
 # (ci/manifest-plan/src/manifest_corpus.rs). The rows were moved verbatim from
 # ci/compat/corpus-strict.json, which was extracted mechanically from
@@ -58,6 +64,285 @@ corpus:
       top: live process-table reads differ on the GitHub-managed portable runner
       zstd: timed out on the GitHub-managed portable no-PMU runner
       zstd-roundtrip: timed out on the GitHub-managed portable no-PMU runner
+  heavy:
+    timeout_seconds: 600
+    cpu_timeout_seconds: 599
+    slow_reason: >-
+      A full compile-link-run or JVM startup workload gets the 600-second
+      wall budget the scheduled super suite gives each of these rows
+      (validate_plan::compat_nodes_for's wall_override); its CPU budget stays
+      one second below it
+    rows:
+      rustc: compiles and runs a Rust program
+      javac: compiles a Java program
+      java: compiles and runs a Java program
+      node: starts the Node.js runtime
+  # The SaBRe run type (scripts/validate.rs --sabre-compat-only): every row
+  # also runs on SaBRe, except the four the SaBRe corpus never had. Until
+  # 2026-10-01 that corpus was ci/compat/corpus-sabre.json, run as 212
+  # separate sabrecompat.<program> validation nodes; its rows that agreed
+  # with this corpus run these rows' argv here.
+  focused:
+    - label: sabre-compat-only
+      backend: sabre
+      except:
+        lsof: >-
+          Not in the SaBRe corpus this replaced (ci/compat/corpus-sabre.json
+          had no lsof row)
+        netlink-route: >-
+          Not in the SaBRe corpus this replaced (ci/compat/corpus-sabre.json
+          had no netlink-route row)
+        netlink-sock-diag: >-
+          Not in the SaBRe corpus this replaced (ci/compat/corpus-sabre.json
+          had no netlink-sock-diag row)
+        shell-build: >-
+          Not in the SaBRe corpus this replaced (ci/compat/corpus-sabre.json
+          had no shell-build row)
+  # Cells measured red on 2026-10-01 (release Hermit at 03bbb8358, through
+  # this bucket): each stays enabled with ci: false and its failure class's
+  # issue, so the SaBRe run type does not require it.
+  unselected:
+    - backend: sabre
+      result: crash-error
+      evidence: https://github.com/rrnewton/hermit/issues/3486
+      reason: >-
+        The guest starts a second program image, and each image after the
+        first makes 33 raw system calls in ld-linux and libc, which
+        SaBRe's execution-path contract refuses
+        (trusted_shared_object_sites > 0)
+      rows:
+        [
+          addr2line, ar, as, awk, basenc, bc, bzip2, bzip2-roundtrip, "c++filt",
+          cargo, chmod, chown, chrt, cmake, cmp, col, colrm, column, comm, cp,
+          cpio-roundtrip, cpp, crc32, cscope, csplit, curl-localhost, cut, dc,
+          dd, df, diff, diff3, dos2unix, egrep, elfedit, env, envsubst, expand,
+          factor, fallocate, fgrep, file, find, flex, flock, fmt, fold, "g++",
+          gcc, gcov, getconf, git, gprof, grep, gzip, gzip-roundtrip, hexdump,
+          iconv, install, ionice, ip, javac, join, jq, ld, ln, logname, lscpu,
+          lua, m4, mkdir, mkfifo, mktemp, mountpoint, msgfmt, msgunfmt, mv,
+          namei, nice, nl, nm, nohup, objcopy, objdump, od, paste, patch,
+          pathchk, perl, pgrep, pkg-config, pkill, printenv, ptx, ranlib,
+          readelf, rev, rm, rmdir, sar-resource-tables, sed, seq, setfacl,
+          setfattr, shred, shuf, size, sort, split, sqlite3, ss, stdbuf,
+          strings, strip, sync, tac, tar, tar-roundtrip, taskset, tcl, tee,
+          time, timeout, top, touch, tr, truncate, tsort, tty, unexpand, uniq,
+          uuidgen, wget-localhost, xargs, xmllint, xxd, xz, xz-roundtrip, "yes",
+          zip-unzip, zstd, zstd-roundtrip
+        ]
+    - backend: sabre
+      result: crash-error
+      evidence: https://github.com/rrnewton/hermit/issues/3489
+      reason: >-
+        Waiting for a child it just started returns ECHILD under SaBRe
+        (make: "wait: No child processes"; clang: "Error waiting for child
+        process"; rustc: "could not exec the linker `/usr/bin/clang`: No
+        child processes")
+      rows:
+        [
+          clang, make, rustc
+        ]
+    - backend: sabre
+      result: crash-error
+      evidence: https://github.com/rrnewton/hermit/issues/3490
+      reason: >-
+        logger --stderr --no-act exits 1 with no output under SaBRe
+      rows:
+        [
+          logger
+        ]
+    - backend: sabre
+      result: crash-error
+      evidence: https://github.com/rrnewton/hermit/issues/3491
+      reason: >-
+        node prints its output and then dies with SIGSEGV under SaBRe
+      rows:
+        [
+          node
+        ]
+    - backend: sabre
+      result: crash-error
+      evidence: https://github.com/rrnewton/hermit/issues/3492
+      reason: >-
+        The java row's javac step aborts on the in-guest Detcore invariant
+        "end_of_timeslice is None during update_logical_time_rcbs"
+      rows:
+        [
+          java
+        ]
+    - backend: sabre
+      result: determinism-failure
+      evidence: https://github.com/rrnewton/hermit/issues/3494
+      reason: >-
+        Diverges at an inbound-signal scheduler commit under SaBRe in 4 of
+        4 runs; ptrace passes 3 of 3
+      rows:
+        [
+          iostat, mpstat-softirqs
+        ]
+    - backend: ptrace
+      result: crash-error
+      evidence: https://github.com/rrnewton/hermit/issues/2110
+      reason: >-
+        Detcore panics with "signal_guest: thread should be parked in the
+        scheduler" while timeout waits in rt_sigsuspend for its child (1 of
+        1 in the validation of 57883eff8); locally 1 of 40 runs diverged at
+        the same rt_sigsuspend
+      rows:
+        [
+          timeout
+        ]
+    - backend: ptrace
+      result: determinism-failure
+      evidence: https://github.com/rrnewton/hermit/issues/3495
+      reason: >-
+        Diverges at a read whose content differs between runs (syscall
+        134)
+      rows:
+        [
+          java, javac
+        ]
+  # The strict run type (scripts/validate.rs --strict-compat-only): every row
+  # of ci/compat/corpus-strict.json once more on ptrace, under --strict and
+  # Hermit's stripped --verify with none of the corpus's relaxations, so
+  # CPUID virtualization and the preemption timeslice stay on. Until
+  # 2026-10-02 these were 193 separate strictcompat.<program> validation
+  # nodes running the same argv.
+  variants:
+    - label: strict-compat-only
+      id_prefix: strict-
+      description: Real program under strict Hermit with no relaxations
+      timeout_seconds: 60
+      cpu_timeout_seconds: 59
+      slow_reason: >-
+        The strict lane gives every program 60 wall seconds
+        (STRICT_COMPAT_TIMEOUT in validate.sh), heavy rows included: the
+        wall bound its generated strictcompat.<program> validation nodes
+        carried. Their 120 CPU seconds cannot be stated: a cell's CPU
+        budget must stay below its wall bound, so it is 59. Measured on
+        2026-10-02 with the release Hermit built at 03bbb8358: the slowest
+        passing program (rustc) used 4.0 s wall and 3.5 s CPU, and the two
+        red JVM rows at most 19.6 s wall and 19.2 s CPU
+      no_retry_reason: >-
+        Each program ran once per strict validation as its own
+        strictcompat.<program> node, and a failure of that one run failed
+        the validation; a second attempt would let a nondeterministic
+        program pass
+      except:
+        - reason: >-
+            Not in the strict corpus (ci/compat/corpus-strict.json): the
+            SaBRe corpus had these programs and the strict corpus did not
+          rows:
+            [
+              timeout, truncate, fallocate, setfattr, setfacl, mountpoint,
+              diff3, basenc, dos2unix, envsubst, col, colrm, crc32, uuidgen,
+              shred, sync, pathchk, namei, getconf, cscope, flex, msgfmt,
+              msgunfmt
+            ]
+        - reason: >-
+            The SaBRe corpus's single-image argv; the strict corpus runs
+            these programs through the rows of the same name without the
+            suffix
+          rows: [lua-direct, perl-direct, df-direct]
+      # Measured red on 2026-10-02 with the release Hermit built at
+      # 03bbb8358: through this bucket, and 2 of 2 runs each of the retired
+      # strictcompat.<program> command.
+      unselected:
+        - result: determinism-failure
+          evidence: https://github.com/rrnewton/hermit/issues/3495
+          reason: >-
+            Diverges at a read whose content differs between runs (syscall
+            134, after the JVM's .hotspotrc lookup)
+          rows: [java, javac]
+    # The rr run type (scripts/validate.rs --rr-compat-only): every program
+    # the rr lane listed as passing record/replay (its 139
+    # RR_COMPAT_PASSING_LABELS) recorded and replayed once on ptrace by
+    # `hermit record start --verify`. Until 2026-10-02 these were 139
+    # separate rrcompat.<program> validation nodes running the argv of
+    # ci/compat/corpus-rr.json, whose rows are this corpus's rows of the same
+    # labels (the -direct rows for lua, perl and df); that file and the label
+    # list went with them.
+    - label: rr-compat-only
+      id_prefix: rr-
+      description: Real program recorded and replayed by Hermit
+      mode: replay
+      timeout_seconds: 60
+      cpu_timeout_seconds: 59
+      slow_reason: >-
+        The rr lane gave every program 60 wall seconds, the wall bound its
+        generated rrcompat.<program> validation nodes carried. Their 120 CPU
+        seconds cannot be stated: a cell's CPU budget must stay below its
+        wall bound, so it is 59. Measured on 2026-10-02 with the release
+        Hermit built from 97ae0ccef: the 51 programs that pass took 56.7
+        wall seconds together through the retired command
+      except:
+        - reason: >-
+            Not in the rr lane's corpus (ci/compat/corpus-rr.json until
+            2026-10-02), so the rr lane never ran it
+          rows:
+            [
+              xmllint, shell-build, clang, gzip-roundtrip, bzip2-roundtrip,
+              xz-roundtrip, zstd-roundtrip, tar-roundtrip, cpio-roundtrip,
+              wget-localhost, curl-localhost, ip, ss, netlink-route,
+              netlink-sock-diag, lscpu, lsof, time, javac, timeout, truncate,
+              fallocate, setfattr, setfacl, mountpoint, diff3, basenc,
+              dos2unix, envsubst, col, colrm, crc32, uuidgen, shred, sync,
+              pathchk, namei, getconf, cscope, flex, msgfmt, msgunfmt
+            ]
+        - reason: >-
+            The rr corpus ran these programs with the argv of the -direct
+            row of the same name, which this run type runs instead
+          rows: [lua, perl, df]
+        - reason: >-
+            In the rr lane's corpus but not in its measured passing set
+            (RR_COMPAT_PASSING_LABELS), so the rr lane generated no node for
+            it
+          rows:
+            [
+              jq, cargo, curl, cmake, pkg-config, m4, zip-unzip, mktemp,
+              iostat, vmstat-disk, pidstat-disk, findmnt, sysctl-random-uuid,
+              sar-resource-tables, lsirq, mpstat-softirqs, lsmod, numastat,
+              numactl-hardware, ps, vmstat, top, kill, pgrep, pkill, patch,
+              chown, ln, csplit, rustc
+            ]
+        - reason: >-
+            Measured to fail record/replay (RR_COMPAT_KNOWN_FAILURES in
+            validate.sh): replay of thread 13 diverges near event 132, where
+            the header lookup is a readlink in one run and a newfstatat of
+            the precompiled .gch in the other
+          rows: [g++]
+        - reason: >-
+            Measured to fail record/replay (RR_COMPAT_KNOWN_FAILURES in
+            validate.sh): replay of thread 11 diverges near event 3, in the
+            execveat of the rm -rf teardown
+          rows: [ar]
+        - reason: >-
+            Measured to fail record/replay (RR_COMPAT_KNOWN_FAILURES in
+            validate.sh): replay diverges at replayer/mod.rs:776 after a
+            clean record
+          rows: [strip, gprof, gcov]
+      # Measured red on 2026-10-02 with the release Hermit built from
+      # 97ae0ccef: through this bucket, and through the retired
+      # rrcompat.<program> command, where each exits 122 at its first clock
+      # read (81 at gettimeofday, 4 at clock_gettime, 3 at time).
+      unselected:
+        - result: replay-failure
+          evidence: https://github.com/rrnewton/hermit/issues/3519
+          reason: >-
+            Record mode refuses every clock read (gettimeofday,
+            clock_gettime, time) as an unsupported syscall, and the recording
+            stops with exit status 122
+          rows:
+            [
+              addr2line, as, awk, bash, bc, bzip2, cal, c++filt, chmod, chrt,
+              cmp, column, comm, cp, cpp, cut, date, dc, dd, diff, egrep,
+              elfedit, env, expand, factor, fgrep, file, find, flock, fmt,
+              fold, gcc, git, grep, gzip, hexdump, iconv, install, java, join,
+              ld, logger, logname, lua-direct, make, mkdir, mkfifo, mv, nl, nm,
+              node, objcopy, objdump, od, paste, perl-direct, ptx, python3,
+              ranlib, readelf, rev, rm, rmdir, ruby, sed, seq, shuf, size,
+              sort, split, sqlite3, strings, tac, tar, taskset, tcl, tee,
+              touch, tr, tsort, tty, unexpand, uniq, xargs, xxd, xz, "yes", zstd
+            ]
   rows:
     - {label: "echo", argv: ["/bin/echo", "hermit-compat"]}
     - {label: "true", argv: ["/usr/bin/true"]}
@@ -248,3 +533,41 @@ corpus:
     - {label: "mkfifo", argv: ["bash", "-c", "set -euo pipefail; p=$(mktemp -u); mkfifo \"$p\"; stat -c \"%F\" \"$p\"; rm -f \"$p\""]}
     - {label: "cmp", argv: ["bash", "-c", "set -euo pipefail; d=$(mktemp -d); printf \"same\\n\" >\"$d/a\"; printf \"same\\n\" >\"$d/b\"; cmp -s \"$d/a\" \"$d/b\"; printf \"cmp-ok\\n\"; rm -rf \"$d\""]}
     - {label: "free", argv: ["/usr/bin/free", "-m"]}
+    # Rows only the SaBRe run type runs, on ptrace and on SaBRe: the SaBRe
+    # corpus's programs this corpus lacks, and the four heavy rows the super
+    # suite still runs on ptrace from ci/compat/corpus-strict.json.
+    - {label: "rustc", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "rustc"], labels: [sabre-compat-only]}
+    - {label: "javac", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "javac"], labels: [sabre-compat-only]}
+    - {label: "java", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "java"], labels: [sabre-compat-only]}
+    - {label: "node", argv: ["/bin/node", "-e", "console.log(42)"], labels: [sabre-compat-only]}
+    - {label: "timeout", argv: ["/usr/bin/timeout", "1", "/usr/bin/true"], labels: [sabre-compat-only]}
+    - {label: "truncate", argv: ["bash", "-c", "set -euo pipefail; f=$(mktemp); printf \"Hermit\\n\" >\"$f\"; /usr/bin/truncate -s 4096 \"$f\"; test \"$(stat -c %s \"$f\")\" = 4096; /usr/bin/truncate -s 7 \"$f\"; test \"$(stat -c %s \"$f\")\" = 7; test \"$(cat \"$f\")\" = Hermit; rm -f \"$f\"; printf \"truncate:4096-to-7-ok\\n\""], labels: [sabre-compat-only]}
+    - {label: "fallocate", argv: ["bash", "-c", "set -euo pipefail; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; f=\"$d/file\"; /usr/bin/fallocate -l 4096 \"$f\"; size=$(stat -c %s \"$f\"); test \"$size\" = 4096; printf \"fallocate:size=%s\\n\" \"$size\""], labels: [sabre-compat-only]}
+    - {label: "setfattr", argv: ["bash", "-c", "set -euo pipefail; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; printf payload >\"$f\"; /usr/bin/setfattr -n user.hermit.compat -v 42 \"$f\"; value=$(/usr/bin/getfattr --absolute-names --only-values -n user.hermit.compat \"$f\"); test \"$value\" = 42; /usr/bin/setfattr -x user.hermit.compat \"$f\"; ! /usr/bin/getfattr --absolute-names --only-values -n user.hermit.compat \"$f\" >/dev/null 2>&1; printf \"setfattr:value=%s:removed\\n\" \"$value\""], labels: [sabre-compat-only]}
+    - {label: "setfacl", argv: ["bash", "-c", "set -euo pipefail; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; chmod 600 \"$f\"; /usr/bin/setfacl -m u::rw,g::r,o::- \"$f\"; mode=$(stat -c %a \"$f\"); test \"$mode\" = 640; /usr/bin/getfacl --absolute-names -cp \"$f\" | /usr/bin/grep -Fxq \"group::r--\"; printf \"setfacl:mode=%s\\n\" \"$mode\""], labels: [sabre-compat-only]}
+    - {label: "mountpoint", argv: ["bash", "-c", "set -euo pipefail; /usr/bin/mountpoint -q /; ! /usr/bin/mountpoint -q {{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures/README.md; printf \"mountpoint:root=yes:file=no\\n\""], labels: [sabre-compat-only]}
+    - {label: "diff3", argv: ["bash", "-c", "set -euo pipefail; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; printf \"alpha\\nbeta\\n\" >\"$d/base\"; printf \"alpha\\nbeta\\nours\\n\" >\"$d/ours\"; printf \"theirs\\nalpha\\nbeta\\n\" >\"$d/theirs\"; /usr/bin/diff3 -m \"$d/ours\" \"$d/base\" \"$d/theirs\" | /usr/bin/diff -u <(printf \"theirs\\nalpha\\nbeta\\nours\\n\") -; printf \"diff3:clean-merge-ok\\n\""], labels: [sabre-compat-only]}
+    - {label: "basenc", argv: ["bash", "-c", "set -euo pipefail; encoded=$(printf \"Hermit\\n\" | /usr/bin/basenc --base64url); test \"$encoded\" = SGVybWl0Cg==; decoded=$(printf \"%s\\n\" \"$encoded\" | /usr/bin/basenc --base64url -d); test \"$decoded\" = Hermit; printf \"basenc:%s:roundtrip-ok\\n\" \"$encoded\""], labels: [sabre-compat-only]}
+    - {label: "dos2unix", argv: ["bash", "-c", "set -euo pipefail; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; printf \"alpha\\r\\nbeta\\r\\n\" >\"$f\"; /usr/bin/dos2unix -q \"$f\"; /usr/bin/diff -u <(printf \"alpha\\nbeta\\n\") \"$f\"; printf \"dos2unix:crlf-to-lf-ok\\n\""], labels: [sabre-compat-only]}
+    - {label: "envsubst", argv: ["bash", "-c", "set -euo pipefail; output=$(HERMIT_NAME=Hermit HERMIT_VALUE=42 /usr/bin/envsubst \"\\$HERMIT_NAME=\\$HERMIT_VALUE\" <<<\"\\$HERMIT_NAME=\\$HERMIT_VALUE\"); test \"$output\" = Hermit=42; printf \"envsubst:%s\\n\" \"$output\""], labels: [sabre-compat-only]}
+    - {label: "col", argv: ["bash", "-c", "set -euo pipefail; output=$(printf \"A\\bB\\n\" | /usr/bin/col -b); test \"$output\" = B; printf \"col:overstrike=%s\\n\" \"$output\""], labels: [sabre-compat-only]}
+    - {label: "colrm", argv: ["bash", "-c", "set -euo pipefail; output=$(printf \"abcdef\\n\" | /usr/bin/colrm 3 5); test \"$output\" = abf; printf \"colrm:%s\\n\" \"$output\""], labels: [sabre-compat-only]}
+    - {label: "crc32", argv: ["bash", "-c", "set -euo pipefail; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; printf \"Hermit\\n\" >\"$f\"; sum=$(/usr/bin/crc32 \"$f\"); test \"$sum\" = 146f43bb; printf \"crc32:%s\\n\" \"$sum\""], labels: [sabre-compat-only]}
+    - {label: "uuidgen", argv: ["bash", "-c", "set -euo pipefail; value=$(/usr/bin/uuidgen --random); [[ $value =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; printf \"uuidgen:%s\\n\" \"$value\""], labels: [sabre-compat-only]}
+    - {label: "shred", argv: ["bash", "-c", "set -euo pipefail; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; printf seed >\"$f\"; /usr/bin/shred -n 1 -z -s 4096 \"$f\"; test \"$(stat -c %s \"$f\")\" = 4096; /usr/bin/cmp -n 4096 \"$f\" /dev/zero; printf \"shred:4096-zeroed\\n\""], labels: [sabre-compat-only]}
+    - {label: "sync", argv: ["bash", "-c", "set -euo pipefail; f=$(mktemp); trap 'rm -f \"$f\"' EXIT; printf \"sync-payload\\n\" >\"$f\"; /usr/bin/sync -f \"$f\"; test \"$(cat \"$f\")\" = sync-payload; printf \"sync:file-ok\\n\""], labels: [sabre-compat-only]}
+    - {label: "pathchk", argv: ["bash", "-c", "set -euo pipefail; /usr/bin/pathchk -p alpha/beta_42; component=$(printf \"%015d\" 0 | /usr/bin/tr 0 x); ! /usr/bin/pathchk -p \"$component\" >/dev/null 2>&1; printf \"pathchk:portable-limit-ok\\n\""], labels: [sabre-compat-only]}
+    - {label: "namei", argv: ["bash", "-c", "set -euo pipefail; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; mkdir \"$d/real\"; touch \"$d/real/file\"; ln -s real \"$d/link\"; /usr/bin/namei -m \"$d/link/file\" >\"$d/output\"; /usr/bin/grep -Fxq \" lrwxrwxrwx link -> real\" \"$d/output\"; /usr/bin/grep -Fxq \" -rw-r--r-- file\" \"$d/output\"; printf \"namei:symlink-path-ok\\n\""], labels: [sabre-compat-only]}
+    - {label: "getconf", argv: ["bash", "-c", "set -euo pipefail; page=$(/usr/bin/getconf PAGESIZE); bits=$(/usr/bin/getconf LONG_BIT); test \"$page:$bits\" = 4096:64; printf \"getconf:page=%s:long=%s\\n\" \"$page\" \"$bits\""], labels: [sabre-compat-only]}
+    - {label: "cscope", argv: ["bash", "-c", "set -euo pipefail; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; printf \"int compat_add(int a, int b) { return a + b; }\\nint main(void) { return compat_add(20, 22) != 42; }\\n\" >\"$d/fixture.c\"; printf \"fixture.c\\n\" >\"$d/cscope.files\"; (cd \"$d\" && /usr/bin/cscope -bq -i cscope.files); output=$(cd \"$d\" && /usr/bin/cscope -dL -1 compat_add); [[ $output == *\"fixture.c compat_add 1\"* ]]; printf \"cscope:compat_add-found\\n\""], labels: [sabre-compat-only]}
+    - {label: "flex", argv: ["bash", "-c", "set -euo pipefail; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; printf \"%s\\n\" \"%option prefix=\\\"compat\\\" noyywrap\" \"%%\" \"[0-9]+ return 1;\" \".      ;\" \"%%\" >\"$d/scanner.l\"; /usr/bin/flex -o \"$d/scanner.c\" \"$d/scanner.l\"; grep -q compatlex \"$d/scanner.c\"; printf \"flex:compat-scanner-generated\\n\""], labels: [sabre-compat-only]}
+    - {label: "msgfmt", argv: ["bash", "-c", "set -euo pipefail; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; printf \"%s\\n\" \"msgid \\\"\\\"\" \"msgstr \\\"Content-Type: text/plain; charset=UTF-8\\\\n\\\"\" \"\" \"msgid \\\"hello\\\"\" \"msgstr \\\"Hermit\\\"\" >\"$d/messages.po\"; /usr/bin/msgfmt -o \"$d/messages.mo\" \"$d/messages.po\"; test -s \"$d/messages.mo\"; printf \"msgfmt:catalog-compiled\\n\""], labels: [sabre-compat-only]}
+    - {label: "msgunfmt", argv: ["bash", "-c", "set -euo pipefail; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; printf \"%s\\n\" \"msgid \\\"\\\"\" \"msgstr \\\"Content-Type: text/plain; charset=UTF-8\\\\n\\\"\" \"\" \"msgid \\\"hello\\\"\" \"msgstr \\\"Hermit\\\"\" >\"$d/messages.po\"; /usr/bin/msgfmt -o \"$d/messages.mo\" \"$d/messages.po\"; /usr/bin/msgunfmt \"$d/messages.mo\" >\"$d/roundtrip.po\"; grep -Fq 'msgstr \"Hermit\"' \"$d/roundtrip.po\"; printf \"msgunfmt:catalog-roundtrip-ok\\n\""], labels: [sabre-compat-only]}
+    # The SaBRe corpus ran these three programs directly, as one program
+    # image. This corpus's rows of the same name run them under a bash
+    # wrapper, whose exec starts a second image, so on SaBRe those rows test
+    # https://github.com/rrnewton/hermit/issues/3486 rather than the program.
+    # These rows keep the SaBRe corpus's argv.
+    - {label: "lua-direct", argv: ["lua", "-e", "print(42)"], labels: [sabre-compat-only]}
+    - {label: "perl-direct", argv: ["perl", "-e", "print 42, chr(10)"], labels: [sabre-compat-only]}
+    - {label: "df-direct", argv: ["/usr/bin/df", "-P", "/"], labels: [sabre-compat-only]}

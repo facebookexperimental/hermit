@@ -23,10 +23,11 @@
  * timing channel; the flag is a policy hint the kernel records but the fixture
  * never relies on any hugepage-backing side effect.
  *
- * ptrace and DBT drive the full round-trip; KVM's ElfExecutor does not
- * implement the PR_*_THP_DISABLE requests and refuses them with ENOSYS
- * (recorded as a KVM gap in matrix.tsv), so this row runs on ptrace and DBT.
- * The fixture prints only a check count.
+ * ptrace and DBT drive the full round-trip. When this fixture was written,
+ * KVM's ElfExecutor refused the PR_*_THP_DISABLE requests with ENOSYS. It now
+ * implements them, and the KVM verify cell for c-programs/thp-disable in
+ * tests/e2e/manifests/c-programs.yaml is enabled. The fixture prints only a
+ * check count.
  */
 
 #ifndef PR_SET_THP_DISABLE

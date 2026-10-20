@@ -1,0 +1,6 @@
+--config
+build.execution_platforms=gh_facebook_buck2_shims_meta//platforms:hybrid
+--config
+hermit.rust_sysroot=rust-sysroot
+--config
+test.v2_test_executor=$BUCK2_BINARY_DIR/buck2-tpx

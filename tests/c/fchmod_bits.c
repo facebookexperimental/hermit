@@ -17,7 +17,8 @@
 // and only the final self-set mode is printed; no host-derived ownership,
 // device, inode, or timestamp field is exposed.
 //
-// _GNU_SOURCE is supplied by the harness compile flags (see run_matrix.py).
+// _GNU_SOURCE is defined here: the manifest runner compiles this file with
+// -std=c11 and no -D_GNU_SOURCE (ci/manifest-plan/src/runner.rs).
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>

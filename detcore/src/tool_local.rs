@@ -1849,6 +1849,19 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) uncharged_bootstrap_syscalls: u32,
 
+    /// True from the moment [`ThreadState::charge_syscall_time`] leaves the
+    /// syscall this thread is handling uncharged until that syscall's handler
+    /// finishes. Resource requests made meanwhile through
+    /// `tool_global::resource_request` are marked
+    /// [`Resources::backend_runtime_bootstrap`], so the scheduler withholds
+    /// their turn time as well, except for an IO-polling retry, which still
+    /// advances it. Requests that bypass `resource_request` (direct futex and
+    /// thread-lifecycle requests) are not marked and advance it as usual.
+    /// Cleared at the start of every handler and before the syscall handler's
+    /// post-hook.
+    #[serde(default)]
+    pub(crate) in_uncharged_bootstrap_syscall: bool,
+
     /// Thread state associated with record/replay.
     pub record_or_replay: T,
 
@@ -2262,6 +2275,7 @@ impl<T> ThreadState<T> {
             thread_logical_time,
             committed_clock_value: 0,
             uncharged_bootstrap_syscalls: 0,
+            in_uncharged_bootstrap_syscall: false,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2502,6 +2516,7 @@ impl<T> ThreadState<T> {
             poll_attempt: 0,
             fyi: String::new(),
             signal_interrupt_errno: None,
+            backend_runtime_bootstrap: false,
         }
     }
 
@@ -2565,6 +2580,31 @@ impl<T> ThreadState<T> {
             metadata.discover_fd_from_current_process(self.dettid, fd)?;
         }
         metadata.with_detfd(fd, f)
+    }
+
+    /// Descriptors in this table that Detcore manages as internal pipes: typed
+    /// `Pipe`, physically nonblocking and logically blocking, which is how
+    /// `handle_pipe2` leaves a guest-created pipe (and how exec restores it).
+    /// On ptrace, a pipe inherited from the host is not in this set: stdio is
+    /// typed `Regular`, and another inherited FIFO is physically nonblocking
+    /// only when it is logically nonblocking too. On SaBRe, stdio is discovered
+    /// as `Pipe` and a guest `F_SETFL` gives it the marker, so a host stdin pipe
+    /// can appear here (as its fd 0 already behaves like an internal pipe).
+    /// Sorted, so callers probe them in a deterministic order.
+    pub(crate) fn scheduler_managed_pipe_fds(&self) -> Vec<RawFd> {
+        let mut fds: Vec<RawFd> = self
+            .metadata()
+            .file_handles
+            .iter()
+            .filter(|(_, detfd)| {
+                detfd.ty() == FdType::Pipe
+                    && detfd.physically_nonblocking()
+                    && !detfd.is_nonblocking()
+            })
+            .map(|(&fd, _)| fd)
+            .collect();
+        fds.sort_unstable();
+        fds
     }
 
     pub(crate) fn count_open_files_at_paths(&self, paths: &[&Path]) -> usize {

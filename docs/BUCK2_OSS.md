@@ -48,9 +48,16 @@ non-host platform targets that the default Hermit binary does not use.
 ## Shadow release parity
 
 The feature-complete release target is shadow-only: Cargo remains the
-authoritative binary and install/resource producer. First run the existing
-`build.runtime_release` command, then invoke the guarded wrapper with explicit
-absolute paths:
+authoritative binary and install/resource producer. First build the Cargo
+release with the optional backends and the revision stamped; the wrapper
+requires the Cargo binary to name the 12-character `HEAD` revision, and only a
+stamped build embeds one:
+
+```sh
+HERMIT_STAMP_GIT_SHA=1 cargo build --release --workspace --features hermit/third-party-backends
+```
+
+Then invoke the guarded wrapper with explicit absolute paths:
 
 ```sh
 ./scripts/build-buck-release.rs \
@@ -92,8 +99,8 @@ changing the caller path cannot change the run. The wrapper likewise snapshots
 the DotSlash descriptor and resolved Buck executable, then invokes only the
 snapshotted Buck binary for version, build, and log decoding. Before any Cargo
 probe it snapshots the caller's binary and complete install bundle into the
-exclusive evidence directory. Every subsequent probe, comparison, matrix, and
-receipt fact uses that tested snapshot, never the mutable caller paths. The
+exclusive evidence directory. Every subsequent probe, comparison, and receipt
+fact uses that tested snapshot, never the mutable caller paths. The
 Buck candidate's bundle is published separately from the caller's pre-overlay
 install tree, and the two complete resource manifests must be byte-identical,
 so any change to that tree between the two publications is refused. Before the first probe the
@@ -107,49 +114,22 @@ help bytes exactly, and typed-decodes and compares both candidates' ptrace run
 and record reports again. It also replays retained Buck event/stdout/shell-exit
 semantics, re-runs the snapshotted Buck log summary, and requires exactly the
 ten named candidate invocations with applied wall/cgroup safehermit reports.
-After both official DBT matrices, it inventories the observed (not statically
-predicted) Cargo and Buck matrix candidate invocations, rejects unexpected
-tree entries and non-regular files, validates every applied wall/cgroup report,
-and publishes a closed manifest binding each candidate label/identity and its
-normalized case/role/argv, report/stdout/stderr hashes, and data-tree hashes.
-Completeness is not inferred from equal nonzero populations: before execution,
-the driver imports the official `run_matrix.py` catalog/expectation/reference
-policy and retains a source-hash-bound expected ledger. Every candidate runs on
-the host through safehermit's `systemd-run --user` service, which starts in the
-initial user namespace without CAP_SYS_ADMIN, so a per-run `/test` tmpfs
-cannot be mounted there. The matrix therefore runs with a reviewed host
-envelope that the driver owns: the strict flags `--backend dbt --strict
---require-backend --no-parent-scorecard`, an empty environment, a 900 s wall and
-7200 s CPU budget, and a 512-MiB baseline and 2-GiB hard memory bound. These are
-the values the validation DAG's `test.dbt_parity_on_host` node carried until
-slice S13 of https://github.com/rrnewton/hermit/issues/3301 retired it; the
-matrix's 28 cases now run in authoritative validation as DBT verify cells of
-the c-programs and system-utils manifests, so `run_matrix.py` no longer runs in
-the validation DAG. The matrix runs each DBT command inside a rootless
-user+mount namespace whose `/tmp` is a per-command directory. The proxy must not
-start there: safehermit's disk bound needs host `sudo`, and its service would
-escape the namespace anyway, so the guest would silently run on the host `/tmp`.
-For the proxy only, `run_matrix.py` instead hands over its unchanged
-private-`/tmp` stage (`--matrix-private-tmp`) as data. The proxy refuses to run
-outside the initial user namespace, accepts only that exact stage with canonical
-binds beneath the command directory, and has safehermit execute the stage inside
-its bounded service. A readback written immediately before the candidate starts
-must show the command directory as `/tmp`, `/tmp` as the working directory and
-`TMPDIR`, and root mapped from exactly the proxy's uid; otherwise the invocation
-is refused. Each DBT invocation retains that readback and a typed record of
-the stage (`private-tmp.json`); the retained audit requires both for every DBT
-run and neither for any other role, re-checks the readback against the record,
-and binds both hashes in the invocation manifest. The driver refuses an
-envelope that requests `HERMIT_E2E_EMPTY_WORKDIR` or whose environment collides
-with a candidate proxy binding.
-For the current strict DBT mode the matrix independently requires
-28 TSV rows (27 selected plus the documented `pthread_lifecycle` gap), 23
-ptrace references, 81 DBT candidate runs, two global probes, and therefore 106
-proxy invocations per candidate. Cargo and Buck must each match that exact
-case/role multiset and their normalized argv multisets must match. The final
-typed receipt binds the expected-ledger name/hash/count plus the actual
-manifest hash and both per-candidate counts, then recomputes all of it.
-Post-behavior evidence mutation, deletion, or addition therefore refuses.
+The shadow runs no DBT guest. It used to run the official DBT parity matrix
+under both binaries and require equal result rows with the timing column
+removed; slice S13 of https://github.com/rrnewton/hermit/issues/3301 removed
+that leg. Nothing automated ran it: the nightly workflow runs only the
+driver's tests and its flag modes, and the validation DAG runs only
+`--validate-dag-build` and `--validate-dag-install`. Of the matrix's 28 cases,
+26 are CI-enabled DBT verify cells of the c-programs and system-utils
+manifests. `io_uring_fallback` is a CI-enabled DBT custom cell (three
+`--strict` runs that must repeat identically) while
+https://github.com/rrnewton/reverie/issues/764 keeps its DBT verify cell out
+of CI. `pthread_lifecycle` stays DBT-disabled; the matrix recorded it as a gap
+and never passed it either. The `./scripts/validate.rs --buck-release` opt-in
+(see [Validate DAG opt-in](#validate-dag-opt-in)) runs every E2E cell, those
+DBT cells included, against the Buck release binary. The final receipt schema
+is `hermit-buck-shadow-parity/v3`; a v2 receipt, which carried the matrix
+facts, is refused.
 The generated Buck graph has stable hashes immediately before/after the build
 and at receipt time. The canonical host liblzma input remains guarded the same
 way, while the link action consumes the separately verified content-addressed
@@ -158,10 +138,9 @@ typed schema: unknown, duplicate, missing, mutated, or non-recomputable semantic
 facts refuse. It publishes separate Cargo and Buck bundles only under
 `ignored/buck2-phase1/`; it never writes the authoritative
 `target/ci/hermit-strict` or E2E artifact pointer. A pass requires equal build
-records and backend inventories, compatible ELF contracts, canonical ptrace
-strict-verify and record/replay evidence through `safehermit`, and equal
-duration-normalized results from the official DBT parity matrix. Buck event
-evidence is retained as `.json-lines.gz` and must decode through
+records and backend inventories, compatible ELF contracts, and canonical
+ptrace strict-verify and record/replay evidence through `safehermit`. Buck
+event evidence is retained as `.json-lines.gz` and must decode through
 `buck2 log summary` before the wrapper can pass.
 
 ### Virtual-time scope
@@ -173,11 +152,10 @@ byte-identical trajectories and exactly equal strict reports, virtual time
 included. It is not evidence of virtual-time parity between backends, and it
 says nothing about DBT or KVM virtual time:
 
-- The DBT matrix runs the simpler `tests/c/clock_determinism.c` fixture. Its
-  clock rows are repeatability contracts within one backend, and
-  `tests/backend-parity/run_matrix.py` deliberately excludes them from
-  cross-backend byte comparison. The shadow compares only the Cargo and Buck
-  matrix case identities and outcomes.
+- The shadow runs no DBT guest. In validation, the DBT verify cell
+  `system-utils/clock-determinism` runs the simpler
+  `tests/c/clock_determinism.c` fixture as a repeatability contract within the
+  DBT backend.
 - The shadow runs no KVM guest. In validation, the KVM verify cell
   `system-utils/proc-uptime` reads `/proc/uptime` and checks repeatability. It
   does not exercise `sysinfo(2)`, exec or thread continuity, or an exact

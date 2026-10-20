@@ -17,6 +17,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
 use std::process::ExitStatus;
@@ -143,8 +144,18 @@ fn check_outputs(directory: &Path) {
     if logs.exists() {
         for entry in fs::read_dir(logs).expect("verify log directory") {
             let entry = entry.expect("verify log entry");
-            assert!(entry.file_type().expect("log type").is_file());
-            assert!(entry.metadata().expect("log size").len() <= 64 * MIB);
+            // After a match Hermit deletes run 2's log while the command is
+            // still running (the `keep_golden_log_only` branch in
+            // `hermit-cli/src/bin/hermit/verify.rs`), so a listed log can be
+            // gone by the time it is examined. A deleted log is not retained,
+            // and this bound is on retained files.
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("verify log {}: {error}", entry.path().display()),
+            };
+            assert!(metadata.is_file());
+            assert!(metadata.len() <= 64 * MIB);
         }
     }
 }
@@ -157,6 +168,39 @@ pub(super) fn bounded_command_with_timeout(
     command: &mut Command,
     directory: &Path,
     wall_limit: Duration,
+) -> ExitStatus {
+    bounded_command_polling(command, directory, wall_limit, || {})
+}
+
+/// [`bounded_command_with_timeout`] for a `hermit run --verify --keep-logs`
+/// command whose `--verify-log-dir` is `directory/verify-logs`. Also returns
+/// run 2's log, which Hermit deletes after a match, hard-linked on a poll
+/// while the command runs as the `run2_log` module describes.
+///
+/// The link is `directory/captured-run2.log`. The caller checks it like a
+/// retained log and then removes it, so a passing test keeps only the golden
+/// log, as Hermit does. `None` means no poll saw a run 2 log.
+pub(super) fn bounded_verify_command(
+    command: &mut Command,
+    directory: &Path,
+    wall_limit: Duration,
+) -> (ExitStatus, Option<PathBuf>) {
+    let logs = directory.join("verify-logs");
+    let capture = directory.join("captured-run2.log");
+    let mut captured = false;
+    let status = bounded_command_polling(command, directory, wall_limit, || {
+        if !captured {
+            captured = super::run2_log::link_run2_log(&logs, &capture);
+        }
+    });
+    (status, captured.then_some(capture))
+}
+
+fn bounded_command_polling(
+    command: &mut Command,
+    directory: &Path,
+    wall_limit: Duration,
+    mut poll: impl FnMut(),
 ) -> ExitStatus {
     fs::create_dir_all(directory).expect("create retained command directory");
     fs::write(directory.join("command.txt"), format!("{command:?}\n"))
@@ -189,6 +233,7 @@ pub(super) fn bounded_command_with_timeout(
         stdout.drain();
         stderr.drain();
         check_outputs(directory);
+        poll();
         // Do not reap the direct child until both pipes reach EOF. If a
         // descendant retains a write end after the child exits, the unchanged
         // deadline fails while we still own the unreaped process-group ID.
@@ -570,7 +615,8 @@ pub(super) fn run(loops: usize, expected: i32) {
     ];
     let mut command = super::hermit_command(&args);
     command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
-    let status = bounded_command(&mut command, &run_dir);
+    let (status, run2_log) =
+        bounded_verify_command(&mut command, &run_dir, Duration::from_secs(57));
     assert_eq!(
         status.code(),
         Some(expected),
@@ -617,8 +663,8 @@ pub(super) fn run(loops: usize, expected: i32) {
         assert_eq!(operand.stdout_sha256, EMPTY_SHA256);
         assert_eq!(operand.stderr_sha256, EMPTY_SHA256);
     }
-    for prefix in ["run1_log_", "run2_log_"] {
-        let matches: Vec<_> = fs::read_dir(&logs)
+    let retained = |prefix: &str| -> Vec<_> {
+        fs::read_dir(&logs)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| {
@@ -627,14 +673,25 @@ pub(super) fn run(loops: usize, expected: i32) {
                     .to_string_lossy()
                     .starts_with(prefix)
             })
-            .collect();
-        assert_eq!(
-            matches.len(),
-            1,
-            "exactly one retained log for each real run"
-        );
-        let log =
-            String::from_utf8(bounded_read(&matches[0], 16 * MIB)).expect("complete UTF-8 trace");
+            .collect()
+    };
+    // After a match `--keep-logs` keeps only run 1's log, the golden copy;
+    // run 2's log, which matched it, is deleted. Its capture is checked in
+    // its place.
+    let golden = retained("run1_log_");
+    assert_eq!(
+        golden.len(),
+        1,
+        "exactly one retained golden log of the matched run"
+    );
+    assert!(
+        retained("run2_log_").is_empty(),
+        "a matched verification must not retain run 2's log"
+    );
+    let run2_log = run2_log.expect("run 2's log, captured while the command ran");
+    for path in [&golden[0], &run2_log] {
+        let log = String::from_utf8(bounded_read(path, 16 * MIB)).expect("complete UTF-8 trace");
         assert_mechanism(&log, loops, timestamp);
     }
+    fs::remove_file(&run2_log).expect("remove run 2's checked log");
 }

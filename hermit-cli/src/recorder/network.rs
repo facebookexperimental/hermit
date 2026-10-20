@@ -10,6 +10,7 @@
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::Pid;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::EpollWait;
@@ -17,8 +18,10 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
 use reverie::syscalls::PollFd;
 use reverie::syscalls::Ppoll;
+use reverie::syscalls::Pselect6;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
+use reverie::syscalls::Select;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
@@ -28,8 +31,10 @@ use crate::event::EpollWaitEvent;
 use crate::event::PollEvent;
 use crate::event::PpollEvent;
 use crate::event::RecvmsgEvent;
+use crate::event::SelectEvent;
 use crate::event::SockOptEvent;
 use crate::event::SyscallEvent;
+use crate::event::fd_set_bytes;
 
 fn read_bytes<M: MemoryAccess>(
     memory: &M,
@@ -178,6 +183,91 @@ fn capture_ppoll_event<M: MemoryAccess>(
     })
 }
 
+/// Read up to `length` bytes, stopping at the first unreadable byte. Linux
+/// clamps `nfds` to the descriptor table size, so a successful call writes a
+/// prefix of the guest's range; any readable bytes past it are unchanged guest
+/// memory, which replay restores to the same value.
+fn read_byte_prefix<M: MemoryAccess>(
+    memory: &M,
+    address: AddrMut<'_, u8>,
+    length: usize,
+) -> Vec<u8> {
+    let mut bytes = vec![0; length];
+    let mut filled = 0;
+    while filled < length {
+        let Some(chunk) = address
+            .as_raw()
+            .checked_add(filled)
+            .and_then(AddrMut::<u8>::from_raw)
+        else {
+            break;
+        };
+        match memory.read(chunk, &mut bytes[filled..]) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => filled += count,
+        }
+    }
+    bytes.truncate(filled);
+    bytes
+}
+
+/// The kernel's descriptor-table size for `tid`, from the `FDSize:` line of
+/// `/proc/<tid>/status`. `core_sys_select` clamps `nfds` to this before it
+/// reads or writes a set, so no byte past it belongs to the call.
+fn guest_max_fds(tid: Pid) -> Option<i32> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", tid.as_raw())).ok()?;
+    parse_fd_size(&status)
+}
+
+/// A task's table holds at least `NR_OPEN_DEFAULT` (`BITS_PER_LONG`) entries.
+/// A smaller value means a task without a table, or the wrong task, and would
+/// silently record empty sets, so it is treated as unknown.
+fn parse_fd_size(status: &str) -> Option<i32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("FDSize:"))
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|&size: &i32| size >= 64)
+}
+
+/// The `nfds` the kernel acted on. Without a table size, fall back to the
+/// default `fs.nr_open` limit of 1048576 descriptors (128 KiB per set), so a
+/// guest passing `INT_MAX` cannot make the recorder allocate gigabytes.
+fn select_capture_nfds(nfds: i32, max_fds: Option<i32>) -> i32 {
+    nfds.min(max_fds.unwrap_or(1 << 20))
+}
+
+fn capture_select_event<M: MemoryAccess>(
+    memory: &M,
+    nfds: i32,
+    fd_sets: [Option<AddrMut<'_, libc::fd_set>>; 3],
+    timeout: Option<(AddrMut<'_, u8>, usize)>,
+    result: Result<i64, Errno>,
+) -> SelectEvent {
+    // fs/select.c copies the sets out after a successful wait and can fault
+    // partway through; every other result leaves them as the guest wrote them.
+    // `nfds` must already be clamped to the descriptor table.
+    let copied_out = matches!(result, Ok(_) | Err(Errno::EFAULT));
+    let length = fd_set_bytes(nfds);
+    let fd_sets = fd_sets.map(|address| {
+        address
+            .filter(|_| copied_out)
+            .map(|address| read_byte_prefix(memory, address.cast(), length))
+    });
+    // Linux may write the remaining time back on any result that reached the
+    // wait, and leaves it alone otherwise; capturing the post-call bytes is
+    // right either way, because replaying unchanged bytes changes nothing. An
+    // unreadable pointer could not have been written.
+    let timeout = timeout
+        .map(|(address, length)| read_byte_prefix(memory, address, length))
+        .filter(|bytes| !bytes.is_empty());
+    SelectEvent {
+        result,
+        fd_sets,
+        timeout,
+    }
+}
+
 impl Recorder {
     pub(super) async fn handle_epoll_wait<G: Guest<Self>>(
         &self,
@@ -253,6 +343,44 @@ impl Recorder {
 
         self.record_event(guest, event);
 
+        result
+    }
+
+    pub(super) async fn handle_select<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Select,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+        let event = capture_select_event(
+            &guest.memory(),
+            select_capture_nfds(syscall.nfds(), guest_max_fds(guest.tid())),
+            [syscall.readfds(), syscall.writefds(), syscall.exceptfds()],
+            syscall
+                .timeout()
+                .map(|address| (address.cast(), std::mem::size_of::<libc::timeval>())),
+            result,
+        );
+        self.record_event(guest, Ok(SyscallEvent::Select(event)));
+        result
+    }
+
+    pub(super) async fn handle_pselect6<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Pselect6,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+        let event = capture_select_event(
+            &guest.memory(),
+            select_capture_nfds(syscall.nfds(), guest_max_fds(guest.tid())),
+            [syscall.readfds(), syscall.writefds(), syscall.exceptfds()],
+            syscall
+                .timeout()
+                .map(|address| (address.cast(), std::mem::size_of::<Timespec>())),
+            result,
+        );
+        self.record_event(guest, Ok(SyscallEvent::Select(event)));
         result
     }
 
@@ -639,6 +767,141 @@ mod tests {
         assert_eq!(event.result, Err(Errno::EINVAL));
         assert!(event.fds_pointer_present);
         assert!(event.fds.is_none());
+        assert!(event.timeout.is_none());
+    }
+
+    fn fd_set_with(fds: &[i32]) -> libc::fd_set {
+        let mut set: libc::fd_set = unsafe { std::mem::zeroed() };
+        for &fd in fds {
+            unsafe { libc::FD_SET(fd, &mut set) };
+        }
+        set
+    }
+
+    #[test]
+    fn fd_set_bytes_rounds_up_to_whole_longs() {
+        assert_eq!(fd_set_bytes(-1), 0);
+        assert_eq!(fd_set_bytes(0), 0);
+        assert_eq!(fd_set_bytes(1), 8);
+        assert_eq!(fd_set_bytes(64), 8);
+        assert_eq!(fd_set_bytes(65), 16);
+    }
+
+    #[test]
+    fn capture_select_keeps_sets_and_timeout_on_success() {
+        let mut readfds = fd_set_with(&[3]);
+        let mut timeout = libc::timeval {
+            tv_sec: 1,
+            tv_usec: 234_567,
+        };
+        let event = capture_select_event(
+            &LocalMemory::new(),
+            4,
+            [
+                AddrMut::from_raw((&mut readfds as *mut libc::fd_set) as usize),
+                None,
+                None,
+            ],
+            AddrMut::<u8>::from_raw((&mut timeout as *mut libc::timeval) as usize)
+                .map(|address| (address, std::mem::size_of::<libc::timeval>())),
+            Ok(1),
+        );
+
+        assert_eq!(event.result, Ok(1));
+        let [read, write, except] = event.fd_sets;
+        assert_eq!(read, Some(vec![0b1000, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(write.is_none());
+        assert!(except.is_none());
+        let mut expected = vec![0u8; std::mem::size_of::<libc::timeval>()];
+        expected[..8].copy_from_slice(&1i64.to_ne_bytes());
+        expected[8..].copy_from_slice(&234_567i64.to_ne_bytes());
+        assert_eq!(event.timeout, Some(expected));
+    }
+
+    #[test]
+    fn select_capture_is_clamped_to_the_descriptor_table() {
+        let status = "Name:\tguest\nFDSize:\t64\nGroups:\t\n";
+        assert_eq!(parse_fd_size(status), Some(64));
+        assert_eq!(parse_fd_size("Name:\tguest\n"), None);
+        assert_eq!(parse_fd_size("FDSize:\t0\n"), None);
+        let own = Pid::from_raw(unsafe { libc::gettid() });
+        assert!(guest_max_fds(own).is_some_and(|size| size >= 64));
+
+        assert_eq!(select_capture_nfds(4, Some(64)), 4);
+        assert_eq!(select_capture_nfds(i32::MAX, Some(64)), 64);
+        assert_eq!(fd_set_bytes(select_capture_nfds(i32::MAX, Some(64))), 8);
+        assert_eq!(select_capture_nfds(i32::MAX, None), 1 << 20);
+        assert_eq!(select_capture_nfds(-1, Some(64)), -1);
+
+        // A guest-sized nfds far past its table reads only the table's bytes.
+        let mut readfds = fd_set_with(&[3]);
+        let event = capture_select_event(
+            &LocalMemory::new(),
+            select_capture_nfds(i32::MAX, Some(64)),
+            [
+                AddrMut::from_raw((&mut readfds as *mut libc::fd_set) as usize),
+                None,
+                None,
+            ],
+            None,
+            Ok(1),
+        );
+        assert_eq!(event.fd_sets[0], Some(vec![0b1000, 0, 0, 0, 0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn capture_select_keeps_the_readable_prefix_and_drops_an_unreadable_timeout() {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        assert_eq!(
+            unsafe { libc::mprotect(base.cast::<u8>().add(page).cast(), page, libc::PROT_NONE) },
+            0
+        );
+        // The set starts 16 bytes before the inaccessible page, as a partial
+        // copy-out before EFAULT would leave it.
+        let set = base as usize + page - 16;
+        unsafe { std::ptr::write_bytes(set as *mut u8, 0xa5, 16) };
+        let event = capture_select_event(
+            &LocalMemory::new(),
+            1024,
+            [AddrMut::from_raw(set), None, None],
+            AddrMut::<u8>::from_raw(base as usize + page)
+                .map(|address| (address, std::mem::size_of::<Timespec>())),
+            Err(Errno::EFAULT),
+        );
+        unsafe { libc::munmap(base, 2 * page) };
+
+        assert_eq!(event.fd_sets[0], Some(vec![0xa5; 16]));
+        assert!(event.timeout.is_none());
+    }
+
+    #[test]
+    fn capture_select_omits_sets_the_kernel_did_not_copy_out() {
+        let mut readfds = fd_set_with(&[3]);
+        let event = capture_select_event(
+            &LocalMemory::new(),
+            4,
+            [
+                AddrMut::from_raw((&mut readfds as *mut libc::fd_set) as usize),
+                None,
+                None,
+            ],
+            None,
+            Err(Errno::EBADF),
+        );
+
+        assert_eq!(event.result, Err(Errno::EBADF));
+        assert!(event.fd_sets.iter().all(Option::is_none));
         assert!(event.timeout.is_none());
     }
 }

@@ -32,6 +32,12 @@ mod rust_script_prelude;
 #[path = "../ci/manifest-plan/src/manifest_value.rs"]
 mod manifest_value;
 
+// The corpus module names its result classes through the shared CI-selection
+// types; this adapter needs only that enum.
+#[allow(dead_code)]
+#[path = "../ci/manifest-plan/src/ci_selection.rs"]
+mod ci_selection;
+
 // A `corpus:` bucket (compat.yaml) is expanded into the ordinary tests the
 // harness runs, and its argv placeholders rendered for a shell; this adapter
 // uses only that part of the shared module.
@@ -45,6 +51,7 @@ mod manifest_corpus;
 #[path = "../ci/manifest-plan/src/timeouts.rs"]
 mod timeouts;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -311,6 +318,29 @@ fn mode_guest_args(spec: &Value, mode: &str, backend: &str, id: &str) -> Vec<Str
     args
 }
 
+/// Guest arguments one (mode, backend) cell runs with. A replay cell records
+/// the program its verify cell runs, so for a backend its replay recipe does not
+/// name it takes `modes.verify.guest_args.<backend>`, the same rule as
+/// `hermit-manifest-plan`'s `cell_guest_args`.
+fn cell_guest_args(
+    modes: &BTreeMap<String, Value>,
+    mode: &str,
+    backend: &str,
+    id: &str,
+) -> Vec<String> {
+    let declares = |spec: &Value| {
+        spec.get("guest_args")
+            .and_then(Value::as_table)
+            .is_some_and(|by_backend| by_backend.contains_key(backend))
+    };
+    match modes.get("verify") {
+        Some(verify) if mode == "replay" && !declares(&modes[mode]) => {
+            mode_guest_args(verify, "verify", backend, id)
+        }
+        _ => mode_guest_args(&modes[mode], mode, backend, id),
+    }
+}
+
 /// Append the guest's own arguments to an already-quoted guest command.
 ///
 /// `sh -c` consumes the next word as `$0`, so string-form direct commands need
@@ -352,7 +382,7 @@ fn hermit_command(
             )
         }
         "replay" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log info --backend {} record start --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout \"$remaining\" {HERMIT_GUEST_ENV_ARGS} -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log info --backend {} record start --base-env=minimal --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout \"$remaining\" {HERMIT_GUEST_ENV_ARGS} -- {guest}",
             shell_quote(backend)
         ),
         "chaos" => format!(
@@ -475,7 +505,7 @@ fn commands_for_test(test: &Value, bucket: &str, inherited_timeout_seconds: i64)
         for backend in backends {
             let timeout =
                 cell_timeout_seconds(spec, &backend, inherited_timeout_seconds, &id, mode);
-            let guest_args = mode_guest_args(spec, mode, &backend, &id);
+            let guest_args = cell_guest_args(modes, mode, &backend, &id);
             let guest = guest_with_args(test, &guest, &guest_args);
             let mut invocations = Vec::new();
             for seed in &seeds {
@@ -520,8 +550,9 @@ struct GuestArgsRecord {
 /// Emit every declared per-backend guest-argument vector as JSON Lines on
 /// stdout, sorted by test id, mode, and backend.
 ///
-/// This is the machine-readable form of the same `guest_args` the generated
-/// commands embed, so an out-of-tree harness (the `compat-envelope` corpus
+/// This is the machine-readable form of the `guest_args` the manifests declare
+/// (a replay cell that declares none runs its verify recipe's; see
+/// [`cell_guest_args`]), so an out-of-tree harness (the `compat-envelope` corpus
 /// collector) can invoke a guest correctly without maintaining a second copy of
 /// the argument list, which would drift. JSON preserves empty strings, tabs,
 /// newlines, and explicitly empty vectors without delimiter ambiguity.
@@ -791,6 +822,49 @@ test:
             guest_with_args(&tests[0].2, "\"$cell/guest\"", &args),
             "\"$cell/guest\" multi 'value with spaces'"
         );
+    }
+
+    /// A replay cell runs its verify cell's guest arguments for every backend
+    /// its own recipe does not name, and its own where it does, including an
+    /// explicitly empty vector. Its command carries verify's minimal base
+    /// environment.
+    #[test]
+    fn replay_inherits_verify_guest_args_per_backend() {
+        let tests = manifest(
+            r#"
+test:
+  - id: c-programs/replayed
+    program: tests/c/replayed.c
+    modes:
+      verify:
+        backends_enabled: [ptrace, liteinst]
+        guest_args:
+          ptrace: [from-verify]
+          liteinst: [verify-edge]
+      replay:
+        backends_enabled: [ptrace, liteinst]
+        guest_args:
+          liteinst: []
+"#,
+        );
+        let modes = tests[0].2["modes"].as_table().unwrap();
+        let id = "c-programs/replayed";
+        assert_eq!(
+            cell_guest_args(modes, "replay", "ptrace", id),
+            vec!["from-verify"]
+        );
+        assert!(cell_guest_args(modes, "replay", "liteinst", id).is_empty());
+        assert_eq!(
+            cell_guest_args(modes, "verify", "liteinst", id),
+            vec!["verify-edge"]
+        );
+        let lines = commands_for_test(&tests[0].2, "c-programs", 15);
+        let ptrace_replay = lines
+            .iter()
+            .find(|line| line.ends_with("mode=replay backend=ptrace"))
+            .unwrap();
+        assert!(ptrace_replay.contains("record start --base-env=minimal "));
+        assert!(ptrace_replay.contains("from-verify"));
     }
 
     /// The channel is per-BACKEND, not per-cell: two backends of the same cell

@@ -95,32 +95,36 @@ h1 em { display: block; color: var(--coral); font-weight: 400; }
 .blog-link a { color: var(--ink); }
 
 .hero-visual { position: relative; display: flex; flex-direction: column; align-items: center; margin: 0; min-width: 0; }
-.orbit-scene { position: relative; width: 100%; max-width: 560px; aspect-ratio: 1; order: 0; }
-.orbit-scene::before, .orbit-scene::after { content: ""; position: absolute; border: 1px solid var(--orbit-line); border-radius: 50%; inset: 7%; }
-.orbit-scene::after { inset: 23%; }
+.orbit-scene { --ring-outer: 9.1%; --ring-middle: 14.5%; --ring-inner: 18.4%; position: relative; width: 100%; max-width: 560px; aspect-ratio: 1; order: 0; overflow: clip; }
+.orbit-scene::before, .orbit-scene::after, .orbit::before { content: ""; position: absolute; border: 1px solid var(--orbit-line); border-radius: 50%; inset: var(--ring-outer); }
+.orbit::before { inset: var(--ring-middle); }
+.orbit-scene::after { inset: var(--ring-inner); }
 .architecture { position: absolute; z-index: 1; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 148px; border: 1px solid var(--ink); box-shadow: 0 12px 30px var(--stack-shadow); }
 .layer { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 59px; padding: 8px 6px; background: var(--paper); }
 .layer + .layer { border-top: 1px solid var(--ink); }
 .layer strong { font: 700 1.35rem var(--serif); }
 .layer span { margin-top: 2px; font-size: 0.64rem; }
 .hermit-layer { color: var(--stack-ink); background: var(--coral-bright); }
-.orbit { position: absolute; inset: 13.8%; margin: 0; padding: 0; list-style: none; border: 1px solid var(--orbit-line); border-radius: 50%; animation: orbit-turn 72s linear infinite; }
-.entropy { position: absolute; transform: translate(-50%, -50%); }
-.entropy-1 { left: 50%; top: 0; }
-.entropy-2 { left: 93.3%; top: 25%; }
-.entropy-3 { left: 93.3%; top: 75%; }
-.entropy-4 { left: 50%; top: 100%; }
-.entropy-5 { left: 6.7%; top: 75%; }
-.entropy-6 { left: 6.7%; top: 25%; }
-.entropy-label { display: block; color: var(--coral); font-size: 0.73rem; font-weight: 650; line-height: 1.3; text-align: center; white-space: nowrap; animation: label-turn 72s linear infinite; }
+.orbit { position: absolute; inset: 0; margin: 0; padding: 0; list-style: none; }
+.entropy { position: absolute; inset: calc(var(--ring-inset) + 1px); pointer-events: none; animation: orbit-turn var(--ring-period) linear infinite; }
+.ring-outer { --ring-inset: var(--ring-outer); --ring-period: 108s; }
+.ring-middle { --ring-inset: var(--ring-middle); --ring-period: 72s; }
+.ring-inner { --ring-inset: var(--ring-inner); --ring-period: 54s; }
+.entropy-label { position: absolute; transform: translate(-50%, -50%); display: block; color: var(--coral); font-size: 0.73rem; font-weight: 650; line-height: 1.3; text-align: center; white-space: nowrap; pointer-events: auto; animation: label-turn var(--ring-period) linear infinite; }
+.entropy-1 .entropy-label { left: 50%; top: 0; }
+.entropy-2 .entropy-label { left: 93.3%; top: 25%; }
+.entropy-3 .entropy-label { left: 50%; top: 100%; }
+.entropy-4 .entropy-label { left: 6.7%; top: 75%; }
+.entropy-5 .entropy-label { left: 6.7%; top: 25%; }
+.entropy-6 .entropy-label { left: 93.3%; top: 75%; }
 @keyframes orbit-turn { to { transform: rotate(360deg); } }
-@keyframes label-turn { to { transform: rotate(-360deg); } }
+@keyframes label-turn { from { transform: translate(-50%, -50%) rotate(0deg); } to { transform: translate(-50%, -50%) rotate(-360deg); } }
 .motion-toggle { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 .motion-control { order: 1; display: inline-flex; align-items: center; gap: 7px; padding: 5px 8px; margin-bottom: 12px; font-size: 0.76rem; cursor: pointer; }
 .motion-control::before { content: ""; width: 13px; height: 13px; border: 1px solid var(--muted); border-radius: 2px; }
 .motion-toggle:checked + .motion-control::before { background: var(--ink); box-shadow: inset 0 0 0 2px var(--paper); }
 .motion-toggle:focus-visible + .motion-control { outline: 3px solid var(--blue); outline-offset: 3px; }
-.motion-toggle:checked ~ .orbit-scene .orbit, .motion-toggle:checked ~ .orbit-scene .entropy-label { animation-play-state: paused; }
+.motion-toggle:checked ~ .orbit-scene .entropy, .motion-toggle:checked ~ .orbit-scene .entropy-label { animation-play-state: paused; }
 figcaption { order: 2; max-width: 410px; color: var(--muted); font-size: 0.82rem; text-align: center; }
 
 .section { padding: 76px 0; border-top: 1px solid var(--line); }
@@ -192,11 +196,11 @@ footer nav a { font-size: 0.8rem; }
   .lede { font-size: 1rem; }
   .hero-visual { margin-top: 12px; }
   .orbit-scene { display: flex; flex-direction: column; align-items: center; aspect-ratio: auto; padding: 24px 12px; border: 1px solid var(--line); background: var(--orbit-surface); }
-  .orbit-scene::before, .orbit-scene::after { display: none; }
+  .orbit-scene::before, .orbit-scene::after, .orbit::before { display: none; }
   .architecture { position: static; transform: none; margin-bottom: 26px; width: 170px; }
-  .orbit { position: static; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; gap: 8px; border: 0; border-radius: 0; animation: none; }
-  .entropy { position: static; transform: none; }
-  .entropy-label { display: flex; align-items: center; justify-content: center; min-height: 45px; height: 100%; animation: none; white-space: normal; }
+  .orbit { position: static; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; gap: 8px; }
+  .entropy { position: static; animation: none; }
+  .entropy-label { position: static; transform: none; display: flex; align-items: center; justify-content: center; min-height: 45px; height: 100%; animation: none; white-space: normal; }
   .entropy-label br { display: none; }
   .motion-control, .motion-toggle { display: none; }
   figcaption { margin-top: 18px; }
@@ -207,6 +211,6 @@ footer nav a { font-size: 0.8rem; }
 }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
-  .orbit, .entropy-label { animation: none; }
+  .entropy, .entropy-label { animation: none; }
   .motion-control, .motion-toggle { display: none; }
 }

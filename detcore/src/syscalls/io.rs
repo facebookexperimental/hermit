@@ -431,6 +431,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Record or replay a raw `select` or `pselect6` the way `poll` is: a zero
+    /// timeout cannot block and takes an ordinary scheduler turn; any other call
+    /// may wait in the kernel, so it runs as a blocking external operation. The
+    /// recorder captures the descriptor sets and remaining time, so replay never
+    /// asks the kernel about descriptors it did not recreate.
+    async fn record_or_replay_select_family<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        zero_timeout: bool,
+    ) -> Result<i64, Error> {
+        if zero_timeout {
+            resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
+            Ok(self.record_or_replay(guest, call).await?)
+        } else {
+            self.record_or_replay_blocking(guest, call).await
+        }
+    }
+
     /// pselect6 syscall (MAYHANG).
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
@@ -439,9 +458,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Pselect6,
     ) -> Result<i64, Error> {
-        if self.cfg.recordreplay_modes || !self.cfg.sequentialize_threads {
-            // Recorder/Replayer do not model pselect6 events. Preserve their existing
-            // live-kernel behavior without adding BlockingExternalIO scheduler events.
+        if self.cfg.recordreplay_modes {
+            let zero_timeout = call.timeout().is_some_and(|timeout| {
+                guest
+                    .memory()
+                    .read_value(timeout)
+                    .is_ok_and(|timeout: Timespec| timeout.tv_sec == 0 && timeout.tv_nsec == 0)
+            });
+            return self
+                .record_or_replay_select_family(guest, Syscall::Pselect6(call), zero_timeout)
+                .await;
+        }
+        if !self.cfg.sequentialize_threads {
             return Ok(guest.inject(call).await?);
         }
 
@@ -711,9 +739,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Select,
     ) -> Result<i64, Error> {
-        if self.cfg.recordreplay_modes || !self.cfg.sequentialize_threads {
-            // Recorder/Replayer do not model select events. Preserve their existing
-            // live-kernel behavior without adding BlockingExternalIO scheduler events.
+        if self.cfg.recordreplay_modes {
+            let zero_timeout = call.timeout().is_some_and(|timeout| {
+                guest
+                    .memory()
+                    .read_value(timeout)
+                    .is_ok_and(|timeout: libc::timeval| timeout.tv_sec == 0 && timeout.tv_usec == 0)
+            });
+            return self
+                .record_or_replay_select_family(guest, Syscall::Select(call), zero_timeout)
+                .await;
+        }
+        if !self.cfg.sequentialize_threads {
             return Ok(guest.inject(call).await?);
         }
 

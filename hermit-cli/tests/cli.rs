@@ -39,6 +39,9 @@ mod liteinst_runtime;
 #[path = "common/readonly_proc.rs"]
 mod readonly_proc;
 
+#[path = "common/run2_log.rs"]
+mod run2_log;
+
 #[path = "common/nonleader_exec.rs"]
 mod nonleader_exec;
 
@@ -81,6 +84,7 @@ static DBT_PID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_PRLIMIT_SELF_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KVM_EXACT_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static KVM_GETTIMEOFDAY_EFAULT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_STDERR_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -406,6 +410,48 @@ fn liteinst_runtime_cache_requires_the_current_revision() {
     ));
 }
 
+/// A regular build embeds no source revision; only `HERMIT_STAMP_GIT_SHA=1`
+/// stamps one. Both `--version` and `version --json` must say which.
+#[test]
+fn version_names_a_revision_only_when_the_build_was_stamped() {
+    let text = hermit(&["--version"]);
+    assert!(text.status.success(), "hermit --version failed: {text:?}");
+    let text = String::from_utf8(text.stdout).expect("--version is not UTF-8");
+    let json = hermit(&["version", "--json"]);
+    assert!(
+        json.status.success(),
+        "hermit version --json failed: {json:?}"
+    );
+    let info: detcore_model::build_info::BuildInfo =
+        serde_json::from_slice(&json.stdout).expect("version --json is not BuildInfo");
+
+    if option_env!("HERMIT_STAMP_GIT_SHA") == Some("1") {
+        let sha = info.git_sha.strip_suffix("-dirty").unwrap_or(&info.git_sha);
+        assert!(
+            sha.len() == 12 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "a stamped build must embed a 12-hex revision, got {:?}",
+            info.git_sha
+        );
+        assert!(
+            text.trim_end().ends_with(&format!(", g{})", info.git_sha)),
+            "--version must name the stamped revision: {text:?}"
+        );
+    } else {
+        assert_eq!(
+            info.git_sha, "unknown",
+            "a regular build embedded a revision"
+        );
+        assert!(
+            text.trim_end().ends_with(", source revision not embedded)"),
+            "--version must disclose the missing source revision: {text:?}"
+        );
+        assert!(
+            !text.contains(", g"),
+            "--version names a revision: {text:?}"
+        );
+    }
+}
+
 #[cfg(feature = "liteinst")]
 fn liteinst_inert_runtime() -> &'static Path {
     LITEINST_INERT_RUNTIME.get_or_init(|| {
@@ -692,6 +738,31 @@ fn kvm_exact_child_waits_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "KVM exact-child wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn kvm_gettimeofday_efault_guest() -> &'static Path {
+    KVM_GETTIMEOFDAY_EFAULT_GUEST.get_or_init(|| {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kvm_gettimeofday_efault.c");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-gettimeofday-efault");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create KVM gettimeofday EFAULT guest directory");
+        let guest = build_root.join("kvm_gettimeofday_efault");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile KVM gettimeofday EFAULT guest");
+        assert!(
+            output.status.success(),
+            "KVM gettimeofday EFAULT guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -1408,7 +1479,8 @@ fn run_verify_uses_readonly_proc_after_permission_denial() {
 #[test]
 fn record_replay_uses_readonly_proc_after_permission_denial() {
     let _guard = hermit_run_guard();
-    let args = ["record", "--verify", "--", "/bin/true"];
+    // Local networking would require another flags-zero mount for sysfs.
+    let args = ["record", "--network=host", "--verify", "--", "/bin/true"];
     let output = readonly_proc_command(&args)
         .output()
         .expect("start record/replay with writable mounts denied");
@@ -1439,10 +1511,37 @@ fn readonly_proc_metadata_detects_replay_mismatch_and_accepts_older_recordings()
     let _guard = hermit_run_guard();
     let data = tempfile::tempdir().unwrap();
     let directory = data.path().to_str().unwrap();
-    let record_args = ["record", "--data-dir", directory, "--", "/bin/true"];
+    // Local networking would require another flags-zero mount for sysfs.
+    let record_args = [
+        "record",
+        "--network=host",
+        "--data-dir",
+        directory,
+        "--",
+        "/bin/true",
+    ];
     let recording = readonly_proc_command(&record_args).output().unwrap();
     assert_success(&recording, &record_args);
     let id = fs::read_to_string(data.path().join("last")).unwrap();
+
+    // The completion hint must name the data directory the recording went to.
+    // Without it the printed command looks in the default directory and finds
+    // nothing. Run the printed command itself, not a hand-built equivalent.
+    let record_stderr = strip_ansi_sgr(&stderr(&recording));
+    let hint = format!(
+        "hermit replay --autopilot --data-dir={} {}",
+        shell_words::quote(directory),
+        id.trim()
+    );
+    assert!(
+        record_stderr.contains(&hint),
+        "missing replay hint {hint:?}:\n{record_stderr}"
+    );
+    let hint_words = shell_words::split(&hint).unwrap();
+    let hint_args: Vec<&str> = hint_words[1..].iter().map(String::as_str).collect();
+    let hinted_replay = readonly_proc_command(&hint_args).output().unwrap();
+    assert_success(&hinted_replay, &hint_args);
+
     let metadata_path = data.path().join(id.trim()).join("metadata.json");
     let mut metadata: serde_json::Value =
         serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
@@ -1827,15 +1926,22 @@ fn run_dbt_verifies_fresh_physical_workdirs() {
             report["compared_log_messages"]["left"], report["compared_log_messages"]["right"],
             "{report}"
         );
-        for side in ["run1_log_", "run2_log_"] {
-            let captures = fs::read_dir(&logs)
+        // After a match `--keep-logs` retains only run 1's log, the golden
+        // log; run 2's log, which matched it, is deleted.
+        let captures = |side: &str| {
+            fs::read_dir(&logs)
                 .unwrap()
                 .map(Result::unwrap)
                 .filter(|entry| entry.file_name().to_string_lossy().starts_with(side))
-                .collect::<Vec<_>>();
-            assert_eq!(captures.len(), 1);
-            assert!(captures[0].metadata().unwrap().len() > 0);
-        }
+                .collect::<Vec<_>>()
+        };
+        let golden = captures("run1_log_");
+        assert_eq!(golden.len(), 1);
+        assert!(golden[0].metadata().unwrap().len() > 0);
+        assert!(
+            captures("run2_log_").is_empty(),
+            "verify {attempt}: a matched verification must not retain run 2's log"
+        );
     };
     // Each command performs the original strict two-run comparison. Reusing
     // either a physical-run directory or a sibling's directory makes O_EXCL
@@ -1858,11 +1964,14 @@ fn run_dbt_verifies_fresh_physical_workdirs() {
 
 /// DBT's retained verify captures must carry the names THE HARNESS SCANS FOR.
 ///
-/// This is not a style assertion. `ci/compat-envelope/pressure-test.rs` and
-/// `ci/manifest-plan/src/runner.rs` both locate the pair with
-/// `name.starts_with("run1_log_")` / `("run2_log_")`, and a terminal verify
-/// result whose directory does not yield exactly one of each is recorded
-/// `infrastructure-error` regardless of the verdict it actually reached.
+/// This is not a style assertion. `ci/compat-envelope/pressure-test.rs` locates
+/// the retained logs with `name.starts_with("run1_log_")` / `("run2_log_")`,
+/// and the parity post-pass reads the `run1_log_` golden. A matched verify
+/// result must yield exactly one nonempty `run1_log_` capture and no
+/// `run2_log_` capture, because `--keep-logs` keeps only the golden log after a
+/// match; a diverged result must yield exactly one of each. A terminal result
+/// whose directory does not fit its verdict is recorded `infrastructure-error`
+/// regardless of the verdict it actually reached.
 ///
 /// DBT used to pass "dbt-run1"/"dbt-run2" to `temp_log_files_in`, producing
 /// `dbt-run1_log_*`, which does not start with `run1_log_`. Measured 2026-08-27
@@ -1876,7 +1985,10 @@ fn run_dbt_verifies_fresh_physical_workdirs() {
 /// Nothing else in the tree ever referenced the `dbt-` spelling, so it was
 /// undefended: the mismatch could return by editing one string with no test
 /// failing. This asserts BOTH directions -- the scanned names are present, and
-/// the old spelling is absent -- so a revert is visible.
+/// the old spelling is absent -- so a revert is visible. Run 2's name is only
+/// retained after a divergence, so
+/// `dbt_verify_without_json_rejects_io_buffer_content_divergence` pins it on a
+/// deterministic divergence.
 #[test]
 fn dbt_verify_retains_captures_under_the_names_the_harness_scans_for() {
     if dbt_unavailable("dbt_verify_retains_captures_under_the_names_the_harness_scans_for") {
@@ -1887,6 +1999,7 @@ fn dbt_verify_retains_captures_under_the_names_the_harness_scans_for() {
         .expect("failed to create DBT verify-log naming test directory");
     let log_dir = root.path().join("verify-logs");
     fs::create_dir(&log_dir).expect("failed to create DBT verification log directory");
+    let verdict_path = root.path().join("verdict.json");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
@@ -1898,26 +2011,38 @@ fn dbt_verify_retains_captures_under_the_names_the_harness_scans_for() {
             "--keep-logs",
             "--verify-log-dir",
         ])
-        .arg(&log_dir);
+        .arg(&log_dir)
+        .arg("--verify-json")
+        .arg(&verdict_path);
     append_hermit_args_using_outer_mount(
         &mut command,
         &["--", "/bin/echo", "dbt-verify-log-naming"],
     );
     let output = command.output().expect("failed to run DBT verification");
 
-    // DELIBERATELY NOT asserting the verdict. The subject here is the NAME the
-    // captures are retained under, and `--keep-logs` retains them whether the
-    // two runs matched or not. An earlier version of this test also required
-    // success and was flaky within three runs: DBT verification of /bin/echo
-    // diverged on one of them ("Log differences found between run 1 and run 2"),
-    // which failed the test for a reason that has nothing to do with the naming
-    // it exists to pin. Coupling a property to an unrelated verdict is how a
-    // test starts getting re-run until it passes.
+    // DELIBERATELY NOT REQUIRING a particular verdict. The subject here is the
+    // NAME the captures are retained under. An earlier version of this test
+    // required success and was flaky within three runs: DBT verification of
+    // /bin/echo diverged on one of them ("Log differences found between run 1
+    // and run 2"), which failed the test for a reason that has nothing to do
+    // with the naming it exists to pin. Coupling a property to an unrelated
+    // verdict is how a test starts getting re-run until it passes. The verdict
+    // only selects which captures `--keep-logs` must have retained.
     let stderr_text = strip_ansi_sgr(&stderr(&output));
     assert!(
-        stderr_text.contains("Verification logs retained") || output.status.success(),
-        "DBT verification neither succeeded nor reported retained logs, so this test cannot \
-         observe the capture names at all:\n{stderr_text}"
+        stderr_text.contains("Verification logs retained"),
+        "DBT verification did not report retained logs, so this test cannot observe the \
+         capture names at all:\n{stderr_text}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&verdict_path).expect("DBT verification did not write its --verify-json report"),
+    )
+    .expect("DBT verification report should be JSON");
+    let matched = report["verdict"] == "matched";
+    assert_eq!(
+        output.status.success(),
+        matched,
+        "process status disagrees with the recorded verdict: {report}"
     );
 
     let names = |prefix: &str| -> Vec<String> {
@@ -1928,26 +2053,46 @@ fn dbt_verify_retains_captures_under_the_names_the_harness_scans_for() {
             .filter(|name| name.starts_with(prefix))
             .collect()
     };
-
-    // The harness predicate, applied verbatim: exactly one of each, both nonempty.
-    for prefix in ["run1_log_", "run2_log_"] {
-        let matched = names(prefix);
-        assert_eq!(
-            matched.len(),
-            1,
-            "DBT verification must retain exactly one {prefix} capture for the harness to find; \
-             directory held {:?}",
-            fs::read_dir(&log_dir)
-                .map(|entries| entries
+    let directory_listing = || {
+        fs::read_dir(&log_dir)
+            .map(|entries| {
+                entries
                     .filter_map(Result::ok)
                     .map(|e| e.file_name())
-                    .collect::<Vec<_>>())
-                .unwrap_or_default()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+
+    // The harness predicate, applied verbatim: a match retains exactly one
+    // nonempty golden capture and no second capture; anything else retains
+    // exactly one nonempty capture of each side.
+    let retained: &[&str] = if matched {
+        &["run1_log_"]
+    } else {
+        &["run1_log_", "run2_log_"]
+    };
+    for prefix in retained {
+        let found = names(prefix);
+        assert_eq!(
+            found.len(),
+            1,
+            "DBT verification ({}) must retain exactly one {prefix} capture for the harness to \
+             find; directory held {:?}",
+            report["verdict"],
+            directory_listing()
         );
-        let size = fs::metadata(log_dir.join(&matched[0]))
+        let size = fs::metadata(log_dir.join(&found[0]))
             .expect("failed to stat a retained capture")
             .len();
-        assert!(size > 0, "retained capture {} is empty", matched[0]);
+        assert!(size > 0, "retained capture {} is empty", found[0]);
+    }
+    if matched {
+        assert!(
+            names("run2_log_").is_empty(),
+            "a matched DBT verification must not retain run 2's log; directory held {:?}",
+            directory_listing()
+        );
     }
 
     // And the spelling that hid them must not come back.
@@ -2039,6 +2184,43 @@ fn dbt_verify_without_json_rejects_io_buffer_content_divergence() {
             stderr.contains(marker),
             "DBT's no-JSON verification failure did not name {marker:?}; it must fail on the \
              syscall output-buffer evidence itself:\n{stderr}"
+        );
+    }
+
+    // A divergence keeps both logs under `--keep-logs`, each under the name the
+    // harness scans for. This deterministic divergence is what pins run 2's
+    // name: after a match only run 1's golden log is retained.
+    let captures = |prefix: &str| -> Vec<PathBuf> {
+        fs::read_dir(&log_dir)
+            .expect("failed to read the retained DBT verify-log directory")
+            .map(|entry| entry.expect("failed to read a retained log entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .collect()
+    };
+    for prefix in ["run1_log_", "run2_log_"] {
+        let found = captures(prefix);
+        assert_eq!(
+            found.len(),
+            1,
+            "a diverged DBT verification must retain exactly one {prefix} capture: {found:?}"
+        );
+        let size = fs::metadata(&found[0])
+            .expect("failed to stat a retained DBT capture")
+            .len();
+        assert!(
+            size > 0,
+            "retained DBT capture {} is empty",
+            found[0].display()
+        );
+    }
+    for stale in ["dbt-run1_log_", "dbt-run2_log_"] {
+        assert!(
+            captures(stale).is_empty(),
+            "DBT retained a {stale} capture instead of the name the harness scans for"
         );
     }
 }
@@ -2674,11 +2856,164 @@ fn backend_stats_are_debug_gated_and_absent_from_the_info_envelope() {
     let debug_args = ["--log", "debug", "run", "--strict", "--", "/bin/true"];
     let debug_output = hermit(&debug_args);
     assert_success(&debug_output, &debug_args);
+    let debug_stderr = stderr(&debug_output);
     assert!(
-        stderr(&debug_output).contains("backend run complete backend=ptrace stats=metrics=none"),
-        "{}",
-        stderr(&debug_output)
+        debug_stderr.contains("backend run complete backend=ptrace stats=ptrace activity stats: "),
+        "{debug_stderr}"
     );
+    let dispatch_marker = " dispatch=dispatch stats v1 backend=ptrace dispatches=";
+    let dispatches = debug_stderr
+        .split_once(dispatch_marker)
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("{debug_stderr}"));
+    assert!(
+        dispatches.starts_with(|c: char| c.is_ascii_digit()),
+        "ptrace always measures its dispatches: {debug_stderr}"
+    );
+}
+
+/// LiteInst reports its own counters, under the same DEBUG gate as ptrace.
+///
+/// The guest is Hermit's activation probe: 32 `getpid` calls from one
+/// instruction site, of which the first traps and installs the hook and the
+/// other 31 go through it. So a record that really came from this run counts
+/// at least 31 direct hooks; other sites in the probe's own start-up may add
+/// more. Exactly one record is required because the activation check Hermit
+/// runs first happens before logging is set up.
+///
+/// Hermit reports from two call sites, one per way of running the guest: a
+/// plain `run` waits for the exit status, while `--verify` (and `analyze`)
+/// capture the output. Both are checked. Under `--verify --keep-logs` each of
+/// the two compared runs writes its DEBUG log to its own file, and after a
+/// match Hermit keeps only run 1's as the golden log and deletes run 2's
+/// (https://github.com/rrnewton/hermit/issues/3301). So run 2's log must be
+/// gone, and each log must hold exactly one record from its own run: the
+/// golden log, and run 2's, through a link made while Hermit ran. Plain
+/// `--verify` compares only selected DETLOG and scheduler COMMIT records
+/// (`filter_deterministic` in `detcore/src/logdiff.rs`), so the match does not
+/// imply that run 2's log holds this DEBUG record.
+///
+/// `process_reports=0` is today's architecture, not a gap: the ptrace host
+/// counts every hook entry itself, so no guest process submits a report.
+/// When Detcore moves into the guest (https://github.com/rrnewton/hermit/issues/3520)
+/// each guest process reports its own counts and this becomes 1.
+#[test]
+#[cfg(feature = "liteinst")]
+fn liteinst_backend_stats_report_the_guests_own_dispatch_paths() {
+    liteinst_runtime::ensure_liteinst_runtime();
+    let hermit = liteinst_runtime::hermit_binary();
+    let hermit_path = hermit.to_str().expect("Hermit test binary path is UTF-8");
+    // With `verify` as `Some((logs, capture))` the guest runs under
+    // `--verify --keep-logs` into `logs`, and run 2's log is also returned
+    // through a hard link at `capture`.
+    let run = |log: &[&str], verify: Option<(&Path, &Path)>| {
+        let mut args = log.to_vec();
+        args.extend(["--backend", "liteinst", "run"]);
+        if let Some((logs, _)) = verify {
+            let logs = logs.to_str().expect("verify-log directory path is UTF-8");
+            args.extend(["--verify", "--keep-logs", "--verify-log-dir", logs]);
+        }
+        args.extend([
+            "--strict",
+            "--env=HERMIT_INTERNAL_LITEINST_ACTIVATION_PROBE=1",
+            "--",
+            hermit_path,
+        ]);
+        let mut command = Command::new(&hermit);
+        command
+            .env_remove("RUST_LOG")
+            .env_remove("HERMIT_LOG")
+            .env_remove("HERMIT_LOG_FILE");
+        append_hermit_args(&mut command, &args);
+        let (output, run2_log) = match verify {
+            Some((logs, capture)) => output_capturing_run2_log(&mut command, logs, capture),
+            None => (
+                command.output().unwrap_or_else(|error| {
+                    panic!("failed to run LiteInst Hermit with {args:?}: {error}")
+                }),
+                None,
+            ),
+        };
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            "hermit-liteinst-activation calls=32 traps=1 hooks=31\n"
+        );
+        (stderr(&output), run2_log)
+    };
+    let check_record = |source: &str, text: &str| {
+        let records: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("backend run complete"))
+            .collect();
+        let [record] = records[..] else {
+            panic!(
+                "expected exactly one backend statistics record in {source}, found {records:#?}"
+            );
+        };
+        assert!(
+            record.contains(
+                "backend run complete backend=liteinst stats=LiteInst instrumentation stats: process_reports=0 "
+            ),
+            "{source}: {record}"
+        );
+        let direct_hooks: u64 = record
+            .split_once("direct_hook=")
+            .and_then(|(_, rest)| {
+                rest.split(|character: char| !character.is_ascii_digit())
+                    .next()
+            })
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| panic!("no direct_hook count in {source}: {record}"));
+        assert!(
+            direct_hooks >= 31,
+            "the probe makes 31 hooked calls, but {source} counts {direct_hooks}: {record}"
+        );
+    };
+
+    for log in [&[][..], &["--log", "info"][..]] {
+        let (stderr, _) = run(log, None);
+        assert!(
+            !stderr.contains("backend run complete"),
+            "the record is DEBUG-only, but {log:?} printed it:\n{stderr}"
+        );
+    }
+
+    check_record("the run's stderr", &run(&["--log", "debug"], None).0);
+
+    let directory = tempfile::Builder::new()
+        .prefix("liteinst-stats-verify-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create LiteInst verify directory")
+        .keep();
+    eprintln!(
+        "LiteInst statistics verification artifacts retained at {}",
+        directory.display()
+    );
+    let logs = directory.join("verify-logs");
+    fs::create_dir(&logs).expect("failed to create LiteInst verify-log directory");
+    let link = directory.join("captured-run2.log");
+    let (verify_stderr, run2_log) = run(&["--log", "debug"], Some((&logs, &link)));
+    assert!(
+        verify_stderr.contains("Success: deterministic. Determinism verified."),
+        "{verify_stderr}"
+    );
+    let golden = retained_captures(&logs, "run1_log_");
+    let [capture] = &golden[..] else {
+        panic!("expected exactly one run1_log_ capture, found {golden:?}");
+    };
+    let duplicates = retained_captures(&logs, "run2_log_");
+    assert!(
+        duplicates.is_empty(),
+        "a matched verification must delete run 2's log: {duplicates:?}"
+    );
+    let run2_log = run2_log.expect("run 2's log, captured while the command ran");
+    for path in [capture, &run2_log] {
+        let text = fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        check_record(&path.display().to_string(), &text);
+    }
+    fs::remove_file(&run2_log).expect("failed to remove run 2's checked log");
 }
 
 #[test]
@@ -2863,11 +3198,18 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
         (None, "<unset>"),
         (Some("guest-sentinel"), "guest-sentinel"),
     ] {
-        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-            .expect("failed to create DBT log-env verification directory");
-        let logs = directory.path().join("logs");
+        let directory = tempfile::Builder::new()
+            .prefix("dbt-log-env-verify-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create DBT log-env verification directory")
+            .keep();
+        eprintln!(
+            "DBT log-env verification artifacts retained at {}",
+            directory.display()
+        );
+        let logs = directory.join("logs");
         fs::create_dir(&logs).expect("failed to create DBT log-env verification log directory");
-        let verdict = directory.path().join("verdict.json");
+        let verdict = directory.join("verdict.json");
         let expected_arg = format!("expect={expected}");
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
         command
@@ -2893,26 +3235,60 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
         if let Some(value) = guest_value {
             command.env("HERMIT_LOG", value);
         }
-        let output = command.output().expect("failed to run DBT log-env case");
+        let capture = directory.join("captured-run2.log");
+        let (output, run2_log) = output_capturing_run2_log(&mut command, &logs, &capture);
         let report = read_terminal_dbt_verdict(&verdict);
         assert_eq!(
             output.status.success(),
             report["verified"] == true,
             "process status disagrees with terminal verdict: {report}"
         );
-        let retained_logs = fs::read_dir(&logs)
+        let mut retained_logs = fs::read_dir(&logs)
             .expect("failed to read retained DBT log-env verification logs")
             .map(|entry| entry.expect("failed to read retained log entry").path())
             .collect::<Vec<_>>();
-        assert_eq!(retained_logs.len(), 2, "unexpected logs: {retained_logs:?}");
-        for log in retained_logs {
-            let contents = fs::read_to_string(&log).expect("failed to read retained DBT log");
+        retained_logs.sort();
+        // `--keep-logs` keeps only run 1's golden log after a match, and both
+        // logs after a divergence.
+        let expected_sides: &[&str] = if report["verdict"] == "matched" {
+            &["run1_log_"]
+        } else {
+            &["run1_log_", "run2_log_"]
+        };
+        assert_eq!(
+            retained_logs.len(),
+            expected_sides.len(),
+            "unexpected logs for verdict {}: {retained_logs:?}",
+            report["verdict"]
+        );
+        for (log, side) in retained_logs.iter().zip(expected_sides) {
+            assert!(
+                log.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(side)),
+                "expected a {side} capture, found {log:?}"
+            );
+        }
+        // The helper links run 2's log while the command runs, and once more
+        // after it exits, which finds the log a divergence retains. A missing
+        // capture fails here whatever the verdict.
+        let run2_log = run2_log.expect("run 2's log was not captured while the command ran");
+        // After a match Hermit deletes run 2's log, so the link made while the
+        // command ran is checked in its place. The match compares only INFO
+        // records, and leaked guest stdout could be in a record of another level.
+        let mut checked_logs = retained_logs;
+        if report["verdict"] == "matched" {
+            checked_logs.push(run2_log.clone());
+        }
+        for log in checked_logs {
+            let contents = fs::read_to_string(&log).expect("failed to read DBT verification log");
             assert!(contents.contains("INFO detcore"), "empty INFO log: {log:?}");
             assert!(
                 !contents.contains("hermit_log="),
                 "guest stdout leaked into DBT diagnostics: {log:?}"
             );
         }
+        fs::remove_file(run2_log).expect("failed to remove run 2's checked log");
     }
 }
 
@@ -3396,6 +3772,54 @@ fn run_kvm_executes_dynamic_guest() {
         "kvm must not fall through to the ptrace backend:\n{}",
         stderr(&output),
     );
+}
+
+#[test]
+fn run_kvm_gettimeofday_invalid_tv_returns_efault_and_guest_continues() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let program = kvm_gettimeofday_efault_guest()
+        .to_str()
+        .expect("KVM gettimeofday EFAULT guest path should be UTF-8");
+    let args = [
+        "--backend",
+        "kvm",
+        "run",
+        "--strict",
+        "--",
+        program,
+        "invalid-tv",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "invalid-tv: EFAULT\n");
+}
+
+#[test]
+fn run_kvm_gettimeofday_faulting_tz_returns_efault_without_tool_error() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let program = kvm_gettimeofday_efault_guest()
+        .to_str()
+        .expect("KVM gettimeofday EFAULT guest path should be UTF-8");
+    let args = [
+        "--backend",
+        "kvm",
+        "run",
+        "--strict",
+        "--",
+        program,
+        "faulting-tz",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "faulting-tz: EFAULT tv=0.000000\n");
 }
 
 /// ⚠️ A GUEST THAT MUTATES hermit's OWN stderr MUST NOT MAKE `--verify` REPORT
@@ -6138,6 +6562,2547 @@ fn hermit_dap_rejects_replay_options_without_replay() {
     );
 }
 
+/// Set where a DAP-capable GDB is installed and must be exercised. Validation
+/// sets it on `test.cli`, whose pinned hermetic image ships GDB 17.2, so the
+/// end-to-end hermit-dap tests below FAIL there instead of skipping when GDB
+/// is missing, lacks a DAP interpreter, or is refused by managed replay.
+const HERMIT_REQUIRE_DAP_GDB: &str = "HERMIT_REQUIRE_DAP_GDB";
+
+/// The start of managed replay's refusal of a GDB whose DAP internals it
+/// cannot hook. The replay tests skip on it like on a GDB with no DAP
+/// interpreter: both are host-tool limits, and the pinned validation image,
+/// which ships the tested GDB 17.2, sets [`HERMIT_REQUIRE_DAP_GDB`] so that a
+/// refusal there fails instead.
+const DAP_GDB_REFUSAL: &str = "managed replay does not support this GDB";
+
+/// How long one DAP exchange may take before the test fails rather than hangs.
+/// A reverse request restarts the replay and runs it forward, so it gets more.
+/// Every wait is also cut off at the end of [`DAP_SESSION_BUDGET`].
+const DAP_TIMEOUT: Duration = Duration::from_secs(120);
+const DAP_REVERSE_TIMEOUT: Duration = Duration::from_secs(240);
+
+/// How long a whole DAP session may run, from spawning hermit-dap, before
+/// scaling by [`dap_wall_timeout_multiplier`].
+///
+/// Nextest kills a test at 57 s (`.config/nextest.toml`, scaled by the same
+/// multiplier) and reports only `(test timed out)`, so a wait longer than that
+/// can never fail on its own: the hosted runs
+/// <https://github.com/rrnewton/hermit/actions/runs/37134916002> and
+/// <https://github.com/rrnewton/hermit/actions/runs/37126714210> lost which
+/// request hung (<https://github.com/rrnewton/hermit/issues/3651>). Ending the
+/// session 7 s before that kill makes a hang fail with the request it waited
+/// for and the DAP transcript. The 7 s cover what a test does before the
+/// session starts: compiling the guest and starting the gdbserver or recording
+/// the guest. The whole attach test, setup included, takes under 1 s locally.
+const DAP_SESSION_BUDGET: Duration = Duration::from_secs(50);
+
+/// The line of `square`'s body in [`DAP_GUEST_SOURCE`], where the tests break.
+const DAP_GUEST_BREAK_LINE: u64 = 4;
+/// The line in `main` that calls `square`.
+const DAP_GUEST_CALL_LINE: u64 = 11;
+// ⚠️ THE TWO LINE NUMBERS ABOVE ARE THIS LAYOUT. Keep them in step.
+const DAP_GUEST_SOURCE: &str = r#"#include <stdio.h>
+
+static int square(int x) {
+  int y = x * x;
+  return y;
+}
+
+int main(void) {
+  int total = 0;
+  for (int i = 0; i < 3; i++) {
+    total += square(i);
+  }
+  printf("total=%d\n", total);
+  return 0;
+}
+"#;
+
+/// The GDB hermit-dap would pick (`/usr/bin/gdb`, else `gdb` on `PATH`), when it
+/// has a DAP interpreter.
+///
+/// hermit-dap is only a launcher: everything after `exec` is GDB's DAP server,
+/// so these tests need a real one. Where none is installed they skip loudly; a
+/// job that sets [`HERMIT_REQUIRE_DAP_GDB`] turns the skip into a failure.
+fn dap_capable_gdb(test: &str) -> Option<PathBuf> {
+    let candidate = if Path::new("/usr/bin/gdb").is_file() {
+        Some(PathBuf::from("/usr/bin/gdb"))
+    } else {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("gdb"))
+                .find(|gdb| gdb.is_file())
+        })
+    };
+    let reason = match &candidate {
+        None => "no gdb at /usr/bin/gdb or on PATH".to_owned(),
+        Some(gdb) => match Command::new(gdb)
+            .args(["--batch", "-nx", "-ex", "python import gdb.dap.server"])
+            .output()
+        {
+            Ok(output) if output.status.success() => return candidate,
+            Ok(output) => format!(
+                "{} has no DAP interpreter (`python import gdb.dap.server` failed: {})",
+                gdb.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(error) => format!("{} could not be run: {error}", gdb.display()),
+        },
+    };
+    dap_gdb_skip(test, &reason);
+    None
+}
+
+/// Skips `test` loudly, or fails it where [`HERMIT_REQUIRE_DAP_GDB`] is set.
+fn dap_gdb_skip(test: &str, reason: &str) {
+    assert!(
+        std::env::var_os(HERMIT_REQUIRE_DAP_GDB).is_none(),
+        "{HERMIT_REQUIRE_DAP_GDB} is set, but {reason}, so {test} cannot drive hermit-dap \
+         through a real GDB"
+    );
+    eprintln!(
+        "skipping {test}: {reason}; install a GDB with DAP support (tested with GDB 17.2), \
+         or set {HERMIT_REQUIRE_DAP_GDB}=1 to make this a failure"
+    );
+}
+
+/// Writes and compiles [`DAP_GUEST_SOURCE`] under `directory`, returning the
+/// source and program paths. Each test passes its own directory: nextest runs
+/// tests in separate processes, so a shared output file would race.
+fn dap_guest(directory: &Path) -> (PathBuf, PathBuf) {
+    dap_compile(directory, "squares", DAP_GUEST_SOURCE)
+}
+
+/// Writes `text` to `directory/name.c` and compiles it, unoptimized and at a
+/// fixed address so the tests' line numbers map to stable instructions.
+fn dap_compile(directory: &Path, name: &str, text: &str) -> (PathBuf, PathBuf) {
+    let source = directory.join(format!("{name}.c"));
+    fs::write(&source, text).expect("failed to write the hermit-dap guest source");
+    let program = directory.join(name);
+    let output = Command::new("cc")
+        .args(["-g", "-O0", "-fno-pie", "-no-pie"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&program)
+        .output()
+        .expect("failed to run cc for the hermit-dap guest");
+    assert!(
+        output.status.success(),
+        "hermit-dap guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    (source, program)
+}
+
+/// A second guest for managed replay, shaped to put two kinds of arrival in
+/// the recorded history that [`DAP_GUEST_SOURCE`] does not:
+///
+/// - `countdown`'s loop branches back to the first instruction of line 4, the
+///   address its line breakpoint sits on, so the history holds consecutive
+///   arrivals at one pc and one source line, each a separate point in time.
+/// - `twice` is written under `#line 2`, so its first statement (line 2) and
+///   its opening line (8) resolve to one breakpoint address while GDB reports
+///   a stop there as line 2. The line breakpoint that records the arrival is
+///   line 8's, so the recorded entry and the stop name different lines.
+const DAP_LOOPS_SOURCE: &str = r#"#include <stdio.h>
+
+static int countdown(int n) {
+  do { n--; } while (n > 0);
+  return n;
+}
+
+static int twice(int x) {
+#line 2
+  return x + x;
+#line 12
+}
+
+int main(void) {
+  int left = countdown(3);
+  int sum = twice(1) + twice(2);
+  printf("left=%d sum=%d\n", left, sum);
+  return 0;
+}
+"#;
+/// `countdown`'s loop, its call in `main`, `twice`'s body (renumbered to 2)
+/// and closing brace, and the line in `main` that calls `twice`.
+const DAP_LOOPS_COUNTDOWN_LINE: u64 = 4;
+const DAP_LOOPS_COUNTDOWN_CALL_LINE: u64 = 15;
+const DAP_LOOPS_TWICE_BODY_LINE: u64 = 2;
+const DAP_LOOPS_TWICE_END_LINE: u64 = 12;
+const DAP_LOOPS_TWICE_CALL_LINE: u64 = 16;
+// ⚠️ THE FIVE LINE NUMBERS ABOVE ARE THIS LAYOUT. Keep them in step.
+
+/// The `for` line of [`DAP_GUEST_SOURCE`]'s loop in `main`.
+const DAP_GUEST_LOOP_LINE: u64 = 10;
+
+/// Records `program` with `hermit record start` under `data_dir`, requires
+/// `expected` in its stdout, and returns the recording id.
+fn dap_record(program: &Path, data_dir: &Path, expected: &str) -> String {
+    let program_arg = program.to_str().expect("guest path should be UTF-8");
+    let recorded = hermit_command(&["record", "start", "--", program_arg])
+        .env("HERMIT_DATA_DIR", data_dir)
+        .output()
+        .expect("failed to run hermit record start");
+    assert!(
+        recorded.status.success() && String::from_utf8_lossy(&recorded.stdout).contains(expected),
+        "hermit record start: {}\nstdout:\n{}\nstderr:\n{}",
+        recorded.status,
+        String::from_utf8_lossy(&recorded.stdout),
+        stderr(&recorded)
+    );
+    fs::read_to_string(data_dir.join("last"))
+        .expect("hermit record start wrote no `last` recording id")
+        .trim()
+        .to_owned()
+}
+
+/// hermit-dap serving `recording` from `data_dir` through `gdb`.
+fn dap_replay_adapter(
+    hermit_dap: &Path,
+    gdb: &Path,
+    recording: &str,
+    data_dir: &Path,
+    port: u16,
+) -> Command {
+    let mut adapter = Command::new(hermit_dap);
+    adapter
+        .arg("--gdb")
+        .arg(gdb)
+        .args(["--replay", recording, "--data-dir"])
+        .arg(data_dir)
+        .args(["--gdbserver-port", &port.to_string()]);
+    adapter
+}
+
+/// A loopback port nothing is listening on right now.
+fn unused_local_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("failed to find an unused loopback port")
+        .port()
+}
+
+/// Whether anything in this network namespace listens on TCP `port`.
+///
+/// Read from /proc rather than by connecting: Hermit's gdbserver accepts one
+/// client, and a probe connection would be that client.
+fn tcp_port_is_listening(port: u16) -> bool {
+    let wanted = format!(":{port:04X}");
+    ["/proc/net/tcp", "/proc/net/tcp6"].iter().any(|table| {
+        fs::read_to_string(table).is_ok_and(|text| {
+            text.lines().skip(1).any(|row| {
+                let fields: Vec<&str> = row.split_whitespace().collect();
+                fields.len() > 3 && fields[1].ends_with(&wanted) && fields[3] == "0A"
+            })
+        })
+    })
+}
+
+/// Kills and reaps the child when dropped, so a failed assertion cannot leave a
+/// gdbserver or guest running.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Whether `message` is a DAP event reporting that the debuggee stopped or
+/// ended: the events [`DapClient::stopped`] waits for.
+fn is_stop_class_event(message: &serde_json::Value) -> bool {
+    message["type"] == "event"
+        && matches!(
+            message["event"].as_str(),
+            Some("stopped" | "terminated" | "exited")
+        )
+}
+
+/// Appends `message` to `early` when it is a stop-class event.
+fn keep_stop_class_event(early: &mut Vec<serde_json::Value>, message: serde_json::Value) {
+    if is_stop_class_event(&message) {
+        early.push(message);
+    }
+}
+
+/// A Debug Adapter Protocol client for hermit-dap, keeping a transcript so a
+/// failure shows the whole exchange together with the adapter's stderr.
+struct DapClient {
+    adapter: KillOnDrop,
+    stdin: std::process::ChildStdin,
+    messages: std::sync::mpsc::Receiver<Result<serde_json::Value, String>>,
+    next_seq: u64,
+    transcript: Vec<String>,
+    stderr_path: PathBuf,
+    /// The scaled [`DAP_SESSION_BUDGET`] and the instant it runs out.
+    session_budget: Duration,
+    session_deadline: Instant,
+}
+
+impl DapClient {
+    fn spawn(mut command: Command, stderr_path: PathBuf) -> Self {
+        let session_budget = DAP_SESSION_BUDGET.mul_f64(dap_wall_timeout_multiplier());
+        let session_deadline = Instant::now() + session_budget;
+        let stderr =
+            fs::File::create(&stderr_path).expect("failed to create the hermit-dap stderr file");
+        let mut adapter = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            .spawn()
+            .expect("failed to spawn hermit-dap");
+        let stdin = adapter
+            .stdin
+            .take()
+            .expect("hermit-dap stdin should be piped");
+        let stdout = adapter
+            .stdout
+            .take()
+            .expect("hermit-dap stdout should be piped");
+        let (sender, messages) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse::<usize>().ok();
+                    }
+                }
+                let message = match length {
+                    None => Err("a DAP header block had no Content-Length".to_owned()),
+                    Some(length) => {
+                        let mut body = vec![0; length];
+                        match std::io::Read::read_exact(&mut reader, &mut body) {
+                            Err(error) => Err(format!("a DAP body was cut short: {error}")),
+                            Ok(()) => serde_json::from_slice(&body).map_err(|error| {
+                                format!(
+                                    "unparsable DAP message ({error}): {}",
+                                    String::from_utf8_lossy(&body)
+                                )
+                            }),
+                        }
+                    }
+                };
+                let stop = message.is_err();
+                if sender.send(message).is_err() || stop {
+                    return;
+                }
+            }
+        });
+        Self {
+            adapter: KillOnDrop(adapter),
+            stdin,
+            messages,
+            next_seq: 0,
+            transcript: Vec::new(),
+            stderr_path,
+            session_budget,
+            session_deadline,
+        }
+    }
+
+    /// `timeout`, cut off at the end of the session budget, and what to add
+    /// to the failure when the cut-off is what runs out.
+    fn session_bound(&self, timeout: Duration) -> (Duration, String) {
+        let left = self
+            .session_deadline
+            .saturating_duration_since(Instant::now());
+        if left < timeout {
+            let note = format!(
+                " (the end of the DAP session's {:?} budget, which is set below \
+                 nextest's per-test wall kill)",
+                self.session_budget
+            );
+            (left, note)
+        } else {
+            (timeout, String::new())
+        }
+    }
+
+    fn adapter_stderr(&self) -> String {
+        fs::read_to_string(&self.stderr_path).unwrap_or_default()
+    }
+
+    fn fail(&self, problem: &str) -> ! {
+        panic!(
+            "{problem}\nDAP transcript:\n{}\nhermit-dap stderr:\n{}",
+            self.transcript.join("\n"),
+            self.adapter_stderr()
+        )
+    }
+
+    fn request(&mut self, command: &str, arguments: serde_json::Value) -> u64 {
+        self.next_seq += 1;
+        let body = serde_json::json!({
+            "seq": self.next_seq,
+            "type": "request",
+            "command": command,
+            "arguments": arguments,
+        })
+        .to_string();
+        self.transcript.push(format!("-> {body}"));
+        let sent = write!(self.stdin, "Content-Length: {}\r\n\r\n{body}", body.len())
+            .and_then(|()| self.stdin.flush());
+        if let Err(error) = sent {
+            self.fail(&format!("could not send {command}: {error}"));
+        }
+        self.next_seq
+    }
+
+    /// The next message `matches` accepts; earlier messages are only logged.
+    fn wait_for(
+        &mut self,
+        what: &str,
+        timeout: Duration,
+        matches: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        self.wait_for_noting(what, timeout, matches, |_| {})
+    }
+
+    /// Like [`Self::wait_for`], but each earlier message is also handed to
+    /// `skipped` after it is logged.
+    fn wait_for_noting(
+        &mut self,
+        what: &str,
+        timeout: Duration,
+        matches: impl Fn(&serde_json::Value) -> bool,
+        mut skipped: impl FnMut(serde_json::Value),
+    ) -> serde_json::Value {
+        let (bound, cut_off) = self.session_bound(timeout);
+        let deadline = Instant::now() + bound;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.messages.recv_timeout(remaining) {
+                Ok(Ok(message)) => {
+                    let text = message.to_string();
+                    self.transcript
+                        .push(format!("<- {}", text.chars().take(600).collect::<String>()));
+                    if matches(&message) {
+                        return message;
+                    }
+                    skipped(message);
+                }
+                Ok(Err(problem)) => self.fail(&format!("waiting for {what}: {problem}")),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => self.fail(&format!(
+                    "timed out after {bound:?} waiting for {what}{cut_off}"
+                )),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => self.fail(&format!(
+                    "hermit-dap closed its output while waiting for {what}"
+                )),
+            }
+        }
+    }
+
+    /// Sends `command` and returns its response, which must report success.
+    fn call(
+        &mut self,
+        command: &str,
+        arguments: serde_json::Value,
+        timeout: Duration,
+    ) -> serde_json::Value {
+        self.call_noting(command, arguments, timeout, |_| {})
+    }
+
+    /// Like [`Self::call`], but each message before the response is also
+    /// handed to `skipped`.
+    fn call_noting(
+        &mut self,
+        command: &str,
+        arguments: serde_json::Value,
+        timeout: Duration,
+        skipped: impl FnMut(serde_json::Value),
+    ) -> serde_json::Value {
+        let seq = self.request(command, arguments);
+        let response = self.wait_for_noting(
+            &format!("the {command} response"),
+            timeout,
+            |message| message["type"] == "response" && message["request_seq"] == seq,
+            skipped,
+        );
+        if response["success"] != true {
+            self.fail(&format!("{command} failed: {response}"));
+        }
+        response
+    }
+
+    /// Sends `initialize` and returns its response, successful or not. The
+    /// adapter closing its output first fails the test: a startup refusal
+    /// must reach the client as this response, not only as stderr text.
+    fn initialize_response(&mut self) -> serde_json::Value {
+        let seq = self.request(
+            "initialize",
+            serde_json::json!({
+                "adapterID": "hermit",
+                "linesStartAt1": true,
+                "columnsStartAt1": true,
+                "pathFormat": "path",
+            }),
+        );
+        self.wait_for("the initialize response", DAP_TIMEOUT, |message| {
+            message["type"] == "response" && message["request_seq"] == seq
+        })
+    }
+
+    /// Sends `initialize`, which must succeed, except that a managed-replay
+    /// refusal of this GDB is returned as `Err(message)` for the caller to
+    /// skip on. Any other failure fails the test.
+    fn initialize(&mut self) -> Result<serde_json::Value, String> {
+        let response = self.initialize_response();
+        if response["success"] == true {
+            return Ok(response);
+        }
+        match response["message"].as_str() {
+            Some(message) if message.contains(DAP_GDB_REFUSAL) => Err(message.to_owned()),
+            _ => self.fail(&format!("initialize failed: {response}")),
+        }
+    }
+
+    /// Waits up to `timeout` for the adapter to exit and returns its status.
+    fn exit_status(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let (bound, cut_off) = self.session_bound(timeout);
+        let deadline = Instant::now() + bound;
+        loop {
+            match self.adapter.0.try_wait() {
+                Ok(Some(status)) => return status,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+                Ok(None) => self.fail(&format!(
+                    "hermit-dap did not exit within {bound:?}{cut_off}"
+                )),
+                Err(error) => self.fail(&format!("failed to poll hermit-dap: {error}")),
+            }
+        }
+    }
+
+    /// Sends `command` for `thread`, which must succeed, and returns the body
+    /// of the `stopped` event that follows.
+    fn resume(
+        &mut self,
+        command: &str,
+        thread: &serde_json::Value,
+        what: &str,
+        timeout: Duration,
+    ) -> serde_json::Value {
+        self.call(command, serde_json::json!({"threadId": thread}), timeout);
+        self.stopped(what, timeout)
+    }
+
+    /// Attaches to `target`, sets one breakpoint at `line` of `source`, finishes
+    /// configuration, and returns the thread of the initial stop.
+    ///
+    /// GDB 16 and later defer the attach until `configurationDone`, so the
+    /// attach stop follows it. GDB 15 runs `target remote` inside the `attach`
+    /// request and reports the attach stop during configuration, before
+    /// `configurationDone` is even sent. A stop-class event that arrives
+    /// during configuration is therefore kept rather than discarded: waiting
+    /// for a second stop after it would hang, as it did with GDB 15.1 on the
+    /// hosted runner in
+    /// <https://github.com/rrnewton/hermit/actions/runs/37134916002>.
+    fn attach_and_break(
+        &mut self,
+        program: &Path,
+        target: &str,
+        source: &Path,
+        line: u64,
+    ) -> serde_json::Value {
+        let mut early = Vec::new();
+        let attach = self.request(
+            "attach",
+            serde_json::json!({"program": program, "target": target}),
+        );
+        let initialized = self.wait_for_noting(
+            "the initialized event",
+            DAP_TIMEOUT,
+            |message| {
+                message["event"] == "initialized"
+                    || (message["type"] == "response" && message["request_seq"] == attach)
+            },
+            |message| keep_stop_class_event(&mut early, message),
+        );
+        if initialized["type"] == "response" && initialized["success"] != true {
+            self.fail(&format!("attach failed: {initialized}"));
+        }
+        let breakpoints = self.call_noting(
+            "setBreakpoints",
+            serde_json::json!({"source": {"path": source}, "breakpoints": [{"line": line}]}),
+            DAP_TIMEOUT,
+            |message| keep_stop_class_event(&mut early, message),
+        );
+        // GDB 16 and later answer before `target remote` has run, so the
+        // breakpoint is still pending here. That it resolved is proved later,
+        // by a `breakpoint` stop at this line.
+        if breakpoints["body"]["breakpoints"]
+            .as_array()
+            .is_none_or(|breakpoints| breakpoints.len() != 1)
+        {
+            self.fail(&format!(
+                "expected one breakpoint for line {line}: {breakpoints}"
+            ));
+        }
+        self.call_noting(
+            "configurationDone",
+            serde_json::json!({}),
+            DAP_TIMEOUT,
+            |message| keep_stop_class_event(&mut early, message),
+        );
+        let stop = match early.as_slice() {
+            [] => self.stopped("the stop after attaching", DAP_TIMEOUT),
+            [event] if event["event"] == "stopped" && event["body"]["reason"] == "attach" => {
+                event["body"].clone()
+            }
+            events => self.fail(&format!(
+                "expected nothing but one `attach` stop before configurationDone \
+                 answered, got: {}",
+                events
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        };
+        if !stop["threadId"].is_u64() {
+            self.fail(&format!("the attach stop names no thread: {stop}"));
+        }
+        stop["threadId"].clone()
+    }
+
+    /// The body of the next `stopped` event; the debuggee ending first fails.
+    fn stopped(&mut self, what: &str, timeout: Duration) -> serde_json::Value {
+        let event = self.wait_for(what, timeout, is_stop_class_event);
+        if event["event"] != "stopped" {
+            self.fail(&format!("expected {what}, but the debuggee ended: {event}"));
+        }
+        event["body"].clone()
+    }
+
+    /// Requires that `stop` is a `reason` stop of `thread` whose stack starts
+    /// with `frames`, each (function, line), and whose innermost frame
+    /// evaluates `watch.0` to `watch.1`. Checks the thread through `threads`
+    /// and `stackTrace`, the two requests that lost it before the fix.
+    fn assert_stop(
+        &mut self,
+        what: &str,
+        stop: &serde_json::Value,
+        thread: &serde_json::Value,
+        reason: &str,
+        frames: &[(&str, u64)],
+        watch: (&str, &str),
+    ) {
+        let (variable, value) = watch;
+        if stop["reason"] != reason || stop["threadId"] != *thread {
+            self.fail(&format!(
+                "{what}: expected a {reason} stop of thread {thread}, got {stop}"
+            ));
+        }
+        let threads = self.call("threads", serde_json::json!({}), DAP_TIMEOUT);
+        let listed = threads["body"]["threads"]
+            .as_array()
+            .is_some_and(|threads| threads.iter().any(|entry| entry["id"] == *thread));
+        if !listed {
+            self.fail(&format!(
+                "{what}: thread {thread} is missing from {threads}"
+            ));
+        }
+        let trace = self.call(
+            "stackTrace",
+            serde_json::json!({"threadId": thread}),
+            DAP_TIMEOUT,
+        );
+        let stack: Vec<(String, u64, serde_json::Value)> = trace["body"]["stackFrames"]
+            .as_array()
+            .map(|frames| {
+                frames
+                    .iter()
+                    .map(|frame| {
+                        (
+                            frame["name"].as_str().unwrap_or_default().to_owned(),
+                            frame["line"].as_u64().unwrap_or_default(),
+                            frame["id"].clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let observed: Vec<(&str, u64)> = stack
+            .iter()
+            .take(frames.len())
+            .map(|(name, line, _)| (name.as_str(), *line))
+            .collect();
+        if observed != frames {
+            self.fail(&format!(
+                "{what}: expected the stack to start {frames:?}, got {observed:?}"
+            ));
+        }
+        let evaluated = self.call(
+            "evaluate",
+            serde_json::json!({"expression": variable, "frameId": stack[0].2, "context": "watch"}),
+            DAP_TIMEOUT,
+        );
+        if evaluated["body"]["result"] != value {
+            self.fail(&format!(
+                "{what}: expected {variable} = {value}, got {evaluated}"
+            ));
+        }
+    }
+}
+
+/// Attaching hermit-dap to `hermit run --gdbserver` must keep the stopped
+/// thread usable across `continue`, `threads` and `stackTrace`.
+///
+/// Before the fix, GDB's DAP server switched threads with `thread N` before
+/// every resume and stack walk. GDB checks the thread with the remote `T`
+/// (thread-alive) packet, and Reverie's gdbstub had its `T` handler commented
+/// out, so it answered with an empty reply. GDB treats any reply other than
+/// `OK` as a dead thread. Measured with GDB 17.2 before the fix: the first
+/// `continue` failed with "Thread ID 1 has terminated." The fix is in Reverie
+/// (<https://github.com/rrnewton/reverie/pull/885>), which answers `T` with
+/// `OK` for a live thread and `E01` otherwise.
+#[test]
+fn hermit_dap_attach_keeps_the_thread_across_continue_and_stack_trace() {
+    const TEST: &str = "hermit_dap_attach_keeps_the_thread_across_continue_and_stack_trace";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let (source, program) = dap_guest(work.path());
+    let program_arg = program.to_str().expect("guest path should be UTF-8");
+    let port = unused_local_port();
+    let port_arg = port.to_string();
+    let guest_stdout = work.path().join("hermit-run.stdout");
+    let guest_stderr = work.path().join("hermit-run.stderr");
+    let mut command = hermit_command(&[
+        "run",
+        "--gdbserver",
+        "--gdbserver-port",
+        &port_arg,
+        "--",
+        program_arg,
+    ]);
+    command
+        .stdout(fs::File::create(&guest_stdout).expect("failed to create the run stdout file"))
+        .stderr(fs::File::create(&guest_stderr).expect("failed to create the run stderr file"));
+    let mut run = KillOnDrop(
+        command
+            .spawn()
+            .expect("failed to spawn hermit run --gdbserver"),
+    );
+
+    let deadline = Instant::now() + DAP_TIMEOUT;
+    while !tcp_port_is_listening(port) {
+        let exited = run.0.try_wait().expect("failed to poll hermit run");
+        assert!(
+            exited.is_none() && Instant::now() < deadline,
+            "hermit run --gdbserver never listened on port {port} (exit: {exited:?})\nstderr:\n{}",
+            fs::read_to_string(&guest_stderr).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut adapter = Command::new(hermit_dap);
+    adapter.arg("--gdb").arg(&gdb);
+    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
+    if let Err(refusal) = dap.initialize() {
+        dap.fail(&format!(
+            "attach mode needs no managed-replay hooks: {refusal}"
+        ));
+    }
+    let thread = dap.attach_and_break(
+        &program,
+        &format!("127.0.0.1:{port}"),
+        &source,
+        DAP_GUEST_BREAK_LINE,
+    );
+
+    // Two continues: the thread must survive the first resume AND the second.
+    for x in ["0", "1"] {
+        dap.call(
+            "continue",
+            serde_json::json!({"threadId": thread}),
+            DAP_TIMEOUT,
+        );
+        let what = format!("the breakpoint hit with x = {x}");
+        let stop = dap.stopped(&what, DAP_TIMEOUT);
+        dap.assert_stop(
+            &what,
+            &stop,
+            &thread,
+            "breakpoint",
+            &[
+                ("square", DAP_GUEST_BREAK_LINE),
+                ("main", DAP_GUEST_CALL_LINE),
+            ],
+            ("x", x),
+        );
+    }
+
+    // Run the guest to completion: it must finish with its real output.
+    dap.call(
+        "setBreakpoints",
+        serde_json::json!({"source": {"path": source}, "breakpoints": []}),
+        DAP_TIMEOUT,
+    );
+    dap.call(
+        "continue",
+        serde_json::json!({"threadId": thread}),
+        DAP_TIMEOUT,
+    );
+    dap.wait_for("the guest's exit", DAP_TIMEOUT, |message| {
+        message["type"] == "event"
+            && matches!(message["event"].as_str(), Some("exited" | "terminated"))
+    });
+    drop(dap);
+
+    let deadline = Instant::now() + DAP_TIMEOUT;
+    let status = loop {
+        if let Some(status) = run.0.try_wait().expect("failed to poll hermit run") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "hermit run did not exit after its guest finished\nstderr:\n{}",
+            fs::read_to_string(&guest_stderr).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = fs::read_to_string(&guest_stdout).unwrap_or_default();
+    assert!(
+        status.success() && stdout.contains("total=5"),
+        "hermit run --gdbserver: status {status}, stdout {stdout:?}\nstderr:\n{}",
+        fs::read_to_string(&guest_stderr).unwrap_or_default()
+    );
+}
+
+/// Managed replay must step backward and reverse-continue through a recording,
+/// landing where the guest really was earlier.
+///
+/// Before the fix, the replay hook script failed on GDB 17.2 before serving a
+/// request: it wrapped `gdb.dap.server.Server.send_event`, which GDB 17.2
+/// renamed to `_send_event` (AttributeError). Repairing that exposed further
+/// defects that this test also pins: stepBack moved FORWARD in time (lines 3
+/// and 4 resolve to one breakpoint address, so each arrival was recorded twice
+/// and the occurrence count overshot), and `readelf` output truncated without
+/// `--wide` silently dropped every line breakpoint. The frame cache surviving
+/// a restart to the replay's entry is pinned by
+/// `hermit_dap_replay_steps_back_through_stops_off_line_breakpoints`; this
+/// test's restarts all resume the replay, which drops the cache anyway.
+///
+/// The expected positions are the guest's real history: the second hit of
+/// `square` has x = 1, one source line earlier is the call in `main` with
+/// i = 1, and the breakpoint hit before that is the first call, x = 0.
+#[test]
+fn hermit_dap_replay_steps_back_and_reverse_continues_through_a_recording() {
+    const TEST: &str = "hermit_dap_replay_steps_back_and_reverse_continues_through_a_recording";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let (source, program) = dap_guest(work.path());
+    let data_dir = work.path().join("recordings");
+    let recording = dap_record(&program, &data_dir, "total=5");
+
+    let port = unused_local_port();
+    let adapter = dap_replay_adapter(hermit_dap, &gdb, &recording, &data_dir, port);
+    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
+    let initialized = match dap.initialize() {
+        Ok(response) => response,
+        Err(refusal) => {
+            dap_gdb_skip(TEST, &refusal);
+            return;
+        }
+    };
+    if initialized["body"]["supportsStepBack"] != true {
+        dap.fail(&format!(
+            "managed replay must advertise supportsStepBack: {initialized}"
+        ));
+    }
+    let thread = dap.attach_and_break(
+        &program,
+        &format!("127.0.0.1:{port}"),
+        &source,
+        DAP_GUEST_BREAK_LINE,
+    );
+    let in_square = [
+        ("square", DAP_GUEST_BREAK_LINE),
+        ("main", DAP_GUEST_CALL_LINE),
+    ];
+
+    for x in ["0", "1"] {
+        dap.call(
+            "continue",
+            serde_json::json!({"threadId": thread}),
+            DAP_TIMEOUT,
+        );
+        let what = format!("the breakpoint hit with x = {x}");
+        let stop = dap.stopped(&what, DAP_TIMEOUT);
+        dap.assert_stop(&what, &stop, &thread, "breakpoint", &in_square, ("x", x));
+    }
+
+    dap.call(
+        "stepBack",
+        serde_json::json!({"threadId": thread}),
+        DAP_REVERSE_TIMEOUT,
+    );
+    let stop = dap.stopped("the stop after stepBack", DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(
+        "stepBack from the second hit",
+        &stop,
+        &thread,
+        "step",
+        &[("main", DAP_GUEST_CALL_LINE)],
+        ("i", "1"),
+    );
+
+    dap.call(
+        "reverseContinue",
+        serde_json::json!({"threadId": thread}),
+        DAP_REVERSE_TIMEOUT,
+    );
+    let stop = dap.stopped("the stop after reverseContinue", DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(
+        "reverseContinue to the first hit",
+        &stop,
+        &thread,
+        "breakpoint",
+        &in_square,
+        ("x", "0"),
+    );
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// A managed-replay startup refusal must reach the DAP client as a failed
+/// response to its first request, and must also be written to stderr.
+///
+/// GDB's DAP interpreter points its descriptors 1 and 2 at internal pipes
+/// before the replay extension runs, and drains them only once its server
+/// loop starts. Before the fix, the extension wrote its refusal with
+/// `gdb.write` and exited: measured with GDB 17.2, zero bytes reached either
+/// stream, and the client saw only a closed connection.
+///
+/// Two refusals are driven through a real GDB: a GDB whose DAP module lacks
+/// `gdb.dap.frames._clear_frame_ids` (simulated by deleting it in an earlier
+/// init command, after GDB has loaded its DAP server), and a PATH with no
+/// readelf. The PATH case runs first: if the real GDB is itself refused, the
+/// test skips like the other replay tests (or fails under
+/// `HERMIT_REQUIRE_DAP_GDB`).
+///
+/// The PATH refusal is then driven twice more with a client whose first
+/// message is not a request: a framed event before `initialize` (skipped, so
+/// `initialize` still gets the failed response), and a header block with no
+/// Content-Length, which cannot be framed and so gets the refusal as an
+/// `output` event instead of nothing.
+#[test]
+fn hermit_dap_replay_refusal_reaches_the_client() {
+    const TEST: &str = "hermit_dap_replay_refusal_reaches_the_client";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    // Nothing is replayed: both refusals happen before the replay starts.
+    let data_dir = work.path().join("recordings");
+
+    let empty_path = work.path().join("empty-path");
+    fs::create_dir(&empty_path).expect("failed to create an empty PATH directory");
+    let mut adapter = dap_replay_adapter(
+        hermit_dap,
+        &gdb,
+        "no-such-recording",
+        &data_dir,
+        unused_local_port(),
+    );
+    adapter.env("PATH", &empty_path);
+    let mut dap = DapClient::spawn(adapter, work.path().join("no-readelf.stderr"));
+    let response = dap.initialize_response();
+    let message = response["message"].as_str().unwrap_or_default().to_owned();
+    // This GDB's own support check runs before the tool check. If the real GDB
+    // is refused, the hookless case below would prove nothing either.
+    if message.contains(DAP_GDB_REFUSAL) {
+        dap_gdb_skip(TEST, &message);
+        return;
+    }
+    if response["success"] != false
+        || !message.contains("managed replay requires readelf and setpriv on PATH")
+        || !message.contains("readelf")
+        || response["body"]["error"]["showUser"] != true
+    {
+        dap.fail(&format!(
+            "initialize must fail, shown to the user, naming the missing tool: {response}"
+        ));
+    }
+    let status = dap.exit_status(DAP_TIMEOUT);
+    if status.success() || !dap.adapter_stderr().contains(&message) {
+        dap.fail(&format!(
+            "the refused adapter must exit nonzero ({status}) with the refusal on stderr"
+        ));
+    }
+
+    let hookless_gdb = work.path().join("gdb-without-clear-frame-ids");
+    fs::write(
+        &hookless_gdb,
+        format!(
+            "#!/bin/sh\nexec '{}' '--init-eval-command=python import gdb.dap.frames; \
+             del gdb.dap.frames._clear_frame_ids' \"$@\"\n",
+            gdb.display()
+        ),
+    )
+    .expect("failed to write the GDB wrapper");
+    fs::set_permissions(&hookless_gdb, fs::Permissions::from_mode(0o755))
+        .expect("failed to make the GDB wrapper executable");
+    let adapter = dap_replay_adapter(
+        hermit_dap,
+        &hookless_gdb,
+        "no-such-recording",
+        &data_dir,
+        unused_local_port(),
+    );
+    let mut dap = DapClient::spawn(adapter, work.path().join("hookless.stderr"));
+    let refusal = match dap.initialize() {
+        Err(refusal) => refusal,
+        Ok(response) => dap.fail(&format!(
+            "a GDB without _clear_frame_ids must be refused: {response}"
+        )),
+    };
+    if !refusal.contains("gdb.dap.frames lacks _clear_frame_ids") {
+        dap.fail(&format!(
+            "the refusal must name the missing hook: {refusal}"
+        ));
+    }
+    let status = dap.exit_status(DAP_TIMEOUT);
+    if status.success() || !dap.adapter_stderr().contains(&refusal) {
+        dap.fail(&format!(
+            "the refused adapter must exit nonzero ({status}) with the refusal on stderr"
+        ));
+    }
+
+    let no_readelf = |stderr: &str| {
+        let mut adapter = dap_replay_adapter(
+            hermit_dap,
+            &gdb,
+            "no-such-recording",
+            &data_dir,
+            unused_local_port(),
+        );
+        adapter.env("PATH", &empty_path);
+        DapClient::spawn(adapter, work.path().join(stderr))
+    };
+
+    let mut dap = no_readelf("event-first.stderr");
+    let event = r#"{"seq":1,"type":"event","event":"hermitTestNotARequest"}"#;
+    let sent = write!(dap.stdin, "Content-Length: {}\r\n\r\n{event}", event.len())
+        .and_then(|()| dap.stdin.flush());
+    if let Err(error) = sent {
+        dap.fail(&format!("could not send the leading event: {error}"));
+    }
+    dap.next_seq = 1;
+    let response = dap.initialize_response();
+    if response["success"] != false
+        || !response["message"]
+            .as_str()
+            .is_some_and(|text| text.contains(&message))
+    {
+        dap.fail(&format!(
+            "after a leading event, initialize must still get the refusal: {response}"
+        ));
+    }
+    let status = dap.exit_status(DAP_TIMEOUT);
+    if status.success() {
+        dap.fail(&format!("the refused adapter must exit nonzero ({status})"));
+    }
+
+    let mut dap = no_readelf("no-content-length.stderr");
+    let sent = write!(dap.stdin, "X-Not-Dap: 1\r\n\r\n{{}}").and_then(|()| dap.stdin.flush());
+    if let Err(error) = sent {
+        dap.fail(&format!("could not send the unframed header: {error}"));
+    }
+    let output = dap.wait_for("the refusal as an output event", DAP_TIMEOUT, |incoming| {
+        incoming["type"] == "event" && incoming["event"] == "output"
+    });
+    if !output["body"]["output"]
+        .as_str()
+        .is_some_and(|text| text.contains(&message))
+    {
+        dap.fail(&format!(
+            "an unframed first message must get the refusal as output: {output}"
+        ));
+    }
+    let status = dap.exit_status(DAP_TIMEOUT);
+    if status.success() || !dap.adapter_stderr().contains(&message) {
+        dap.fail(&format!(
+            "the refused adapter must exit nonzero ({status}) with the refusal on stderr"
+        ));
+    }
+}
+
+/// stepBack must land at the right point in time when the history holds stops
+/// at addresses no line breakpoint covers, and reverseContinue with no earlier
+/// breakpoint hit must stop at the replay's entry with a usable stack.
+///
+/// A stepOut lands on the call's return address, and a `next` from there on
+/// the loop's increment; neither is the first instruction of a source line,
+/// so no line breakpoint records arrivals there. Before the fix, stepBack
+/// chose which arrival to restart to by counting the history's entries at the
+/// target address, which held only the arrivals the client happened to stop
+/// at. Measured before the fix on the sequence below: the second stepBack
+/// landed in `main` with i = 0 instead of i = 1.
+///
+/// The restart to the replay's entry is the one reverse request that does not
+/// resume the replay, so GDB's DAP frame cache, which it drops only on resume,
+/// still held the killed replay's frames; the extension drops it after each
+/// restart.
+///
+/// The expected positions are the guest's real history: the stepOut from the
+/// second call returns to `main` with i = 1, one source line before the third
+/// call is the call line with i = 2, and one before that is the return from
+/// the second call, which is also one source line before the loop increment
+/// that follows it.
+#[test]
+fn hermit_dap_replay_steps_back_through_stops_off_line_breakpoints() {
+    const TEST: &str = "hermit_dap_replay_steps_back_through_stops_off_line_breakpoints";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let (source, program) = dap_guest(work.path());
+    let data_dir = work.path().join("recordings");
+    let recording = dap_record(&program, &data_dir, "total=5");
+
+    let port = unused_local_port();
+    let adapter = dap_replay_adapter(hermit_dap, &gdb, &recording, &data_dir, port);
+    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
+    if let Err(refusal) = dap.initialize() {
+        dap_gdb_skip(TEST, &refusal);
+        return;
+    }
+    let thread = dap.attach_and_break(
+        &program,
+        &format!("127.0.0.1:{port}"),
+        &source,
+        DAP_GUEST_BREAK_LINE,
+    );
+    let in_square = [
+        ("square", DAP_GUEST_BREAK_LINE),
+        ("main", DAP_GUEST_CALL_LINE),
+    ];
+    let at_call = [("main", DAP_GUEST_CALL_LINE)];
+
+    let what = "the first breakpoint hit";
+    let stop = dap.resume("continue", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "breakpoint", &in_square, ("x", "0"));
+
+    // No breakpoint hit precedes this one, so reverseContinue restarts the
+    // replay and stops at its entry, before main has run.
+    let what = "reverseContinue to the replay's entry";
+    let stop = dap.resume("reverseContinue", &thread, what, DAP_REVERSE_TIMEOUT);
+    if stop["reason"] != "entry" || stop["threadId"] != thread {
+        dap.fail(&format!(
+            "{what}: expected an entry stop of thread {thread}, got {stop}"
+        ));
+    }
+    let threads = dap.call("threads", serde_json::json!({}), DAP_TIMEOUT);
+    if !threads["body"]["threads"]
+        .as_array()
+        .is_some_and(|threads| threads.iter().any(|entry| entry["id"] == thread))
+    {
+        dap.fail(&format!(
+            "{what}: thread {thread} is missing from {threads}"
+        ));
+    }
+    let trace = dap.call(
+        "stackTrace",
+        serde_json::json!({"threadId": thread}),
+        DAP_TIMEOUT,
+    );
+    let names: Vec<String> = trace["body"]["stackFrames"]
+        .as_array()
+        .map(|frames| {
+            frames
+                .iter()
+                .map(|frame| frame["name"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    if names.is_empty() || names.iter().any(|name| name == "square" || name == "main") {
+        dap.fail(&format!(
+            "{what}: the stack must be the fresh replay's, before main: {names:?}"
+        ));
+    }
+
+    for x in ["0", "1"] {
+        let what = format!("the breakpoint hit with x = {x} after the restart");
+        let stop = dap.resume("continue", &thread, &what, DAP_TIMEOUT);
+        dap.assert_stop(&what, &stop, &thread, "breakpoint", &in_square, ("x", x));
+    }
+    let what = "stepOut of the second call";
+    let stop = dap.resume("stepOut", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "step", &at_call, ("i", "1"));
+    let what = "the breakpoint hit with x = 2";
+    let stop = dap.resume("continue", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "breakpoint", &in_square, ("x", "2"));
+
+    let what = "stepBack from the third call";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "step", &at_call, ("i", "2"));
+    let what = "stepBack to the stepOut's stop";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "step", &at_call, ("i", "1"));
+
+    // The same target with no recorded line arrival after it: stepBack must
+    // first run the replay forward to one. Counting to the replay's exit
+    // instead would also count the third call's return, and land at i = 2.
+    let what = "next to the loop increment";
+    let stop = dap.resume("next", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("main", DAP_GUEST_LOOP_LINE)],
+        ("i", "1"),
+    );
+    let what = "stepBack to the second call's return";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "step", &at_call, ("i", "1"));
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// stepBack must count every arrival at an address once, including
+/// consecutive arrivals at the same source line and arrivals recorded under a
+/// different line than the stop reports.
+///
+/// The recorded history once dropped an arrival when the previous entry had
+/// the same pc and line, which erases all but one pass of a loop whose body
+/// starts at its breakpoint address, and merged a stop into the entry just
+/// recorded only when both named the same line, which records an arrival
+/// twice where two source lines share an address (see [`DAP_LOOPS_SOURCE`]).
+/// Either one makes stepBack restart to the wrong arrival.
+///
+/// The expected positions are the guest's real history: before the loop's
+/// third pass (n = 1) is its second (n = 2), and one source line before the
+/// second call of `twice` (x = 2) is the end of its first call (x = 1).
+#[test]
+fn hermit_dap_replay_steps_back_through_repeated_and_shared_addresses() {
+    const TEST: &str = "hermit_dap_replay_steps_back_through_repeated_and_shared_addresses";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let (source, program) = dap_compile(work.path(), "loops", DAP_LOOPS_SOURCE);
+    let data_dir = work.path().join("recordings");
+    let recording = dap_record(&program, &data_dir, "left=0 sum=6");
+
+    let port = unused_local_port();
+    let adapter = dap_replay_adapter(hermit_dap, &gdb, &recording, &data_dir, port);
+    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
+    if let Err(refusal) = dap.initialize() {
+        dap_gdb_skip(TEST, &refusal);
+        return;
+    }
+    let thread = dap.attach_and_break(
+        &program,
+        &format!("127.0.0.1:{port}"),
+        &source,
+        DAP_LOOPS_COUNTDOWN_LINE,
+    );
+    let in_countdown = [
+        ("countdown", DAP_LOOPS_COUNTDOWN_LINE),
+        ("main", DAP_LOOPS_COUNTDOWN_CALL_LINE),
+    ];
+
+    for n in ["3", "2", "1"] {
+        let what = format!("the loop's pass with n = {n}");
+        let stop = dap.resume("continue", &thread, &what, DAP_TIMEOUT);
+        dap.assert_stop(&what, &stop, &thread, "breakpoint", &in_countdown, ("n", n));
+    }
+    let what = "stepBack to the loop's previous pass";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "step", &in_countdown, ("n", "2"));
+
+    let breakpoints = dap.call(
+        "setBreakpoints",
+        serde_json::json!({
+            "source": {"path": source},
+            "breakpoints": [{"line": DAP_LOOPS_TWICE_BODY_LINE}],
+        }),
+        DAP_TIMEOUT,
+    );
+    if breakpoints["body"]["breakpoints"][0]["verified"] != true {
+        dap.fail(&format!(
+            "the breakpoint at line {DAP_LOOPS_TWICE_BODY_LINE} must resolve: {breakpoints}"
+        ));
+    }
+    let in_twice = [
+        ("twice", DAP_LOOPS_TWICE_BODY_LINE),
+        ("main", DAP_LOOPS_TWICE_CALL_LINE),
+    ];
+    for x in ["1", "2"] {
+        let what = format!("the call of twice with x = {x}");
+        let stop = dap.resume("continue", &thread, &what, DAP_TIMEOUT);
+        dap.assert_stop(&what, &stop, &thread, "breakpoint", &in_twice, ("x", x));
+    }
+    let what = "stepBack to the end of the first call of twice";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[
+            ("twice", DAP_LOOPS_TWICE_END_LINE),
+            ("main", DAP_LOOPS_TWICE_CALL_LINE),
+        ],
+        ("x", "1"),
+    );
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// The recursive guest of the stepBack test below. `depth(3)` recurses to
+/// `depth(0)`; line 5 holds the recursive call and its return address.
+const DAP_RECURSION_SOURCE: &str = r#"#include <stdio.h>
+
+static int depth(int n) {
+  if (n == 0) return 0;
+  int r = depth(n - 1);
+  return r + 1;
+}
+
+int main(void) {
+  int d = depth(3);
+  printf("d=%d\n", d);
+  return 0;
+}
+"#;
+// ⚠️ THE LINE NUMBERS IN THE TEST BELOW ARE THIS LAYOUT: 4 is the base case,
+// 5 the recursive call, 6 `return r + 1;`, 7 the closing brace, 10 main's call.
+
+/// stepBack in recursion must land exactly, in the right activation.
+///
+/// Stopped in `depth(0)`, two stepOuts reach `depth(2)` at the recursive
+/// call's return address, and three nexts walk lines 6 and 7 of `depth(2)` to
+/// line 6 of `depth(3)`. The previous stop is line 7 of `depth(2)`. A
+/// stepOut from there reaches `depth(3)`'s return address, in the middle of
+/// line 5, and the stop before that is again line 7 of `depth(2)`.
+///
+/// The second stepOut starts at the return address it also targets, and GDB
+/// steps over a breakpoint there. Reverie's gdbstub used to restore a whole
+/// 8-byte word when it removed a software breakpoint, which erased the line-7
+/// breakpoint 6 bytes further on for the rest of that stepOut, so the history
+/// missed `depth(1)`'s line 7. Counting arrivals at line 7 then picked
+/// `depth(1)`'s: measured before the frame check, stepBack reported a `step`
+/// stop at line 7 with n = 1 and four frames, and with the frame check it
+/// refused the landing. The gdbstub now restores only the breakpoint's own
+/// byte (<https://github.com/rrnewton/reverie/pull/890>), and stepBack must
+/// land exactly. Against a Reverie without that fix this test fails.
+#[test]
+fn hermit_dap_replay_step_back_in_recursion_lands_exactly() {
+    const TEST: &str = "hermit_dap_replay_step_back_in_recursion_lands_exactly";
+    let Some((mut dap, _work, source, program, port)) =
+        dap_replay_session(TEST, "recursion", DAP_RECURSION_SOURCE, "d=3", None)
+    else {
+        return;
+    };
+    let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+    dap_recursion_walk_to_depth_3_line_6(&mut dap, &thread);
+
+    let at_line_7_of_depth_2 = [("depth", 7), ("depth", 5), ("main", 10)];
+    let what = "stepBack to line 7 of depth(2)";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &at_line_7_of_depth_2,
+        ("n", "2"),
+    );
+
+    let what = "stepOut to depth(3)'s return address";
+    let stop = dap.resume("stepOut", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("depth", 5), ("main", 10)],
+        ("n", "3"),
+    );
+    let what = "stepBack from the return address to line 7 of depth(2)";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &at_line_7_of_depth_2,
+        ("n", "2"),
+    );
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// Drives the recursion guest from its attach stop, with a breakpoint on
+/// line 4, to line 6 of `depth(3)`, checking every stop on the way: the four
+/// base-case checks, two stepOuts to `depth(2)`'s return address, and nexts
+/// to lines 6 and 7 of `depth(2)` and line 6 of `depth(3)`.
+fn dap_recursion_walk_to_depth_3_line_6(dap: &mut DapClient, thread: &serde_json::Value) {
+    dap_recursion_walk_to_depth_2_line_7(dap, thread);
+    let what = "next to line 6 of depth(3)";
+    let stop = dap.resume("next", thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        thread,
+        "step",
+        &[("depth", 6), ("main", 10)],
+        ("n", "3"),
+    );
+}
+
+/// The first part of [`dap_recursion_walk_to_depth_3_line_6`]: from the
+/// attach stop to line 7 of `depth(2)`.
+fn dap_recursion_walk_to_depth_2_line_7(dap: &mut DapClient, thread: &serde_json::Value) {
+    dap_recursion_walk_to_depth_2_return(dap, thread);
+    // (what, expected frames, expected n) for each `next`.
+    type Frames<'a> = &'a [(&'a str, u64)];
+    let walk: [(&str, Frames<'_>, &str); 2] = [
+        (
+            "next to line 6 of depth(2)",
+            &[("depth", 6), ("depth", 5), ("main", 10)],
+            "2",
+        ),
+        (
+            "next to line 7 of depth(2)",
+            &[("depth", 7), ("depth", 5), ("main", 10)],
+            "2",
+        ),
+    ];
+    for (what, frames, n) in walk {
+        let stop = dap.resume("next", thread, what, DAP_TIMEOUT);
+        dap.assert_stop(what, &stop, thread, "step", frames, ("n", n));
+    }
+}
+
+/// The first part of [`dap_recursion_walk_to_depth_2_line_7`]: from the
+/// attach stop, through the four base-case checks, and two stepOuts to
+/// `depth(2)` at the recursive call's return address.
+fn dap_recursion_walk_to_depth_2_return(dap: &mut DapClient, thread: &serde_json::Value) {
+    for n in ["3", "2", "1", "0"] {
+        let what = format!("the base-case check with n = {n}");
+        let stop = dap.resume("continue", thread, &what, DAP_TIMEOUT);
+        dap.assert_stop(
+            &what,
+            &stop,
+            thread,
+            "breakpoint",
+            &[("depth", 4)],
+            ("n", n),
+        );
+    }
+    let what = "stepOut into depth(1)";
+    let stop = dap.resume("stepOut", thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        thread,
+        "step",
+        &[("depth", 5), ("depth", 5), ("depth", 5), ("main", 10)],
+        ("n", "1"),
+    );
+    let what = "stepOut into depth(2)";
+    let stop = dap.resume("stepOut", thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        thread,
+        "step",
+        &[("depth", 5), ("depth", 5), ("main", 10)],
+        ("n", "2"),
+    );
+}
+
+/// hermit-dap serving a fresh recording of `text` (compiled as `name`, whose
+/// output must contain `expected`) to a client that has initialized it, with
+/// the extension's test-only fault injection set to `drop_line_arrival`
+/// when it is given (see [`DAP_TEST_ONLY_DROP_LINE_ARRIVAL`]). Returns
+/// `None` after reporting a skip, as the other hermit-dap tests do.
+fn dap_replay_session(
+    test: &str,
+    name: &str,
+    text: &str,
+    expected: &str,
+    drop_line_arrival: Option<&str>,
+) -> Option<(DapClient, tempfile::TempDir, PathBuf, PathBuf, u16)> {
+    let hermit_dap = hermit_dap_binary(test)?;
+    let gdb = dap_capable_gdb(test)?;
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let (source, program) = dap_compile(work.path(), name, text);
+    let data_dir = work.path().join("recordings");
+    let recording = dap_record(&program, &data_dir, expected);
+    let port = unused_local_port();
+    let mut adapter = dap_replay_adapter(hermit_dap, &gdb, &recording, &data_dir, port);
+    adapter.env_remove(DAP_TEST_ONLY_DROP_LINE_ARRIVAL);
+    if let Some(drop) = drop_line_arrival {
+        adapter.env(DAP_TEST_ONLY_DROP_LINE_ARRIVAL, drop);
+    }
+    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
+    if let Err(refusal) = dap.initialize() {
+        dap_gdb_skip(test, &refusal);
+        return None;
+    }
+    Some((dap, work, source, program, port))
+}
+
+/// The replay extension's test-only fault injection. `LINE:K` makes its line
+/// breakpoints leave the K-th arrival they record at source line LINE out of
+/// the history, as a debugger stub that loses a breakpoint would, so a test
+/// can drive the frame check and its recovery paths without depending on
+/// such a stub bug. A stop the client sees is still recorded.
+const DAP_TEST_ONLY_DROP_LINE_ARRIVAL: &str = "HERMIT_DAP_TEST_ONLY_DROP_LINE_ARRIVAL";
+
+/// The guest of the sibling-call stepBack tests below: `main` calls `g`
+/// twice from the same depth, so both activations of `g` have the same stack
+/// pointer. In `g`, line 9 (`return r + 1;`) and line 10 (the closing brace)
+/// start 6 bytes apart at -O0.
+const DAP_SIBLING_SOURCE: &str = r#"#include <stdio.h>
+
+static int k(int x) {
+  return x;
+}
+
+static int g(int x) {
+  int r = k(x);
+  return r + 1;
+}
+
+int main(void) {
+  int a = g(1);
+  int b = g(2);
+  printf("s=%d\n", a + b);
+  return 0;
+}
+"#;
+// ⚠️ THE LINE NUMBERS IN THE TESTS BELOW ARE THIS LAYOUT: 4 is k's body, 8
+// g's call of k, 9 `return r + 1;`, 10 g's closing brace, 13 and 14 the two
+// calls of g, 15 the printf, 16 `return 0;`.
+
+/// Drives the sibling-call guest from its attach stop, with a breakpoint on
+/// line 4, to the printf after both calls of `g`, checking every stop: into
+/// `k` from `g(1)`, out to `g` and to `main`, next to the second call, into
+/// `k` from `g(2)`, out to `g`, and nexts over lines 9 and 10 of `g(2)` and
+/// back into `main`.
+fn dap_sibling_walk_to_the_printf(dap: &mut DapClient, thread: &serde_json::Value) {
+    // (request, what, reason, expected frames, (watched expression, value)).
+    type Step<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        &'a [(&'a str, u64)],
+        (&'a str, &'a str),
+    );
+    let walk: [Step<'_>; 9] = [
+        (
+            "continue",
+            "the stop in k called from g(1)",
+            "breakpoint",
+            &[("k", 4), ("g", 8), ("main", 13)],
+            ("x", "1"),
+        ),
+        (
+            "stepOut",
+            "stepOut to g(1)",
+            "step",
+            &[("g", 8), ("main", 13)],
+            ("x", "1"),
+        ),
+        (
+            "stepOut",
+            "stepOut to main from g(1)",
+            "step",
+            &[("main", 13)],
+            ("sizeof a", "4"),
+        ),
+        (
+            "next",
+            "next to the second call",
+            "step",
+            &[("main", 14)],
+            ("a", "2"),
+        ),
+        (
+            "continue",
+            "the stop in k called from g(2)",
+            "breakpoint",
+            &[("k", 4), ("g", 8), ("main", 14)],
+            ("x", "2"),
+        ),
+        (
+            "stepOut",
+            "stepOut to g(2)",
+            "step",
+            &[("g", 8), ("main", 14)],
+            ("x", "2"),
+        ),
+        (
+            "next",
+            "next to line 9 of g(2)",
+            "step",
+            &[("g", 9), ("main", 14)],
+            ("x", "2"),
+        ),
+        (
+            "next",
+            "next to line 10 of g(2)",
+            "step",
+            &[("g", 10), ("main", 14)],
+            ("x", "2"),
+        ),
+        (
+            "next",
+            "next to the printf",
+            "step",
+            &[("main", 15)],
+            ("b", "3"),
+        ),
+    ];
+    for (request, what, reason, frames, watch) in walk {
+        let stop = dap.resume(request, thread, what, DAP_TIMEOUT);
+        dap.assert_stop(what, &stop, thread, reason, frames, watch);
+    }
+}
+
+/// stepBack between two calls from the same caller at the same depth must
+/// land in the right one.
+///
+/// Stopped at the printf after `g(1)` and `g(2)`, the previous stop is line
+/// 10 of `g(2)`. Both activations of `g` have the same stack pointer. Before
+/// the Reverie fix (<https://github.com/rrnewton/reverie/pull/890>), GDB
+/// stepping over line 9's breakpoint in `g(1)` erased line 10's 6 bytes
+/// further on, the history missed `g(1)`'s line 10, and the arrival count
+/// picked `g(1)`'s. Measured with a stack-pointer-only frame check: stepBack
+/// reported a `step` stop at line 10 called from line 13, x = 1. With the
+/// fix, it must land exactly: line 10 called from line 14, x = 2. Against a
+/// Reverie without the fix this test fails.
+#[test]
+fn hermit_dap_replay_step_back_between_sibling_calls_lands_exactly() {
+    const TEST: &str = "hermit_dap_replay_step_back_between_sibling_calls_lands_exactly";
+    let Some((mut dap, _work, source, program, port)) =
+        dap_replay_session(TEST, "sibling", DAP_SIBLING_SOURCE, "s=5", None)
+    else {
+        return;
+    };
+    let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+    dap_sibling_walk_to_the_printf(&mut dap, &thread);
+
+    let what = "stepBack to line 10 of g(2)";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("g", 10), ("main", 14)],
+        ("x", "2"),
+    );
+    let what = "stepBack to line 9 of g(2)";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("g", 9), ("main", 14)],
+        ("x", "2"),
+    );
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// Sends a reverse request that must fail because Hermit could not land
+/// exactly, and returns the `stopped` event that puts the client back at its
+/// current stop.
+fn dap_refused_reverse_request(
+    dap: &mut DapClient,
+    command: &str,
+    thread: &serde_json::Value,
+    what: &str,
+) -> serde_json::Value {
+    let seq = dap.request(command, serde_json::json!({"threadId": thread}));
+    let response = dap.wait_for(
+        &format!("the {command} response"),
+        DAP_REVERSE_TIMEOUT,
+        |message| message["type"] == "response" && message["request_seq"] == seq,
+    );
+    if response["success"] != false
+        || !response["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("could not reach the earlier stop exactly"))
+    {
+        dap.fail(&format!(
+            "{what}: the {command} must fail and say it could not land exactly: {response}"
+        ));
+    }
+    dap.stopped(what, DAP_REVERSE_TIMEOUT)
+}
+
+/// A stepBack whose arrival count is short must refuse to land in a sibling
+/// call that has the same stack pointer, and stay at the current stop.
+///
+/// The test-only fault injection drops the first arrival the line
+/// breakpoints record at line 10, `g(1)`'s, which is the history the Reverie
+/// bug of [`hermit_dap_replay_step_back_between_sibling_calls_lands_exactly`]
+/// produced. Counting arrivals at line 10 then picks `g(1)`'s, whose stack
+/// pointer equals `g(2)`'s; only the caller's return address (line 13
+/// against line 14) tells them apart. stepBack must fail, put the replay back
+/// at the printf with a `stopped` event, and leave a working session.
+#[test]
+fn hermit_dap_replay_step_back_refuses_a_sibling_call_with_the_same_stack_pointer() {
+    const TEST: &str =
+        "hermit_dap_replay_step_back_refuses_a_sibling_call_with_the_same_stack_pointer";
+    let Some((mut dap, _work, source, program, port)) =
+        dap_replay_session(TEST, "sibling", DAP_SIBLING_SOURCE, "s=5", Some("10:1"))
+    else {
+        return;
+    };
+    let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+    dap_sibling_walk_to_the_printf(&mut dap, &thread);
+
+    let what = "the printf after the refused stepBack";
+    let stop = dap_refused_reverse_request(&mut dap, "stepBack", &thread, what);
+    dap.assert_stop(what, &stop, &thread, "step", &[("main", 15)], ("b", "3"));
+    let what = "next to `return 0` after the refused stepBack";
+    let stop = dap.resume("next", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("main", 16)],
+        ("a + b", "5"),
+    );
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// The guest of the frame-identity depth test below: `main` calls a chain of
+/// seven helpers, `h6` down to `h0`, from two consecutive lines. At line 5 of
+/// `h0` the two activations have 8 frames, and the newest 7 (`h0` to `h6`)
+/// have the same pc and stack pointer in both; only frame 7, `main`'s return
+/// address (line 26 against line 27), differs. Checked with `bt` and
+/// `gdb.Frame.read_register("sp")` in GDB 17.2, on the host recorded in
+/// docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts".
+const DAP_HELPER_CHAIN_SOURCE: &str = r#"#include <stdio.h>
+
+static int h0(int x) {
+  int y = x + 1;
+  return y;
+}
+static int h1(int x) {
+  return h0(x) + 1;
+}
+static int h2(int x) {
+  return h1(x) + 1;
+}
+static int h3(int x) {
+  return h2(x) + 1;
+}
+static int h4(int x) {
+  return h3(x) + 1;
+}
+static int h5(int x) {
+  return h4(x) + 1;
+}
+static int h6(int x) {
+  return h5(x) + 1;
+}
+int main(void) {
+  int a = h6(1);
+  int b = h6(2);
+  printf("s=%d\n", a + b);
+  return 0;
+}
+"#;
+// ⚠️ THE LINE NUMBERS IN THE TEST BELOW ARE THIS LAYOUT: 4 is h0's first
+// statement, 5 `return y;`, 6 h0's closing brace, 8 to 23 the calls in h1 to
+// h6, 26 and 27 the two calls of h6.
+
+/// The frames of a stop at `line` of `h0` called from `main`'s line
+/// `main_line`, newest first.
+fn dap_helper_chain_frames(line: u64, main_line: u64) -> [(&'static str, u64); 8] {
+    [
+        ("h0", line),
+        ("h1", 8),
+        ("h2", 11),
+        ("h3", 14),
+        ("h4", 17),
+        ("h5", 20),
+        ("h6", 23),
+        ("main", main_line),
+    ]
+}
+
+/// A stepBack whose arrival count is short must refuse to land in an
+/// activation that differs from the right one only at frame index 7, which
+/// pins the frame identity at 8 frames.
+///
+/// With a breakpoint on line 4, the client stops in `h0` under the first
+/// call of `h6`, continues to `h0` under the second call, and steps to line 5
+/// and then line 6. The test-only fault injection drops the first arrival the
+/// line breakpoints record at line 5, the first call's, which the client
+/// never saw. stepBack from line 6 goes to line 5 of the second call, and the
+/// count picks the first call's line 5 instead. The newest 7 frames of the
+/// two are equal; only `main`'s return address tells them apart. With an
+/// identity of 7 frames or fewer, the landing check passes and stepBack
+/// reports success. With 8 it must fail, put the replay back at line 6 with
+/// a `stopped` event, and leave a working session.
+#[test]
+fn hermit_dap_replay_step_back_refuses_an_activation_that_differs_only_at_frame_7() {
+    const TEST: &str =
+        "hermit_dap_replay_step_back_refuses_an_activation_that_differs_only_at_frame_7";
+    let Some((mut dap, _work, source, program, port)) =
+        dap_replay_session(TEST, "chain", DAP_HELPER_CHAIN_SOURCE, "s=17", Some("5:1"))
+    else {
+        return;
+    };
+    let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+    // (request, what, reason, h0 line, main line, (watched expression, value)).
+    let walk = [
+        (
+            "continue",
+            "the stop in h0 under the first call",
+            "breakpoint",
+            4,
+            26,
+            ("x", "1"),
+        ),
+        (
+            "continue",
+            "the stop in h0 under the second call",
+            "breakpoint",
+            4,
+            27,
+            ("x", "2"),
+        ),
+        ("next", "next to line 5", "step", 5, 27, ("y", "3")),
+        ("next", "next to line 6", "step", 6, 27, ("y", "3")),
+    ];
+    for (request, what, reason, line, main_line, watch) in walk {
+        let stop = dap.resume(request, &thread, what, DAP_TIMEOUT);
+        let frames = dap_helper_chain_frames(line, main_line);
+        dap.assert_stop(what, &stop, &thread, reason, &frames, watch);
+    }
+
+    let what = "line 6 after the refused stepBack";
+    let stop = dap_refused_reverse_request(&mut dap, "stepBack", &thread, what);
+    let frames = dap_helper_chain_frames(6, 27);
+    dap.assert_stop(what, &stop, &thread, "step", &frames, ("y", "3"));
+    let what = "stepOut to h1 after the refused stepBack";
+    let stop = dap.resume("stepOut", &thread, what, DAP_TIMEOUT);
+    let frames = &dap_helper_chain_frames(0, 27)[1..];
+    dap.assert_stop(what, &stop, &thread, "step", frames, ("x", "2"));
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// A refused stepBack from a stop in the middle of a source line must put the
+/// replay back at that stop, not end the session.
+///
+/// The client stops at `depth(3)`'s return address, in the middle of line 5,
+/// after the walk of [`hermit_dap_replay_step_back_in_recursion_lands_exactly`].
+/// The test-only fault injection drops the first arrival the line breakpoints
+/// record at line 7, `depth(0)`'s, so the count for line 7 of `depth(2)`
+/// picks another activation and the frame check refuses the landing. Going
+/// back to the current stop means counting arrivals at an address no line
+/// breakpoint covers, which needs a line arrival after it in the history.
+/// Before the fix none was recorded, and the request failed with "no later
+/// source line to count arrivals against" and ended the session.
+#[test]
+fn hermit_dap_replay_refused_step_back_stays_at_a_mid_line_stop() {
+    const TEST: &str = "hermit_dap_replay_refused_step_back_stays_at_a_mid_line_stop";
+    let Some((mut dap, _work, source, program, port)) =
+        dap_replay_session(TEST, "recursion", DAP_RECURSION_SOURCE, "d=3", Some("7:1"))
+    else {
+        return;
+    };
+    let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+    dap_recursion_walk_to_depth_2_line_7(&mut dap, &thread);
+    let at_return = [("depth", 5), ("main", 10)];
+    let what = "stepOut to depth(3)'s return address";
+    let stop = dap.resume("stepOut", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "step", &at_return, ("n", "3"));
+
+    let what = "the return address after the refused stepBack";
+    let stop = dap_refused_reverse_request(&mut dap, "stepBack", &thread, what);
+    dap.assert_stop(what, &stop, &thread, "step", &at_return, ("n", "3"));
+    let what = "next to line 6 of depth(3) after the refused stepBack";
+    let stop = dap.resume("next", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("depth", 6), ("main", 10)],
+        ("r", "2"),
+    );
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// A reverse request that can neither land exactly nor go back to the current
+/// stop must fail and end the session, saying why, rather than leave the
+/// client at an unknown position.
+///
+/// With a breakpoint on line 6, the client stops there in `depth(2)` and then
+/// in `depth(3)`. The test-only fault injection drops the first arrival the
+/// line breakpoints record at line 6, `depth(1)`'s, so every count for line 6
+/// is one short: reverseContinue lands in `depth(1)` instead of `depth(2)`,
+/// and going back to the current stop lands in `depth(2)` instead of
+/// `depth(3)`. Both landings fail the frame check. The client must get a
+/// failed response, an `output` event naming the request and the frames, and
+/// a `terminated` event.
+#[test]
+fn hermit_dap_replay_reverse_continue_ends_the_session_when_it_cannot_return() {
+    const TEST: &str = "hermit_dap_replay_reverse_continue_ends_the_session_when_it_cannot_return";
+    let Some((mut dap, _work, source, program, port)) =
+        dap_replay_session(TEST, "recursion", DAP_RECURSION_SOURCE, "d=3", Some("6:1"))
+    else {
+        return;
+    };
+    let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+    dap_recursion_walk_to_depth_2_return(&mut dap, &thread);
+    let what = "next to line 6 of depth(2)";
+    let stop = dap.resume("next", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("depth", 6), ("depth", 5), ("main", 10)],
+        ("n", "2"),
+    );
+    let breakpoints = dap.call(
+        "setBreakpoints",
+        serde_json::json!({"source": {"path": source}, "breakpoints": [{"line": 6}]}),
+        DAP_TIMEOUT,
+    );
+    if breakpoints["body"]["breakpoints"][0]["verified"] != true {
+        dap.fail(&format!(
+            "the breakpoint at line 6 must resolve: {breakpoints}"
+        ));
+    }
+    let what = "the breakpoint at line 6 of depth(3)";
+    let stop = dap.resume("continue", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "breakpoint",
+        &[("depth", 6), ("main", 10)],
+        ("n", "3"),
+    );
+
+    let seq = dap.request("reverseContinue", serde_json::json!({"threadId": thread}));
+    let response = dap.wait_for(
+        "the reverseContinue response",
+        DAP_REVERSE_TIMEOUT,
+        |message| message["type"] == "response" && message["request_seq"] == seq,
+    );
+    if response["success"] != false {
+        dap.fail(&format!("the reverseContinue must fail: {response}"));
+    }
+    let output = dap.wait_for(
+        "the output event of the failed reverseContinue",
+        DAP_REVERSE_TIMEOUT,
+        |message| {
+            message["type"] == "event"
+                && (message["event"] == "output"
+                    || matches!(
+                        message["event"].as_str(),
+                        Some("stopped" | "terminated" | "exited")
+                    ))
+        },
+    );
+    let text = output["body"]["output"].as_str().unwrap_or_default();
+    if output["event"] != "output"
+        || !text.starts_with("hermit-dap: reverseContinue failed: ")
+        || !text.contains("has the frames")
+    {
+        dap.fail(&format!(
+            "the failed reverseContinue must first report why, naming the frames: {output}"
+        ));
+    }
+    let ended = dap.wait_for(
+        "the terminated event of the failed reverseContinue",
+        DAP_REVERSE_TIMEOUT,
+        |message| {
+            message["type"] == "event"
+                && matches!(
+                    message["event"].as_str(),
+                    Some("stopped" | "terminated" | "exited")
+                )
+        },
+    );
+    if ended["event"] != "terminated" {
+        dap.fail(&format!(
+            "the failed reverseContinue must end the session with terminated: {ended}"
+        ));
+    }
+
+    let _ = dap.request("disconnect", serde_json::json!({"terminateDebuggee": true}));
+}
+
+/// The guest of the exit-path stepBack tests below: after the second call of
+/// `g`, `main` calls `exit` in the middle of line 9, so no source line
+/// arrival follows the return address of that call.
+const DAP_EXIT_SOURCE: &str = r#"#include <stdio.h>
+#include <stdlib.h>
+static int g(int x) {
+  return x + 1;
+}
+int main(void) {
+  printf("start\n");
+  int a = g(1);
+  exit(g(a) - 3);
+}
+"#;
+// ⚠️ THE LINE NUMBERS IN THE TESTS BELOW ARE THIS LAYOUT: 4 is `g`'s body, 5
+// its closing brace, 8 the first call of `g`, 9 the second call and `exit`.
+
+/// Drives the exit guest from its attach stop, with a breakpoint on line 4,
+/// into `g(1)` and `g(2)` and out of `g(2)` to its return address in the
+/// middle of line 9, checking every stop.
+fn dap_exit_walk_to_the_last_return(dap: &mut DapClient, thread: &serde_json::Value) {
+    let what = "the stop in g(1)";
+    let stop = dap.resume("continue", thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        thread,
+        "breakpoint",
+        &[("g", 4), ("main", 8)],
+        ("x", "1"),
+    );
+    let what = "the stop in g(2)";
+    let stop = dap.resume("continue", thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        thread,
+        "breakpoint",
+        &[("g", 4), ("main", 9)],
+        ("x", "2"),
+    );
+    let what = "stepOut of g(2) to the middle of line 9";
+    let stop = dap.resume("stepOut", thread, what, DAP_TIMEOUT);
+    dap.assert_stop(what, &stop, thread, "step", &[("main", 9)], ("a", "2"));
+}
+
+/// stepBack from a stop in the middle of a line after which the program
+/// only exits must land exactly.
+///
+/// The client stops at `g(2)`'s return address in the middle of line 9,
+/// after which the guest calls `exit`. Before it rewinds, the adapter runs
+/// the replay forward to find a later line arrival to count the current stop
+/// against; here the program exits first, so it counts the current stop
+/// right away. The earlier stop is line 5 of `g(2)`, with x = 2.
+#[test]
+fn hermit_dap_replay_step_back_before_an_exit_lands_exactly() {
+    const TEST: &str = "hermit_dap_replay_step_back_before_an_exit_lands_exactly";
+    let Some((mut dap, _work, source, program, port)) =
+        dap_replay_session(TEST, "exit", DAP_EXIT_SOURCE, "start", None)
+    else {
+        return;
+    };
+    let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+    dap_exit_walk_to_the_last_return(&mut dap, &thread);
+
+    let what = "stepBack to line 5 of g(2)";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("g", 5), ("main", 9)],
+        ("x", "2"),
+    );
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// A refused stepBack from a stop in the middle of a line after which the
+/// program only exits must put the replay back at that stop.
+///
+/// The walk is that of [`hermit_dap_replay_step_back_before_an_exit_lands_exactly`].
+/// The test-only fault injection drops the first arrival the line
+/// breakpoints record at line 5, `g(1)`'s, so the count for line 5 of `g(2)`
+/// picks `g(1)`'s and the frame check refuses the landing (the caller's
+/// return address is in line 8, not line 9). Going back to the current stop
+/// needs its own arrival count. No line arrival follows it, because the
+/// program exits, so the adapter must have counted it when its forward run
+/// reached the exit; without that count the request fails with "no later
+/// source line to count arrivals against" and ends the session. The client
+/// must stay at the return address with a working session: a `next` runs
+/// the guest to its exit, with status 0 (`g(2) - 3`).
+#[test]
+fn hermit_dap_replay_refused_step_back_before_an_exit_stays_at_the_stop() {
+    const TEST: &str = "hermit_dap_replay_refused_step_back_before_an_exit_stays_at_the_stop";
+    let Some((mut dap, _work, source, program, port)) =
+        dap_replay_session(TEST, "exit", DAP_EXIT_SOURCE, "start", Some("5:1"))
+    else {
+        return;
+    };
+    let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+    dap_exit_walk_to_the_last_return(&mut dap, &thread);
+
+    let what = "the return address after the refused stepBack";
+    let stop = dap_refused_reverse_request(&mut dap, "stepBack", &thread, what);
+    dap.assert_stop(what, &stop, &thread, "step", &[("main", 9)], ("a", "2"));
+
+    dap.call("next", serde_json::json!({"threadId": thread}), DAP_TIMEOUT);
+    let ended = dap.wait_for("the guest's exit after next", DAP_TIMEOUT, |message| {
+        message["type"] == "event"
+            && matches!(
+                message["event"].as_str(),
+                Some("stopped" | "terminated" | "exited")
+            )
+    });
+    if ended["event"] != "exited" || ended["body"]["exitCode"] != 0 {
+        dap.fail(&format!(
+            "next from the return address must run the guest to exit status 0: {ended}"
+        ));
+    }
+
+    let _ = dap.request("disconnect", serde_json::json!({"terminateDebuggee": true}));
+}
+
+/// The guest of the deep-recursion test below, recursing `depth` calls deep
+/// before it calls `bottom`.
+fn dap_deep_source(depth: u32) -> String {
+    format!(
+        r#"#include <stdio.h>
+
+static int bottom(int n) {{
+  return n + 1;
+}}
+
+static int depth(int n) {{
+  if (n == 0) return bottom(n);
+  int r = depth(n - 1);
+  return r + 1;
+}}
+
+int main(void) {{
+  int d = depth({depth});
+  printf("d=%d\n", d);
+  return 0;
+}}
+"#
+    )
+}
+// ⚠️ THE LINE NUMBERS IN THE TEST BELOW ARE THIS LAYOUT: 4 is `bottom`'s
+// body, 8 the base case and its call of `bottom`, 9 the recursive call.
+
+/// How deep the guest of
+/// [`hermit_dap_replay_continue_through_deep_recursion_is_fast_and_lands_exactly`]
+/// recurses.
+const DAP_DEEP_DEPTH: u32 = 1000;
+
+/// The bound on that test's `continue` before scaling by
+/// [`dap_wall_timeout_multiplier`]; see the test's documentation.
+const DAP_DEEP_CONTINUE_BOUND: Duration = Duration::from_secs(20);
+
+/// The runner's wall-clock timeout multiplier, which also scales its 57 s
+/// per-test wall kill (`.config/nextest.toml`), read the way
+/// `ci/manifest-plan/src/timeouts.rs` reads it: unset is 1, and anything else
+/// must be a finite number greater than zero.
+fn dap_wall_timeout_multiplier() -> f64 {
+    const NAME: &str = "HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER";
+    match std::env::var(NAME) {
+        Err(std::env::VarError::NotPresent) => 1.0,
+        Ok(text) => match text.parse::<f64>() {
+            Ok(value) if value.is_finite() && value > 0.0 => value,
+            _ => panic!("{NAME} must be a finite number greater than zero, got {text:?}"),
+        },
+        Err(std::env::VarError::NotUnicode(_)) => panic!("{NAME} must be valid UTF-8"),
+    }
+}
+
+/// The stop `stop` must be a `reason` stop of `thread` whose newest frames
+/// are `frames`, each (function, line), and whose newest frame evaluates
+/// `watch.0` to `watch.1`. Unlike [`DapClient::assert_stop`], this asks for
+/// only as many frames as it checks, because the stack is thousands deep.
+fn dap_assert_newest_frames(
+    dap: &mut DapClient,
+    what: &str,
+    stop: &serde_json::Value,
+    thread: &serde_json::Value,
+    reason: &str,
+    frames: &[(&str, u64)],
+    watch: (&str, &str),
+) {
+    if stop["reason"] != reason || stop["threadId"] != *thread {
+        dap.fail(&format!(
+            "{what}: expected a {reason} stop of thread {thread}, got {stop}"
+        ));
+    }
+    let trace = dap.call(
+        "stackTrace",
+        serde_json::json!({"threadId": thread, "startFrame": 0, "levels": frames.len()}),
+        DAP_TIMEOUT,
+    );
+    let stack = trace["body"]["stackFrames"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let observed: Vec<(&str, u64)> = stack
+        .iter()
+        .map(|frame| {
+            (
+                frame["name"].as_str().unwrap_or_default(),
+                frame["line"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect();
+    if observed != frames {
+        dap.fail(&format!(
+            "{what}: expected the newest frames {frames:?}, got {observed:?}"
+        ));
+    }
+    let (variable, value) = watch;
+    let evaluated = dap.call(
+        "evaluate",
+        serde_json::json!({"expression": variable, "frameId": stack[0]["id"], "context": "watch"}),
+        DAP_TIMEOUT,
+    );
+    if evaluated["body"]["result"] != value {
+        dap.fail(&format!(
+            "{what}: expected {variable} = {value}, got {evaluated}"
+        ));
+    }
+}
+
+/// Runs the deep-recursion guest, `depth` calls deep, to its breakpoint in
+/// `bottom` with one `continue` that must take less than `bound`, then steps
+/// back twice, landing exactly. Returns how long the `continue` took.
+fn dap_deep_recursion_session(test: &str, depth: u32, bound: Duration) -> Option<Duration> {
+    let text = dap_deep_source(depth);
+    let expected = format!("d={}", depth + 1);
+    let (mut dap, _work, source, program, port) =
+        dap_replay_session(test, "deep", &text, &expected, None)?;
+    let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+
+    let what = "the stop in bottom";
+    let start = Instant::now();
+    dap.call("continue", serde_json::json!({"threadId": thread}), bound);
+    let stop = dap.stopped(what, bound.saturating_sub(start.elapsed()));
+    let elapsed = start.elapsed();
+    if elapsed >= bound {
+        dap.fail(&format!(
+            "the continue through {depth} recursive calls took {elapsed:?}, not under {bound:?}"
+        ));
+    }
+    dap_assert_newest_frames(
+        &mut dap,
+        what,
+        &stop,
+        &thread,
+        "breakpoint",
+        &[("bottom", 4), ("depth", 8), ("depth", 9), ("depth", 9)],
+        ("n", "0"),
+    );
+
+    let what = "stepBack to line 8 of depth(0)";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap_assert_newest_frames(
+        &mut dap,
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("depth", 8), ("depth", 9), ("depth", 9)],
+        ("n", "0"),
+    );
+    let what = "stepBack to line 9 of depth(1)";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap_assert_newest_frames(
+        &mut dap,
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("depth", 9), ("depth", 9), ("depth", 9)],
+        ("n", "1"),
+    );
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+    Some(elapsed)
+}
+
+/// A forward `continue` through deep recursion must stay fast, and stepBack
+/// deep in that recursion must still land exactly.
+///
+/// The adapter records a frame identity at every line arrival while the
+/// replay runs forward. Unwinding every frame for it made that cost the square
+/// of the stack depth, so the identity holds only the newest 8 frames. One
+/// `continue` from the attach stop to `bottom` passes about 2000 line
+/// arrivals at stack depths up to 1000. Measured on the host recorded in
+/// docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts" with GDB 17.2
+/// and Reverie 4f125805, it took 2.51 s to 2.66 s in eight runs with 8
+/// frames, and 63.45 s with every frame. The bound, 20 s (times
+/// `HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER` when set), is 7.5 times the slowest
+/// capped run and 3.2 times under the uncapped one.
+///
+/// The validation runner kills a test at 57 s of wall time
+/// (`.config/nextest.toml`, also times the wall multiplier) and at 22
+/// CPU-seconds counted over the test's cgroup, GDB and Hermit included
+/// (`DEFAULT_TEST_CPU_TIMEOUT_SECONDS` in `ci/manifest-plan/src/timeouts.rs`).
+/// The whole test took 6.11 s to 6.29 s of wall time and 4.69 s to 4.75 s of
+/// cgroup CPU in three runs in a systemd unit: 4.6 times under the CPU kill
+/// and 9 times under the wall kill. With every frame, the test failed at its
+/// bound after 20.97 s and 20.3 CPU-seconds in two runs, just under the CPU
+/// kill; in the runner, whichever fires first fails the test.
+///
+/// Then stepBack must land exactly at the previous two line arrivals: line 8
+/// of `depth(0)` and line 9 of `depth(1)`, more than 1000 frames deep, where
+/// every arrival at those lines has the same newest frames except for their
+/// stack pointers.
+#[test]
+fn hermit_dap_replay_continue_through_deep_recursion_is_fast_and_lands_exactly() {
+    let bound = DAP_DEEP_CONTINUE_BOUND.mul_f64(dap_wall_timeout_multiplier());
+    if let Some(elapsed) = dap_deep_recursion_session(
+        "hermit_dap_replay_continue_through_deep_recursion_is_fast_and_lands_exactly",
+        DAP_DEEP_DEPTH,
+        bound,
+    ) {
+        eprintln!(
+            "the continue through {DAP_DEEP_DEPTH} recursive calls took {elapsed:?} (bound {bound:?})"
+        );
+    }
+}
+
+/// The guest of the one-line-loop stepBack test below: a loop on one source
+/// line whose body calls `sq`, which is linked from an object without debug
+/// information.
+const DAP_ONE_LINE_LOOP_SOURCE: &str = r#"#include <stdio.h>
+int sq(int x);
+int main(void) {
+  int total = 0;
+  for (int i = 0; i < 3; i++) total += sq(i);
+  printf("total=%d\n", total);
+  return 0;
+}
+"#;
+/// The loop's line in [`DAP_ONE_LINE_LOOP_SOURCE`].
+const DAP_ONE_LINE_LOOP_LINE: u64 = 5;
+/// The `printf` line in [`DAP_ONE_LINE_LOOP_SOURCE`].
+const DAP_ONE_LINE_LOOP_PRINT_LINE: u64 = 6;
+
+/// stepBack from after a one-line loop must return to the pass where the
+/// client stopped, not to a later pass of the same address.
+///
+/// The client stops in `sq` for i = 0, steps out to the return address in the
+/// loop's line, then continues to line 6. The replay passes that return
+/// address twice more (i = 1 and i = 2) without stopping, and no line
+/// breakpoint covers it, so only the stop-address breakpoint records those
+/// passes. stepBack goes to the previous stop the client saw: i = 0, with
+/// total still 0. Without the stop-address breakpoint, without the
+/// subtraction of the passes it recorded, or with stepBack targeting one of
+/// those recorded passes, it lands at i = 2 with total = 1.
+#[test]
+fn hermit_dap_replay_step_back_skips_later_passes_of_a_one_line_loop() {
+    const TEST: &str = "hermit_dap_replay_step_back_skips_later_passes_of_a_one_line_loop";
+    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+        return;
+    };
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let sq = work.path().join("sq.c");
+    fs::write(&sq, "int sq(int x) { return x * x; }\n").expect("failed to write sq.c");
+    let sq_object = work.path().join("sq.o");
+    let output = Command::new("cc")
+        .args(["-O0", "-fno-pie", "-c"])
+        .arg(&sq)
+        .arg("-o")
+        .arg(&sq_object)
+        .output()
+        .expect("failed to run cc for sq.o");
+    assert!(
+        output.status.success(),
+        "compiling sq.c without debug information failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let source = work.path().join("oneline.c");
+    fs::write(&source, DAP_ONE_LINE_LOOP_SOURCE).expect("failed to write oneline.c");
+    let program = work.path().join("oneline");
+    let output = Command::new("cc")
+        .args(["-g", "-O0", "-fno-pie", "-no-pie"])
+        .arg(&source)
+        .arg(&sq_object)
+        .arg("-o")
+        .arg(&program)
+        .output()
+        .expect("failed to run cc for the one-line-loop guest");
+    assert!(
+        output.status.success(),
+        "compiling the one-line-loop guest failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let data_dir = work.path().join("recordings");
+    let recording = dap_record(&program, &data_dir, "total=5");
+
+    let port = unused_local_port();
+    let adapter = dap_replay_adapter(hermit_dap, &gdb, &recording, &data_dir, port);
+    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
+    if let Err(refusal) = dap.initialize() {
+        dap_gdb_skip(TEST, &refusal);
+        return;
+    }
+    let thread = dap.attach_and_break(
+        &program,
+        &format!("127.0.0.1:{port}"),
+        &source,
+        DAP_ONE_LINE_LOOP_PRINT_LINE,
+    );
+    let breakpoints = dap.call(
+        "setFunctionBreakpoints",
+        serde_json::json!({"breakpoints": [{"name": "sq"}]}),
+        DAP_TIMEOUT,
+    );
+    if breakpoints["body"]["breakpoints"][0]["verified"] != true {
+        dap.fail(&format!("the breakpoint on sq must resolve: {breakpoints}"));
+    }
+    let stop = dap.resume("continue", &thread, "the stop in sq", DAP_TIMEOUT);
+    if stop["reason"] != "function breakpoint" && stop["reason"] != "breakpoint" {
+        dap.fail(&format!("expected a breakpoint stop in sq, got {stop}"));
+    }
+    dap.call(
+        "setFunctionBreakpoints",
+        serde_json::json!({"breakpoints": []}),
+        DAP_TIMEOUT,
+    );
+    let in_loop = [("main", DAP_ONE_LINE_LOOP_LINE)];
+    let what = "stepOut of sq to the loop's first pass";
+    let stop = dap.resume("stepOut", &thread, what, DAP_TIMEOUT);
+    // GDB reports a stepOut of a function without debug information with
+    // reason "stopped", not "step".
+    dap.assert_stop(what, &stop, &thread, "stopped", &in_loop, ("i", "0"));
+    let what = "the breakpoint after the loop";
+    let stop = dap.resume("continue", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "breakpoint",
+        &[("main", DAP_ONE_LINE_LOOP_PRINT_LINE)],
+        ("total", "5"),
+    );
+
+    let what = "stepBack to the loop's first pass";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "step", &in_loop, ("i", "0"));
+    let trace = dap.call(
+        "stackTrace",
+        serde_json::json!({"threadId": thread}),
+        DAP_TIMEOUT,
+    );
+    let frame = trace["body"]["stackFrames"][0]["id"].clone();
+    let total = dap.call(
+        "evaluate",
+        serde_json::json!({"expression": "total", "frameId": frame, "context": "watch"}),
+        DAP_TIMEOUT,
+    );
+    if total["body"]["result"] != "0" {
+        dap.fail(&format!(
+            "{what}: expected total = 0 before the first pass adds to it, got {total}"
+        ));
+    }
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
 /// A recorded PMU skid overshoot and a guest that exited 1 must be
 /// distinguishable from `$?`
 /// ALONE, with no stderr parsing.
@@ -6232,6 +9197,161 @@ fn skid_overshoot_and_guest_failure_have_different_exit_codes() {
         overshoot_code,
         Some(HERMIT_POLICY_REFUSAL_EXIT),
         "an understood infrastructure failure should use the policy-refusal status"
+    );
+}
+
+/// Retained entries of a verify-log directory whose names start with `prefix`.
+fn retained_captures(log_dir: &Path, prefix: &str) -> Vec<PathBuf> {
+    let mut captures = fs::read_dir(log_dir)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", log_dir.display()))
+        .map(|entry| entry.expect("failed to read a retained log entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(prefix))
+        })
+        .collect::<Vec<_>>();
+    captures.sort();
+    captures
+}
+
+/// Runs a `hermit run --verify --keep-logs` command whose `--verify-log-dir` is
+/// `logs`, as [`Command::output`] does, and also returns run 2's log, which
+/// Hermit deletes after a match. The log survives as a hard link at `capture`,
+/// made by a poll while the command runs, or after it exits if Hermit retained
+/// the log; the `run2_log` module explains why that link holds run 2's complete
+/// log. The caller checks it like a retained log and
+/// then removes it. `None` means no poll saw a run 2 log and Hermit did not
+/// retain one.
+fn output_capturing_run2_log(
+    command: &mut Command,
+    logs: &Path,
+    capture: &Path,
+) -> (Output, Option<PathBuf>) {
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start the verify command");
+    let waiter = thread::spawn(move || child.wait_with_output());
+    let mut captured = false;
+    while !waiter.is_finished() {
+        if !captured {
+            captured = run2_log::link_run2_log(logs, capture);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let output = waiter
+        .join()
+        .expect("the verify command's waiter panicked")
+        .expect("failed to wait for the verify command");
+    // The polls can miss the whole run. A run 2 log that Hermit retained, as
+    // it does after a divergence, is still there to link.
+    if !captured {
+        captured = run2_log::link_run2_log(logs, capture);
+    }
+    (output, captured.then(|| capture.to_owned()))
+}
+
+/// `--keep-logs` keeps ONLY the first run's log after a matched verification.
+///
+/// Owner rule, https://github.com/rrnewton/hermit/issues/3301: after the two
+/// runs are checked to match for determinism, only one log needs to be kept.
+/// The first run's log is kept as the golden log, and `--keep-logs` deletes the
+/// second run's log, which compared equal to it. This
+/// drives the real ptrace backend with the exact retention flags the E2E runner
+/// emits, `--keep-logs --verify-log-dir <dir>`, so the directory checked here
+/// has the shape the pressure-test gate and the parity post-pass read.
+#[test]
+fn ptrace_keep_logs_retains_only_the_golden_log_after_a_match() {
+    let _guard = hermit_run_guard();
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the golden-log test directory");
+    let log_dir = root.path().join("verify-logs");
+    fs::create_dir(&log_dir).expect("failed to create the verify-log directory");
+    let verdict_path = root.path().join("verdict.json");
+    let stdout_path = root.path().join("stdout");
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--keep-logs",
+        "--verify-log-dir",
+        log_dir
+            .to_str()
+            .expect("verify-log directory should be UTF-8"),
+        "--verify-json",
+        verdict_path.to_str().expect("verdict path should be UTF-8"),
+        "--",
+        "/bin/echo",
+        "golden-log",
+    ];
+    let mut child = hermit_command(&args)
+        .stdout(fs::File::create(&stdout_path).expect("failed to create the stdout capture"))
+        .stderr(Stdio::piped())
+        // Own process group, so `wait_bounded` can reach namespace descendants.
+        .process_group(0)
+        .spawn()
+        .expect("failed to spawn the ptrace verification");
+    let status = wait_bounded(
+        &mut child,
+        "ptrace_keep_logs_retains_only_the_golden_log_after_a_match",
+    );
+    let stderr = strip_ansi_sgr(&drain_bounded(child.stderr.take()));
+    assert!(
+        status.success(),
+        "ptrace verification failed ({status}):\n{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&stdout_path).expect("failed to read the guest stdout"),
+        "golden-log\n"
+    );
+
+    let report = VerificationReport::from_current_json_value(
+        serde_json::from_slice(&fs::read(&verdict_path).expect("failed to read the verdict"))
+            .expect("the verdict should be JSON"),
+    )
+    .expect("the verdict should be a current verification report");
+    assert_eq!(report.verdict, Verdict::Matched, "{stderr}");
+    assert!(report.verified && report.bitwise_parity, "{stderr}");
+    let compared = report
+        .compared_log_messages
+        .expect("a canonical verification must report its compared INFO messages");
+    assert!(
+        compared.left > 0 && compared.left == compared.right,
+        "the golden log must come from a nonempty compared log population: {compared:?}"
+    );
+
+    // Exactly one nonempty golden log, and it is the only retained file.
+    let golden = retained_captures(&log_dir, "run1_log_");
+    assert_eq!(golden.len(), 1, "expected one golden log: {golden:?}");
+    let size = fs::metadata(&golden[0])
+        .expect("failed to stat the golden log")
+        .len();
+    assert!(size > 0, "the golden log {} is empty", golden[0].display());
+    let duplicates = retained_captures(&log_dir, "run2_log_");
+    assert!(
+        duplicates.is_empty(),
+        "a matched verification must delete run 2's log: {duplicates:?}"
+    );
+    let everything = retained_captures(&log_dir, "");
+    assert_eq!(
+        everything, golden,
+        "the golden log must be the only retained file"
+    );
+    // The retained path printed for the user names that same file, and no
+    // second log is reported as retained.
+    assert!(
+        stderr.contains(&format!("::   run 1: {}", golden[0].display())),
+        "the retained golden path was not reported:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("::   run 2:"),
+        "a deleted run 2 log was reported as retained:\n{stderr}"
     );
 }
 
@@ -7909,6 +11029,17 @@ fn sigint_instakill_reports_a_signal_death_not_a_policy_refusal() {
         "SIGINT to guest failed"
     );
 
+    // ⚠️ LET THE SIGNAL INTERRUPT THE READ BEFORE CLOSING STDIN. Closed at once,
+    // the pipe's EOF usually won the race: the guest's read returned 0
+    // uninterrupted and SIGINT reached the Tool at an ordinary delivery stop.
+    // The failing order is the one where the read is interrupted: detcore's
+    // retried read then takes SIGINT into reverie's held-signal slot, and before
+    // https://github.com/rrnewton/reverie/pull/831 the resume delivered it
+    // without calling handle_signal_event, so Hermit died of SIGINT instead of
+    // exiting 130 (https://github.com/rrnewton/hermit/issues/3468). The pause
+    // makes that the order this test checks on every run.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
     // ⚠️ CLOSE STDIN AFTER SIGNALLING, BEFORE WAITING. This one line is the
     // difference between measuring the fix and measuring nothing. With it held
     // open through the wait, this reported `code=None signal=Some(2)` -- the
@@ -8800,6 +11931,534 @@ fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
              point somewhere. backend={backend} stderr:\n{stderr}"
         );
     }
+}
+
+/// In-guest LiteInst (`HERMIT_LITEINST_IN_GUEST=1`,
+/// https://github.com/rrnewton/hermit/issues/3520) cannot deliver Detcore's
+/// preemption timer yet: the in-guest Tool host refuses `set_timer` with
+/// `ENOSYS`, which Detcore treats as fatal. A run with the default maximum
+/// timeslice must be REFUSED before dispatch, not fail inside the guest. The
+/// refusal comes from argument validation, so it holds in builds without the
+/// `liteinst` feature or runtime too.
+#[test]
+fn liteinst_in_guest_refuses_a_maximum_timeslice_before_dispatch() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let output = hermit_command(&[
+        "--backend",
+        "liteinst",
+        "run",
+        "--",
+        "/bin/echo",
+        "unreachable",
+    ])
+    .env("HERMIT_LITEINST_IN_GUEST", "1")
+    .stdin(Stdio::null())
+    .output()
+    .expect("failed to run hermit");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // EXIT-CLASS: hermit
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "in-guest LiteInst must refuse a maximum timeslice it cannot enforce. Got \
+         {:?}. stderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("pass --max-timeslice=disabled"),
+        "the refusal must say how to run without the timer. stderr:\n{stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("unreachable"),
+        "the guest must not run"
+    );
+}
+
+/// The selector accepts only "unset" (the ptrace-hosted hybrid) and `1`, so a
+/// typo cannot silently pick the hybrid.
+#[test]
+fn liteinst_in_guest_selector_rejects_unknown_values() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let output = hermit_command(&[
+        "--backend",
+        "liteinst",
+        "run",
+        "--max-timeslice=disabled",
+        "--",
+        "/bin/echo",
+        "unreachable",
+    ])
+    .env("HERMIT_LITEINST_IN_GUEST", "yes")
+    .stdin(Stdio::null())
+    .output()
+    .expect("failed to run hermit");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("HERMIT_LITEINST_IN_GUEST=\"yes\" is not a LiteInst runtime selection"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("unreachable"),
+        "the guest must not run"
+    );
+}
+
+/// In-guest LiteInst refuses `--verify`, and must refuse it before `--verify`
+/// snapshots stdin. The snapshot reads stdin to its end, so a refusal checked
+/// after it would wait for input that may never come instead of exiting. Stdin
+/// here is a pipe that the test holds open and never writes to.
+#[test]
+fn liteinst_in_guest_refuses_verify_without_reading_stdin() {
+    use std::io::Read;
+
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut child = hermit_command(&[
+        "--backend",
+        "liteinst",
+        "run",
+        "--max-timeslice=disabled",
+        "--verify",
+        "--",
+        "/bin/echo",
+        "unreachable",
+    ])
+    .env("HERMIT_LITEINST_IN_GUEST", "1")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("failed to run hermit");
+    let held_stdin = child.stdin.take().expect("stdin is piped");
+    let deadline = Instant::now() + DEADLINE;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("cannot poll hermit") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "hermit was still running {DEADLINE:?} after start with stdin open: the \
+                 --verify refusal waited for input"
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    drop(held_stdin);
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout is piped")
+        .read_to_string(&mut stdout)
+        .expect("cannot read hermit's stdout");
+    child
+        .stderr
+        .take()
+        .expect("stderr is piped")
+        .read_to_string(&mut stderr)
+        .expect("cannot read hermit's stderr");
+
+    // EXIT-CLASS: hermit
+    assert_eq!(
+        status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "status {status:?}, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--verify compares Detcore's internal logs"),
+        "the refusal must name --verify. stderr:\n{stderr}"
+    );
+    assert!(!stdout.contains("unreachable"), "the guest must not run");
+}
+
+/// A statically linked guest has no dynamic loader to load the in-guest
+/// runtime, so under in-guest LiteInst it would run entirely unmonitored. It
+/// must be refused before it starts.
+///
+/// The CLI reports a missing runtime library as an unavailable backend before
+/// it starts the container, and the program refusal is made inside the
+/// container, where the guest is spawned. So this test needs the runtime too.
+/// The refusal logic itself is covered without it by the
+/// `in_guest_liteinst_*` unit tests in `hermit-cli/src/lib.rs`.
+///
+/// The guest is a hand-assembled 157-byte static x86-64 executable that writes
+/// `RAN\n` and exits 0. It is run natively first, so the refusal cannot pass
+/// because the image was broken.
+#[test]
+#[cfg(feature = "liteinst")]
+#[ignore = "needs the in-guest Detcore runtime from `cargo build -p detcore-liteinst`"]
+fn liteinst_in_guest_refuses_a_statically_linked_guest() {
+    const BASE: u64 = 0x40_0000;
+    const HEADERS: usize = 64 + 56;
+    #[rustfmt::skip]
+    const CODE: &[u8] = &[
+        0xb8, 0x01, 0x00, 0x00, 0x00,             // mov eax, 1 (write)
+        0xbf, 0x01, 0x00, 0x00, 0x00,             // mov edi, 1
+        0x48, 0x8d, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip + 16]
+        0xba, 0x04, 0x00, 0x00, 0x00,             // mov edx, 4
+        0x0f, 0x05,                               // syscall
+        0xb8, 0x3c, 0x00, 0x00, 0x00,             // mov eax, 60 (exit)
+        0x31, 0xff,                               // xor edi, edi
+        0x0f, 0x05,                               // syscall
+        b'R', b'A', b'N', b'\n',
+    ];
+
+    fn put(image: &mut [u8], offset: usize, value: &[u8]) {
+        image[offset..offset + value.len()].copy_from_slice(value);
+    }
+
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let size = (HEADERS + CODE.len()) as u64;
+    let mut image = vec![0u8; HEADERS];
+    image.extend_from_slice(CODE);
+    put(&mut image, 0, b"\x7fELF\x02\x01\x01"); // 64-bit, little-endian, version 1
+    put(&mut image, 16, &2u16.to_le_bytes()); // ET_EXEC
+    put(&mut image, 18, &62u16.to_le_bytes()); // EM_X86_64
+    put(&mut image, 20, &1u32.to_le_bytes()); // EV_CURRENT
+    put(&mut image, 24, &(BASE + HEADERS as u64).to_le_bytes()); // e_entry
+    put(&mut image, 32, &64u64.to_le_bytes()); // e_phoff
+    put(&mut image, 52, &64u16.to_le_bytes()); // e_ehsize
+    put(&mut image, 54, &56u16.to_le_bytes()); // e_phentsize
+    put(&mut image, 56, &1u16.to_le_bytes()); // e_phnum
+    // One PT_LOAD maps the whole file, readable and executable, at BASE. There
+    // is no PT_INTERP, so the kernel starts it with no dynamic loader.
+    put(&mut image, 64, &1u32.to_le_bytes()); // PT_LOAD
+    put(&mut image, 68, &5u32.to_le_bytes()); // PF_R | PF_X
+    put(&mut image, 80, &BASE.to_le_bytes()); // p_vaddr
+    put(&mut image, 88, &BASE.to_le_bytes()); // p_paddr
+    put(&mut image, 96, &size.to_le_bytes()); // p_filesz
+    put(&mut image, 104, &size.to_le_bytes()); // p_memsz
+    put(&mut image, 112, &0x1000u64.to_le_bytes()); // p_align
+    assert_eq!(image.len(), 157);
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = directory.path().join("static-ran");
+    fs::write(&guest, &image).unwrap();
+    fs::set_permissions(&guest, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let native = Command::new(&guest)
+        .stdin(Stdio::null())
+        .output()
+        .expect("cannot run the static guest natively");
+    assert!(native.status.success(), "native run: {:?}", native.status);
+    assert_eq!(native.stdout, b"RAN\n", "native run");
+
+    let guest_arg = guest.to_str().expect("UTF-8 temporary path");
+    let output = hermit_command(&[
+        "--backend",
+        "liteinst",
+        "run",
+        "--max-timeslice=disabled",
+        "--",
+        guest_arg,
+    ])
+    .env("HERMIT_LITEINST_IN_GUEST", "1")
+    .stdin(Stdio::null())
+    .output()
+    .expect("failed to run hermit");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // EXIT-CLASS: hermit
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "status {:?}, stderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("is statically linked") && stderr.contains(guest_arg),
+        "the refusal must name the program and why. stderr:\n{stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("RAN"),
+        "the guest must not run"
+    );
+}
+
+/// In-guest LiteInst runs Detcore's Tool in the guest preload, with no ptrace
+/// tracer on the guest.
+///
+/// The guest is observed from OUTSIDE hermit. It cannot answer this question
+/// about itself: Detcore virtualizes `/proc/<pid>/status` and reports
+/// `TracerPid: 1` under every backend (`sanitize_status` in
+/// `detcore/src/procfs.rs`), so a guest-side probe reads 1 under in-guest
+/// LiteInst as well and cannot tell the backends apart.
+///
+/// The guest is `/bin/cat <fifo>`. Once a non-blocking open of the FIFO for
+/// writing stops failing with `ENXIO`, the guest has reached its own `open`,
+/// past the preload bootstrap, and it then blocks reading until this test
+/// writes. While it is parked there the test reads the guest's host
+/// `/proc/<pid>/status` and `/proc/<pid>/maps`. The ptrace backend is the
+/// control for both checks: it must show a nonzero `TracerPid` and no in-guest
+/// runtime mapping, so neither assertion can pass vacuously.
+#[test]
+#[cfg(feature = "liteinst")]
+#[ignore = "needs the in-guest Detcore runtime from `cargo build -p detcore-liteinst`"]
+fn liteinst_in_guest_runs_detcore_without_a_ptrace_tracer() {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const IN_GUEST_RUNTIME: &str = "/libdetcore_liteinst.so";
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    /// Unblocks and reaps the run on every exit path, including a failed
+    /// assertion, so a guest parked on the FIFO cannot outlive the test.
+    struct Run {
+        fifo: PathBuf,
+        child: Option<std::process::Child>,
+    }
+    impl Drop for Run {
+        fn drop(&mut self) {
+            let Some(mut child) = self.child.take() else {
+                return;
+            };
+            // An `O_RDWR` open of a FIFO never blocks on Linux and counts as a
+            // writer, so closing it hands a parked reader end-of-file.
+            drop(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&self.fifo),
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            // SAFETY: `killpg` has no memory-safety preconditions; the group was
+            // created for this run by `process_group(0)`.
+            unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+            let _ = child.wait();
+        }
+    }
+
+    struct GuestView {
+        tracer_pids: Vec<String>,
+        runtime_mapped: bool,
+    }
+
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let command_for = |backend: &str, program: &[&str]| {
+        let mut args = vec![
+            "--backend",
+            backend,
+            "run",
+            "--max-timeslice=disabled",
+            "--",
+        ];
+        args.extend(program);
+        let mut command = hermit_command(&args);
+        if backend == "liteinst" {
+            command.env("HERMIT_LITEINST_IN_GUEST", "1");
+        }
+        command
+    };
+    let check_stderr = |backend: &str, stderr: &str| {
+        if backend == "liteinst" {
+            assert!(
+                stderr.contains(
+                    "hermit: [liteinst in-guest] selected: the guest preload is to host the \
+                     Detcore Tool"
+                ),
+                "stderr:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains("[liteinst host hybrid]"),
+                "stderr:\n{stderr}"
+            );
+        }
+    };
+    let tracer_pid = |status: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("TracerPid:"))
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|| panic!("no TracerPid line in:\n{status}"))
+    };
+
+    let output = command_for("liteinst", &["/bin/echo", "hello", "in-guest"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "status {:?}, stderr:\n{stderr}",
+        output.status
+    );
+    check_stderr("liteinst", &stderr);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello in-guest\n");
+
+    let observe = |backend: &str| -> GuestView {
+        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create the FIFO directory");
+        let fifo = dir.path().join("guest-blocks-here");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).expect("NUL in temp path");
+        // SAFETY: `fifo_c` is a valid NUL-terminated path and mode has no
+        // additional preconditions.
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) },
+            0,
+            "mkfifo {fifo:?}: {}",
+            std::io::Error::last_os_error()
+        );
+        let fifo_arg = fifo.to_str().expect("temp path is not UTF-8");
+        let mut command = command_for(backend, &["/bin/cat", fifo_arg]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut run = Run {
+            fifo: fifo.clone(),
+            child: Some(command.spawn().expect("failed to spawn hermit")),
+        };
+
+        let deadline = Instant::now() + DEADLINE;
+        let mut writer = loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+            {
+                Ok(file) => break file,
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ENXIO) && Instant::now() < deadline =>
+                {
+                    let child = run.child.as_mut().expect("run is live");
+                    if let Ok(Some(status)) = child.try_wait() {
+                        panic!(
+                            "{backend}: hermit exited {status:?} before the guest opened {fifo:?}"
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("{backend}: the guest never opened {fifo:?}: {error}"),
+            }
+        };
+
+        let fifo_bytes = fifo.as_os_str().as_bytes();
+        let guests: Vec<u32> = fs::read_dir("/proc")
+            .expect("failed to list /proc")
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+                    let argv = cmdline.strip_suffix(&[0]).unwrap_or(&cmdline[..]);
+                    argv.split(|byte| *byte == 0)
+                        .eq([b"/bin/cat".as_slice(), fifo_bytes])
+                })
+            })
+            .collect();
+        assert_eq!(
+            guests.len(),
+            1,
+            "{backend}: expected exactly one guest `/bin/cat {fifo:?}`, found {guests:?}"
+        );
+        let guest = guests[0];
+        let tracer_pids = (0..3)
+            .map(|_| {
+                let status = fs::read_to_string(format!("/proc/{guest}/status"))
+                    .unwrap_or_else(|error| panic!("{backend}: guest {guest} status: {error}"));
+                thread::sleep(Duration::from_millis(50));
+                tracer_pid(&status)
+            })
+            .collect();
+        let maps = fs::read_to_string(format!("/proc/{guest}/maps"))
+            .unwrap_or_else(|error| panic!("{backend}: guest {guest} maps: {error}"));
+        let runtime_mapped = maps.lines().any(|line| line.ends_with(IN_GUEST_RUNTIME));
+
+        writer
+            .write_all(b"released\n")
+            .expect("failed to write to the FIFO");
+        drop(writer);
+        let mut child = run.child.take().expect("run is live");
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("failed to poll hermit") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                run.child = Some(child);
+                panic!("{backend}: the guest did not exit after the FIFO was released");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        child
+            .stdout
+            .take()
+            .expect("piped stdout")
+            .read_to_string(&mut stdout)
+            .expect("failed to read stdout");
+        child
+            .stderr
+            .take()
+            .expect("piped stderr")
+            .read_to_string(&mut stderr)
+            .expect("failed to read stderr");
+        assert!(
+            status.success(),
+            "{backend}: status {status:?}, stderr:\n{stderr}"
+        );
+        assert_eq!(stdout, "released\n", "{backend}: stderr:\n{stderr}");
+        check_stderr(backend, &stderr);
+        GuestView {
+            tracer_pids,
+            runtime_mapped,
+        }
+    };
+
+    let control = observe("ptrace");
+    assert!(
+        control.tracer_pids.iter().all(|pid| pid != "0"),
+        "under the ptrace backend the guest's host TracerPid read {:?}, so this probe \
+         cannot see a tracer and proves nothing about in-guest LiteInst",
+        control.tracer_pids
+    );
+    assert!(
+        !control.runtime_mapped,
+        "the ptrace guest maps {IN_GUEST_RUNTIME}, so the mapping check cannot tell \
+         the backends apart"
+    );
+    let in_guest = observe("liteinst");
+    assert_eq!(
+        in_guest.tracer_pids,
+        ["0", "0", "0"],
+        "in-guest LiteInst left a ptrace tracer on the guest"
+    );
+    assert!(
+        in_guest.runtime_mapped,
+        "the in-guest Detcore runtime {IN_GUEST_RUNTIME} is not mapped into the guest"
+    );
 }
 
 /// `--timeout` qualification is a static policy fact, so an UNAVAILABLE

@@ -1230,6 +1230,167 @@ fn waitid_polls_until_child_exit_and_supports_wnohang() {
 }
 
 #[test]
+fn wait4_argument_errors_match_linux_and_preserve_children() {
+    det_test_fn_sequential_without_pmu(|| {
+        // The pid argument is a full register so callers can set its high
+        // word; Linux reads only the low 32 bits of this `int` parameter.
+        fn wait4_error(pid: libc::c_long, options: libc::c_int, expected: libc::c_int) {
+            const STATUS_SENTINEL: libc::c_int = 0x5a5a_5a5a;
+            let mut status = STATUS_SENTINEL;
+            let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe {
+                std::ptr::write_bytes(
+                    (&mut usage as *mut libc::rusage).cast::<u8>(),
+                    0x5a,
+                    std::mem::size_of::<libc::rusage>(),
+                )
+            };
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_wait4,
+                    pid,
+                    &mut status,
+                    options,
+                    &mut usage as *mut libc::rusage,
+                )
+            };
+            assert_eq!(
+                result, -1,
+                "wait4({pid:#x}, {options:#x}) unexpectedly succeeded"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(expected),
+                "wait4({pid:#x}, {options:#x}) returned the wrong errno"
+            );
+            // Linux copies status and rusage only when wait4 returns a child,
+            // so every failure leaves both outputs untouched.
+            assert_eq!(
+                status, STATUS_SENTINEL,
+                "wait4({pid:#x}, {options:#x}) wrote the status output"
+            );
+            let usage_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&usage as *const libc::rusage).cast::<u8>(),
+                    std::mem::size_of::<libc::rusage>(),
+                )
+            };
+            assert!(
+                usage_bytes.iter().all(|&byte| byte == 0x5a),
+                "wait4({pid:#x}, {options:#x}) wrote the rusage output"
+            );
+        }
+        const INT_MIN: libc::c_long = libc::pid_t::MIN as libc::c_long;
+        // INT_MIN above is sign-extended, so its high word is 0xffff_ffff. The
+        // values below put INT_MIN in the low 32 bits under high word 0 (INT_MIN
+        // zero-extended) or 1, and -1 under high word 1.
+        const ZERO_HIGH_WORD_INT_MIN: libc::c_long = 0x0000_0000_8000_0000;
+        const HIGH_WORD_INT_MIN: libc::c_long = 0x0000_0001_8000_0000;
+        const HIGH_WORD_MINUS_ONE: libc::c_long = 0x0000_0001_ffff_ffff;
+
+        fn spawn_exiting_child(exit_status: libc::c_int) -> libc::pid_t {
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0, "fork should succeed");
+            if child == 0 {
+                unsafe { libc::_exit(exit_status) };
+            }
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        child as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                },
+                0
+            );
+            assert_eq!(unsafe { info.si_pid() }, child);
+            assert_eq!(info.si_code, libc::CLD_EXITED);
+            assert_eq!(unsafe { info.si_status() }, exit_status);
+            child
+        }
+
+        fn reap_child(child: libc::pid_t, exit_status: libc::c_int) {
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), exit_status);
+        }
+
+        wait4_error(INT_MIN, 0, libc::ESRCH);
+        wait4_error(INT_MIN, libc::WNOHANG, libc::ESRCH);
+        wait4_error(ZERO_HIGH_WORD_INT_MIN, 0, libc::ESRCH);
+        wait4_error(ZERO_HIGH_WORD_INT_MIN, libc::WNOHANG, libc::ESRCH);
+        wait4_error(HIGH_WORD_INT_MIN, 0, libc::ESRCH);
+        wait4_error(HIGH_WORD_INT_MIN, libc::WNOHANG, libc::ESRCH);
+        // Only INT_MIN is refused. INT_MIN + 1 selects process group INT_MAX,
+        // which no process can have, so Linux finds no child to wait for.
+        wait4_error(INT_MIN + 1, 0, libc::ECHILD);
+        wait4_error(INT_MIN + 1, libc::WNOHANG, libc::ECHILD);
+        wait4_error(0, libc::WNOHANG, libc::ECHILD);
+
+        let mut release_pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(release_pipe.as_mut_ptr()) }, 0);
+        let running_child = unsafe { libc::fork() };
+        assert!(running_child >= 0, "fork should succeed");
+        if running_child == 0 {
+            unsafe {
+                libc::close(release_pipe[1]);
+                let mut byte = 0_u8;
+                let result = libc::read(release_pipe[0], (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(if result == 1 { 31 } else { 126 });
+            }
+        }
+        unsafe { libc::close(release_pipe[0]) };
+        wait4_error(INT_MIN, libc::WNOHANG, libc::ESRCH);
+        let byte = 1_u8;
+        assert_eq!(
+            unsafe { libc::write(release_pipe[1], (&byte as *const u8).cast(), 1) },
+            1
+        );
+        unsafe { libc::close(release_pipe[1]) };
+        reap_child(running_child, 31);
+
+        let zombie_wnohang = spawn_exiting_child(41);
+        wait4_error(INT_MIN, libc::WNOHANG, libc::ESRCH);
+        wait4_error(ZERO_HIGH_WORD_INT_MIN, libc::WNOHANG, libc::ESRCH);
+        wait4_error(HIGH_WORD_INT_MIN, libc::WNOHANG, libc::ESRCH);
+        // The zombie is in this process's group, not group INT_MAX.
+        wait4_error(INT_MIN + 1, libc::WNOHANG, libc::ECHILD);
+        wait4_error(INT_MIN + 1, 0, libc::ECHILD);
+        reap_child(zombie_wnohang, 41);
+
+        let zombie_blocking = spawn_exiting_child(42);
+        wait4_error(INT_MIN, 0, libc::ESRCH);
+        reap_child(zombie_blocking, 42);
+
+        let zombie_untraced = spawn_exiting_child(51);
+        wait4_error(INT_MIN, libc::WUNTRACED | libc::WNOHANG, libc::ESRCH);
+        reap_child(zombie_untraced, 51);
+
+        let invalid_options_child = spawn_exiting_child(61);
+        wait4_error(INT_MIN, 0x10, libc::EINVAL);
+        wait4_error(ZERO_HIGH_WORD_INT_MIN, 0x10, libc::EINVAL);
+        wait4_error(HIGH_WORD_INT_MIN, 0x10, libc::EINVAL);
+        wait4_error(-1, 0x10, libc::EINVAL);
+        reap_child(invalid_options_child, 61);
+
+        for bit in 0..u32::BITS {
+            let option = (1_u32 << bit) as libc::c_int;
+            let expected = if matches!(bit, 0 | 1 | 3 | 29 | 30 | 31) {
+                libc::ECHILD
+            } else {
+                libc::EINVAL
+            };
+            wait4_error(-1, option, expected);
+            wait4_error(HIGH_WORD_MINUS_ONE, option, expected);
+        }
+    });
+}
+
+#[test]
 fn ordinary_clone_child_starts_before_parent_resumes() {
     det_test_fn_sequential_without_pmu(|| {
         use std::sync::Arc;

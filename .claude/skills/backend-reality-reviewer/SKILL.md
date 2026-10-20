@@ -87,12 +87,13 @@ repository:
 - PR opened = in review.
 - Merged to main + `hermit run --backend X` works = DONE.
 - Never report a backend milestone as delivered for work on an unlanded branch.
-  Closing the task is not the claim — the tags are. At implementation handoff,
-  post the PR and exact SHA, add the `implemented` tag, and close your own task
-  (`tg update <task> --status closed`). `implemented` without `landed` is what
-  keeps the unlanded backend visible in the drain; a closed task still tagged
-  `implemented` is NOT a delivered backend. Add `landed` once the commit is on
-  `main`.
+  Closing a task is not the claim — the commit on `main` is. At implementation
+  handoff, post the exact SHA and evidence in the PR itself; that is the record.
+  Under ORC only (TaskGraph is ORC's to-do list, not a record), also add the
+  `implemented` tag and close your own task
+  (`tg update <task> --status closed`); a closed task still tagged
+  `implemented` is NOT a delivered backend, and `landed` is added once the
+  commit is on `main`.
 
 ## Deep Code-Path Audit
 
@@ -219,4 +220,7 @@ The gap report must include SPECIFIC, ORDERED steps like:
 5. Test with ptrace strict-verify corpus
 6. Each step = a PR
 
-These steps become tasks in the task graph.
+Backend gaps are product defects, so every step needs a GitHub issue in
+`rrnewton/hermit`: search for an existing issue and reuse it, or file one if
+there is none. An open PR for a step does not replace its issue; link the PR
+from the issue. Under ORC, the steps also become tasks in ORC's task graph.

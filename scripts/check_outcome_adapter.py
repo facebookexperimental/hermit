@@ -109,8 +109,8 @@ class AuthorityIntegrityError(RuntimeError):
     """
 
 
-AUTHORITY_COMMIT = "4b78d727f35bc8612ac460a6e270dda5f5df304c"
-AUTHORITY_SHA256 = "2f1c61d5ec9d98b9697317fd9e66b705161defb69b808d23e6d83384e1e2a1e8"
+AUTHORITY_COMMIT = "588f462716087dab75bed0f56abba42b87b33b8c"
+AUTHORITY_SHA256 = "9e2a96f610007d6043daee3e05e0b30395518ea93113b0109fafd0d31e8ee5ee"
 AUTHORITY_RELATIVE_PATH = Path("ci-hub/check_outcome.py")
 AUTHORITY_API_PATH = (
     f"repos/rrnewton/dev-hermit/contents/ci-hub/check_outcome.py?ref={AUTHORITY_COMMIT}"

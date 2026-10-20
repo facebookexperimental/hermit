@@ -30,16 +30,17 @@ test:
       verify:
         ci:
           ptrace: true
+          sabre: true
           kvm: true
           liteinst: true
           dbt: true
         backends_enabled:
           - ptrace
+          - sabre
           - kvm
           - liteinst
           - dbt
-        backends_disabled:
-          sabre: SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC
+        backends_disabled: {}
         expected_stdout_contains:
           ptrace: "clock matrix success\n"
           dbt: "clock matrix success\n"
@@ -1282,8 +1283,7 @@ test:
           ptrace: false
         ci_disabled_reason:
           ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
-        compare_io_buffers: false
-        compare_io_buffers_disabled_reason: The guest asserts sanitizer-specific invariants for sixteen procfs files that legitimately retain process, virtual-time, topology, or host data; comparing their raw whole-file bytes would manufacture flakes.
+        compare_io_buffers: true
         rcb_time: false
         rcb_time_disabled_reason: The guest intentionally parses sanitizer outputs whose non-sanitized fields may vary; RCB-derived virtual time would turn legitimate data-dependent assertion work into unrelated INFO timestamp divergence.
         backends_enabled:
@@ -1421,10 +1421,10 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - sabre
           - kvm
         backends_disabled:
           dbt: Qualify recursive find independently against the new ptrace golden baseline
-          sabre: Qualify recursive find independently against the new ptrace golden baseline
           liteinst: Qualify recursive find independently against the new ptrace golden baseline
       replay:
         ci: false
@@ -1478,11 +1478,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - sabre
           - kvm
         backends_disabled:
           dbt: Enable once measured on this backend; ptrace is the proven baseline
           liteinst: Enable once measured on this backend; ptrace is the proven baseline
-          sabre: Enable once measured on this backend; ptrace is the proven baseline
       naked:
         ci: false
         backends_enabled: []
@@ -1540,11 +1540,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - sabre
           - kvm
         backends_disabled:
           dbt: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away
           liteinst: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away
-          sabre: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away
       naked:
         ci: false
         backends_enabled: []
@@ -1671,14 +1671,15 @@ test:
       verify:
         ci:
           ptrace: true
+          sabre: true
           kvm: true
         backends_enabled:
           - ptrace
+          - sabre
           - kvm
         backends_disabled:
           dbt: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
           liteinst: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
-          sabre: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
       naked:
         ci: false
         backends_enabled: []
@@ -1799,11 +1800,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - sabre
           - kvm
         backends_disabled:
           dbt: Enable once measured on this backend; ptrace is the proven baseline
           liteinst: Enable once measured on this backend; ptrace is the proven baseline
-          sabre: Enable once measured on this backend; ptrace is the proven baseline
       naked:
         ci: false
         backends_enabled: []
@@ -2167,9 +2168,9 @@ test:
         backends_enabled:
           - ptrace
           - dbt
+          - sabre
         backends_disabled:
           kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
-          sabre: Added for the DBT contract that replaced the backend-parity matrix; qualify SaBRe against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout:
           ptrace: "hello world\n"
@@ -2235,9 +2236,9 @@ test:
         backends_enabled:
           - ptrace
           - dbt
+          - sabre
         backends_disabled:
           kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
-          sabre: Added for the DBT contract that replaced the backend-parity matrix; qualify SaBRe against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout:
           ptrace: "alpha|two words\n"
@@ -2300,9 +2301,9 @@ test:
         backends_enabled:
           - ptrace
           - dbt
+          - sabre
         backends_disabled:
           kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
-          sabre: Added for the DBT contract that replaced the backend-parity matrix; qualify SaBRe against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout:
           ptrace: ""
@@ -2436,9 +2437,9 @@ test:
         backends_enabled:
           - ptrace
           - dbt
+          - sabre
         backends_disabled:
           kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
-          sabre: Added for the DBT contract that replaced the backend-parity matrix; qualify SaBRe against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout:
           ptrace: "backend parity fixture\n"

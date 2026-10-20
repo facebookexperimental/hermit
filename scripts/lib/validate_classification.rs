@@ -348,28 +348,34 @@ pub(super) fn validation_completeness_detail(
 
 /// Count only classified product results without fabricating StepOutcome fields.
 /// The committed repetition count remains the selected denominator.
+///
+/// Each probe is one node whose repetitions are rows of its structured test
+/// results. Rows count only when the classification says the node produced a
+/// product result; a node without one contributes no repetitions, so the
+/// shortfall is reported as NO_RESULT rather than as passes or failures.
 pub(super) fn stress_rates(
     classified: &RunClassification,
+    outcomes: &[StepOutcome],
     reps: i64,
 ) -> Vec<super::validate_super::ProbeRate> {
     super::validate_super::STRESS_PROBES
         .iter()
         .map(|probe| {
-            let prefix = format!("superstress.{}_", probe.slug().replace('-', "_"));
-            let ran = classified
-                .product_result_nodes
-                .iter()
-                .filter(|tag| tag.starts_with(&prefix))
-                .count();
-            let failed = classified
-                .product_failure_nodes
-                .iter()
-                .filter(|tag| tag.starts_with(&prefix))
-                .count();
+            let tag = format!("superstress.{}", probe.job_stem());
+            let rows: Vec<_> = if classified.product_result_nodes.contains(&tag) {
+                outcomes
+                    .iter()
+                    .filter(|outcome| outcome.tag == tag)
+                    .filter_map(|outcome| outcome.test_results.as_ref())
+                    .flatten()
+                    .collect()
+            } else {
+                Vec::new()
+            };
             super::validate_super::ProbeRate {
                 probe: *probe,
-                passed: ran - failed,
-                ran,
+                passed: rows.iter().filter(|row| row.passed).count(),
+                ran: rows.len(),
                 planned: reps as usize,
             }
         })
@@ -824,25 +830,45 @@ fn populations_bracket() -> Result<(), String> {
     }
     // Missing super repetitions keep the committed denominator and never become
     // measured failures. Both raw and classified rates agree for complete input.
+    let probe_outcome = |probe: &super::validate_super::StressProbe, verdicts: &[bool]| {
+        let failed = verdicts.iter().any(|passed| !passed);
+        let mut outcome = fixture_outcome(
+            &format!("superstress.{}", probe.job_stem()),
+            i64::from(failed),
+        );
+        outcome.test_results = Some(
+            verdicts
+                .iter()
+                .enumerate()
+                .map(|(index, passed)| {
+                    dagrun::TestResult::new(
+                        format!("{}/repetition-{:02}", probe.slug(), index + 1),
+                        *passed,
+                        1,
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        );
+        outcome
+    };
     let complete: Vec<_> = super::validate_super::STRESS_PROBES
         .iter()
-        .map(|probe| {
-            fixture_outcome(
-                &format!("superstress.{}_1", probe.slug().replace('-', "_")),
-                0,
-            )
-        })
+        .map(|probe| probe_outcome(probe, &[true]))
         .collect();
     let planned = complete.iter().map(|outcome| outcome.tag.clone()).collect();
     let classes = classify_run(&complete, &[], &[], &planned, &[]);
     let old = super::validate_super::stress_rates(&complete, 1);
-    let new = stress_rates(&classes, 1);
+    let new = stress_rates(&classes, &complete, 1);
     if old.iter().zip(&new).any(|(a, b)| {
         (a.probe, a.passed, a.ran, a.planned) != (b.probe, b.passed, b.ran, b.planned)
-    }) {
+    }) || new
+        .iter()
+        .any(|rate| (rate.passed, rate.ran, rate.planned) != (1, 1, 1))
+    {
         return Err("classification super rates changed a complete product population".into());
     }
-    let partial = stress_rates(&classes, 2);
+    let partial = stress_rates(&classes, &complete, 2);
     if partial
         .iter()
         .any(|rate| (rate.passed, rate.ran, rate.planned) != (1, 1, 2))
@@ -850,7 +876,7 @@ fn populations_bracket() -> Result<(), String> {
     {
         return Err("classification super rates invented a failed repetition".into());
     }
-    let empty_rates = stress_rates(&RunClassification::default(), 2);
+    let empty_rates = stress_rates(&RunClassification::default(), &complete, 2);
     if empty_rates
         .iter()
         .any(|rate| (rate.passed, rate.ran, rate.planned) != (0, 0, 2))
@@ -859,24 +885,45 @@ fn populations_bracket() -> Result<(), String> {
     {
         return Err("classification super rates changed absent or complete populations".into());
     }
-    let mut nonblocking = RunClassification::default();
-    for probe in super::validate_super::STRESS_PROBES
+    let nonblocking_outcomes: Vec<_> = super::validate_super::STRESS_PROBES
         .iter()
         .filter(|probe| probe.nonblocking())
+        .map(|probe| probe_outcome(probe, &[true, false]))
+        .collect();
+    let nonblocking_plan = nonblocking_outcomes
+        .iter()
+        .map(|outcome| outcome.tag.clone())
+        .collect();
+    let nonblocking = classify_run(&nonblocking_outcomes, &[], &[], &nonblocking_plan, &[]);
+    let nonblocking_rates = stress_rates(&nonblocking, &nonblocking_outcomes, 2);
+    if nonblocking_rates
+        .iter()
+        .filter(|rate| rate.probe.nonblocking())
+        .any(|rate| (rate.passed, rate.ran) != (1, 2))
+        || super::print_super_stress_verdict(&nonblocking_rates, 2, 1, 1) != 0
     {
-        let tag = format!("superstress.{}_1", probe.slug().replace('-', "_"));
-        nonblocking.product_result_nodes.insert(tag.clone());
-        nonblocking.product_failure_nodes.insert(tag);
-    }
-    if super::print_super_stress_verdict(&stress_rates(&nonblocking, 2), 2, 1, 1) != 0 {
         return Err(
             "classification super rates changed the existing nonblocking probe policy".into(),
         );
     }
-    let mut failed = classes;
-    failed.product_failure_nodes.insert(complete[0].tag.clone());
-    if super::print_super_stress_verdict(&stress_rates(&failed, 2), 2, 1, 1) != 1 {
+    // One failed repetition among passes is a measured blocking failure for a
+    // ptrace probe, counted from the node's rows rather than from its exit.
+    let mut failed_outcomes = complete.clone();
+    failed_outcomes[0] = probe_outcome(&super::validate_super::STRESS_PROBES[0], &[true, false]);
+    let failed = classify_run(&failed_outcomes, &[], &[], &planned, &[]);
+    let failed_rates = stress_rates(&failed, &failed_outcomes, 2);
+    if (failed_rates[0].passed, failed_rates[0].ran) != (1, 2)
+        || super::print_super_stress_verdict(&failed_rates, 2, 1, 1) != 1
+    {
         return Err("classification super rates lost a measured blocking failure".into());
+    }
+    // A probe node that failed without writing its rows produced no measured
+    // repetitions; the shortfall is displayed as NO_RESULT, not as passes.
+    let mut rowless = complete;
+    rowless[0].test_results = None;
+    let rowless_rates = stress_rates(&classes, &rowless, 1);
+    if (rowless_rates[0].passed, rowless_rates[0].ran) != (0, 0) {
+        return Err("classification super rates counted a node without result rows".into());
     }
     Ok(())
 }

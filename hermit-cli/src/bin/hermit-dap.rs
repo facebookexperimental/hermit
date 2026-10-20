@@ -10,6 +10,10 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::io;
+use std::os::fd::AsFd;
+use std::os::fd::BorrowedFd;
+use std::os::fd::IntoRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -148,6 +152,49 @@ fn replay_command(options: &ReplayOptions) -> Result<Vec<String>, String> {
     Ok(serialized)
 }
 
+/// Inheritable duplicates of this process's stdin, stdout and stderr, as a
+/// Python tuple literal, or `None` if any duplicate fails.
+///
+/// GDB's DAP interpreter redirects its own descriptors 0, 1 and 2 to internal
+/// pipes before it runs the replay extension, and drains them only after
+/// startup. A startup refusal written through them never reaches the client,
+/// so the extension writes it through these duplicates instead. They survive
+/// the exec below on purpose; the extension closes them once startup
+/// succeeds. Without them the extension can only write a refusal to GDB's own
+/// stderr, so a failed duplicate is reported here, while this process's
+/// stderr still reaches the client's log.
+fn client_fds() -> String {
+    let duplicate = |name: &'static str, fd: BorrowedFd<'_>| {
+        nix::unistd::dup(fd).map_err(|error| format!("{name} ({error})"))
+    };
+    match (
+        duplicate("stdin", io::stdin().as_fd()),
+        duplicate("stdout", io::stdout().as_fd()),
+        duplicate("stderr", io::stderr().as_fd()),
+    ) {
+        (Ok(input), Ok(output), Ok(error)) => format!(
+            "({}, {}, {})",
+            input.into_raw_fd(),
+            output.into_raw_fd(),
+            error.into_raw_fd()
+        ),
+        (input, output, error) => {
+            // Dropping the duplicates that did succeed closes them.
+            let failed: Vec<String> = [input.err(), output.err(), error.err()]
+                .into_iter()
+                .flatten()
+                .collect();
+            eprintln!(
+                "hermit-dap: could not duplicate {}; if managed replay refuses to \
+                 start, its reason goes only to GDB's stderr, which GDB's DAP \
+                 interpreter does not pass to the client",
+                failed.join(", ")
+            );
+            "None".to_string()
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let options = match parse_options(env::args_os().skip(1)) {
         Ok(Some(options)) => options,
@@ -178,9 +225,11 @@ fn main() -> ExitCode {
             }
         };
         let replay_target = format!("127.0.0.1:{}", replay.gdbserver_port);
+        let client_fds = client_fds();
         let extension = format!(
             "python HERMIT_REPLAY_COMMAND = {replay_command}; \
-             HERMIT_REPLAY_TARGET = {replay_target:?}; exec({REVERSE_DAP:?})"
+             HERMIT_REPLAY_TARGET = {replay_target:?}; \
+             HERMIT_CLIENT_FDS = {client_fds}; exec({REVERSE_DAP:?})"
         );
         gdb_command.arg(format!("--init-eval-command={extension}"));
     }

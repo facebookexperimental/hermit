@@ -122,9 +122,21 @@ pub(crate) struct ComparisonOptions {
     /// This is not a comparator setting; it describes what the records being
     /// compared can possibly show. See [`ComparisonSpec::compare_io_buffers`].
     pub compare_io_buffers: bool,
-    /// Keep both captured logs at their selected paths after comparison,
-    /// whether the runs match or diverge.
+    /// Keep captured logs at their selected paths after comparison.
+    ///
+    /// After a match, only the first side's log is kept, as the golden log,
+    /// and the second side's log, which compared equal to it under the
+    /// selected policy, is deleted. After a divergence, a
+    /// no-result, an error, or a match that did not compare the logs, both
+    /// logs are kept, because they are the evidence of what differed or of
+    /// what was never checked.
     pub keep_logs: bool,
+    /// The caller has already observed a result that replaces a comparator
+    /// match: a skid overshoot, which is an infrastructure error, or a DBT
+    /// counted-branch or statistics divergence. A match is then not the
+    /// terminal verdict, so the logs are retained as for a divergence, and
+    /// [`Self::keep_logs`] does not delete the second side's log.
+    pub match_overridden: bool,
     /// Where an implicitly retained failed comparison is stored and bounded.
     /// This is absent when the caller explicitly requested `--keep-logs`; an
     /// explicit evidence directory remains entirely caller-owned.
@@ -481,6 +493,7 @@ fn runtime_stats(summary: &RunSummary) -> RuntimeStats {
         scheduler_turns: summary.sched_turns,
         virtual_nanoseconds: summary.virttime_elapsed,
         syscalls: summary.syscalls,
+        dispatch: summary.dispatch_stats.clone(),
     }
 }
 
@@ -752,6 +765,24 @@ pub fn write_skid_overshoot_without_comparison_json(
 /// either the terminal verdict or an honest "no verdict reached".
 pub fn write_pending_verification_json(path: &Path) -> Result<(), Error> {
     write_report_json(path, &VerificationReport::no_result())
+}
+
+/// Forward the first compared run's guest output to Hermit's own stdout and
+/// stderr, as an unverified run would. It is written when the comparison
+/// verified, or when both runs' outputs agree: a disagreement was already
+/// reported as a labelled diff, and printing one side would choose for the
+/// reader. `run --verify` and `record start --verify` both emit through this.
+pub(crate) fn emit_compared_guest_output(
+    verified: bool,
+    first: &Output,
+    second: &Output,
+) -> io::Result<()> {
+    use std::io::Write;
+    if verified || (first.stdout == second.stdout && first.stderr == second.stderr) {
+        std::io::stdout().write_all(&first.stdout)?;
+        std::io::stderr().write_all(&first.stderr)?;
+    }
+    Ok(())
 }
 
 /// Execute one real verification run and replace the pending stamp only when
@@ -1466,10 +1497,32 @@ fn compare_two_runs_with_unsupported_scan(
         return Err(error);
     }
 
-    // Divergence historically retained both diagnostics. `--keep-logs` extends
-    // that behavior to successful comparisons instead of changing the failure
-    // path.
-    if options.keep_logs || failed {
+    // Divergence historically retained both diagnostics, and it still does.
+    // `--keep-logs` extends retention to successful comparisons, but a match
+    // needs only one log: once the two logs compared equal under the selected
+    // policy, the first is kept as the golden log and the second is deleted.
+    // It is deleted only when the logs were actually compared and no result
+    // the caller already observed overrides the match; every other outcome
+    // keeps both, as the failure path always has.
+    let keep_golden_log_only = options.keep_logs
+        && !failed
+        && !options.match_overridden
+        && compared_log_messages.is_some();
+    if keep_golden_log_only {
+        retain_verification_logs([(label1, log1)])?;
+        let matched_log = log2.to_path_buf();
+        log2.close().with_context(|| {
+            format!(
+                "could not delete {label2}'s log {}, which matched {label1}'s",
+                matched_log.display()
+            )
+        })?;
+        // Deliberately not in the `::   <label>: <path>` shape printed for a
+        // retained log: the deleted file has no path left to report.
+        eprintln!(
+            ":: Deleted {label2}'s log: it matched {label1}'s, which is kept as the golden log"
+        );
+    } else if options.keep_logs || failed {
         if let Some(retention) = &options.failed_log_retention {
             eprintln!(":: Verification logs retained:");
             retain_failed_verification_logs([(label1, log1), (label2, log2)], retention)?;
@@ -1607,32 +1660,157 @@ fn comparison_evidence_line(comparison: &ComparisonSpec) -> Option<String> {
 /// before `write_verification_json` replaced the pending `no_result` report.
 pub fn announce_verification_outcome(
     outcome: &VerificationOutcome,
+    second_run: SecondRun,
     success_message: &str,
     failure_message: &str,
 ) {
+    // Console output is best-effort, as it was with `eprintln!`; the verdict
+    // itself travels through the exit status and the published report.
+    let _ = write_verification_announcement(
+        &mut io::stderr().lock(),
+        outcome,
+        second_run,
+        success_message,
+        failure_message,
+    );
+}
+
+/// What the second half of a verification was, which decides what a match
+/// without virtual time does and does not show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecondRun {
+    /// A second, independent execution of the guest (`hermit run --verify`
+    /// and the DBT arm).
+    Rerun,
+    /// A replay of the first execution's recording
+    /// (`hermit record start --verify`).
+    Replay,
+}
+
+/// The phrase that claims bitwise parity on the console. It is printed only
+/// when the published report's `bitwise_parity` is true, so no weaker
+/// comparison can be read as that claim.
+pub(crate) const BITWISE_PARITY_CLAIM: &str = "bitwise parity established";
+
+/// Write the announcement for `outcome` to `out`.
+///
+/// On a match, the caller's success message is followed by a line that states
+/// what the match rests on. The success message is kept byte-for-byte as the
+/// callers pass it, because tests and harnesses in this repository and in the
+/// parent workspace match `Success: deterministic. Determinism verified.` as a
+/// substring and, in at least one place, as an exact line. That message is
+/// printed for the lossy `Stripped` comparison of a plain `--verify` as well as
+/// for the canonical comparison of `--verify-strict`, so on its own it cannot
+/// tell a reader which one ran.
+fn write_verification_announcement(
+    out: &mut impl io::Write,
+    outcome: &VerificationOutcome,
+    second_run: SecondRun,
+    success_message: &str,
+    failure_message: &str,
+) -> io::Result<()> {
     // Announce the comparison only after any requested machine-readable report
     // has been durably published. Output-only fallbacks did not compare an
     // internal log and therefore must not claim a comparison policy.
     if let Some(evidence) = comparison_evidence_line(&outcome.comparison) {
-        eprintln!("{evidence}");
+        writeln!(out, "{evidence}")?;
     }
     match outcome.verdict {
-        Verdict::Matched => eprintln!(":: {}", success_message.green().bold()),
-        Verdict::Diverged => eprintln!(":: {}", failure_message.red().bold()),
-        Verdict::NoResult => eprintln!(
+        Verdict::Matched => {
+            writeln!(out, ":: {}", success_message.green().bold())?;
+            writeln!(
+                out,
+                ":: {}",
+                matched_comparison_qualifier(outcome, second_run)
+            )?;
+        }
+        Verdict::Diverged => writeln!(out, ":: {}", failure_message.red().bold())?,
+        Verdict::NoResult => writeln!(
+            out,
             ":: {}",
             "No result: the comparison was refused, so this is neither a match nor a difference."
                 .red()
                 .bold()
-        ),
-        Verdict::InfrastructureError => eprintln!(
+        )?,
+        Verdict::InfrastructureError => writeln!(
+            out,
             ":: {}",
             "Infrastructure error: the result is neither a match nor a product difference."
                 .red()
                 .bold()
-        ),
+        )?,
+    }
+    Ok(())
+}
+
+/// Say, in plain words, what a `Matched` verdict compared.
+///
+/// The bitwise claim is derived from [`verification_report`], the same
+/// predicate that sets `bitwise_parity` in `--verify-json`, so the console and
+/// the machine-readable report cannot disagree. Stdout and stderr are always
+/// compared byte for byte by [`compare_two_runs`]; the guest's log records are
+/// compared only when `compare_logs` is set, under the spec's strictness and
+/// only within its `log_scope`. When time was not virtualized, the line also
+/// says what that leaves unshown, which depends on `second_run`.
+fn matched_comparison_qualifier(outcome: &VerificationOutcome, second_run: SecondRun) -> String {
+    let comparison = &outcome.comparison;
+    let scope = match comparison.log_scope {
+        ComparedLogScope::Deterministic => {
+            "only the DETLOG and scheduler COMMIT records of the guest's log"
+        }
+        ComparedLogScope::Info => "the INFO records of the guest's log",
+        ComparedLogScope::FullTrace => "every record of the guest's log",
+    };
+    let records = outcome.compared_log_messages.map_or_else(
+        || scope.to_owned(),
+        |counts| format!("{scope} ({} vs {})", counts.left, counts.right),
+    );
+    let compared = if verification_report(outcome).bitwise_parity {
+        format!(
+            "Compared: stdout and stderr byte for byte, and {records} exactly apart from \
+             the wall-clock prefix and canonicalized addresses, under {}: \
+             {BITWISE_PARITY_CLAIM}.",
+            comparison.display_name
+        )
+    } else if !comparison.compare_logs {
+        "Compared: stdout and stderr only. The guest's log records were not compared, \
+         so this is not a bitwise comparison."
+            .to_owned()
+    } else if comparison.strictness == LogCompareStrictness::Stripped {
+        format!(
+            "Compared: stdout and stderr byte for byte, and {records} under the lossy \
+             Stripped comparison, which erases numbers, addresses, paths and timestamps \
+             before comparing. This is not a bitwise comparison; add --verify-strict \
+             for one."
+        )
+    } else {
+        format!(
+            "Compared: stdout and stderr byte for byte, and {records} under {}, but \
+             without all the evidence the parity contract requires (see \
+             `bitwise_parity` in --verify-json). This is not a bitwise comparison.",
+            comparison.display_name
+        )
+    };
+    match (comparison.virtualize_time, second_run) {
+        (true, _) => compared,
+        (false, SecondRun::Replay) => format!("{compared} {TIME_NOT_VIRTUALIZED_NOTE}"),
+        (false, SecondRun::Rerun) => format!("{compared} {RERUN_TIME_NOT_VIRTUALIZED_NOTE}"),
     }
 }
+
+/// Appended to a replay's match when time was not virtualized, which is what
+/// `hermit record start --verify` always does (see
+/// [`ComparisonSpec::virtualize_time`]). Without it, a record-mode
+/// `bitwise parity established` would read as a determinism result.
+pub(crate) const TIME_NOT_VIRTUALIZED_NOTE: &str = "Time was not virtualized, so this shows \
+    that the second run reproduced the first, not that separate runs of the guest agree.";
+
+/// Appended to a rerun's match when time was not virtualized, for example
+/// `hermit run --no-virtualize-time --verify`. Both runs are independent
+/// executions, so the match is real, but the guest read the host's clock.
+pub(crate) const RERUN_TIME_NOT_VIRTUALIZED_NOTE: &str = "Time was not virtualized: the guest \
+    read the host's clock, so these two runs matched, but a guest whose output depends on the \
+    time can differ from one run to the next.";
 
 fn display_diff(left: &str, right: &str) {
     for result in diff::lines(left, right) {
@@ -2079,6 +2257,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: true,
                 keep_logs: false,
+                match_overridden: false,
                 failed_log_retention: None,
                 record_envelope,
                 virtualize_time: true,
@@ -2316,6 +2495,13 @@ mod tests {
             2,
             "both retained-log paths must use the caller-bound labels"
         );
+        assert_eq!(
+            production
+                .matches("retain_verification_logs([(label1, log1)])")
+                .count(),
+            1,
+            "the golden-log path after a match must use the caller-bound label"
+        );
     }
 
     #[test]
@@ -2344,6 +2530,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: false,
+                match_overridden: false,
                 failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
@@ -2558,6 +2745,7 @@ mod tests {
                 diagnostic_full_trace: true,
                 compare_io_buffers: false,
                 keep_logs: false,
+                match_overridden: false,
                 failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
@@ -2625,54 +2813,365 @@ mod tests {
         fs::remove_file(path2).unwrap();
     }
 
+    // A plain `--verify` (Stripped) and `--verify-strict` (Canonical) print the
+    // same success sentence, which is kept verbatim for its many consumers. The
+    // line after it must say which comparison ran, and only a match whose
+    // published report has `bitwise_parity` may claim bitwise parity. This
+    // checks the bytes the announcement actually writes, not a helper alone.
+    #[test]
+    fn stripped_success_does_not_claim_bitwise_parity_but_strict_success_does() {
+        const SUCCESS: &str = "Success: deterministic. Determinism verified.";
+        let announce_as = |outcome: &VerificationOutcome, second_run: SecondRun| {
+            let mut bytes = Vec::new();
+            write_verification_announcement(
+                &mut bytes,
+                outcome,
+                second_run,
+                SUCCESS,
+                "Failure: nondeterministic.",
+            )
+            .unwrap();
+            String::from_utf8(bytes).unwrap()
+        };
+        let announce = |outcome: &VerificationOutcome| announce_as(outcome, SecondRun::Rerun);
+        let out = output(0, b"hello\n", b"");
+
+        let (log1, log2) = empty_logs();
+        fs::write(&log1, detlog_with_value(100)).unwrap();
+        fs::write(&log2, detlog_with_value(100)).unwrap();
+        let stripped =
+            compare_with(&out, log1, &out, log2, LogCompareStrictness::Stripped).unwrap();
+        assert_eq!(stripped.verdict, Verdict::Matched);
+        assert!(!verification_report(&stripped).bitwise_parity);
+        let text = announce(&stripped);
+        assert!(text.contains(SUCCESS), "{text}");
+        assert!(!text.contains(BITWISE_PARITY_CLAIM), "{text}");
+        assert!(
+            text.contains(
+                "only the DETLOG and scheduler COMMIT records of the guest's log (1 vs 1) \
+                 under the lossy Stripped comparison"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("This is not a bitwise comparison; add --verify-strict for one."),
+            "{text}"
+        );
+        assert!(!text.contains(TIME_NOT_VIRTUALIZED_NOTE), "{text}");
+        assert!(!text.contains(RERUN_TIME_NOT_VIRTUALIZED_NOTE), "{text}");
+
+        let (log1, log2) = empty_logs();
+        fs::write(&log1, detlog_with_value(100)).unwrap();
+        fs::write(&log2, detlog_with_value(100)).unwrap();
+        let canonical =
+            compare_with(&out, log1, &out, log2, LogCompareStrictness::Canonical).unwrap();
+        assert_eq!(canonical.verdict, Verdict::Matched);
+        assert!(verification_report(&canonical).bitwise_parity);
+        let text = announce(&canonical);
+        assert!(text.contains(SUCCESS), "{text}");
+        assert!(
+            text.contains(&format!("under BitwiseInfoV1: {BITWISE_PARITY_CLAIM}.")),
+            "{text}"
+        );
+        assert!(
+            text.contains("the INFO records of the guest's log (1 vs 1) exactly"),
+            "{text}"
+        );
+        assert!(!text.contains("not a bitwise comparison"), "{text}");
+        assert!(!text.contains(TIME_NOT_VIRTUALIZED_NOTE), "{text}");
+        assert!(!text.contains(RERUN_TIME_NOT_VIRTUALIZED_NOTE), "{text}");
+        // With virtual time on, a replay's match carries no time note either.
+        let text = announce_as(&canonical, SecondRun::Replay);
+        assert!(!text.contains(TIME_NOT_VIRTUALIZED_NOTE), "{text}");
+        assert!(!text.contains(RERUN_TIME_NOT_VIRTUALIZED_NOTE), "{text}");
+
+        // `record start --verify --verify-strict` compares with virtual time
+        // off. Parity can still hold, but the line must say that the match is
+        // replay fidelity, not agreement between separate runs.
+        let time_off = VerificationOutcome {
+            comparison: ComparisonSpec {
+                virtualize_time: false,
+                ..canonical.comparison
+            },
+            ..canonical.clone()
+        };
+        assert!(verification_report(&time_off).bitwise_parity);
+        let text = announce_as(&time_off, SecondRun::Replay);
+        assert!(
+            text.contains(&format!(
+                "{BITWISE_PARITY_CLAIM}. {TIME_NOT_VIRTUALIZED_NOTE}"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(RERUN_TIME_NOT_VIRTUALIZED_NOTE), "{text}");
+
+        // `run --no-virtualize-time --verify-strict` compares two independent
+        // runs, so the replay wording ("the second run reproduced the first")
+        // would be false there. It says instead that the guest read the
+        // host's clock.
+        let text = announce_as(&time_off, SecondRun::Rerun);
+        assert!(
+            text.contains(&format!(
+                "{BITWISE_PARITY_CLAIM}. {RERUN_TIME_NOT_VIRTUALIZED_NOTE}"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(TIME_NOT_VIRTUALIZED_NOTE), "{text}");
+        assert!(!text.contains("reproduced the first"), "{text}");
+
+        // A full-trace comparison names the whole log as its scope.
+        let full_trace = VerificationOutcome {
+            comparison: ComparisonSpec {
+                log_scope: ComparedLogScope::FullTrace,
+                ..canonical.comparison
+            },
+            ..canonical.clone()
+        };
+        let text = announce(&full_trace);
+        assert!(
+            text.contains("every record of the guest's log (1 vs 1)"),
+            "{text}"
+        );
+
+        // A canonical spec without the evidence parity needs (here, no
+        // compared records) must not inherit the claim from its policy name.
+        let no_evidence = VerificationOutcome {
+            compared_log_messages: Some(ComparedLogCounts { left: 0, right: 0 }),
+            ..canonical.clone()
+        };
+        let text = announce(&no_evidence);
+        assert!(!text.contains(BITWISE_PARITY_CLAIM), "{text}");
+        assert!(text.contains("This is not a bitwise comparison."), "{text}");
+
+        // An output-only fallback compared no log at all.
+        let output_only = VerificationOutcome {
+            comparison: ComparisonSpec {
+                compare_logs: false,
+                ..canonical.comparison
+            },
+            compared_log_messages: None,
+            ..canonical.clone()
+        };
+        let text = announce(&output_only);
+        assert!(!text.contains(BITWISE_PARITY_CLAIM), "{text}");
+        assert!(text.contains("Compared: stdout and stderr only."), "{text}");
+
+        // A divergence prints no qualifier and no claim.
+        let diverged = VerificationOutcome {
+            verdict: Verdict::Diverged,
+            ..canonical
+        };
+        let text = announce(&diverged);
+        assert!(!text.contains("Compared:"), "{text}");
+        assert!(!text.contains(BITWISE_PARITY_CLAIM), "{text}");
+    }
+
+    /// Compare two in-memory logs with the canonical comparator and report
+    /// which of the two log paths survived the comparison.
+    fn compare_for_retention(
+        directory: &Path,
+        left_log: &str,
+        right_log: &str,
+        compare_logs: bool,
+        keep_logs: bool,
+        match_overridden: bool,
+    ) -> (Verdict, PathBuf, PathBuf) {
+        let output = output(0, b"hello\n", b"");
+        let (left, right) = temp_log_files_in("run1", "run2", Some(directory)).unwrap();
+        fs::write(left.path(), left_log).unwrap();
+        fs::write(right.path(), right_log).unwrap();
+        let left_path = left.path().to_path_buf();
+        let right_path = right.path().to_path_buf();
+        let outcome = compare_two_runs(
+            ComparedRun {
+                output: &output,
+                log: left.into_temp_path(),
+                label: "run 1",
+            },
+            ComparedRun {
+                output: &output,
+                log: right.into_temp_path(),
+                label: "run 2",
+            },
+            ComparisonOptions {
+                verbose: false,
+                strictness: LogCompareStrictness::Canonical,
+                compare_logs,
+                diagnostic_full_trace: false,
+                compare_io_buffers: false,
+                keep_logs,
+                match_overridden,
+                failed_log_retention: None,
+                record_envelope: RecordEnvelope::all_records_v1(),
+                virtualize_time: true,
+            },
+        )
+        .unwrap();
+        (outcome.verdict, left_path, right_path)
+    }
+
+    /// Assert that a retained log is a regular file holding exactly `expected`.
+    fn assert_retained_log(path: &Path, expected: &str, side: &str) {
+        let metadata = fs::symlink_metadata(path)
+            .unwrap_or_else(|error| panic!("{side} log {} is missing: {error}", path.display()));
+        assert!(metadata.file_type().is_file(), "{side} log is not a file");
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            expected,
+            "{side} log was not retained byte for byte"
+        );
+    }
+
+    /// `--keep-logs` retains one golden log after a match and both logs after
+    /// a divergence. Once the two logs compared equal, run 2's log is deleted
+    /// and run 1's is kept as the golden log.
+    /// A divergence retains both whether or not `--keep-logs` was given, and a
+    /// match the caller has already overridden (a skid overshoot, or a DBT
+    /// counted-branch or statistics divergence) retains both, as a divergence
+    /// does. Without `--keep-logs`, a match retains nothing.
     #[test]
     fn verification_log_retention_matches_the_cli_contract() {
         let directory = tempfile::tempdir().unwrap();
-        let output = output(0, b"hello\n", b"");
 
-        for (left_value, right_value, keep_logs, expected, retained) in [
-            (7, 7, false, Verdict::Matched, false),
-            (7, 8, false, Verdict::Diverged, true),
-            (7, 7, true, Verdict::Matched, true),
-            (7, 8, true, Verdict::Diverged, true),
+        for (
+            left_value,
+            right_value,
+            keep_logs,
+            match_overridden,
+            expected,
+            run1_retained,
+            run2_retained,
+        ) in [
+            (7, 7, false, false, Verdict::Matched, false, false),
+            (7, 8, false, false, Verdict::Diverged, true, true),
+            (7, 7, true, false, Verdict::Matched, true, false),
+            (7, 8, true, false, Verdict::Diverged, true, true),
+            (7, 7, false, true, Verdict::Matched, false, false),
+            (7, 7, true, true, Verdict::Matched, true, true),
+            (7, 8, true, true, Verdict::Diverged, true, true),
         ] {
-            let (left, right) = temp_log_files_in("left", "right", Some(directory.path())).unwrap();
-            fs::write(left.path(), detlog_with_value(left_value)).unwrap();
-            fs::write(right.path(), detlog_with_value(right_value)).unwrap();
-            let left_path = left.path().to_path_buf();
-            let right_path = right.path().to_path_buf();
-            let outcome = compare_two_runs(
-                ComparedRun {
-                    output: &output,
-                    log: left.into_temp_path(),
-                    label: "run 1",
-                },
-                ComparedRun {
-                    output: &output,
-                    log: right.into_temp_path(),
-                    label: "run 2",
-                },
-                ComparisonOptions {
-                    verbose: false,
-                    strictness: LogCompareStrictness::Canonical,
-                    compare_logs: true,
-                    diagnostic_full_trace: false,
-                    compare_io_buffers: false,
-                    keep_logs,
-                    failed_log_retention: None,
-                    record_envelope: RecordEnvelope::all_records_v1(),
-                    virtualize_time: true,
-                },
-            )
-            .unwrap();
-            assert_eq!(outcome.verdict, expected);
-            assert_eq!(left_path.exists(), retained, "run-1 retention mismatch");
-            assert_eq!(right_path.exists(), retained, "run-2 retention mismatch");
-            if retained {
-                fs::remove_file(left_path).unwrap();
-                fs::remove_file(right_path).unwrap();
+            let case = format!(
+                "values {left_value}/{right_value}, keep_logs={keep_logs}, \
+                 match_overridden={match_overridden}"
+            );
+            let (verdict, left_path, right_path) = compare_for_retention(
+                directory.path(),
+                &detlog_with_value(left_value),
+                &detlog_with_value(right_value),
+                true,
+                keep_logs,
+                match_overridden,
+            );
+            assert_eq!(verdict, expected, "verdict mismatch for {case}");
+            if run1_retained {
+                assert_retained_log(&left_path, &detlog_with_value(left_value), "run-1");
+            } else {
+                assert!(!left_path.exists(), "run-1 log must be deleted for {case}");
+            }
+            if run2_retained {
+                assert_retained_log(&right_path, &detlog_with_value(right_value), "run-2");
+            } else {
+                assert!(!right_path.exists(), "run-2 log must be deleted for {case}");
+            }
+            for (path, retained) in [(left_path, run1_retained), (right_path, run2_retained)] {
+                if retained {
+                    fs::remove_file(path).unwrap();
+                }
             }
         }
+        assert_eq!(
+            fs::read_dir(directory.path()).unwrap().count(),
+            0,
+            "every retained log was accounted for"
+        );
+    }
+
+    /// A match that never compared the logs has not verified run 2's log
+    /// against run 1's, so neither is a golden copy of the other and
+    /// `--keep-logs` retains both.
+    #[test]
+    fn requested_logs_survive_a_match_that_did_not_compare_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let (verdict, left_path, right_path) = compare_for_retention(
+            directory.path(),
+            &detlog_with_value(7),
+            &detlog_with_value(8),
+            false,
+            true,
+            false,
+        );
+        assert_eq!(verdict, Verdict::Matched);
+        assert_retained_log(&left_path, &detlog_with_value(7), "run-1");
+        assert_retained_log(&right_path, &detlog_with_value(8), "run-2");
+    }
+
+    /// A refused comparison is a no-result, not a match, so `--keep-logs`
+    /// retains both logs, exactly as before one-golden-log retention.
+    #[test]
+    fn requested_logs_survive_a_refused_comparison() {
+        let directory = tempfile::tempdir().unwrap();
+        let body = format!(
+            "{}{}{}\n",
+            detlog_with_value(1),
+            detlog_with_value(2),
+            detcore::logdiff::TRUNCATION_MARKER
+        );
+        let (verdict, left_path, right_path) =
+            compare_for_retention(directory.path(), &body, &body, true, true, false);
+        assert_eq!(verdict, Verdict::NoResult);
+        assert_retained_log(&left_path, &body, "run-1");
+        assert_retained_log(&right_path, &body, "run-2");
+    }
+
+    /// The DBT backend observes a counted-branch or statistics divergence
+    /// before the log comparison, so its logs can match while the verdict is
+    /// a divergence. It forces retention and marks the match overridden; both
+    /// logs must then land in the bounded failure directory, as they did
+    /// before one-golden-log retention, and neither stays at its source path.
+    #[test]
+    fn an_overridden_match_keeps_both_logs_in_the_failure_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let root = temporary.path().join("verify-failures");
+        fs::create_dir(&source).unwrap();
+        let output = output(0, b"same output\n", b"");
+        let (left, right) = temp_log_files_in("run1", "run2", Some(&source)).unwrap();
+        fs::write(left.path(), detlog_with_value(7)).unwrap();
+        fs::write(right.path(), detlog_with_value(7)).unwrap();
+        let left_name = left.path().file_name().unwrap().to_owned();
+        let right_name = right.path().file_name().unwrap().to_owned();
+        let outcome = compare_two_runs(
+            ComparedRun {
+                output: &output,
+                log: left.into_temp_path(),
+                label: "run 1",
+            },
+            ComparedRun {
+                output: &output,
+                log: right.into_temp_path(),
+                label: "run 2",
+            },
+            ComparisonOptions {
+                verbose: false,
+                strictness: LogCompareStrictness::Canonical,
+                compare_logs: true,
+                diagnostic_full_trace: false,
+                compare_io_buffers: true,
+                keep_logs: true,
+                match_overridden: true,
+                failed_log_retention: Some(FailedVerifyLogRetention::new(root.clone(), 2)),
+                record_envelope: RecordEnvelope::all_records_v1(),
+                virtualize_time: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.verdict, Verdict::Matched);
+        assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
+        let directories = retained_comparison_dirs(&root).unwrap();
+        assert_eq!(directories.len(), 1, "one retained comparison");
+        let retained = &directories[0].0;
+        assert_retained_log(&retained.join(&left_name), &detlog_with_value(7), "run-1");
+        assert_retained_log(&retained.join(&right_name), &detlog_with_value(7), "run-2");
     }
 
     fn run_failed_comparison(source: &Path, retention: FailedVerifyLogRetention, value: u64) {
@@ -2698,6 +3197,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: true,
                 keep_logs: false,
+                match_overridden: false,
                 failed_log_retention: Some(retention),
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
@@ -2838,6 +3338,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: true,
+                match_overridden: false,
                 failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
@@ -2903,6 +3404,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: true,
+                match_overridden: false,
                 failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
@@ -3607,6 +4109,35 @@ mod tests {
         assert_eq!(json["verdict"], "no_result");
         assert_eq!(json["runtime"]["run1"]["virtual_nanoseconds"], 34);
         assert_eq!(json["runtime"]["run2"]["syscalls"], 6);
+        assert!(json["runtime"]["run1"].get("dispatch").is_none());
+    }
+
+    #[test]
+    fn report_carries_each_run_dispatch_record() {
+        let record = reverie::DispatchStats::new(
+            "ptrace",
+            reverie::DispatchCounters {
+                ptrace_seccomp_stops: Some(9),
+                ..reverie::DispatchCounters::ZERO
+            },
+            reverie::SiteCounters::NONE_PATCHED,
+        );
+        let first = RunSummary {
+            dispatch_stats: Some(record.clone()),
+            ..Default::default()
+        };
+        let runtime = verification_runtime_from_summaries(Some(&first), None)
+            .expect("one summary produces runtime totals");
+        assert_eq!(runtime.run1.unwrap().dispatch, Some(record.clone()));
+
+        let mut report = VerificationReport::no_result();
+        report.runtime = verification_runtime_from_summaries(Some(&first), Some(&first));
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["runtime"]["run2"]["dispatch"]["backend"], "ptrace");
+        assert_eq!(
+            json["runtime"]["run2"]["dispatch"]["schema_version"],
+            reverie::DISPATCH_STATS_SCHEMA_VERSION
+        );
     }
 
     #[test]

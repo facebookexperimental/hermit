@@ -23,9 +23,10 @@
  *
  * The ptrace and KVM backends determinize all four. The DBT (DynamoRIO) backend
  * pins release but forwards the *host* nodename, so it deterministically-but-
- * host-dependently fails the nodename check; matrix.tsv records that as a DBT
- * gap. Native Linux honors none of the pinned values, proving these are Hermit
- * determinization choices rather than host coincidences.
+ * host-dependently fails the nodename check; the DBT verify cell for
+ * c-programs/uname-identity in tests/e2e/manifests/c-programs.yaml is disabled
+ * with that reason. Native Linux honors none of the pinned values, proving
+ * these are Hermit determinization choices rather than host coincidences.
  *
  * Uses only the libc uname() wrapper and POSIX <sys/utsname.h>; no _GNU_SOURCE.
  */

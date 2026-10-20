@@ -25,6 +25,7 @@ use regex::Regex;
 
 use super::kvm_cancellation::bounded_command_with_timeout;
 use super::kvm_cancellation::bounded_read;
+use super::kvm_cancellation::bounded_verify_command;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -476,7 +477,7 @@ fn run_fixture(scenario: Scenario) {
             args.insert(8, "--skid-margin=1000");
         }
         let mut command = traced_hermit_command(&args);
-        let status = bounded_command_with_timeout(&mut command, &directory, remaining());
+        let (status, run2_log) = bounded_verify_command(&mut command, &directory, remaining());
         assert_eq!(
             status.code(),
             Some(0),
@@ -546,8 +547,8 @@ fn run_fixture(scenario: Scenario) {
             assert_eq!(operand.stderr_bytes, 0);
             assert_eq!(operand.stderr_sha256, Digest::new(b"").to_string());
         }
-        for prefix in ["run1_log_", "run2_log_"] {
-            let matches: Vec<_> = fs::read_dir(&logs)
+        let retained = |prefix: &str| -> Vec<_> {
+            fs::read_dir(&logs)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| {
@@ -556,10 +557,21 @@ fn run_fixture(scenario: Scenario) {
                         .to_string_lossy()
                         .starts_with(prefix)
                 })
-                .collect();
-            assert_eq!(matches.len(), 1, "one complete retained log per execution");
-            let log = String::from_utf8(bounded_read(&matches[0], 64 * MIB)).unwrap();
-            assert_no_single_step_dumps(&log, &matches[0]);
+                .collect()
+        };
+        // After a match `--keep-logs` keeps only run 1's log, the golden copy;
+        // run 2's log, which matched it, is deleted. Its capture is checked in
+        // its place.
+        let golden = retained("run1_log_");
+        assert_eq!(golden.len(), 1, "one complete retained golden log");
+        assert!(
+            retained("run2_log_").is_empty(),
+            "a matched verification must not retain run 2's log"
+        );
+        let run2_log = run2_log.expect("run 2's log, captured while the command ran");
+        for path in [&golden[0], &run2_log] {
+            let log = String::from_utf8(bounded_read(path, 64 * MIB)).unwrap();
+            assert_no_single_step_dumps(&log, path);
             if !exit_only {
                 assert_pmu_handoffs(&log, stdout);
             }
@@ -567,6 +579,7 @@ fn run_fixture(scenario: Scenario) {
                 assert_preemption_handoffs(&log, stdout, scenario == Scenario::RunnableLeader);
             }
         }
+        fs::remove_file(&run2_log).expect("remove run 2's checked log");
         previous_stdout = Some(output);
         eprintln!("ptrace nonleader exec pair {pair}: two full canonical executions");
     }
@@ -575,19 +588,15 @@ fn run_fixture(scenario: Scenario) {
 const PREEMPTION_REFUSAL: &str =
     "unsupported: preemption recording and replay across nonleader exec";
 
-fn preemption_artifact_case(
-    directory: &Path,
-    guest: &Path,
-    target: &Path,
-    artifact_option: &str,
-    refused: bool,
-    expected_identity: Option<(&str, &str)>,
-    timeout: Duration,
-) -> String {
-    let logs = directory.join("verify-logs");
-    fs::create_dir_all(&logs).unwrap();
-    let report_path = directory.join("verification.json");
-    let args = [
+/// The verified command of one preemption-artifact case.
+fn artifact_args<'a>(
+    guest: &'a Path,
+    target: &'a Path,
+    artifact_option: &'a str,
+    report_path: &'a Path,
+    logs: &'a Path,
+) -> Vec<&'a str> {
+    vec![
         "--log=trace",
         "--backend=ptrace",
         "run",
@@ -611,9 +620,86 @@ fn preemption_artifact_case(
         "--",
         guest.to_str().unwrap(),
         target.to_str().unwrap(),
-    ];
+    ]
+}
+
+/// The checks of one execution's trace in a preemption-artifact case.
+/// Returns whether the trace names the transfer refusal.
+fn assert_artifact_log(
+    log: &str,
+    path: &Path,
+    artifact_option: &str,
+    refused: bool,
+    (leader, worker): (&str, &str),
+) -> bool {
+    let worker_execve = format!("[detcore, dtid {worker}] inbound syscall: execve(");
+    let leader_syscall = format!("[detcore, dtid {leader}] inbound syscall:");
+    let worker_timer = format!("[detcore, dtid {worker}] inbound timer preemption event");
+    let worker_next_timeslice = format!("[dtid {worker}] next timeslice (T");
+    assert_no_single_step_dumps(log, path);
+    let exec = log
+        .find(&worker_execve)
+        .expect("the identified worker attempted the same exec path");
+    if refused {
+        assert!(
+            !log[exec..].contains(&leader_syscall),
+            "the replacement must not enter ordinary syscall handling"
+        );
+    }
+    assert!(
+        log[..exec].contains(&worker_timer),
+        "the recorded and replayed prefix contains actual PMU preemption"
+    );
+    if let Some(path) = artifact_option.strip_prefix("--replay-preemptions-from=") {
+        let history: PreemptionRecord =
+            serde_json::from_slice(&bounded_read(Path::new(path), 4 * MIB)).unwrap();
+        history.validate().unwrap();
+        let (_, history) = history
+            .extract_all()
+            .into_iter()
+            .find(|(tid, _)| tid.to_string() == worker)
+            .expect("replay contains the actual worker");
+        let mut expected = history.into_iter();
+        let consumed: Vec<_> = log[..exec]
+            .lines()
+            .filter(|line| {
+                line.contains(&worker_next_timeslice) && line.contains("set by recording to ")
+            })
+            .collect();
+        assert!(
+            !consumed.is_empty(),
+            "replay must actually consume worker history"
+        );
+        for line in consumed {
+            let (deadline, priority, rcbs) = expected
+                .next_with_rcbs()
+                .expect("each consumed boundary belongs to the recording");
+            assert!(rcbs.is_some(), "the recording contains exact PMU targets");
+            assert!(
+                line.contains(&format!("set by recording to {deadline:?} ")),
+                "{line}"
+            );
+            assert!(line.ends_with(&format!(", priority {priority}")), "{line}");
+        }
+    }
+    log.contains(PREEMPTION_REFUSAL)
+}
+
+fn preemption_artifact_case(
+    directory: &Path,
+    guest: &Path,
+    target: &Path,
+    artifact_option: &str,
+    refused: bool,
+    expected_identity: Option<(&str, &str)>,
+    timeout: Duration,
+) -> String {
+    let logs = directory.join("verify-logs");
+    fs::create_dir_all(&logs).unwrap();
+    let report_path = directory.join("verification.json");
+    let args = artifact_args(guest, target, artifact_option, &report_path, &logs);
     let mut command = traced_hermit_command(&args);
-    let status = bounded_command_with_timeout(&mut command, directory, timeout);
+    let (status, run2_log) = bounded_verify_command(&mut command, directory, timeout);
     let stderr = String::from_utf8(bounded_read(&directory.join("stderr"), 16 * MIB)).unwrap();
     let stdout = String::from_utf8(bounded_read(&directory.join("stdout"), MIB)).unwrap();
     let report = VerificationReport::from_current_json_slice(&bounded_read(&report_path, MIB))
@@ -677,10 +763,6 @@ fn preemption_artifact_case(
         }
         actual
     };
-    let worker_execve = format!("[detcore, dtid {worker}] inbound syscall: execve(");
-    let leader_syscall = format!("[detcore, dtid {leader}] inbound syscall:");
-    let worker_timer = format!("[detcore, dtid {worker}] inbound timer preemption event");
-    let worker_next_timeslice = format!("[dtid {worker}] next timeslice (T");
     let mut diagnostic = stderr.contains(PREEMPTION_REFUSAL);
     for prefix in ["run1_log_", "run2_log_"] {
         let paths: Vec<_> = fs::read_dir(&logs)
@@ -693,68 +775,45 @@ fn preemption_artifact_case(
                     .starts_with(prefix)
             })
             .collect();
-        let expected = usize::from(!refused || prefix == "run1_log_");
+        // Only run 1's log survives either way: a refusal has no second
+        // verified run, and after a match `--keep-logs` keeps the golden log
+        // alone because run 2's log matched it and was deleted.
+        let expected = usize::from(prefix == "run1_log_");
         assert_eq!(
             paths.len(),
             expected,
-            "refusal cannot produce a second verified run"
+            "only run 1's log may be retained (refused: {refused})"
         );
         for path in paths {
             let log = String::from_utf8(bounded_read(&path, 64 * MIB)).unwrap();
-            assert_no_single_step_dumps(&log, &path);
-            let exec = log
-                .find(&worker_execve)
-                .expect("the identified worker attempted the same exec path");
-            if refused {
-                assert!(
-                    !log[exec..].contains(&leader_syscall),
-                    "the replacement must not enter ordinary syscall handling"
-                );
-            }
-            assert!(
-                log[..exec].contains(&worker_timer),
-                "the recorded and replayed prefix contains actual PMU preemption"
-            );
-            if let Some(path) = artifact_option.strip_prefix("--replay-preemptions-from=") {
-                let history: PreemptionRecord =
-                    serde_json::from_slice(&bounded_read(Path::new(path), 4 * MIB)).unwrap();
-                history.validate().unwrap();
-                let (_, history) = history
-                    .extract_all()
-                    .into_iter()
-                    .find(|(tid, _)| tid.to_string() == worker)
-                    .expect("replay contains the actual worker");
-                let mut expected = history.into_iter();
-                let consumed: Vec<_> = log[..exec]
-                    .lines()
-                    .filter(|line| {
-                        line.contains(&worker_next_timeslice)
-                            && line.contains("set by recording to ")
-                    })
-                    .collect();
-                assert!(
-                    !consumed.is_empty(),
-                    "replay must actually consume worker history"
-                );
-                for line in consumed {
-                    let (deadline, priority, rcbs) = expected
-                        .next_with_rcbs()
-                        .expect("each consumed boundary belongs to the recording");
-                    assert!(rcbs.is_some(), "the recording contains exact PMU targets");
-                    assert!(
-                        line.contains(&format!("set by recording to {deadline:?} ")),
-                        "{line}"
-                    );
-                    assert!(line.ends_with(&format!(", priority {priority}")), "{line}");
-                }
-            }
-            diagnostic |= log.contains(PREEMPTION_REFUSAL);
+            diagnostic |=
+                assert_artifact_log(&log, &path, artifact_option, refused, (leader, worker));
         }
+    }
+    if refused {
+        // Run 1's refusal ends the verification before run 2 starts, and
+        // Hermit then deletes run 2's log, which it created empty before run
+        // 1. A capture made before that deletion is empty.
+        if let Some(path) = &run2_log {
+            assert!(
+                bounded_read(path, 64 * MIB).is_empty(),
+                "a refusal has no second verified run"
+            );
+        }
+    } else {
+        let path = run2_log
+            .as_ref()
+            .expect("run 2's log, captured while the command ran");
+        let log = String::from_utf8(bounded_read(path, 64 * MIB)).unwrap();
+        diagnostic |= assert_artifact_log(&log, path, artifact_option, refused, (leader, worker));
     }
     assert_eq!(
         diagnostic, refused,
         "specific transfer refusal only on successful exec"
     );
+    if let Some(path) = run2_log {
+        fs::remove_file(path).expect("remove run 2's checked log");
+    }
     stdout
 }
 

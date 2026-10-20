@@ -18,7 +18,7 @@ compile_probe() {
 populate_fixture() {
     local root=$1
     mkdir -p "$root/proc/self"
-    printf '400000-401000 r-xp 00000000 00:00 0 /guest\nRss:\t0 kB\nPss:\t0 kB\n' >"$root/proc/self/smaps"
+    printf '400000-401000 r-xp 00000000 00:00 0 /guest\nRss:\t0 kB\nPss:\t0 kB\nPrivate_Dirty:\t0 kB\n' >"$root/proc/self/smaps"
     printf '0 0 0 0 0 0 0\n' >"$root/proc/self/statm"
     printf 'rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\nread_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n' >"$root/proc/self/io"
     printf '1 0 0:1 /tmpvol/.hermit / rw - tmpfs tmpfs rw\n' >"$root/proc/self/mountinfo"
@@ -67,6 +67,27 @@ self_test() {
     fi
     [[ $output == *'self-io rchar retained a nonzero host counter'* ]] || {
         printf 'procfs-sanitized-paths self-test got the wrong invariant failure: %s\n' "$output" >&2
+        return 1
+    }
+
+    populate_fixture "$work/root"
+    printf '400000-401000 r-xp 00000000 00:00 0 /guest\nRss:\t0 kB\nPss:\t0 kB\nPrivate_Dirty:\t4 kB\n' >"$work/root/proc/self/smaps"
+    if output=$("$work/probe" --fixture-root "$work/root" 2>&1); then
+        echo 'procfs-sanitized-paths self-test accepted a nonzero Private_Dirty' >&2
+        return 1
+    fi
+    [[ $output == *'self-smaps left Private_Dirty unnormalized'* ]] || {
+        printf 'procfs-sanitized-paths self-test got the wrong dirty-page failure: %s\n' "$output" >&2
+        return 1
+    }
+
+    printf '400000-401000 r-xp 00000000 00:00 0 /guest\nRss:\t0 kB\nPss:\t0 kB\n' >"$work/root/proc/self/smaps"
+    if output=$("$work/probe" --fixture-root "$work/root" 2>&1); then
+        echo 'procfs-sanitized-paths self-test accepted smaps without Private_Dirty' >&2
+        return 1
+    fi
+    [[ $output == *'self-smaps omitted Private_Dirty'* ]] || {
+        printf 'procfs-sanitized-paths self-test got the wrong omission failure: %s\n' "$output" >&2
         return 1
     }
 

@@ -87,7 +87,6 @@ thread_self_procfs_determinism	none-recorded	No reason was recorded when this bi
 thread_sync_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 uevent_seqnum_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 unix_socket_table_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
-verify_claim_names_its_limit	measured-green-pending-registration	Measured 2026-08-26 on hermit@a787a547ea: 3 tests, 3 pass, 0.1s. Green; belongs in the DAG pending a memory sample for its hint block.
 version_provenance	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 vmstat_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 waitid_signal_interrupt	measured-green-pending-registration	Measured 2026-08-26 on hermit@a787a547ea: 11 tests, 11 pass, 0.5s. Green; belongs in the DAG pending a memory sample for its hint block.

@@ -25,7 +25,9 @@ folded into c-programs (https://github.com/rrnewton/hermit/issues/3301).
   complete Run1 logs have SHA-256
   `03a22d52750074e8d661e173540a1495f288272c3d4fa67b68e57a78adbc51bb`.
   The pre-fix record contents and artifact hashes remain preserved in
-  [`tests/backend-parity/README.md`](backend-parity/README.md#hardware-trap-identity-pre-fix-dbt-child-exit-polling-changed-the-canonical-log).
+  [`tests/backend-parity/README.md` at hermit `82e24cc0e6fac0f7f9a8dac4b4b25d9ad8e3231d`](https://github.com/rrnewton/hermit/blob/82e24cc0e6fac0f7f9a8dac4b4b25d9ad8e3231d/tests/backend-parity/README.md#hardware-trap-identity-pre-fix-dbt-child-exit-polling-changed-the-canonical-log);
+  slice S13 of https://github.com/rrnewton/hermit/issues/3301 deleted that
+  directory.
 - Observed: 3 of 3 attempts returned `ERROR` with `verdict=no_result`; no
   terminal comparison exists. Two attempts completed an identical Run1 trace
   with no `InternalIOPolling` and ended after the root entered `exit_group(0)`,

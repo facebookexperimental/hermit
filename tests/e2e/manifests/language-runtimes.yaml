@@ -714,10 +714,10 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - sabre
           - kvm
         backends_disabled:
           dbt: DBT Rust qualification is tracked by backend compatibility
-          sabre: SaBRe requires its external runtime
           liteinst: LiteInst Rust qualification is tracked by backend compatibility
       replay:
         ci: false

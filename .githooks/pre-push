@@ -57,8 +57,9 @@ fi
 
 # ⚠️ "COULD NOT CHECK" IS NOT "DOES NOT COMPILE", AND THIS HOOK USED TO SAY THE
 # SECOND FOR BOTH. In a fresh worktree the submodules are not populated, so a
-# path dependency such as agent-utils/rs/dagrun is simply absent and Cargo fails
-# to resolve the workspace before it lints anything. The tree was never checked,
+# path dependency into one (agent-utils/rs/dagrun, until it became a git
+# dependency) is simply absent and Cargo fails to resolve the workspace before
+# it lints anything. The tree was never checked,
 # but the message below announced a compile failure and pointed at
 # `cargo clippy`, which cannot reproduce it and does not mention the submodule.
 #
@@ -82,13 +83,17 @@ fi
 # submodules are optional (see the parent's checkout-optional-submodules
 # target), so an unpopulated one does not imply a broken build. Testing this
 # first would refuse pushes from trees that lint perfectly well.
-# Only agent-utils is required by the default workspace checker today:
-# ci/manifest-plan/Cargo.toml resolves dagrun through agent-utils/rs/dagrun.
-# third-party/rr is runtime input for ignored rr tests and an unpopulated rr
-# checkout does not stop `cargo clippy --workspace --all-targets`. Treating every
-# unpopulated submodule as causal hides a real compiler error whenever an
-# unrelated optional submodule happens to be absent.
-required_checker_submodules=(agent-utils)
+# No submodule is required by the default workspace checker today. agent-utils
+# was, until ci/manifest-plan took dagrun as a git dependency pinned to the
+# agent-utils gitlink, so that a clone without submodules builds (see
+# ci/manifest-plan/tests/dagrun_pin.rs). Validation still runs the dagrun
+# executable from the submodule, but this checker does not. third-party/rr is
+# runtime input for ignored rr tests and an unpopulated rr checkout does not
+# stop `cargo clippy --workspace --all-targets`. Treating every unpopulated
+# submodule as causal hides a real compiler error whenever an unrelated optional
+# submodule happens to be absent. Name a submodule here only when the workspace
+# again has a path dependency into it.
+required_checker_submodules=()
 
 submodule_state_status=0
 submodule_state=$(git -C "$root" submodule status 2>&1) || submodule_state_status=$?

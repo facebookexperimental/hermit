@@ -8,9 +8,11 @@
 
 use reverie::Errno;
 use reverie::RdtscResult;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::PollFd;
 use reverie::syscalls::StatBuf;
 use reverie::syscalls::StatxBuf;
+use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Timeval;
 use reverie::syscalls::Timezone;
@@ -30,6 +32,23 @@ pub(crate) fn deterministic_ioctl_error(request: &ioctl::Request<'_>) -> Option<
         ioctl::Request::SIOCETHTOOL(_) | ioctl::Request::Other(SIOCETHTOOL, _) => {
             Some(Errno::ENODEV)
         }
+        _ => None,
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-3601)
+/// Returns the output buffer and its size for an xattr query (`getxattr`,
+/// `lgetxattr`, `fgetxattr` and the `listxattr` family), or `None` for any
+/// other syscall. A zero size only asks for the length the value needs: the
+/// kernel copies nothing out and returns that length.
+pub(crate) fn xattr_query_output(syscall: &Syscall) -> Option<(Option<AddrMut<'_, u8>>, usize)> {
+    match syscall {
+        Syscall::Getxattr(call) => Some((call.value().map(|a| a.cast()), call.size())),
+        Syscall::Lgetxattr(call) => Some((call.value().map(|a| a.cast()), call.size())),
+        Syscall::Fgetxattr(call) => Some((call.value().map(|a| a.cast()), call.size())),
+        Syscall::Listxattr(call) => Some((call.list().map(|a| a.cast()), call.size())),
+        Syscall::Llistxattr(call) => Some((call.list().map(|a| a.cast()), call.size())),
+        Syscall::Flistxattr(call) => Some((call.list().map(|a| a.cast()), call.size())),
         _ => None,
     }
 }
@@ -104,6 +123,12 @@ pub enum SyscallEvent {
     Exec(ExecEvent),
     /// The result and mutable output fields of a raw `ppoll` call.
     Ppoll(PpollEvent),
+    /// The result and mutable output fields of a raw `select` or `pselect6`
+    /// call.
+    Select(SelectEvent),
+    /// The result of a guest-semantic `madvise` and the file-backed contents
+    /// replay must restore over its anonymous replacement mappings.
+    Madvise(MadviseEvent),
 }
 
 /// Recorded output and signal side effects of a read syscall.
@@ -308,6 +333,31 @@ pub struct MmapEvent {
     pub buf: Vec<u8>,
 }
 
+/// Recorded outcome of a guest-semantic `madvise`.
+///
+/// Replay maps recorded files as anonymous memory, so advice whose effect
+/// depends on the backing store cannot simply run live.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MadviseEvent {
+    pub result: Result<i64, Errno>,
+    /// Length of the prefix of the advised range that replay applies live.
+    /// It is shorter than the guest's length when Linux stopped at a
+    /// file-backed mapping that replay represents anonymously.
+    pub live_len: usize,
+    /// File-backed contents observed after the call, which replay writes
+    /// over the zero pages its anonymous mappings expose.
+    pub refills: Vec<MadviseRefill>,
+}
+
+/// Contents of one file-backed range after a recorded `madvise`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MadviseRefill {
+    pub addr: usize,
+    pub bytes: Vec<u8>,
+    /// `PROT_*` bits of the mapping, restored after replay writes the bytes.
+    pub prot: i32,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecvmsgEvent {
     pub result: i64,
@@ -371,6 +421,37 @@ pub struct PpollEvent {
     /// this continuously; replay must restore the captured value without
     /// rounding, freezing, or synthesizing it.
     pub timeout: Option<Timespec>,
+}
+
+/// Records every guest-visible output of a raw `select` or `pselect6` call.
+///
+/// Linux copies the three descriptor sets out only when the call succeeds, or
+/// partially before an EFAULT. It may then write the remaining time into a
+/// non-null timeout (a `struct timeval` for `select`, a `struct timespec` for
+/// `pselect6`); the recorder keeps the post-call bytes whether or not it did.
+/// Replay restores the writes in that order before returning the recorded
+/// result.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SelectEvent {
+    /// The exact return value or errno observed while recording.
+    pub result: Result<i64, Errno>,
+
+    /// Post-kernel bytes of the read, write and exception sets, in argument
+    /// order. Each holds the readable prefix of the set's `FDS_BYTES(nfds)`
+    /// range, with `nfds` clamped to the guest's descriptor table, or `None`
+    /// when the pointer was null or the kernel did not copy the sets out.
+    pub fd_sets: [Option<Vec<u8>>; 3],
+
+    /// Post-kernel bytes of the timeout, when its pointer was non-null and
+    /// readable. Replay restores them exactly, without rounding or freezing.
+    pub timeout: Option<Vec<u8>>,
+}
+
+/// Bytes Linux copies in and out for each descriptor set of `nfds` bits:
+/// whole `long`s, as `FDS_BYTES` in fs/select.c.
+pub fn fd_set_bytes(nfds: i32) -> usize {
+    const LONG_BYTES: usize = std::mem::size_of::<libc::c_long>();
+    usize::try_from(nfds).map_or(0, |nfds| nfds.div_ceil(8 * LONG_BYTES) * LONG_BYTES)
 }
 
 #[derive(Serialize, Deserialize, Debug)]

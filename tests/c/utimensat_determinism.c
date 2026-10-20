@@ -8,18 +8,18 @@
 
 // utimensat(2) file-timestamp determinization parity probe.
 //
-// A file's access and modification times are host-derived state: outside Hermit
-// they reflect whatever a program sets (or the real wall clock via UTIME_NOW).
-// Hermit's determinize_stat normalizes the timestamp fields that stat/fstat
-// report to a single deterministic value, so a guest cannot observe the true
-// stored times. utimensat itself is accepted (it must not spuriously fail), but
-// the value read back is the determinized constant, not the caller's request.
+// A file's stored timestamps are host-derived state, so Hermit's stat reports
+// virtual ones: the mtime moves with virtual time on writes and atime is a
+// deterministic constant. An explicit mtime passed to utimensat is not host
+// state, though. The guest chose it, so it is as deterministic as the program,
+// and Linux reports it back exactly. `tar`, `cp -p`, `touch -r` and `make`
+// depend on that (https://github.com/rrnewton/hermit/issues/3565). This file
+// used to assert the opposite, that the requested mtime was overridden, which
+// pinned that defect as policy.
 //
-// The checks are epoch-agnostic and relational: they never hard-code Hermit's
-// internal time base. They assert that the two timestamp fields collapse to a
-// single value and that the value the program requested was overridden. Under
-// Hermit all five checks pass (ok=5); native passes only the two acceptance
-// checks (ok=2) because it faithfully echoes the requested atime/mtime.
+// The checks never hard-code Hermit's internal time base. Under Hermit all five
+// pass (ok=5). Native passes four (ok=4): it also echoes the requested atime,
+// which Hermit keeps virtual.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -63,11 +63,11 @@ int main(void) {
   }
   long a = st.st_atim.tv_sec;
   long m = st.st_mtim.tv_sec;
-  // (2) Determinized: both timestamp fields collapse to one value.
-  if (a == m)
+  // (2) The requested mtime is reported exactly, as on Linux.
+  if (m == 2222222222L && st.st_mtim.tv_nsec == 0)
     ok++;
-  // (3) Determinized: the requested mtime was overridden (native keeps it).
-  if (m != 2222222222L)
+  // (3) Determinized: atime does not echo the request (native keeps it).
+  if (a != 1111111111L)
     ok++;
 
   // Omit atime, request a fresh distinct mtime.
@@ -86,8 +86,8 @@ int main(void) {
   }
   long a2 = st2.st_atim.tv_sec;
   long m2 = st2.st_mtim.tv_sec;
-  // (5) Determinized: fields still collapse and the new mtime was overridden.
-  if (a2 == m2 && m2 != 3333333333L)
+  // (5) The new mtime lands and the omitted atime is unchanged.
+  if (m2 == 3333333333L && a2 == a)
     ok++;
 
   close(fd);

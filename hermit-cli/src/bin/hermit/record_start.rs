@@ -47,6 +47,7 @@ use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::run::BaseEnv;
+use super::run::NetworkingMode;
 use super::run::apply_base_environment;
 use super::run::is_elf_file;
 use super::run::parse_assignment;
@@ -54,8 +55,10 @@ use super::run::path_resolution_visits_prefix;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
+use super::verify::SecondRun;
 use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
+use super::verify::emit_compared_guest_output;
 use super::verify::setup_double_run;
 use super::verify::validate_log_level;
 use super::verify::write_pending_verification_json;
@@ -188,7 +191,7 @@ pub struct StartOpts {
     /// Recording does NOT run under `run --strict`'s configuration: see
     /// `hermit_cli::metadata::record_or_replay_config`, which deliberately sets
     /// `virtualize_time: false`, `deterministic_io: false`, `passthru_opt: true` and
-    /// `panic_on_unsupported_syscalls: false`. A recorded guest therefore reads the REAL
+    /// `panic_on_unsupported_syscalls: true`. A recorded guest therefore reads the REAL
     /// host clock, and two independent recordings of the same program observe different
     /// times. What `--verify` establishes is that a recording REPLAYS faithfully, not that
     /// two independent recordings agree.
@@ -214,6 +217,15 @@ pub struct StartOpts {
     /// Mount a file, directory, or fresh filesystem for recording and an immediate verify replay.
     #[clap(long)]
     mount: Vec<Mount>,
+
+    /// Select guest networking, with the same contract as `hermit run --network`. `local`
+    /// (the default) gives the recording and its verify replay an isolated loopback
+    /// interface; `host` exposes the host network to the recording. The choice is
+    /// stored in the recording, and `hermit replay --autopilot` replays in the same
+    /// network. `--verify-with-gdbex` defaults to, and requires, `host`: its replay's
+    /// gdbserver must be reachable from the gdb client outside the container.
+    #[clap(long, alias = "net", value_name = "local|host")]
+    network: Option<NetworkingMode>,
 
     /// Set the working directory for both recording and replay after mounts apply.
     #[clap(long, value_name = "path")]
@@ -354,6 +366,8 @@ impl StartOpts {
             return Ok(None);
         }
 
+        #[cfg(not(feature = "e9patch"))]
+        Backend::E9patch.ensure_available()?;
         Backend::Ptrace.ensure_available()?;
         let target = self.resolve_e9patch_record_target()?;
         if !is_elf_file(&target)? {
@@ -395,8 +409,39 @@ impl StartOpts {
         )
     }
 
-    fn configured_container(&self) -> Result<(Container, IdentityGuard), Error> {
+    /// Whether this invocation replays its recording under a gdbserver.
+    fn replays_under_gdb(&self) -> bool {
+        !self.verify && !self.gdbex.is_empty()
+    }
+
+    /// The network the recording (and an immediate replay of it) runs in.
+    fn network(&self) -> NetworkingMode {
+        self.network.unwrap_or(if self.replays_under_gdb() {
+            NetworkingMode::Host
+        } else {
+            NetworkingMode::Local
+        })
+    }
+
+    /// A replay served to gdb runs on the host network, where the gdb client
+    /// can reach its gdbserver port, so the recording it checks must too.
+    fn check_gdb_replay_network(&self) -> Result<(), Error> {
+        if self.replays_under_gdb() && self.network() == NetworkingMode::Local {
+            anyhow::bail!(
+                "--verify-with-gdbex replays under a gdbserver that the gdb client reaches \
+                 on the host network, so the recording must use the same network; \
+                 --network local is not supported with it"
+            );
+        }
+        Ok(())
+    }
+
+    fn configured_container(
+        &self,
+        network: NetworkingMode,
+    ) -> Result<(Container, IdentityGuard), Error> {
         let mut container = default_container(true);
+        network.configure(&mut container, false);
         let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts()?;
         for mount in &self.mount {
             let user_target = mount.get_target();
@@ -415,7 +460,7 @@ impl StartOpts {
         global: &GlobalOpts,
     ) -> Result<(Container, IdentityGuard), Error> {
         let overlay = self.prepare_e9patch_overlay(global)?;
-        let (mut container, identity_guard) = self.configured_container()?;
+        let (mut container, identity_guard) = self.configured_container(self.network())?;
         if let Some(overlay) = overlay {
             container.mount(Mount::bind(&overlay.source, &overlay.target).readonly());
             container.mount(
@@ -442,6 +487,7 @@ impl StartOpts {
         } else {
             let hermit = HermitData::from(self.data_dir.as_ref());
             let record_timeout = self.record_timeout();
+            let local_networking = self.network() == NetworkingMode::Local;
 
             let (mut container, identity_guard) = self.recording_container(global)?;
 
@@ -468,20 +514,34 @@ impl StartOpts {
                     let mountinfo = identity.mountinfo_root_rewrites()?;
                     match record_timeout {
                         Some(timeout) => with_recording_deadline(timeout, || {
-                            hermit::record_to_with_mountinfo(command, data.path(), mountinfo)
+                            hermit::record_to_with_mountinfo(
+                                command,
+                                data.path(),
+                                mountinfo,
+                                local_networking,
+                            )
                         }),
-                        None => hermit::record_to_with_mountinfo(command, data.path(), mountinfo),
+                        None => hermit::record_to_with_mountinfo(
+                            command,
+                            data.path(),
+                            mountinfo,
+                            local_networking,
+                        ),
                     }
                 },
             )?;
             let recording = hermit.commit_recording(data, exit_status)?;
 
-            eprintln!(
-                "\n{message}:\n\n    {command} {id}\n",
-                message = "RECORDING COMPLETE! To replay, run".yellow().bold(),
-                command = "hermit replay".blue().bold(),
-                id = recording.id.to_string().bold()
-            );
+            eprintln!("\n{}\n", "RECORDING COMPLETE!".yellow().bold());
+            for (label, command) in
+                replay_hint_commands(&recording.id.to_string(), self.data_dir.as_deref())
+            {
+                eprintln!(
+                    "{}:\n\n    {}\n",
+                    label.yellow().bold(),
+                    command.blue().bold()
+                );
+            }
 
             Ok(recording.exit_status)
         }
@@ -514,6 +574,7 @@ impl StartOpts {
             temp_data_dir.path().display()
         );
         let record_timeout = self.record_timeout();
+        let local_networking = self.network() == NetworkingMode::Local;
         let options = self.clone();
         let record_global = global1.clone();
         let (recording, (temp_data_dir, _record_identity, log1, log2)) =
@@ -534,18 +595,20 @@ impl StartOpts {
                                 command,
                                 data.path(),
                                 mountinfo,
+                                local_networking,
                             )
                         }),
                         None => hermit::record_with_output_with_mountinfo(
                             command,
                             data.path(),
                             mountinfo,
+                            local_networking,
                         ),
                     }
                 },
             )?;
         eprintln!(":: {}", "Replaying...".yellow().bold());
-        let (mut replay_container, replay_identity) = self.configured_container()?;
+        let (mut replay_container, replay_identity) = self.configured_container(self.network())?;
         let mounts = self.mount.clone();
         let replay_global = global2.clone();
         let (replay, (_data, _identity, log1, log2)) = super::owned_container::run(
@@ -589,6 +652,7 @@ impl StartOpts {
                 // cannot describe a policy the run did not use.
                 virtualize_time: hermit::RECORD_REPLAY_VIRTUALIZES_TIME,
                 keep_logs: false,
+                match_overridden: false,
                 failed_log_retention: Some(super::verify::default_failed_verify_log_retention()),
                 record_envelope: RecordEnvelope::all_records_v1(),
             },
@@ -603,20 +667,24 @@ impl StartOpts {
         }
         announce_verification_outcome(
             &outcome,
+            SecondRun::Replay,
             "Success: replay matched recording.",
             "Recording output did not match replay output!",
         );
+        emit_compared_guest_output(outcome.verified(), &recording, &replay)?;
 
         outcome.into_exit_status()
     }
     /// This is called when `--verify-with-gdbex` is passed to the command line.
     fn record_verify_debug(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.check_gdb_replay_network()?;
         let (mut container, identity_guard) = self.recording_container(global)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
 
         let temp_data_dir = tempfile::tempdir()?;
         let record_timeout = self.record_timeout();
+        let local_networking = self.network() == NetworkingMode::Local;
         let options = self.clone();
         let record_global = global.clone();
         let resources = format!(
@@ -636,9 +704,19 @@ impl StartOpts {
                 let mountinfo = identity.mountinfo_root_rewrites()?;
                 match record_timeout {
                     Some(timeout) => with_recording_deadline(timeout, || {
-                        hermit::record_to_with_mountinfo(command, data.path(), mountinfo)
+                        hermit::record_to_with_mountinfo(
+                            command,
+                            data.path(),
+                            mountinfo,
+                            local_networking,
+                        )
                     }),
-                    None => hermit::record_to_with_mountinfo(command, data.path(), mountinfo),
+                    None => hermit::record_to_with_mountinfo(
+                        command,
+                        data.path(),
+                        mountinfo,
+                        local_networking,
+                    ),
                 }
             },
         )?;
@@ -687,7 +765,10 @@ impl StartOpts {
         // on that container result, unreachable in exactly the case that needed
         // it. The watch owns the reap and releases the accept.
         let gdb_watch = GdbClientWatch::spawn(gdb_command, gdbserver_port)?;
-        let (mut container, identity) = self.configured_container()?;
+        // The gdb client runs outside the container, so the replay's gdbserver
+        // port must live in the host network namespace, which `network()`
+        // guarantees the recording also used.
+        let (mut container, identity) = self.configured_container(self.network())?;
         let guards = Rc::new(RefCell::new((temp_data_dir, identity, gdb_watch)));
         let replay_global = global.clone();
         let mounts = self.mount.clone();
@@ -726,9 +807,71 @@ impl StartOpts {
     }
 }
 
+/// The replay commands offered after a successful `hermit record start`, as
+/// `(label, command)` pairs in the order they are printed.
+///
+/// Plain playback comes first because a bare `hermit replay` starts an
+/// interactive GDB session (see `ReplayOpts::main`), which is a debugging
+/// tool, not the way to watch a recording run again. `--autopilot` replays to
+/// the end without a debugger. A recording made with `--data-dir` (or
+/// `HERMIT_DATA_DIR`) is only found by a replay given the same directory, so
+/// the directory is repeated in both commands.
+fn replay_hint_commands(id: &str, data_dir: Option<&Path>) -> [(&'static str, String); 2] {
+    let data_dir = data_dir.map_or_else(String::new, |dir| {
+        format!(" --data-dir={}", shell_words::quote(&dir.to_string_lossy()))
+    });
+    [
+        (
+            "To replay it to the end",
+            format!("hermit replay --autopilot{data_dir} {id}"),
+        ),
+        (
+            "To replay it under GDB for debugging",
+            format!("hermit replay{data_dir} {id}"),
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_hint_offers_plain_playback_before_the_gdb_session() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let [(plain_label, plain), (gdb_label, gdb)] = replay_hint_commands(id, None);
+        assert_eq!(plain, format!("hermit replay --autopilot {id}"));
+        assert_eq!(plain_label, "To replay it to the end");
+        assert_eq!(gdb, format!("hermit replay {id}"));
+        assert!(gdb_label.contains("GDB"), "{gdb_label}");
+
+        let [(_, plain), (_, gdb)] =
+            replay_hint_commands(id, Some(Path::new("/data/my recordings")));
+        assert_eq!(
+            plain,
+            format!("hermit replay --autopilot --data-dir='/data/my recordings' {id}")
+        );
+        assert_eq!(
+            gdb,
+            format!("hermit replay --data-dir='/data/my recordings' {id}")
+        );
+
+        // Both offered commands must parse as real `hermit replay` invocations,
+        // and only the plain one may select autopilot (no GDB).
+        use clap::CommandFactory;
+        for (command, autopilot) in [(&plain, true), (&gdb, false)] {
+            let matches = crate::Args::command()
+                .try_get_matches_from(shell_words::split(command).unwrap())
+                .unwrap_or_else(|e| panic!("{command}: {e}"));
+            let replay = matches.subcommand_matches("replay").expect(command);
+            assert_eq!(replay.get_flag("autopilot"), autopilot, "{command}");
+            assert_eq!(
+                replay.get_one::<PathBuf>("data_dir"),
+                Some(&PathBuf::from("/data/my recordings")),
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn replay_report_is_published_before_success_is_announced() {
@@ -744,6 +887,11 @@ mod tests {
             .find("announce_verification_outcome(")
             .expect("verification announcement");
         assert!(publish < announce);
+        // The second half of record-mode verification is a replay, so its match
+        // line must use the replay wording for the time note.
+        let call = &verification[announce..];
+        let call = &call[..call.find(");").expect("end of announcement call")];
+        assert!(call.contains("SecondRun::Replay"), "{call}");
     }
 
     fn start_options(env: Vec<(String, Option<String>)>) -> StartOpts {
@@ -754,6 +902,7 @@ mod tests {
             env,
             base_env: BaseEnv::Host,
             mount: Vec::new(),
+            network: None,
             workdir: None,
             data_dir: None,
             record_timeout: None,
@@ -762,6 +911,94 @@ mod tests {
             verify_strict: false,
             gdbex: Vec::new(),
         }
+    }
+
+    /// `record start` takes `run`'s networking contract, local by default,
+    /// except that a gdb-served replay needs the host network.
+    #[test]
+    fn record_networking_defaults_to_local_like_run() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[clap(flatten)]
+            start: StartOpts,
+        }
+        let parse = |args: &[&str]| {
+            <Cli as clap::Parser>::try_parse_from(args)
+                .unwrap()
+                .start
+                .network()
+        };
+        assert_eq!(parse(&["start", "/bin/true"]), NetworkingMode::Local);
+        assert_eq!(
+            parse(&["start", "--network", "host", "/bin/true"]),
+            NetworkingMode::Host
+        );
+        assert_eq!(
+            parse(&["start", "--verify-with-gdbex", "continue", "/bin/true"]),
+            NetworkingMode::Host
+        );
+        assert_eq!(
+            parse(&[
+                "start",
+                "--verify",
+                "--verify-with-gdbex",
+                "continue",
+                "/bin/true"
+            ]),
+            NetworkingMode::Local
+        );
+        assert_eq!(
+            parse(&[
+                "start",
+                "--network",
+                "local",
+                "--verify-with-gdbex",
+                "continue",
+                "/bin/true"
+            ]),
+            NetworkingMode::Local
+        );
+    }
+
+    #[test]
+    fn a_gdb_checked_recording_refuses_local_networking() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[clap(flatten)]
+            start: StartOpts,
+        }
+        let check = |args: &[&str]| {
+            <Cli as clap::Parser>::try_parse_from(args)
+                .unwrap()
+                .start
+                .check_gdb_replay_network()
+        };
+        let refused = check(&[
+            "start",
+            "--network",
+            "local",
+            "--verify-with-gdbex",
+            "continue",
+            "/bin/true",
+        ])
+        .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("--network local is not supported"),
+            "{refused:#}"
+        );
+        check(&["start", "--verify-with-gdbex", "continue", "/bin/true"]).unwrap();
+        check(&[
+            "start",
+            "--network",
+            "host",
+            "--verify-with-gdbex",
+            "continue",
+            "/bin/true",
+        ])
+        .unwrap();
+        check(&["start", "--network", "local", "/bin/true"]).unwrap();
     }
 
     #[test]
@@ -865,6 +1102,7 @@ mod tests {
             env: Vec::new(),
             base_env: BaseEnv::Host,
             mount: Vec::new(),
+            network: None,
             workdir: None,
             data_dir: None,
             record_timeout: None,

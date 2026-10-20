@@ -1,0 +1,3 @@
+#!/bin/sh
+# Local (non-RE) builds: the host's cmake.
+exec cmake "$@"

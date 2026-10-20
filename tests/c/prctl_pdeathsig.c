@@ -23,9 +23,10 @@
  * set is a pure per-thread register with no host-derived state, so it is
  * deterministic across repeated runs and backends.
  *
- * ptrace and DBT drive the full state machine; KVM's ElfExecutor does not
- * implement the PR_*_PDEATHSIG requests and refuses them with ENOSYS (recorded
- * as a KVM gap in matrix.tsv), so this row runs on ptrace and DBT.
+ * ptrace and DBT drive the full state machine. KVM's ElfExecutor refuses a
+ * nonzero PR_SET_PDEATHSIG with ENOSYS, so the KVM verify cell for
+ * c-programs/prctl-pdeathsig in tests/e2e/manifests/c-programs.yaml is
+ * disabled.
  *
  * EMISSION CONTRACT: the fixture prints the signal number read back after each
  * set, not just a check count. The values are guest-chosen (SIGUSR1, then

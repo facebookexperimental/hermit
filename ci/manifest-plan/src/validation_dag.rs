@@ -272,7 +272,6 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     // Consumers of the one validate-profile build. They ran on the host, against
     // a second, host-built copy of the same producers, until 2026-09-30.
     "check.dbt_runtime_abi",
-    "check.backend_parity_suites",
     "lint.clippy",
     "doc.doctests",
     "doc.rustdoc",
@@ -281,6 +280,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.detcore_unit",
     "test.detcore_misc",
     "test.detcore_parallel",
+    "test.detcore_time",
     "test.hermit_integration",
     "test.arbitrary_binaries",
     "test.cli",
@@ -309,6 +309,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "privileged-test.pmu_buck_chaos_cases",
     "privileged-test.pmu_ptrace_completion_cases",
     "privileged-test.pmu_cli_cases",
+    "privileged-test.pmu_detcore_time_cases",
     "privileged-test.cli_kvm",
     "privileged-only-cpuid.faulting",
     "privileged-only-pmu.preemption",
@@ -380,26 +381,38 @@ struct Profile {
 // full, portable and hosted-portable then replaced 189 compat.<program> nodes
 // with one e2e.manifest_compat bucket (its hosted twin for hosted-portable):
 // 274/275, 261/262 and 255/255 before.
-const PROFILES: [Profile; 8] = [
+// full, portable and hosted-portable then gained check.e9patch_corpus when the
+// e9patch corpus left tests/backend-parity (slice S13 of
+// https://github.com/rrnewton/hermit/issues/3301): 86/87, 73/74 and
+// 67/67 before. full, portable and hosted-portable then each lost one step
+// when check.backend_parity_suites and its _on_host twin were retired with
+// tests/backend-parity (also slice S13): 87/88, 74/75 and 68/68 before.
+// full then gained privileged-test.pmu_detcore_time_cases when the 29
+// tests_time cases that need a PMU left test.detcore_time and its hosted twin
+// (https://github.com/rrnewton/hermit/issues/3663): 87/88 before. portable and
+// hosted-portable are unchanged because the node carries only the full label.
+const PROFILES: [Profile; 11] = [
     Profile {
         label: "full",
-        direct_steps: 86,
-        selected_steps: 87,
+        direct_steps: 88,
+        selected_steps: 89,
     },
     Profile {
         label: "portable",
-        direct_steps: 73,
-        selected_steps: 74,
+        direct_steps: 74,
+        selected_steps: 75,
     },
     Profile {
         label: "quick",
         direct_steps: 21,
         selected_steps: 22,
     },
+    // 56/57 since the 100 superstress repetition nodes became one node per
+    // probe (5), each running its 20 repetitions: 151/152 before.
     Profile {
         label: "super",
-        direct_steps: 151,
-        selected_steps: 152,
+        direct_steps: 56,
+        selected_steps: 57,
     },
     Profile {
         label: "privileged",
@@ -408,8 +421,8 @@ const PROFILES: [Profile; 8] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 67,
-        selected_steps: 67,
+        direct_steps: 68,
+        selected_steps: 68,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -422,6 +435,25 @@ const PROFILES: [Profile; 8] = [
         label: "portable-strict-compat-only",
         direct_steps: 3,
         selected_steps: 10,
+    },
+    // The SaBRe run type: its fixtures and bucket, plus the validation's one
+    // Hermit build (the pinned-root producers and the host link) they need.
+    Profile {
+        label: "sabre-compat-only",
+        direct_steps: 2,
+        selected_steps: 13,
+    },
+    // The strict run type: the same shape as the SaBRe run type.
+    Profile {
+        label: "strict-compat-only",
+        direct_steps: 2,
+        selected_steps: 13,
+    },
+    // The rr run type: the same shape again.
+    Profile {
+        label: "rr-compat-only",
+        direct_steps: 2,
+        selected_steps: 13,
     },
 ];
 
@@ -556,11 +588,83 @@ fn generated_plan(root: &Path, scratch: &Path) -> Result<DagConfig, String> {
     dag_from_json(&text).map_err(|error| format!("invalid generated {}: {error}", path.display()))
 }
 
-fn expected_cells(root: &Path) -> Result<Vec<DagManifest>, String> {
+/// The required cells each run type's manifest bucket nodes own: the default
+/// run type's from ci/expected-e2e-plan.json (dereferencing to them), and
+/// each run type a node selects by label from the manifests themselves.
+struct Populations {
+    full: Vec<DagManifest>,
+    labelled: BTreeMap<&'static str, Vec<DagManifest>>,
+}
+
+impl std::ops::Deref for Populations {
+    type Target = Vec<DagManifest>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.full
+    }
+}
+
+impl Populations {
+    /// The required cells of the run type `label` selects: its labelled
+    /// cells when a node selects it by label, else the default run type's
+    /// subset for that profile.
+    fn for_label(&self, label: &str) -> Vec<&DagManifest> {
+        match self.labelled.get(label) {
+            Some(cells) => cells.iter().collect(),
+            None => expected_for_label(label, &self.full),
+        }
+    }
+
+    /// The cells a manifest bucket node owns.
+    fn owned_by(&self, step: &Step) -> Vec<&DagManifest> {
+        let Some(selector) = &step.manifest else {
+            return Vec::new();
+        };
+        let cells = match crate::validation_dag_static::manifest_run_type(&step.tag()) {
+            Some(label) => self.labelled.get(label).map_or(&[][..], Vec::as_slice),
+            None => &self.full[..],
+        };
+        cells
+            .iter()
+            .filter(|cell| cell.lane == selector.lane && cell.category == selector.category)
+            .collect()
+    }
+
+    fn all(&self) -> impl Iterator<Item = &DagManifest> {
+        self.full.iter().chain(self.labelled.values().flatten())
+    }
+}
+
+fn expected_cells(root: &Path) -> Result<Populations, String> {
     let path = root.join(EXPECTED_PLAN);
     let text = fs::read_to_string(&path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    expected_cells_from_json(&text).map_err(|error| format!("invalid {}: {error}", path.display()))
+    let full = expected_cells_from_json(&text)
+        .map_err(|error| format!("invalid {}: {error}", path.display()))?;
+    let manifests = crate::runner::ManifestSet::load(root)?;
+    let mut labelled = BTreeMap::new();
+    for label in crate::validation_dag_static::manifest_run_types() {
+        let cells = manifests
+            .select(&crate::runner::Selection {
+                population: Some(crate::runner::Population::Required),
+                labels: vec![label.to_string()],
+                ..Default::default()
+            })?
+            .into_iter()
+            .map(|cell| DagManifest {
+                lane: cell.test.lane.clone(),
+                category: cell.category.clone(),
+                test: Some(cell.id.test.clone()),
+                mode: Some(cell.id.mode.clone()),
+                backend: cell.id.backend.clone(),
+            })
+            .collect::<Vec<_>>();
+        if cells.is_empty() {
+            return Err(format!("run type {label} requires no manifest cell"));
+        }
+        labelled.insert(label, cells);
+    }
+    Ok(Populations { full, labelled })
 }
 
 /// Decode the same source-owned expected population for generation and retained
@@ -709,7 +813,19 @@ fn is_pinned_root_producer(step: &Step) -> bool {
 /// Manifest bucket nodes that run on the validation host rather than in the
 /// pinned root: the compatibility corpus exercises programs installed on the
 /// host, 31 of which the pinned image does not carry.
-pub const HOST_MANIFEST_RUNS: &[&str] = &["e2e.manifest_compat", "portablecompat.manifest_compat"];
+pub const HOST_MANIFEST_RUNS: &[&str] = &[
+    "e2e.manifest_compat",
+    "portablecompat.manifest_compat",
+    "sabrecompat.manifest_compat",
+    "strictcompat.manifest_compat",
+    "rrcompat.manifest_compat",
+];
+
+/// The run type a manifest bucket node selects with `test-harness run
+/// --label`, from the node's static source; `None` for the default run type.
+pub fn manifest_run_type(tag: &str) -> Option<&'static str> {
+    crate::validation_dag_static::manifest_run_type(tag)
+}
 
 /// The release Hermit compatprep.hermit_release_in_pinned_root builds, as the
 /// host sees it: the pinned root's /src/target is ignored/hermetic/split/target.
@@ -1019,8 +1135,9 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     // change of 2026-09-30 moved the host consumers of the retired host Hermit
     // build into the pinned root: check.dbt_runtime_abi,
     // check.backend_parity_suites, lint.clippy, doc.doctests and doc.rustdoc,
-    // which were already in this split's dependency closure and are now its
-    // roots.
+    // which were already in this split's dependency closure and became its
+    // roots; 20 until check.backend_parity_suites was retired with
+    // tests/backend-parity (also slice S13). 20 since test.detcore_time and its hosted twin were enrolled.
     if split.len() != 20 {
         return Err(format!(
             "hosted test split has {} roots, expected 20",
@@ -1061,6 +1178,8 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     // https://github.com/rrnewton/hermit/issues/3301); 212 until the 189
     // compat.<program> nodes that depended on compatprep.fixtures became the
     // e2e.manifest_compat bucket (2026-10-01), whose hosted twin is authored.
+    // 23 until check.backend_parity_suites was retired with
+    // tests/backend-parity (also slice S13). 23 since test.detcore_time and its hosted twin were enrolled.
     if split.len() != 23 {
         return Err(format!(
             "hosted test dependency closure has {} nodes, expected 23",
@@ -1504,12 +1623,21 @@ fn generated_partition(step: &Step) -> Option<GeneratedPartition> {
         "portablecompatprep" => {
             return Some(GeneratedPartition::PortableFocusedCompat);
         }
-        "strictcompat" | "strictcompatprep" => return Some(GeneratedPartition::StrictCompat),
-        "sabrecompat" | "sabrecompatprep" => return Some(GeneratedPartition::SabreCompat),
+        // The strict lane's rows are the compat.yaml cells labelled
+        // strict-compat-only, run by the static node
+        // strictcompat.manifest_compat; only its fixtures are generated.
+        "strictcompatprep" => return Some(GeneratedPartition::StrictCompat),
+        // The SaBRe lane's rows are the compat.yaml cells labelled
+        // sabre-compat-only, run by the static node
+        // sabrecompat.manifest_compat; only its fixtures are generated.
+        "sabrecompatprep" => return Some(GeneratedPartition::SabreCompat),
         "e9patchcompat" | "e9patchcompatprep" => {
             return Some(GeneratedPartition::E9patchCompat);
         }
-        "rrcompat" | "rrcompatprep" => return Some(GeneratedPartition::RrCompat),
+        // The rr lane's rows are the compat.yaml replay cells labelled
+        // rr-compat-only, run by the static node rrcompat.manifest_compat;
+        // only its fixtures are generated.
+        "rrcompatprep" => return Some(GeneratedPartition::RrCompat),
         _ => {}
     }
     if step.group == "superstress" {
@@ -1557,15 +1685,24 @@ fn refresh_generated_partitions(
         // 1 since the focused portable lane runs the same bucket through the
         // static node portablecompat.manifest_compat: only its fixtures remain.
         (GeneratedPartition::PortableFocusedCompat, 1usize),
-        (GeneratedPartition::StrictCompat, 194usize),
-        (GeneratedPartition::SabreCompat, 213usize),
+        // 1 since the strict lane's 193 probes became compat.yaml cells run by
+        // the static node strictcompat.manifest_compat: only its fixtures remain.
+        (GeneratedPartition::StrictCompat, 1usize),
+        // 1 since the SaBRe lane's 212 probes became compat.yaml cells run by
+        // the static node sabrecompat.manifest_compat: only its fixtures remain.
+        (GeneratedPartition::SabreCompat, 1usize),
         // 175 since the one-build change of 2026-09-30 added
         // e9patchcompatprep.release_resources, which stages the release
         // resources the retired host build.runtime_release used to provide.
         (GeneratedPartition::E9patchCompat, 175usize),
-        (GeneratedPartition::RrCompat, 140usize),
+        // 1 since the rr lane's 139 probes became compat.yaml replay cells run
+        // by the static node rrcompat.manifest_compat: only its fixtures remain.
+        (GeneratedPartition::RrCompat, 1usize),
         (GeneratedPartition::SuperCompat, 5usize),
-        (GeneratedPartition::SuperStress, 102usize),
+        // 7 since each stress probe's 20 repetition nodes became one node that
+        // runs the repetitions and reports each as a structured test result:
+        // the 2 availability nodes plus 5 probe nodes.
+        (GeneratedPartition::SuperStress, 7usize),
     ] {
         let actual = replacements.get(&partition).map_or(0, Vec::len);
         if actual != expected {
@@ -1622,7 +1759,7 @@ fn refresh_generated_partitions(
     Ok(committed)
 }
 
-fn attach_result_ownership(cfg: &mut DagConfig, cells: &[DagManifest]) {
+fn attach_result_ownership(cfg: &mut DagConfig, cells: &Populations) {
     for step in &mut cfg.steps {
         let structured = step
             .result_manifests
@@ -1632,16 +1769,12 @@ fn attach_result_ownership(cfg: &mut DagConfig, cells: &[DagManifest]) {
             .filter(|manifest| matches!(manifest, ResultManifest::StructuredTestResults(_)))
             .collect::<Vec<_>>();
         let hosted_portable = step.labels == [HOSTED_PORTABLE_LABEL];
-        let mut owned = if let Some(selector) = &step.manifest {
-            cells
-                .iter()
-                .filter(|cell| cell.lane == selector.lane && cell.category == selector.category)
-                .filter(|cell| !(hosted_portable && hosted_portable_excludes(cell)))
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let mut owned = cells
+            .owned_by(step)
+            .into_iter()
+            .filter(|cell| !(hosted_portable && hosted_portable_excludes(cell)))
+            .cloned()
+            .collect::<Vec<_>>();
         if step.tag() == "quick.e2e_verify" {
             owned.extend(cells.iter().filter(|cell| quick_verify_cell(cell)).cloned());
         }
@@ -1666,12 +1799,20 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    // 110 since portablecompat.manifest_compat, the focused lane's corpus
+    // 118 since the five super stress probe nodes, each writing one row per
+    // repetition, joined them; 113 since rrcompat.manifest_compat, the rr
+    // lane's bucket, joined them;
+    // 112 since strictcompat.manifest_compat, the strict lane's bucket, joined
+    // them; 111 since sabrecompat.manifest_compat, the SaBRe lane's bucket, joined
+    // them; 110 since portablecompat.manifest_compat, the focused lane's corpus
     // bucket, joined them; 109 since e2e.manifest_compat and its hosted twin
-    // joined the test-harness producers (2026-10-01).
-    if expected.len() != 110 {
+    // joined the test-harness producers (2026-10-01); 120 since
+    // test.detcore_time and its hosted twin were enrolled; 121 since
+    // privileged-test.pmu_detcore_time_cases took the 29 tests_time cases that
+    // need a PMU (https://github.com/rrnewton/hermit/issues/3663).
+    if expected.len() != 121 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 110",
+            "structured result producer registry has {} entries, expected 121",
             expected.len()
         ));
     }
@@ -1680,9 +1821,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .iter()
         .copied()
         .collect::<BTreeMap<_, _>>();
-    if expected_counts.len() != 40 {
+    // 43 since privileged-test.pmu_detcore_time_cases joined it
+    // (https://github.com/rrnewton/hermit/issues/3663).
+    if expected_counts.len() != 43 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 40",
+            "Nextest expected-count registry has {} entries, expected 43",
             expected_counts.len()
         ));
     }
@@ -1807,8 +1950,14 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
         .collect::<Vec<_>>();
     // TestHarness 34 -> 36 with the compat bucket and its hosted twin, and
-    // 37 with the focused lane's portablecompat.manifest_compat.
-    if actual_group_counts != [69, 37, 2, 2] {
+    // 37 with the focused lane's portablecompat.manifest_compat, and 38 with
+    // the SaBRe lane's sabrecompat.manifest_compat, and 39 with the strict
+    // lane's strictcompat.manifest_compat, and 40 with the rr lane's
+    // rrcompat.manifest_compat. Envelope 2 -> 7 with the five super stress
+    // probe nodes. Nextest 69 -> 71 when test.detcore_time and its hosted twin
+    // were enrolled, and 72 with privileged-test.pmu_detcore_time_cases
+    // (https://github.com/rrnewton/hermit/issues/3663).
+    if actual_group_counts != [72, 40, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -2060,6 +2209,23 @@ pub const FAIL_CLOSED_MANIFEST_BUCKETS: &[&str] = &["c-programs", "compat"];
 /// with diagnostic cells exists.
 pub const DIAGNOSTIC_MANIFEST_BUCKETS: &[&str] = &["compat"];
 
+/// The harness selection a manifest bucket node `tag` passes after
+/// `test-harness run`: its lane, its category, the `--label` of the run type
+/// it selects ([`manifest_run_type`]) and the category's
+/// [`manifest_selector_flags`]. The generator and validate.rs's raw-census
+/// check both read it.
+pub fn manifest_bucket_selection(tag: &str, manifest: &DagManifest) -> String {
+    let label = manifest_run_type(tag)
+        .map(|label| format!(" --label {label}"))
+        .unwrap_or_default();
+    format!(
+        "--lane {} --category {}{label} {}",
+        manifest.lane,
+        manifest.category,
+        manifest_selector_flags(&manifest.category)
+    )
+}
+
 pub fn manifest_selector_flags(category: &str) -> &'static str {
     match (
         FAIL_CLOSED_MANIFEST_BUCKETS.contains(&category),
@@ -2084,10 +2250,8 @@ fn assert_fail_closed_manifest_selectors(cfg: &DagConfig) -> Result<(), String> 
             continue;
         }
         let selector = format!(
-            "target/debug/test-harness run --lane {} --category {} {}",
-            manifest.lane,
-            manifest.category,
-            manifest_selector_flags(&manifest.category)
+            "target/debug/test-harness run {}",
+            manifest_bucket_selection(&step.tag(), manifest)
         );
         if step.cmd.contains("--allow-empty") || step.cmd.matches(selector.as_str()).count() != 1 {
             return Err(format!(
@@ -2268,7 +2432,7 @@ fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
         .ok_or_else(|| "selected graph is empty".to_string())
 }
 
-fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
+fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String> {
     // Backend parity is a scored comparison, not a gate
     // (https://github.com/rrnewton/hermit/issues/3301). No newly constructed
     // plan asks the harness for a ptrace reference run. Plans retained before
@@ -2312,9 +2476,25 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     // (2026-10-01).
     // 1052 since the 189 portablecompat.<program> nodes became the one
     // bucket portablecompat.manifest_compat (1240 - 189 + 1).
-    if cfg.steps.len() != 1052 {
+    // +1 for check.e9patch_corpus when the e9patch corpus
+    // left tests/backend-parity (also slice S13); -2 when
+    // check.backend_parity_suites and its _on_host twin were retired with
+    // tests/backend-parity (also slice S13).
+    // 840 since the 212 sabrecompat.<program> probes became the one bucket
+    // sabrecompat.manifest_compat (1051 - 212 + 1).
+    // 648 since the 193 strictcompat.<program> probes became the one bucket
+    // strictcompat.manifest_compat (840 - 193 + 1).
+    // 510 since the 139 rrcompat.<program> probes became the one bucket
+    // rrcompat.manifest_compat (648 - 139 + 1).
+    // 415 since the 100 superstress repetition nodes became one node per
+    // probe (510 - 100 + 5).
+    // 417 when test.detcore_time and its hosted twin were enrolled (415 + 2).
+    // 418 with privileged-test.pmu_detcore_time_cases, which runs the 29
+    // tests_time cases that need a PMU (417 + 1;
+    // https://github.com/rrnewton/hermit/issues/3663).
+    if cfg.steps.len() != 418 {
         return Err(format!(
-            "superset has {} steps, expected 1052",
+            "superset has {} steps, expected 418",
             cfg.steps.len()
         ));
     }
@@ -2458,12 +2638,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         }
     }
     let focused_release = step("compatprep.hermit_release")?;
-    let expected_focused_labels = [
-        "strict-compat-only",
-        "sabre-compat-only",
-        "e9patch-compat-only",
-        "rr-compat-only",
-    ];
+    // sabre-compat-only left it on 2026-10-01, and strict-compat-only and
+    // rr-compat-only on 2026-10-02: those run types' buckets run the
+    // validation's one build, the e2e artifact.
+    let expected_focused_labels = ["e9patch-compat-only"];
     if focused_release.cmd != "cargo build --release -p hermit --features third-party-backends"
         || focused_release.deps != ["gate.manifest"]
         || focused_release.labels
@@ -2524,10 +2702,13 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         "rrcompatprep",
     ] {
         let prep = step(&format!("{group}.fixtures"))?;
-        let producer = if group == "portablecompatprep" {
-            "compatprep.hermit_release_in_pinned_root"
-        } else {
-            "compatprep.hermit_release"
+        // The SaBRe, strict and rr run types take the validation's one build,
+        // linked on the host by build.host_hermit_link, instead of a dedicated
+        // release build.
+        let producer = match group {
+            "portablecompatprep" => "compatprep.hermit_release_in_pinned_root",
+            "sabrecompatprep" | "strictcompatprep" | "rrcompatprep" => HOST_HERMIT_LINK_TAG,
+            _ => "compatprep.hermit_release",
         };
         if !prep.deps.iter().any(|dependency| dependency == producer)
             || prep
@@ -2653,6 +2834,30 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
             missing_rust_script_dep.join(", ")
         ));
     }
+    // A bucket node that selects a run type by label carries exactly that
+    // run type's DAG label and passes exactly that `--label`; every other
+    // bucket node selects the default run type and passes none.
+    for step in cfg.steps.iter().filter(|step| step.manifest.is_some()) {
+        let tag = step.tag();
+        match crate::validation_dag_static::manifest_run_type(&tag) {
+            Some(label) => {
+                let manifest = step.manifest.as_ref().expect("filtered on manifest");
+                let flag = format!(" --category {} --label {label} ", manifest.category);
+                if step.labels != [label] || !step.cmd.contains(&flag) {
+                    return Err(format!(
+                        "{tag} selects run type {label}: it must carry only that DAG label and pass `{}`",
+                        flag.trim()
+                    ));
+                }
+            }
+            None if step.cmd.contains(" --label ") => {
+                return Err(format!(
+                    "{tag} passes --label without declaring the run type it selects"
+                ));
+            }
+            None => {}
+        }
+    }
     for profile in PROFILES {
         let direct = cfg
             .steps
@@ -2675,7 +2880,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 profile.selected_steps
             ));
         }
-        let expected_results = expected_for_label(profile.label, cells);
+        let expected_results = cells.for_label(profile.label);
         for result in &expected_results {
             result_manifest_owner(&selected.steps, result)
                 .map_err(|error| format!("{} result ownership failed: {error}", profile.label))?;
@@ -2907,7 +3112,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
             ));
         }
     }
-    let known_results = cells.iter().map(result_identity).collect::<BTreeSet<_>>();
+    let known_results = cells.all().map(result_identity).collect::<BTreeSet<_>>();
     for step in &cfg.steps {
         if step.result_manifests.is_none() {
             return Err(format!("{} omits explicit result ownership", step.tag()));
@@ -3631,6 +3836,53 @@ sys.exit(37)
     }
 
     #[test]
+    fn steps_sharing_a_result_file_never_run_in_one_run_type() {
+        // e2e.manifest_compat, portablecompat.manifest_compat,
+        // sabrecompat.manifest_compat, strictcompat.manifest_compat,
+        // rrcompat.manifest_compat and e2e.manifest_compat_on_host all write
+        // $E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl. That is safe
+        // only while no run type selects two of them: a run selects one label,
+        // so their label sets must be non-empty and pairwise disjoint.
+        let root = crate::git_environment::checkout_root();
+        let dag = generate(&root).unwrap();
+        let mut writers: BTreeMap<String, Vec<&Step>> = BTreeMap::new();
+        for step in &dag.steps {
+            for flag in ["--results", "--junit"] {
+                if let Some((_, rest)) = step.cmd.split_once(&format!("{flag} \"")) {
+                    let path = rest.split('"').next().unwrap().to_string();
+                    writers.entry(path).or_default().push(step);
+                }
+            }
+        }
+        let shared = writers
+            .get("$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl")
+            .map_or(0, Vec::len);
+        assert_eq!(
+            shared, 6,
+            "the six manifest_compat buckets share one result file"
+        );
+        for (path, steps) in &writers {
+            for (index, first) in steps.iter().enumerate() {
+                for second in &steps[index + 1..] {
+                    assert!(
+                        !first.labels.is_empty()
+                            && !second.labels.is_empty()
+                            && !first
+                                .labels
+                                .iter()
+                                .any(|label| second.labels.contains(label)),
+                        "{} and {} both write {path} and can run in one run type ({:?} vs {:?})",
+                        first.tag(),
+                        second.tag(),
+                        first.labels,
+                        second.labels
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn new_plans_never_request_a_ptrace_parity_reference() {
         let root = crate::git_environment::checkout_root();
         let dag = generate(&root).unwrap();
@@ -3905,6 +4157,12 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
+        // 68 since test.detcore_time_on_host was enrolled;
+        // 67 since check.backend_parity_suites_on_host was retired with
+        // tests/backend-parity (slice S13 of
+        // https://github.com/rrnewton/hermit/issues/3301); 68 since
+        // check.e9patch_corpus was added when the e9patch corpus left
+        // tests/backend-parity (also slice S13);
         // 67 since the 189 per-program compat.<label>_on_host nodes were
         // folded into the one bucket e2e.manifest_compat_on_host (fold 1 of
         // https://github.com/rrnewton/hermit/issues/3448: 255 - 189 + 1);
@@ -3915,9 +4173,8 @@ sys.exit(37)
         // 256 since selftest.scorecard_commands split from selftest.scorecard;
         // 255 since the five selftest.<name> nodes left gate.manifest
         // (https://github.com/rrnewton/hermit/issues/3381); 250 since
-        // test.dbt_parity_on_host was retired (slice S13 of
-        // https://github.com/rrnewton/hermit/issues/3301); 251 before.
-        assert_eq!(selected.steps.len(), 67);
+        // test.dbt_parity_on_host was retired (slice S13); 251 before.
+        assert_eq!(selected.steps.len(), 68);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3943,6 +4200,7 @@ sys.exit(37)
             "command_strict_verify",
             "detcore_misc",
             "detcore_parallel",
+            "detcore_time",
             "detcore_unit",
             "envelope_levels",
             "hermit_integration",
@@ -3967,23 +4225,25 @@ sys.exit(37)
         new_variants.extend([
             "build.e2e_artifact_on_host".into(),
             "build.workspace_on_host".into(),
-            "check.backend_parity_suites_on_host".into(),
             "check.dbt_runtime_abi_on_host".into(),
             "compatprep.fixtures_on_host".into(),
             "doc.doctests_on_host".into(),
             "doc.rustdoc_on_host".into(),
             "lint.clippy_on_host".into(),
         ]);
+        // 23 since test.detcore_time_on_host was enrolled;
+        // 22 since check.backend_parity_suites_on_host was retired with
+        // tests/backend-parity (slice S13 of
+        // https://github.com/rrnewton/hermit/issues/3301);
         // 23 since the 189 compat.<label>_on_host nodes became the one
         // manifest bucket e2e.manifest_compat_on_host, counted with the other
         // bucket twins above (fold 1 of
         // https://github.com/rrnewton/hermit/issues/3448);
-        // 212 since test.dbt_parity_on_host was retired with its pinned twin
-        // (slice S13 of https://github.com/rrnewton/hermit/issues/3301); still
-        // 212 after the one-build change of 2026-09-30 retired
-        // build.liteinst_runtime_release_on_host and moved check.dbt_runtime_abi
-        // into the pinned root, which gave it the hosted twin
-        // check.dbt_runtime_abi_on_host.
+        // 212 before that, since test.dbt_parity_on_host was retired with its
+        // pinned twin (also slice S13), and still 212 after the one-build
+        // change of 2026-09-30 retired build.liteinst_runtime_release_on_host
+        // and moved check.dbt_runtime_abi into the pinned root, which gave it
+        // the hosted twin check.dbt_runtime_abi_on_host.
         assert_eq!(new_variants.len(), 23);
         let mut expected = legacy_variants
             .map(str::to_string)
@@ -4117,6 +4377,14 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
+            // 67 = the 68 hosted-portable direct steps since
+            // test.detcore_time_on_host was enrolled, minus the one planted loss;
+            // 66 = the 67 hosted-portable direct steps since
+            // check.backend_parity_suites_on_host was retired with
+            // tests/backend-parity in slice S13 of
+            // https://github.com/rrnewton/hermit/issues/3301 (68 before,
+            // since check.e9patch_corpus was added, also in slice S13), minus
+            // the one planted loss;
             // 66 = the 67 hosted-portable direct steps since the 189
             // compat.<label>_on_host nodes became e2e.manifest_compat_on_host
             // (fold 1 of https://github.com/rrnewton/hermit/issues/3448),
@@ -4128,7 +4396,7 @@ sys.exit(37)
             // selftest.scorecard_commands split from selftest.scorecard,
             // https://github.com/rrnewton/hermit/issues/3381), minus the one
             // planted loss.
-            error.contains("hosted-portable label has 66 direct steps"),
+            error.contains("hosted-portable label has 67 direct steps"),
             "{error}"
         );
     }
@@ -4213,6 +4481,7 @@ sys.exit(37)
                     "test.command_strict_verify",
                     "test.detcore_misc",
                     "test.detcore_parallel",
+                    "test.detcore_time",
                     "test.detcore_unit",
                     "test.hermit_integration",
                     "test.hermit_modes",

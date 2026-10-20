@@ -92,12 +92,12 @@
             <div class="layer"><strong>Linux</strong><span>Host kernel</span></div>
           </div>
           <ul class="orbit" aria-label="Sources of variation controlled by Hermit">
-            <li class="entropy entropy-1"><span class="entropy-label">Thread scheduling</span></li>
-            <li class="entropy entropy-2"><span class="entropy-label">Clocks</span></li>
-            <li class="entropy entropy-3"><span class="entropy-label">Random bytes</span></li>
-            <li class="entropy entropy-4"><span class="entropy-label">Process IDs</span></li>
-            <li class="entropy entropy-5"><span class="entropy-label">File metadata</span></li>
-            <li class="entropy entropy-6"><span class="entropy-label">CPU clock<br> and features</span></li>
+            <li class="entropy entropy-1 ring-middle"><span class="entropy-label">Thread scheduling</span></li>
+            <li class="entropy entropy-2 ring-inner"><span class="entropy-label">Clocks</span></li>
+            <li class="entropy entropy-3 ring-middle"><span class="entropy-label">Random bytes</span></li>
+            <li class="entropy entropy-4 ring-inner"><span class="entropy-label">Process IDs</span></li>
+            <li class="entropy entropy-5 ring-outer"><span class="entropy-label">File<br> metadata</span></li>
+            <li class="entropy entropy-6 ring-outer"><span class="entropy-label">CPU clock<br> and features</span></li>
           </ul>
         </div>
         <figcaption>
@@ -159,7 +159,7 @@
           <h3 id="replay-title">Record and replay</h3>
         </div>
         <div>
-          <p>Record a program execution, then replay it to investigate a failure. Hermit offers a workflow similar to <a href="https://rr-project.org/">Mozilla's rr</a>, with GDB debugging. Its experimental Debug Adapter Protocol (DAP) adapter has known failures with GDB 17.2; see the instructions below for details.</p>
+          <p>Record a program execution, then replay it to investigate a failure. Hermit offers a workflow similar to <a href="https://rr-project.org/">Mozilla's rr</a>, with GDB debugging. Its experimental Debug Adapter Protocol (DAP) adapter is tested end to end with GDB 17.2, including reverse stepping through a recording; other GDB versions are not tested. See the instructions below for details.</p>
           <p>Record/replay supports fewer workloads than deterministic execution.</p>
           <div class="text-links">
             <a href="https://github.com/rrnewton/hermit/blob/main/docs/USER_GUIDE.md#record-and-replay">Record/replay guide <span aria-hidden="true">&rarr;</span></a>

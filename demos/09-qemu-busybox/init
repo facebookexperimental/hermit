@@ -1,0 +1,43 @@
+#!/bin/sh
+# shellcheck shell=busybox
+# PID 1 of the demo 9 guest. It runs a fixed BusyBox workload and prints the
+# PASS line only after every stage of it, including every command of the
+# pipeline, has exited 0. Otherwise it prints a FAIL line that names the stage
+# and its exit status, and powers off without the PASS line. run.sh requires
+# the PASS line. build-initramfs.sh refuses a BusyBox that lacks an applet
+# this script runs or whose shell lacks `set -o pipefail`.
+
+mount -t proc none /proc 2>/dev/null
+mount -t sysfs none /sys 2>/dev/null
+mount -t devtmpfs none /dev 2>/dev/null || mount -t tmpfs none /dev 2>/dev/null
+[ -c /dev/ttyS0 ] || mknod /dev/ttyS0 c 4 64 2>/dev/null
+
+stage_failed() {
+  echo "HERMIT-QEMU-BUSYBOX-FAIL stage=$1 status=$2"
+  poweroff -f
+  # Not reached in the guest. If poweroff returned, PID 1 exiting makes the
+  # kernel panic, and with panic=-1 and QEMU's -no-reboot the machine stops.
+  exit 1
+}
+
+# Without pipefail a pipeline's status is that of its last command, so a
+# failed printf, sort or head would go unnoticed: sha256sum succeeds on empty
+# input. The subshell keeps a shell without the option from exiting here.
+(set -o pipefail) 2>/dev/null || stage_failed pipefail 1
+set -o pipefail
+
+echo 'HERMIT-QEMU-BUSYBOX-START'
+busybox uname -a || stage_failed uname "$?"
+echo '--- root filesystem ---'
+busybox ls -1 / || stage_failed ls "$?"
+echo '--- four-stage pipeline ---'
+# The input fits in one pipe buffer, so head never stops reading while sort is
+# still writing; with more data sort could die of SIGPIPE and fail the stage.
+busybox printf 'delta\nalpha\ncharlie\nbravo\n' | busybox sort |
+  busybox head -n 3 | busybox sha256sum || stage_failed pipeline "$?"
+echo '--- pi (bc -l, scale=10) ---'
+echo 'scale=10;4*a(1)' | busybox bc -l || stage_failed bc "$?"
+echo '--- busybox sha256 ---'
+busybox sha256sum /bin/busybox || stage_failed sha256sum "$?"
+echo 'HERMIT-QEMU-BUSYBOX-PASS stages=5'
+poweroff -f

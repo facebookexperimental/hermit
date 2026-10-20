@@ -26,6 +26,7 @@
     "check.shard_coverage",
     "check.backend_abstraction",
     "check.backend_parity_mutation",
+    "check.e9patch_corpus",
     "check.portability_paths",
     "check.dagrun_naming",
     "check.run_node_args",
@@ -80,7 +81,8 @@
       "nodes": [
         "test.hermit_unit",
         "test.detcore_unit",
-        "test.detcore_misc"
+        "test.detcore_misc",
+        "test.detcore_time"
       ]
     },
     {
@@ -93,7 +95,6 @@
     {
       "slug": "integration",
       "nodes": [
-        "check.backend_parity_suites",
         "test.hermit_integration",
         "test.cli_on_host",
         "test.arbitrary_binaries",
@@ -132,7 +133,7 @@
   ],
   "release_shards": [
     {
-      "slug": "dbt-parity",
+      "slug": "dbt-runtime-abi",
       "needs": "dbt",
       "nodes": [
         "check.dbt_runtime_abi"

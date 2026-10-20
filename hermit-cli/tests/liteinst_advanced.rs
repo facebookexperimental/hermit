@@ -11,6 +11,8 @@
 // no tests, because there is no backend for them to exercise.
 #![cfg(feature = "liteinst")]
 
+#[path = "common/dispatch_stats.rs"]
+mod dispatch_stats;
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
 
@@ -1256,22 +1258,27 @@ fn clock_trajectory(backend: &str) -> Vec<ClockSample> {
 ///
 /// The fix for https://github.com/rrnewton/hermit/issues/3338 stops charging the
 /// runtime's preload constructor, which cost about 1.99 s per image here (of a
-/// 2.14 s gap between the backends with the constructor charged). It does
-/// not make the backends reach main at the same instant. Before the runtime's
-/// begin trap, the dynamic loader maps the preloaded runtime and its libgcc_s
-/// dependency as ordinary guest syscalls, and those stay charged. Scheduler
-/// turns inside the bootstrap window also still advance global time. Measured
-/// with these flags, LiteInst reaches main 151,137,500 ns after ptrace in the
-/// first image in one build directory and 136,137,500 ns in another, at the
-/// same commit, and in both the exec adds 136,137,500 ns more. The values repeat
-/// across runs in one environment, but they depend on the fixture binary that
-/// the host's cc produces, on the runtime's library set and on the environment
-/// (likely the lengths of the mapped paths), so the test bounds them instead of
-/// asserting them. 200 ms per image leaves about 49 to 64 ms of headroom and
-/// fails if even a tenth of the runtime constructor is charged again. This residual is
-/// not parity: it grows with every exec, and after enough execs sysinfo uptime
-/// differs between the backends again. The follow-up is tracked from
-/// https://github.com/rrnewton/hermit/issues/3338.
+/// 2.14 s gap between the backends with the constructor charged). The fix for
+/// https://github.com/rrnewton/hermit/issues/3517 also withholds the scheduler
+/// turns that serve the constructor's uncharged syscalls, about 12 ms per image
+/// here. Neither makes the backends reach main at the same instant. Before the
+/// runtime's begin trap, the dynamic loader maps the preloaded runtime and its
+/// library dependencies as ordinary guest syscalls, and those stay charged.
+/// Measured with these flags, LiteInst reaches main 124,637,500 ns after ptrace
+/// in the first image on a development host and 119,525,000 ns in an Ubuntu
+/// 24.04 root filesystem, and the exec adds 124,137,500 ns and 119,025,000 ns
+/// more. On the GitHub-hosted runner the runtime links libunwind.so.8, which
+/// brings in liblzma.so.5, instead of libgcc_s.so.1. Mapping the extra library
+/// is charged, and both values there were 194,525,000 ns before the 3517 fix,
+/// which withholds about 13 ms of them. The values repeat across runs in one
+/// environment, but they depend on the fixture binary that the host's cc
+/// produces, on the runtime's library set and on the environment, so the test
+/// bounds them instead of asserting them. 200 ms per image leaves about 75 to
+/// 80 ms of headroom on a development host but only about 18 to 19 ms on the
+/// hosted runner, and fails if even a tenth of the runtime constructor is
+/// charged again. This residual is not parity: it grows with every exec, and
+/// after enough execs sysinfo uptime differs between the backends again. The
+/// follow-up is tracked from https://github.com/rrnewton/hermit/issues/3338.
 const LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS: u128 = 200_000_000;
 
 #[test]
@@ -1279,9 +1286,12 @@ fn liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image() {
     let liteinst = clock_trajectory("liteinst");
     let ptrace = clock_trajectory("ptrace");
 
-    // The fixture's last read is about 0.91 to 0.92 s past the epoch under LiteInst,
-    // below the next uptime boundary, so both backends read the same uptime.
-    // This is not a general guarantee; see LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS.
+    // The fixture's last read is about 0.85 to 0.89 s past the epoch under
+    // LiteInst on a development host and about 0.98 s on the hosted runner,
+    // below the next uptime boundary at 1 s, so both backends read the same
+    // uptime. Before the fix for https://github.com/rrnewton/hermit/issues/3517
+    // the hosted read was at 1.005 s and the uptimes differed. This is not a
+    // general guarantee; see LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS.
     let liteinst_uptime = liteinst.iter().map(|s| s.uptime).collect::<Vec<_>>();
     let ptrace_uptime = ptrace.iter().map(|s| s.uptime).collect::<Vec<_>>();
     assert_eq!(
@@ -1307,8 +1317,8 @@ fn liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image() {
         );
     }
 
-    // LiteInst reaches main later than ptrace in each image, by the loader and
-    // scheduler residual only. Bound the first image's gap, and the growth of
+    // LiteInst reaches main later than ptrace in each image, by the loader
+    // residual only. Bound the first image's gap, and the growth of
     // the gap across the exec, by the per-image residual bound.
     let gap_before_exec = liteinst[0]
         .monotonic_ns
@@ -1339,4 +1349,23 @@ fn liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image() {
         exec_growth < LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS,
         "the exec adds {exec_growth} ns to the LiteInst gap\nliteinst={liteinst:?}\nptrace={ptrace:?}"
     );
+}
+
+/// LiteInst's dispatch record: it measures its patch candidates and finds some
+/// in the guest.
+#[test]
+fn liteinst_dispatch_record_reports_patched_sites() {
+    liteinst_runtime::ensure_liteinst_runtime();
+    let guest = dispatch_stats::build_guest("guest-liteinst", &[]);
+    let record = dispatch_stats::dispatch_record(
+        "liteinst",
+        &liteinst_runtime::hermit_binary(),
+        &[],
+        &guest,
+    );
+    let candidates = record
+        .sites
+        .candidates
+        .expect("LiteInst measures its candidates");
+    assert!(candidates > 0, "{record}");
 }

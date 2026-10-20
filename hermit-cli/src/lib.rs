@@ -7,6 +7,7 @@
  */
 
 // Treat all Clippy warnings as errors.
+#![doc = include_str!("../README.md")]
 #![deny(clippy::all)]
 #![allow(clippy::uninlined_format_args)]
 
@@ -324,7 +325,9 @@ mod record_replay_path;
 mod recorder;
 mod replay;
 mod replayer;
+#[cfg(feature = "sabre")]
 mod sabre_bootstrap;
+#[cfg(feature = "sabre")]
 mod sabre_ptrace;
 mod script;
 
@@ -336,13 +339,18 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
+#[cfg(any(feature = "sabre", feature = "liteinst"))]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(feature = "sabre")]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(any(feature = "sabre", feature = "liteinst"))]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(feature = "sabre")]
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(feature = "sabre")]
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use std::time::Instant;
@@ -390,6 +398,7 @@ pub use ptrace_completion::RecoveryRefusal;
 use record::Record;
 use replay::Replay;
 pub use reverie::ExitStatus;
+#[cfg(feature = "sabre")]
 use reverie::GlobalTool;
 pub use reverie::process;
 pub use reverie::process::Command;
@@ -847,40 +856,48 @@ fn liteinst_runtime_pin_matches(path: &Path) -> io::Result<()> {
 
 fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
     liteinst_runtime_pin_matches(path)?;
+    validate_preload_constructor_library(
+        path,
+        "LiteInst runtime",
+        &[
+            "reverie_liteinst_initialize",
+            "reverie_liteinst_site_trap_count",
+            "reverie_liteinst_site_hook_count",
+        ],
+        "reverie_liteinst_initialize",
+    )
+}
+
+/// Checks that `path` is an x86-64 shared object that exports every name in
+/// `required` and registers `initializer_name` in its constructor array, so
+/// that preloading it runs that initializer. `label` names the library in every
+/// error message. Returns the canonical path.
+fn validate_preload_constructor_library(
+    path: &Path,
+    label: &str,
+    required: &[&str],
+    initializer_name: &str,
+) -> io::Result<PathBuf> {
     let bytes = fs::read(path).map_err(|error| {
         io::Error::new(
             error.kind(),
-            format!(
-                "failed to read LiteInst runtime {}: {error}",
-                path.display()
-            ),
+            format!("failed to read {label} {}: {error}", path.display()),
         )
     })?;
     let elf = Elf::parse(&bytes).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "LiteInst runtime {} is not an ELF DSO: {error}",
-                path.display()
-            ),
+            format!("{label} {} is not an ELF DSO: {error}", path.display()),
         )
     })?;
     if elf.header.e_type != header::ET_DYN || elf.header.e_machine != header::EM_X86_64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "LiteInst runtime {} is not an x86-64 shared object",
-                path.display()
-            ),
+            format!("{label} {} is not an x86-64 shared object", path.display()),
         ));
     }
 
-    let required = [
-        "reverie_liteinst_initialize",
-        "reverie_liteinst_site_trap_count",
-        "reverie_liteinst_site_hook_count",
-    ];
-    for name in required {
+    for &name in required {
         if !elf
             .dynsyms
             .iter()
@@ -889,7 +906,7 @@ fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "LiteInst runtime {} is missing required export {name}",
+                    "{label} {} is missing required export {name}",
                     path.display()
                 ),
             ));
@@ -899,10 +916,12 @@ fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
         .dynsyms
         .iter()
         .enumerate()
-        .find(|(_, symbol)| {
-            elf.dynstrtab.get_at(symbol.st_name) == Some("reverie_liteinst_initialize")
-        })
-        .ok_or_else(|| io::Error::other("checked LiteInst initializer disappeared"))?;
+        .find(|(_, symbol)| elf.dynstrtab.get_at(symbol.st_name) == Some(initializer_name))
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "checked {label} initializer {initializer_name} disappeared"
+            ))
+        })?;
     let init_array = elf
         .section_headers
         .iter()
@@ -910,10 +929,7 @@ fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "LiteInst runtime {} has no constructor array",
-                    path.display()
-                ),
+                format!("{label} {} has no constructor array", path.display()),
             )
         })?;
     let init_start = init_array.sh_addr;
@@ -943,7 +959,7 @@ fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "LiteInst runtime {} does not register reverie_liteinst_initialize as a preload constructor",
+                "{label} {} does not register {initializer_name} as a preload constructor",
                 path.display()
             ),
         ));
@@ -1000,6 +1016,403 @@ pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
     ))
 }
 
+/// Environment variable that selects where `--backend=liteinst` runs Detcore.
+///
+/// Unset keeps the ptrace-hosted hybrid, which is still the default. `1` runs
+/// Detcore's Tool inside the guest through the `detcore-liteinst` preload, with
+/// no ptrace tracer on the syscall path
+/// (<https://github.com/rrnewton/hermit/issues/3520>). Any other value is
+/// refused.
+pub const LITEINST_IN_GUEST_ENV: &str = "HERMIT_LITEINST_IN_GUEST";
+
+/// Environment variable naming the in-guest Detcore preload
+/// (`libdetcore_liteinst.so`) explicitly.
+pub const LITEINST_TOOL_RUNTIME_ENV: &str = "HERMIT_LITEINST_TOOL_RUNTIME";
+
+/// Where `--backend=liteinst` runs Detcore's Tool.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LiteinstRuntime {
+    /// Detcore runs in the Hermit process under a ptrace tracer; the guest
+    /// preload patches sites and unpatched syscalls stop in ptrace.
+    HostHybrid,
+    /// Detcore's Tool runs in the guest (`detcore-liteinst`) and reaches its
+    /// global state in Hermit over the coordinator socket.
+    InGuest,
+}
+
+impl LiteinstRuntime {
+    /// Parses a value of [`LITEINST_IN_GUEST_ENV`]; `None` means unset.
+    pub fn parse(value: Option<&OsStr>) -> Result<Self, Error> {
+        match value {
+            None => Ok(Self::HostHybrid),
+            Some(value) if value == OsStr::new("1") => Ok(Self::InGuest),
+            Some(value) => Err(anyhow!(
+                "{LITEINST_IN_GUEST_ENV}={:?} is not a LiteInst runtime selection: leave it unset \
+                 for the ptrace-hosted hybrid, or set it to 1 for in-guest Detcore",
+                value
+            )),
+        }
+    }
+
+    /// Reads [`LITEINST_IN_GUEST_ENV`] from this process's environment.
+    pub fn from_env() -> Result<Self, Error> {
+        Self::parse(std::env::var_os(LITEINST_IN_GUEST_ENV).as_deref())
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3635): Review in-guest Detcore runtime discovery.
+/// Returns the in-guest Detcore preload built beside the Hermit binary by
+/// `cargo build -p detcore-liteinst`, or the one [`LITEINST_TOOL_RUNTIME_ENV`]
+/// names.
+///
+/// Unlike the hybrid runtime, this library records no Reverie revision yet, so
+/// a stale build is not detected. Staging it with a revision marker is part of
+/// making in-guest the default (<https://github.com/rrnewton/hermit/issues/3520>).
+#[doc(hidden)]
+pub fn liteinst_tool_runtime_library_path() -> io::Result<PathBuf> {
+    if let Some(path) = std::env::var_os(LITEINST_TOOL_RUNTIME_ENV) {
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{LITEINST_TOOL_RUNTIME_ENV} does not name a regular file"),
+            ));
+        }
+        return validate_liteinst_tool_runtime_library(&path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("{LITEINST_TOOL_RUNTIME_ENV} is invalid: {error}"),
+            )
+        });
+    }
+
+    let executable = std::env::current_exe()?;
+    let directory = executable.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Hermit executable has no parent directory",
+        )
+    })?;
+    if let Some(path) = [
+        directory.join("libdetcore_liteinst.so"),
+        directory.join("deps/libdetcore_liteinst.so"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    {
+        return validate_liteinst_tool_runtime_library(&path);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "libdetcore_liteinst.so was not built beside {}",
+            executable.display()
+        ),
+    ))
+}
+
+fn validate_liteinst_tool_runtime_library(path: &Path) -> io::Result<PathBuf> {
+    validate_preload_constructor_library(
+        path,
+        "in-guest Detcore runtime",
+        &["detcore_liteinst_initialize"],
+        "detcore_liteinst_initialize",
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3635): Review the in-guest LiteInst library refusals.
+/// In-guest LiteInst refused a run before starting its guest, because the
+/// runtime cannot honour the request or could not monitor the program.
+///
+/// A type rather than a message, because it crosses the container error
+/// boundary as [`error::FailureKind::PolicyRefusal`] (exit 122).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteinstInGuestRefusal {
+    reason: String,
+}
+
+impl LiteinstInGuestRefusal {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for LiteinstInGuestRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{LITEINST_IN_GUEST_ENV}=1 (in-guest LiteInst) refuses this run: {}",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for LiteinstInGuestRefusal {}
+
+/// Refuses, before the guest starts, an in-guest LiteInst run that the runtime
+/// cannot honour or could not monitor.
+///
+/// - A maximum timeslice. Reverie's in-guest Tool host has no preemption timer:
+///   its `set_timer` refuses with `ENOSYS`, and Detcore treats a failed
+///   `set_timer` as fatal (`.expect("Failed to set timer")`), so the guest
+///   would panic at its first scheduling point. The CLI refuses
+///   `--max-timeslice` earlier; this covers library callers.
+/// - A guest program that would run code before, or without, the runtime's
+///   constructor ([`in_guest_liteinst_program_gap`]).
+///
+/// This runs where the guest is spawned (inside the container for the CLI),
+/// so it resolves the program in the filesystem the guest sees. It pins the
+/// resolved program on `command` ([`pin_spawn_program`]), so the launch
+/// executes the same path this check inspected.
+#[cfg(feature = "liteinst")]
+fn refuse_in_guest_liteinst_run(command: &mut Command, config: &DetConfig) -> Result<(), Error> {
+    let reason = if config.max_timeslice.is_some() {
+        Some(
+            "it cannot deliver Detcore's preemption timer yet (the in-guest Tool host refuses \
+             set_timer with ENOSYS), so the run would fail at its first timeslice; pass \
+             --max-timeslice=disabled"
+                .to_owned(),
+        )
+    } else {
+        in_guest_liteinst_program_gap(command)?
+    };
+    match reason {
+        Some(reason) => Err(Error::new(LiteinstInGuestRefusal::new(reason))),
+        None => Ok(()),
+    }
+}
+
+/// How many `#!` interpreters [`in_guest_liteinst_program_gap`] follows before
+/// it refuses the program. The kernel has its own small limit (`exec_binprm` in
+/// `fs/exec.c`); a chain this check stops following is refused, not run, so the
+/// check fails closed whichever limit is lower.
+#[cfg(feature = "liteinst")]
+const MAX_INTERPRETER_DEPTH: usize = 4;
+
+/// Why the guest program would run code before, or without, the in-guest
+/// runtime, or `None` when it would not.
+///
+/// The runtime is an `LD_PRELOAD` library whose constructor installs Detcore.
+/// The dynamic loader never loads it into a statically linked image or an image
+/// of another architecture, and ignores `LD_PRELOAD` in secure-execution mode
+/// (set-user-ID, set-group-ID, or file capabilities). An executable's
+/// `DT_PREINIT_ARRAY` runs before every library constructor. Each of those
+/// would run guest code unmonitored, so each is refused. `#!` scripts are
+/// checked through their interpreter, read as the kernel's script handler
+/// reads it ([`script::KernelScript`]). A program or interpreter that is not a
+/// regular file is refused before it is opened: the kernel executes only
+/// regular files, opening a device can act on it, opening a socket fails, and
+/// reading a FIFO that has no writer would block the check.
+///
+/// Every fact about one file (its type, header, ELF headers, mode bits and
+/// capabilities) is read through one open descriptor, so they all describe
+/// the same file. The check is still advisory, not containment: the `execve`
+/// opens the path again, and a file replaced at that path in between is not
+/// checked again.
+///
+/// Not covered, and recorded on
+/// <https://github.com/rrnewton/hermit/issues/3520>:
+/// - The loader itself, the C library's initialization, the executable's
+///   `IFUNC` resolvers and the constructors of the executable's own shared
+///   libraries all run before the runtime's constructor in every guest.
+/// - Secure-execution mode that a security module or a parent with differing
+///   real and effective IDs imposes; only the file's own mode bits and
+///   capabilities are checked.
+/// - Whether the `PT_INTERP` loader honours `LD_PRELOAD` at all.
+/// - A `binfmt_misc` rule, which the kernel consults before its ELF and script
+///   handlers, and which can hand a file this check accepted to another
+///   interpreter (for example an emulator).
+/// - A runtime library the loader fails to load: the loader continues without
+///   it, and only the launch's check that the guest connected before it exited
+///   reports the failure, after the guest ran.
+/// - A `pre_exec` callback on `command` that changes the working directory or
+///   the root directory: the check resolves paths against the working
+///   directory `command` is configured with, in Hermit's root, before any
+///   such callback runs.
+#[cfg(feature = "liteinst")]
+fn in_guest_liteinst_program_gap(command: &mut Command) -> Result<Option<String>, Error> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    use script::KernelScript;
+
+    let mut path = pin_spawn_program(command)?;
+    for _ in 0..=MAX_INTERPRETER_DEPTH {
+        let shown = path.display().to_string();
+        let not_regular = || {
+            Ok(Some(format!(
+                "{shown} is not a regular file, and the kernel executes only regular files"
+            )))
+        };
+        if !fs::metadata(&path)
+            .with_context(|| format!("cannot read guest program {shown}"))?
+            .is_file()
+        {
+            return not_regular();
+        }
+        // The path can change type after the check above. O_NONBLOCK then keeps
+        // the open of a FIFO that has no writer from blocking, and O_NOCTTY
+        // keeps a terminal from becoming Hermit's controlling terminal; neither
+        // changes how a regular file is read. The descriptor's own type is
+        // checked again below.
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(&path)
+            .with_context(|| format!("cannot read guest program {shown}"))?;
+        if !file
+            .metadata()
+            .with_context(|| format!("cannot read guest program {shown}"))?
+            .is_file()
+        {
+            return not_regular();
+        }
+        let mut header = Vec::new();
+        (&file)
+            .take(256)
+            .read_to_end(&mut header)
+            .with_context(|| format!("cannot read guest program {shown}"))?;
+        match KernelScript::from_buf(&header) {
+            KernelScript::Interpreter(interpreter) => {
+                // The kernel opens a relative interpreter against the working
+                // directory of the process calling execve.
+                path = match command.get_current_dir() {
+                    Some(directory) => directory.join(interpreter),
+                    None => interpreter,
+                };
+                continue;
+            }
+            KernelScript::Declined => {
+                return Ok(Some(format!(
+                    "{shown} starts with #! but the kernel's script handler declines it (it \
+                     names no interpreter, or the interpreter path fills the first 256 bytes), \
+                     so the kernel would fail the execve or hand the file to another handler \
+                     that need not load the runtime"
+                )));
+            }
+            KernelScript::NotScript => {}
+        }
+        let Some(startup) = interp::elf_startup(&mut file)
+            .with_context(|| format!("cannot read the ELF headers of guest program {shown}"))?
+        else {
+            return Ok(Some(format!(
+                "{shown} is neither an ELF executable nor a #! script, so the kernel would hand \
+                 it to a handler that need not load the runtime"
+            )));
+        };
+        let reason = if !startup.x86_64 {
+            "is not a 64-bit x86-64 ELF image, so the dynamic loader cannot load the 64-bit \
+             runtime into it"
+        } else if !startup.has_interp {
+            "is statically linked (it has no PT_INTERP), so no dynamic loader runs to load the \
+             runtime"
+        } else if is_secure_execution_image(&file, &shown)? {
+            "is set-user-ID, set-group-ID or has file capabilities, so the kernel runs it in \
+             secure-execution mode, where the dynamic loader ignores LD_PRELOAD"
+        } else if startup.has_preinit_array {
+            "has a DT_PREINIT_ARRAY, whose functions run before the runtime's constructor"
+        } else {
+            return Ok(None);
+        };
+        return Ok(Some(format!(
+            "guest program {shown} {reason}, so it would run unmonitored if Hermit launched it"
+        )));
+    }
+    Ok(Some(format!(
+        "the #! interpreters of guest program {} nest more than {MAX_INTERPRETER_DEPTH} deep",
+        Path::new(command.get_program()).display()
+    )))
+}
+
+/// Resolves the program `command` executes with Reverie's
+/// [`Command::find_program`], the call the in-guest launch makes, and pins the
+/// result on `command`, keeping `argv[0]`.
+///
+/// The result is absolute, so the launch's own `find_program` returns it
+/// unchanged and the launch executes the same path the check inspected,
+/// whatever `PATH` or working directory either side would otherwise use. The
+/// path, not its contents: a file replaced at that path in between is not
+/// checked again (see [`in_guest_liteinst_program_gap`]). A program the launch
+/// could not find is an error here, as it would be at launch.
+#[cfg(feature = "liteinst")]
+fn pin_spawn_program(command: &mut Command) -> Result<PathBuf, Error> {
+    let arg0 = command.get_arg0().to_owned();
+    let program = command.find_program().with_context(|| {
+        format!(
+            "cannot find guest program {}",
+            Path::new(command.get_program()).display()
+        )
+    })?;
+    command.program(&program).arg0(arg0);
+    Ok(program)
+}
+
+/// Whether executing `file` (shown as `shown`) puts the kernel in
+/// secure-execution mode (`AT_SECURE`): set-user-ID, set-group-ID (with group
+/// execute, as the kernel requires), or a `security.capability` attribute.
+#[cfg(feature = "liteinst")]
+fn is_secure_execution_image(file: &fs::File, shown: &str) -> Result<bool, Error> {
+    let mode = file
+        .metadata()
+        .with_context(|| format!("cannot stat guest program {shown}"))?
+        .permissions()
+        .mode();
+    if mode & 0o4000 != 0 || mode & 0o2010 == 0o2010 {
+        return Ok(true);
+    }
+    // SAFETY: the descriptor is open for the call, the name is NUL-terminated,
+    // and a zero-sized query writes no value.
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"security.capability".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if size >= 0 {
+        return Ok(true);
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(false),
+        _ => Err(Error::new(io::Error::last_os_error()).context(format!(
+            "cannot read the file capabilities of guest program {shown}"
+        ))),
+    }
+}
+
+/// Refuses a wall-clock bound on an in-guest LiteInst run. The bound drops the
+/// run's future, and dropping it neither kills the guest nor stops the
+/// blocking task that waits for it.
+#[cfg(feature = "liteinst")]
+fn refuse_in_guest_liteinst_timeout(
+    backend: Backend,
+    timeout: Option<Duration>,
+) -> Result<(), Error> {
+    if backend == Backend::Liteinst
+        && timeout.is_some()
+        && LiteinstRuntime::from_env()? == LiteinstRuntime::InGuest
+    {
+        return Err(Error::new(LiteinstInGuestRefusal::new(
+            "a wall-clock timeout has not been qualified for the in-guest runtime, whose run \
+             future does not kill the guest when it is dropped",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "liteinst"))]
+fn refuse_in_guest_liteinst_timeout(
+    _backend: Backend,
+    _timeout: Option<Duration>,
+) -> Result<(), Error> {
+    Ok(())
+}
+
 #[cfg(feature = "liteinst")]
 fn liteinst_unavailable_reason() -> Option<String> {
     liteinst_runtime_unavailable_reason()
@@ -1016,11 +1429,19 @@ fn liteinst_unavailable_reason() -> Option<String> {
 
 #[cfg(feature = "liteinst")]
 fn liteinst_runtime_unavailable_reason() -> Option<String> {
-    liteinst_runtime_library_path().err().map(|error| {
-        format!(
-            "the LiteInst preload runtime is unavailable: {error}; build the locked liteinst-runtime-build manifest and stage its constructor-enabled DSO beside hermit"
-        )
-    })
+    match LiteinstRuntime::from_env() {
+        Err(error) => Some(error.to_string()),
+        Ok(LiteinstRuntime::InGuest) => liteinst_tool_runtime_library_path().err().map(|error| {
+            format!(
+                "the in-guest Detcore runtime is unavailable: {error}; build it with `cargo build -p detcore-liteinst` in the target directory of this hermit binary, or name it with {LITEINST_TOOL_RUNTIME_ENV}"
+            )
+        }),
+        Ok(LiteinstRuntime::HostHybrid) => liteinst_runtime_library_path().err().map(|error| {
+            format!(
+                "the LiteInst preload runtime is unavailable: {error}; build the locked liteinst-runtime-build manifest and stage its constructor-enabled DSO beside hermit"
+            )
+        }),
+    }
 }
 
 fn kvm_device_unavailable_reason(path: &Path) -> Option<String> {
@@ -1121,7 +1542,27 @@ impl Backend {
     }
 
     fn uses_ptrace_pmu_timers(self) -> bool {
-        matches!(self, Self::Ptrace | Self::Liteinst | Self::E9patch)
+        let liteinst_runtime = if self == Self::Liteinst {
+            LiteinstRuntime::from_env().unwrap_or(LiteinstRuntime::HostHybrid)
+        } else {
+            LiteinstRuntime::HostHybrid
+        };
+        self.uses_ptrace_pmu_timers_for_liteinst_runtime(liteinst_runtime)
+    }
+
+    /// [`Self::uses_ptrace_pmu_timers`] with the LiteInst runtime given
+    /// explicitly rather than read from [`LITEINST_IN_GUEST_ENV`]. Other
+    /// backends ignore it.
+    fn uses_ptrace_pmu_timers_for_liteinst_runtime(
+        self,
+        liteinst_runtime: LiteinstRuntime,
+    ) -> bool {
+        match self {
+            Self::Ptrace | Self::E9patch => true,
+            // In-guest Detcore has no ptrace tracer to arm the PMU timer from.
+            Self::Liteinst => liteinst_runtime != LiteinstRuntime::InGuest,
+            Self::Dbt | Self::Sabre | Self::Kvm => false,
+        }
     }
 
     /// Returns backends whose Hermit integration prerequisites are met.
@@ -1247,13 +1688,9 @@ impl SkidOvershootReport {
     }
 }
 
-// SaBRe and e9patch add no third-party Rust dependencies to `hermit-cli` (SaBRe
-// shells out to an external loader plus `libdetcore_sabre.so`, and e9patch shells
-// out to `e9tool`/`e9patch`). They are still gated behind the `sabre` and
-// `e9patch` cargo features so the default `hermit` binary reports them as absent
-// and only the `third-party-backends` build offers them. The reverie-sabre Rust
-// dependency lives in the `detcore-sabre` crate, which is excluded from the
-// workspace's `default-members`.
+// SaBRe's statistics and RPC support are selected only by `sabre`; the external
+// loader and Detcore plugin must also be supplied. e9patch preprocessing requires
+// external `e9tool`/`e9patch` artifacts. Neither path is enabled by default.
 #[cfg(feature = "sabre")]
 fn sabre_unavailable_reason() -> Option<String> {
     sabre_runtime_unavailable_reason()
@@ -1291,17 +1728,31 @@ fn dbt_unavailable_reason() -> Option<String> {
 #[cfg(not(feature = "dbt"))]
 // TODO-HUMAN-REVIEW(PR-1150): Review the default-on DBT compile-time feature boundary.
 fn dbt_unavailable_reason() -> Option<String> {
-    Some("the `dbt` feature is not enabled in this build; rebuild with `--features dbt` (or `--features third-party-backends`). This says nothing about whether DynamoRIO works on this machine -- it has not been checked".to_owned())
+    Some(dbt_disabled_build_reason(
+        option_env!("CARGO_PKG_NAME").unwrap_or("hermit"),
+    ))
 }
 
+#[cfg(not(feature = "dbt"))]
+fn dbt_disabled_build_reason(package_name: &str) -> String {
+    if package_name == "hermit-run" {
+        "the dbt backend is not included in this registry release; use a source build from https://github.com/rrnewton/hermit with `--features dbt`. The registry's `third-party-backends` feature does not include DBT. DynamoRIO availability on this machine has not been checked".to_owned()
+    } else {
+        "the `dbt` feature is not enabled in this source build; rebuild with `--features dbt` (or `--features third-party-backends`). DynamoRIO availability on this machine has not been checked".to_owned()
+    }
+}
+
+#[cfg(feature = "sabre")]
 const SABRE_BINARY_ENV: &str = "HERMIT_SABRE_BINARY";
 
+#[cfg(feature = "sabre")]
 fn is_executable_file(path: &Path) -> bool {
     fs::metadata(path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 // TODO-HUMAN-REVIEW(PR-739): Review SaBRe loader discovery and executable validation.
+#[cfg(feature = "sabre")]
 fn resolve_sabre_binary_from(
     override_path: Option<&OsStr>,
     packaged_path: Option<&Path>,
@@ -1358,6 +1809,7 @@ fn resolve_sabre_binary_from(
     ))
 }
 
+#[cfg(feature = "sabre")]
 fn resolve_sabre_binary() -> Result<PathBuf, Error> {
     let executable =
         std::env::current_exe().context("failed to locate running Hermit executable")?;
@@ -1372,21 +1824,28 @@ fn resolve_sabre_binary() -> Result<PathBuf, Error> {
     )
 }
 
+#[cfg(feature = "sabre")]
 const SABRE_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
+#[cfg(feature = "sabre")]
 const SABRE_DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
+#[cfg(feature = "sabre")]
 const SABRE_PATH_EVIDENCE_ENV: &str = "HERMIT_SABRE_PATH_EVIDENCE";
+#[cfg(feature = "sabre")]
 const SABRE_STAGING_DIRECTORY: &str = "/dev/shm";
 
+#[cfg(feature = "sabre")]
 struct StagedSabreProgram {
     path: PathBuf,
 }
 
+#[cfg(feature = "sabre")]
 impl Drop for StagedSabreProgram {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
 }
 
+#[cfg(feature = "sabre")]
 fn sabre_program_needs_neutral_name(program: &Path) -> bool {
     program
         .file_name()
@@ -1395,6 +1854,7 @@ fn sabre_program_needs_neutral_name(program: &Path) -> bool {
 
 // TODO-HUMAN-REVIEW(PR-845): Review the neutral-name workaround for SaBRe's
 // dynamic-loader prefix collision.
+#[cfg(feature = "sabre")]
 fn stage_sabre_program_in(
     program: &Path,
     staging_directory: &Path,
@@ -1436,6 +1896,7 @@ fn stage_sabre_program_in(
 }
 
 // TODO-HUMAN-REVIEW(PR-738): Review controller/plugin artifact separation.
+#[cfg(feature = "sabre")]
 fn sabre_runtime_library_path() -> io::Result<PathBuf> {
     if let Some(path) = hermit_resources::resource("libdetcore_sabre.so")?
         && path.is_file()
@@ -1481,8 +1942,10 @@ fn sabre_runtime_unavailable_reason() -> Option<String> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-774): Review the bounded SaBRe RPC disconnect drain.
+#[cfg(feature = "sabre")]
 const SABRE_RPC_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
+#[cfg(feature = "sabre")]
 async fn wait_for_sabre_rpc_disconnects<T>(
     global: &Arc<T>,
     timeout: Duration,
@@ -1508,6 +1971,7 @@ async fn wait_for_sabre_rpc_disconnects<T>(
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-782): Review SaBRe RPC server shutdown errors.
+#[cfg(feature = "sabre")]
 async fn stop_sabre_rpc_server<E>(
     server_task: tokio::task::JoinHandle<Result<(), E>>,
 ) -> Result<(), Error>
@@ -1525,6 +1989,7 @@ where
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-789): Review complete SaBRe RPC shutdown ordering.
+#[cfg(feature = "sabre")]
 async fn shutdown_sabre_rpc<T, E>(
     server_task: tokio::task::JoinHandle<Result<(), E>>,
     global: &Arc<T>,
@@ -1567,6 +2032,7 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
 /// the single GlobalState held by this Hermit coordinator process.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-738): Review SaBRe coordinator lifetime and artifact loading.
+#[cfg(feature = "sabre")]
 async fn run_sabre(
     mut command: Command,
     config: DetConfig,
@@ -1640,6 +2106,18 @@ async fn run_sabre(
     }
     command.env_remove("SABRE_BINARY");
     command.env_remove("SABRE_PLUGIN");
+    // Always collect: the statistics page is a descriptor the guest can see,
+    // so creating it only when a summary or DEBUG log is requested would make
+    // those flags change the guest's view. The plugin takes the variable out
+    // of the guest environment, and the descriptor sits above the plugin's
+    // fixed RPC socket.
+    let stats = reverie_sabre_stats::SabreStats::create(reverie::BackendStatsRequest::ENABLED)
+        .map_err(|error| anyhow!("failed to create the SaBRe statistics page: {error}"))?
+        .expect("an enabled request creates the statistics page");
+    command.env(
+        reverie_sabre_stats::BACKEND_STATS_ENV,
+        stats.raw_fd().to_string(),
+    );
 
     // THE SOCKET PATH IS DELIBERATELY RANDOM AND MUST NOT BE COMPARED.
     //
@@ -1687,6 +2165,7 @@ async fn run_sabre(
         fallback_ready,
         global.clone(),
         bootstrap_launch,
+        stats.clone(),
         capture_output,
     )
     .await
@@ -1758,8 +2237,13 @@ async fn run_sabre(
     if requires_forced_shutdown {
         global.cancel_internal_scheduler().await;
     }
+    let dispatch_stats = backend_stats::report(
+        Backend::Sabre,
+        backend_stats::request(print_summary_to_json_file),
+        &stats,
+    );
     global
-        .clean_up(print_summary, print_summary_to_json_file)
+        .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
         .await;
     tracing::info!(
         target: "hermit::sabre::fallback",
@@ -1777,8 +2261,21 @@ async fn run_sabre(
     Ok(output)
 }
 
+#[cfg(not(feature = "sabre"))]
+async fn run_sabre(
+    _command: Command,
+    _config: DetConfig,
+    _print_summary: bool,
+    _print_summary_to_json_file: &Option<PathBuf>,
+    _capture_output: bool,
+) -> Result<Output, Error> {
+    Backend::Sabre.ensure_available()?;
+    unreachable!("SaBRe availability must fail when the feature is disabled");
+}
+
 /// Classify the existing SaBRe reach evidence without collapsing "never
 /// engaged" into the same zero-valued state as a fully exercised run.
+#[cfg(feature = "sabre")]
 fn sabre_reach_state(guest_rpc_observed: bool, ptrace_fallback_sites: usize) -> &'static str {
     match (guest_rpc_observed, ptrace_fallback_sites) {
         (false, _) => "no-detcore-reached",
@@ -1799,6 +2296,7 @@ fn sabre_reach_state(guest_rpc_observed: bool, ptrace_fallback_sites: usize) -> 
 /// 14 under ptrace; the 11 absent records were the loader's libc.so.6 path
 /// resolution. The launch-order fact, not that host-specific count, is the
 /// runtime contract.
+#[cfg(feature = "sabre")]
 fn sabre_backend_evidence_line(evidence: &sabre_ptrace::PathEvidence) -> String {
     format!(
         ":: Backend: sabre static rewriting + ptrace runtime; run_mode=run; \
@@ -1826,6 +2324,7 @@ fn sabre_backend_evidence_line(evidence: &sabre_ptrace::PathEvidence) -> String 
 /// statically linked ELF is the sharp edge: it has no dynamic loader and no
 /// shared library through which SaBRe could regain control, so an unrewritten
 /// static client runs entirely on bare Linux with no second chance.
+#[cfg(feature = "sabre")]
 fn sabre_uninstrumented_guest_message(status: &ExitStatus) -> String {
     format!(
         "the SaBRe backend finished ({status:?}) without the guest ever reaching the Detcore \
@@ -1999,6 +2498,26 @@ fn prepare_kvm_mountinfo_config(
     Ok(())
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3695): Review
+// host metadata timestamps for KVM runs.
+/// Whether a KVM run asks the backend for the timestamps the kernel stored
+/// rather than its fixed value.
+///
+/// With virtual metadata, Detcore rewrites every timestamp that a stat call
+/// returns to the guest, and it reads the stored host values for its own
+/// checks: `set_file_times` confirms that `utimensat` stored the requested
+/// mtime. KVM replaces those timestamps with a fixed value unless the run asks
+/// for the stored ones. The backend refuses this setting unless Detcore owns
+/// every guest thread. The stored values sit in the guest's buffer until
+/// Detcore rewrites them, so the run must also sequentialize threads: then no
+/// other guest thread runs in that interval.
+fn kvm_reports_stored_metadata_timestamps(config: &DetConfig) -> bool {
+    config.virtualize_metadata
+        && config.backend_dispatches_thread_tools
+        && config.sequentialize_threads
+}
+
 /// Dispatch a command onto the real reverie-kvm Tool runtime.
 async fn run_kvm(
     command: &Command,
@@ -2115,6 +2634,11 @@ async fn run_kvm(
     // needed.
     if !config.backend_dispatches_thread_tools {
         backend.unmonitored_threads();
+    }
+    if kvm_reports_stored_metadata_timestamps(&config) {
+        backend
+            .set_host_metadata_timestamps(true)
+            .map_err(|error| anyhow!("failed to configure KVM metadata timestamps: {error}"))?;
     }
 
     let execution_started = Instant::now();
@@ -2424,7 +2948,27 @@ pub fn run_with_backend_timeout(
 
 // TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
 #[doc(hidden)]
-pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
+pub fn prepare_backend_config(config: DetConfig, backend: Backend) -> DetConfig {
+    // An unrecognized selector value configures the hybrid here; the run refuses
+    // that value before it dispatches.
+    let liteinst_runtime = if backend == Backend::Liteinst {
+        LiteinstRuntime::from_env().unwrap_or(LiteinstRuntime::HostHybrid)
+    } else {
+        LiteinstRuntime::HostHybrid
+    };
+    prepare_backend_config_for_liteinst_runtime(config, backend, liteinst_runtime)
+}
+
+/// [`prepare_backend_config`] with the LiteInst runtime given explicitly rather
+/// than read from [`LITEINST_IN_GUEST_ENV`]. Other backends ignore it.
+#[doc(hidden)]
+pub fn prepare_backend_config_for_liteinst_runtime(
+    mut config: DetConfig,
+    backend: Backend,
+    liteinst_runtime: LiteinstRuntime,
+) -> DetConfig {
+    let in_guest_liteinst =
+        backend == Backend::Liteinst && liteinst_runtime == LiteinstRuntime::InGuest;
     config.discover_live_file_metadata = backend == Backend::Sabre;
     // Guest-visible wall and monotonic clocks must stay in the same global
     // virtual-time domain as timers, sleeps, and timeout deadlines. SaBRe's
@@ -2435,9 +2979,12 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
     // Wake pending RPCs on logical removal, reject stale requests, and account
     // the eventual deregistration exactly once. KVM has no native task exit
-    // that can resolve a removed thread's pending Tool future.
+    // that can resolve a removed thread's pending Tool future, and in-guest
+    // LiteInst, like DBT, has no ptrace exit-group teardown to resolve it.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3635): Review in-guest LiteInst killed-thread RPC cancellation.
     config.cancel_killed_thread_rpcs =
-        matches!(backend, Backend::Sabre | Backend::Dbt | Backend::Kvm);
+        in_guest_liteinst || matches!(backend, Backend::Sabre | Backend::Dbt | Backend::Kvm);
     config.backend_reports_physical_process_exits = backend == Backend::Sabre;
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     config.backend_serializes_fork_children = false;
@@ -2558,6 +3105,7 @@ async fn run_with_backend_inner(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<ExitStatus, Error> {
+    refuse_in_guest_liteinst_timeout(backend, timeout)?;
     // Keep the large backend future off the container supervisor's stack
     // before the deadline and Tokio wrappers capture it. Polling and dropping
     // stay inline, including the backend teardown on timeout.
@@ -2616,18 +3164,60 @@ async fn dispatch_backend(
     if backend == Backend::Liteinst {
         #[cfg(feature = "liteinst")]
         {
-            let preload = liteinst_runtime_library_path()?;
-            let (exit_status, mut global_state) =
-                reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
-                    command, config, preload,
-                )
-                .await?;
+            let stats_request = backend_stats::request(print_summary_to_json_file);
+            let (exit_status, mut global_state, dispatch_stats) = match LiteinstRuntime::from_env()?
+            {
+                LiteinstRuntime::InGuest => {
+                    let mut command = command;
+                    refuse_in_guest_liteinst_run(&mut command, &config)?;
+                    let preload = liteinst_tool_runtime_library_path()?;
+                    if stats_request.is_enabled() {
+                        let (exit_status, global_state, source) =
+                            reverie_liteinst::LiteinstBackend::run_with_preload_and_stats::<Detcore>(
+                                command, config, preload,
+                            )
+                            .await?;
+                        let dispatch_stats = backend_stats::report(backend, stats_request, &source);
+                        (exit_status, global_state, dispatch_stats)
+                    } else {
+                        let (exit_status, global_state) =
+                            reverie_liteinst::LiteinstBackend::run_with_preload::<Detcore>(
+                                command, config, preload,
+                            )
+                            .await?;
+                        (exit_status, global_state, None)
+                    }
+                }
+                LiteinstRuntime::HostHybrid => {
+                    let preload = liteinst_runtime_library_path()?;
+                    if stats_request.is_enabled() {
+                        let (exit_status, global_state, source) =
+                            reverie_liteinst::LiteinstBackend::run_host_with_preload_and_stats::<
+                                Detcore,
+                            >(command, config, preload)
+                            .await?;
+                        let dispatch_stats = backend_stats::report(backend, stats_request, &source);
+                        (exit_status, global_state, dispatch_stats)
+                    } else {
+                        let (exit_status, global_state) =
+                            reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
+                                command, config, preload,
+                            )
+                            .await?;
+                        (exit_status, global_state, None)
+                    }
+                }
+            };
             if liteinst_requires_forced_shutdown(exit_status) {
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
             }
             global_state
-                .clean_up(print_summary, print_summary_to_json_file)
+                .clean_up_with_dispatch_stats(
+                    print_summary,
+                    print_summary_to_json_file,
+                    dispatch_stats,
+                )
                 .await;
             return Ok(exit_status);
         }
@@ -2639,7 +3229,7 @@ async fn dispatch_backend(
     }
     ensure_backend_dispatch(backend)?;
 
-    let stats_request = backend_stats::request();
+    let stats_request = backend_stats::request(print_summary_to_json_file);
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
     if config.gdbserver {
         builder = builder.gdbserver(config.gdbserver_port);
@@ -2656,12 +3246,14 @@ async fn dispatch_backend(
     }
     let control = control
         .ok_or_else(|| Error::msg("ordinary ptrace requires its retained operation owner"))?;
-    let (exit_status, global_state) =
-        ptrace_completion::wait(builder.spawn().await?, control).await?;
+    let tracer = builder.backend_stats(stats_request).spawn().await?;
+    let stats_source = tracer.backend_stats();
+    let (exit_status, global_state) = ptrace_completion::wait(tracer, control).await?;
+    let dispatch_stats =
+        backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
     global_state
-        .clean_up(print_summary, print_summary_to_json_file)
+        .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
         .await; // Before it's dropped by this function.
-    backend_stats::report(backend, stats_request, &backend_stats::PtraceStatsSource);
     Ok(exit_status)
 }
 
@@ -2800,6 +3392,7 @@ async fn run_with_output_backend_inner(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<Output, Error> {
+    refuse_in_guest_liteinst_timeout(backend, timeout)?;
     let Some(limit) = timeout else {
         return dispatch_output_backend(
             command,
@@ -2859,6 +3452,8 @@ async fn dispatch_output_backend(
         }
     }
     if backend == Backend::Sabre {
+        #[cfg(not(feature = "sabre"))]
+        backend.ensure_available()?;
         command.stdin(output_backend_stdin()?);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -2875,19 +3470,65 @@ async fn dispatch_output_backend(
         #[cfg(feature = "liteinst")]
         {
             command.stdin(output_backend_stdin()?);
-            let preload = liteinst_runtime_library_path()?;
-            let (output, mut global_state) =
-                reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
-                    command, config, preload,
-                )
-                .await?;
+            let stats_request = backend_stats::request(print_summary_to_json_file);
+            let (output, mut global_state, dispatch_stats) = match LiteinstRuntime::from_env()? {
+                LiteinstRuntime::InGuest => {
+                    refuse_in_guest_liteinst_run(&mut command, &config)?;
+                    let preload = liteinst_tool_runtime_library_path()?;
+                    let (output, global_state, dispatch_stats) = if stats_request.is_enabled() {
+                        let (output, global_state, source) =
+                            reverie_liteinst::LiteinstBackend::run_with_output_and_preload_and_stats::<
+                                Detcore,
+                            >(command, config, preload)
+                            .await?;
+                        let dispatch_stats = backend_stats::report(backend, stats_request, &source);
+                        (output, global_state, dispatch_stats)
+                    } else {
+                        let (output, global_state) =
+                            reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<
+                                Detcore,
+                            >(command, config, preload)
+                            .await?;
+                        (output, global_state, None)
+                    };
+                    let output = Output {
+                        status: output.status.into(),
+                        stdout: output.stdout,
+                        stderr: output.stderr,
+                    };
+                    (output, global_state, dispatch_stats)
+                }
+                LiteinstRuntime::HostHybrid => {
+                    let preload = liteinst_runtime_library_path()?;
+                    if stats_request.is_enabled() {
+                        let (output, global_state, source) =
+                            reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload_and_stats::<
+                                Detcore,
+                            >(command, config, preload)
+                            .await?;
+                        let dispatch_stats = backend_stats::report(backend, stats_request, &source);
+                        (output, global_state, dispatch_stats)
+                    } else {
+                        let (output, global_state) =
+                            reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<
+                                Detcore,
+                            >(command, config, preload)
+                            .await?;
+                        (output, global_state, None)
+                    }
+                }
+            };
             let status = output.status;
             if liteinst_requires_forced_shutdown(status) {
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
             }
             global_state
-                .clean_up(print_summary, print_summary_to_json_file)
+                .clean_up_with_dispatch_stats(
+                    print_summary,
+                    print_summary_to_json_file,
+                    dispatch_stats,
+                )
                 .await;
             return Ok(Output {
                 status,
@@ -2903,7 +3544,7 @@ async fn dispatch_output_backend(
     }
     ensure_backend_dispatch(backend)?;
 
-    let stats_request = backend_stats::request();
+    let stats_request = backend_stats::request(print_summary_to_json_file);
     command.stdin(output_backend_stdin()?);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -2923,12 +3564,14 @@ async fn dispatch_output_backend(
     }
     let control = control
         .ok_or_else(|| Error::msg("ordinary ptrace requires its retained operation owner"))?;
-    let (output, global_state) =
-        ptrace_completion::wait_with_output(builder.spawn().await?, control).await?;
+    let tracer = builder.backend_stats(stats_request).spawn().await?;
+    let stats_source = tracer.backend_stats();
+    let (output, global_state) = ptrace_completion::wait_with_output(tracer, control).await?;
+    let dispatch_stats =
+        backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
     global_state
-        .clean_up(print_summary, print_summary_to_json_file)
+        .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
         .await;
-    backend_stats::report(backend, stats_request, &backend_stats::PtraceStatsSource);
     Ok(output)
 }
 
@@ -3022,7 +3665,7 @@ impl HermitData {
         ptrace_completion::run(None, move |control| async move {
             let data = store.create_recording_dir()?;
             let exit_status =
-                record_to_async(command, data.path(), Vec::new(), None, control).await?;
+                record_to_async(command, data.path(), Vec::new(), None, None, control).await?;
             store.commit_recording(data, exit_status)
         })
     }
@@ -3044,6 +3687,7 @@ impl HermitData {
                 data.path(),
                 mountinfo_root_rewrites,
                 Some(mount_ids),
+                None,
                 control,
             )
             .await?;
@@ -3137,16 +3781,7 @@ impl HermitData {
 
     /// Returns the metadata of a recording.
     pub fn recording_metadata(&self, id: Id) -> Result<Metadata, Error> {
-        let mut metadata_path = self.data_dir.join(id.to_string());
-        metadata_path.push(METADATA_NAME);
-
-        let metadata: Metadata = serde_json::from_reader(
-            fs::File::open(&metadata_path)
-                .with_context(|| format!("Failed to open {:?}", metadata_path))?,
-        )
-        .with_context(|| format!("Failed to parse {:?}", metadata_path))?;
-
-        Ok(metadata)
+        Metadata::load(&self.data_dir.join(id.to_string()))
     }
 
     /// Deletes a recording.
@@ -3223,16 +3858,18 @@ impl<'a> From<Option<&'a PathBuf>> for HermitData {
 pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
-        record_to_async(command, &dir, Vec::new(), None, control).await
+        record_to_async(command, &dir, Vec::new(), None, None, control).await
     })
 }
 
 /// Records with producer-owned mountinfo provenance. The directory-lifetime
-/// obligation is the same as [`record_to`].
+/// obligation is the same as [`record_to`]. `local_networking` is stored in
+/// the recording's `metadata.json`, and an autopilot replay uses that network.
 pub fn record_to_with_mountinfo(
     command: Command,
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+    local_networking: bool,
 ) -> Result<ExitStatus, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
@@ -3242,6 +3879,7 @@ pub fn record_to_with_mountinfo(
             &dir,
             mountinfo_root_rewrites,
             Some(mount_ids),
+            Some(local_networking),
             control,
         )
         .await
@@ -3253,14 +3891,21 @@ async fn record_to_async(
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     mountinfo_mount_ids: Option<Vec<u64>>,
+    local_networking: Option<bool>,
     control: std::rc::Rc<ptrace_completion::Control>,
 ) -> Result<ExitStatus, Error> {
     let report = SkidOvershootReport::begin(true);
     let result = async {
-        Record::spawn_with_mountinfo(command, dir, mountinfo_root_rewrites, mountinfo_mount_ids)
-            .await?
-            .wait(control)
-            .await
+        Record::spawn_with_mountinfo(
+            command,
+            dir,
+            mountinfo_root_rewrites,
+            mountinfo_mount_ids,
+            local_networking,
+        )
+        .await?
+        .wait(control)
+        .await
     }
     .await;
     report.finish(result)
@@ -3271,15 +3916,17 @@ async fn record_to_async(
 pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
-        record_with_output_async(command, &dir, Vec::new(), None, control).await
+        record_with_output_async(command, &dir, Vec::new(), None, None, control).await
     })
 }
 
 /// Records with captured output and exact mountinfo provenance.
+/// `local_networking` is as for [`record_to_with_mountinfo`].
 pub fn record_with_output_with_mountinfo(
     command: Command,
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+    local_networking: bool,
 ) -> Result<Output, Error> {
     let dir = dir.to_owned();
     ptrace_completion::run(None, move |control| async move {
@@ -3289,6 +3936,7 @@ pub fn record_with_output_with_mountinfo(
             &dir,
             mountinfo_root_rewrites,
             Some(mount_ids),
+            Some(local_networking),
             control,
         )
         .await
@@ -3300,6 +3948,7 @@ async fn record_with_output_async(
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     mountinfo_mount_ids: Option<Vec<u64>>,
+    local_networking: Option<bool>,
     control: std::rc::Rc<ptrace_completion::Control>,
 ) -> Result<Output, Error> {
     let report = SkidOvershootReport::begin(true);
@@ -3307,10 +3956,16 @@ async fn record_with_output_async(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     let result = async {
-        Record::spawn_with_mountinfo(command, dir, mountinfo_root_rewrites, mountinfo_mount_ids)
-            .await?
-            .wait_with_output(control)
-            .await
+        Record::spawn_with_mountinfo(
+            command,
+            dir,
+            mountinfo_root_rewrites,
+            mountinfo_mount_ids,
+            local_networking,
+        )
+        .await?
+        .wait_with_output(control)
+        .await
     }
     .await;
     report.finish(result)
@@ -3626,12 +4281,380 @@ mod tests {
 
     #[test]
     fn only_ptrace_hosted_backends_consume_skid_overshoot_reports() {
-        for backend in [Backend::Ptrace, Backend::Liteinst, Backend::E9patch] {
-            assert!(backend.uses_ptrace_pmu_timers(), "{backend:?}");
+        for runtime in [LiteinstRuntime::HostHybrid, LiteinstRuntime::InGuest] {
+            for backend in [Backend::Ptrace, Backend::E9patch] {
+                assert!(
+                    backend.uses_ptrace_pmu_timers_for_liteinst_runtime(runtime),
+                    "{backend:?} {runtime:?}"
+                );
+            }
+            for backend in [Backend::Dbt, Backend::Sabre, Backend::Kvm] {
+                assert!(
+                    !backend.uses_ptrace_pmu_timers_for_liteinst_runtime(runtime),
+                    "{backend:?} {runtime:?}"
+                );
+            }
         }
-        for backend in [Backend::Dbt, Backend::Sabre, Backend::Kvm] {
-            assert!(!backend.uses_ptrace_pmu_timers(), "{backend:?}");
+        // The hybrid hosts Detcore in the ptrace tracer, which arms the PMU
+        // timer; in-guest Detcore has no tracer to arm it from.
+        assert!(
+            Backend::Liteinst
+                .uses_ptrace_pmu_timers_for_liteinst_runtime(LiteinstRuntime::HostHybrid)
+        );
+        assert!(
+            !Backend::Liteinst
+                .uses_ptrace_pmu_timers_for_liteinst_runtime(LiteinstRuntime::InGuest)
+        );
+    }
+
+    #[cfg(feature = "liteinst")]
+    fn write_guest_program(directory: &Path, name: &str, bytes: &[u8], mode: u32) -> PathBuf {
+        let path = directory.join(name);
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        // The kernel may clear a set-group-ID bit that this user cannot set;
+        // a test that silently lost its bit would test nothing.
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            mode,
+            "{}",
+            path.display()
+        );
+        path
+    }
+
+    #[cfg(feature = "liteinst")]
+    fn shebang_to(interpreter: &Path) -> Vec<u8> {
+        let mut script = b"#!".to_vec();
+        script.extend_from_slice(interpreter.as_os_str().as_bytes());
+        script.extend_from_slice(b" -e\necho script\n");
+        script
+    }
+
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_liteinst_runs_a_dynamically_linked_x86_64_program() {
+        use interp::startup_fixtures::dynamic_executable;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = write_guest_program(
+            directory.path(),
+            "dynamic",
+            &dynamic_executable(false),
+            0o755,
+        );
+        assert_eq!(
+            in_guest_liteinst_program_gap(&mut Command::new(&program)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_liteinst_refuses_programs_that_start_before_the_runtime() {
+        use interp::startup_fixtures::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cases: [(&str, Vec<u8>, &str); 4] = [
+            (
+                "static",
+                elf(EM_X86_64, &[(PT_LOAD, b"code")]),
+                "is statically linked",
+            ),
+            (
+                "preinit",
+                dynamic_executable(true),
+                "has a DT_PREINIT_ARRAY",
+            ),
+            (
+                "aarch64",
+                elf(EM_AARCH64, &[(PT_INTERP, INTERP)]),
+                "is not a 64-bit x86-64 ELF image",
+            ),
+            (
+                "text",
+                b"plain text, no #! line\n".to_vec(),
+                "is neither an ELF executable nor a #! script",
+            ),
+        ];
+        for (name, bytes, reason) in cases {
+            let program = write_guest_program(directory.path(), name, &bytes, 0o755);
+            let gap = in_guest_liteinst_program_gap(&mut Command::new(&program))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name} was not refused"));
+            assert!(
+                gap.contains(reason) && gap.contains(&program.display().to_string()),
+                "{name}: {gap}"
+            );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_liteinst_refuses_secure_execution_images() {
+        use interp::startup_fixtures::dynamic_executable;
+
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = dynamic_executable(false);
+        let gap = |name: &str, mode: u32| {
+            let program = write_guest_program(directory.path(), name, &bytes, mode);
+            in_guest_liteinst_program_gap(&mut Command::new(&program)).unwrap()
+        };
+        for (name, mode) in [("setuid", 0o4755), ("setgid", 0o2755)] {
+            let refusal = gap(name, mode).unwrap_or_else(|| panic!("{name} was not refused"));
+            assert!(refusal.contains("secure-execution mode"), "{refusal}");
+        }
+        // Without group execute the kernel treats set-group-ID as mandatory
+        // locking, not a credential change, so the loader honours LD_PRELOAD.
+        assert_eq!(gap("setgid-no-group-exec", 0o2744), None);
+    }
+
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_liteinst_checks_scripts_through_their_interpreter() {
+        use interp::startup_fixtures::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        let dynamic = write_guest_program(
+            directory.path(),
+            "dynamic",
+            &dynamic_executable(false),
+            0o755,
+        );
+        let static_elf = write_guest_program(
+            directory.path(),
+            "static",
+            &elf(EM_X86_64, &[(PT_LOAD, b"code")]),
+            0o755,
+        );
+
+        let script = write_guest_program(
+            directory.path(),
+            "to-static",
+            &shebang_to(&static_elf),
+            0o755,
+        );
+        let gap = in_guest_liteinst_program_gap(&mut Command::new(&script))
+            .unwrap()
+            .expect("a script run by a static interpreter was not refused");
+        assert!(
+            gap.contains(&static_elf.display().to_string()) && gap.contains("statically linked"),
+            "{gap}"
+        );
+
+        // A relative interpreter resolves against the guest's working directory.
+        let relative = write_guest_program(directory.path(), "relative", b"#!static\n", 0o755);
+        let gap =
+            in_guest_liteinst_program_gap(Command::new(&relative).current_dir(directory.path()))
+                .unwrap()
+                .expect("a relative static interpreter was not refused");
+        assert!(gap.contains("statically linked"), "{gap}");
+
+        // The kernel keeps a carriage return in the interpreter path, so a
+        // script with CRLF line endings runs `interp\r`, not `interp`.
+        write_guest_program(
+            directory.path(),
+            "interp",
+            &dynamic_executable(false),
+            0o755,
+        );
+        let interp_cr = write_guest_program(
+            directory.path(),
+            "interp\r",
+            &elf(EM_X86_64, &[(PT_LOAD, b"code")]),
+            0o755,
+        );
+        let mut crlf = b"#!".to_vec();
+        crlf.extend_from_slice(directory.path().join("interp").as_os_str().as_bytes());
+        crlf.extend_from_slice(b"\r\necho script\r\n");
+        let crlf = write_guest_program(directory.path(), "crlf", &crlf, 0o755);
+        let gap = in_guest_liteinst_program_gap(&mut Command::new(&crlf))
+            .unwrap()
+            .expect("a CRLF script run by a static interp\\r was not refused");
+        assert!(
+            gap.contains(&interp_cr.display().to_string()) && gap.contains("statically linked"),
+            "{gap}"
+        );
+
+        // A #! line the kernel's script handler declines runs no interpreter:
+        // the kernel fails the execve or tries another handler, so it is
+        // refused.
+        let mut truncated = b"#!/".to_vec();
+        truncated.resize(256, b'a');
+        for (name, bytes) in [
+            ("empty", b"#! \t\nbody\n".to_vec()),
+            ("truncated", truncated),
+        ] {
+            let program = write_guest_program(directory.path(), name, &bytes, 0o755);
+            let gap = in_guest_liteinst_program_gap(&mut Command::new(&program))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name} was not refused"));
+            assert!(
+                gap.contains("the kernel's script handler declines it"),
+                "{name}: {gap}"
+            );
+        }
+
+        // Four nested scripts are followed to the ELF image; a fifth is refused.
+        let mut target = dynamic;
+        for level in 1..=5 {
+            target = write_guest_program(
+                directory.path(),
+                &format!("level-{level}"),
+                &shebang_to(&target),
+                0o755,
+            );
+            let gap = in_guest_liteinst_program_gap(&mut Command::new(&target)).unwrap();
+            if level <= MAX_INTERPRETER_DEPTH {
+                assert_eq!(gap, None, "level {level}");
+            } else {
+                let gap = gap.expect("five nested scripts were not refused");
+                assert!(gap.contains("nest more than 4 deep"), "{gap}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_liteinst_refuses_a_fifo_without_blocking() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o700) }, 0);
+        let script = write_guest_program(directory.path(), "to-fifo", &shebang_to(&fifo), 0o755);
+        // A socket cannot be opened at all (ENXIO), and opening a device can
+        // act on it; both must be refused, not reported as unreadable.
+        let socket = directory.path().join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let to_socket =
+            write_guest_program(directory.path(), "to-socket", &shebang_to(&socket), 0o755);
+        let device = PathBuf::from("/dev/null");
+        let to_device =
+            write_guest_program(directory.path(), "to-device", &shebang_to(&device), 0o755);
+        // `./fifo` reaches the check through find_program's working-directory
+        // branch, which does not require a regular file; the scripts reach the
+        // FIFO, the socket and the device as their interpreters. Nothing opens
+        // the FIFO for writing, so a blocking open or read would never return:
+        // each check runs on its own thread and must answer within 10 s.
+        let cases = [
+            (
+                "program",
+                PathBuf::from("./fifo"),
+                Some(directory.path().to_owned()),
+                fs::canonicalize(&fifo).unwrap(),
+            ),
+            ("interpreter", script, None, fifo.clone()),
+            ("socket interpreter", to_socket, None, socket.clone()),
+            ("device interpreter", to_device, None, device),
+        ];
+        for (name, program, current_dir, shown) in cases {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut command = Command::new(&program);
+                if let Some(directory) = current_dir {
+                    command.current_dir(directory);
+                }
+                let gap = in_guest_liteinst_program_gap(&mut command)
+                    .map_err(|error| format!("{error:#}"));
+                let _ = sender.send(gap);
+            });
+            let gap = receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{name}: the check blocked on the FIFO"))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name}: the FIFO was not refused"));
+            assert!(
+                gap.contains(&format!("{} is not a regular file", shown.display())),
+                "{name}: {gap}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_liteinst_pins_the_program_the_launch_resolves() {
+        use interp::startup_fixtures::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        // A name that no host PATH directory holds.
+        let name = "hermit-3520-static";
+        let static_elf = write_guest_program(
+            directory.path(),
+            name,
+            &elf(EM_X86_64, &[(PT_LOAD, b"code")]),
+            0o755,
+        );
+        let search = format!("/nonexistent-directory:{}", directory.path().display());
+        // The launch resolves the program with `find_program` on the command it
+        // is given. Builds the command twice: once for the launch's own
+        // resolution, once for the check, which must agree with it.
+        let check = |build: &dyn Fn() -> Command| {
+            let launch = build().find_program();
+            let mut command = build();
+            let arg0 = command.get_arg0().to_owned();
+            let gap = in_guest_liteinst_program_gap(&mut command);
+            match launch {
+                Ok(program) => {
+                    let gap = gap.unwrap().expect("the static image was not refused");
+                    assert!(gap.contains("is statically linked"), "{gap}");
+                    assert_eq!(Path::new(command.get_program()), program);
+                    assert_eq!(command.get_arg0(), arg0);
+                    // Pinned: the launch's own resolution returns it unchanged.
+                    assert_eq!(command.find_program().unwrap(), program);
+                    assert_eq!(
+                        fs::canonicalize(&program).unwrap(),
+                        fs::canonicalize(&static_elf).unwrap()
+                    );
+                    true
+                }
+                Err(_) => {
+                    let error = gap.expect_err("the check found what the launch cannot");
+                    assert!(
+                        format!("{error:#}").contains("cannot find guest program"),
+                        "{error:#}"
+                    );
+                    false
+                }
+            }
+        };
+
+        // A path with a slash resolves against the guest's working directory.
+        assert!(check(&|| {
+            let mut command = Command::new(format!("./{name}"));
+            command.current_dir(directory.path());
+            command
+        }));
+        // A bare name is searched for in the command's PATH once the base
+        // environment is cleared, skipping entries without such a file.
+        assert!(check(&|| {
+            let mut command = Command::new(name);
+            command.env_clear().env("PATH", &search);
+            command
+        }));
+        // Without a cleared environment the launch searches Hermit's own PATH,
+        // not the command's, so the static image is not found by either.
+        assert!(!check(&|| {
+            let mut command = Command::new(name);
+            command.env("PATH", &search);
+            command
+        }));
+        // A cleared environment without PATH (`--base-env=empty`) searches
+        // Hermit's working directory, not the guest's and not /bin:/usr/bin.
+        assert!(!check(&|| {
+            let mut command = Command::new(name);
+            command.env_clear().current_dir(directory.path());
+            command
+        }));
+        // Not executable, or missing: the launch cannot run it, and neither
+        // resolution finds it.
+        fs::set_permissions(&static_elf, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!check(&|| {
+            let mut command = Command::new(name);
+            command.env_clear().env("PATH", &search);
+            command
+        }));
+        assert!(!check(&|| Command::new(&static_elf)));
+        assert!(!check(&|| Command::new("hermit-no-such-program-3520")));
     }
 
     #[test]
@@ -3857,6 +4880,56 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "dbt"))]
+    #[test]
+    fn dbt_registry_diagnostic_redirects_to_a_source_build() {
+        let reason = super::dbt_disabled_build_reason("hermit-run");
+        assert!(reason.contains("not included in this registry release"));
+        assert!(reason.contains("source build from https://github.com/rrnewton/hermit"));
+        assert!(reason.contains("`third-party-backends` feature does not include DBT"));
+        assert!(reason.contains("has not been checked"));
+
+        let source_reason = super::dbt_disabled_build_reason("hermit");
+        assert!(source_reason.contains("rebuild with `--features dbt`"));
+        assert!(!source_reason.contains("not included in this registry release"));
+    }
+
+    #[cfg(not(feature = "sabre"))]
+    #[tokio::test]
+    async fn disabled_sabre_dispatch_refuses_before_resolving_the_program() {
+        let program = "/hermit-missing-disabled-sabre-program";
+        let error = super::dispatch_backend(
+            super::Command::new(program),
+            super::DetConfig::default(),
+            false,
+            &None,
+            Backend::Sabre,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the `sabre` feature is not enabled")
+        );
+        let error = super::dispatch_output_backend(
+            super::Command::new(program),
+            super::DetConfig::default(),
+            false,
+            &None,
+            Backend::Sabre,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the `sabre` feature is not enabled")
+        );
+    }
+
     #[test]
     #[cfg(feature = "dbt")]
     fn a_cold_dbt_runtime_diagnostic_is_not_feature_absence() {
@@ -3871,17 +4944,25 @@ mod tests {
         assert!(!reason.contains("not enabled in this build"));
         assert!(!reason.contains("has not been checked"));
     }
+    #[cfg(feature = "sabre")]
     use std::ffi::OsStr;
     use std::fs;
+    #[cfg(any(feature = "sabre", feature = "dbt"))]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[cfg(feature = "sabre")]
     use std::sync::Arc;
+    #[cfg(feature = "sabre")]
     use std::time::Duration;
 
     use super::Backend;
+    #[cfg(any(feature = "sabre", feature = "liteinst"))]
     use super::ExitStatus;
     use super::HermitData;
     use super::Id;
+    use super::LITEINST_IN_GUEST_ENV;
+    use super::LiteinstRuntime;
+    #[cfg(feature = "sabre")]
     use super::SABRE_RPC_SOCKET_ENV;
     use super::collect_recording_ids;
     #[cfg(feature = "dbt")]
@@ -3900,16 +4981,26 @@ mod tests {
     use super::liteinst_unavailable_reason;
     use super::output_backend_stdin_file;
     use super::prepare_backend_config;
+    use super::prepare_backend_config_for_liteinst_runtime;
     use super::reserve_output_stdin_snapshot;
     use super::resolve_kvm_shebang;
+    #[cfg(feature = "sabre")]
     use super::resolve_sabre_binary_from;
+    #[cfg(feature = "sabre")]
     use super::sabre_backend_evidence_line;
+    #[cfg(feature = "sabre")]
     use super::sabre_program_needs_neutral_name;
+    #[cfg(feature = "sabre")]
     use super::sabre_reach_state;
+    #[cfg(feature = "sabre")]
     use super::sabre_uninstrumented_guest_message;
+    #[cfg(feature = "sabre")]
     use super::shutdown_sabre_rpc;
+    #[cfg(feature = "sabre")]
     use super::stage_sabre_program_in;
+    #[cfg(feature = "sabre")]
     use super::stop_sabre_rpc_server;
+    #[cfg(feature = "sabre")]
     use super::wait_for_sabre_rpc_disconnects;
 
     #[test]
@@ -4068,6 +5159,7 @@ mod tests {
     /// reaches this path in practice because a static client has no dynamic
     /// loader through which SaBRe could regain control.
     #[test]
+    #[cfg(feature = "sabre")]
     fn uninstrumented_sabre_guest_is_reported_as_no_determinization() {
         let message = sabre_uninstrumented_guest_message(&ExitStatus::Exited(0));
         assert!(
@@ -4098,6 +5190,7 @@ mod tests {
     /// engaged zero-fallback run as `sabre-exercised`. Assert the three states
     /// together so no pair can collapse back onto one value.
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_reach_states_are_pairwise_distinct() {
         let no_detcore = sabre_reach_state(false, 0);
         let degraded = sabre_reach_state(true, 1);
@@ -4117,6 +5210,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_backend_fact_is_versioned_and_names_preplugin_coverage() {
         let exercised = super::sabre_ptrace::PathEvidence {
             schema: 1,
@@ -4160,6 +5254,56 @@ mod tests {
     }
 
     #[test]
+    fn liteinst_runtime_selector_accepts_only_unset_or_one() {
+        assert_eq!(
+            LiteinstRuntime::parse(None).unwrap(),
+            LiteinstRuntime::HostHybrid
+        );
+        assert_eq!(
+            LiteinstRuntime::parse(Some(std::ffi::OsStr::new("1"))).unwrap(),
+            LiteinstRuntime::InGuest
+        );
+        for value in ["", "0", "true", "yes", " 1", "1 "] {
+            let error = LiteinstRuntime::parse(Some(std::ffi::OsStr::new(value))).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains(LITEINST_IN_GUEST_ENV) && message.contains(&format!("{value:?}")),
+                "{value:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_guest_liteinst_cancels_killed_thread_rpcs() {
+        let config = super::DetConfig::default();
+        assert!(
+            prepare_backend_config_for_liteinst_runtime(
+                config.clone(),
+                Backend::Liteinst,
+                LiteinstRuntime::InGuest,
+            )
+            .cancel_killed_thread_rpcs
+        );
+        assert!(
+            !prepare_backend_config_for_liteinst_runtime(
+                config.clone(),
+                Backend::Liteinst,
+                LiteinstRuntime::HostHybrid,
+            )
+            .cancel_killed_thread_rpcs
+        );
+        // The LiteInst runtime selection changes no other backend.
+        assert!(
+            !prepare_backend_config_for_liteinst_runtime(
+                config,
+                Backend::Ptrace,
+                LiteinstRuntime::InGuest,
+            )
+            .cancel_killed_thread_rpcs
+        );
+    }
+
+    #[test]
     fn sabre_backend_configures_process_local_capabilities() {
         let config = super::DetConfig::default();
         let sabre = prepare_backend_config(config.clone(), Backend::Sabre);
@@ -4190,6 +5334,46 @@ mod tests {
         assert!(!ptrace.backend_requires_thread_directed_process_signals);
         assert!(!ptrace.backend_virtualizes_capability_prctls);
         assert!(!ptrace.backend_defers_vfork_child_registration);
+    }
+
+    #[test]
+    fn kvm_reports_stored_metadata_timestamps_only_for_sequential_tool_threads() {
+        let sequential = prepare_backend_config(
+            super::DetConfig {
+                sequentialize_threads: true,
+                virtualize_metadata: true,
+                ..super::DetConfig::default()
+            },
+            Backend::Kvm,
+        );
+        assert!(sequential.backend_dispatches_thread_tools);
+        assert!(super::kvm_reports_stored_metadata_timestamps(&sequential));
+
+        // Another guest thread could read the stored values before Detcore
+        // rewrites them.
+        let concurrent = super::DetConfig {
+            sequentialize_threads: false,
+            ..sequential.clone()
+        };
+        assert!(!super::kvm_reports_stored_metadata_timestamps(&concurrent));
+
+        // Nothing rewrites the stored values.
+        let host_metadata = super::DetConfig {
+            virtualize_metadata: false,
+            ..sequential.clone()
+        };
+        assert!(!super::kvm_reports_stored_metadata_timestamps(
+            &host_metadata
+        ));
+
+        // The backend owns the threads, so no Detcore rewrite runs on them.
+        let host_threads = super::DetConfig {
+            backend_dispatches_thread_tools: false,
+            ..sequential
+        };
+        assert!(!super::kvm_reports_stored_metadata_timestamps(
+            &host_threads
+        ));
     }
 
     #[test]
@@ -4326,6 +5510,7 @@ mod tests {
         assert!(reason.contains("read-write"));
     }
 
+    #[cfg(any(feature = "sabre", feature = "dbt"))]
     fn write_test_executable(path: &std::path::Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, b"test loader").unwrap();
@@ -4335,11 +5520,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_rpc_socket_uses_private_exec_environment() {
         assert!(SABRE_RPC_SOCKET_ENV.starts_with("REVERIE_SABRE_"));
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_stages_program_names_that_collide_with_loader_prefix() {
         assert!(sabre_program_needs_neutral_name(
             PathBuf::from("/usr/bin/ld").as_path()
@@ -4353,6 +5540,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_neutral_name_staging_preserves_program_bytes_and_cleans_up() {
         let temp = tempfile::tempdir().unwrap();
         let program = temp.path().join("ld.test");
@@ -4376,6 +5564,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[cfg(feature = "sabre")]
     async fn sabre_rpc_disconnect_wait_observes_delayed_release() {
         let global = Arc::new(());
         let connection = global.clone();
@@ -4391,6 +5580,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[cfg(feature = "sabre")]
     async fn sabre_rpc_disconnect_wait_reports_stuck_connection() {
         let global = Arc::new(());
         let _connection = global.clone();
@@ -4402,6 +5592,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sabre")]
     async fn sabre_rpc_server_intentional_abort_is_clean() {
         let server_task = tokio::spawn(std::future::pending::<Result<(), &'static str>>());
 
@@ -4409,6 +5600,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sabre")]
     async fn sabre_rpc_server_failure_is_reported() {
         let server_task = tokio::spawn(async { Err::<(), _>("accept failed") });
         while !server_task.is_finished() {
@@ -4420,6 +5612,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[cfg(feature = "sabre")]
     async fn sabre_rpc_shutdown_drains_connections_after_server_failure() {
         let global = Arc::new(());
         let connection = global.clone();
@@ -4440,6 +5633,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_binary_resolver_finds_cargo_target_build() {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("target/release/hermit");
@@ -4453,6 +5647,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_binary_resolver_uses_packaged_loader() {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("target/release/hermit");
@@ -4466,6 +5661,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_binary_resolver_prefers_and_validates_override() {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("target/release/hermit");

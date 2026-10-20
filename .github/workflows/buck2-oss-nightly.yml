@@ -76,10 +76,12 @@ jobs:
           test "$(realpath "$resolved_rust_script")" = "$(realpath "$CARGO_HOME/bin/rust-script")"
           test "$("$resolved_rust_script" --version)" = "rust-script 0.36.0"
 
-      # Two driver tests (matrix_private_tmp_readback_* and
-      # matrix_proxy_refuses_to_launch_safehermit_inside_a_user_namespace) run
-      # `unshare --user --map-root-user`, which ubuntu-24.04's AppArmor policy
-      # refuses with EPERM on /proc/self/uid_map.
+      # Added for two driver tests (matrix_private_tmp_readback_* and
+      # matrix_proxy_refuses_to_launch_safehermit_inside_a_user_namespace) that
+      # ran `unshare --user --map-root-user`, which ubuntu-24.04's AppArmor
+      # policy refuses with EPERM on /proc/self/uid_map. Slice S13 of
+      # https://github.com/rrnewton/hermit/issues/3301 removed both tests with
+      # the DBT matrix leg. Deleting this step is a separate decision.
       - name: Enable unprivileged user namespaces
         timeout-minutes: 2
         shell: bash

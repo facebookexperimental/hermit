@@ -115,6 +115,14 @@ use crate::timeouts::NON_CI_CELL_COUNT;
 use crate::timeouts::PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::ResolvedTestTimeouts;
 #[cfg(test)]
+use crate::timeouts::SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS;
+#[cfg(test)]
+use crate::timeouts::SABRE_2026_10_03_SELECTED_CI_CELL_COUNT;
+#[cfg(test)]
+use crate::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT;
+#[cfg(test)]
+use crate::timeouts::SELECT_REPLAY_2026_10_03_TESTS;
+#[cfg(test)]
 use crate::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::TimeoutMultipliers;
 use crate::timeouts::resolve_test_timeouts;
@@ -137,7 +145,7 @@ pub const E2E_RUN_INDEX_ENV: &str = "E2E_RUN_INDEX";
 fn source_identity(root: &Path, source_sha: Option<&str>) -> Result<(String, bool), String> {
     match source_sha {
         Some(sha) => {
-            validate_source_sha(sha)?;
+            validate_source_snapshot(root, sha)?;
             Ok((sha.to_string(), false))
         }
         None => Ok((
@@ -161,6 +169,63 @@ pub fn validate_source_sha(sha: &str) -> Result<(), String> {
             "--source-sha must be a full 40-digit lowercase commit sha, got {sha:?}; \
              pass the output of `git rev-parse HEAD` for the archived commit"
         ))
+    }
+}
+
+/// A `--source-sha` names the commit of a Git-less snapshot at `root`, which
+/// is then recorded as clean. A directory holding files Git tracks is refused:
+/// Git reports their commit and whether they are dirty, and the name would
+/// override both. A root with no `.git` at or above it (an RE worker's input
+/// tree, whether or not git is installed there) is accepted, and so is a
+/// snapshot extracted inside a checkout but not tracked by it
+/// (ci/buck-e2e/staged/src). Inside a checkout, a git that cannot answer
+/// (a corrupt index, an unusable `.git`, no git to run) is refused: the files
+/// might be tracked. The search for `.git` starts from the resolved root, so
+/// a symlink to tracked files is looked up where the files are.
+pub fn validate_source_snapshot(root: &Path, sha: &str) -> Result<(), String> {
+    validate_source_sha(sha)?;
+    let resolved = std::fs::canonicalize(root).map_err(|error| {
+        format!(
+            "cannot resolve --repo-root {}: {error}; pass an existing directory",
+            root.display()
+        )
+    })?;
+    if !resolved
+        .ancestors()
+        .any(|dir| dir.join(".git").symlink_metadata().is_ok())
+    {
+        return Ok(());
+    }
+    let tracked = crate::git_environment::git_command()
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--error-unmatch", "--", "."])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+    match tracked {
+        // `--error-unmatch` exits 1 when Git tracks nothing under the path.
+        Ok(output) if output.status.code() == Some(1) => Ok(()),
+        Ok(output) if output.status.success() => Err(format!(
+            "--source-sha names the commit of a Git-less `git archive` snapshot, but Git \
+             tracks files under {}, and Git reports their commit and whether they are dirty; \
+             drop --source-sha, or pass --repo-root naming the archive",
+            root.display()
+        )),
+        Ok(output) => Err(format!(
+            "--source-sha names the commit of a Git-less snapshot, but {} is inside a Git \
+             checkout and `git ls-files` there failed ({}: {}), so whether Git tracks its files \
+             is unknown; repair the checkout, or pass --repo-root naming an archive outside it",
+            root.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) => Err(format!(
+            "--source-sha names the commit of a Git-less snapshot, but {} is inside a Git \
+             checkout and git cannot run ({error}), so whether Git tracks its files is unknown; \
+             install git, or pass --repo-root naming an archive outside the checkout",
+            root.display()
+        )),
     }
 }
 
@@ -392,12 +457,13 @@ pub struct ModeRecipe {
     /// prints, so two runs that agree on output lacking it do not pass.
     #[serde(default)]
     pub expected_stdout_contains: BTreeMap<String, String>,
-    /// Hermit `run` flags a verify cell adds after the runner's own, for a test
-    /// whose recorded policy runs a specific configuration. Only the flags in
-    /// ALLOWED_HERMIT_ARGS are accepted, each relaxes determinism, so
-    /// `hermit_args_reason` is required and both are recorded as relaxations.
+    /// Hermit `run` flags a verify cell adds after the runner's own, per
+    /// enabled backend, for a test whose recorded policy runs a specific
+    /// configuration on that backend. Only the flags in ALLOWED_HERMIT_ARGS
+    /// are accepted, each relaxes determinism, so `hermit_args_reason` is
+    /// required and both are recorded as relaxations.
     #[serde(default)]
-    pub hermit_args: Vec<String>,
+    pub hermit_args: BTreeMap<String, Vec<String>>,
     pub hermit_args_reason: Option<String>,
     /// Guest environment variables a verify cell adds, as `--env NAME=VALUE`,
     /// after the runner's fixed guest environment. A name the runner sets is
@@ -426,6 +492,61 @@ pub struct ModeRecipe {
     /// for a corpus whose recorded verdict was a single run (the strict
     /// compatibility corpus), so a first-attempt failure stays a failure.
     pub no_retry_reason: Option<String>,
+    /// Run-type labels of this mode's cell on an enabled backend, added to the
+    /// test's own `labels` for that cell only. See [`cell_labels`].
+    #[serde(default)]
+    pub labels: BTreeMap<String, Vec<String>>,
+}
+
+/// The run type of a cell that names none: the full validation, whose
+/// required cells ci/expected-e2e-plan.json lists and whose bucket nodes (and
+/// the portable, hosted and quick profiles' subsets of them) select no label.
+pub const DEFAULT_RUN_TYPE: &str = "full";
+
+/// The run types a cell belongs to: its test's `labels`, plus its mode's
+/// `labels` for its backend, or [`DEFAULT_RUN_TYPE`] alone when both are
+/// empty. A selection keeps a cell when the cell's run types meet the
+/// selection's `--label`s, and a selection without `--label` selects the
+/// default run type, so a cell labelled only with a focused run type (such as
+/// `sabre-compat-only`) is required there and nowhere else.
+pub fn cell_labels<'a>(
+    test: &'a TestRecipe,
+    recipe: &'a ModeRecipe,
+    backend: Option<&str>,
+) -> BTreeSet<&'a str> {
+    let mut labels: BTreeSet<&str> = test.labels.iter().map(String::as_str).collect();
+    if let Some(mode_labels) = backend.and_then(|backend| recipe.labels.get(backend)) {
+        labels.extend(mode_labels.iter().map(String::as_str));
+    }
+    if labels.is_empty() {
+        labels.insert(DEFAULT_RUN_TYPE);
+    }
+    labels
+}
+
+/// Why full validation does not select a cell whose run types exclude
+/// [`DEFAULT_RUN_TYPE`], or `None` when the cell is full's.
+pub fn focused_run_type_reason(
+    test: &TestRecipe,
+    recipe: &ModeRecipe,
+    backend: Option<&str>,
+) -> Option<String> {
+    let labels = cell_labels(test, recipe, backend);
+    (!labels.contains(DEFAULT_RUN_TYPE)).then(|| {
+        format!(
+            "Only the {} run type selects this cell, by its manifest label; full validation does not.",
+            labels.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    })
+}
+
+/// The Hermit `run` flags a verify cell on `backend` adds after the runner's own.
+pub fn cell_hermit_args<'a>(recipe: &'a ModeRecipe, backend: &str) -> &'a [String] {
+    recipe
+        .hermit_args
+        .get(backend)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
 }
 
 /// The Hermit the harness runs: `HERMIT_BIN`, else target/debug/hermit. A
@@ -568,38 +689,80 @@ impl ExpectedGuestExit {
     }
 }
 
-/// The declared guest disposition for a selected cell; only verify cells carry one.
+/// The recipes a cell reads its guest inputs and expectations from, most
+/// specific first.
+///
+/// `record start --verify` records and replays the same program that
+/// `run --verify` checks, so a replay cell inherits each guest input (argv,
+/// workdir, environment) from its verify recipe unless the replay recipe
+/// declares that field itself. Every other mode reads only its own recipe. The
+/// runner and the cell metadata both read through this; the expectations a
+/// replay cell inherits are in [`expectation_recipe`].
+fn inherited_recipes(cell: &SelectedCell) -> impl Iterator<Item = &ModeRecipe> {
+    let verify = (cell.id.mode == "replay")
+        .then(|| cell.test.modes.get("verify"))
+        .flatten();
+    cell.test.modes.get(&cell.id.mode).into_iter().chain(verify)
+}
+
+/// The first value `pick` finds in [`inherited_recipes`].
+fn inherited<'a, T>(
+    cell: &'a SelectedCell,
+    pick: impl FnMut(&'a ModeRecipe) -> Option<T>,
+) -> Option<T> {
+    inherited_recipes(cell).find_map(pick)
+}
+
+/// The recipe whose declared guest exit and stdout a cell's verdict checks.
+///
+/// Validation admits those declarations only on a verify recipe, so a replay
+/// cell reads its verify recipe's, and no other mode has any; the same field
+/// on another mode's recipe is not authority for a pass there.
+fn expectation_recipe(cell: &SelectedCell) -> Option<&ModeRecipe> {
+    matches!(cell.id.mode.as_str(), "verify" | "replay")
+        .then(|| cell.test.modes.get("verify"))
+        .flatten()
+}
+
+/// The guest arguments a selected cell runs on `backend`.
+pub(crate) fn cell_guest_args(cell: &SelectedCell, backend: &str) -> Vec<String> {
+    inherited(cell, |recipe| recipe.guest_args.get(backend).cloned()).unwrap_or_default()
+}
+
+/// The guest working directory a selected cell names, if any.
+pub(crate) fn cell_workdir(cell: &SelectedCell) -> Option<String> {
+    inherited(cell, |recipe| recipe.workdir.clone())
+}
+
+/// The guest environment variables a selected cell adds after the runner's own.
+fn cell_mode_env(cell: &SelectedCell) -> BTreeMap<String, String> {
+    inherited(cell, |recipe| {
+        (!recipe.env.is_empty()).then(|| recipe.env.clone())
+    })
+    .unwrap_or_default()
+}
+
+/// The declared guest disposition for a selected verify or replay cell.
 fn cell_expected_guest_exit(cell: &SelectedCell) -> Option<ExpectedGuestExit> {
-    (cell.id.mode == "verify")
-        .then(|| cell.test.modes.get(&cell.id.mode))
-        .flatten()
-        .and_then(|recipe| recipe.expected_guest_exit.clone())
+    expectation_recipe(cell)?.expected_guest_exit.clone()
 }
 
-/// The exact stdout a selected verify cell requires, if its backend declares one.
+/// The exact stdout a selected verify or replay cell requires, if its backend declares one.
 fn cell_expected_stdout(cell: &SelectedCell) -> Option<String> {
-    (cell.id.mode == "verify")
-        .then(|| cell.test.modes.get(&cell.id.mode))
-        .flatten()
-        .and_then(|recipe| {
-            cell.id
-                .backend
-                .as_ref()
-                .and_then(|backend| recipe.expected_stdout.get(backend).cloned())
-        })
+    let backend = cell.id.backend.as_ref()?;
+    expectation_recipe(cell)?
+        .expected_stdout
+        .get(backend)
+        .cloned()
 }
 
-/// The stdout text a selected verify cell must contain, if its backend declares one.
+/// The stdout text a selected verify or replay cell must contain, if its backend declares one.
 fn cell_expected_stdout_contains(cell: &SelectedCell) -> Option<String> {
-    (cell.id.mode == "verify")
-        .then(|| cell.test.modes.get(&cell.id.mode))
-        .flatten()
-        .and_then(|recipe| {
-            cell.id
-                .backend
-                .as_ref()
-                .and_then(|backend| recipe.expected_stdout_contains.get(backend).cloned())
-        })
+    let backend = cell.id.backend.as_ref()?;
+    expectation_recipe(cell)?
+        .expected_stdout_contains
+        .get(backend)
+        .cloned()
 }
 
 /// A per-backend stdout assertion is verify-only and keyed by enabled backends.
@@ -1158,8 +1321,12 @@ pub struct Selection {
     pub exclude_categories: Vec<String>,
     pub include_occasional: bool,
     pub include_manual: bool,
-    /// When non-empty, only tests carrying at least one of these labels.
+    /// When non-empty, only cells whose run types ([`cell_labels`]) include
+    /// at least one of these labels; when empty, the default run type's.
     pub labels: Vec<String>,
+    /// Every run type's cells, ignoring `labels`: a census of the cells in
+    /// the manifest (the metadata export), not a run of one run type.
+    pub all_run_types: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1326,16 +1493,29 @@ impl ManifestSet {
     }
 
     pub fn select(&self, selection: &Selection) -> Result<Vec<SelectedCell>, String> {
-        // A label no test carries is a typo, not an empty run type: with
+        // A label no cell carries is a typo, not an empty run type: with
         // --allow-empty it would otherwise select nothing and pass.
         if let Some(label) = selection.labels.iter().find(|label| {
-            !self
-                .tests
-                .values()
-                .any(|(_, _, _, test)| test.labels.contains(label))
+            !self.tests.values().any(|(_, _, _, test)| {
+                test.modes.values().any(|recipe| {
+                    std::iter::once(None)
+                        .chain(recipe.backends_enabled.iter().map(|b| Some(b.as_str())))
+                        .any(|backend| cell_labels(test, recipe, backend).contains(label.as_str()))
+                })
+            })
         }) {
             return Err(format!("--label {label} names no test in any manifest"));
         }
+        // Without --label, a selection is the default run type's.
+        let wanted_labels: BTreeSet<&str> = if selection.labels.is_empty() {
+            BTreeSet::from([DEFAULT_RUN_TYPE])
+        } else {
+            selection.labels.iter().map(String::as_str).collect()
+        };
+        let labelled = |test: &TestRecipe, recipe: &ModeRecipe, backend: Option<&str>| {
+            selection.all_run_types
+                || !cell_labels(test, recipe, backend).is_disjoint(&wanted_labels)
+        };
         // An excluded category no manifest has is a typo that would exclude nothing.
         if let Some(category) = selection.exclude_categories.iter().find(|category| {
             !self
@@ -1363,11 +1543,6 @@ impl ManifestSet {
                 || selection.test.as_deref().is_some_and(|value| value != id)
                 || selection.exclude_categories.contains(category)
                 || (!selection.include_occasional && test.occasional)
-                || (!selection.labels.is_empty()
-                    && !test
-                        .labels
-                        .iter()
-                        .any(|label| selection.labels.contains(label)))
             {
                 continue;
             }
@@ -1395,6 +1570,7 @@ impl ManifestSet {
                         .as_deref()
                         .is_some_and(|backend| backend != "native")
                         || !accepted
+                        || !labelled(test, recipe, None)
                     {
                         continue;
                     }
@@ -1431,6 +1607,7 @@ impl ManifestSet {
                         .as_deref()
                         .is_some_and(|value| value != backend)
                         || selection.exclude_backends.contains(&backend)
+                        || !labelled(test, recipe, Some(&backend))
                     {
                         continue;
                     }
@@ -1847,7 +2024,13 @@ fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
     }
     let reason =
         |reason: &Option<String>| reason.as_deref().unwrap_or("reason missing").to_string();
-    for arg in &recipe.hermit_args {
+    for arg in cell
+        .id
+        .backend
+        .as_deref()
+        .map(|backend| cell_hermit_args(recipe, backend))
+        .unwrap_or_default()
+    {
         relaxations.push(format!("{arg}: {}", reason(&recipe.hermit_args_reason)));
     }
     if recipe.comparator == Some(Comparator::Stripped) {
@@ -1995,12 +2178,6 @@ pub struct CellRunSpec {
     attempt: String,
     #[serde(skip)]
     fixed_workdir_source: PathBuf,
-    /// Normalize the retained ptrace log into `normalized-ptrace-golden.log`.
-    /// Only `E2E_KEEP_VERIFY_LOGS=1` asks for this; logs retained for the
-    /// parity post-pass alone are never normalized, so parity retention adds
-    /// no process to the cell and cannot change its outcome.
-    #[serde(skip)]
-    normalize_ptrace_golden: bool,
 }
 
 /// The existing pressure-test result vocabulary for one executed cell.
@@ -2137,8 +2314,10 @@ pub struct AttemptResult {
     pub timed_out: bool,
     #[serde(default)]
     pub duration_ms: u128,
-    /// CPU consumed by the launched process group and any required retained-log
-    /// normalization process.
+    /// CPU consumed by the launched process group. Rows written before the
+    /// ptrace golden-log normalization was removed
+    /// (<https://github.com/rrnewton/hermit/issues/3301>) also include that
+    /// normalization process for `E2E_KEEP_VERIFY_LOGS=1` ptrace verify cells.
     ///
     /// Completed commands use `wait4`; a CPU timeout retains the last live
     /// process-group observation when that is larger. It is not inferred from
@@ -2575,13 +2754,15 @@ pub struct RunContext {
     /// See [`CellResult::binary_build_sha`].
     pub binary_build_sha: Option<String>,
     pub prebuilt: bool,
-    /// `E2E_KEEP_VERIFY_LOGS=1`: retain every verify cell's logs and normalize
-    /// each ptrace golden, as before.
+    /// `E2E_KEEP_VERIFY_LOGS=1`: retain every verify cell's logs through
+    /// `hermit run --keep-logs`, which keeps one golden log (run 1's) after a
+    /// match and both logs after a divergence. Retention adds no process to
+    /// the cell and cannot change its outcome.
     pub keep_logs: bool,
     /// `(test, backend)` verify cells whose logs are retained for the parity
     /// post-pass even without `keep_logs`. This is the selection closure of
-    /// [`crate::parity::retention_closure`]: retention only, so it neither
-    /// normalizes a ptrace golden nor adds any other process to the cell.
+    /// [`crate::parity::retention_closure`]: retention only, the same
+    /// `--keep-logs` retention as `keep_logs`, adding no process to the cell.
     pub parity_retained: BTreeSet<(String, String)>,
     pub run_verify_strict: bool,
     pub record_verify_strict: bool,
@@ -2630,6 +2811,23 @@ impl RunContext {
         root: PathBuf,
         prebuilt: bool,
         source_sha: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::from_env_probing(root, prebuilt, source_sha, true)
+    }
+
+    /// The context of a run that executes no cell: `E2E_IMPORT_RESULTS`
+    /// re-publishes rows another harness process wrote. Nothing launches the
+    /// Hermit binary, so it is neither required nor probed; the binary-derived
+    /// fields stay empty and every other field is read as `from_env` reads it.
+    pub fn for_import(root: PathBuf, source_sha: Option<&str>) -> Result<Self, String> {
+        Self::from_env_probing(root, true, source_sha, false)
+    }
+
+    fn from_env_probing(
+        root: PathBuf,
+        prebuilt: bool,
+        source_sha: Option<&str>,
+        probe_hermit: bool,
     ) -> Result<Self, String> {
         let (source_sha, source_dirty) = source_identity(&root, source_sha)?;
         let result_root = std::env::var_os("E2E_RESULT_ROOT")
@@ -2682,14 +2880,16 @@ impl RunContext {
         // Ask the binary where it came from, the same way this function already
         // asks it what flags it supports. `source_sha` above describes the
         // checkout; only the binary can describe the binary.
-        let binary_build_sha = probe_binary_build_sha(&hermit_bin);
+        let binary_build_sha = probe_hermit
+            .then(|| probe_binary_build_sha(&hermit_bin))
+            .flatten();
         // Published main still exposes the legacy `--verify-strict` spelling;
         // the canonical-only cutover removes it and makes bare `--verify`
         // canonical.  Detect the running binary rather than keying behavior to
         // a source SHA.  Whichever spelling executes is retained verbatim in
         // the result row, so this bridge cannot hide the comparison policy.
-        let run_verify_strict =
-            command_help_contains(&hermit_bin, &["run", "--help"], "--verify-strict")?;
+        let run_verify_strict = probe_hermit
+            && command_help_contains(&hermit_bin, &["run", "--help"], "--verify-strict")?;
         let isolated_workdir = match std::env::var_os(ISOLATED_WORKDIR_ENV) {
             None => None,
             Some(value) if value == HERMETIC_TEST_WORKDIR => {
@@ -2702,11 +2902,12 @@ impl RunContext {
                 ));
             }
         };
-        let record_verify_strict = command_help_contains(
-            &hermit_bin,
-            &["record", "start", "--help"],
-            "--verify-strict",
-        )?;
+        let record_verify_strict = probe_hermit
+            && command_help_contains(
+                &hermit_bin,
+                &["record", "start", "--help"],
+                "--verify-strict",
+            )?;
         Ok(Self {
             root,
             hermit_bin,
@@ -2920,8 +3121,7 @@ fn prepare_test_until(
         copy_tree(&source, &destination)?;
     }
     let backend = cell.id.backend.as_deref().unwrap_or("native");
-    let mode = cell.test.modes.get(&cell.id.mode).unwrap();
-    let guest_args = mode.guest_args.get(backend).cloned().unwrap_or_default();
+    let guest_args = cell_guest_args(cell, backend);
     let mut guest = match (&cell.test.program, &cell.test.direct) {
         (Some(program), None) if program.ends_with(".c") => {
             let output = dir.join("fixtures/program");
@@ -3114,7 +3314,7 @@ pub fn resolved_cell_timeouts(
     )
 }
 
-fn cell_timeouts(
+pub(crate) fn cell_timeouts(
     context: &RunContext,
     cell: &SelectedCell,
 ) -> Result<ResolvedTestTimeouts, String> {
@@ -3251,6 +3451,8 @@ pub fn build_spec(
             cell.id.mode
         ));
     }
+    // `record start` has no `--bind`, so outside the hermetic path a replay cell
+    // runs in its manifest workdir or the runner's working directory.
     let bound_workdir_source = (matches!(cell.id.mode.as_str(), "verify" | "chaos" | "custom")
         && backend != "dbt")
         .then_some(fixed_workdir_source.as_path());
@@ -3259,139 +3461,36 @@ pub fn build_spec(
     let mut verification_log_dir = None;
     let (argv, verdict_path) = match cell.id.mode.as_str() {
         "naked" => (guest_argv.clone(), None),
-        "verify" => {
-            let mut argv = vec![
-                context.hermit_bin.to_string_lossy().into_owned(),
-                "--log".into(),
-                "info".into(),
-                "--backend".into(),
-                backend.into(),
-                "run".into(),
-                "--base-env=minimal".into(),
-                "--strict".into(),
-            ];
-            if context.run_verify_strict && mode_recipe.comparator != Some(Comparator::Stripped) {
-                argv.push("--verify-strict".into());
-            }
-            argv.extend(mode_recipe.hermit_args.iter().cloned());
-            if mode_recipe.compare_io_buffers == Some(false) {
-                argv.push("--no-detlog-io-buffers".into());
-            }
-            if mode_recipe.rcb_time == Some(false) {
-                argv.push("--no-rcb-time".into());
-            }
-            argv.push("--verify".into());
-            if mode_recipe.expected_guest_exit.is_some() {
-                // The exact disposition is enforced on the report after the
-                // comparison; this only lets a failing first run be compared.
-                argv.push("--verify-allow=failure".into());
-            }
-            argv.extend([
-                "--verify-json".into(),
-                verdict.to_string_lossy().into_owned(),
-            ]);
-            if context.retains_verify_logs(&cell.id.test, backend) {
+        mode @ ("verify" | "replay" | "chaos") => {
+            let invocation = match mode {
+                "verify" => VerifiedInvocation::Verify,
+                "replay" => VerifiedInvocation::Replay {
+                    data_dir: dir.join("recording"),
+                    record_timeout_seconds: timeout_seconds,
+                },
+                _ => VerifiedInvocation::Chaos {
+                    seed: seed.ok_or_else(|| "chaos attempt requires a seed".to_string())?,
+                },
+            };
+            if matches!(invocation, VerifiedInvocation::Verify)
+                && context.retains_verify_logs(&cell.id.test, backend)
+            {
                 let logs = dir.join(format!("verify-logs/verify-{attempt}"));
                 fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
-                argv.extend([
-                    "--keep-logs".into(),
-                    "--verify-log-dir".into(),
-                    logs.to_string_lossy().into_owned(),
-                ]);
                 verification_log_dir = Some(logs);
             }
-            append_execution_root_args(
-                &mut argv,
+            let argv = verified_invocation_argv(VerifiedInvocationArgs {
+                context,
+                cell,
                 backend,
-                context.isolated_workdir.as_deref(),
-                mode_recipe.workdir.as_deref(),
+                invocation,
+                verdict: &verdict,
+                verification_log_dir: verification_log_dir.as_deref(),
                 bound_workdir_source,
-            );
-            if equalized_inputs {
-                append_equalized_input_binds(&mut argv, &dir);
-                append_guest_env_args(&mut argv, &equalized_guest_env(&env), isolated);
-            } else {
-                append_guest_env_args(&mut argv, &env, isolated);
-            }
-            for (name, value) in &mode_recipe.env {
-                argv.extend(["--env".into(), format!("{name}={value}")]);
-            }
-            argv.push("--".into());
-            argv.extend(guest_argv.clone());
-            (argv, Some(verdict))
-        }
-        "replay" => {
-            let mut argv = vec![
-                context.hermit_bin.to_string_lossy().into_owned(),
-                "--log".into(),
-                "info".into(),
-                "--backend".into(),
-                backend.into(),
-                "record".into(),
-                "start".into(),
-                "--strict".into(),
-            ];
-            if isolated {
-                argv.push("--base-env=minimal".into());
-            }
-            if context.record_verify_strict {
-                argv.push("--verify-strict".into());
-            }
-            argv.extend([
-                "--verify".into(),
-                "--verify-json".into(),
-                verdict.to_string_lossy().into_owned(),
-                "--data-dir".into(),
-                dir.join("recording").to_string_lossy().into_owned(),
-                "--record-timeout".into(),
-                timeout_seconds.to_string(),
-            ]);
-            append_execution_root_args(
-                &mut argv,
-                backend,
-                context.isolated_workdir.as_deref(),
-                mode_recipe.workdir.as_deref(),
-                bound_workdir_source,
-            );
-            append_guest_env_args(&mut argv, &env, isolated);
-            argv.push("--".into());
-            argv.extend(guest_argv.clone());
-            (argv, Some(verdict))
-        }
-        "chaos" => {
-            let seed = seed.ok_or_else(|| "chaos attempt requires a seed".to_string())?;
-            let mut argv = vec![
-                context.hermit_bin.to_string_lossy().into_owned(),
-                "--log".into(),
-                "info".into(),
-                "--backend".into(),
-                backend.into(),
-                "run".into(),
-                "--base-env=minimal".into(),
-                "--strict".into(),
-            ];
-            if context.run_verify_strict {
-                argv.push("--verify-strict".into());
-            }
-            argv.extend([
-                "--verify".into(),
-                "--verify-allow=both".into(),
-                "--verify-json".into(),
-                verdict.to_string_lossy().into_owned(),
-                "--chaos".into(),
-                "--sched-heuristic=random".into(),
-                format!("--seed={seed}"),
-            ]);
-            append_execution_root_args(
-                &mut argv,
-                backend,
-                context.isolated_workdir.as_deref(),
-                mode_recipe.workdir.as_deref(),
-                bound_workdir_source,
-            );
-            append_guest_env_args(&mut argv, &env, isolated);
-            argv.push("--".into());
-            argv.extend(guest_argv.clone());
+                equalized_inputs_dir: equalized_inputs.then_some(dir.as_path()),
+                env: &env,
+                guest_argv: &guest_argv,
+            });
             (argv, Some(verdict))
         }
         "custom" => {
@@ -3446,12 +3545,194 @@ pub fn build_spec(
         },
         attempt: attempt.into(),
         fixed_workdir_source,
-        normalize_ptrace_golden: context.keep_logs,
     })
+}
+
+/// The Hermit subcommand a verified cell runs and the arguments only it takes.
+enum VerifiedInvocation {
+    /// `hermit run --verify`: two runs compared.
+    Verify,
+    /// `hermit record start --verify`: a recording and its replay compared.
+    Replay {
+        data_dir: PathBuf,
+        record_timeout_seconds: u64,
+    },
+    /// `hermit run --verify --chaos`: two runs under one random schedule.
+    Chaos { seed: i64 },
+}
+
+struct VerifiedInvocationArgs<'a> {
+    context: &'a RunContext,
+    cell: &'a SelectedCell,
+    backend: &'a str,
+    invocation: VerifiedInvocation,
+    verdict: &'a Path,
+    verification_log_dir: Option<&'a Path>,
+    bound_workdir_source: Option<&'a Path>,
+    /// The cell directory whose inputs are bound at their guest paths, for an
+    /// equalized cell.
+    equalized_inputs_dir: Option<&'a Path>,
+    env: &'a BTreeMap<String, String>,
+    guest_argv: &'a [String],
+}
+
+/// The one argv builder for verify, replay and chaos cells.
+///
+/// The three modes run the same guest under the same base environment,
+/// strictness, execution root and guest environment; only the subcommand and
+/// the arguments in [`VerifiedInvocation`] differ. Building them in one place is
+/// what keeps a replay cell from silently running a different guest than the
+/// verify cell it records.
+fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
+    let VerifiedInvocationArgs {
+        context,
+        cell,
+        backend,
+        invocation,
+        verdict,
+        verification_log_dir,
+        bound_workdir_source,
+        equalized_inputs_dir,
+        env,
+        guest_argv,
+    } = args;
+    let mode_recipe = &cell.test.modes[&cell.id.mode];
+    let mut argv = vec![
+        context.hermit_bin.to_string_lossy().into_owned(),
+        "--log".into(),
+        "info".into(),
+        "--backend".into(),
+        backend.into(),
+    ];
+    let verify_strict = match invocation {
+        VerifiedInvocation::Replay { .. } => {
+            argv.extend(["record".into(), "start".into()]);
+            context.record_verify_strict
+        }
+        VerifiedInvocation::Verify | VerifiedInvocation::Chaos { .. } => {
+            argv.push("run".into());
+            context.run_verify_strict
+        }
+    };
+    argv.extend(["--base-env=minimal".into(), "--strict".into()]);
+    if verify_strict && mode_recipe.comparator != Some(Comparator::Stripped) {
+        argv.push("--verify-strict".into());
+    }
+    // Validation admits these relaxations only on a verify recipe, and a
+    // replay cell does not inherit them: `record start` has no such flags.
+    argv.extend(cell_hermit_args(mode_recipe, backend).iter().cloned());
+    if mode_recipe.compare_io_buffers == Some(false) {
+        argv.push("--no-detlog-io-buffers".into());
+    }
+    if mode_recipe.rcb_time == Some(false) {
+        argv.push("--no-rcb-time".into());
+    }
+    argv.push("--verify".into());
+    match &invocation {
+        VerifiedInvocation::Chaos { .. } => argv.push("--verify-allow=both".into()),
+        // The exact disposition is enforced on the report after the
+        // comparison; this only lets a failing first run be compared.
+        // `record start --verify` always compares and returns the guest's
+        // status on a match, so it needs no allowance.
+        VerifiedInvocation::Verify if cell_expected_guest_exit(cell).is_some() => {
+            argv.push("--verify-allow=failure".into());
+        }
+        VerifiedInvocation::Verify | VerifiedInvocation::Replay { .. } => {}
+    }
+    argv.extend([
+        "--verify-json".into(),
+        verdict.to_string_lossy().into_owned(),
+    ]);
+    if let Some(logs) = verification_log_dir {
+        argv.extend([
+            "--keep-logs".into(),
+            "--verify-log-dir".into(),
+            logs.to_string_lossy().into_owned(),
+        ]);
+    }
+    match invocation {
+        VerifiedInvocation::Verify => {}
+        VerifiedInvocation::Replay {
+            data_dir,
+            record_timeout_seconds,
+        } => argv.extend([
+            "--data-dir".into(),
+            data_dir.to_string_lossy().into_owned(),
+            "--record-timeout".into(),
+            record_timeout_seconds.to_string(),
+        ]),
+        VerifiedInvocation::Chaos { seed } => argv.extend([
+            "--chaos".into(),
+            "--sched-heuristic=random".into(),
+            format!("--seed={seed}"),
+        ]),
+    }
+    append_execution_root_args(
+        &mut argv,
+        backend,
+        context.isolated_workdir.as_deref(),
+        cell_workdir(cell).as_deref(),
+        bound_workdir_source,
+    );
+    let isolated = context.isolated_workdir.is_some();
+    if let Some(cell_dir) = equalized_inputs_dir {
+        append_equalized_input_binds(&mut argv, cell_dir);
+        append_guest_env_args(&mut argv, &equalized_guest_env(env), isolated);
+    } else {
+        append_guest_env_args(&mut argv, env, isolated);
+    }
+    for (name, value) in cell_mode_env(cell) {
+        argv.extend(["--env".into(), format!("{name}={value}")]);
+    }
+    argv.push("--".into());
+    argv.extend(guest_argv.iter().cloned());
+    argv
 }
 
 fn current_verification_report(bytes: &[u8]) -> Result<VerificationReport, String> {
     VerificationReport::from_current_json_slice(bytes)
+}
+
+/// Backends whose every completed run must carry a dispatch record.
+const DISPATCH_RECORD_BACKENDS: [&str; 3] = ["ptrace", "liteinst", "sabre"];
+
+/// Why a passing verify report's runtime does not carry each run's dispatch
+/// record for `backend`, or `None` when it does.
+///
+/// Only a run whose summary was read is checked: a report without runtime has
+/// nothing to carry the record in. KVM and DBT have no record, and native runs
+/// no backend, so they are not checked.
+fn dispatch_record_error(backend: &str, runtime: Option<&VerificationRuntime>) -> Option<String> {
+    if !DISPATCH_RECORD_BACKENDS.contains(&backend) {
+        return None;
+    }
+    let runtime = runtime?;
+    [
+        ("run1", runtime.run1.as_ref()),
+        ("run2", runtime.run2.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(run, stats)| Some((run, stats?)))
+    .find_map(|(run, stats)| {
+        let Some(record) = &stats.dispatch else {
+            return Some(format!(
+                "verification runtime.{run} carries no {backend} dispatch record"
+            ));
+        };
+        if record.backend != backend {
+            return Some(format!(
+                "verification runtime.{run} dispatch record names backend {}, expected {backend}",
+                record.backend
+            ));
+        }
+        let inconsistencies = record.inconsistencies();
+        (!inconsistencies.is_empty()).then(|| {
+            format!(
+                "verification runtime.{run} dispatch record is inconsistent: {}",
+                inconsistencies.join("; ")
+            )
+        })
+    })
 }
 pub fn execute_spec(spec: &CellRunSpec) -> Result<AttemptResult, String> {
     execute_spec_until(
@@ -3547,33 +3828,7 @@ fn execute_spec_until(
             timeout,
         ));
     }
-    let execution_ordinal = observations.len() as u64 + 1;
     let output = execute_process(request, (deadline, remaining_cpu_usec), observations)?;
-    let mut accounted_cpu_usage_usec = Some(output.cpu_usage_usec);
-    let mut normalization_error = None;
-    if output.timeout.is_none()
-        && spec.normalize_ptrace_golden
-        && spec.id.mode == "verify"
-        && spec.id.backend.as_deref() == Some("ptrace")
-    {
-        if let Some(directory) = &spec.verification_log_dir {
-            let normalized = normalize_ptrace_golden(
-                &spec.argv[0],
-                directory,
-                &spec.cwd,
-                deadline,
-                remaining_cpu_usec.map(|budget| budget.saturating_sub(output.cpu_usage_usec)),
-                (cpu_timeout_seconds, wall_timeout_seconds),
-                (
-                    observations,
-                    InvocationRole::PtraceNormalization { execution_ordinal },
-                ),
-            );
-            accounted_cpu_usage_usec =
-                checked_add_cpu_usage(accounted_cpu_usage_usec, normalized.cpu_usage_usec);
-            normalization_error = normalized.result.err();
-        }
-    }
     let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
     let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
     let mut outcome = if output.timeout.is_some() || !output.status.success() {
@@ -3954,14 +4209,21 @@ fn execute_spec_until(
             }
         }
     }
+    if outcome == "PASS" {
+        if let Some(error) = spec
+            .id
+            .backend
+            .as_deref()
+            .and_then(|backend| dispatch_record_error(backend, runtime.as_ref()))
+        {
+            outcome = "ERROR".into();
+            error_kind = Some("incomplete-verification-evidence".into());
+            reason = Some(error);
+        }
+    }
     if let Some(timeout) = output.timeout {
         error_kind = Some(timeout.error_kind().into());
         reason = Some(timeout.reason(cpu_timeout_seconds, wall_timeout_seconds));
-    }
-    if let Some(error) = normalization_error {
-        outcome = "ERROR".into();
-        error_kind = Some("incomplete-verification-evidence".into());
-        reason = Some(error);
     }
     Ok(AttemptResult {
         index: index.into(),
@@ -3971,7 +4233,7 @@ fn execute_spec_until(
         signal: std::os::unix::process::ExitStatusExt::signal(&output.status),
         timed_out: output.timeout.is_some(),
         duration_ms: started.elapsed().as_millis(),
-        cpu_usage_usec: accounted_cpu_usage_usec,
+        cpu_usage_usec: Some(output.cpu_usage_usec),
         observation_sha256: None,
         argv: spec.argv.clone(),
         guest_argv: spec.guest_argv.clone(),
@@ -3993,96 +4255,6 @@ fn execute_spec_until(
         sabre_path_evidence_sha256,
         reason,
     })
-}
-
-/// Preserve process accounting even when post-processing cannot produce its
-/// semantic result. An `Err` must not erase CPU already consumed by a child.
-struct AccountedStep<T> {
-    result: Result<T, String>,
-    cpu_usage_usec: Option<u64>,
-}
-
-fn normalize_ptrace_golden(
-    hermit: &str,
-    directory: &Path,
-    cwd: &Path,
-    deadline: Instant,
-    remaining_cpu_usec: Option<u64>,
-    timeout_seconds: (u64, u64),
-    record: (&mut Vec<InvocationCpuObservation>, InvocationRole),
-) -> AccountedStep<()> {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) => {
-            return AccountedStep {
-                result: Err(format!("cannot read {}: {error}", directory.display())),
-                cpu_usage_usec: Some(0),
-            };
-        }
-    };
-    let mut run1 = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(OsStr::to_str)
-                .is_some_and(|name| name.starts_with("run1_log_"))
-        })
-        .collect::<Vec<_>>();
-    run1.sort();
-    let normalized = directory.join("normalized-ptrace-golden.log");
-    let status_path = directory.join("normalized-ptrace-golden.status");
-    if run1.len() != 1 || !run1[0].metadata().is_ok_and(|metadata| metadata.len() > 0) {
-        let result = fs::write(&normalized, b"")
-            .and_then(|()| fs::write(status_path, b"2\n"))
-            .map_err(|error| error.to_string());
-        return AccountedStep {
-            result,
-            cpu_usage_usec: Some(0),
-        };
-    }
-    let stderr = directory.join("normalized-ptrace-golden.stderr");
-    let args = vec!["log-diff".into(), run1[0].to_string_lossy().into_owned()];
-    let output = match execute_process(
-        ProcessRequest::new(
-            record.1,
-            cwd,
-            hermit,
-            &args,
-            &BTreeMap::new(),
-            &normalized,
-            &stderr,
-        ),
-        (deadline, remaining_cpu_usec),
-        record.0,
-    ) {
-        Ok(output) => output,
-        Err(error) => {
-            return AccountedStep {
-                result: Err(format!("cannot normalize {}: {error}", run1[0].display())),
-                cpu_usage_usec: None,
-            };
-        }
-    };
-    let cpu_usage_usec = Some(output.cpu_usage_usec);
-    let status = output.status.code().unwrap_or(1);
-    let result = (|| {
-        if !output.status.success() {
-            fs::write(&normalized, b"").map_err(|error| error.to_string())?;
-        }
-        fs::write(&status_path, format!("{status}\n")).map_err(|error| error.to_string())?;
-        if let Some(timeout) = output.timeout {
-            return Err(format!(
-                "ptrace golden normalization {}",
-                timeout.reason(timeout_seconds.0, timeout_seconds.1)
-            ));
-        }
-        Ok(())
-    })();
-    AccountedStep {
-        result,
-        cpu_usage_usec,
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4488,8 +4660,16 @@ fn monitor_process<R>(
                 }
                 Err(error) => {
                     let reason = error.reason;
-                    let missing_since = cpu_accounting_missing_since.get_or_insert(now);
-                    if now.duration_since(*missing_since) >= CELL_CPU_ACCOUNTING_GRACE {
+                    // Time the grace from when the failed sample returned, not
+                    // from `now`, which was taken before it ran. One host-wide
+                    // /proc census can itself outlast the grace, and proccpu
+                    // then serves its refusal again for 500 ms
+                    // (https://github.com/rrnewton/hermit/issues/3377). Timed
+                    // from `now`, that census alone would stop the command at
+                    // the next poll, with no fresh sample in between.
+                    let failed_at = Instant::now();
+                    let missing_since = cpu_accounting_missing_since.get_or_insert(failed_at);
+                    if failed_at.duration_since(*missing_since) >= CELL_CPU_ACCOUNTING_GRACE {
                         observation.termination = TerminationPath::AccountingUnavailableStop;
                         return match stop_process_group(pid, started, &mut observation.final_wait) {
                             Ok(_) => Err(format!(
@@ -4625,11 +4805,30 @@ pub fn cell_artifact_path(
     result_root.join("runs").join(run_id).join(slug)
 }
 
-fn verification_verdict(attempt: &AttemptResult) -> Option<Verdict> {
+/// The verdict of `attempt`'s retained verification report, or `None` when it
+/// retains none or one that is not a current report. A `diverged` verdict
+/// here is what [`observed_result`] types a verify row
+/// `determinism-failure` from; the parity post-pass reads the same verdict
+/// from every attempt (`parity::records_mismatch`).
+pub(crate) fn verification_verdict(attempt: &AttemptResult) -> Option<Verdict> {
     let report = attempt.verification_report.as_deref()?;
     current_verification_report(report.as_bytes())
         .ok()
         .map(|report| report.verdict)
+}
+
+/// Whether `attempt` retains a current verification report whose strict
+/// comparison matched: [`VerificationReport::require_canonical_match`], the
+/// check a strict verify cell must pass before the runner can pass it. A
+/// `matched` verdict from a weaker comparison does not count. The parity
+/// post-pass reads it from the single attempt of a `FAIL` row to decide that
+/// the row still has one deterministic log (`parity::evaluate_history`).
+pub(crate) fn verification_matched_canonically(attempt: &AttemptResult) -> bool {
+    attempt
+        .verification_report
+        .as_deref()
+        .and_then(|report| current_verification_report(report.as_bytes()).ok())
+        .is_some_and(|report| report.require_canonical_match().is_ok())
 }
 
 fn observed_result(
@@ -5246,11 +5445,7 @@ fn run_cell_inner(
             None
         }
     };
-    if outcome == "PASS"
-        && execution_path
-            .as_ref()
-            .is_some_and(|evidence| evidence["eligible"] != true)
-    {
+    if outcome == "PASS" && execution_path_ineligible(execution_path.as_ref()) {
         outcome = "FAIL".into();
         reason = Some("SaBRe execution path is incomplete or used fallback/native sites".into());
     }
@@ -5553,6 +5748,17 @@ fn cell_divergence_position(attempts: &[AttemptResult]) -> DivergencePosition {
         left_message: messages.and_then(|attempt| attempt.first_divergent_left_message.clone()),
         right_message: messages.and_then(|attempt| attempt.first_divergent_right_message.clone()),
     }
+}
+
+/// Whether a row's SaBRe execution-path evidence
+/// ([`summarize_sabre_path_evidence`]) shows that its run did not stay on
+/// SaBRe's own path: the evidence is incomplete, or the run used fallback or
+/// native sites. A row with no such evidence, which is every row of another
+/// backend, is not ineligible. The runner fails a `PASS` whose evidence is
+/// ineligible, and the parity post-pass does not score such a row from its
+/// log (`parity::evaluate_history`).
+pub(crate) fn execution_path_ineligible(execution_path: Option<&JsonValue>) -> bool {
+    execution_path.is_some_and(|evidence| evidence["eligible"] != true)
 }
 
 pub(crate) fn summarize_sabre_path_evidence(
@@ -5962,17 +6168,27 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
     {
         return Err(format!("{id}: no_retry_reason must be substantive"));
     }
-    // Each flag at most once. An exact repeat would repeat a relaxation
-    // identity, which the scorecard refuses; two values for one flag would
-    // leave the effective configuration to Hermit's argument order.
-    let mut seen_flags = BTreeSet::new();
-    for arg in &recipe.hermit_args {
-        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
-        if !seen_flags.insert(flag) {
-            return Err(format!("{id}: hermit_args repeats `{flag}`"));
+    for (backend, args) in &recipe.hermit_args {
+        if !recipe.backends_enabled.contains(backend) {
+            return Err(format!(
+                "{id}: hermit_args names backend `{backend}`, which is not in backends_enabled"
+            ));
+        }
+        if args.is_empty() {
+            return Err(format!("{id}: hermit_args for `{backend}` is empty"));
+        }
+        // Each flag at most once. An exact repeat would repeat a relaxation
+        // identity, which the scorecard refuses; two values for one flag would
+        // leave the effective configuration to Hermit's argument order.
+        let mut seen_flags = BTreeSet::new();
+        for arg in args {
+            let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+            if !seen_flags.insert(flag) {
+                return Err(format!("{id}: hermit_args repeats `{flag}`"));
+            }
         }
     }
-    for arg in &recipe.hermit_args {
+    for arg in recipe.hermit_args.values().flatten() {
         let allowed = ALLOWED_HERMIT_ARGS
             .iter()
             .any(|flag| match flag.strip_suffix('=') {
@@ -6046,6 +6262,17 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
         return Err(format!(
             "{id}: comparator stripped cannot establish the bitwise_parity it asserts"
         ));
+    }
+    for (backend, labels) in &recipe.labels {
+        if !recipe.backends_enabled.contains(backend) {
+            return Err(format!(
+                "{id}: {mode} labels name backend `{backend}`, which is not in backends_enabled"
+            ));
+        }
+        if labels.is_empty() {
+            return Err(format!("{id}: {mode} labels for `{backend}` are empty"));
+        }
+        validate_labels(&format!("{id}: {mode} on {backend}"), labels)?;
     }
     for (backend, reason) in &recipe.diagnostic {
         if !stripped {
@@ -6203,7 +6430,7 @@ fn observation_hash(observation: &Observation, attempt: &AttemptResult, dir: &Pa
     format!("{:x}", digest.finalize())
 }
 
-fn test_digest(root: &Path, test: &TestRecipe) -> Result<String, String> {
+pub(crate) fn test_digest(root: &Path, test: &TestRecipe) -> Result<String, String> {
     let bytes = if let Some(program) = &test.program {
         fs::read(root.join(program)).map_err(|e| e.to_string())?
     } else {
@@ -6382,6 +6609,115 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
         assert_eq!(named, Ok((sha.to_string(), false)));
         assert!(asked.is_err(), "{asked:?}");
+    }
+
+    /// Where Git tracks files it knows their commit and whether they are dirty,
+    /// so a `--source-sha` that would override both is refused, at the
+    /// checkout's top level and below it. A snapshot extracted inside the
+    /// checkout but not tracked by it keeps its name.
+    #[test]
+    fn a_source_sha_is_refused_where_git_tracks_the_files() {
+        let checkout = std::env::temp_dir().join(format!("runner-checkout-{}", std::process::id()));
+        let snapshot = checkout.join("snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(checkout.join("src")).unwrap();
+        fs::write(checkout.join("src/lib.rs"), "").unwrap();
+        let git = |args: &[&str]| {
+            crate::git_environment::git_command()
+                .arg("-C")
+                .arg(&checkout)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        };
+        let tracking = git(&["init", "-q"]) && git(&["add", "src/lib.rs"]);
+        let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
+        let refused = [
+            source_identity(&checkout, Some(sha)),
+            source_identity(&checkout.join("src"), Some(sha)),
+        ];
+        let nested = source_identity(&snapshot, Some(sha));
+        // A corrupt index leaves Git unable to say whether it tracks the files.
+        fs::write(checkout.join(".git/index"), "junk").unwrap();
+        let unreadable = [
+            source_identity(&checkout.join("src"), Some(sha)),
+            source_identity(&snapshot, Some(sha)),
+        ];
+        fs::remove_dir_all(&checkout).unwrap();
+        assert!(tracking);
+        for identity in refused {
+            let error = identity.unwrap_err();
+            assert!(error.contains("Git tracks files under"), "{error}");
+        }
+        assert_eq!(nested, Ok((sha.to_string(), false)));
+        for identity in unreadable {
+            let error = identity.unwrap_err();
+            assert!(
+                error.contains("`git ls-files` there failed")
+                    && error.contains("whether Git tracks its files is unknown"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_sha_is_accepted_outside_any_checkout() {
+        let archive = std::env::temp_dir().join(format!("runner-archive-{}", std::process::id()));
+        fs::create_dir_all(archive.join("src")).unwrap();
+        // `..` out of a checkout is resolved before looking for `.git`.
+        let checkout = archive.join("checkout");
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
+        let outside = source_identity(&archive.join("src"), Some(sha));
+        let climbed = source_identity(&checkout.join("../src"), Some(sha));
+        // A root that does not resolve cannot be placed inside or outside a checkout.
+        let missing = source_identity(&archive.join("missing"), Some(sha));
+        fs::remove_dir_all(&archive).unwrap();
+        assert!(
+            !std::env::temp_dir()
+                .ancestors()
+                .any(|dir| dir.join(".git").exists()),
+            "this test needs a temporary directory outside any checkout"
+        );
+        assert_eq!(outside, Ok((sha.to_string(), false)));
+        assert_eq!(climbed, Ok((sha.to_string(), false)));
+        let error = missing.unwrap_err();
+        assert!(error.contains("cannot resolve --repo-root"), "{error}");
+    }
+
+    /// A symlink outside any checkout that points at tracked files names
+    /// those files, so it is refused as they are.
+    #[test]
+    fn a_source_sha_is_refused_through_a_symlink_to_tracked_files() {
+        let base = std::env::temp_dir().join(format!("runner-symlink-{}", std::process::id()));
+        let checkout = base.join("checkout");
+        fs::create_dir_all(checkout.join("src")).unwrap();
+        fs::write(checkout.join("src/lib.rs"), "").unwrap();
+        let git = |args: &[&str]| {
+            crate::git_environment::git_command()
+                .arg("-C")
+                .arg(&checkout)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        };
+        let tracking = git(&["init", "-q"]) && git(&["add", "src/lib.rs"]);
+        let link = base.join("link");
+        std::os::unix::fs::symlink(checkout.join("src"), &link).unwrap();
+        let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
+        let linked = source_identity(&link, Some(sha));
+        fs::remove_dir_all(&base).unwrap();
+        assert!(
+            !std::env::temp_dir()
+                .ancestors()
+                .any(|dir| dir.join(".git").exists()),
+            "this test needs a temporary directory outside any checkout"
+        );
+        assert!(tracking);
+        let error = linked.unwrap_err();
+        assert!(error.contains("Git tracks files under"), "{error}");
     }
 
     /// The four outcomes of the verification-spelling probe.
@@ -6701,10 +7037,13 @@ mod tests {
     fn verify_extensions_are_verify_only_reasoned_and_allowlisted() {
         let accepted = ModeRecipe {
             backends_enabled: vec!["ptrace".into()],
-            hermit_args: vec![
-                "--no-virtualize-cpuid".into(),
-                "--max-timeslice=disabled".into(),
-            ],
+            hermit_args: BTreeMap::from([(
+                "ptrace".into(),
+                vec![
+                    "--no-virtualize-cpuid".into(),
+                    "--max-timeslice=disabled".into(),
+                ],
+            )]),
             hermit_args_reason: Some("the corpus records this configuration".into()),
             env: BTreeMap::from([("TMPDIR".into(), "/tmp".into())]),
             comparator: Some(Comparator::Stripped),
@@ -6735,27 +7074,33 @@ mod tests {
             "true",
         ] {
             refused(
-                &|r| r.hermit_args = vec![flag.into()],
+                &|r| r.hermit_args = BTreeMap::from([("ptrace".into(), vec![flag.into()])]),
                 "verify",
                 "is not one of",
             );
         }
         refused(
             &|r| {
-                r.hermit_args = vec![
-                    "--no-virtualize-cpuid".into(),
-                    "--no-virtualize-cpuid".into(),
-                ]
+                r.hermit_args = BTreeMap::from([(
+                    "ptrace".into(),
+                    vec![
+                        "--no-virtualize-cpuid".into(),
+                        "--no-virtualize-cpuid".into(),
+                    ],
+                )])
             },
             "verify",
             "repeats `--no-virtualize-cpuid`",
         );
         refused(
             &|r| {
-                r.hermit_args = vec![
-                    "--max-timeslice=1".into(),
-                    "--max-timeslice=disabled".into(),
-                ]
+                r.hermit_args = BTreeMap::from([(
+                    "ptrace".into(),
+                    vec![
+                        "--max-timeslice=1".into(),
+                        "--max-timeslice=disabled".into(),
+                    ],
+                )])
             },
             "verify",
             "repeats `--max-timeslice`",
@@ -6774,6 +7119,36 @@ mod tests {
             &|r| r.hermit_args.clear(),
             "verify",
             "hermit_args_reason without hermit_args",
+        );
+        // Flags belong to an enabled backend, and a named backend has some.
+        refused(
+            &|r| {
+                r.hermit_args =
+                    BTreeMap::from([("sabre".into(), vec!["--no-virtualize-cpuid".into()])])
+            },
+            "verify",
+            "hermit_args names backend `sabre`, which is not in backends_enabled",
+        );
+        refused(
+            &|r| r.hermit_args = BTreeMap::from([("ptrace".into(), Vec::new())]),
+            "verify",
+            "hermit_args for `ptrace` is empty",
+        );
+        // Run-type labels name an enabled backend and are well formed.
+        refused(
+            &|r| r.labels = BTreeMap::from([("sabre".into(), vec!["sabre-compat-only".into()])]),
+            "verify",
+            "labels name backend `sabre`, which is not in backends_enabled",
+        );
+        refused(
+            &|r| r.labels = BTreeMap::from([("ptrace".into(), Vec::new())]),
+            "verify",
+            "labels for `ptrace` are empty",
+        );
+        refused(
+            &|r| r.labels = BTreeMap::from([("ptrace".into(), vec!["Bad".into()])]),
+            "verify",
+            "is not lowercase-words-with-dashes",
         );
         refused(
             &|r| r.comparator_reason = None,
@@ -6891,7 +7266,8 @@ mod tests {
         )
         .unwrap();
         let mut test = five_modes();
-        test.modes.get_mut("verify").unwrap().hermit_args = vec!["--chaos".into()];
+        test.modes.get_mut("verify").unwrap().hermit_args =
+            BTreeMap::from([("ptrace".into(), vec!["--chaos".into()])]);
         let document = ManifestDocument {
             test: vec![test],
             ..document
@@ -6928,7 +7304,8 @@ mod tests {
     fn declared_relaxations_are_recorded_on_the_cell() {
         let mut test = recipe(true);
         let mode = test.modes.get_mut("verify").unwrap();
-        mode.hermit_args = vec!["--no-virtualize-cpuid".into()];
+        mode.hermit_args =
+            BTreeMap::from([("ptrace".into(), vec!["--no-virtualize-cpuid".into()])]);
         mode.hermit_args_reason = Some("corpus configuration".into());
         mode.comparator = Some(Comparator::Stripped);
         mode.comparator_reason = Some("corpus verdict policy".into());
@@ -6969,6 +7346,60 @@ mod tests {
         }
     }
 
+    /// A mode's per-backend labels put that backend's cell in their run type
+    /// alone; the test's other cells stay in the default (full) run type, and
+    /// per-backend hermit_args reach only their backend's cell.
+    #[test]
+    fn a_cell_labelled_by_its_mode_belongs_to_that_run_type_alone() {
+        let mut test = recipe(true);
+        let mode = test.modes.get_mut("verify").unwrap();
+        mode.backends_enabled.push("sabre".into());
+        mode.backends_disabled.remove("sabre");
+        mode.labels = BTreeMap::from([("sabre".into(), vec!["sabre-compat-only".into()])]);
+        mode.hermit_args =
+            BTreeMap::from([("ptrace".into(), vec!["--no-virtualize-cpuid".into()])]);
+        mode.hermit_args_reason = Some("fixture configuration".into());
+        let mode = &test.modes["verify"];
+        validate_mode_extensions(&test.id, "verify", mode).unwrap();
+        assert_eq!(cell_hermit_args(mode, "ptrace"), ["--no-virtualize-cpuid"]);
+        assert!(cell_hermit_args(mode, "sabre").is_empty());
+        assert_eq!(
+            cell_labels(&test, mode, Some("sabre")),
+            BTreeSet::from(["sabre-compat-only"])
+        );
+        assert_eq!(
+            cell_labels(&test, mode, Some("ptrace")),
+            BTreeSet::from([DEFAULT_RUN_TYPE])
+        );
+        let set = ManifestSet {
+            documents: Vec::new(),
+            tests: BTreeMap::from([(
+                test.id.clone(),
+                ("fixture".into(), 15, DEFAULT_TEST_CPU_TIMEOUT_SECONDS, test),
+            )]),
+        };
+        let backends = |labels: &[&str], population: Population| {
+            set.select(&Selection {
+                population: Some(population),
+                labels: labels.iter().map(|l| l.to_string()).collect(),
+                ..Selection::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|cell| cell.id.backend.unwrap())
+            .collect::<Vec<_>>()
+        };
+        for population in [Population::Required, Population::Enabled] {
+            assert_eq!(backends(&[], population), ["ptrace"]);
+            assert_eq!(backends(&["full"], population), ["ptrace"]);
+            assert_eq!(backends(&["sabre-compat-only"], population), ["sabre"]);
+            assert_eq!(
+                backends(&["full", "sabre-compat-only"], population),
+                ["ptrace", "sabre"]
+            );
+        }
+    }
+
     #[test]
     fn labels_select_only_the_tests_that_carry_them() {
         let mut strict = recipe(true);
@@ -6998,9 +7429,31 @@ mod tests {
             .map(|cell| cell.id.test)
             .collect::<Vec<_>>()
         };
+        // An unlabelled test belongs to the default run type, full, so both
+        // tests are full's; only the labelled one is strict-compat's.
         assert_eq!(selected(&[]), ["fixture/plain", "fixture/strict"]);
-        assert_eq!(selected(&["full"]), ["fixture/strict"]);
-        assert_eq!(selected(&["strict-compat", "full"]), ["fixture/strict"]);
+        assert_eq!(selected(&["full"]), ["fixture/plain", "fixture/strict"]);
+        assert_eq!(selected(&["strict-compat"]), ["fixture/strict"]);
+        assert_eq!(
+            selected(&["strict-compat", "full"]),
+            ["fixture/plain", "fixture/strict"]
+        );
+        // Without full among its labels, a labelled test leaves the default
+        // run type.
+        let mut set = set;
+        set.tests.get_mut("fixture/strict").unwrap().3.labels = vec!["strict-compat".into()];
+        let selected = |labels: &[&str]| {
+            set.select(&Selection {
+                labels: labels.iter().map(|l| l.to_string()).collect(),
+                ..Selection::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|cell| cell.id.test)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(selected(&[]), ["fixture/plain"]);
+        assert_eq!(selected(&["strict-compat"]), ["fixture/strict"]);
         let error = set
             .select(&Selection {
                 labels: vec!["full".into(), "super".into()],
@@ -7013,7 +7466,8 @@ mod tests {
     fn extended_verify_spec(comparator: Option<Comparator>) -> CellRunSpec {
         let mut test = recipe(true);
         let mode = test.modes.get_mut("verify").unwrap();
-        mode.hermit_args = vec!["--no-virtualize-cpuid".into()];
+        mode.hermit_args =
+            BTreeMap::from([("ptrace".into(), vec!["--no-virtualize-cpuid".into()])]);
         mode.hermit_args_reason = Some("fixture configuration".into());
         mode.env = BTreeMap::from([("TMPDIR".into(), "/tmp".into())]);
         mode.comparator = comparator;
@@ -7240,9 +7694,139 @@ mod tests {
 
     use super::PRODUCER_STRIPPED_REPORT;
 
+    /// A ptrace dispatch record that satisfies [`dispatch_record_error`].
+    fn ptrace_dispatch_record() -> detcore_model::summary::DispatchStats {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "backend": "ptrace",
+            "counters": {
+                "signal_traps": 0,
+                "patched_direct_calls": 0,
+                "ptrace_seccomp_stops": 40,
+                "ptrace_sigtrap_stops": 0,
+                "sigill_marker_hits": 0,
+                "ptrace_syscall_entry_stops": 0,
+                "ptrace_syscall_exit_stops": 0,
+                "refusals": 0
+            },
+            "sites": {"candidates": 0, "patched": 0, "fell_back": 0}
+        }))
+        .unwrap()
+    }
+
+    /// The producer report above predates the dispatch record; a current
+    /// ptrace run carries one in each run's runtime.
+    fn with_ptrace_dispatch(mut report: VerificationReport) -> VerificationReport {
+        let runtime = report.runtime.as_mut().unwrap();
+        for stats in [runtime.run1.as_mut(), runtime.run2.as_mut()] {
+            stats.unwrap().dispatch = Some(ptrace_dispatch_record());
+        }
+        report
+    }
+
+    #[test]
+    fn a_passing_patching_backend_report_must_carry_a_consistent_dispatch_record() {
+        let current = with_ptrace_dispatch(serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap());
+        let pass = attempt_with_report(None, Comparator::Stripped, current.clone(), "exit 0", 5);
+        assert_eq!(pass.outcome, "PASS", "{:?}", pass.reason);
+        assert_eq!(
+            pass.runtime
+                .as_ref()
+                .unwrap()
+                .run2
+                .as_ref()
+                .unwrap()
+                .dispatch,
+            Some(ptrace_dispatch_record())
+        );
+
+        let refused = |report: VerificationReport, expected: &str| {
+            let result = attempt_with_report(None, Comparator::Stripped, report, "exit 0", 5);
+            assert_eq!(result.outcome, "ERROR", "{:?}", result.reason);
+            assert_eq!(
+                result.error_kind.as_deref(),
+                Some("incomplete-verification-evidence")
+            );
+            assert!(
+                result
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(expected)),
+                "{:?}",
+                result.reason
+            );
+        };
+        let mut missing = current.clone();
+        missing
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run2
+            .as_mut()
+            .unwrap()
+            .dispatch = None;
+        refused(missing, "runtime.run2 carries no ptrace dispatch record");
+        let mut relabeled = current.clone();
+        relabeled
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run1
+            .as_mut()
+            .unwrap()
+            .dispatch
+            .as_mut()
+            .unwrap()
+            .backend = "liteinst".into();
+        refused(relabeled, "names backend liteinst, expected ptrace");
+        let mut impossible = current.clone();
+        impossible
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run1
+            .as_mut()
+            .unwrap()
+            .dispatch
+            .as_mut()
+            .unwrap()
+            .sites
+            .patched = Some(1);
+        refused(impossible, "exceeds candidates 0");
+
+        // A failing comparison keeps its own classification.
+        let mut diverged = current;
+        diverged.verified = false;
+        diverged.verdict = Verdict::Diverged;
+        diverged
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run1
+            .as_mut()
+            .unwrap()
+            .dispatch = None;
+        let fail = attempt_with_report(None, Comparator::Stripped, diverged, "exit 1", 5);
+        assert_eq!(fail.outcome, "FAIL", "{:?}", fail.reason);
+
+        // Backends without a record are not held to one.
+        let historical: VerificationReport =
+            serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap();
+        assert_eq!(
+            dispatch_record_error("kvm", historical.runtime.as_ref()),
+            None
+        );
+        assert_eq!(
+            dispatch_record_error("dbt", historical.runtime.as_ref()),
+            None
+        );
+        assert_eq!(dispatch_record_error("ptrace", None), None);
+        assert!(dispatch_record_error("sabre", historical.runtime.as_ref()).is_some());
+    }
+
     #[test]
     fn a_stripped_cell_passes_only_a_matched_report_and_a_strict_one_still_needs_canonical() {
-        let matched: VerificationReport = serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap();
+        let matched = with_ptrace_dispatch(serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap());
         assert_eq!(
             matched.comparison.as_ref().unwrap().strictness,
             crate::canonical_verdict::LogCompareStrictness::Stripped
@@ -7955,6 +8539,23 @@ mod tests {
                 assert_eq!(cell.timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
             }
         }
+        // https://github.com/rrnewton/hermit/pull/3580 selects ptrace replay of
+        // the two select programs, with the ordinary bounds.
+        for population in [&required, &enabled] {
+            for test in SELECT_REPLAY_2026_10_03_TESTS {
+                let replay = population
+                    .iter()
+                    .filter(|cell| cell.id.test == test && cell.id.mode == "replay")
+                    .collect::<Vec<_>>();
+                assert_eq!(replay.len(), 1, "{test}");
+                assert_eq!(replay[0].id.backend.as_deref(), Some("ptrace"), "{test}");
+                assert_eq!(
+                    replay[0].cpu_timeout_seconds,
+                    DEFAULT_TEST_CPU_TIMEOUT_SECONDS
+                );
+                assert_eq!(replay[0].timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
+            }
+        }
         assert_eq!(
             required.len(),
             CALIBRATED_CI_CELL_COUNT + KVM_RATCHET_CI_CELL_COUNT - KVM_RUN_1709_CI_REMOVAL_COUNT
@@ -7969,7 +8570,43 @@ mod tests {
                 + 3 // the exact RNG identities asserted above
                 + DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT
                 + STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
+                + SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT
+                // Six KVM verify selections; the frozen calibration stays unchanged.
+                // https://github.com/rrnewton/reverie/issues/891
+                + 6
+                // Three socket KVM verify selections from the same issue; assertions stay exact.
+                // https://github.com/rrnewton/reverie/issues/891
+                + 3
+                // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
+                + 1
+                // One zero-time epoll-pwait2 KVM verify selection: https://github.com/rrnewton/reverie/issues/905.
+                + 1
+                // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
+                + 1
+                // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+                + 1
+                // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+                + 1
+                + SABRE_2026_10_03_SELECTED_CI_CELL_COUNT
         );
+        // The SaBRe verify selections of 2026-10-03 have the ordinary bounds,
+        // and the ones that were enabled with ci:false are now required.
+        fn sabre_verify<'a>(
+            population: &'a [SelectedCell],
+            test: &str,
+        ) -> Option<&'a SelectedCell> {
+            population.iter().find(|cell| {
+                cell.id.test == test
+                    && cell.id.mode == "verify"
+                    && cell.id.backend.as_deref() == Some("sabre")
+            })
+        }
+        for test in SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS {
+            let cell = sabre_verify(&required, test)
+                .unwrap_or_else(|| panic!("{test} verify/sabre is not required"));
+            assert_eq!(cell.cpu_timeout_seconds, DEFAULT_TEST_CPU_TIMEOUT_SECONDS);
+            assert_eq!(cell.timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
+        }
         // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 selected three
         // DBT verify cells that were enabled with ci:false and enabled one new
         // ci:false DBT verify cell; the timeouts module names them.
@@ -8001,7 +8638,8 @@ mod tests {
             NON_CI_CELL_COUNT
                 - LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
                 - DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS.len()
-                + DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS.len(),
+                + DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS.len()
+                - SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS.len(),
             "the current manifest census records every enabled ci:false cell"
         );
 
@@ -8179,7 +8817,6 @@ mod tests {
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: root.join("workdir/1"),
-            normalize_ptrace_golden: false,
         };
 
         // This is the exact boundary reached when the aggregate execution
@@ -8866,6 +9503,122 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_failed_sample_does_not_use_up_the_unavailable_grace() {
+        // One host-wide /proc census can outlast the whole grace. proccpu then
+        // refuses it ("scan deadline") and serves that refusal again for 500 ms
+        // (https://github.com/rrnewton/hermit/issues/3377). The grace is timed
+        // from when the failed sample returned, so the refusal served right
+        // after a slow census cannot stop the command before a fresh sample
+        // runs. The samples are synthetic so the sequence is exact on any host.
+        let root = cpu_reader_test_root("reader-slow-failure");
+        let done = root.join("done");
+        let (child, started, mut observation) = spawn_cpu_reader_fixture(
+            &root,
+            "slow",
+            "while [ ! -f done ]; do sleep 0.02; done",
+            true,
+        );
+        let pid = child.id();
+        let mut samples = 0;
+        let output = monitor_process(
+            child,
+            ProcessLimits {
+                deadline: Instant::now() + Duration::from_secs(10),
+                cpu_budget_usec: Some(5_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            started,
+            &mut observation,
+            |_| Ok(()),
+            |_| {
+                samples += 1;
+                match samples {
+                    1 => {
+                        std::thread::sleep(CELL_CPU_ACCOUNTING_GRACE + Duration::from_millis(200));
+                        Err("fixture scan deadline".into())
+                    }
+                    2 => Err("fixture scan deadline".into()),
+                    _ => {
+                        fs::write(&done, b"complete").map_err(|error| error.to_string())?;
+                        Ok(0.0)
+                    }
+                }
+            },
+        )
+        .expect("a slow failed sample followed by a valid one must not stop the command");
+        assert!(output.status.success());
+        assert_eq!(output.timeout, None);
+        assert!(started.elapsed() > CELL_CPU_ACCOUNTING_GRACE);
+        assert!(samples >= 3);
+        assert!(done.is_file());
+        assert!(owned_child_is_reaped(pid));
+        assert_process_observation(&observation, &output);
+        let live = enabled_cpu(&observation);
+        assert_eq!(live.unavailable_polls, 2);
+        assert!(live.valid_polls >= 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_slow_census_that_keeps_failing_still_stops_the_command() {
+        // The refusal above never clears here: every fresh census takes 1 s and
+        // fails, and its refusal is served again for 500 ms, as proccpu does
+        // (https://github.com/rrnewton/hermit/issues/3377). The command must
+        // still be stopped and reaped through the accounting stop, at least
+        // the grace after the first failed census returned. The grace is only
+        // checked when a sample returns, so the census running when it expires
+        // adds its own length: there is no fixed stop time.
+        let root = cpu_reader_test_root("reader-slow-permanent-failure");
+        let (child, started, mut observation) =
+            spawn_cpu_reader_fixture(&root, "permanent", "exec sleep 30", true);
+        let pid = child.id();
+        let mut censuses = 0;
+        let mut last_census_returned: Option<Instant> = None;
+        let mut first_census_returned: Option<Instant> = None;
+        let result = monitor_process(
+            child,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(15),
+                cpu_budget_usec: Some(5_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            started,
+            &mut observation,
+            |_| Ok(()),
+            |_| {
+                if last_census_returned
+                    .is_none_or(|returned| returned.elapsed() >= Duration::from_millis(500))
+                {
+                    censuses += 1;
+                    std::thread::sleep(Duration::from_secs(1));
+                    let returned = Instant::now();
+                    last_census_returned = Some(returned);
+                    first_census_returned.get_or_insert(returned);
+                }
+                Err("fixture scan deadline".into())
+            },
+        );
+        let error = result
+            .map(|_| ())
+            .expect_err("a census that never succeeds must stop the command");
+        assert!(error.contains("sampling: fixture scan deadline"), "{error}");
+        assert_eq!(
+            observation.termination,
+            TerminationPath::AccountingUnavailableStop
+        );
+        assert!(first_census_returned.unwrap().elapsed() >= CELL_CPU_ACCOUNTING_GRACE);
+        // The cached refusal ends 500 ms after the first census returns, inside
+        // the grace, so a fresh census ran before the stop.
+        assert!(censuses >= 2, "{censuses}");
+        assert!(owned_child_is_reaped(pid));
+        let live = enabled_cpu(&observation);
+        assert_eq!(live.valid_polls, 0);
+        assert!(live.unavailable_polls >= 2);
+        measured_final_cpu(&observation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn live_cpu_conversion_refuses_unrepresentable_values() {
         assert_eq!(live_cpu_usage_usec(42, 0.0), Ok(0));
         assert_eq!(live_cpu_usage_usec(42, 0.125), Ok(125_000));
@@ -8910,7 +9663,6 @@ mod tests {
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: root.join(label).join("workdir/1"),
-            normalize_ptrace_golden: false,
         }
     }
 
@@ -9501,47 +10253,6 @@ int main(int argc, char **argv) {
     }
 
     #[test]
-    fn ptrace_golden_normalization_is_bounded_and_accounts_a_timeout() {
-        let root = std::env::temp_dir().join(format!(
-            "hermit-runner-normalization-budget-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("run1_log_fixture.log"), b"retained log\n").unwrap();
-        let program = root.join("hermit");
-        fs::write(&program, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let normalized = normalize_ptrace_golden(
-            program.to_str().unwrap(),
-            &root,
-            &root,
-            Instant::now() + Duration::from_secs(5),
-            Some(200_000),
-            (1, 5),
-            (
-                &mut Vec::new(),
-                InvocationRole::PtraceNormalization {
-                    execution_ordinal: 1,
-                },
-            ),
-        );
-        let error = normalized
-            .result
-            .expect_err("normalization must obey the shared CPU budget");
-        assert!(error.contains("CPU"), "{error}");
-        assert!(
-            normalized
-                .cpu_usage_usec
-                .is_some_and(|usage| usage >= 100_000),
-            "timed-out normalization must retain its measured CPU: {:?}",
-            normalized.cpu_usage_usec
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn sleeping_repeated_invocations_do_not_consume_the_cpu_budget() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-cell-deadline-{}",
@@ -9564,6 +10275,15 @@ int main(int argc, char **argv) {
         let mut mode = test.modes.remove("verify").unwrap();
         mode.runs = Some(3);
         test.modes.insert("naked".into(), mode);
+        // The property under test: three attempts that each sleep 0.7 s spend
+        // at least 2.1 s of wall time but almost no CPU, so the cell must
+        // pass under a 1 s aggregate CPU budget. That needs only total wall
+        // time > cpu_timeout_seconds; the wall deadline is the backstop for a
+        // wedged process, not part of the property. A 3 s deadline left
+        // about 0.9 s for three shell start-ups and timed out at 3.048 s on a
+        // heavily loaded host, so the deadline and the upper duration bound
+        // carry several seconds of margin. The lower bound of 2_000 ms still
+        // proves that wall time exceeded the CPU budget.
         let cell = SelectedCell {
             category: "fixture".into(),
             id: CellId {
@@ -9573,7 +10293,7 @@ int main(int argc, char **argv) {
             },
             test,
             enabled: true,
-            timeout_seconds: 3,
+            timeout_seconds: 10,
             cpu_timeout_seconds: 1,
         };
         let context = RunContext {
@@ -9616,7 +10336,7 @@ int main(int argc, char **argv) {
             .duration_ms
             .expect("a cell that executed must report measured wall time");
         assert!(
-            (2_000..3_000).contains(&duration_ms),
+            (2_000..10_000).contains(&duration_ms),
             "three sleeping attempts should pass despite exceeding the old one-second wall cap: {duration_ms}ms"
         );
         let attempt_cpu_usage_usec = result.attempts.iter().try_fold(0u64, |total, attempt| {
@@ -11062,7 +11782,15 @@ backends_disabled:
         assert!(replay.argv.windows(2).any(|window| {
             window[0] == "--verify-json" && window[1] == "/repo/results/replay-cell/verify-1.json"
         }));
-        assert!(!replay.argv.iter().any(|arg| arg.starts_with("--base-env")));
+        // Replay runs under the same minimal base environment as verify.
+        assert_eq!(
+            replay
+                .argv
+                .iter()
+                .filter(|arg| arg.starts_with("--base-env"))
+                .collect::<Vec<_>>(),
+            ["--base-env=minimal"]
+        );
         assert_eq!(
             guest_env_args(&replay.argv),
             vec![
@@ -12187,7 +12915,18 @@ exit "$(cat "$PWD/exit-status")"
         // candidate's arguments.
         // S13 of https://github.com/rrnewton/hermit/issues/3301 enabled dbt on
         // pid-probe, which adds the one portable dbt candidate.
-        assert_eq!(candidates.len(), 174);
+        // Six more portable KVM verify cells preserve the same parity argument contract.
+        // https://github.com/rrnewton/reverie/issues/891
+        // The three socket candidates join the six earlier KVM selections.
+        // https://github.com/rrnewton/reverie/issues/891
+        // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
+        // One epoll-pwait2 KVM candidate: https://github.com/rrnewton/reverie/issues/905.
+        // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
+        // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+        // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+        // 89 SaBRe candidates from the 2026-10-03 selection of ten-for-ten
+        // SaBRe verify cells (timeouts::SABRE_2026_10_03_EVIDENCE_SHA).
+        assert_eq!(candidates.len(), 174 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89);
         let mut by_backend = BTreeMap::new();
         for cell in &candidates {
             *by_backend
@@ -12196,7 +12935,12 @@ exit "$(cat "$PWD/exit-status")"
         }
         assert_eq!(
             by_backend,
-            BTreeMap::from([("dbt", 1), ("kvm", 75), ("liteinst", 97), ("sabre", 1)])
+            BTreeMap::from([
+                ("dbt", 1),
+                ("kvm", 75 + 6 + 3 + 1 + 1 + 1 + 1 + 1),
+                ("liteinst", 97),
+                ("sabre", 1 + 89)
+            ])
         );
         assert!(
             candidates
@@ -12225,8 +12969,8 @@ exit "$(cat "$PWD/exit-status")"
         }
     }
 
-    /// The kvm, liteinst and sabre candidates pinned above (75, 97 and 1) used to
-    /// add a ptrace reference run and a `hermit log-diff` comparison, and the
+    /// The kvm, liteinst and sabre candidates pinned above (75 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
+    /// 97 and 1 + 89) used to add a ptrace reference run and a `hermit log-diff` comparison, and the
     /// comparison could overwrite their outcome. Since
     /// https://github.com/rrnewton/hermit/issues/3301 each one runs only its own
     /// backend's strict verification, even when its log differs from ptrace's.
@@ -12360,7 +13104,6 @@ exit "$(cat "$PWD/exit-status")"
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
-            normalize_ptrace_golden: false,
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -12409,7 +13152,6 @@ exit "$(cat "$PWD/exit-status")"
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
-            normalize_ptrace_golden: false,
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -12843,7 +13585,6 @@ exit "$(cat "$PWD/exit-status")"
             comparator,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
-            normalize_ptrace_golden: false,
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -13012,6 +13753,18 @@ exit "$(cat "$PWD/exit-status")"
         report: VerificationReport,
         ending: &str,
     ) -> (CellResult, serde_json::Value) {
+        expected_exit_row_in_mode("verify", expected, report, ending)
+    }
+
+    /// [`expected_exit_row`] for a `mode` cell. The declaration is always on
+    /// the verify recipe, the only place validation admits it; a replay cell
+    /// gets a verify recipe beside its own.
+    fn expected_exit_row_in_mode(
+        mode: &str,
+        expected: Option<ExpectedGuestExit>,
+        report: VerificationReport,
+        ending: &str,
+    ) -> (CellResult, serde_json::Value) {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-expected-exit-row-{}-{:?}",
             std::process::id(),
@@ -13052,7 +13805,11 @@ cp "{}" "$verdict"
         .unwrap();
         fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let mut cell = ptrace_cell("verify");
+        let mut cell = ptrace_cell(mode);
+        if mode != "verify" {
+            let verify = ptrace_cell("verify").test.modes["verify"].clone();
+            cell.test.modes.insert("verify".into(), verify);
+        }
         cell.test.id = "fixture/expected-exit-row".into();
         cell.id.test = cell.test.id.clone();
         cell.timeout_seconds = 10;
@@ -13164,6 +13921,151 @@ cp "{}" "$verdict"
         assert_eq!(cell_expected_guest_exit(&ptrace_cell("verify")), None);
     }
 
+    /// A test with both a verify and a replay recipe, selected as its replay cell.
+    /// A replay cell passes on its verify cell's declared nonzero disposition
+    /// only through the same gate a verify cell does: a matched canonical
+    /// replay whose guest and Hermit both end that way. A wrong exit, a
+    /// diverged replay, or no declaration at all is still a failure.
+    #[test]
+    fn a_replay_cell_passes_on_the_inherited_exit_only_when_matched_and_exact() {
+        let (exact, _) = expected_exit_row_in_mode(
+            "replay",
+            Some(expected_exit(Some(7), None)),
+            expected_exit_report(Some(7), None),
+            "exit 7",
+        );
+        assert_eq!(exact.outcome, "PASS", "{:?}", exact.reason);
+        assert!(exact.attempts[0].argv.iter().any(|arg| arg == "record"));
+
+        let (wrong_exit, _) = expected_exit_row_in_mode(
+            "replay",
+            Some(expected_exit(Some(7), None)),
+            expected_exit_report(Some(6), None),
+            "exit 6",
+        );
+        assert_eq!(wrong_exit.outcome, "FAIL", "{:?}", wrong_exit.reason);
+        assert_eq!(
+            wrong_exit.reason.as_deref(),
+            Some("guest ended with exit code 6, but the manifest expects exit code 7")
+        );
+
+        let mut diverged = expected_exit_report(Some(7), None);
+        diverged.verified = false;
+        diverged.bitwise_parity = false;
+        diverged.verdict = Verdict::Diverged;
+        diverged.first_divergent_record = Some(9);
+        diverged.first_divergent_left_message = Some("left".into());
+        diverged.first_divergent_right_message = Some("right".into());
+        let (diverged, _) = expected_exit_row_in_mode(
+            "replay",
+            Some(expected_exit(Some(7), None)),
+            diverged,
+            "exit 7",
+        );
+        assert_eq!(diverged.outcome, "FAIL", "{:?}", diverged.reason);
+
+        let (undeclared, _) = expected_exit_row_in_mode(
+            "replay",
+            None,
+            expected_exit_report(Some(7), None),
+            "exit 7",
+        );
+        assert_ne!(undeclared.outcome, "PASS", "{:?}", undeclared.reason);
+    }
+
+    fn replay_cell_with_verify(verify: ModeRecipe, replay: ModeRecipe) -> SelectedCell {
+        let mut cell = ptrace_cell("replay");
+        cell.test.modes.insert("verify".into(), verify);
+        cell.test.modes.insert("replay".into(), replay);
+        cell
+    }
+
+    /// A replay cell records the program its verify cell checks: it inherits
+    /// verify's guest inputs and expectations, and a guest input it declares
+    /// itself wins.
+    #[test]
+    fn a_replay_cell_inherits_its_verify_guest_inputs_and_expectations() {
+        let base = ptrace_cell("verify").test.modes["verify"].clone();
+        let mut verify = base.clone();
+        verify.guest_args = BTreeMap::from([("ptrace".into(), vec!["workdir".into()])]);
+        verify.workdir = Some("/srv".into());
+        verify.env = BTreeMap::from([("MODE".into(), "x".into())]);
+        verify.expected_guest_exit = Some(expected_exit(Some(3), None));
+        verify.expected_stdout = BTreeMap::from([("ptrace".into(), "p\n".into())]);
+        verify.expected_stdout_contains = BTreeMap::from([("ptrace".into(), "ok".into())]);
+        let inherited = replay_cell_with_verify(verify.clone(), base.clone());
+        assert_eq!(cell_guest_args(&inherited, "ptrace"), ["workdir"]);
+        assert_eq!(cell_guest_args(&inherited, "dbt"), Vec::<String>::new());
+        assert_eq!(cell_workdir(&inherited).as_deref(), Some("/srv"));
+        assert_eq!(cell_mode_env(&inherited), verify.env);
+        assert_eq!(
+            cell_expected_guest_exit(&inherited),
+            Some(expected_exit(Some(3), None))
+        );
+        assert_eq!(cell_expected_stdout(&inherited).as_deref(), Some("p\n"));
+        assert_eq!(
+            cell_expected_stdout_contains(&inherited).as_deref(),
+            Some("ok")
+        );
+
+        let mut replay = base;
+        replay.guest_args = BTreeMap::from([("ptrace".into(), vec!["--record".into()])]);
+        let overridden = replay_cell_with_verify(verify.clone(), replay);
+        assert_eq!(cell_guest_args(&overridden, "ptrace"), ["--record"]);
+        // Validation refuses `workdir` on a replay recipe, so the inherited one
+        // is the only one a replay cell can have.
+        assert_eq!(cell_workdir(&overridden).as_deref(), Some("/srv"));
+
+        // Chaos keeps reading only its own recipe.
+        let mut chaos = ptrace_cell("chaos");
+        chaos.test.modes.insert("verify".into(), verify);
+        assert_eq!(cell_guest_args(&chaos, "ptrace"), Vec::<String>::new());
+        assert_eq!(cell_workdir(&chaos), None);
+        assert_eq!(cell_expected_guest_exit(&chaos), None);
+    }
+
+    /// Verify, replay and chaos argv come from one builder: replay runs the
+    /// same guest environment and mode environment, and differs only in its
+    /// subcommand and recording arguments.
+    #[test]
+    fn replay_argv_carries_the_inherited_verify_environment() {
+        let context = run_context(Path::new("/repo"));
+        let base = ptrace_cell("verify").test.modes["verify"].clone();
+        let mut verify = base.clone();
+        verify.env = BTreeMap::from([("MODE".into(), "x".into())]);
+        verify.workdir = Some("/srv".into());
+        let cell = replay_cell_with_verify(verify, base);
+        let spec = build_spec(
+            &context,
+            &cell,
+            PathBuf::from("/repo/results/replay-cell"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+            15,
+        )
+        .unwrap();
+        assert_eq!(&spec.argv[5..7], ["record", "start"]);
+        assert!(spec.argv.iter().any(|arg| arg == "MODE=x"));
+        assert!(
+            spec.argv
+                .windows(2)
+                .any(|window| window[0] == "--workdir" && window[1] == "/srv")
+        );
+        assert!(
+            spec.argv
+                .windows(2)
+                .any(|window| window[0] == "--record-timeout" && window[1] == "15")
+        );
+        assert!(
+            !spec
+                .argv
+                .iter()
+                .any(|arg| arg.starts_with("--verify-allow"))
+        );
+        assert_eq!(spec.argv.last().map(String::as_str), Some("/bin/true"));
+    }
+
     /// A canonical matched report whose two runs printed `first` and
     /// `second` on stdout.
     fn stdout_report(first: &str, second: &str) -> VerificationReport {
@@ -13233,7 +14135,6 @@ cp "{}" "$verdict"
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
-            normalize_ptrace_golden: false,
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -13871,7 +14772,6 @@ cp "{}" "$verdict"
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
-            normalize_ptrace_golden: false,
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -14154,10 +15054,18 @@ cp "{}" "$verdict"
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+        // The property under test: preparation and execution each get their
+        // own wall deadline of timeout_seconds, so preparation time is not
+        // charged against the execution budget. Each phase sleeps 2.1 s under
+        // a 4 s deadline, so the two phases together (at least 4.2 s) exceed
+        // one deadline: a shared deadline would time out the run, while
+        // separate deadlines let both phases pass. Each phase keeps about
+        // 1.9 s for process start-up on a loaded host; the earlier 1.1 s
+        // sleeps under a 2 s deadline left only 0.9 s per phase.
         let program = root.join("fixture.sh");
         fs::write(
             &program,
-            "#!/bin/sh\ncase \"$1\" in\n  --prepare) sleep 1.1 ;;\n  --run) sleep 1.1; printf 'complete\\n' ;;\n  *) exit 64 ;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\n  --prepare) sleep 2.1 ;;\n  --run) sleep 2.1; printf 'complete\\n' ;;\n  *) exit 64 ;;\nesac\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&program).unwrap().permissions();
@@ -14184,7 +15092,7 @@ cp "{}" "$verdict"
             },
             test,
             enabled: true,
-            timeout_seconds: 2,
+            timeout_seconds: 4,
             cpu_timeout_seconds: 1,
         };
         let context = run_context(&root);
@@ -14206,7 +15114,7 @@ cp "{}" "$verdict"
         assert!(!result.attempts[0].timed_out);
         assert_eq!(result.attempts[0].stdout, "complete\n");
         assert!(
-            result.duration_ms.is_some_and(|duration| duration >= 2_000),
+            result.duration_ms.is_some_and(|duration| duration >= 4_000),
             "the fixture did not exercise separate preparation and execution time: {result:?}"
         );
         fs::remove_dir_all(root).unwrap();

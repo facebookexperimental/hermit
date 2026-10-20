@@ -1,0 +1,118 @@
+name: Cached apt install
+description: >-
+  Install apt packages from a per-image, per-package-list cache of the
+  downloaded .deb files, falling back to a bounded, retried mirror download.
+
+# WHY: every Dependencies step of .github/workflows/ci-portable.yml used to run
+# a bare `sudo apt-get update && sudo apt-get install -y ...` of up to ~70
+# packages (about 203-208 MB) from the runner image's default mirror, with no
+# cache, no timeout and no retry. Individual runners that got 68-216 kB/s from
+# that mirror spent their whole job budget in this step and were cancelled at
+# timeout-minutes before any test ran: 9 jobs in 3 runs on 2026-10-01, for
+# example https://github.com/rrnewton/hermit/actions/runs/36890056138
+# (https://github.com/rrnewton/hermit/issues/3487).
+#
+# WHAT: four steps around ci/apt-install-cached.sh, which documents the apt side
+# (offline install on a hit, per-attempt timeouts and retries on a miss, and the
+# install phase that is deliberately never timed out or retried).
+#   1. prepare  create the archive directory and compute the cache key
+#               apt-debs-v1-<ImageOS>-<ImageVersion>-<arch>-<hash of the sorted,
+#               de-duplicated package list>-s<hash of ci/apt-install-cached.sh>
+#   2. restore  actions/cache/restore of that directory under that exact key
+#   3. install  cache hit: install the restored files, no mirror contacted;
+#               miss or unusable hit: download, then install
+#   4. save     actions/cache/save, only after a successful install on a miss
+#
+# KEY DESIGN. The key changes whenever the package list, the runner image or
+# ci/apt-install-cached.sh (whose apt-get options shape what a miss downloads)
+# changes, and only then. ImageVersion rotates roughly weekly as GitHub
+# republishes ubuntu-latest, which is also when the image's own package set and
+# the mirror's current versions move, so a new image starts a new cache instead
+# of installing week-old .deb files against a newer base. Within one
+# ImageVersion a hit installs the versions the mirror served when the entry was
+# saved, not the mirror's current ones, so an update published after the save
+# (security fixes included) reaches hit jobs only when the image rotates or
+# KEY_VERSION is bumped; before this action every job installed the mirror's
+# current versions. That is acceptable for CI build and test dependencies. There
+# are no restore-keys on purpose: a partial match would restore files for a
+# different list or image, and the install would then fall back to the mirror
+# anyway.
+#
+# A HIT THAT CANNOT BE USED is never replaced automatically: step 4 skips exact
+# hits and a cache entry is immutable for its key and branch scope. The install
+# step then falls back to the mirror and its warning names the key and the two
+# remedies (`gh cache delete <key>`, or bump KEY_VERSION).
+#
+# CACHE SCOPE (GitHub's rule, not ours). A run can restore caches saved on its
+# own ref and on the repository's default branch (main); it saves only to its
+# own ref. For this workflow that means:
+#   * runs on `integration` (its push trigger) build and reuse their own cache;
+#     the first integration run after this lands, and the first after each image
+#     rotation, is a cold miss.
+#   * a `workflow_dispatch --ref <feature-branch>` run reuses that branch's own
+#     cache and anything main has; its saves are invisible to every other
+#     branch.
+#   * only a `workflow_dispatch --ref main` run saves into main's scope, which
+#     is the one every branch, integration included, can read.
+#
+# WHY NO continue-on-error ON THE CACHE STEPS. Neither can fail the job by
+# itself. actions/cache/restore treats a service or download error as a miss
+# (it fails only on invalid inputs, such as a key containing a comma, which the
+# computed key cannot contain; SEGMENT_DOWNLOAD_TIMEOUT_MINS below bounds a
+# slow restore), and
+# actions/cache/save catches every error, including the "unable to reserve
+# cache" race when matrix siblings save the same key at once, and reports it as
+# a warning (https://github.com/actions/cache/blob/main/src/saveImpl.ts).
+# ci/check-shard-coverage.sh forbids continue-on-error in the e2e and regular
+# jobs, and none is needed here.
+#
+# The install step's failure DOES fail the job: a missing package is a broken
+# test environment, not a cache problem.
+#
+# REQUIRES the repository checked out at the workspace root, which `uses:
+# ./.github/actions/apt-install` already requires.
+
+inputs:
+  packages:
+    description: Whitespace-separated Debian package names, exactly as for apt-get install.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare apt archive cache
+      id: prepare
+      shell: bash
+      env:
+        APT_PACKAGES: ${{ inputs.packages }}
+      run: '"$GITHUB_WORKSPACE/ci/apt-install-cached.sh" prepare'
+
+    - name: Restore apt archive cache
+      id: restore
+      uses: actions/cache/restore@v4
+      env:
+        # The default is 10 minutes per segment. A cache restore that slow is
+        # the same failure as the slow mirror this exists to avoid; give up
+        # sooner and take the miss path, whose phases are bounded.
+        SEGMENT_DOWNLOAD_TIMEOUT_MINS: "5"
+      with:
+        path: ${{ steps.prepare.outputs.dir }}
+        key: ${{ steps.prepare.outputs.key }}
+
+    - name: Install apt packages
+      shell: bash
+      env:
+        APT_PACKAGES: ${{ inputs.packages }}
+        APT_CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+      run: '"$GITHUB_WORKSPACE/ci/apt-install-cached.sh" install'
+
+    # Runs only when the install succeeded (a composite stops at a failed step)
+    # and the key was not already an exact hit; a hit's key exists and cache
+    # entries are immutable. The path and key must be the restore step's
+    # exactly, or the saved entry would never match a later restore.
+    - name: Save apt archive cache
+      if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ steps.prepare.outputs.dir }}
+        key: ${{ steps.prepare.outputs.key }}

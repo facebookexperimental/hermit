@@ -43,6 +43,12 @@ mod rust_script_prelude;
 #[path = "../ci/manifest-plan/src/manifest_value.rs"]
 mod manifest_value;
 
+// The corpus module names its result classes through the shared CI-selection
+// types; this adapter needs only that enum.
+#[allow(dead_code)]
+#[path = "../ci/manifest-plan/src/ci_selection.rs"]
+mod ci_selection;
+
 // A `corpus:` bucket (compat.yaml) is expanded into the ordinary tests the
 // harness runs, and its argv placeholders rendered for a shell; this adapter
 // uses only that part of the shared module.
@@ -408,6 +414,29 @@ fn mode_guest_args(spec: &Value, mode: &str, backend: &str, id: &str) -> Vec<Str
     )
 }
 
+/// Guest arguments one (mode, backend) cell runs with. A replay cell records
+/// the program its verify cell runs, so for a backend its replay recipe does not
+/// name it takes `modes.verify.guest_args.<backend>`, the same rule as
+/// `hermit-manifest-plan`'s `cell_guest_args`.
+fn cell_guest_args(
+    modes: &std::collections::BTreeMap<String, Value>,
+    mode: &str,
+    backend: &str,
+    id: &str,
+) -> Vec<String> {
+    let declares = |spec: &Value| {
+        spec.get("guest_args")
+            .and_then(Value::as_table)
+            .is_some_and(|by_backend| by_backend.contains_key(backend))
+    };
+    match modes.get("verify") {
+        Some(verify) if mode == "replay" && !declares(&modes[mode]) => {
+            mode_guest_args(verify, "verify", backend, id)
+        }
+        _ => mode_guest_args(&modes[mode], mode, backend, id),
+    }
+}
+
 /// Append guest arguments while preserving `sh -c`'s `$0` convention.
 fn guest_with_args(test: &Value, guest: &str, guest_args: &[String]) -> String {
     if guest_args.is_empty() {
@@ -476,7 +505,7 @@ fn hermit_command(
             )
         }
         "replay" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log {log} --backend {be} record start --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout \"$remaining\" {HERMIT_GUEST_ENV_ARGS}{extra_joined} -- {guest}"
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log {log} --backend {be} record start --base-env=minimal --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout \"$remaining\" {HERMIT_GUEST_ENV_ARGS}{extra_joined} -- {guest}"
         ),
         "chaos" => {
             let seed = seed.unwrap_or_else(|| {
@@ -895,7 +924,7 @@ fn build_full_command(
 ) -> (String, String, String) {
     let (mode, backend, lane, timeout) = resolve_cell(test, id, inherited_timeout_seconds, args);
     let (setup, guest) = setup_prefix(test, id);
-    let guest_args = mode_guest_args(&modes_table(test, id)[&mode], &mode, &backend, id);
+    let guest_args = cell_guest_args(modes_table(test, id), &mode, &backend, id);
     let guest = guest_with_args(test, &guest, &guest_args);
     let log = args
         .flag("log")
@@ -1221,6 +1250,41 @@ guest_args:
     .parse()
     .unwrap();
     assert!(validate_mode_guest_args(&empty_guest_args, "verify", "fixture").is_ok());
+    // A replay cell runs its verify recipe's guest arguments for a backend its
+    // own recipe does not name, and its own (even an empty vector) where it does.
+    let inherited_guest_args: Value = r#"
+verify:
+  backends_enabled: [ptrace, liteinst]
+  guest_args:
+    ptrace: [from-verify]
+    liteinst: [verify-edge]
+replay:
+  backends_enabled: [ptrace, liteinst]
+  guest_args:
+    liteinst: []
+"#
+    .parse()
+    .unwrap();
+    let inherited_modes = inherited_guest_args.as_table().unwrap();
+    assert_eq!(
+        cell_guest_args(inherited_modes, "replay", "ptrace", "fixture"),
+        vec!["from-verify"]
+    );
+    assert!(cell_guest_args(inherited_modes, "replay", "liteinst", "fixture").is_empty());
+    assert!(
+        hermit_command(
+            "replay",
+            "ptrace",
+            "portable",
+            None,
+            &[],
+            false,
+            "info",
+            &[],
+            "g"
+        )
+        .contains("record start --base-env=minimal ")
+    );
     let nul_guest_args: Value = r#"
 backends_enabled: [ptrace]
 guest_args:

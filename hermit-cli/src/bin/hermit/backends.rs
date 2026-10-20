@@ -26,6 +26,7 @@ use std::env;
 #[cfg(feature = "dbt")]
 use std::ffi::OsStr;
 use std::ffi::OsString;
+#[cfg(any(feature = "sabre", feature = "dbt"))]
 use std::fs;
 #[cfg(feature = "dbt")]
 use std::io::IsTerminal as _;
@@ -41,12 +42,14 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 #[cfg(feature = "dbt")]
 use std::os::fd::FromRawFd;
+#[cfg(any(feature = "sabre", feature = "dbt"))]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(any(feature = "dbt", test))]
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 #[cfg(feature = "dbt")]
 use std::path::PathBuf;
+#[cfg(any(feature = "sabre", feature = "dbt"))]
 use std::process::Command as StdCommand;
 #[cfg(any(feature = "dbt", test))]
 use std::process::Output;
@@ -81,6 +84,8 @@ use super::verify::ComparisonOptions;
 use super::verify::DbtCountedBranchComparison;
 #[cfg(feature = "dbt")]
 use super::verify::LogCompareStrictness;
+#[cfg(feature = "dbt")]
+use super::verify::SecondRun;
 #[cfg(feature = "dbt")]
 use super::verify::Verdict;
 #[cfg(feature = "dbt")]
@@ -1013,9 +1018,10 @@ pub(super) fn run_dbt(
 
     // The capture names are READ BY THE HARNESS, so they are not a local choice.
     //
-    // `ci/compat-envelope/pressure-test.rs` and `ci/manifest-plan/src/runner.rs`
-    // both scan a retained verify-log directory with
-    // `name.starts_with("run1_log_")` / `("run2_log_")`. This call used to pass
+    // `ci/compat-envelope/pressure-test.rs` scans a retained verify-log
+    // directory with `name.starts_with("run1_log_")` / `("run2_log_")`, and the
+    // parity post-pass in `ci/manifest-plan/src/parity.rs` reads the
+    // `run1_log_` golden. This call used to pass
     // "dbt-run1"/"dbt-run2", which `temp_log_files_in` turns into the prefixes
     // `dbt-run1_log_` / `dbt-run2_log_` -- and those do not start with
     // `run1_log_`. `run.rs` passes "run1"/"run2" for every other backend.
@@ -1243,6 +1249,11 @@ pub(super) fn run_dbt(
             keep_logs: keep_logs
                 || branch_clock_diverged
                 || summary_comparison.requires_log_retention(),
+            // The same divergence also overrides a log match: the verdict
+            // becomes a divergence after this comparison, so both logs are
+            // retained rather than the single golden log `--keep-logs` keeps
+            // after a match.
+            match_overridden: branch_clock_diverged || summary_comparison.requires_log_retention(),
             failed_log_retention: (!keep_logs)
                 .then(super::verify::default_failed_verify_log_retention),
             // Each log holds `DbtEvidence::all_records()`, so every
@@ -1280,7 +1291,12 @@ pub(super) fn run_dbt(
          was given, so a divergence confined to a buffer whose length is stable \
          would not have been seen; drop that flag to include it."
     };
-    announce_verification_outcome(&outcome, success_message, "Failure: nondeterministic.");
+    announce_verification_outcome(
+        &outcome,
+        SecondRun::Rerun,
+        success_message,
+        "Failure: nondeterministic.",
+    );
     if !outcome.verified() {
         return outcome.into_exit_status();
     }
@@ -1524,6 +1540,7 @@ fn output_status(output: &Output) -> ExitStatus {
     ExitStatus::from_raw(output.status.into_raw())
 }
 
+#[cfg(feature = "sabre")]
 fn sabre_artifact(variable: &str, description: &str, executable: bool) -> Result<OsString, Error> {
     let value = std::env::var_os(variable).ok_or_else(|| {
         Error::msg(format!(
@@ -1533,6 +1550,7 @@ fn sabre_artifact(variable: &str, description: &str, executable: bool) -> Result
     validate_sabre_artifact(Path::new(&value), variable, executable)
 }
 
+#[cfg(feature = "sabre")]
 fn validate_sabre_artifact(
     requested_path: &Path,
     variable: &str,
@@ -1565,8 +1583,10 @@ fn validate_sabre_artifact(
     Ok(path.into_os_string())
 }
 
+#[cfg(feature = "sabre")]
 const SABRE_QUIET_ENV: &str = "REVERIE_SABRE_STRACE_QUIET";
 
+#[cfg(feature = "sabre")]
 fn sabre_command(
     runner: &OsString,
     sabre: &OsString,
@@ -1594,6 +1614,7 @@ fn sabre_command(
     command
 }
 
+#[cfg(feature = "sabre")]
 fn sabre_artifacts() -> Result<(OsString, OsString, OsString), Error> {
     Ok((
         sabre_artifact("HERMIT_SABRE_RUNNER", "reverie-sabre-strace", true)?,
@@ -1617,6 +1638,7 @@ fn sabre_artifacts() -> Result<(OsString, OsString, OsString), Error> {
 /// * HERMIT_SABRE_PLUGIN: libreverie_sabre_strace_plugin.so.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#589): Review SaBRe CLI backend dispatch.
+#[cfg(feature = "sabre")]
 pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, Error> {
     let (runner, sabre, plugin) = sabre_artifacts()?;
 
@@ -1634,8 +1656,29 @@ pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, E
     Ok(status.into())
 }
 
+#[cfg(not(feature = "sabre"))]
+pub fn run_sabre_strace(_program: &Path, _args: &[String]) -> Result<ExitStatus, Error> {
+    hermit::Backend::Sabre.ensure_available()?;
+    unreachable!("SaBRe availability must fail when the feature is disabled");
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "sabre"))]
+    #[test]
+    fn disabled_sabre_strace_refuses_before_resolving_artifacts() {
+        let error = super::run_sabre_strace(
+            std::path::Path::new("/hermit-missing-disabled-sabre-program"),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the `sabre` feature is not enabled")
+        );
+    }
+
     #[cfg(feature = "dbt")]
     #[tokio::test]
     async fn dbt_abnormal_cleanup_ends_an_unregistered_scheduler() {
@@ -1783,6 +1826,7 @@ mod tests {
                     diagnostic_full_trace: false,
                     compare_io_buffers: true,
                     keep_logs: false,
+                    match_overridden: false,
                     failed_log_retention: None,
                     record_envelope: RecordEnvelope::all_records_v1(),
                     virtualize_time: true,
@@ -2751,6 +2795,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_artifact_returns_the_validated_absolute_path() {
         let file = tempfile::NamedTempFile::new_in(".").unwrap();
         let relative_path = file.path().file_name().unwrap();

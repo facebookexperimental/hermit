@@ -2283,6 +2283,11 @@ const BUCK_BUILD_PIN_SITE: &str = "hermit-cli/BUCK";
 /// A stale value therefore produces a working binary that reports the wrong
 /// backend revision, even while every Cargo entry and the submodule gitlink are
 /// uniform. The ordinary pin gate must cover that active non-Cargo binding.
+///
+/// The release targets may also consume it, through the one
+/// [`UNSTAMPED_RELEASE_ALIAS`] line, when CI builds them without the release
+/// provenance stamp. That alias reads the same checked block, so it needs no
+/// pin of its own; any other mention is still refused.
 fn parse_buck_build_pin_binding(line: &str) -> Result<Option<String>, String> {
     let trimmed = line.trim_start();
     if trimmed.starts_with('#') {
@@ -2321,6 +2326,9 @@ fn parse_buck_build_pin_binding(line: &str) -> Result<Option<String>, String> {
     Ok(Some(value.to_string()))
 }
 
+const UNSTAMPED_RELEASE_ALIAS: &str =
+    "release_build_env = hermit_build_env if release_unstamped else {";
+
 fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
     let path = root.join(BUCK_BUILD_PIN_SITE);
     let contents = match fs::read_to_string(&path) {
@@ -2337,6 +2345,7 @@ fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
     let lines: Vec<&str> = contents.lines().collect();
     let mut build_env_starts = Vec::new();
     let mut build_env_consumers = 0usize;
+    let mut release_aliases = 0usize;
     let mut invalid_mentions = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         let code = line.split('#').next().unwrap_or("").trim();
@@ -2346,16 +2355,22 @@ fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
         match code {
             "hermit_build_env = {" => build_env_starts.push(index),
             "env = hermit_build_env," => build_env_consumers += 1,
+            UNSTAMPED_RELEASE_ALIAS => release_aliases += 1,
             _ => invalid_mentions.push((index + 1, code)),
         }
     }
-    if build_env_starts.len() != 1 || build_env_consumers != 2 || !invalid_mentions.is_empty() {
+    if build_env_starts.len() != 1
+        || build_env_consumers != 2
+        || release_aliases > 1
+        || !invalid_mentions.is_empty()
+    {
         loud_header("BUCK BUILD ENV MISSING OR AMBIGUOUS - BLOCKED");
         eprintln!("Canonical Reverie pin: {pin}");
         eprintln!(
-            "Expected exactly one canonical `hermit_build_env = {{` block, two `env = hermit_build_env,` consumers, and no reassignment or mutation in {BUCK_BUILD_PIN_SITE}; found {} block opener(s), {} consumer(s), and {} unsupported active mention(s).",
+            "Expected exactly one canonical `hermit_build_env = {{` block, two `env = hermit_build_env,` consumers, at most one `{UNSTAMPED_RELEASE_ALIAS}` line, and no reassignment or mutation in {BUCK_BUILD_PIN_SITE}; found {} block opener(s), {} consumer(s), {} alias line(s), and {} unsupported active mention(s).",
             build_env_starts.len(),
             build_env_consumers,
+            release_aliases,
             invalid_mentions.len()
         );
         for (line, code) in &invalid_mentions {
@@ -4334,6 +4349,41 @@ mod tests {
             check_buck_build_pin_binding(&root, pin).expect("check duplicate bindings"),
             1,
             "duplicate active bindings are ambiguous and must fail closed"
+        );
+
+        let aliased = |alias: &str| {
+            consumed(format!(
+                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n{alias}}}\n"
+            ))
+        };
+        fs::write(&buck, aliased(&format!("{UNSTAMPED_RELEASE_ALIAS}\n")))
+            .expect("write unstamped release alias");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check unstamped release alias"),
+            0,
+            "the unstamped release alias reads the checked block and is accepted"
+        );
+        fs::write(
+            &buck,
+            aliased(&format!(
+                "{UNSTAMPED_RELEASE_ALIAS}\n}}\n{UNSTAMPED_RELEASE_ALIAS}\n"
+            )),
+        )
+        .expect("write duplicated unstamped release alias");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check duplicated alias"),
+            1,
+            "a second alias line is ambiguous and must fail closed"
+        );
+        fs::write(
+            &buck,
+            aliased("release_build_env = hermit_build_env if True else {\n"),
+        )
+        .expect("write near-miss alias");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check near-miss alias"),
+            1,
+            "only the exact alias line is accepted"
         );
 
         fs::write(&buck, consumed("hermit_build_env = {}\n".to_string()))

@@ -527,12 +527,33 @@ static void check_sysinfo_memory_matches_configured_memory(void) {
 // advances once 10ms of the matching time has accumulated. A fixed handful of
 // cheap syscalls does not guarantee that: 2048 getpid calls take well under a
 // millisecond on Linux and under Detcore's modeled syscall costs alike. Keep
-// issuing syscall work until this process's system CPU clock crosses a tick,
-// and bound the loop so a clock that never advances still fails the checks
-// that follow instead of hanging.
-enum { SYSTEM_TICK_WORK_BOUND = 100000 };
+// issuing syscall work until this process's system CPU clock has advanced by
+// two ticks, and bound the loop so a clock that never advances fails loudly
+// instead of hanging.
+//
+// One tick is not enough for the elapsed-clock check that follows. The two
+// clocks are sampled at independent phases, so the first system tick can land
+// immediately after the work starts while the elapsed clock is still early in
+// its own tick: less than 10ms of time has then passed and neither clock is
+// required to have crossed a boundary. Two system ticks mean more than 10ms of
+// system time was spent, and for a single thread elapsed time is at least
+// system time, so the elapsed clock must also have crossed at least one
+// boundary.
+//
+// The bound only turns a clock that never advances into a named failure; it is
+// not a threshold the test is judged by. Reaching two ticks took 362 (parent)
+// and 398 (child) iterations under Hermit ptrace, identical across runs, and
+// 57,449 to 115,215 iterations on native Linux (80 loops over 40 runs), so
+// 1,000,000 leaves more than 8x headroom over the slowest native loop.
+// Exhausting it takes about 0.3 s natively but about 150 s under Hermit ptrace,
+// past the manifest cell's 22 s CPU timeout (and its 57 s wall timeout), so
+// there a stuck clock fails the cell as a timeout rather than with this
+// message. Either way the cell fails. There is deliberately no clock-based
+// give-up: under Hermit it would read virtual time, which a clock bug could
+// stop as well.
+enum { SYSTEM_TICK_WORK_BOUND = 1000000, SYSTEM_TICKS_REQUIRED = 2 };
 
-static void syscall_work_until_system_tick(clock_t start_stime) {
+static void syscall_work_until_system_ticks(clock_t start_stime) {
   for (int i = 0; i < SYSTEM_TICK_WORK_BOUND; ++i) {
     int fd = dup(STDOUT_FILENO);
     if (fd < 0) {
@@ -545,10 +566,17 @@ static void syscall_work_until_system_tick(clock_t start_stime) {
     if (times(&usage) == (clock_t)-1) {
       fail("times during work");
     }
-    if (usage.tms_stime > start_stime) {
+    if (usage.tms_stime >= start_stime + SYSTEM_TICKS_REQUIRED) {
       return;
     }
   }
+  fprintf(
+      stderr,
+      "times system CPU clock did not advance %d ticks within %d syscall "
+      "work iterations\n",
+      SYSTEM_TICKS_REQUIRED,
+      SYSTEM_TICK_WORK_BOUND);
+  exit(1);
 }
 
 static void check_times(void) {
@@ -562,7 +590,7 @@ static void check_times(void) {
     fail("times first");
   }
 
-  syscall_work_until_system_tick(first_usage.tms_stime);
+  syscall_work_until_system_ticks(first_usage.tms_stime);
   clock_t second = times(&second_usage);
   if (second == (clock_t)-1) {
     fail("times second");
@@ -593,7 +621,7 @@ static void check_times(void) {
     if (times(&child_start) == (clock_t)-1) {
       _exit(1);
     }
-    syscall_work_until_system_tick(child_start.tms_stime);
+    syscall_work_until_system_ticks(child_start.tms_stime);
     _exit(0);
   }
 
@@ -604,6 +632,16 @@ static void check_times(void) {
   }
   if (child_info.si_pid != child) {
     fprintf(stderr, "times waitid WNOWAIT returned the wrong child\n");
+    exit(1);
+  }
+  // The child reports an exhausted work bound through its exit status; do not
+  // let the parent's child-clock checks run on a child that failed.
+  if (child_info.si_code != CLD_EXITED || child_info.si_status != 0) {
+    fprintf(
+        stderr,
+        "times child work did not exit cleanly: code=%d status=%d\n",
+        child_info.si_code,
+        child_info.si_status);
     exit(1);
   }
   struct tms before_reap;

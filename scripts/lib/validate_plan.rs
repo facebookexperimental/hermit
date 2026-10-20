@@ -88,33 +88,27 @@ const COMPAT_MEM_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 /// Which compatibility corpus a focused mode runs, and how it is labelled.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CompatMode {
-    Strict,
     PortableStrict,
-    Sabre,
     E9patch,
-    Rr,
 }
 
 impl CompatMode {
     /// The `ci/compat/corpus-<mode>.json` file this mode reads. `PortableStrict`
-    /// shares `strict`'s corpus: `PORTABLE_STRICT_PROBE_ARGS` changes the Hermit
-    /// FLAGS, never corpus membership (validate.sh:2965).
+    /// reads the strict lane's corpus: `PORTABLE_STRICT_PROBE_ARGS` changes the
+    /// Hermit FLAGS, never corpus membership (validate.sh:2965). The strict lane
+    /// itself runs those rows as compat.yaml cells since 2026-10-02.
     pub fn corpus_name(self) -> &'static str {
         match self {
-            CompatMode::Strict | CompatMode::PortableStrict => "strict",
-            CompatMode::Sabre => "sabre",
+            CompatMode::PortableStrict => "strict",
             CompatMode::E9patch => "e9patch",
-            CompatMode::Rr => "rr",
         }
     }
 
     /// Plain-language name printed per row and in the summary.
     pub fn display_name(self) -> &'static str {
         match self {
-            CompatMode::Strict | CompatMode::PortableStrict => "legacy below-L2 stripped verify",
-            CompatMode::Sabre => "SaBRe legacy below-L2 stripped verify",
+            CompatMode::PortableStrict => "legacy below-L2 stripped verify",
             CompatMode::E9patch => "e9patch legacy below-L2 stripped verify",
-            CompatMode::Rr => "rr",
         }
     }
 
@@ -123,14 +117,6 @@ impl CompatMode {
     pub fn run_args(self, label: &str, nsswitch: &str) -> Vec<String> {
         let s = |v: &str| v.to_string();
         match self {
-            CompatMode::Strict => vec![
-                s("run"),
-                s("--strict"),
-                s("--verify"),
-                s("--env"),
-                s("TMPDIR=/tmp"),
-                s("--"),
-            ],
             CompatMode::PortableStrict => vec![
                 s("run"),
                 s("--strict"),
@@ -144,16 +130,6 @@ impl CompatMode {
                 s("TMPDIR=/tmp"),
                 s("--"),
             ],
-            CompatMode::Sabre => {
-                vec![
-                    s("--backend"),
-                    s("sabre"),
-                    s("run"),
-                    s("--strict"),
-                    s("--verify"),
-                    s("--"),
-                ]
-            }
             CompatMode::E9patch => {
                 let mut v = vec![s("--backend"), s("e9patch"), s("run")];
                 // These rows query owner names the host may delegate to an async
@@ -171,17 +147,6 @@ impl CompatMode {
                 v.push(s("--verify"));
                 v.push(s("--"));
                 v
-            }
-            // rr rows are driven through `hermit record start --verify`, matching
-            // rr_compatibility_probe rather than the plain run path.
-            CompatMode::Rr => {
-                vec![
-                    s("record"),
-                    s("start"),
-                    s("--verify"),
-                    s("--verify-strict"),
-                    s("--"),
-                ]
             }
         }
     }
@@ -212,9 +177,6 @@ pub enum CompatDisposition {
     Passed,
     /// Passed while listed as known fail-closed. The EXPECTATION is stale, not the run.
     PassedButListedFailClosed,
-    /// Failed, listed, and exempted. This is `Strict`'s historical behaviour and is deliberately
-    /// confined to it.
-    KnownFailClosedExempt,
     /// Failed while listed as known fail-closed, and STILL BLOCKING. Reporting the row's reason
     /// is not the same as excusing it; this variant exists so the reason can be printed without
     /// the failure being downgraded.
@@ -245,8 +207,8 @@ impl CompatDisposition {
 /// exercise every combination without constructing or planting a corpus, and so production
 /// keeps reading the real tables.
 ///
-/// `Strict` keeps its exemption. `PortableStrict` gains REPORTING ONLY. Every other mode --
-/// `Sabre`, `E9patch`, `Rr` -- consults neither table and gains nothing: a failure there is
+/// `PortableStrict` gains REPORTING ONLY. Every other mode --
+/// `E9patch` -- consults neither table and gains nothing: a failure there is
 /// blocking exactly as before.
 pub fn classify_compat_outcome(
     mode: CompatMode,
@@ -254,10 +216,9 @@ pub fn classify_compat_outcome(
     listed_failclosed: bool,
     listed_diagnostic: bool,
 ) -> CompatDisposition {
-    // Only the two strict modes consult the fail-closed table at all; it describes what
+    // Only the strict mode consults the fail-closed table at all; it describes what
     // `--strict` refuses, which says nothing about the other backends.
-    let consults_failclosed =
-        matches!(mode, CompatMode::Strict | CompatMode::PortableStrict) && listed_failclosed;
+    let consults_failclosed = mode == CompatMode::PortableStrict && listed_failclosed;
     if ok {
         if consults_failclosed {
             return CompatDisposition::PassedButListedFailClosed;
@@ -265,10 +226,7 @@ pub fn classify_compat_outcome(
         return CompatDisposition::Passed;
     }
     if consults_failclosed {
-        return match mode {
-            CompatMode::Strict => CompatDisposition::KnownFailClosedExempt,
-            _ => CompatDisposition::KnownFailClosedBlocking,
-        };
+        return CompatDisposition::KnownFailClosedBlocking;
     }
     if mode == CompatMode::PortableStrict && listed_diagnostic {
         return CompatDisposition::PortableDiagnostic;
@@ -737,7 +695,6 @@ pub fn compat_nodes_for(
     wall_override: Option<i64>,
 ) -> Result<Vec<Step>, String> {
     let rows = validate_corpus::load(root, mode.corpus_name(), paths)?;
-    let rr_allowed: Vec<&str> = validate_corpus::RR_PASSING_LABELS.to_vec();
     let super_only = validate_corpus::portable_super_only();
     let mut out = Vec::new();
     for row in rows {
@@ -745,11 +702,6 @@ pub fn compat_nodes_for(
             if !keep.contains(&row.label) {
                 continue;
             }
-        }
-        // rr measures ONLY the labels proven to pass record/replay; the bash
-        // applies the same filter inside rr_compatibility_probe.
-        if mode == CompatMode::Rr && !rr_allowed.contains(&row.label.as_str()) {
-            continue;
         }
         // Heavy runtime workloads are deferred out of the portable profile to the
         // scheduled super suite (validate.sh:3090) — unless this IS that suite,
@@ -763,7 +715,24 @@ pub fn compat_nodes_for(
         let mut argv: Vec<String> = vec![hermit_bin.to_string()];
         argv.extend(mode.run_args(&row.label, nsswitch));
         let wall = wall_override.unwrap_or_else(|| mode.timeout_for(&row.label));
-        out.push(node(
+        let description = match mode {
+            CompatMode::E9patch => format!(
+                "One per-program probe of the e9patch-compat-only profile, generated from a row of ci/compat/{}. It runs `target/release/hermit --backend e9patch run --strict --verify -- <program>` with stdin from /dev/null. That is e9patch binary-rewriting preprocessing with the ptrace backend, not a backend of its own: Hermit rewrites the guest's main ELF with e9tool and e9patch, then runs the rewritten program on the ptrace backend under strict mode, twice, comparing the runs with the Stripped comparator of plain --verify, so no row establishes L2. The rows range from coreutils such as echo and cat to bash pipelines and tests/compat/real_compat_workload.sh workloads; whoami, groups, pinky, logname, tar and chown also bind the files-only nsswitch.conf over /etc/nsswitch.conf. The profile counts every failure as blocking, for example a rewritten binary that crashes or two runs whose output differs.",
+                mode.corpus_name()
+            ),
+            CompatMode::PortableStrict => match super_only.get(row.label.as_str()) {
+                Some(workload) if only.is_some() => format!(
+                    "Runs the {label} row of the portable strict compatibility corpus, a {workload}, as `target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled` with a tmpfs /test working directory, stdin from /dev/null, on the default ptrace backend. Plain --verify runs the guest twice and compares the runs with the Stripped comparator, so the row establishes L1 with a lossy repeat check, not L2. The portable profile defers this row to the super profile because it is too heavy for the corpus's {COMPAT_TIMEOUT_S}-second budget; here it gets {wall} seconds and runs after {fixtures}, which prepares the files the real_compat_workload.sh rows read. A missing toolchain or fixture, a syscall strict mode refuses, or output that differs between the two runs turns it red, and a failure fails the super run.",
+                    label = row.label,
+                    fixtures = gate_dep.unwrap_or("its fixtures node"),
+                ),
+                _ => format!(
+                    "Runs the {label} row of the portable strict compatibility corpus as `target/release/hermit run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled` with a tmpfs /test working directory, stdin from /dev/null, on the default ptrace backend, comparing the two runs with the Stripped comparator of plain --verify. A syscall strict mode refuses or output that differs between the runs turns it red.",
+                    label = row.label,
+                ),
+            },
+        };
+        let mut step = node(
             "compat",
             &sanitize_job(&row.label),
             &format!("{} compatibility: {}", mode.display_name(), row.label),
@@ -776,7 +745,9 @@ pub fn compat_nodes_for(
             wall,
             COMPAT_CPU_TIMEOUT_S.max(wall),
             COMPAT_MEM_BYTES,
-        ));
+        );
+        step.description = description;
+        out.push(step);
     }
     if out.is_empty() {
         return Err(format!("compatibility mode {mode:?} selected zero probes"));

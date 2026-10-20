@@ -1,0 +1,59 @@
+#!/bin/bash
+# Stage the host inputs that the RE modes (shim/modes/hybrid, shim/modes/remote) pass to
+# remote actions, because RE workers do not have them:
+#   shim/rust-sysroot                     hermit's pinned rust toolchain (the sysroot
+#                                         rustup resolves from rust-toolchain.toml)
+#   shim/third-party/libunwind/staged     libunwind-devel's link inputs (libunwind 1.8 on
+#                                         CentOS 9), linked by unwind-sys
+#   shim/third-party/xz/staged            xz-devel's liblzma (linked by hermit-release)
+#   shim/third-party/cmake/staged         a self-contained cmake (PyPI manylinux wheel,
+#                                         pinned by sha256) for reverie-dbt's DynamoRIO build
+# Idempotent; reflinks when it can. Both paths are gitignored.
+set -euo pipefail
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+src=$(cd "$root" && rustc --print sysroot)
+want=$(cd "$root" && rustc --version)
+dst=$root/shim/rust-sysroot
+if [[ -f $dst/.version && $(cat "$dst/.version") == "$want" ]]; then
+    echo "$dst: $want (up to date)"
+else
+    rm -rf "${dst:?}"
+    cp -a --reflink=auto "$src" "$dst"
+    # Documentation and std sources are never action inputs.
+    rm -rf "${dst:?}/share/doc" "${dst:?}/lib/rustlib/src" "${dst:?}/lib/rustlib/rustc-src"
+    echo "$want" >"$dst/.version"
+    echo "$dst: $want"
+fi
+
+lu=$root/shim/third-party/libunwind/staged
+mkdir -p "$lu"
+for f in libunwind-ptrace.a libunwind-generic.so libunwind-x86_64.so libunwind-x86_64.so.8 libunwind.so libunwind.so.8; do
+    [[ -e /usr/lib64/$f ]] || { echo "missing /usr/lib64/$f: install libunwind-devel" >&2; exit 1; }
+    cmp -s "/usr/lib64/$f" "$lu/$f" || cp -L "/usr/lib64/$f" "$lu/$f"
+done
+echo "$lu: $(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}' libunwind-devel 2>/dev/null || echo libunwind)"
+
+xz=$root/shim/third-party/xz/staged
+mkdir -p "$xz"
+xzlib=${XZ_LIBDIR:-/usr/lib64}
+for f in liblzma.so liblzma.so.5; do
+    [[ -e $xzlib/$f ]] || { echo "missing $xzlib/$f: install xz-devel (or set XZ_LIBDIR)" >&2; exit 1; }
+    cmp -s "$xzlib/$f" "$xz/$f" || cp -L "$xzlib/$f" "$xz/$f"
+done
+echo "$xz: $(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}' xz-devel 2>/dev/null || echo liblzma)"
+
+# cmake: the PyPI wheel is a manylinux2010 build that needs only the base C/C++ runtime.
+cm=$root/shim/third-party/cmake/staged
+CMAKE_WHEEL_URL=https://files.pythonhosted.org/packages/1e/52/85550dfcadca90b59809a1225461bfaadfcbbcc8fe62fa24f75edbe6e0b1/cmake-3.31.6-py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.whl
+CMAKE_WHEEL_SHA256=2297e9591307d9c61e557efe737bcf4d7c13a30f1f860732f684a204fee24dca
+if [[ ! -x $cm/bin/cmake ]]; then
+    tmp=$(mktemp -d)
+    curl -fsSL -o "$tmp/cmake.whl" "$CMAKE_WHEEL_URL"
+    echo "$CMAKE_WHEEL_SHA256  $tmp/cmake.whl" | sha256sum -c --quiet
+    python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$tmp/cmake.whl" "$tmp/x"
+    rm -rf "${cm:?}"
+    mv "$tmp/x/cmake/data" "$cm"
+    chmod +x "$cm"/bin/*
+    rm -rf "${tmp:?}"
+fi
+echo "$cm: $("$cm/bin/cmake" --version | head -1)"

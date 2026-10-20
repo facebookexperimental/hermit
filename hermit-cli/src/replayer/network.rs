@@ -14,14 +14,18 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
 use reverie::syscalls::PollFd;
 use reverie::syscalls::Ppoll;
+use reverie::syscalls::Pselect6;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
+use reverie::syscalls::Select;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Replayer;
 use crate::event::PollEvent;
 use crate::event::PpollEvent;
+use crate::event::SelectEvent;
+use crate::event::fd_set_bytes;
 
 fn replay_pollfds<M: MemoryAccess>(
     memory: &mut M,
@@ -141,6 +145,50 @@ fn write_bytes<M: MemoryAccess>(
     memory.write_exact(address.cast(), bytes)
 }
 
+fn replay_select_event<M: MemoryAccess>(
+    memory: &mut M,
+    nfds: i32,
+    fd_set_addresses: [Option<AddrMut<'_, libc::fd_set>>; 3],
+    timeout_address: Option<AddrMut<'_, u8>>,
+    event: SelectEvent,
+) -> Result<i64, Errno> {
+    let SelectEvent {
+        result,
+        fd_sets,
+        timeout,
+    } = event;
+    let length = fd_set_bytes(nfds);
+    for (address, bytes) in fd_set_addresses.into_iter().zip(fd_sets) {
+        let Some(bytes) = bytes else {
+            assert!(
+                address.is_none() || result.is_err(),
+                "recorded select omitted a set the kernel copied out"
+            );
+            continue;
+        };
+        assert!(bytes.len() <= length);
+        let address = address.expect("recorded select set output requires a pointer");
+        let write_result = write_bytes(memory, address.as_raw() as *mut libc::c_void, &bytes);
+        if matches!(result, Err(Errno::EFAULT)) {
+            // As for ppoll: the fault that ended the recorded copy-out may end
+            // this one too. The recorded errno is still the result.
+            if let Err(error) = write_result {
+                tracing::trace!(?error, "partial select set replay write returned an error");
+            }
+        } else {
+            write_result?;
+        }
+    }
+    if let Some(timeout) = timeout {
+        let address = timeout_address.expect("recorded select timeout requires a pointer");
+        // Linux keeps the select result when the remaining-time write faults.
+        if let Err(error) = write_bytes(memory, address.as_raw() as *mut libc::c_void, &timeout) {
+            tracing::trace!(?error, "select timeout replay write returned an error");
+        }
+    }
+    result
+}
+
 fn cmsg_align(length: usize) -> Option<usize> {
     let alignment = std::mem::size_of::<usize>();
     length
@@ -250,6 +298,36 @@ impl Replayer {
             syscall.fds(),
             syscall.timeout(),
             syscall.nfds() as usize,
+            event,
+        )
+    }
+
+    pub(super) async fn handle_select<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Select,
+    ) -> Result<i64, Errno> {
+        let event = next_event!(guest, Select)?;
+        replay_select_event(
+            &mut guest.memory(),
+            syscall.nfds(),
+            [syscall.readfds(), syscall.writefds(), syscall.exceptfds()],
+            syscall.timeout().map(AddrMut::cast),
+            event,
+        )
+    }
+
+    pub(super) async fn handle_pselect6<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Pselect6,
+    ) -> Result<i64, Errno> {
+        let event = next_event!(guest, Select)?;
+        replay_select_event(
+            &mut guest.memory(),
+            syscall.nfds(),
+            [syscall.readfds(), syscall.writefds(), syscall.exceptfds()],
+            syscall.timeout().map(AddrMut::cast),
             event,
         )
     }
@@ -678,5 +756,84 @@ mod current_main_tests {
 
         assert_eq!(result, Err(Errno::EINVAL));
         assert_eq!(memory.writes, 0);
+    }
+
+    #[test]
+    fn replay_select_restores_sets_and_exact_timeout() {
+        let mut readfds: libc::fd_set = unsafe { std::mem::zeroed() };
+        unsafe { libc::FD_SET(3, &mut readfds) };
+        let mut timeout = libc::timeval {
+            tv_sec: 2,
+            tv_usec: 0,
+        };
+        let recorded_timeout = libc::timeval {
+            tv_sec: 1,
+            tv_usec: 999_873,
+        };
+        let recorded_timeout_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&recorded_timeout as *const libc::timeval).cast::<u8>(),
+                std::mem::size_of::<libc::timeval>(),
+            )
+        }
+        .to_vec();
+        let event = SelectEvent {
+            result: Ok(0),
+            fd_sets: [Some(vec![0; 8]), None, None],
+            timeout: Some(recorded_timeout_bytes),
+        };
+        let result = replay_select_event(
+            &mut LocalMemory::new(),
+            4,
+            [
+                AddrMut::from_raw((&mut readfds as *mut libc::fd_set) as usize),
+                None,
+                None,
+            ],
+            AddrMut::from_raw((&mut timeout as *mut libc::timeval) as usize),
+            event,
+        );
+
+        assert_eq!(result, Ok(0));
+        assert!(!unsafe { libc::FD_ISSET(3, &readfds) });
+        assert_eq!(timeout.tv_sec, recorded_timeout.tv_sec);
+        assert_eq!(timeout.tv_usec, recorded_timeout.tv_usec);
+    }
+
+    #[test]
+    fn replay_select_restores_only_the_recorded_prefix_before_efault() {
+        // Recorded: the read set was partly copied out (its first long), then
+        // the kernel faulted before reaching the write set.
+        let mut readfds: libc::fd_set = unsafe { std::mem::zeroed() };
+        let mut writefds: libc::fd_set = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::FD_SET(3, &mut readfds);
+            libc::FD_SET(100, &mut readfds);
+            libc::FD_SET(5, &mut writefds);
+        }
+        let event = SelectEvent {
+            result: Err(Errno::EFAULT),
+            fd_sets: [Some(vec![0b0100_0000, 0, 0, 0, 0, 0, 0, 0]), None, None],
+            timeout: None,
+        };
+        let result = replay_select_event(
+            &mut LocalMemory::new(),
+            128,
+            [
+                AddrMut::from_raw((&mut readfds as *mut libc::fd_set) as usize),
+                AddrMut::from_raw((&mut writefds as *mut libc::fd_set) as usize),
+                None,
+            ],
+            None,
+            event,
+        );
+
+        assert_eq!(result, Err(Errno::EFAULT));
+        assert!(!unsafe { libc::FD_ISSET(3, &readfds) });
+        assert!(unsafe { libc::FD_ISSET(6, &readfds) });
+        // Past the recorded prefix, and the set the kernel never reached,
+        // keep the guest's own bytes.
+        assert!(unsafe { libc::FD_ISSET(100, &readfds) });
+        assert!(unsafe { libc::FD_ISSET(5, &writefds) });
     }
 }

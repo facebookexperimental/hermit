@@ -75,7 +75,8 @@ unknown path, a footprint node missing from the current DAG, files not proven
 inert — resolves to **full**. Therefore a mismapped footprint can only waste
 time, never hide a regression. The one place a mistake could wrongly skip is the
 `ci_irrelevant` list, so it is kept deliberately tight (docs, notes, images,
-non-workflow `.github/**`; the three real workflow files are force_full).
+non-workflow `.github/**`; the three real workflow files, and the local actions
+under `.github/actions/**` that they call, are force_full).
 
 ## From nodes to shards and cells
 

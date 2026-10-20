@@ -4828,6 +4828,28 @@ impl Scheduler {
                 trace!(
                     "[scheduler] skipping scheduler time advance because just-finished turn was an internal book-keeping one"
                 );
+            } else if !last_turn_was_polling
+                && last_turn
+                    .as_ref()
+                    .map(|resources| resources.backend_runtime_bootstrap)
+                    .unwrap_or(false)
+            {
+                // The turn served a syscall that a backend-resident runtime made
+                // inside its bootstrap window and whose syscall cost is withheld
+                // (`ThreadState::charge_syscall_time`). Per Reverie's
+                // `Guest::is_backend_runtime_bootstrap` contract that work is not
+                // the guest's, so its turn must not advance the guest's clock
+                // either: a backend without such a runtime never makes this turn,
+                // so charging it would add time that only one backend's guests
+                // see. An IO-polling retry is
+                // excluded above and still advances, because finite poll and
+                // futex timeouts are enforced against this clock. The decision is
+                // a function of the request alone, which the guest's own
+                // execution determines, so both runs of --verify and a replay
+                // make it identically.
+                trace!(
+                    "[scheduler] skipping scheduler time advance because just-finished turn served a backend-runtime bootstrap syscall whose cost is withheld"
+                );
             } else {
                 let newtime = gtime.add_scheduler_time();
                 if last_turn_was_polling {
@@ -5642,6 +5664,8 @@ impl Scheduler {
                 realtime_elapsed: None,
                 timeslice_stats,
                 per_thread_timeslice,
+                // The backend, not the scheduler, measures dispatch.
+                dispatch_stats: None,
             },
             info_reprio_descrip,
         ))
@@ -7338,6 +7362,60 @@ mod test {
         assert_eq!(
             after_skip, before_skip,
             "a skipped turn must not advance virtual time"
+        );
+    }
+
+    /// https://github.com/rrnewton/hermit/issues/3517: a committed turn that
+    /// served a backend-runtime bootstrap syscall whose cost is withheld does not
+    /// advance virtual time. The identical request without the mark does, so the
+    /// negative is not vacuous, and a marked IO-polling retry still does, because
+    /// finite poll and futex timeouts are enforced against this clock.
+    #[test]
+    fn bootstrap_syscall_turn_withholds_scheduler_time_except_for_polling_retries() {
+        let config = Config::default();
+        let runnable = DetTid::from_raw(13);
+        let advance = |request: Resources| {
+            // A non-empty run queue keeps the "only waiting on external
+            // events" guard from suppressing the advance for an unrelated reason.
+            let mut sched = Scheduler::new(&config);
+            sched.priorities.insert(runnable, DEFAULT_PRIORITY);
+            sched.runqueue_push_back(runnable);
+            let time = Mutex::new(GlobalTime::new(&config));
+            let before = time.lock().unwrap().as_nanos();
+            sched.bump_global_time(&time, &Ok(request));
+            let after = time.lock().unwrap().as_nanos();
+            assert_eq!(sched.committed_time, after);
+            (before, after)
+        };
+        let file = ResourceID::Path("/proc/self/maps".into());
+
+        let mut guest_turn = Resources::new(runnable);
+        guest_turn.resources.insert(file.clone(), Permission::R);
+        let (before, after) = advance(guest_turn.clone());
+        assert!(
+            after > before,
+            "an unmarked committed turn must advance virtual time ({before:?} -> {after:?})"
+        );
+        let per_turn = after - before;
+
+        let mut bootstrap_turn = guest_turn;
+        bootstrap_turn.backend_runtime_bootstrap = true;
+        let (before, after) = advance(bootstrap_turn);
+        assert_eq!(
+            after, before,
+            "a turn serving an uncharged bootstrap syscall must not advance virtual time"
+        );
+
+        let mut bootstrap_poll = Resources::new(runnable);
+        bootstrap_poll
+            .resources
+            .insert(ResourceID::InternalIOPolling, Permission::W);
+        bootstrap_poll.backend_runtime_bootstrap = true;
+        let (before, after) = advance(bootstrap_poll);
+        assert_eq!(
+            after - before,
+            per_turn,
+            "a marked IO-polling retry must still advance virtual time by one turn"
         );
     }
 

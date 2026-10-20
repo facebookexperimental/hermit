@@ -33,6 +33,27 @@ name: CI (GitHub-managed portable)
 # back to validate; commands, dependencies, and resource policy stay in the
 # constructed plan. The workflow supplies artifacts for predecessors that ran in
 # earlier jobs rather than restating their behavior here.
+#
+# APT DEPENDENCIES (https://github.com/rrnewton/hermit/issues/3487). WHY: each
+# job used to run a bare `sudo apt-get update && sudo apt-get install -y` of up
+# to ~70 packages (about 203-208 MB) with no cache, timeout or retry, and runners
+# that drew a 68-216 kB/s mirror connection were cancelled at timeout-minutes
+# before any test ran (9 jobs in 3 runs on 2026-10-01). WHAT: every
+# `Dependencies` step now uses .github/actions/apt-install, which caches the
+# downloaded .deb files per runner image and package list, installs a cache hit
+# without contacting any mirror, and bounds and retries the mirror phases on a
+# miss; a failed install still fails the job. Keep each list on one `packages:`
+# line: ci/check-shard-coverage.sh reads the e2e job's line for btrfs-progs.
+#
+# default-jdk-headless (~129 MB of the ~205 MB full list) is no longer in any
+# list, because no job here runs Java: test.app_strict_verify passes
+# `--skip java_ --skip javac_`; the JVM test in language_runtime_determinism is
+# #[ignore]d; compat.yaml and language-runtimes.yaml have no Java row; and
+# integration_matrix, whose optional Java case uses javac when present, is
+# scheduled only by super.threaded_integration_matrix_diagnostic, which is not
+# in this workflow's plan; tests/e2e/lib/language-runtimes/run.sh, whose Java
+# case also skips without a JDK, is scheduled by no DAG step or manifest. A job
+# that starts running Java must add the package to its own list.
 
 on:
   workflow_dispatch:
@@ -285,9 +306,9 @@ jobs:
       # and the library it links with are two separate prerequisites and this job
       # was missing both.
       - name: Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y binutils liblzma-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: binutils liblzma-dev
       # build.rust_scripts compiles every tracked rust-script with `cargo
       # clippy`, so clippy is a prerequisite of THIS job and not only of the jobs
       # that lint Hermit itself. Installing rustfmt alone made cargo answer
@@ -375,9 +396,9 @@ jobs:
       - name: Initialize submodules
         run: git submodule update --init --recursive
       - name: Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y liblzma-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: liblzma-dev
       - name: Rust components
         run: rustup component add clippy rustfmt
       # check.script_unit_tests runs the real structured-Nextest fixture.  Installing
@@ -423,12 +444,15 @@ jobs:
           set -euo pipefail
           corpus_root="$(./ci/prepare-scorecard-self-test-corpus.sh "$RUNNER_TEMP")"
           printf 'DEV_HERMIT_TEST_LEDGER_ROOT=%s\n' "$corpus_root" >> "$GITHUB_ENV"
-      # check.script_unit_tests runs scripts/build-buck-release.rs's tests, two of
-      # which enter the exact `unshare --user --map-root-user --mount` stage the
-      # matrix proxy composes. Ubuntu 24.04 runners restrict unprivileged user
-      # namespaces through AppArmor, so run 36499357369 failed both with
-      # "unshare: write failed /proc/self/uid_map: Operation not permitted".
-      # Lift the restriction as the test jobs below do, and probe that shape.
+      # Added for two scripts/build-buck-release.rs tests, run by
+      # check.script_unit_tests, that entered the `unshare --user --map-root-user
+      # --mount` stage the DBT matrix proxy composed. Ubuntu 24.04 runners
+      # restrict unprivileged user namespaces through AppArmor, so run
+      # 36499357369 failed both with "unshare: write failed /proc/self/uid_map:
+      # Operation not permitted". Slice S13 of
+      # https://github.com/rrnewton/hermit/issues/3301 removed both tests with
+      # the matrix leg. No remaining node of this job runs unshare, and the job
+      # unpacks no Hermit binary. Deleting this step is a separate decision.
       - name: Enable unprivileged user and mount namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
@@ -487,9 +511,9 @@ jobs:
           shared-key: portable-parallel-debug
           cache-on-failure: true
       - name: Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+        uses: ./.github/actions/apt-install
+        with:
+          packages: bc binutils bsdextrautils bzip2 clang cmake cpio curl dc file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Rust components
         run: rustup component add clippy rustfmt
       # gate.manifest runs `test-harness validate`, which shells out to
@@ -771,9 +795,9 @@ jobs:
           shared-key: portable-parallel-debug
           save-if: false
       - name: Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang cmake file g++ gcc git jq libelf-dev libunwind-dev liblzma-dev make pkg-config python3-full zlib1g-dev zstd
+        uses: ./.github/actions/apt-install
+        with:
+          packages: clang cmake file g++ gcc git jq libelf-dev libunwind-dev liblzma-dev make pkg-config python3-full zlib1g-dev zstd
       - name: Install rust-script
         env:
           RUSTFLAGS: ""
@@ -906,9 +930,9 @@ jobs:
           shared-key: portable-parallel-debug
           save-if: false
       - name: Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk gdb git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+        uses: ./.github/actions/apt-install
+        with:
+          packages: bc binutils bsdextrautils bzip2 clang cmake cpio curl dc file g++ gcc gawk gdb git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Rust components
         run: rustup component add clippy rustfmt
       - name: Install cargo-nextest (unit-parallel shard)
@@ -921,7 +945,7 @@ jobs:
       #
       # Compiling the driver instead of installing the interpreter is not an
       # option here: validate.rs carries an embedded `//! ```cargo` manifest and
-      # depends on `dagrun` from the agent-utils submodule, so plain
+      # depends on `dagrun` (a git dependency on agent-utils), so plain
       # `rustc` cannot build it the way the check.skill_discovery node builds its
       # std-only script.
       #
@@ -1059,9 +1083,9 @@ jobs:
           shared-key: portable-parallel-debug
           save-if: false
       - name: Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+        uses: ./.github/actions/apt-install
+        with:
+          packages: bc binutils bsdextrautils bzip2 clang cmake cpio curl dc file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Install rust-script
         env:
           RUSTFLAGS: ""
@@ -1165,9 +1189,9 @@ jobs:
           shared-key: portable-parallel-debug
           save-if: false
       - name: Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bc binutils bzip2 clang cmake file g++ gcc git iproute2 jq libc6-dbg libelf-dev libunwind-dev liblzma-dev make pkg-config procps python3-full time zlib1g-dev zstd
+        uses: ./.github/actions/apt-install
+        with:
+          packages: bc binutils bzip2 clang cmake file g++ gcc git iproute2 jq libc6-dbg libelf-dev libunwind-dev liblzma-dev make pkg-config procps python3-full time zlib1g-dev zstd
       # Release shards now execute individual tests through the same pinned
       # nextest timeout policy as debug shards. The release artifact contains
       # product binaries, not Cargo subcommand tooling, so provision it here.
@@ -1282,9 +1306,9 @@ jobs:
       - name: Initialize dagrun submodule
         run: git submodule update --init agent-utils
       - name: Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bc binutils bsdextrautils btrfs-progs bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+        uses: ./.github/actions/apt-install
+        with:
+          packages: bc binutils bsdextrautils btrfs-progs bzip2 clang cmake cpio curl dc file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Install rust-script
         env:
           RUSTFLAGS: ""
@@ -1382,9 +1406,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bsdextrautils jq libunwind-dev liblzma-dev zstd
+        uses: ./.github/actions/apt-install
+        with:
+          packages: bsdextrautils jq libunwind-dev liblzma-dev zstd
       - name: Enable unprivileged user and mount namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then

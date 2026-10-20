@@ -29,8 +29,36 @@ On Debian or Ubuntu:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y libunwind-dev liblzma-dev
+sudo apt-get install -y build-essential pkg-config libunwind-dev liblzma-dev
 ```
+
+For the registry release, install stable Rust with rustup, then use
+`cargo +stable install hermit-run --version 0.4.1 --locked`. The package's
+executable is named `hermit`. The 0.4.1 ptrace release is qualified on Ubuntu
+24.04's stock Linux 6.8 kernel. Source builds continue to use the toolchain
+selected by `rust-toolchain.toml`.
+
+Ubuntu 24.04 may deny unprivileged user namespaces through AppArmor even when
+`kernel.unprivileged_userns_clone=1`. Errors include `MapUid: EPERM` and
+`Setting UID map failed`. An administrator can allow the installed Hermit
+executable through a scoped profile while keeping
+`kernel.apparmor_restrict_unprivileged_userns=1`. Find its absolute path with
+`readlink -f "$(command -v hermit)"`; create `/etc/apparmor.d/hermit-local`,
+substituting that path for the example attachment below:
+
+```text
+abi <abi/4.0>,
+include <tunables/global>
+
+profile hermit /home/YOUR_USER/.cargo/bin/hermit flags=(unconfined) {
+  userns,
+}
+```
+
+Load it with `sudo apparmor_parser -r /etc/apparmor.d/hermit-local`, then retry
+`hermit run -- /bin/echo hello`. This grants user-namespace access to the named
+executable; review that path and local security policy before applying the
+profile, and update it if the installation path changes.
 
 On Fedora or CentOS:
 
@@ -72,6 +100,14 @@ The debug executable is `target/debug/hermit`. For an optimized build:
 cargo build --release --workspace
 ./target/install_pkg/hermit --version
 ```
+
+A regular build does not embed the Git revision, so `hermit --version` reports
+`hermit 0.4.0 (2026-10-02, source revision not embedded)` and `hermit version --json` reports
+`"git_sha": "unknown"`. This keeps a commit that does not change Hermit's
+source from rebuilding it. To stamp the revision, as a release build does, set
+`HERMIT_STAMP_GIT_SHA=1` when building; the version then reads
+`hermit 0.4.0 (2026-10-02, g0123456789ab)`, with a `-dirty` suffix when tracked
+files differed from that commit. `make release-core` sets it for you.
 
 The release build creates `target/install_pkg/hermit` and
 `target/install_pkg/rsrcs/`. The resource directory contains the SaBRe and
@@ -327,8 +363,16 @@ under `$XDG_STATE_HOME/hermit/verify-failures` (or a bounded directory under the
 system temporary directory when no state directory is available) and prints
 their final, readable paths. A `hermit log-diff` reading one of those paths
 prevents its comparison directory from being retired until the read finishes.
-Keep both runs regardless of verdict, without that automatic retirement, with
-`--keep-logs`; Hermit prints only the final, readable paths. The default
+`--keep-logs` retains logs whatever the verdict, without that automatic
+retirement, and Hermit prints only the final, readable paths. After a match it
+keeps only the first run's log, as the golden log; the second run's log, which
+compared equal to it under the selected comparison policy, is deleted. The two
+raw files need not be byte-identical: every policy removes the real wall-clock
+prefix and normalizes host addresses, and the default policy (without
+`--verify-strict`) ignores more, so the golden log carries the first run's
+values wherever the comparison looked past a difference. After a divergence, a
+no-result, or an error it keeps both logs, or only the first run's when
+verification stopped before a second run. The default
 destination is `$XDG_STATE_HOME/hermit/verify-logs`, normally
 `~/.local/state/hermit/verify-logs`, and `--verify-log-dir=DIR` selects another
 durable directory. `--print-verify-logs` instead copies the first run's captured
@@ -722,9 +766,11 @@ time. Detcore counts retired conditional branches with the CPU PMU and uses a
 timer to end a time slice. At each scheduling point it chooses the next runnable
 thread deterministically; chaos mode makes that choice with a seeded PRNG.
 
-Some calls are fully emulated, some are forwarded and sanitized, and unsupported
-calls may pass through. This is why Hermit can run ordinary unmodified binaries
-but cannot guarantee determinism for every Linux interface.
+Some calls are fully emulated, some are forwarded and sanitized, and calls
+classified Unsupported are rejected unless the run-only
+`--allow-unsupported-syscalls` option lets them reach Linux. This is why Hermit
+can run ordinary unmodified binaries but cannot guarantee determinism for every
+Linux interface.
 
 ## Reproducibility Checklist
 

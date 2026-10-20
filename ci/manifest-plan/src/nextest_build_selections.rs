@@ -39,6 +39,9 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         | "super.network_syscall_determinism_diagnostic" => {
             Some(&["-p", "hermit-detcore", "--test", "tests_misc"])
         }
+        "test.detcore_time" | "privileged-test.pmu_detcore_time_cases" => {
+            Some(&["-p", "hermit-detcore", "--test", "tests_time"])
+        }
         "test.detcore_parallel"
         | "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore"
         | "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore"
@@ -76,11 +79,15 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "cpufreq_avg_determinism",
             "--test",
+            "dispatch_stats",
+            "--test",
             "epoll_determinism",
             "--test",
             "epoll_pwait_zero_timeout_progress",
             "--test",
             "file_nr_determinism",
+            "--test",
+            "first_seen_mtime",
             "--test",
             "fp_reduction_determinism",
             "--test",
@@ -118,6 +125,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "python_stdlib",
             "--test",
+            "reopened_pipe_progress",
+            "--test",
             "robust_futex_owner_death",
             "--test",
             "run_evidence",
@@ -140,9 +149,13 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "thp_stats_determinism",
             "--test",
+            "utimensat_mtime",
+            "--test",
             "verification_report_cli",
             "--test",
             "verification_report_consumers",
+            "--test",
+            "verify_claim_names_its_limit",
             "--test",
             "writev_determinism",
             "--test",
@@ -599,7 +612,56 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "179");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "195");
+            // The explicit utimensat mtime regression
+            // (https://github.com/rrnewton/hermit/issues/3565).
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--test", "utimensat_mtime"])
+            );
+            assert!(
+                step.integration_test_binaries
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|binary| binary == "utimensat_mtime")
+            );
+            // The canonical first-seen mtime regression
+            // (https://github.com/rrnewton/hermit/issues/3639).
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--test", "first_seen_mtime"])
+            );
+            assert!(
+                step.integration_test_binaries
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|binary| binary == "first_seen_mtime")
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--test", "reopened_pipe_progress"])
+            );
+            // The ptrace dispatch record and its DEBUG-only control.
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--test", "dispatch_stats"])
+            );
+            assert!(
+                step.integration_test_binaries
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|binary| binary == "reopened_pipe_progress")
+            );
+            assert!(
+                step.integration_test_binaries
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|binary| binary == "dispatch_stats")
+            );
             assert!(
                 args.windows(2)
                     .any(|pair| pair == ["--test", "clock_determinism"])

@@ -112,6 +112,85 @@ impl Shebang {
     }
 }
 
+/// How the kernel's script handler reads the start of a file, for checks that
+/// must inspect exactly the interpreter the kernel executes.
+// Only the in-guest LiteInst program check uses it.
+#[cfg(any(test, feature = "liteinst"))]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum KernelScript {
+    /// The file does not start with `#!`; the kernel tries its other handlers.
+    NotScript,
+    /// The script handler runs no interpreter: the `#!` line names none, or it
+    /// has no newline and the interpreter path runs to the end of the
+    /// [`BINPRM_BUF_SIZE`] bytes the kernel reads, so it may be truncated.
+    /// Measured on Linux 7.1: `#!\n`, `#! \t\n` and a 254-byte path with no
+    /// newline fail with `ENOEXEC`, so the kernel tries its other handlers;
+    /// `#!` alone and `#!\0/bin/sh\n`, whose name a NUL leaves empty, fail the
+    /// `execve` with `EACCES`.
+    Declined,
+    /// The kernel executes this interpreter path, byte for byte.
+    Interpreter(PathBuf),
+}
+
+#[cfg(any(test, feature = "liteinst"))]
+impl KernelScript {
+    /// Source of truth: `load_script()` in `fs/binfmt_script.c`; the errors
+    /// noted on [`KernelScript::Declined`] were measured on Linux 7.1. Unlike
+    /// [`Shebang::from_buf`], which its existing callers keep,
+    /// this ends the interpreter path only at a space, tab or NUL: a carriage
+    /// return is part of the path, as it is for the kernel.
+    pub(crate) fn from_buf(buf: &[u8]) -> Self {
+        // The kernel reads the file's first BINPRM_BUF_SIZE bytes into a buffer
+        // that is NUL-padded when the file is shorter.
+        let mut header = [0_u8; BINPRM_BUF_SIZE];
+        let len = buf.len().min(BINPRM_BUF_SIZE);
+        header[..len].copy_from_slice(&buf[..len]);
+        if !header.starts_with(b"#!") {
+            return Self::NotScript;
+        }
+        let last = BINPRM_BUF_SIZE - 1;
+        // `strnchr` stops at the first NUL.
+        let newline = header
+            .iter()
+            .take_while(|byte| **byte != 0)
+            .position(|byte| *byte == b'\n');
+        let line_end = match newline {
+            Some(newline) => newline,
+            None => {
+                // Without a newline the interpreter path must be followed by a
+                // space, tab or NUL within the buffer, or it may be truncated.
+                let Some(start) = (2..=last).find(|&index| !matches!(header[index], b' ' | b'\t'))
+                else {
+                    return Self::Declined;
+                };
+                if !header[start..=last]
+                    .iter()
+                    .any(|byte| matches!(byte, b' ' | b'\t' | 0))
+                {
+                    return Self::Declined;
+                }
+                // The kernel overwrites the buffer's last byte with a NUL.
+                last
+            }
+        };
+        let line = &header[2..line_end];
+        let start = line
+            .iter()
+            .position(|byte| !matches!(byte, b' ' | b'\t'))
+            .unwrap_or(line.len());
+        let name = &line[start..];
+        let name = &name[..name
+            .iter()
+            .position(|byte| matches!(byte, b' ' | b'\t' | 0))
+            .unwrap_or(name.len())];
+        if name.is_empty() {
+            Self::Declined
+        } else {
+            Self::Interpreter(PathBuf::from(OsStr::from_bytes(name)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -203,5 +282,54 @@ mod test {
                 args: vec![OsString::from("python3"), OsString::from("-c")],
             })
         );
+    }
+
+    fn kernel_interpreter(path: &[u8]) -> KernelScript {
+        KernelScript::Interpreter(PathBuf::from(OsStr::from_bytes(path)))
+    }
+
+    #[test]
+    fn kernel_script_reads_the_interpreter_as_load_script_does() {
+        let cases: [(&[u8], KernelScript); 7] = [
+            (b"\x7fELF\x02\x01\x01", KernelScript::NotScript),
+            (b"! /bin/bash", KernelScript::NotScript),
+            // A carriage return is part of the path, unlike in Shebang.
+            (b"#!/tmp/interp\r\n", kernel_interpreter(b"/tmp/interp\r")),
+            (
+                b"#! \t/usr/bin/env python3 -c\nbody",
+                kernel_interpreter(b"/usr/bin/env"),
+            ),
+            // A NUL ends the path.
+            (b"#!/bin/sh\0junk\n", kernel_interpreter(b"/bin/sh")),
+            // A short file is NUL-padded, which ends the path.
+            (b"#!/bin/bash", kernel_interpreter(b"/bin/bash")),
+            (b"#!relative arg\n", kernel_interpreter(b"relative")),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(KernelScript::from_buf(input), expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn kernel_script_declines_a_missing_or_truncated_interpreter() {
+        for input in [b"#!".as_slice(), b"#!\n", b"#! \t\n", b"#!\0/bin/sh\n"] {
+            assert_eq!(
+                KernelScript::from_buf(input),
+                KernelScript::Declined,
+                "input: {input:?}"
+            );
+        }
+        // No newline and no space, tab or NUL in the first 256 bytes: the path
+        // may be truncated, so the kernel declines it, whatever follows.
+        let mut long = b"#!/".to_vec();
+        long.resize(BINPRM_BUF_SIZE, b'a');
+        assert_eq!(KernelScript::from_buf(&long), KernelScript::Declined);
+        long.extend_from_slice(b" arg\n");
+        assert_eq!(KernelScript::from_buf(&long), KernelScript::Declined);
+        // A space in the last byte ends the path inside the buffer.
+        long.truncate(BINPRM_BUF_SIZE);
+        long[BINPRM_BUF_SIZE - 1] = b' ';
+        let expected = long[2..BINPRM_BUF_SIZE - 1].to_vec();
+        assert_eq!(KernelScript::from_buf(&long), kernel_interpreter(&expected));
     }
 }

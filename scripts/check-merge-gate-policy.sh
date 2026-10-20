@@ -193,9 +193,9 @@ labels_kvm_case=$(awk '
 [[ $labels_kvm_case == *'0 | 1)'* && $labels_kvm_case == *'exit 2'* ]] ||
     fail "KVM label grep must accept only status 0/1 and refuse every error"
 grep -Fq 'actions: write' "$WORKFLOW" || fail "NO_RESULT must be able to re-dispatch and cancel"
-grep -Fq 'ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' "$WORKFLOW" ||
+grep -Fq 'ref=588f462716087dab75bed0f56abba42b87b33b8c' "$WORKFLOW" ||
     fail "gate must pin the parent authority commit"
-grep -Fq '2f1c61d5ec9d98b9697317fd9e66b705161defb69b808d23e6d83384e1e2a1e8' "$WORKFLOW" ||
+grep -Fq '9e2a96f610007d6043daee3e05e0b30395518ea93113b0109fafd0d31e8ee5ee' "$WORKFLOW" ||
     fail "gate must content-pin the check-status authority"
 grep -Fq '"$CHECK_OUTCOME_AUTHORITY"' "$WORKFLOW" ||
     fail "gate must call the parent check-status authority"
@@ -287,9 +287,9 @@ trap 'rm -rf "$_authority_dir"' EXIT
 CONSUMER_TEST="$ROOT_DIR/scripts/test-check-status-outcome.sh"
 [[ -f $CLASSIFIER ]] || fail "the check-status adapter is missing at $CLASSIFIER"
 [[ -x $CONSUMER_TEST ]] || fail "the check-status consumer test is missing at $CONSUMER_TEST"
-grep -Fq 'AUTHORITY_COMMIT = "4b78d727f35bc8612ac460a6e270dda5f5df304c"' "$CLASSIFIER" ||
+grep -Fq 'AUTHORITY_COMMIT = "588f462716087dab75bed0f56abba42b87b33b8c"' "$CLASSIFIER" ||
     fail "the local adapter must pin the reviewed parent authority commit"
-grep -Fq 'AUTHORITY_SHA256 = "2f1c61d5ec9d98b9697317fd9e66b705161defb69b808d23e6d83384e1e2a1e8"' "$CLASSIFIER" ||
+grep -Fq 'AUTHORITY_SHA256 = "9e2a96f610007d6043daee3e05e0b30395518ea93113b0109fafd0d31e8ee5ee"' "$CLASSIFIER" ||
     fail "the local adapter must content-pin the reviewed parent authority"
 
 # The consumer test executes the shell adapter, pr_status.py, and

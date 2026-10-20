@@ -163,7 +163,7 @@ set -euo pipefail
 
 main_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 case "$1:$2" in
-    api:repos/rrnewton/dev-hermit/contents/ci-hub/check_outcome.py\?ref=4b78d727f35bc8612ac460a6e270dda5f5df304c)
+    api:repos/rrnewton/dev-hermit/contents/ci-hub/check_outcome.py\?ref=588f462716087dab75bed0f56abba42b87b33b8c)
         cat "$PINNED_AUTHORITY"
         ;;
     pr:list)

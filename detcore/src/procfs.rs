@@ -2908,23 +2908,45 @@ fn sanitize_numa_maps(contents: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Every `smaps`/`smaps_rollup` field that counts pages the host currently
+/// holds for the mapping: resident, dirty, swapped, huge-page backed, reclaim
+/// pending, or locked. Reclaim, writeback, khugepaged and swap change these
+/// without any guest action, so both sanitizers report each one as `0 kB`.
+/// The zero `Rss` bounds every field except `Swap` and `SwapPss`, which count
+/// swapped-out pages, and `Shared_Hugetlb` and `Private_Hugetlb`, which count
+/// hugetlb pages that the kernel keeps out of `Rss`. All zero is still a
+/// state Linux reports, for example for an untouched mapping.
+const SMAPS_ACCOUNTING_FIELDS: &[&str] = &[
+    "Rss",
+    "Pss",
+    "Pss_Dirty",
+    "Pss_Anon",
+    "Pss_File",
+    "Pss_Shmem",
+    "Shared_Clean",
+    "Shared_Dirty",
+    "Private_Clean",
+    // Counts a page as dirty when its page-cache copy is dirty, not only
+    // when the guest wrote it, so a freshly written executable reports
+    // 4 kB per text mapping until host writeback runs.
+    "Private_Dirty",
+    "Referenced",
+    "Anonymous",
+    "KSM",
+    "LazyFree",
+    "AnonHugePages",
+    "ShmemPmdMapped",
+    "FilePmdMapped",
+    "Shared_Hugetlb",
+    "Private_Hugetlb",
+    "Swap",
+    "SwapPss",
+    "Locked",
+];
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-937): Review the /proc/self/smaps_rollup field policy.
 fn sanitize_smaps_rollup(contents: &[u8]) -> Vec<u8> {
-    const HOST_ACCOUNTING_FIELDS: &[&str] = &[
-        "Rss",
-        "Pss",
-        "Pss_Dirty",
-        "Pss_Anon",
-        "Pss_File",
-        "Pss_Shmem",
-        "Shared_Clean",
-        "Shared_Dirty",
-        "Private_Clean",
-        "Referenced",
-        "KSM",
-        "SwapPss",
-    ];
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
     };
@@ -2941,7 +2963,8 @@ fn sanitize_smaps_rollup(contents: &[u8]) -> Vec<u8> {
                 && fields.next().is_none())
             .then_some(label)
         });
-        if let Some(label) = accounting_label.filter(|label| HOST_ACCOUNTING_FIELDS.contains(label))
+        if let Some(label) =
+            accounting_label.filter(|label| SMAPS_ACCOUNTING_FIELDS.contains(label))
         {
             normalized.extend_from_slice(label.as_bytes());
             normalized.extend_from_slice(b":\t0 kB");
@@ -2985,21 +3008,6 @@ fn sanitize_arch_status(contents: &[u8]) -> Vec<u8> {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-949): Review the /proc/self/smaps accounting field policy.
 fn sanitize_smaps(contents: &[u8], table: &BTreeMap<(u64, u64), (u64, u64)>) -> Vec<u8> {
-    const ACCOUNTING_FIELDS: &[&str] = &[
-        "Rss",
-        "Pss",
-        "Pss_Dirty",
-        "Pss_Anon",
-        "Pss_File",
-        "Pss_Shmem",
-        "Shared_Clean",
-        "Shared_Dirty",
-        "Private_Clean",
-        "Referenced",
-        "KSM",
-        "SwapPss",
-    ];
-
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
     };
@@ -3024,7 +3032,7 @@ fn sanitize_smaps(contents: &[u8], table: &BTreeMap<(u64, u64), (u64, u64)>) -> 
                 return contents.to_vec();
             };
 
-            if ACCOUNTING_FIELDS.contains(&label) {
+            if SMAPS_ACCOUNTING_FIELDS.contains(&label) {
                 if !is_smaps_kilobyte_value(value) {
                     return contents.to_vec();
                 }
@@ -3033,11 +3041,7 @@ fn sanitize_smaps(contents: &[u8], table: &BTreeMap<(u64, u64), (u64, u64)>) -> 
                 accounting_count += 1;
             } else {
                 let valid_static_field = match label {
-                    "Size" | "KernelPageSize" | "MMUPageSize" | "Private_Dirty" | "Anonymous"
-                    | "LazyFree" | "AnonHugePages" | "ShmemPmdMapped" | "FilePmdMapped"
-                    | "Shared_Hugetlb" | "Private_Hugetlb" | "Swap" | "Locked" => {
-                        is_smaps_kilobyte_value(value)
-                    }
+                    "Size" | "KernelPageSize" | "MMUPageSize" => is_smaps_kilobyte_value(value),
                     "THPeligible" | "ProtectionKey" => is_smaps_integer_value(value),
                     "VmFlags" => value
                         .split_whitespace()
@@ -5805,11 +5809,122 @@ MMUPageSize:           4 kB\n\
 Rss:\t0 kB\n\
 Pss:\t0 kB\n\
 Shared_Clean:\t0 kB\n\
-Private_Dirty:         0 kB\n\
+Private_Dirty:\t0 kB\n\
 THPeligible:           0\n\
 ProtectionKey:         0\n\
 VmFlags: rd ex mr mw me ac\n"
         );
+    }
+
+    /// Measured on a ptrace run of a just-compiled executable: its three
+    /// read-only and text mappings reported `Private_Dirty: 4 kB` until host
+    /// writeback cleaned the page cache, then `0 kB`, with no guest write in
+    /// between. Two verify runs that straddled writeback diverged.
+    #[test]
+    fn smaps_hides_page_cache_dirty_state() {
+        let dirty = b"00400000-00401000 r--p 00000000 00:2a 99 /guest\n\
+Size:                  4 kB\n\
+Rss:                   4 kB\n\
+Private_Dirty:         4 kB\n\
+VmFlags: rd mr mw me\n";
+        let clean = b"00400000-00401000 r--p 00000000 00:2a 99 /guest\n\
+Size:                  4 kB\n\
+Rss:                   4 kB\n\
+Private_Dirty:         0 kB\n\
+VmFlags: rd mr mw me\n";
+
+        let expected = b"00400000-00401000 r--p 00000000 00:2a 99 /guest\n\
+Size:                  4 kB\n\
+Rss:\t0 kB\n\
+Private_Dirty:\t0 kB\n\
+VmFlags: rd mr mw me\n";
+        assert_eq!(sanitize_smaps(dirty, &BTreeMap::new()), expected);
+        assert_eq!(sanitize_smaps(clean, &BTreeMap::new()), expected);
+        assert_eq!(
+            sanitize_smaps_rollup(b"Private_Dirty:        12 kB\n"),
+            b"Private_Dirty:\t0 kB\n"
+        );
+    }
+
+    /// Every host page-accounting field, in the order this kernel prints them.
+    /// Deliberately a separate literal rather than `SMAPS_ACCOUNTING_FIELDS`, so
+    /// dropping a field from the sanitizer's list fails here.
+    const KERNEL_SMAPS_ACCOUNTING_LABELS: &[&str] = &[
+        "Rss",
+        "Pss",
+        "Pss_Dirty",
+        "Pss_Anon",
+        "Pss_File",
+        "Pss_Shmem",
+        "Shared_Clean",
+        "Shared_Dirty",
+        "Private_Clean",
+        "Private_Dirty",
+        "Referenced",
+        "Anonymous",
+        "KSM",
+        "LazyFree",
+        "AnonHugePages",
+        "ShmemPmdMapped",
+        "FilePmdMapped",
+        "Shared_Hugetlb",
+        "Private_Hugetlb",
+        "Swap",
+        "SwapPss",
+        "Locked",
+    ];
+
+    /// Reclaim, writeback, swap and khugepaged change every one of these
+    /// between two runs of an unchanged guest. Two blocks that differ only in
+    /// those values must sanitize to the same bytes, in both files.
+    #[test]
+    fn smaps_hides_every_host_page_accounting_field() {
+        let block = |seed: u64| {
+            let mut block = String::from(
+                "00400000-00600000 rw-p 00000000 00:00 0\nSize:               2048 kB\n",
+            );
+            for (index, label) in KERNEL_SMAPS_ACCOUNTING_LABELS.iter().enumerate() {
+                let value = seed * (index as u64 + 1);
+                block.push_str(&format!("{:<16}{value:>8} kB\n", format!("{label}:")));
+            }
+            block.push_str("THPeligible:    1\nVmFlags: rd wr mr mw me ac\n");
+            block
+        };
+        let idle = block(0);
+        let busy = block(4);
+        let mut expected =
+            String::from("00400000-00600000 rw-p 00000000 00:00 0\nSize:               2048 kB\n");
+        for label in KERNEL_SMAPS_ACCOUNTING_LABELS {
+            expected.push_str(&format!("{label}:\t0 kB\n"));
+        }
+        expected.push_str("THPeligible:    1\nVmFlags: rd wr mr mw me ac\n");
+
+        for input in [&idle, &busy] {
+            let smaps = sanitize_smaps(input.as_bytes(), &BTreeMap::new());
+            assert_eq!(String::from_utf8(smaps).unwrap(), expected);
+        }
+
+        let rollup = |block: &str| {
+            let block = block.replace("00400000-00600000 rw-p", "00400000-7ffffffff000 ---p");
+            let body: String = block
+                .lines()
+                .filter(|line| {
+                    !line.starts_with("Size:")
+                        && !line.starts_with("THPeligible:")
+                        && !line.starts_with("VmFlags:")
+                })
+                .map(|line| format!("{line}\n"))
+                .collect();
+            String::from_utf8(sanitize_smaps_rollup(body.as_bytes())).unwrap()
+        };
+        let idle_rollup = rollup(&idle);
+        assert_eq!(idle_rollup, rollup(&busy));
+        for label in KERNEL_SMAPS_ACCOUNTING_LABELS {
+            assert!(
+                idle_rollup.contains(&format!("\n{label}:\t0 kB\n")),
+                "rollup left {label} unsanitized: {idle_rollup}"
+            );
+        }
     }
 
     #[test]
@@ -5867,8 +5982,8 @@ THPeligible:    0\n";
 Rss:\t0 kB\n\
 Pss:\t0 kB\n\
 Pss_File:\t0 kB\n\
-Locked:                12 kB\n\
-Swap:                   8 kB\n\
+Locked:\t0 kB\n\
+Swap:\t0 kB\n\
 THPeligible:    0\n"
         );
     }

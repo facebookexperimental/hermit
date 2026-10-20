@@ -15,6 +15,12 @@
 # is accepted; ci/compat-envelope/parity-cells.json marks it "selectable": false
 # with the reason, and it stays unmeasured until both verify cells are selected.
 #
+# Six KVM verify cells were enabled after passing their unchanged probes:
+# https://github.com/rrnewton/reverie/issues/891
+# Their entries below follow the existing rule; this is no parity-pass claim.
+# So does poll-readiness's KVM entry, enabled for
+# https://github.com/rrnewton/reverie/issues/620.
+#
 # After editing this file, regenerate the snapshot with:
 #   cargo run -p hermit-manifest-plan --bin generate-parity-cells -- --write
 schema: 1
@@ -27,205 +33,207 @@ rule: >-
   Candidate cells that are enabled but not selected by full validation are
   included and marked not selectable in ci/compat-envelope/parity-cells.json.
 cells:
+  # SaBRe verify cells promoted 2026-10-03 on 10/10 no-retry pressure runs at c3f7b2bcfa00 (run sabre-promote-c3f7b2bcfa00-20261003)
   - test: c-programs/aio-refusal
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/append-pwrite
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/bind-getsockname
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/cachestat-refusal
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/child-subreaper-refusal
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/close-range-fds
     backends: [kvm, liteinst]
   - test: c-programs/copy-file-range-refusal
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/cpu-virtualization
-    backends: [dbt, kvm, liteinst]
+    backends: [dbt, kvm, liteinst, sabre]
   - test: c-programs/cpuid-probe
     backends: [dbt, kvm, liteinst]
   - test: c-programs/cwd-roundtrip
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/dup-shared-offset
-    backends: [dbt, kvm, liteinst]
+    backends: [dbt, kvm, liteinst, sabre]
+  # One qualified KVM candidate: https://github.com/rrnewton/reverie/issues/905
   - test: c-programs/epoll-pwait2
-    backends: [liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/epoll-readiness
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/event-delivery-ordering
-    backends: [liteinst]
+    backends: [liteinst, sabre]
   - test: c-programs/eventfd-semantics
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/faccessat2-flags
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/fadvise-hints
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/fallocate-extents
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/fchmod-bits
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/fchmodat2-flags
-    backends: [liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/fcntl-owner
-    backends: [liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/fd-duplication
-    backends: [dbt, kvm, liteinst]
+    backends: [dbt, kvm, liteinst, sabre]
   - test: c-programs/file-backed-mmap
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/file-io-roundtrip
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/flock-lifecycle
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/fork-exec-pipeline
     backends: [kvm]
   - test: c-programs/fsync-durability
-    backends: [liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/ftruncate-sparse
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/getcpu-identity
-    backends: [dbt, kvm, liteinst]
+    backends: [dbt, kvm, liteinst, sabre]
   - test: c-programs/getpriority-identity
-    backends: [dbt, kvm, liteinst]
+    backends: [dbt, kvm, liteinst, sabre]
   - test: c-programs/getrusage-self-accounting
     backends: [liteinst]
   - test: c-programs/hardware-trap-identity
     backends: [dbt, liteinst]
   - test: c-programs/host-identity
-    backends: [dbt, liteinst]
+    backends: [dbt, liteinst, sabre]
   - test: c-programs/inline-syscall-sites
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/inotify-watch
-    backends: [liteinst]
+    backends: [liteinst, sabre]
   - test: c-programs/ioctl-fionread
-    backends: [liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/kcmp-refusal
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/linkat-flags
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/lseek-positioning
-    backends: [dbt, kvm, liteinst]
+    backends: [dbt, kvm, liteinst, sabre]
   - test: c-programs/mce-kill-refusal
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/membarrier-query
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/memfd-create
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/mempolicy-default
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/mincore-residency
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/mixed-inline-and-libc-syscalls
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/mkdir-rmdir
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/mknod-special
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/mmap-layout-pointer-order
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/msync-writeback
-    backends: [liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/name-to-handle-refusal
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/no-new-privs-refusal
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/numa-node-identity
-    backends: [dbt, kvm, liteinst]
+    backends: [dbt, kvm, liteinst, sabre]
   - test: c-programs/o-tmpfile-anon
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/openat-flags
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/openat2-refusal
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/path-file-ops
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/personality-domain
-    backends: [liteinst]
+    backends: [liteinst, sabre]
   - test: c-programs/pid-probe
     backends: [dbt, kvm, liteinst, sabre]
   - test: c-programs/pidfd-open-self-pair
-    backends: [dbt, kvm, liteinst]
+    backends: [dbt, kvm, liteinst, sabre]
   - test: c-programs/pipe-capacity
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/pipe-capacity-pin
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/pipe-ipc
     backends: [kvm, liteinst]
   - test: c-programs/pipe2-flags
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/poll-readiness
-    backends: [liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/prctl-identity
-    backends: [dbt, liteinst]
+    backends: [dbt, kvm, liteinst, sabre]
   - test: c-programs/prctl-pdeathsig
-    backends: [liteinst]
+    backends: [liteinst, sabre]
   - test: c-programs/preadv2-flags
-    backends: [liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/pthread-lifecycle
     backends: [kvm, liteinst, sabre]
   - test: c-programs/readdir-entries
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/readdir-order-identity
     backends: [kvm, liteinst]
   - test: c-programs/record-lock
-    backends: [liteinst]
+    backends: [liteinst, sabre]
   - test: c-programs/rename-ops
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/renameat2-flags
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/rlimit-identity
-    backends: [dbt, kvm, liteinst]
+    backends: [dbt, kvm, liteinst, sabre]
   - test: c-programs/robust-list
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/sched-getaffinity-identity
-    backends: [dbt, kvm, liteinst]
+    backends: [dbt, kvm, liteinst, sabre]
   - test: c-programs/seccomp-refusal
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/sendfile-copy
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/set-tid-address
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/short-io-split-identity
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/shutdown-socketpair
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/signal-delivery-sequence
     backends: [liteinst]
   - test: c-programs/signal-waitstatus-identity
     backends: [dbt, liteinst]
   - test: c-programs/signalfd-create
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/socket-epoll-ordering
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/socket-options
-    backends: [liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/socketpair-flags
-    backends: [liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/sockname-unnamed
-    backends: [liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/stat-metadata-identity
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/statfs-free-determinism
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/static-nolibc-syscall-sites
     backends: [kvm]
   - test: c-programs/statx-metadata
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/symlink-ops
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/sync-file-range
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/sysv-ipc-refusal
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/thp-disable
-    backends: [liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/umask-mode
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/uname-identity
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/utimensat-determinism
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/vectored-file-io
-    backends: [liteinst]
+    backends: [kvm, liteinst, sabre]
   - test: c-programs/vectored-io
-    backends: [kvm, liteinst]
+    backends: [kvm, liteinst, sabre]

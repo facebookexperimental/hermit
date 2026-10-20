@@ -130,6 +130,10 @@ pub struct RuntimeStats {
     pub virtual_nanoseconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub syscalls: Option<u64>,
+    /// The run's backend dispatch record, copied from its summary. Absent for
+    /// a backend without one (KVM) and in reports written before the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<detcore_model::summary::DispatchStats>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

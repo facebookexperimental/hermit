@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -17,6 +18,8 @@ use reverie::process::Command;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::consts::METADATA_NAME;
+use crate::error::Context;
 use crate::error::Error;
 
 /// Hermit record version. Recorded as part of hermit-record, hermit-replay
@@ -154,7 +157,20 @@ impl RecordVersion {
 // them. Streams now carry Timespec and Timeofday events for clock_gettime,
 // gettimeofday and time, and clock_getres gains a recorder event (Timespec, or
 // Return for a NULL `res`). An older reader would desynchronize on these events.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11d);
+// 0x11d -> 0x11e: guest-semantic madvise advice, which detcore used to refuse
+// with ENOSYS, now reaches the recorder and replayer and emits a Madvise event.
+// 0x11e -> 0x11f: faccessat, faccessat2, chdir, getcwd and the legacy path
+// mutations (rename, link, symlink, chmod, chown, lchown, mknod, rmdir) are
+// recorded instead of running live. A successful chdir or fchdir carries a
+// Bytes event naming the directory it entered. An older reader would
+// desynchronize on these events.
+// 0x11f -> 0x120: descriptor syncs and metadata changes (fsync, fdatasync,
+// syncfs, fchmod, fchown, fsetxattr, fremovexattr) record a Return event, the
+// xattr queries (getxattr, lgetxattr, fgetxattr and the listxattr family)
+// record a Bytes event (Return for a zero-size query), and zero-count read and
+// pread64 calls are recorded instead of running live. An older reader would
+// desynchronize on these events.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x120);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -179,7 +195,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11d);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11d;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x120;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -231,6 +247,14 @@ pub struct Metadata {
     /// Detcore first observed them.
     #[serde(default)]
     pub fdinfo_unlisted_mount_ids: Vec<u64>,
+    /// Whether the recording ran in an isolated network namespace with only
+    /// loopback (`record start --network local`). `None` means the recorder
+    /// did not say, which is every recording made before this field existed;
+    /// those recordings ran on the host network. An autopilot replay uses the
+    /// same network, so syscalls the replayer re-executes see the same
+    /// interfaces and ports they were recorded against.
+    #[serde(default)]
+    pub local_networking: Option<bool>,
 }
 
 impl Metadata {
@@ -284,7 +308,18 @@ impl Metadata {
             mountinfo_mount_ids: Vec::new(),
             mountinfo_mount_ids_captured: false,
             fdinfo_unlisted_mount_ids: Vec::new(),
+            local_networking: None,
         })
+    }
+
+    /// Reads the metadata of the recording stored in `dir`.
+    pub fn load(dir: &Path) -> Result<Self, Error> {
+        let metadata_path = dir.join(METADATA_NAME);
+        serde_json::from_reader(
+            fs::File::open(&metadata_path)
+                .with_context(|| format!("Failed to open {:?}", metadata_path))?,
+        )
+        .with_context(|| format!("Failed to parse {:?}", metadata_path))
     }
 
     /// Constructs a command from the metadata.
@@ -575,9 +610,44 @@ mod tests {
                 delivered.contains(&Sysno::syslog),
                 "{phase} must deliver syslog to its deterministic Detcore handler"
             );
+            // chdir is PassThrough for Detcore but its result depends on the
+            // replay chroot, so record/replay subscribes it (hermit#3598);
+            // umask, from the same PassThrough group, stays the sentinel that
+            // record/replay does not subscribe everything.
             assert!(
-                !delivered.contains(&Sysno::chdir),
-                "{phase} must leave unlisted PassThrough chdir unsubscribed"
+                delivered.contains(&Sysno::chdir) && delivered.contains(&Sysno::getcwd),
+                "{phase} must deliver chdir and getcwd so replay uses recorded results"
+            );
+            // A replayed descriptor may be a placeholder, so these must
+            // return recorded results rather than run
+            // (https://github.com/rrnewton/hermit/issues/3591).
+            for sysno in [
+                Sysno::fsync,
+                Sysno::fdatasync,
+                Sysno::syncfs,
+                Sysno::fchmod,
+                Sysno::fchown,
+                Sysno::fsetxattr,
+                Sysno::fremovexattr,
+                Sysno::setxattr,
+                Sysno::lsetxattr,
+                Sysno::removexattr,
+                Sysno::lremovexattr,
+                Sysno::getxattr,
+                Sysno::lgetxattr,
+                Sysno::fgetxattr,
+                Sysno::listxattr,
+                Sysno::llistxattr,
+                Sysno::flistxattr,
+            ] {
+                assert!(
+                    delivered.contains(&sysno),
+                    "{phase} must deliver {sysno} so replay uses its recorded result"
+                );
+            }
+            assert!(
+                !delivered.contains(&Sysno::umask),
+                "{phase} must leave unlisted PassThrough umask unsubscribed"
             );
         }
     }
@@ -604,5 +674,24 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x109)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x104)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x102)));
+    }
+
+    /// A recording made before the network choice was stored ran on the host
+    /// network, and must still load, reporting no choice.
+    #[test]
+    fn metadata_without_a_network_choice_loads_as_unknown() {
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "exe": "/bin/true",
+            "program": "true",
+            "arg0": "true",
+            "args": [],
+            "current_dir": "/",
+            "hostname": null,
+            "domainname": null,
+            "envs": {},
+            "version": RECORD_VERSION,
+        }))
+        .unwrap();
+        assert_eq!(metadata.local_networking, None);
     }
 }

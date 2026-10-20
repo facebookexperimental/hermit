@@ -11,6 +11,9 @@
 use std::fmt;
 use std::time::Duration;
 
+/// The backend dispatch record a run summary carries, re-exported so readers of
+/// summaries and verification reports need no direct Reverie dependency.
+pub use reverie::DispatchStats;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -141,6 +144,14 @@ pub struct RunSummary {
     /// Per-thread timeslice distributions, sorted by `DetTid` for deterministic
     /// output.
     pub per_thread_timeslice: Vec<(DetTid, TimesliceStats)>,
+
+    /// How the backend dispatched guest syscalls: through signals, patched
+    /// direct calls, or ptrace stops. The record carries its own schema
+    /// version. Absent when the run did not collect it or the backend has no
+    /// such dispatch (KVM). Deliberately not part of the human-readable
+    /// summary, whose INFO view is compared by `--verify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_stats: Option<DispatchStats>,
 }
 
 /// A human-readable, multi-line summary. Serialized report fields are unchanged.
@@ -193,6 +204,7 @@ impl RunSummary {
             threads_descrip,
             timeslice_stats,
             per_thread_timeslice,
+            dispatch_stats: _,
         } = self;
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;
         writeln!(

@@ -174,7 +174,11 @@ fn classify_unwrapped(error: &Error) -> FailureKind {
         FailureKind::SkidOvershoot {
             count: error.count(),
         }
-    } else if is_policy_refusal(error) {
+    } else if is_policy_refusal(error)
+        || error
+            .downcast_ref::<crate::LiteinstInGuestRefusal>()
+            .is_some()
+    {
         FailureKind::PolicyRefusal
     } else if error.downcast_ref::<crate::GuestTimedOut>().is_some() {
         FailureKind::RunTimeout
@@ -287,5 +291,20 @@ mod tests {
 
         let ordinary = SerializableError::from(Error::msg("ordinary failure"));
         assert_eq!(ordinary.kind(), FailureKind::Error);
+    }
+
+    /// The library's in-guest LiteInst refusals run inside the container, so
+    /// they reach the CLI only as this serialized form.
+    #[test]
+    fn in_guest_liteinst_refusal_is_serialized_as_a_policy_refusal() {
+        let refusal = SerializableError::from(Error::new(crate::LiteinstInGuestRefusal::new(
+            "guest program /static is statically linked",
+        )));
+        assert_eq!(refusal.kind(), FailureKind::PolicyRefusal);
+        assert_eq!(
+            refusal.error,
+            "HERMIT_LITEINST_IN_GUEST=1 (in-guest LiteInst) refuses this run: guest program \
+             /static is statically linked"
+        );
     }
 }

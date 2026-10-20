@@ -3,8 +3,13 @@
 [package]
 name = "detcore-model"
 description = "Core data model and types for Detcore, the Hermit deterministic execution engine."
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
+readme = "README.md"
+homepage = "https://hermetic-infra.org"
+documentation = "https://docs.rs/detcore-model"
+keywords = ["linux", "hermit", "determinism", "debugging"]
+categories = ["development-tools::debugging", "development-tools::testing"]
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
 
@@ -17,7 +22,8 @@ chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-fea
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
-reverie-syscalls = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359" }
+reverie = { package = "reverie-core", version = "=0.4.1" }
+reverie-syscalls = { version = "=0.4.1" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shell-words = "1.1.1"

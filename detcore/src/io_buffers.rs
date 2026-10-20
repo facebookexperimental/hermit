@@ -839,6 +839,9 @@ mod event_tests {
         injected_iovecs: Vec<(usize, usize)>,
         injected_zero_reads: usize,
         polls: Mutex<Vec<u32>>,
+        /// `Resources::backend_runtime_bootstrap` of each resource request,
+        /// in the order the requests arrive.
+        request_marks: Mutex<Vec<bool>>,
         releases: Mutex<usize>,
         retry_gate: Mutex<Option<RetryGate>>,
         /// What this fake backend answers to
@@ -904,6 +907,10 @@ mod event_tests {
                         Some(&Permission::W)
                     );
                     self.polls.lock().unwrap().push(request.poll_attempt);
+                    self.request_marks
+                        .lock()
+                        .unwrap()
+                        .push(request.backend_runtime_bootstrap);
                     match request.poll_attempt {
                         0 => {}
                         1 => {
@@ -1111,6 +1118,7 @@ mod event_tests {
             injected_iovecs: Vec::new(),
             injected_zero_reads: 0,
             polls: Mutex::new(Vec::new()),
+            request_marks: Mutex::new(Vec::new()),
             releases: Mutex::new(0),
             retry_gate: Mutex::new(retry_gate),
             backend_runtime_bootstrap: false,
@@ -1499,6 +1507,82 @@ mod event_tests {
             "the first syscall past the reopened window's cap must be charged"
         );
         assert_eq!(*cap_logs.0.lock().unwrap(), two_cap_lines);
+    }
+
+    /// The resource requests a syscall makes are marked as backend-runtime
+    /// bootstrap work exactly when that syscall's cost is withheld, so the
+    /// scheduler withholds their turn time as well
+    /// (https://github.com/rrnewton/hermit/issues/3517). The same blocking pipe
+    /// readv, which makes two IO-polling requests, is unmarked as a guest
+    /// syscall, marked inside the window, and unmarked again inside the window
+    /// once the window's cap makes it a charged syscall. The mark never outlives
+    /// the syscall that set it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bootstrap_syscall_marks_its_resource_requests_only_while_it_is_uncharged() {
+        use crate::syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS;
+
+        /// Runs one blocking pipe readv (EAGAIN, then four bytes) and returns
+        /// the marks of the requests it made, the clock advance, and the guest.
+        async fn pipe_readv(
+            in_window: bool,
+            uncharged_so_far: u32,
+        ) -> (Vec<bool>, u64, EventGuest) {
+            let (parked_tx, parked_rx) = oneshot::channel();
+            let (resume_tx, resume_rx) = oneshot::channel();
+            let (tool, mut guest) = event_guest(FdType::Pipe, Some((parked_tx, resume_rx)));
+            guest.backend_runtime_bootstrap = in_window;
+            guest.thread.uncharged_bootstrap_syscalls = uncharged_so_far;
+            guest.memory.put_iovec(0, FIRST_DEST, 8);
+            let before = guest.thread.thread_logical_time.as_nanos().as_nanos();
+            let event = tool.handle_syscall_event(&mut guest, readv(1));
+            let resume = async {
+                parked_rx.await.unwrap();
+                resume_tx.send(()).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(event, resume)
+            })
+            .await
+            .expect("readv did not cross its retry resource wait");
+            assert_eq!(result.unwrap(), 4);
+            assert_eq!(*guest.polls.lock().unwrap(), [0, 1]);
+            assert!(
+                !guest.thread.in_uncharged_bootstrap_syscall,
+                "the mark must be cleared when the syscall finishes"
+            );
+            let advance = guest.thread.thread_logical_time.as_nanos().as_nanos() - before;
+            let marks = guest.request_marks.lock().unwrap().clone();
+            (marks, advance, guest)
+        }
+
+        let (guest_marks, guest_cost, _) = pipe_readv(false, 0).await;
+        assert!(guest_cost > 0, "a guest syscall must advance logical time");
+        assert_eq!(
+            guest_marks,
+            [false, false],
+            "a guest syscall's requests must not be marked"
+        );
+
+        let (window_marks, window_cost, booting) = pipe_readv(true, 0).await;
+        assert_eq!(window_cost, 0, "the window's syscall must be uncharged");
+        assert_eq!(booting.thread.uncharged_bootstrap_syscalls, 1);
+        assert_eq!(
+            window_marks,
+            [true, true],
+            "every request of an uncharged window syscall must be marked"
+        );
+
+        let (capped_marks, capped_cost, _) =
+            pipe_readv(true, MAX_UNCHARGED_BOOTSTRAP_SYSCALLS).await;
+        assert_eq!(
+            capped_cost, guest_cost,
+            "a window syscall past the cap must be charged"
+        );
+        assert_eq!(
+            capped_marks,
+            [false, false],
+            "a charged window syscall's requests must not be marked"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

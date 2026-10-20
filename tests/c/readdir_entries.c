@@ -15,8 +15,8 @@
 // regular file. The temporary tree is removed before exit so repeated (and
 // --verify) runs are idempotent.
 //
-// _GNU_SOURCE is supplied by the harness compile flags (see run_matrix.py);
-// do not define it here (it would collide with -D_GNU_SOURCE under -Werror).
+// _GNU_SOURCE is defined here: the manifest runner compiles this file with
+// -std=c11 and no -D_GNU_SOURCE (ci/manifest-plan/src/runner.rs).
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <fcntl.h>

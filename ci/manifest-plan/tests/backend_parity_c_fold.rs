@@ -18,15 +18,25 @@
 //! 1. The retired-id map renames exactly the documented ids: every id is the
 //!    bucket-prefix rename except the one collision, and it is a bijection onto
 //!    live ids.
-//! 2. The committed CI plan selects 1089 cells, with per-(lane, backend, mode)
+//! 2. The committed CI plan selects 1233 cells, with per-(lane, backend, mode)
 //!    counts equal to the pre-fold plan's plus exactly the cells slice S13
-//!    added (895 portable and 5 privileged) and the 189 portable cells of the
-//!    compatibility-corpus fold, after applying the later lane moves listed in
-//!    `LATER_LANE_MOVES` (now 1082 portable and 7 privileged).
-//! 3. The committed compatibility cell table has 9008 rows, with
+//!    added (895 portable and 5 privileged), the 189 portable cells of the
+//!    compatibility-corpus fold, the 2 portable select replay cells and the 6
+//!    portable KVM verify selections, the three socket selections, and one
+//!    poll-readiness, one epoll-pwait2, one fsync-durability, one fcntl-owner
+//!    and one msync-writeback selection, and the 128 portable SaBRe verify
+//!    cells promoted on 2026-10-03,
+//!    after applying the later lane moves listed
+//!    in `LATER_LANE_MOVES` (now 1226 portable and 7 privileged).
+//! 3. The committed compatibility cell table has 14800 rows, with
 //!    per-(backend, mode, status) counts equal to the pre-fold table's plus
 //!    exactly the rows slice S13 added or reclassified and the 3024 rows of the
-//!    compatibility-corpus fold.
+//!    compatibility-corpus fold, plus the 2 select replay and 6 KVM verify
+//!    selection changes, plus three socket, one poll-readiness, one epoll-pwait2,
+//!    one fsync-durability, one fcntl-owner and one msync-writeback selection,
+//!    and the 128 SaBRe verify promotions of 2026-10-03,
+//!    that keep the row total unchanged, plus the later SaBRe, strict and rr
+//!    compatibility folds described below.
 //! 4. The command the c-programs nodes run refuses a selection of zero cells,
 //!    so folding more tests into that node cannot turn it into a vacuous pass.
 //!
@@ -131,6 +141,189 @@ fn compat_fold_cell_deltas() -> Vec<(&'static str, &'static str, &'static str, i
     }
     deltas
 }
+
+/// <https://github.com/rrnewton/hermit/pull/3580> taught the recorder and
+/// replayer `select` and `pselect6` and selected the portable ptrace replay cell
+/// of `c-programs/poll-readiness` and `c-programs/pselect6-simulation`. Both
+/// tests already existed, so the cell table keeps its row count: each test's
+/// ptrace replay row moves from not applicable to selected (green).
+const SELECT_REPLAY_TESTS: usize = 2;
+const SELECT_REPLAY_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] =
+    &[("portable", "ptrace", "replay", SELECT_REPLAY_TESTS)];
+const SELECT_REPLAY_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("ptrace", "replay", "green", SELECT_REPLAY_TESTS as isize),
+    (
+        "ptrace",
+        "replay",
+        "not-applicable",
+        -(SELECT_REPLAY_TESTS as isize),
+    ),
+];
+
+/// <https://github.com/rrnewton/reverie/issues/891> qualified six existing
+/// portable KVM verify cells. Their selection adds six plan cells; the catalogue
+/// moves six existing rows from not applicable to selected (green), without
+/// adding rows or changing any guest assertion or bound.
+const KVM_2026_10_03_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] =
+    &[("portable", "kvm", "verify", 6)];
+const KVM_2026_10_03_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("kvm", "verify", "green", 6),
+    ("kvm", "verify", "not-applicable", -6),
+];
+
+/// Three further socket KVM verify selections from
+/// <https://github.com/rrnewton/reverie/issues/891>; preserve the earlier six
+/// and all frozen pre-fold populations as independent additive changes.
+const KVM_SOCKET_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] = &[("portable", "kvm", "verify", 3)];
+const KVM_SOCKET_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("kvm", "verify", "green", 3),
+    ("kvm", "verify", "not-applicable", -3),
+];
+
+/// <https://github.com/rrnewton/reverie/issues/620> qualifies the unchanged
+/// poll-readiness KVM verify fixture: one required cell, with every original
+/// guest assertion, comparator and bound intact. Replay remains disabled.
+const KVM_PSELECT_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] =
+    &[("portable", "kvm", "verify", 1)];
+const KVM_PSELECT_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("kvm", "verify", "green", 1),
+    ("kvm", "verify", "not-applicable", -1),
+];
+
+/// Fold 3 of <https://github.com/rrnewton/hermit/issues/3448> moved the SaBRe
+/// compatibility corpus from 212 generated validation nodes into the same
+/// manifest, as SaBRe verify cells that only the sabre-compat-only run type
+/// selects. 185 of its programs were already rows, so each of their SaBRe
+/// verify rows went from not applicable to red (enabled, not selected by the
+/// full validation). The other 27 became new rows whose ptrace and SaBRe verify
+/// cells are both red for the same reason, with their other 14 rows not
+/// applicable. Three more new rows, lua-direct, perl-direct and df-direct,
+/// keep the SaBRe corpus's single-image argv for programs whose existing rows
+/// run under a bash wrapper. The plan of the full validation is unchanged.
+const SABRE_FOLD_EXISTING_ROWS: usize = 185;
+const SABRE_FOLD_NEW_ROWS: usize = 27 + 3;
+
+fn sabre_fold_cell_deltas() -> Vec<(&'static str, &'static str, &'static str, isize)> {
+    let existing = SABRE_FOLD_EXISTING_ROWS as isize;
+    let new = SABRE_FOLD_NEW_ROWS as isize;
+    let mut deltas = vec![
+        ("sabre", "verify", "not-applicable", -existing),
+        ("sabre", "verify", "red", existing + new),
+        ("ptrace", "verify", "red", new),
+        ("native", "naked", "not-applicable", new),
+    ];
+    for backend in ["dbt", "kvm", "liteinst"] {
+        deltas.push((backend, "verify", "not-applicable", new));
+    }
+    for backend in ["dbt", "kvm", "liteinst", "ptrace", "sabre"] {
+        deltas.push((backend, "chaos", "not-applicable", new));
+        deltas.push((backend, "replay", "not-applicable", new));
+    }
+    deltas
+}
+
+/// Fold 4 of the same issue moved the strict compatibility run type from 193
+/// generated validation nodes into the manifest as variant tests
+/// compat/strict-<row>, one per program of ci/compat/corpus-strict.json. Each
+/// adds the 16 rows every test has: its ptrace verify row is red (enabled, and
+/// only the strict-compat-only run type selects it), and its other 15 rows are
+/// not applicable. The plan of the full validation is unchanged.
+const STRICT_FOLD_TESTS: usize = 193;
+
+fn strict_fold_cell_deltas() -> Vec<(&'static str, &'static str, &'static str, isize)> {
+    let tests = STRICT_FOLD_TESTS as isize;
+    let mut deltas = vec![
+        ("ptrace", "verify", "red", tests),
+        ("native", "naked", "not-applicable", tests),
+    ];
+    for backend in ["dbt", "kvm", "liteinst", "sabre"] {
+        deltas.push((backend, "verify", "not-applicable", tests));
+    }
+    for backend in ["dbt", "kvm", "liteinst", "ptrace", "sabre"] {
+        deltas.push((backend, "chaos", "not-applicable", tests));
+        deltas.push((backend, "replay", "not-applicable", tests));
+    }
+    deltas
+}
+
+/// Fold 5 of the same issue moved the rr compatibility run type from 139
+/// generated validation nodes into the manifest as replay variant tests
+/// compat/rr-<row>, one per program the retired rr lane listed as passing.
+/// Each adds the 16 rows every test has: its ptrace replay row is red
+/// (enabled, and only the rr-compat-only run type selects it), and its other 15
+/// rows, its ptrace verify row among them, are not applicable. The plan of the
+/// full validation is unchanged.
+const RR_FOLD_TESTS: usize = 139;
+
+fn rr_fold_cell_deltas() -> Vec<(&'static str, &'static str, &'static str, isize)> {
+    let tests = RR_FOLD_TESTS as isize;
+    let mut deltas = vec![
+        ("ptrace", "replay", "red", tests),
+        ("native", "naked", "not-applicable", tests),
+    ];
+    for backend in ["dbt", "kvm", "liteinst", "ptrace", "sabre"] {
+        deltas.push((backend, "chaos", "not-applicable", tests));
+        deltas.push((backend, "verify", "not-applicable", tests));
+    }
+    for backend in ["dbt", "kvm", "liteinst", "sabre"] {
+        deltas.push((backend, "replay", "not-applicable", tests));
+    }
+    deltas
+}
+
+/// <https://github.com/rrnewton/reverie/issues/905> qualifies the unchanged
+/// epoll-pwait2 KVM verify fixture: one additional required cell with all seven
+/// checks and the original bounds intact. Replay stays disabled.
+const KVM_EPOLL_PWAIT2_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] =
+    &[("portable", "kvm", "verify", 1)];
+const KVM_EPOLL_PWAIT2_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("kvm", "verify", "green", 1),
+    ("kvm", "verify", "not-applicable", -1),
+];
+
+/// <https://github.com/rrnewton/reverie/issues/838> adds ordinary syncfs
+/// forwarding for the unchanged fsync-durability KVM verify fixture:
+/// one required cell, all six checks and
+/// original bounds retained. Replay stays disabled.
+const KVM_FSYNC_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] = &[("portable", "kvm", "verify", 1)];
+const KVM_FSYNC_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("kvm", "verify", "green", 1),
+    ("kvm", "verify", "not-applicable", -1),
+];
+
+/// <https://github.com/rrnewton/reverie/pull/910> supplies the proven pipe
+/// owner/signal configuration used by the unchanged fcntl-owner fixture.
+/// One required KVM verify cell, all six checks and original bounds retained;
+/// this selection does not claim asynchronous signal delivery. Replay stays disabled.
+const KVM_FCNTL_OWNER_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] =
+    &[("portable", "kvm", "verify", 1)];
+const KVM_FCNTL_OWNER_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("kvm", "verify", "green", 1),
+    ("kvm", "verify", "not-applicable", -1),
+];
+
+/// <https://github.com/rrnewton/reverie/issues/891> tracks the msync-writeback
+/// KVM verify selection: one required cell with its five checks, exact writeback
+/// assertions and original bounds retained. Replay stays disabled.
+const KVM_MSYNC_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] = &[("portable", "kvm", "verify", 1)];
+const KVM_MSYNC_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("kvm", "verify", "green", 1),
+    ("kvm", "verify", "not-applicable", -1),
+];
+
+/// The 2026-10-03 SaBRe promotion (`SABRE_2026_10_03_*` in
+/// `ci/manifest-plan/src/timeouts.rs`): 128 SaBRe verify cells that passed 10 of
+/// 10 no-retry pressure runs become required, all portable. 120 of them were
+/// declared not applicable and 8 were enabled but kept out of CI (red); 116 are
+/// c-programs cells, 10 system-utils, 1 determinism-stress-c and 1
+/// language-runtimes. The ordinary bounds are unchanged.
+const SABRE_2026_10_03_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] =
+    &[("portable", "sabre", "verify", 128)];
+const SABRE_2026_10_03_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("sabre", "verify", "green", 128),
+    ("sabre", "verify", "not-applicable", -120),
+    ("sabre", "verify", "red", -8),
+];
 
 /// Cells that later changes moved between lanes after the fold, as
 /// (test, backend, mode, from lane, to lane). Each move keeps the cell and only
@@ -456,17 +649,28 @@ fn the_committed_plan_keeps_its_cell_counts() {
             .filter(|&&(_, _, _, _, to)| to == name)
             .count()
     };
+    // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
+    // One zero-time epoll-pwait2 KVM verify selection: https://github.com/rrnewton/reverie/issues/905.
+    // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
+    // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+    // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+    // The 128 portable SaBRe verify cells of `SABRE_2026_10_03_PLAN_ADDITIONS`.
     assert_eq!(
         (cells.len(), lane("portable"), lane("privileged")),
         (
-            900 + COMPAT_FOLD_TESTS,
-            895 + COMPAT_FOLD_TESTS - moved_out("portable") + moved_in("portable"),
+            900 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 128,
+            895 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 128
+                - moved_out("portable")
+                + moved_in("portable"),
             5 - moved_out("privileged") + moved_in("privileged"),
         )
     );
     assert_eq!(
         (lane("portable"), lane("privileged")),
-        (893 + COMPAT_FOLD_TESTS, 7),
+        (
+            893 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 128,
+            7
+        ),
         "the lane moves above are the only ones since the fold"
     );
     // Every documented move is present in the committed plan exactly once, in
@@ -502,7 +706,19 @@ fn the_committed_plan_keeps_its_cell_counts() {
         .iter()
         .map(|&(lane, backend, mode, n)| ((lane.into(), backend.into(), mode.into()), n))
         .collect::<BTreeMap<(String, String, String), usize>>();
-    for &(lane, backend, mode, n) in S13_PLAN_ADDITIONS.iter().chain(COMPAT_FOLD_PLAN_ADDITIONS) {
+    for &(lane, backend, mode, n) in S13_PLAN_ADDITIONS
+        .iter()
+        .chain(COMPAT_FOLD_PLAN_ADDITIONS)
+        .chain(SELECT_REPLAY_PLAN_ADDITIONS)
+        .chain(KVM_2026_10_03_PLAN_ADDITIONS)
+        .chain(KVM_SOCKET_PLAN_ADDITIONS)
+        .chain(KVM_PSELECT_PLAN_ADDITIONS)
+        .chain(KVM_EPOLL_PWAIT2_PLAN_ADDITIONS)
+        .chain(KVM_FSYNC_PLAN_ADDITIONS)
+        .chain(KVM_FCNTL_OWNER_PLAN_ADDITIONS)
+        .chain(KVM_MSYNC_PLAN_ADDITIONS)
+        .chain(SABRE_2026_10_03_PLAN_ADDITIONS)
+    {
         *expected
             .entry((lane.into(), backend.into(), mode.into()))
             .or_default() += n;
@@ -520,7 +736,16 @@ fn the_committed_plan_keeps_its_cell_counts() {
     assert_eq!(counts, expected);
     // The folded cells now belong to c-programs: 437 portable c-programs cells
     // and 276 portable plus 3 privileged backend-parity-c cells before the fold,
-    // plus the 29 portable and 1 privileged c-programs cells S13 added.
+    // plus the 29 portable and 1 privileged c-programs cells S13 added and the
+    // two portable ptrace replay cells of `SELECT_REPLAY_PLAN_ADDITIONS` and
+    // six portable KVM verify cells of `KVM_2026_10_03_PLAN_ADDITIONS` and
+    // three socket KVM verify cells of `KVM_SOCKET_PLAN_ADDITIONS`, plus the one
+    // poll-readiness cell of `KVM_PSELECT_PLAN_ADDITIONS` and one epoll-pwait2
+    // cell of `KVM_EPOLL_PWAIT2_PLAN_ADDITIONS`, plus one fsync-durability
+    // cell of `KVM_FSYNC_PLAN_ADDITIONS` and one fcntl-owner cell
+    // of `KVM_FCNTL_OWNER_PLAN_ADDITIONS`, plus one msync-writeback cell
+    // of `KVM_MSYNC_PLAN_ADDITIONS` above, and the 116 c-programs cells of
+    // `SABRE_2026_10_03_PLAN_ADDITIONS`.
     let retirement = retired_ids();
     let successors = retirement.successors_of(RETIRED_BUCKET).unwrap();
     let mut by_bucket = BTreeMap::<(String, String), usize>::new();
@@ -539,7 +764,10 @@ fn the_committed_plan_keeps_its_cell_counts() {
     assert_eq!(
         by_bucket,
         BTreeMap::from([
-            (("portable".into(), "c-programs".into()), 437 + 276 + 29),
+            (
+                ("portable".into(), "c-programs".into()),
+                437 + 276 + 29 + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 116
+            ),
             (("privileged".into(), "c-programs".into()), 3 + 1),
         ])
     );
@@ -549,7 +777,14 @@ fn the_committed_plan_keeps_its_cell_counts() {
 fn the_committed_cell_table_keeps_its_row_counts() {
     let table = read_json("ci/compat-envelope/cells.json");
     let rows = table["cells"].as_array().unwrap();
-    assert_eq!(rows.len(), 5776 + 208 + 16 * COMPAT_FOLD_TESTS);
+    assert_eq!(
+        rows.len(),
+        5776 + 208
+            + 16 * COMPAT_FOLD_TESTS
+            + 16 * SABRE_FOLD_NEW_ROWS
+            + 16 * STRICT_FOLD_TESTS
+            + 16 * RR_FOLD_TESTS
+    );
     let mut counts = BTreeMap::<(String, String, String), usize>::new();
     for row in rows {
         assert_ne!(field(row, "category"), RETIRED_BUCKET, "{row}");
@@ -572,13 +807,25 @@ fn the_committed_cell_table_keeps_its_row_counts() {
         .iter()
         .copied()
         .chain(compat_fold_cell_deltas())
+        .chain(SELECT_REPLAY_CELL_DELTAS.iter().copied())
+        .chain(KVM_2026_10_03_CELL_DELTAS.iter().copied())
+        .chain(KVM_SOCKET_CELL_DELTAS.iter().copied())
+        .chain(KVM_PSELECT_CELL_DELTAS.iter().copied())
+        .chain(sabre_fold_cell_deltas())
+        .chain(strict_fold_cell_deltas())
+        .chain(rr_fold_cell_deltas())
+        .chain(KVM_EPOLL_PWAIT2_CELL_DELTAS.iter().copied())
+        .chain(KVM_FSYNC_CELL_DELTAS.iter().copied())
+        .chain(KVM_FCNTL_OWNER_CELL_DELTAS.iter().copied())
+        .chain(KVM_MSYNC_CELL_DELTAS.iter().copied())
+        .chain(SABRE_2026_10_03_CELL_DELTAS.iter().copied())
     {
         let count = expected
             .entry((backend.into(), mode.into(), status.into()))
             .or_default();
         *count = count
             .checked_add_signed(delta)
-            .unwrap_or_else(|| panic!("S13 delta {delta} underflows {backend}/{mode}/{status}"));
+            .unwrap_or_else(|| panic!("delta {delta} underflows {backend}/{mode}/{status}"));
     }
     expected.retain(|_, count| *count != 0);
     assert_eq!(counts, expected);

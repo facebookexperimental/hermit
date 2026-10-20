@@ -35,7 +35,7 @@ On Debian or Ubuntu:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y libunwind-dev liblzma-dev
+sudo apt-get install -y build-essential pkg-config libunwind-dev liblzma-dev
 ```
 
 On Fedora or CentOS:
@@ -76,6 +76,14 @@ cargo build --release --workspace
 ./target/install_pkg/hermit --version
 ```
 
+A regular build does not embed the Git revision, so `hermit --version` reports
+`hermit 0.4.0 (2026-10-02, source revision not embedded)` and `hermit version --json` reports
+`"git_sha": "unknown"`. This keeps a commit that does not change Hermit's
+source from rebuilding it. To stamp the revision, as a release build does, set
+`HERMIT_STAMP_GIT_SHA=1` when building; the version then reads
+`hermit 0.4.0 (2026-10-02, g0123456789ab)`, with a `-dirty` suffix when tracked
+files differed from that commit. `make release-core` sets it for you.
+
 Staging resources does not enable optional backends in the CLI. See
 [Execution Backends](#execution-backends) for the feature-enabled build.
 
@@ -85,7 +93,11 @@ client. Hermit finds that directory from its invocation path or executable
 path. Set `HERMIT_INSTALL_DIR` only when the resources live under a different
 prefix. The staging `hermit` entry is a symlink to `target/release/hermit`; use
 a dereferencing copy such as `cp -aL target/install_pkg/ DESTINATION` when
-making a standalone installation or archive.
+making a standalone installation or archive. `make build` removes a
+`target/release/hermit` it cannot match to the current commit, including any
+unstamped build, which leaves that symlink dangling until you rebuild; build
+with `make release-core` or `HERMIT_STAMP_GIT_SHA=1` if you use `make build`
+alongside it.
 
 ## Quick Start
 
@@ -255,12 +267,19 @@ Use `--data-dir=DIR` or `HERMIT_DATA_DIR` to select another directory.
 
 ### Debug Adapter Protocol
 
-The DAP adapter is experimental. End-to-end attach and reverse replay are
-currently broken with GDB 17.2: an attached session can report that its thread
-has terminated, and reverse replay fails while loading the adapter's Python
-extension. No working GDB version is established by this guide. The examples
-below describe the interface; use ordinary GDB debugging or replay with
-`--autopilot` when these adapter failures affect you.
+The DAP adapter is experimental. It is tested end to end with GDB 17.2 on a
+single-threaded C program: attaching to `run --gdbserver`, hitting a source
+breakpoint, continuing, reading the stack and evaluating variables, and, for a
+recording, `stepBack` and `reverseContinue`, including `stepBack` after a
+`stepOut` or `next`, in recursion and between two calls from the same caller,
+and a `reverseContinue` back to the replay's entry (the `hermit_dap_*` tests in
+`hermit-cli/tests/cli.rs`). Other GDB versions are not tested. Reverse replay
+patches GDB's DAP server internals, so under a GDB whose
+DAP server lacks them it refuses to start: the client's first request gets a
+failed response naming the missing hook, and the adapter writes the same
+message to its stderr and exits. It refuses the same way when `readelf` or
+`setpriv` is missing from `PATH`. Multithreaded guests are not yet covered by
+these tests.
 
 Hermit exposes a GDB remote target with `run --gdbserver` and `replay`.
 `hermit-dap` starts GDB's Debug Adapter Protocol interpreter with the local
@@ -273,7 +292,9 @@ when that executable is not `/usr/bin/gdb`. To identify the default GDB:
 ```
 
 A version string alone does not establish a working DAP session. To build
-the adapter and start a remote target:
+the adapter and start a remote target (the first command rebuilds
+`target/debug/hermit` with default features, so if you built it with
+`--features liteinst` above, rerun that build afterwards to keep LiteInst):
 
 ```bash
 cargo build -p hermit --bin hermit --bin hermit-dap
@@ -343,7 +364,61 @@ adding the recording arguments to `spawnConfig`:
 When its extension loads successfully, the adapter advertises `supportsStepBack`
 and implements DAP `stepBack` and `reverseContinue` by restarting the
 deterministic replay and running forward to the requested earlier source
-position. This first implementation favors correctness over speed.
+position. `stepBack` returns to the previous source line the replay passed or
+the previous place the client stopped, whichever came later. When that place
+does not start a source line, such as the return address a `stepOut` stops at,
+`stepBack` restarts the replay once more to count the earlier passes through
+it, and may first run the current replay forward to the next source line. This
+first implementation favors correctness over speed.
+
+`stepBack` goes back to the previous stop or line arrival, not to the previous
+instruction GDB's own reverse-step would reach. When the client stops in a
+one-line loop, for example by stepping out of the loop body's call, then
+continues past the loop, `stepBack` returns to that stop. It skips the later
+passes through the loop's line, which the client never stopped at and which
+start no new source line. A `stepOut` from a function without debug
+information reports the stop with reason `stopped` rather than `step`.
+
+The adapter finds line arrivals with an internal breakpoint on every source
+line, and chooses which arrival at an address to restart to by counting the
+earlier ones. If the debugger stub loses one of those breakpoints, the count
+is wrong and the replay runs to another arrival at the same address. Reverie's
+gdbstub did lose them: it restored a whole 8-byte word when it removed a
+software breakpoint, so when GDB removed a breakpoint to step over it, a
+breakpoint up to 7 bytes after it was erased for the rest of that resume. That
+was fixed in https://github.com/rrnewton/reverie/pull/890.
+
+As a check on the count, the adapter records a frame identity with every stop
+and line arrival: the program counter and stack pointer of the innermost
+frame and of up to 7 of its callers, 8 frames at most (GDB does not unwind
+past `main` by default, so a shallower stack gives fewer). When it replays to
+a stop, it compares the identity where the replay landed. If they differ, it
+puts the replay back at the client's current stop, sends a `stopped` event for
+it, and fails the `stepBack` or `reverseContinue` with an error saying it
+could not reach the earlier stop exactly. If it cannot put the replay back
+either, the request fails and the adapter ends the session: it sends an
+`output` event saying why, then `terminated`.
+
+The frame identity tells apart two activations of a function at different
+call depths, such as recursive calls, and two calls at the same depth from
+different call sites, such as `g(1)` and `g(2)` on consecutive lines, as long
+as the calling frame is among the 8. It cannot tell apart two passes through
+the same activation, such as two iterations of a loop, two calls from the
+same call site at the same depth, such as a call inside a loop, or two
+arrivals whose 8 innermost frames are all equal and which differ only further
+out, such as the same chain of 8 or more nested helper calls entered from
+two call sites in one caller. Their identities are equal, so a wrong count
+there would land at the wrong pass without an error. A test pins the limit:
+with a chain of 7 helpers, the two activations differ only in the caller's
+return address, frame 7, and a wrong count must be refused.
+
+The identity is limited to 8 frames because the adapter takes it at every
+line arrival while the replay runs forward, and unwinding every frame made
+forward execution cost the square of the stack depth. Measured on devbig030
+with GDB 17.2, one `continue` past a recursion 300 calls deep took 12.15 s
+with every frame and 1.59 s with 8; past a recursion 1000 calls deep it took
+121.79 s with every frame and 4.77 s with 8. A `stepBack` from there took
+1.0 s at depth 300 and 1.3 s at depth 1000 either way.
 
 ```bash
 dapper proxy --control-port 4711 from-config hermit-dap-replay.json
@@ -355,7 +430,11 @@ dapper debug --control-port 4711 reverse-continue 1
 
 The `order_violation` guest reads shared state without ensuring that another
 thread has published it. Build Hermit and the guest, then run the default
-deterministic schedule twice:
+deterministic schedule twice. The first command rebuilds `target/release/hermit`,
+which `target/install_pkg/hermit` links to, with default features; if you built
+the `dbt`, `sabre`, and `e9patch` backends above, use
+`cargo build --release --workspace --features hermit/third-party-backends`
+instead so the rebuild keeps them:
 
 ```bash
 cargo build --release -p hermit --bin hermit

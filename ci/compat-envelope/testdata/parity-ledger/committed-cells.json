@@ -1,0 +1,964 @@
+{
+  "cells": [
+    {
+      "test_id": "backend-parity-c/aio-refusal",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/aio-refusal",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/append-pwrite",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/append-pwrite",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/bind-getsockname",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/bind-getsockname",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/cachestat-refusal",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/cachestat-refusal",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/child-subreaper-refusal",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/child-subreaper-refusal",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/close-range-fds",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/close-range-fds",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/copy-file-range-refusal",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/copy-file-range-refusal",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/cpu-virtualization",
+      "backend": "dbt",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/cpu-virtualization",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/cpu-virtualization",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/cpuid-probe",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/cpuid-probe",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/cwd-roundtrip",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/cwd-roundtrip",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/dup-shared-offset",
+      "backend": "dbt",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/dup-shared-offset",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/dup-shared-offset",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/epoll-pwait2",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/epoll-readiness",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/epoll-readiness",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/event-delivery-ordering",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/eventfd-semantics",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/eventfd-semantics",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/faccessat2-flags",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/faccessat2-flags",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/fadvise-hints",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/fadvise-hints",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/fallocate-extents",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/fallocate-extents",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/fchmod-bits",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/fchmod-bits",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/fchmodat2-flags",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/fcntl-owner",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/fd-duplication",
+      "backend": "dbt",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/fd-duplication",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/fd-duplication",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/file-backed-mmap",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/file-backed-mmap",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/file-io-roundtrip",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/file-io-roundtrip",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/flock-lifecycle",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/flock-lifecycle",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/fork-exec-pipeline",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/fsync-durability",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/ftruncate-sparse",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/ftruncate-sparse",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/getcpu-identity",
+      "backend": "dbt",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/getcpu-identity",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/getcpu-identity",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/getpriority-identity",
+      "backend": "dbt",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/getpriority-identity",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/getpriority-identity",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/getrusage-self-accounting",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/hardware-trap-identity",
+      "backend": "dbt",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/hardware-trap-identity",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/host-identity",
+      "backend": "dbt",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/host-identity",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/inline-syscall-sites",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/inline-syscall-sites",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/inotify-watch",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/ioctl-fionread",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/kcmp-refusal",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/kcmp-refusal",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/linkat-flags",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/linkat-flags",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/lseek-positioning",
+      "backend": "dbt",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/lseek-positioning",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/lseek-positioning",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/mce-kill-refusal",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/mce-kill-refusal",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/membarrier-query",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/membarrier-query",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/memfd-create",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/memfd-create",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/mempolicy-default",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/mempolicy-default",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/mincore-residency",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/mincore-residency",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/mixed-inline-and-libc-syscalls",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/mixed-inline-and-libc-syscalls",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/mkdir-rmdir",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/mkdir-rmdir",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/mknod-special",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/mknod-special",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/mmap-layout-pointer-order",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/mmap-layout-pointer-order",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/msync-writeback",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/name-to-handle-refusal",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/name-to-handle-refusal",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/no-new-privs-refusal",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/no-new-privs-refusal",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/numa-node-identity",
+      "backend": "dbt",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/numa-node-identity",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/numa-node-identity",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/o-tmpfile-anon",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/o-tmpfile-anon",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/openat-flags",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/openat-flags",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/openat2-refusal",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/openat2-refusal",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/path-file-ops",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/path-file-ops",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/personality-domain",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pid-probe",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pid-probe",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pid-probe",
+      "backend": "sabre",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pidfd-open-self",
+      "backend": "dbt",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pidfd-open-self",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pidfd-open-self",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pipe-capacity",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pipe-capacity",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pipe-capacity-pin",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pipe-capacity-pin",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pipe-ipc",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pipe-ipc",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pipe2-flags",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pipe2-flags",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/poll-readiness",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/prctl-identity",
+      "backend": "dbt",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/prctl-identity",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/prctl-pdeathsig",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/preadv2-flags",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pthread-lifecycle",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pthread-lifecycle",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/pthread-lifecycle",
+      "backend": "sabre",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/readdir-entries",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/readdir-entries",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/readdir-order-identity",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/readdir-order-identity",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/record-lock",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/rename-ops",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/rename-ops",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/renameat2-flags",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/renameat2-flags",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/rlimit-identity",
+      "backend": "dbt",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/rlimit-identity",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/rlimit-identity",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/robust-list",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/robust-list",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/sched-getaffinity-identity",
+      "backend": "dbt",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/sched-getaffinity-identity",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/sched-getaffinity-identity",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/seccomp-refusal",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/seccomp-refusal",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/sendfile-copy",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/sendfile-copy",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/set-tid-address",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/set-tid-address",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/short-io-split-identity",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/short-io-split-identity",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/shutdown-socketpair",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/shutdown-socketpair",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/signal-delivery-sequence",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/signal-waitstatus-identity",
+      "backend": "dbt",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/signal-waitstatus-identity",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/signalfd-create",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/signalfd-create",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/socket-epoll-ordering",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/socket-epoll-ordering",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/socket-options",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/socketpair-flags",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/sockname-unnamed",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/stat-metadata-identity",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/stat-metadata-identity",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/statfs-free-determinism",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/statfs-free-determinism",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/static-nolibc-syscall-sites",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/statx-metadata",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/statx-metadata",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/symlink-ops",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/symlink-ops",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/sync-file-range",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/sync-file-range",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/sysv-ipc-refusal",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/sysv-ipc-refusal",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/thp-disable",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/umask-mode",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/umask-mode",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/uname-identity",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/uname-identity",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/utimensat-determinism",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/utimensat-determinism",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/vectored-file-io",
+      "backend": "liteinst",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/vectored-io",
+      "backend": "kvm",
+      "selected": true
+    },
+    {
+      "test_id": "backend-parity-c/vectored-io",
+      "backend": "liteinst",
+      "selected": true
+    }
+  ]
+}

@@ -22,6 +22,7 @@ use super::container::deterministic_container;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
 use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
+use super::run::NetworkingMode;
 
 /// Command-line options for the "replay" subcommand.
 #[derive(Debug, Parser, Clone)]
@@ -65,8 +66,19 @@ impl ReplayOpts {
                 .context("Failed to find last recording ID")?,
         };
 
+        let recorded_local = hermit.recording_metadata(id)?.local_networking == Some(true);
+        let network = replay_network(self.autopilot, recorded_local);
+        if recorded_local && network == NetworkingMode::Host {
+            // Same override, and same warning, as `hermit run --gdbserver`.
+            eprintln!(
+                "hermit replay: WARNING: recording {id} used --network local, but a \
+                 gdb-served replay runs on the host network; syscalls replayed by \
+                 re-execution may see different interfaces and ports"
+            );
+        }
         if self.autopilot || self.serve_only {
             let (mut container, identity) = deterministic_container()?;
+            network.configure(&mut container, false);
             let options = self.clone();
             let global = global.clone();
             let resources = format!("replay {} and identity mounts", hermit.data_dir().display());
@@ -173,5 +185,31 @@ impl ReplayOpts {
         } else {
             hermit.replay_with_gdbserver(id, self.gdbserver_port)
         }
+    }
+}
+
+/// The network a replay runs in. Syscalls the replayer does not serve from
+/// the recording are executed for real, so an autopilot replay uses the
+/// network the recording used; recordings that predate the stored choice ran
+/// on the host network. A replay served to gdb uses the host network so the
+/// gdb client can reach its gdbserver port, as `hermit run --gdbserver` does.
+fn replay_network(autopilot: bool, recorded_local: bool) -> NetworkingMode {
+    if autopilot && recorded_local {
+        NetworkingMode::Local
+    } else {
+        NetworkingMode::Host
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_autopilot_replay_of_a_local_recording_is_local() {
+        assert_eq!(replay_network(true, true), NetworkingMode::Local);
+        assert_eq!(replay_network(true, false), NetworkingMode::Host);
+        assert_eq!(replay_network(false, true), NetworkingMode::Host);
+        assert_eq!(replay_network(false, false), NetworkingMode::Host);
     }
 }

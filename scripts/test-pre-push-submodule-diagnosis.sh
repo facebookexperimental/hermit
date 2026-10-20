@@ -55,7 +55,8 @@ head=$(git -C "$repo" rev-parse HEAD)
 stdin_line="refs/heads/x $head refs/heads/x 0000000000000000000000000000000000000000"
 
 run_hook() {
-    ( cd "$repo" && printf '%s\n' "$stdin_line" | bash "$HOOK" origin https://example.invalid ) 2>&1
+    local hook=${1:-$HOOK}
+    ( cd "$repo" && printf '%s\n' "$stdin_line" | bash "$hook" origin https://example.invalid ) 2>&1
 }
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -88,21 +89,39 @@ hook_status=$?
 [[ $out != *"COULD NOT BE CHECKED"* ]] ||
     fail "optional rr absence was incorrectly treated as the checker failure"
 
-# ---- direction 1: a REQUIRED uninitialised submodule recorded in the index.
-# ---- This is exactly what `git submodule status` prefixes with '-' in a fresh
-# ---- worktree. Keep optional rr absent too so this case proves the diagnosis
-# ---- names only the required submodule.
+# ---- agent-utils is no longer required: dagrun is a git dependency, so the
+# ---- workspace resolves without the submodule, and blaming it would hide a
+# ---- genuine compile failure in every fresh worktree.
 printf '%s\n' '[submodule "agent-utils"]' \
     $'\tpath = agent-utils' \
     $'\turl = https://example.invalid/agent-utils.git' >>"$repo/.gitmodules"
 git -C "$repo" add .gitmodules
 git -C "$repo" update-index --add --cacheinfo "160000,$head,agent-utils"
-git -C "$repo" commit -qm "record a required uninitialised submodule"
+git -C "$repo" commit -qm "record an uninitialised agent-utils submodule"
 
 [[ $(git -C "$repo" submodule status | grep -c '^-') -eq 2 ]] ||
     fail "fixture did not produce both uninitialised submodules"
 
 out=$(run_hook)
+hook_status=$?
+[[ $hook_status -ne 0 ]] || fail "a genuine failure with agent-utils absent must refuse"
+[[ $out == *"does not compile in the default feature"* ]] ||
+    fail "agent-utils absence hid a genuine compile failure; got: $out"
+[[ $out != *"COULD NOT BE CHECKED"* ]] ||
+    fail "agent-utils absence was incorrectly treated as the checker failure"
+
+# ---- direction 1: a REQUIRED uninitialised submodule recorded in the index.
+# ---- This is exactly what `git submodule status` prefixes with '-' in a fresh
+# ---- worktree. No submodule is required today, so a copy of the hook names
+# ---- agent-utils as required. Keep optional rr absent too so this case proves
+# ---- the diagnosis names only the required submodule.
+required_hook="$tmp/pre-push-requiring-agent-utils"
+sed 's/^required_checker_submodules=()$/required_checker_submodules=(agent-utils)/' \
+    "$HOOK" >"$required_hook"
+[[ $(grep -c '^required_checker_submodules=(agent-utils)$' "$required_hook") -eq 1 ]] ||
+    fail "could not make a copy of the hook that requires agent-utils"
+
+out=$(run_hook "$required_hook")
 hook_status=$?
 [[ $hook_status -ne 0 ]] || fail "could-not-check must still refuse the push"
 [[ $out == *"COULD NOT BE CHECKED"* ]] ||

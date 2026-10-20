@@ -9,8 +9,10 @@
 //! Emits build metadata consumed by `hermit --version`.
 //!
 //! The crate version is the single source of truth in `Cargo.toml`
-//! (`CARGO_PKG_VERSION`); this script only augments it with the build date and
-//! the source revision so a released binary can be traced back to a commit.
+//! (`CARGO_PKG_VERSION`); this script only augments it with the build date and,
+//! for a release build, the source revision so the released binary can be
+//! traced back to a commit. Regular builds embed no revision; set
+//! `HERMIT_STAMP_GIT_SHA=1` to stamp one (see `build_support::emit_git_revision`).
 //! Both values are exposed to the crate through `cargo:rustc-env` and read with
 //! `env!` in `src/bin/hermit/version.rs`.
 //!
@@ -22,14 +24,12 @@
 mod build_support;
 
 use build_support::build_date;
-use build_support::git_short_sha;
-use build_support::git_watch_paths;
+use build_support::emit_git_revision;
 
 fn main() {
-    let sha = git_short_sha();
     let date = build_date();
 
-    println!("cargo:rustc-env=HERMIT_BUILD_GIT_SHA={sha}");
+    emit_git_revision();
     println!("cargo:rustc-env=HERMIT_BUILD_DATE={date}");
 
     // EMBED THE REVERIE PIN THIS BINARY WAS BUILT AGAINST.
@@ -48,13 +48,5 @@ fn main() {
     let reverie_pin = build_support::reverie_pin();
     println!("cargo:rustc-env=HERMIT_REVERIE_PIN={reverie_pin}");
     println!("cargo:rerun-if-changed=../detcore/Cargo.toml");
-
-    // Re-run when the checked-out revision or index moves. Arbitrary tracked
-    // worktree files are intentionally not added as explicit watches: avoiding
-    // one Cargo dependency per file keeps incremental builds fast, and staging
-    // an edit refreshes the embedded dirty marker through the watched index.
-    for path in git_watch_paths() {
-        println!("cargo:rerun-if-changed={}", path.display());
-    }
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 }

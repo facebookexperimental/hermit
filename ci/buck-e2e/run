@@ -1,0 +1,149 @@
+#!/bin/bash
+# Run every e2e manifest cell as a Tpx test under Buck and write, into --out, the rows
+# (one results.jsonl + summary.json per bucket) that `test-harness run` imports
+# (E2E_IMPORT_RESULTS=IMPORT_DIR) to publish the result files the cargo flow's e2e nodes
+# write. Only import mode may read IMPORT_DIR; see ci/buck-e2e/ingest.py.
+#
+# usage: ci/buck-e2e/run --mode hybrid|local --out IMPORT_DIR --work DIR
+#            [--buck2 PATH] [--no-verdict] [-- EXTRA_BUCK2_TEST_ARGS...]
+#        ci/buck-e2e/run -h|--help
+#
+#   hybrid  RE-routed cells run on Meta RE and the rest locally (see defs.bzl). The two
+#           groups run as two concurrent `buck2 test` invocations: Buck stores RE test
+#           results for test-execution caching only from invocations whose tests are
+#           all remote, so an unchanged cell is answered from the cache next time.
+#   local   every cell runs locally (-c hermit_e2e.routing=local), one invocation.
+#   --buck2 PATH  the buck2 to run (default: $BUCK2, else buck2 on PATH). ingest.py
+#           fetches the results with testx ($TESTX, else testx on PATH).
+#   --no-verdict  stop after ingesting: leave the rows in IMPORT_DIR unjudged, for a caller
+#           that judges them itself (`test-harness run` in import mode, as verdict.py does),
+#           and exit 0 whatever the cells' verdicts are. No validation-DAG node does this yet.
+#
+# The inputs Buck does not build yet must already be staged (ci/buck-e2e/stage), and
+# HEAD must be the staged SOURCE_SHA with no uncommitted changes to tracked files before
+# the run, after it, and after judging it: Buck builds the release hermit from the working
+# tree, and every row records SOURCE_SHA as a clean source tree.
+# Tpx retries a failed cell once (--retry 1); cells pass --no-retry to the harness, and
+# ingest.py turns a retried cell's executions into attempts 1 and 2. EXTRA args go to
+# every `buck2 test` before the `--` (e.g. @shim/modes/hybrid).
+# The release hermit is built unstamped (-c hermit_release.unstamped=true: no commit
+# hash or build date in the binary), so a commit that changes no compiled source
+# rebuilds nothing and its cells stay cached. Only scripts/build-buck-release.rs stamps.
+# Each invocation's event log and test-run id are kept in --work.
+#
+# ci/buck-e2e/verdict.py then judges the rows as the cargo flow's e2e nodes judge theirs:
+# the staged test-harness, in import mode, once per (lane, category) bucket of the plan.
+# Its result files go to --work/verdict, which a run removes as soon as the checkout passes the
+# before-the-run check, so a run that fails later, or is unjudged, leaves no older verdict there.
+# Exit status: 0 when every plan cell passes (an excused diagnostic failure is printed and,
+# as in the cargo flow, does not fail the run), or, with --no-verdict, once the rows are
+# in IMPORT_DIR; 1 when any cell is FAIL or ERROR or has no result (without --no-verdict),
+# or the run could not be ingested or judged; 2 for a usage error or a precondition that
+# fails before the run.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+root=$(cd "$here/../.." && pwd)
+mode= out= work= buck2=${BUCK2:-buck2} verdict=1
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --mode) mode=$2; shift 2 ;;
+        --out) out=$2; shift 2 ;;
+        --work) work=$2; shift 2 ;;
+        --buck2) buck2=$2; shift 2 ;;
+        --no-verdict) verdict=0; shift ;;
+        -h | --help) awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --) shift; break ;;
+        *) echo "ci/buck-e2e/run: unknown argument $1" >&2; exit 2 ;;
+    esac
+done
+[[ $mode == hybrid || $mode == local ]] || { echo "ci/buck-e2e/run: --mode hybrid|local is required" >&2; exit 2; }
+[[ -n $out && -n $work ]] || { echo "ci/buck-e2e/run: --out and --work are required" >&2; exit 2; }
+[[ -s $here/staged/SOURCE_SHA ]] || { echo "ci/buck-e2e/run: stage the inputs first (ci/buck-e2e/stage)" >&2; exit 2; }
+[[ -x $here/staged/bin/test-harness ]] || {
+    echo "ci/buck-e2e/run: $here/staged/bin/test-harness is missing; stage the inputs again (ci/buck-e2e/stage)" >&2
+    exit 2
+}
+staged_sha=$(cat "$here/staged/SOURCE_SHA")
+# The checkout is $root: an inherited GIT_DIR or GIT_WORK_TREE would point git elsewhere
+# (the names of ci/manifest-plan/src/git_environment.rs REPOSITORY_LOCATION_VARIABLES).
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
+require_staged_source() { # require_staged_source WHEN EXIT_STATUS
+    local head changes
+    head=$(git -C "$root" rev-parse HEAD) && changes=$(git -C "$root" status --porcelain --untracked-files=no) || {
+        echo "ci/buck-e2e/run: git cannot read the checkout $root $1 (above), so its source tree is" \
+            "unknown; repair the checkout and run again" >&2
+        exit "$2"
+    }
+    if [[ $head != "$staged_sha" ]]; then
+        echo "ci/buck-e2e/run: HEAD is $head $1, but the staged inputs are for $staged_sha;" \
+            "check out $staged_sha, or re-stage at HEAD (ci/buck-e2e/stage)" >&2
+        exit "$2"
+    fi
+    if [[ -n $changes ]]; then
+        echo "ci/buck-e2e/run: the checkout has uncommitted changes $1, but every row records" \
+            "$staged_sha as a clean source tree; commit them and re-stage, or revert them" >&2
+        exit "$2"
+    fi
+}
+require_staged_source "before the run" 2
+mkdir -p "$out" "$work"
+# A previous run's verdict must not stand beside this run's rows, whether it fails or is unjudged.
+rm -rf -- "${work:?}/verdict"
+extra=("$@")
+tpx=(-- --retry 1 --no-retry-on-skip)
+
+invoke() { # invoke NAME TARGET [buck2 args...]: one `buck2 test`, its exit status in NAME.rc
+    local name=$1 target=$2
+    shift 2
+    set +e
+    env -C "$root" "$buck2" test -c hermit_release.unstamped=true "${extra[@]}" "$@" \
+        --event-log "$work/$name.event-log.pb.zst" --write-test-id "$work/$name.test_id" \
+        "$target" "${tpx[@]}" >"$work/$name.log" 2>&1
+    echo $? >"$work/$name.rc"
+    set -e
+}
+
+if [[ $mode == hybrid ]]; then
+    invoke re //ci/buck-e2e:re &
+    invoke local //ci/buck-e2e:local &
+    wait
+    runs=(re local)
+else
+    invoke all //ci/buck-e2e:all -c hermit_e2e.routing=local
+    runs=(all)
+fi
+
+ids=()
+for r in "${runs[@]}"; do
+    # buck2 test exits 32 when tests fail: the verdicts are the rows', not the exit code.
+    rc=$(cat "$work/$r.rc")
+    if [[ ! -s $work/$r.test_id ]] || { [[ $rc != 0 && $rc != 32 ]]; }; then
+        echo "ci/buck-e2e/run: buck2 test ($r) failed with exit $rc; see $work/$r.log" >&2
+        tail -20 "$work/$r.log" >&2
+        exit 1
+    fi
+    ids+=("$(cat "$work/$r.test_id")")
+done
+require_staged_source "after the run" 1
+python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" --work "$work/artifacts" \
+    --local-artifacts "$root/buck-out/v2/test/execution" "${ids[@]}" || {
+    echo "ci/buck-e2e/run: ingest.py could not turn the run's results into rows (above); the run has no verdict" >&2
+    exit 1
+}
+((verdict)) || {
+    echo "ci/buck-e2e/run: --no-verdict: the rows in $out are unjudged; this run has no verdict" >&2
+    exit 0
+}
+status=0
+python3 "$here/verdict.py" --plan "$root/ci/expected-e2e-plan.json" --import-dir "$out" \
+    --out "$work/verdict" --harness "$here/staged/bin/test-harness" --repo-root "$root" || status=$?
+# The harness records whether the source tree was clean when it judged; it must still be.
+require_staged_source "while the run was judged" 1
+case $status in
+    0) ;;
+    1) echo "ci/buck-e2e/run: the run did not pass (above); each bucket's result files are in $work/verdict" >&2
+       exit 1 ;;
+    *) echo "ci/buck-e2e/run: verdict.py could not judge the run (exit $status, above); the run has no verdict" >&2
+       exit 1 ;;
+esac

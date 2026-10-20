@@ -27,7 +27,7 @@ pub const REQUIRED_ENV: &str = "HERMIT_PREPARED_NEXTEST_REQUIRED";
 pub const PACKAGE: &str = "hermetic_infra_hermit_tests";
 pub const C_FLAGS: [&str; 3] = ["-O0", "-g", "-pthread"];
 
-pub const C_SOURCES: [(&str, &str); 26] = [
+pub const C_SOURCES: [(&str, &str); 29] = [
     ("c_getpid", "tests/c/getpid.c"),
     ("c_getsockopt_null", "tests/c/getsockopt_null.c"),
     ("c_setsockopt_replay", "tests/c/record_replay_setsockopt.c"),
@@ -51,9 +51,18 @@ pub const C_SOURCES: [(&str, &str); 26] = [
         "c_record_replay_poll_partial_copyout",
         "tests/c/record_replay_poll_partial_copyout.c",
     ),
+    ("c_record_replay_select", "tests/c/record_replay_select.c"),
     (
         "c_record_replay_execveat_paths",
         "tests/c/record_replay_execveat_paths.c",
+    ),
+    (
+        "c_record_replay_path_queries",
+        "tests/c/record_replay_path_queries.c",
+    ),
+    (
+        "c_record_replay_fd_metadata",
+        "tests/c/record_replay_fd_metadata.c",
     ),
     (
         "c_record_replay_mkdir_eexist",
@@ -88,7 +97,7 @@ pub const C_SOURCES: [(&str, &str); 26] = [
 
 // Alias, Cargo target, repository-relative source. The clock now uses the
 // declared Cargo dev profile, rather than the former manual debuginfo=1 build.
-pub const RUST_SOURCES: [(&str, &str, &str); 16] = [
+pub const RUST_SOURCES: [(&str, &str, &str); 17] = [
     (
         "rs_clock_gettime",
         "rustbin_clock_gettime",
@@ -151,6 +160,7 @@ pub const RUST_SOURCES: [(&str, &str, &str); 16] = [
         "tests/rust/poll_spin.rs",
     ),
     ("rustbin_rdtsc", "rustbin_rdtsc", "tests/rust/rdtsc.rs"),
+    ("rustbin_select", "rustbin_select", "tests/rust/select.rs"),
     (
         "rustbin_stack_ptr",
         "rustbin_stack_ptr",
@@ -263,7 +273,7 @@ struct Envelope {
 pub fn prepared_envelope(paths: &BTreeMap<String, PathBuf>) -> Result<String, String> {
     if paths.keys().map(String::as_str).collect::<BTreeSet<_>>() != names().collect() {
         return Err(
-            "prepared record workload population must contain exactly all 42 aliases".into(),
+            "prepared record workload population must contain exactly all 43 aliases".into(),
         );
     }
     let workloads = paths
@@ -312,7 +322,7 @@ pub fn consume_prepared(
     }
     if paths.keys().map(String::as_str).collect::<BTreeSet<_>>() != names().collect() {
         return Err(
-            "prepared record workload population must contain exactly all 42 aliases".into(),
+            "prepared record workload population must contain exactly all 43 aliases".into(),
         );
     }
     Ok(Some(
@@ -642,7 +652,7 @@ mod tests {
         fs::rename(events[0]["executable"].as_str().unwrap(), &artifact).unwrap();
         events[0]["executable"] = serde_json::json!(artifact);
         let paths = cargo_executables(&jsonl(&events), &cargo, &fixture.0, &fixture.0).unwrap();
-        assert_eq!(paths.len(), 16);
+        assert_eq!(paths.len(), 17);
         assert_eq!(paths["rs_clock_gettime"], artifact);
         assert!(!paths.contains_key("rustbin_clock_gettime"));
     }

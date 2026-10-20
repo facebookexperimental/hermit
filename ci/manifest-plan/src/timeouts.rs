@@ -73,6 +73,12 @@ pub const IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT: usize = 1;
 /// unchanged canonical L2 match; `resource-determinism` needed a guest loop long
 /// enough to cross one virtual `times()` tick. Each cell passed five
 /// consecutive strict verify runs on the ptrace backend at the evidence SHA.
+///
+/// Since 2026-09-27 that guest loop waits for two system-CPU ticks instead of
+/// one, so the elapsed-clock check no longer depends on tick phase. Under
+/// ptrace strict verify the loop now ends after 362 (parent) and 398 (child)
+/// iterations, identical across 5 runs, and each of 11 whole verify runs took
+/// 0.9 to 3.2 s of wall time, far inside the unchanged 57 s default wall timeout.
 pub const PTRACE_2026_09_24_EVIDENCE_SHA: &str = "17effafddad25b445d21beb33fd74bc4bf5c7bf1";
 pub const PTRACE_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:15:24Z";
 pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
@@ -120,6 +126,47 @@ pub const DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS: [&str; 1] =
 pub const STRICT_COMPAT_FOLD_2026_10_01_EVIDENCE_SHA: &str =
     "76980bac89901c3ecefbefc816ed47bcf099eda6";
 pub const STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT: usize = 189;
+/// Ptrace replay cells selected when
+/// <https://github.com/rrnewton/hermit/pull/3580> taught the recorder and
+/// replayer `select` and `pselect6`. Before it, replay of both programs
+/// diverged; each passed five consecutive replay runs on the ptrace backend at
+/// Hermit 1dd202e847ccf0fa149a442701f23b2ae1c3ede6. They keep the ordinary
+/// 22/57 bounds.
+pub const SELECT_REPLAY_2026_10_03_TESTS: [&str; 2] = [
+    "c-programs/poll-readiness",
+    "c-programs/pselect6-simulation",
+];
+pub const SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT: usize = 2;
+/// SaBRe verify cells selected after ten clean first-attempt strict
+/// verification repetitions each, with retries off, at the evidence SHA
+/// (`ci/compat-envelope/pressure-test.rs run --probe-disabled --backend sabre
+/// --repetitions 10 --no-retry`, runs `sabre-promote-c3f7b2bcfa00-20261003`
+/// and `sabre-promote-red-c3f7b2bcfa00-20261003`). 120 of them had SaBRe
+/// under `backends_disabled`; the 8 in
+/// [`SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS`] were enabled with
+/// `ci.sabre: false` after timing out at the former 15-second cell limit.
+///
+/// The 1,280 verify invocations took at most 2,697 ms of wall time. The
+/// largest whole cell, test harness included, used 5,819 ms of CPU time and
+/// 6,283 ms of wall time, so the ordinary 22 s CPU and 57 s wall bounds cover
+/// them without an override.
+pub const SABRE_2026_10_03_EVIDENCE_SHA: &str = "c3f7b2bcfa0061d1cc6a308ac51761ff0ed29101";
+pub const SABRE_2026_10_03_EVIDENCE_COMPLETED_UTC: &str = "2026-10-03T20:42:34Z";
+pub const SABRE_2026_10_03_SELECTED_CI_CELL_COUNT: usize = 128;
+pub const SABRE_2026_10_03_MAX_MEASURED_CPU_MILLIS: u64 = 5819;
+pub const SABRE_2026_10_03_MAX_MEASURED_WALL_MILLIS: u64 = 6283;
+/// The SaBRe verify cells among those 128 that were already enabled with
+/// `ci: false`, so they leave the enabled-but-unselected census.
+pub const SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS: [&str; 8] = [
+    "c-programs/dbt-copied-tiocgpgrp",
+    "c-programs/dbt-wait-lifecycle",
+    "c-programs/get-robust-list-child",
+    "c-programs/pidfd-waitid-child",
+    "c-programs/ptrace-attach-eperm",
+    "c-programs/ptrace-seize-eperm",
+    "c-programs/remap-file-pages-tmpfile-enosys",
+    "c-programs/so-incoming-cpu-tcp4",
+];
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1927,6 +1974,10 @@ mod tests {
         );
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
         assert_eq!(
+            SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT,
+            SELECT_REPLAY_2026_10_03_TESTS.len()
+        );
+        assert_eq!(
             DBT_MATRIX_2026_09_29_EVIDENCE_SHA,
             "12371d6cbf8a56c69175baea5baeb7507ca7e9cf"
         );
@@ -1942,6 +1993,25 @@ mod tests {
             );
             assert!(
                 DBT_MATRIX_2026_09_29_MAX_MEASURED_WALL_MILLIS
+                    < DEFAULT_TEST_WALL_TIMEOUT_SECONDS * 1000
+            );
+        }
+        assert_eq!(
+            SABRE_2026_10_03_EVIDENCE_SHA,
+            "c3f7b2bcfa0061d1cc6a308ac51761ff0ed29101"
+        );
+        assert_eq!(
+            SABRE_2026_10_03_EVIDENCE_COMPLETED_UTC,
+            "2026-10-03T20:42:34Z"
+        );
+        assert_eq!(SABRE_2026_10_03_SELECTED_CI_CELL_COUNT, 128);
+        assert_eq!(SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS.len(), 8);
+        const {
+            assert!(
+                SABRE_2026_10_03_MAX_MEASURED_CPU_MILLIS < DEFAULT_TEST_CPU_TIMEOUT_SECONDS * 1000
+            );
+            assert!(
+                SABRE_2026_10_03_MAX_MEASURED_WALL_MILLIS
                     < DEFAULT_TEST_WALL_TIMEOUT_SECONDS * 1000
             );
         }

@@ -3,8 +3,13 @@
 [package]
 name = "hermit-verify"
 description = "Run-to-run verification harness for the Hermit deterministic execution engine."
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
+readme = "README.md"
+homepage = "https://hermetic-infra.org"
+documentation = "https://docs.rs/hermit-verify"
+keywords = ["linux", "hermit", "determinism", "debugging"]
+categories = ["development-tools::debugging", "development-tools::testing"]
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
 
@@ -12,9 +17,9 @@ license = "BSD-3-Clause"
 anyhow = "1.0.103"
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 colored = "2.1.0"
-detcore = { package = "hermit-detcore", version = "0.4.0", path = "../detcore" }
-detcore-model = { version = "0.4.0", path = "../detcore-model" }
-fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+detcore = { package = "hermit-detcore", version = "0.4.1", path = "../detcore" }
+detcore-model = { version = "0.4.1", path = "../detcore-model" }
+fbinit = { version = "0.2.0" }
 rand = "0.10.2"
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 similar = { version = "2.2.0", features = ["bytes", "inline"] }

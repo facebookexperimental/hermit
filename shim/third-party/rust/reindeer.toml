@@ -20,6 +20,40 @@ precise_srcs = true
 include_top_level = false
 include_workspace_members = false
 
+# Reindeer generates targets only for crates the workspace members reach with
+# the features it resolves them with: each platform's `features` below, or
+# just `default` when a platform names none. hermit-cli's Buck targets enable
+# backends that are optional cargo features (LiteInst, DBT), so the members
+# are resolved with `third-party-backends`, the set every validation build
+# compiles; with `default` alone, liteinst2 and reverie-liteinst get no target
+# and the shared-cell alias step fails. A platform table here replaces
+# Reindeer's whole default list, so all six of its platforms are repeated.
+# scripts/check-buck-reindeer-features.rs refuses a cargo feature that a Buck
+# target enables and these lists do not resolve.
+[platform.linux-x86_64]
+target = "x86_64-unknown-linux-gnu"
+features = ["default", "third-party-backends"]
+
+[platform.linux-arm64]
+target = "aarch64-unknown-linux-gnu"
+features = ["default", "third-party-backends"]
+
+[platform.macos-x86_64]
+target = "x86_64-apple-darwin"
+features = ["default", "third-party-backends"]
+
+[platform.macos-arm64]
+target = "aarch64-apple-darwin"
+features = ["default", "third-party-backends"]
+
+[platform.windows-msvc]
+target = "x86_64-pc-windows-msvc"
+features = ["default", "third-party-backends"]
+
+[platform.windows-gnu]
+target = "x86_64-pc-windows-gnu"
+features = ["default", "third-party-backends"]
+
 [cargo]
 # Support Cargo's unstable "artifact dependencies" functionality, RFC 3028.
 bindeps = true

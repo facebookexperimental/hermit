@@ -33,6 +33,9 @@ use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
+use reverie_sabre_stats::SabrePatchRoute;
+use reverie_sabre_stats::SabreSlowPath;
+use reverie_sabre_stats::SabreStats;
 
 const SYSCALL_INSN: [u8; 2] = [0x0f, 0x05];
 // SaBRe's SIGILL handler recognizes this reserved two-byte instruction as a
@@ -280,6 +283,9 @@ struct Supervisor {
     physical_exit_observer: Arc<detcore::GlobalState>,
     bootstrap_launch: Option<super::sabre_bootstrap::Launch>,
     bootstrap: Option<super::sabre_bootstrap::Bootstrap>,
+    /// The statistics page shared with the guest's SaBRe loader, which counts
+    /// the dispatches; this supervisor adds its own stops and patches.
+    stats: SabreStats,
 }
 
 impl Supervisor {
@@ -290,6 +296,7 @@ impl Supervisor {
         readiness: Arc<AtomicBool>,
         physical_exit_observer: Arc<detcore::GlobalState>,
         bootstrap_launch: super::sabre_bootstrap::Launch,
+        stats: SabreStats,
     ) -> Self {
         Self {
             root,
@@ -307,6 +314,7 @@ impl Supervisor {
             physical_exit_observer,
             bootstrap_launch: Some(bootstrap_launch),
             bootstrap: None,
+            stats,
         }
     }
 
@@ -595,6 +603,8 @@ impl Supervisor {
         );
         match syscall_info.op {
             libc::PTRACE_SYSCALL_INFO_ENTRY => {
+                self.stats
+                    .increment_slow_path(SabreSlowPath::PtraceSyscallEntry);
                 let mut regs = ptrace::getregs(pid)?;
                 let state = self.states.entry(pid).or_default();
                 if state.pending_bootstrap.is_some() || state.pending_patch.is_some() {
@@ -636,6 +646,13 @@ impl Supervisor {
                     }
                     if !mapping.trusted {
                         write_two_bytes(pid, site, SABRE_SYSCALL_MARKER)?;
+                        self.stats.record_patch(
+                            site as u64,
+                            SABRE_SYSCALL_MARKER.len() as u8,
+                            SabrePatchRoute::PtraceInstalledMarker,
+                        );
+                        self.stats
+                            .increment_slow_path(SabreSlowPath::PtraceRawSyscallRedirect);
                         let syscall = regs.orig_rax;
                         regs.orig_rax = u64::MAX;
                         ptrace::setregs(pid, regs)?;
@@ -652,6 +669,8 @@ impl Supervisor {
                 }
             }
             libc::PTRACE_SYSCALL_INFO_EXIT => {
+                self.stats
+                    .increment_slow_path(SabreSlowPath::PtraceSyscallExit);
                 // A cached verdict describes the mapping that occupied that page
                 // when it was classified. mmap/munmap/mremap/mprotect/brk/shmat
                 // can replace or re-permission that page in-process, so a page
@@ -1229,6 +1248,8 @@ fn write_two_bytes(pid: Pid, address: usize, bytes: [u8; 2]) -> Result<(), Error
     Ok(())
 }
 
+// Each argument is a distinct resource the supervisor takes ownership of.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut command: std::process::Command,
     sabre: PathBuf,
@@ -1236,6 +1257,7 @@ pub async fn run(
     readiness: Arc<AtomicBool>,
     physical_exit_observer: Arc<detcore::GlobalState>,
     bootstrap_launch: super::sabre_bootstrap::Launch,
+    stats: SabreStats,
     capture_output: bool,
 ) -> Result<Output, Error> {
     if capture_output {
@@ -1263,6 +1285,7 @@ pub async fn run(
             readiness,
             physical_exit_observer,
             bootstrap_launch,
+            stats,
         )
     })
     .await
@@ -1300,6 +1323,7 @@ fn run_blocking(
     readiness: Arc<AtomicBool>,
     physical_exit_observer: Arc<detcore::GlobalState>,
     bootstrap_launch: super::sabre_bootstrap::Launch,
+    stats: SabreStats,
 ) -> Result<Output, Error> {
     let root = Pid::from_raw(child.id() as i32);
     let stdout = child.stdout.take();
@@ -1315,6 +1339,7 @@ fn run_blocking(
         readiness,
         physical_exit_observer,
         bootstrap_launch,
+        stats,
     )
     .run();
     // Supervisor owns error cleanup and reaping. Its former root PID may be
@@ -1615,8 +1640,17 @@ mod tests {
         assert_ne!(mapping, libc::MAP_FAILED, "mmap of the fixture failed");
         let address = mapping as usize;
 
-        let maps = fs::read_to_string("/proc/self/maps").expect("read own maps");
-        let entry = mapping_entry(&maps, address).expect("our own mapping must have a row");
+        // Other tests can map non-UTF-8 Linux filenames in this same mm.
+        // Read bytes and select our exact mmap base before decoding its row;
+        // the tempfile path and the kernel's numeric columns are UTF-8.
+        let maps = fs::read("/proc/self/maps").expect("read own maps");
+        let prefix = format!("{address:08x}-");
+        let row = maps
+            .split(|byte| *byte == b'\n')
+            .find(|row| row.starts_with(prefix.as_bytes()))
+            .expect("our own mapping must have a row");
+        let row = std::str::from_utf8(row).expect("our fixture's mapping row must be UTF-8");
+        let entry = mapping_entry(row, address).expect("our own mapping must contain its base");
         let from_maps = entry
             .file_id()
             .expect("a file-backed mapping has an identity");

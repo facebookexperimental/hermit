@@ -119,12 +119,27 @@ rather than on identity.
 Every check below decides what a change IS. This one decides whether it is
 YOURS to decide, and getting it wrong costs two agents instead of one.
 
+**Since 2026-09-28 the owner of a pull request is the single `Owner:` line in
+its description**, in the form
+`Owner: <agent-name> (<harness>, <host>) since <UTC timestamp>`. Read that line
+first. No `Owner:` line, or `Owner: none (released ...)`, means the pull request
+is free. Words in a comment do not take or release ownership; only that line
+does. TaskGraph is ORC's short-term to-do list, not the authority for ownership:
+agents outside ORC skip the two task-graph searches below, and under ORC those
+searches supplement the `Owner:` line and never override it. The pull-request
+side (search 3) applies to every agent, because pull requests opened before
+2026-09-28 usually carry no `Owner:` line; on those, a comment or push from the
+last day by an agent still working on it is the live signal, and you ask that
+agent's coordinator before taking the pull request. The measurements in this
+section predate the `Owner:` line, and they are why neither a task-graph view
+nor a single read was ever enough.
+
 **Search for ownership signals on the pull request number itself, recent-first,
 REGARDLESS OF TASK STATUS.** Filtering the task graph for a live task is not
 enough, and it is wrong often enough to be dangerous:
 
 ```console
-# 1. the obvious search — necessary, and NOT sufficient
+# 1. the obvious search (under ORC) — necessary there, and NOT sufficient
 sqlite3 "$TG_DB_PATH" "SELECT local_id, status, owner FROM tasks
    WHERE (title LIKE '%<N>%' OR description LIKE '%<N>%') AND status != 'CLOSED'"
 
@@ -178,8 +193,10 @@ the task BEFORE touching the head, so a correctly-behaved claimant is INVISIBLE
 on the pull request during exactly the window when claiming matters — measured,
 a head whose task had been claimed 53 seconds earlier scanned clean PR-side. So
 the task graph misses the claimant who has already moved to the head, and the
-pull request misses the one who correctly has not touched it yet. Run both every
-time; a clean result from one side is not evidence.
+pull request misses the one who correctly has not touched it yet. Under ORC, run
+both every time; a clean result from one side is not evidence. For every agent,
+the `Owner:` line closes this window, because the claim itself is now written on
+the pull request.
 
 Measured on 2026-08-25: **four consecutive claims where search 2 caught what
 search 1 missed.** Three of them — hermit#2547, hermit#2546 and hermit#2460 —
@@ -192,7 +209,7 @@ hermit#2547 is the sharp one: it was mid-collision between two agents, and the
 holder's note opened "STOP BEFORE IMPLEMENTING". A third claimant would have
 made it three. That single note was the only place the collision was visible.
 
-Two corollaries, both paid for:
+Two corollaries for task-graph claims under ORC, both paid for:
 
 - **A closed task is not a released claim.** Work is routinely finished,
   recorded and closed while the pull request stays open on purpose. A closed
@@ -203,20 +220,31 @@ Two corollaries, both paid for:
 ### The claim is ADVISORY. Re-reading the owner field is the protocol
 
 `tg claim` **overwrites the owner field unconditionally, prints success to the
-second claimer, and warns neither party.** So a claim succeeding tells you
+second claimer, and warns neither party.** The `Owner:` line has the same
+weakness: `gh pr edit` replaces the whole description, so two agents editing at
+once overwrite each other and neither is warned. So a claim succeeding tells you
 nothing whatever about whether you were first, and the only operation that
-detects a loss is reading the owner field back. These are numbered steps, not
-advice:
+detects a loss is reading the owner field back. For every agent that field is
+the pull request's `Owner:` line; under ORC, the task's owner field is read as
+well. These are numbered steps, not advice:
 
-1. **Search** — the three searches above, task graph and pull request.
-2. **Claim** on the row's own drain task, and post the claim note.
-3. **RE-READ THE OWNER FIELD.** If it names someone else you lost the row:
-   yield, and hand over what you found. Do not claim back.
+1. **Search** — read the `Owner:` line, then run the pull-request side
+   (search 3). Under ORC, also run the two task-graph searches.
+2. **Claim** — write your own `Owner:` line into the description with
+   `gh pr edit <url> --body-file <file>`, keeping exactly one `Owner:` line.
+   Under ORC, also claim the row's own drain task and post the claim note.
+3. **RE-READ THE OWNER FIELD** —
+   `gh pr view <url> --json body -q .body | grep '^Owner:'`. You hold the row
+   only if the read succeeds and prints exactly one `Owner:` line, and that line
+   is yours. If it names someone else you lost the row: yield, and hand over
+   what you found. Do not claim back. If the read fails, prints no line, prints
+   `Owner: none`, or prints more than one line, you do not hold the row either:
+   do nothing irreversible until a later read shows your own single line.
 4. **RE-READ IT AGAIN BEFORE THE IRREVERSIBLE STEP** — the close, the land, the
-   force-push. Checking only at step 3 catches the race you lost in the first
-   minute and misses the one you lost in the fortieth. Check 14 below is the
-   full treatment and its evidence; this step exists so the protocol is complete
-   where you read it.
+   force-push, with the same test as step 3. Checking only at step 3 catches
+   the race you lost in the first minute and misses the one you lost in the
+   fortieth. Check 14 below is the full treatment and its evidence; this step
+   exists so the protocol is complete where you read it.
 
 ⚠️ **A published claim note does not prevent an overwrite.** Measured three
 times inside eight minutes on 2026-08-25, three different pairs of agents —
@@ -1057,6 +1085,23 @@ head.
 one query and it is the one that protects the irreversible step — the close, the
 land, the force-push. A stale `owner` is harmless while you are only reading; it is
 expensive exactly when you stop reading and start writing.
+
+For every agent, the owner field is the pull request's `Owner:` line, read back
+at both ends:
+
+    gh pr edit <url> --body-file <body-with-your-Owner-line>
+    # re-read #1 -- did my claim actually take?
+    gh pr view <url> --json body -q .body | grep '^Owner:'
+    ... do the work ...
+    # re-read #2 -- do I still hold it, now that I am about to close/land?
+    gh pr view <url> --json body -q .body | grep '^Owner:'
+
+Each read passes only if it succeeds and prints exactly one `Owner:` line, and
+that line is your own. A failed read, no line, `Owner: none`, more than one
+line, or someone else's line all mean you do not hold the pull request; do not
+close, land, or force-push on that read.
+
+Under ORC, the task's owner field is read the same way, in addition:
 
     tg claim <task>
     # re-read #1 -- did my claim actually take?

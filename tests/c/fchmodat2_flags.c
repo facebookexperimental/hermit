@@ -16,11 +16,13 @@
 // identical error classifications on every run.
 //
 // The ptrace and DBT backends forward syscall 452 to the host, so all five
-// checks pass (ok=5) exactly as they do natively. The KVM backend's ElfExecutor
-// does not route syscall 452 and returns ENOSYS for every fchmodat2 call, so it
-// fails all five checks (ok=0); that is a documented KVM gap in matrix.tsv, not
-// a determinism relaxation. Native and the two forwarding backends agree, which
-// is the faithful-support shape.
+// checks pass (ok=5) exactly as they do natively. When this fixture was
+// written, the KVM backend's ElfExecutor did not route syscall 452 and returned
+// ENOSYS for every fchmodat2 call, so it failed all five checks (ok=0). That
+// was a KVM gap, not a determinism relaxation. The executor now routes syscall
+// 452, and the KVM verify cell for c-programs/fchmodat2-flags in
+// tests/e2e/manifests/c-programs.yaml is enabled. Native and the two
+// forwarding backends agree, which is the faithful-support shape.
 
 #define _GNU_SOURCE
 #include <errno.h>

@@ -363,7 +363,8 @@ parent repository or its coordination tools.
   `ci-hub/validate/flaky-cells.json`. That registry is keyed by validate DAG-node
   names rather than manifest cell identities, and it defines how to add entries
   but not how to remove them. If an entry appears stale, record the exact node
-  mapping and evidence in a separate TaskGraph task. Never remove a registry
+  mapping and evidence in a GitHub issue. Never remove a registry
   entry because one `tests/DEBUGGING.md` H2 became green.
-- Use TaskGraph for durable coordination. On Meta devservers, prefix commands
-  that need the public internet with `with-proxy`.
+- Put durable findings in a GitHub issue, a pull-request comment, or a tracked
+  report; TaskGraph is ORC's short-term to-do list, not a record. On Meta
+  devservers, prefix commands that need the public internet with `with-proxy`.

@@ -23,9 +23,10 @@
  *
  * The success line is byte-for-byte unchanged, because two consumers assert it
  * exactly: hermit-cli/tests/cli.rs::run_kvm_cpuid_policy_is_deterministic
- * compiles THIS file and compares stdout literally, and
- * tests/backend-parity/run_matrix.py's "cpuid_policy" row expects the same
- * bytes. Only the previously-silent failure paths gained output.
+ * compiles THIS file and compares stdout literally, and the ptrace and DBT
+ * expected_stdout of the c-programs/cpuid-probe verify cell in
+ * tests/e2e/manifests/c-programs.yaml holds the same bytes. Only the
+ * previously-silent failure paths gained output.
  */
 
 #include <cpuid.h>
@@ -118,7 +119,7 @@ int main(void) {
     }
   }
 
-  /* Success line held byte-identical for cli.rs and run_matrix.py. */
+  /* Success line held byte-identical for cli.rs and c-programs.yaml. */
   printf("CPUID-SUCCESS vendor=%s signature=%08x\n", vendor, sig_eax);
   return 0;
 }

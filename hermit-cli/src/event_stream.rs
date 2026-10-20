@@ -259,13 +259,15 @@ impl fmt::Display for DebugEvent {
 fn kernel_arg_count(sysno: Sysno) -> Option<u8> {
     use reverie::syscalls::Sysno::*;
     Some(match sysno {
-        close | fchdir | dup | time | unlink => 1,
-        access | stat | fstat | lstat | dup2 | clock_gettime | clock_getres | gettimeofday
-        | settimeofday | mkdir | statfs | fstatfs | ftruncate | kill | listen | rt_sigpending => 2,
+        close | chdir | fchdir | dup | time | unlink | rmdir => 1,
+        access | getcwd | set_robust_list | stat | fstat | lstat | dup2 | clock_gettime
+        | clock_getres | gettimeofday | settimeofday | mkdir | statfs | fstatfs | ftruncate
+        | kill | listen | rt_sigpending | rename | link | symlink | chmod => 2,
         mprotect | read | readv | write | writev | lseek | getdents | getdents64 | dup3 | ioctl
         | socket | fcntl | connect | sendmsg | poll | getpeername | getsockname | getrandom
-        | readlink | unlinkat | open | execve | close_range | tgkill => 3,
-        pread64 | pwrite64 | newfstatat | fadvise64 | openat => 4,
+        | readlink | unlinkat | open | execve | close_range | tgkill | faccessat | chown
+        | lchown | mknod => 3,
+        pread64 | pwrite64 | newfstatat | fadvise64 | openat | faccessat2 => 4,
         statx | pwritev | preadv | ppoll | setsockopt | getsockopt | execveat | prctl => 5,
         recvfrom | sendto | pwritev2 | preadv2 | mmap => 6,
         _ => return None,
@@ -509,6 +511,25 @@ mod tests {
         assert_eq!(kernel_arg_count(Sysno::rt_sigpending), Some(2));
         assert_eq!(kernel_arg_count(Sysno::tgkill), Some(3));
         assert_eq!(kernel_arg_count(Sysno::prctl), Some(5));
+    }
+
+    #[test]
+    fn path_query_and_mutation_syscalls_have_kernel_arities() {
+        // faccessat takes no flags argument; glibc leaves the fourth register
+        // unset, so it must not be compared. faccessat2 is the flags form.
+        assert_eq!(kernel_arg_count(Sysno::faccessat), Some(3));
+        assert_eq!(kernel_arg_count(Sysno::faccessat2), Some(4));
+        assert_eq!(kernel_arg_count(Sysno::chdir), Some(1));
+        assert_eq!(kernel_arg_count(Sysno::getcwd), Some(2));
+        assert_eq!(kernel_arg_count(Sysno::set_robust_list), Some(2));
+        assert_eq!(kernel_arg_count(Sysno::rmdir), Some(1));
+        assert_eq!(kernel_arg_count(Sysno::rename), Some(2));
+        assert_eq!(kernel_arg_count(Sysno::link), Some(2));
+        assert_eq!(kernel_arg_count(Sysno::symlink), Some(2));
+        assert_eq!(kernel_arg_count(Sysno::chmod), Some(2));
+        assert_eq!(kernel_arg_count(Sysno::chown), Some(3));
+        assert_eq!(kernel_arg_count(Sysno::lchown), Some(3));
+        assert_eq!(kernel_arg_count(Sysno::mknod), Some(3));
     }
 
     #[test]

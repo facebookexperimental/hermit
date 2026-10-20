@@ -7,6 +7,7 @@
  */
 
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -16,6 +17,7 @@ use reverie::Guest;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Ftruncate;
+use reverie::syscalls::Getcwd;
 use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
 use reverie::syscalls::Ioctl;
@@ -41,6 +43,7 @@ use crate::event::StatEvent;
 use crate::event::SyscallEvent;
 use crate::event::WriteEvent;
 use crate::event::deterministic_ioctl_error;
+use crate::event::xattr_query_output;
 use crate::vectored_offset;
 
 /// Read the first `length` output bytes of a vectored read from the guest's
@@ -494,8 +497,12 @@ impl Recorder {
             guest,
             result.and_then(|length| {
                 let mut buf = vec![0; length as usize];
-                let addr = syscall.buf().ok_or(Errno::EFAULT)?;
-                guest.memory().read_exact(addr, &mut buf)?;
+                // A read that transfers nothing never touches the buffer,
+                // which may then be NULL.
+                if !buf.is_empty() {
+                    let addr = syscall.buf().ok_or(Errno::EFAULT)?;
+                    guest.memory().read_exact(addr, &mut buf)?;
+                }
                 Ok(SyscallEvent::ReadV2(ReadEvent {
                     consumed_sigpipe_count: consumed_sigpipe_count(
                         guest.pid().as_raw(),
@@ -522,8 +529,12 @@ impl Recorder {
             guest,
             result.and_then(|length| {
                 let mut buf = vec![0; length as usize];
-                let addr = syscall.buf().ok_or(Errno::EFAULT)?;
-                guest.memory().read_exact(addr, &mut buf)?;
+                // A read that transfers nothing never touches the buffer,
+                // which may then be NULL.
+                if !buf.is_empty() {
+                    let addr = syscall.buf().ok_or(Errno::EFAULT)?;
+                    guest.memory().read_exact(addr, &mut buf)?;
+                }
                 Ok(SyscallEvent::Bytes(buf))
             }),
         );
@@ -833,6 +844,90 @@ impl Recorder {
                 let addr = syscall.buf().ok_or(Errno::EFAULT)?.cast::<u8>();
                 guest.memory().read_exact(addr, &mut buf)?;
                 Ok(SyscallEvent::Bytes(buf))
+            }),
+        );
+
+        result
+    }
+
+    // TODO-HUMAN-REVIEW(PR-3601)
+    /// Records an xattr query. A sized query records the bytes the kernel
+    /// copied out, whose count is the return value. A zero-size query copies
+    /// nothing and returns the length the value needs, so that is recorded
+    /// instead.
+    pub(super) async fn handle_xattr_query<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let (buf, size) = xattr_query_output(&syscall)
+            .unwrap_or_else(|| unreachable!("xattr query recording called for {syscall:?}"));
+        let result = guest.inject(syscall).await;
+
+        if size == 0 {
+            self.record_event(guest, result.map(SyscallEvent::Return));
+        } else {
+            self.record_event(
+                guest,
+                result.and_then(|length| {
+                    let mut bytes = vec![0; length as usize];
+                    // An empty list succeeds without touching the buffer,
+                    // which may then be NULL.
+                    if !bytes.is_empty() {
+                        guest
+                            .memory()
+                            .read_exact(buf.ok_or(Errno::EFAULT)?, &mut bytes)?;
+                    }
+                    Ok(SyscallEvent::Bytes(bytes))
+                }),
+            );
+        }
+
+        result
+    }
+
+    // TODO-HUMAN-REVIEW(#3598)
+    /// Records the path `getcwd` copied out. The raw syscall returns the
+    /// length including the terminating NUL, so the recorded bytes include it.
+    pub(super) async fn handle_getcwd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Getcwd,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.and_then(|length| {
+                let mut buf = vec![0; length as usize];
+                let addr = syscall.buf().ok_or(Errno::EFAULT)?.cast::<u8>();
+                guest.memory().read_exact(addr, &mut buf)?;
+                Ok(SyscallEvent::Bytes(buf))
+            }),
+        );
+
+        result
+    }
+
+    // TODO-HUMAN-REVIEW(#3598)
+    /// Record a successful `chdir(2)` or `fchdir(2)` as the directory it
+    /// actually entered. The spelled path may go through host symlinks or `..`
+    /// components that the replay root lacks, and an fchdir descriptor may be
+    /// a replay placeholder, so replay moves to this resolved name instead.
+    pub(super) async fn handle_working_directory_change<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.map(|_| {
+                let cwd = crate::record_replay_path::process_cwd_path(guest.tid()).unwrap_or_else(
+                    |error| panic!("could not record the directory {syscall:?} entered: {error}"),
+                );
+                SyscallEvent::Bytes(cwd.into_os_string().into_vec())
             }),
         );
 

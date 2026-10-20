@@ -397,7 +397,6 @@
     "c-programs/pselect6-simulation::chaos",
     "c-programs/pselect6-simulation::custom",
     "c-programs/pselect6-simulation::naked",
-    "c-programs/pselect6-simulation::replay",
     "c-programs/ptrace-attach-eperm::chaos",
     "c-programs/ptrace-attach-eperm::custom",
     "c-programs/ptrace-attach-eperm::naked",

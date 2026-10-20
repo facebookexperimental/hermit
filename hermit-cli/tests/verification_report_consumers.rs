@@ -31,16 +31,10 @@ struct Consumer {
 
 const CONSUMERS: &[Consumer] = &[
     Consumer {
-        path: "tests/backend-parity/e9patch_corpus.py",
+        path: "tests/e9patch/e9patch_corpus.py",
         requirement: "matched",
         invocation: "verification_matched(hermit,",
         minimum_invocations: 2,
-    },
-    Consumer {
-        path: "tests/backend-parity/run_matrix.py",
-        requirement: "matched",
-        invocation: "[str(VERIFICATION_REPORT_BIN), \"--json\", \"matched\", str(path)]",
-        minimum_invocations: 1,
     },
     Consumer {
         path: "tests/e2e/lib/data-handling/common.bash",
@@ -74,14 +68,14 @@ const CONSUMERS: &[Consumer] = &[
     },
     Consumer {
         path: "tests/qemu-boot/strict_l2_test.sh",
-        requirement: "matched",
-        invocation: "\"$VERIFICATION_REPORT_BIN\" matched \"$verify_report\"",
+        requirement: "canonical-match",
+        invocation: "\"$VERIFICATION_REPORT_BIN\" canonical-match \"$verify_report\"",
         minimum_invocations: 1,
     },
     Consumer {
         path: "tests/qemu-boot/strict_l2_userspace_test.sh",
-        requirement: "matched",
-        invocation: "\"$VERIFICATION_REPORT_BIN\" matched \"$verify_report\"",
+        requirement: "canonical-match",
+        invocation: "\"$VERIFICATION_REPORT_BIN\" canonical-match \"$verify_report\"",
         minimum_invocations: 1,
     },
     Consumer {
@@ -384,7 +378,9 @@ fn verdict(requirement: &str, path: &Path) -> std::process::Output {
 #[test]
 fn every_named_consumer_delegates_to_the_shared_typed_reader() {
     let root = root();
-    assert_eq!(CONSUMERS.len(), 11, "the published consumer list changed");
+    // 10 since tests/backend-parity/run_matrix.py was retired in slice S13 of
+    // https://github.com/rrnewton/hermit/issues/3301.
+    assert_eq!(CONSUMERS.len(), 10, "the published consumer list changed");
     for consumer in CONSUMERS {
         let source = fs::read_to_string(root.join(consumer.path))
             .unwrap_or_else(|error| panic!("cannot read {}: {error}", consumer.path));
@@ -396,6 +392,22 @@ fn every_named_consumer_delegates_to_the_shared_typed_reader() {
         assert!(
             source.contains("--verify-json"),
             "{} does not request the producer-owned report",
+            consumer.path
+        );
+        // A canonical-match reader can only be satisfied by a canonical
+        // comparison, which a plain `--verify` never runs. The flag must be on
+        // the line that builds the verifying `run` command (`verify_command=(`);
+        // a comment or a message elsewhere that mentions it does not count.
+        assert!(
+            consumer.requirement != "canonical-match"
+                || source.lines().any(|line| {
+                    let line = line.trim_start();
+                    let line = line.strip_prefix("local ").unwrap_or(line);
+                    line.starts_with("verify_command=(")
+                        && line.contains(" run ")
+                        && line.contains("--verify-strict")
+                }),
+            "{} requires canonical-match but its verify_command=( line never requests --verify-strict",
             consumer.path
         );
         assert!(

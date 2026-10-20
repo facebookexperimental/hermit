@@ -23,6 +23,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 use std::path::Component;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -74,6 +75,34 @@ pub(crate) fn open_process_root(pid: Pid) -> io::Result<OwnedFd> {
 /// Pins the tracee's current working directory as a directory descriptor.
 pub(crate) fn open_process_cwd(pid: Pid) -> io::Result<OwnedFd> {
     open_proc_directory(&format!("/proc/{}/cwd", pid.as_raw()))
+}
+
+/// Names the tracee thread's current working directory as the thread itself
+/// would see it: the procfs cwd link with the thread's root prefix removed.
+/// Recording keeps this resolved name for a successful `chdir`, so replay can
+/// enter the same directory even when the spelled path went through a host
+/// symlink that the replay root does not contain.
+pub(crate) fn process_cwd_path(tid: Pid) -> io::Result<PathBuf> {
+    // procfs appends " (deleted)" to a removed directory's name. That string is
+    // not a path, and replay cannot reproduce a deleted working directory.
+    let cwd_fd = open_process_cwd(tid)?;
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(cwd_fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { stat.assume_init() }.st_nlink == 0 {
+        return Err(io::Error::other(format!(
+            "working directory of thread {tid} has been removed"
+        )));
+    }
+    let root = std::fs::read_link(format!("/proc/{}/root", tid.as_raw()))?;
+    let cwd = std::fs::read_link(format!("/proc/{}/cwd", tid.as_raw()))?;
+    let relative = cwd.strip_prefix(&root).map_err(|_| {
+        io::Error::other(format!(
+            "tracee cwd {cwd:?} is not beneath its root {root:?}"
+        ))
+    })?;
+    Ok(Path::new("/").join(relative))
 }
 
 /// Pins one tracee descriptor when it currently names a directory.
@@ -261,6 +290,29 @@ fn is_symlink(identity: FileIdentity) -> bool {
     identity.mode & libc::S_IFMT == libc::S_IFLNK
 }
 
+/// Whether `directory` is on procfs, whose symlinks include "magic" links
+/// such as `/proc/<pid>/root` and `/proc/<pid>/fd/<n>`. Their text is not
+/// where Linux resolves them: the kernel jumps to the linked object itself,
+/// which may be outside the replay root, so text resolution cannot confine them.
+fn is_on_procfs(directory: RawFd) -> io::Result<bool> {
+    let mut filesystem = MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::fstatfs(directory, filesystem.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatfs initialized the complete statfs structure on success.
+    let filesystem = unsafe { filesystem.assume_init() };
+    Ok(filesystem.f_type == libc::PROC_SUPER_MAGIC)
+}
+
+/// Refuses to follow a symlink in a procfs directory, as
+/// `RESOLVE_NO_MAGICLINKS` does, with the same ELOOP.
+fn refuse_procfs_symlink(directory: RawFd) -> io::Result<()> {
+    if is_on_procfs(directory)? {
+        return Err(io::Error::from_raw_os_error(libc::ELOOP));
+    }
+    Ok(())
+}
+
 pub(crate) fn is_regular_file(identity: FileIdentity) -> bool {
     identity.mode & libc::S_IFMT == libc::S_IFREG
 }
@@ -355,6 +407,29 @@ pub(crate) fn resolve_existing_path(
     path: &Path,
     nofollow_final: bool,
 ) -> io::Result<ResolvedPath> {
+    resolve_existing_path_impl(root, start, path, nofollow_final, false)
+}
+
+/// As [`resolve_existing_path`], but fails with ELOOP instead of following a
+/// symlink on procfs. Use it when the answer decides whether the guest's own
+/// kernel may perform a real filesystem operation on the path: the kernel
+/// follows procfs magic links to their objects, which this text resolution
+/// would place inside the replay root.
+pub(crate) fn resolve_existing_path_without_procfs_symlinks(
+    root: &OwnedFd,
+    start: &OwnedFd,
+    path: &Path,
+) -> io::Result<ResolvedPath> {
+    resolve_existing_path_impl(root, start, path, false, true)
+}
+
+fn resolve_existing_path_impl(
+    root: &OwnedFd,
+    start: &OwnedFd,
+    path: &Path,
+    nofollow_final: bool,
+    refuse_procfs_symlinks: bool,
+) -> io::Result<ResolvedPath> {
     if path.as_os_str().is_empty() {
         return Err(io::Error::from_raw_os_error(libc::ENOENT));
     }
@@ -378,6 +453,9 @@ pub(crate) fn resolve_existing_path(
                 let identity = file_identity(object.as_raw_fd())?;
                 let final_component = pending.is_empty();
                 if is_symlink(identity) && !(final_component && nofollow_final) {
+                    if refuse_procfs_symlinks {
+                        refuse_procfs_symlink(current.as_raw_fd())?;
+                    }
                     followed_symlinks += 1;
                     if followed_symlinks > MAX_SYMLINKS {
                         return Err(io::Error::from_raw_os_error(libc::ELOOP));
@@ -664,7 +742,7 @@ pub(crate) fn ensure_directory_path(
     start: &OwnedFd,
     path: &Path,
 ) -> io::Result<()> {
-    ensure_directory_path_impl(root, start, path, false)
+    ensure_directory_path_impl(root, start, path, false, false)
 }
 
 /// As [`ensure_directory_path`], but follows an existing final symlink. This
@@ -675,7 +753,18 @@ pub(crate) fn ensure_directory_path_follow_final(
     start: &OwnedFd,
     path: &Path,
 ) -> io::Result<()> {
-    ensure_directory_path_impl(root, start, path, true)
+    ensure_directory_path_impl(root, start, path, true, false)
+}
+
+/// As [`ensure_directory_path_follow_final`], but fails with ELOOP instead of
+/// following a symlink on procfs (see
+/// [`resolve_existing_path_without_procfs_symlinks`]).
+pub(crate) fn ensure_directory_path_follow_final_without_procfs_symlinks(
+    root: &OwnedFd,
+    start: &OwnedFd,
+    path: &Path,
+) -> io::Result<()> {
+    ensure_directory_path_impl(root, start, path, true, true)
 }
 
 fn ensure_directory_path_impl(
@@ -683,6 +772,7 @@ fn ensure_directory_path_impl(
     start: &OwnedFd,
     path: &Path,
     follow_final_symlink: bool,
+    refuse_procfs_symlinks: bool,
 ) -> io::Result<()> {
     if !path.is_absolute() && !directory_is_beneath(root, start)? {
         return Err(io::Error::new(
@@ -730,6 +820,9 @@ fn ensure_directory_path_impl(
                             }
                             Err(_) => return Err(open_error),
                         };
+                        if refuse_procfs_symlinks {
+                            refuse_procfs_symlink(current.as_raw_fd())?;
+                        }
                         followed_symlinks += 1;
                         if followed_symlinks > MAX_SYMLINKS {
                             return Err(io::Error::from_raw_os_error(libc::ELOOP));
@@ -760,6 +853,24 @@ mod tests {
             )
         })
         .unwrap()
+    }
+
+    #[test]
+    fn procfs_symlinks_are_refused_only_when_requested() {
+        let root = open_test_directory(Path::new("/"));
+        let through_proc = Path::new("/proc/self/root/tmp");
+        assert!(resolve_existing_path(&root, &root, through_proc, false).is_ok());
+        let error = resolve_existing_path_without_procfs_symlinks(&root, &root, through_proc)
+            .err()
+            .expect("a procfs symlink must be refused");
+        assert_eq!(error.raw_os_error(), Some(libc::ELOOP));
+        let error =
+            ensure_directory_path_follow_final_without_procfs_symlinks(&root, &root, through_proc)
+                .expect_err("a procfs symlink must be refused");
+        assert_eq!(error.raw_os_error(), Some(libc::ELOOP));
+        assert!(
+            resolve_existing_path_without_procfs_symlinks(&root, &root, Path::new("/tmp")).is_ok()
+        );
     }
 
     #[test]

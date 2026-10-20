@@ -176,12 +176,16 @@ def _workflow_name(run: Mapping[str, object]) -> str:
     return _text(run.get("workflowName") or run.get("workflow_name") or run.get("name"))
 
 
-def _workflow_order_key(run: Mapping[str, object]) -> tuple[str, int]:
+def _workflow_order_key(run: Mapping[str, object]) -> tuple[str, int, int]:
     try:
         run_id = int(run.get("id") or run.get("databaseId") or run.get("run_id") or 0)
     except (TypeError, ValueError):
         run_id = 0
-    return _text(run.get("created_at") or run.get("createdAt")), run_id
+    try:
+        run_attempt = int(run.get("run_attempt") or run.get("runAttempt") or 0)
+    except (TypeError, ValueError):
+        run_attempt = 0
+    return _text(run.get("created_at") or run.get("createdAt")), run_id, run_attempt
 
 
 def select_latest_workflow_attempts(

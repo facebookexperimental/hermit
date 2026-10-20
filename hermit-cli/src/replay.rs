@@ -28,7 +28,6 @@ use reverie::process::Stdio;
 
 use crate::chroot::TempChroot;
 use crate::consts::EXEC_FILES_NAME;
-use crate::consts::METADATA_NAME;
 use crate::error::Context;
 use crate::error::Error;
 use crate::event::ExecEvent;
@@ -68,13 +67,7 @@ impl Replay {
         gdbserver: Option<u16>,
         mounts: &[Mount],
     ) -> Result<Self, Error> {
-        let metadata_path = dir.join(METADATA_NAME);
-
-        let metadata: Metadata = serde_json::from_reader(
-            fs::File::open(&metadata_path)
-                .with_context(|| format!("Failed to open {:?}", metadata_path))?,
-        )
-        .with_context(|| format!("Failed to parse {:?}", metadata_path))?;
+        let metadata = Metadata::load(dir)?;
 
         let recording_version = &metadata.version;
         let replayer_version = &RECORD_VERSION;

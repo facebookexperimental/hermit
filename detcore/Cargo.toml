@@ -25,8 +25,13 @@
 [package]
 name = "hermit-detcore"
 description = "Detcore: the deterministic scheduler and syscall determinization core of the Hermit execution engine."
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
+readme = "README.md"
+homepage = "https://hermetic-infra.org"
+documentation = "https://docs.rs/hermit-detcore"
+keywords = ["linux", "hermit", "determinism", "debugging"]
+categories = ["development-tools::debugging", "development-tools::testing"]
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
 
@@ -57,10 +62,10 @@ async-trait = "0.1.86"
 bitflags = { version = "2.13.1", features = ["serde"], default-features = false }
 chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
-detcore-model = { version = "0.4.0", path = "../detcore-model" }
+detcore-model = { version = "0.4.1", path = "../detcore-model" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 hex = { version = "0.4.3", features = ["alloc"] }
-libc = "0.2.186"
+libc = "=0.2.189"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 pretty = "0.12.5"
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
@@ -72,7 +77,7 @@ raw-cpuid = "10.7.0"
 regex = "1.13.1"
 # Abstract Reverie interface ONLY. Never add a concrete backend here (see the
 # BACKEND-ABSTRACTION COMMANDMENT at the top of this file).
-reverie = { package = "reverie-core", version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359" }
+reverie = { package = "reverie-core", version = "=0.4.1" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 sha2 = "0.10.6"
@@ -81,10 +86,10 @@ tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
-detcore-testutils = { version = "0.4.0", path = "tests/testutils" }
+detcore-testutils = { path = "tests/testutils" }
 # ALLOWED test-only backend: detcore's integration tests drive a real tracer to
 # exercise the tool. This is a dev-dependency and never reaches the shipped
 # `detcore` rlib. It is the ONLY backend crate permitted in this manifest.
-reverie-ptrace = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359" }
-test-allocator = { version = "0.4.0", path = "../common/test-allocator" }
+reverie-ptrace = { version = "=0.4.1" }
+test-allocator = { path = "../common/test-allocator" }
 test-case = "3.3.1"

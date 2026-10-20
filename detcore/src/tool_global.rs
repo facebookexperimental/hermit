@@ -129,7 +129,69 @@ struct InodePool {
 #[derive(Debug)]
 struct DetInodeInfo {
     raw: RawInode,
-    mtime: LogicalTime,
+    /// The virtual mtime, or `None` while no stat has observed the file and no
+    /// write or explicit time update has set it. Many paths (open, read,
+    /// getdents) mint a DetInode before any stat, so the first-seen policy is
+    /// applied at the first stat rather than at minting; otherwise whether a
+    /// file kept a canonical mtime would depend on which syscall touched it
+    /// first. An unresolved mtime reads as the epoch.
+    mtime: Option<LogicalTime>,
+}
+
+/// Whole-second host mtimes, with a zero nanosecond part, that a file keeps
+/// when Hermit first sees it, instead of having its mtime replaced by the
+/// epoch (https://github.com/rrnewton/hermit/issues/3639).
+///
+/// These values are canonical and content-independent: they are written
+/// deliberately by tools that erase timestamps, so they carry no host clock
+/// or run-specific information. Revealing them makes whether a file's host
+/// mtime is canonical part of Hermit's input, like the file's contents: a
+/// guest that rewrites the host mtime of an input file (`touch f` after
+/// `stat f` on a canonical file) changes the input of the next run, exactly
+/// as rewriting its contents would.
+/// - `1` (1970-01-01T00:00:01Z) is the mtime of every file and directory in
+///   the Nix store (seconds 1, nanoseconds 0). nixpkgs' stdenv derives
+///   `SOURCE_DATE_EPOCH` from the newest source mtime, so reporting the epoch
+///   instead moves embedded build timestamps away from a native build's.
+/// - `0` is what `SOURCE_DATE_EPOCH=0` tooling and archive normalizers write.
+///
+/// Matching is exact. A non-zero nanosecond part, or any other second, is a
+/// real timestamp, and the file gets the epoch as before.
+pub const CANONICAL_FILE_MTIME_SECONDS: [i64; 2] = [0, 1];
+
+/// What a syscall observed about a file's host mtime, already reduced to the
+/// only part the virtual mtime may depend on.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+pub enum ObservedMtime {
+    /// The caller did not read the file's metadata (open, read, getdents...).
+    Unobserved,
+    /// A stat observed a host mtime that is a real timestamp.
+    HostSpecific,
+    /// A stat observed one of [`CANONICAL_FILE_MTIME_SECONDS`], which is kept.
+    Canonical(LogicalTime),
+}
+
+impl ObservedMtime {
+    /// Classify a host mtime that a stat reported.
+    pub fn from_host_mtime(tv_sec: i64, tv_nsec: i64) -> Self {
+        match u64::try_from(tv_sec) {
+            Ok(secs) if tv_nsec == 0 && CANONICAL_FILE_MTIME_SECONDS.contains(&tv_sec) => {
+                ObservedMtime::Canonical(LogicalTime::from_secs(secs))
+            }
+            _ => ObservedMtime::HostSpecific,
+        }
+    }
+
+    /// The virtual mtime to assign to a file whose mtime is still unresolved:
+    /// a canonical value is kept, a real timestamp becomes the epoch, and no
+    /// observation leaves it unresolved.
+    fn first_seen_mtime(self, epoch: LogicalTime) -> Option<LogicalTime> {
+        match self {
+            ObservedMtime::Unobserved => None,
+            ObservedMtime::HostSpecific => Some(epoch),
+            ObservedMtime::Canonical(mtime) => Some(mtime),
+        }
+    }
 }
 
 /// Everything the global scheduler needs to register a new child thread. A
@@ -189,8 +251,18 @@ impl InodePool {
     // can return an existing mapping or extend the mapping by creating a
     // new deterministic inode. The returned inode is strictly increasing
     // to avoid inode re-use issue in some filesystem like ext4.
-    fn add_inode(&mut self, raw_inode: RawInode, mtime: LogicalTime) -> (DetInode, LogicalTime) {
-        match self.inodes.get(&raw_inode) {
+    //
+    // Also return the virtual mtime. When it is still unresolved, `observed`
+    // resolves it under the first-seen policy (see `ObservedMtime`); an
+    // unresolved mtime reads as `epoch`.
+    fn add_inode(
+        &mut self,
+        raw_inode: RawInode,
+        observed: ObservedMtime,
+        epoch: LogicalTime,
+    ) -> (DetInode, LogicalTime) {
+        let dino = match self.inodes.get(&raw_inode) {
+            Some(dino) => *dino,
             None => {
                 // THE determinization boundary: the single place a host inode
                 // is deliberately mapped to a deterministic one. The value is
@@ -203,20 +275,21 @@ impl InodePool {
                     new,
                     DetInodeInfo {
                         raw: raw_inode,
-                        mtime,
+                        mtime: None,
                     },
                 );
                 assert!(prev.is_none()); // Should not have been previously used.
-                (new, mtime)
+                new
             }
-            Some(dino) => {
-                let info = self
-                    .detinodes_info
-                    .get(dino)
-                    .expect("Internal invariant broken, det_ino missing entry");
-                (*dino, info.mtime)
-            }
+        };
+        let info = self
+            .detinodes_info
+            .get_mut(&dino)
+            .expect("Internal invariant broken, det_ino missing entry");
+        if info.mtime.is_none() {
+            info.mtime = observed.first_seen_mtime(epoch);
         }
+        (dino, info.mtime.unwrap_or(epoch))
     }
 
     // remove a det inode
@@ -784,7 +857,20 @@ impl GlobalState {
     ///
     /// If the boolean argument is true, print to stderr, otherwise only print the summary
     /// to the log.
-    pub async fn clean_up(mut self, to_stderr: bool, print_summary_to_json_file: &Option<PathBuf>) {
+    pub async fn clean_up(self, to_stderr: bool, print_summary_to_json_file: &Option<PathBuf>) {
+        self.clean_up_with_dispatch_stats(to_stderr, print_summary_to_json_file, None)
+            .await
+    }
+
+    /// [`Self::clean_up`], also carrying the backend's dispatch record into the
+    /// machine-readable summary. The human-readable report, including the INFO
+    /// view `--verify` compares, never shows it.
+    pub async fn clean_up_with_dispatch_stats(
+        mut self,
+        to_stderr: bool,
+        print_summary_to_json_file: &Option<PathBuf>,
+        dispatch_stats: Option<reverie::DispatchStats>,
+    ) {
         if let Some(handle) = self.sched_handle.take() {
             debug!("Global state cleanup, confirming scheduler has shut down...");
             handle.await.expect("Global scheduler clean shutdown");
@@ -794,6 +880,7 @@ impl GlobalState {
             "  ------------------------------ hermit run report ------------------------------";
         let recording_destination = self.cfg.record_preemptions_to.clone();
         let (mut summary, info_reprio_descrip) = self.into_run_summary_for_log().unwrap();
+        summary.dispatch_stats = dispatch_stats;
 
         // Print machine-readable summary:
         if let Some(path) = print_summary_to_json_file {
@@ -1563,8 +1650,8 @@ impl GlobalTool for GlobalState {
             GlobalRequest::RobustListWakes(wakes) => {
                 R::RobustListWakes(self.recv_robust_list_wakes(wakes))
             }
-            GlobalRequest::DeterminizeInode(ino) => {
-                R::DeterminizeInode(self.recv_determinize_inode(from, ino).await)
+            GlobalRequest::DeterminizeInode(ino, observed) => {
+                R::DeterminizeInode(self.recv_determinize_inode(from, ino, observed).await)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
@@ -1585,6 +1672,9 @@ impl GlobalTool for GlobalState {
                 R::UnlinkInode(self.recv_unlink_inode(from, d_ino).await)
             }
             GlobalRequest::TouchFile(ino) => R::TouchFile(self.recv_touch_file(from, ino).await),
+            GlobalRequest::SetFileMtime(ino, mtime) => {
+                R::SetFileMtime(self.recv_set_file_mtime(from, ino, mtime).await)
+            }
             GlobalRequest::GlobalTimeLowerBound => {
                 let ns = self.global_time.lock().unwrap().as_nanos();
                 R::GlobalTimeLowerBound(ns)
@@ -2211,6 +2301,7 @@ impl GlobalState {
                     poll_attempt: 0,
                     fyi: String::new(),
                     signal_interrupt_errno: None,
+                    backend_runtime_bootstrap: false,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
@@ -2505,20 +2596,30 @@ impl GlobalState {
         sched.wake_futex_waiters_after_exit(&wakes)
     }
 
-    async fn recv_determinize_inode(&self, from: Tid, ino: RawInode) -> (DetInode, LogicalTime) {
-        let _sched = self.lock_rpc_scheduler(false).await;
-        // Here we establish a policy that when we first see a file its mtime is epoch.
+    /// The epoch as a logical time: the virtual mtime of a file first seen
+    /// with a non-canonical host mtime.
+    fn epoch_logical_time(&self) -> LogicalTime {
         let nanos = self
             .cfg
             .epoch
             .timestamp_nanos_opt()
             .expect("epoch cannot be represented in a timestamp with nanosecond precision")
             as u64;
-        let (dino, ns) = self
-            .inodes
-            .lock()
-            .unwrap()
-            .add_inode(ino, LogicalTime::from_nanos(nanos));
+        LogicalTime::from_nanos(nanos)
+    }
+
+    async fn recv_determinize_inode(
+        &self,
+        from: Tid,
+        ino: RawInode,
+        observed: ObservedMtime,
+    ) -> (DetInode, LogicalTime) {
+        let _sched = self.lock_rpc_scheduler(false).await;
+        // Here we establish a policy that when we first see a file its mtime is
+        // the epoch, unless its host mtime is one of the canonical values in
+        // `CANONICAL_FILE_MTIME_SECONDS`, which it keeps.
+        let epoch = self.epoch_logical_time();
+        let (dino, ns) = self.inodes.lock().unwrap().add_inode(ino, observed, epoch);
         trace!(
             "[detcore, dtid {}] resolved (raw) inode {:?} to {:?}, mtime {}",
             from, ino, dino, ns
@@ -2594,26 +2695,36 @@ impl GlobalState {
             "[dtid {}] bumping mtime on file (rawinode {:?}) to {}",
             from, ino, mtime,
         );
+        self.set_inode_mtime(ino, mtime);
+    }
+
+    /// Set the virtual mtime to the time the guest asked for with utimensat
+    /// (or utime/utimes, which are routed through it). Without this, a file's
+    /// mtime is the time of its last write, so `tar` extraction, `cp -p` and
+    /// `touch -r` could not restore one, and `make` saw files ordered by when
+    /// they were unpacked.
+    async fn recv_set_file_mtime(&self, from: Tid, ino: RawInode, mtime: LogicalTime) {
+        let _sched = self.lock_rpc_scheduler(false).await;
+        trace!(
+            "[dtid {}] setting mtime on file (rawinode {:?}) to {}",
+            from, ino, mtime,
+        );
+        self.set_inode_mtime(ino, mtime);
+    }
+
+    fn set_inode_mtime(&self, ino: RawInode, mtime: LogicalTime) {
+        let epoch = self.epoch_logical_time();
         let mut mg = self.inodes.lock().unwrap();
-        let dino =
-            if let Some(d) = mg.inodes.get(&ino) {
-                *d
-            } else {
-                // Otherwise we haven't seen this inode yet (e.g. because there hasnt been a
-                // stat on it), so we just-in-time add it.
-                let nanos =
-                    self.cfg.epoch.timestamp_nanos_opt().expect(
-                        "epoch cannot be represented in a timestamp with nanosecond precision",
-                    ) as u64;
-                let (d, _) = mg.add_inode(ino, LogicalTime::from_nanos(nanos));
-                d
-            };
+        // If we haven't seen this inode yet (e.g. because there hasnt been a
+        // stat on it), this just-in-time adds it; the mtime set below replaces
+        // whatever the first-seen policy would have chosen.
+        let (dino, _) = mg.add_inode(ino, ObservedMtime::Unobserved, epoch);
         let info = mg
             .detinodes_info
             .get_mut(&dino)
             // TODO(T87258449): remove this `expect`:
             .expect("Invariant violation: det inode missing from map.");
-        info.mtime = mtime;
+        info.mtime = Some(mtime);
     }
 
     async fn recv_trace_schedevent(
@@ -2967,8 +3078,9 @@ pub enum GlobalRequest {
     /// The last two arguments are the initial contents of the memory word, and the mask.
     FutexAction(DetTid, FutexAction, FutexID, i32, u32),
 
-    /// Translate nondeterministic to deterministic inode.
-    DeterminizeInode(RawInode),
+    /// Translate nondeterministic to deterministic inode, and report what the
+    /// caller observed of the host mtime (see `ObservedMtime`).
+    DeterminizeInode(RawInode, ObservedMtime),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
@@ -2989,6 +3101,9 @@ pub enum GlobalRequest {
 
     /// Bump mtime
     TouchFile(RawInode),
+
+    /// Set mtime to a guest-requested time (utimensat and friends).
+    SetFileMtime(RawInode, LogicalTime),
 
     /// Retrieve global time.
     GlobalTimeLowerBound,
@@ -3098,6 +3213,7 @@ pub enum GlobalResponse {
     ValidateMountIdOrder(bool),
     UnlinkInode(()),
     TouchFile(()),
+    SetFileMtime(()),
     GlobalTimeLowerBound(LogicalTime),
     TraceSchedEvent(TraceSchedEventResponse),
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3294,11 +3410,17 @@ enum SchedulerRpcResult<T> {
 /// Global method RPC to request to control a resource.
 ///
 /// Blocking: future returns only when resources are fully acquired.
-pub async fn resource_request<G, T>(guest: &mut G, r: Resources) -> ResumeStatus
+pub async fn resource_request<G, T>(guest: &mut G, mut r: Resources) -> ResumeStatus
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    // A request made while handling a syscall whose cost the bootstrap window
+    // withholds carries that fact to the scheduler, which then withholds the
+    // turn's scheduler time too (see `Scheduler::bump_global_time`). Only a
+    // backend whose `is_backend_runtime_bootstrap` can return true ever sets it.
+    r.backend_runtime_bootstrap |=
+        guest.thread_state().in_uncharged_bootstrap_syscall && guest.is_backend_runtime_bootstrap();
     if guest.config().sequentialize_threads {
         if let Some(lease) = guest.signal_observation_lease() {
             if let Some(site) = guest.parked_signal_site() {
@@ -3665,12 +3787,32 @@ where
 /// track a (possibly new) inode, by returning a deterministic inode.
 /// Also return the logical mtime for the inode, though this is only
 /// used if `virtualize_metadata` is set.
+///
+/// For callers that have not read the file's metadata. A stat must use
+/// [`determinize_inode_observing_mtime`] so the first-seen mtime policy sees
+/// the host mtime.
 pub async fn determinize_inode<G, T>(guest: &mut G, inode: RawInode) -> (DetInode, LogicalTime)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let resp = send_and_update_time(guest, GlobalRequest::DeterminizeInode(inode)).await;
+    determinize_inode_observing_mtime(guest, inode, ObservedMtime::Unobserved).await
+}
+
+/// Like [`determinize_inode`], for a caller that observed the file's host
+/// mtime. If the file's virtual mtime is still unresolved, `observed` resolves
+/// it: a canonical mtime (see [`CANONICAL_FILE_MTIME_SECONDS`]) is kept, and any
+/// other becomes the epoch.
+pub async fn determinize_inode_observing_mtime<G, T>(
+    guest: &mut G,
+    inode: RawInode,
+    observed: ObservedMtime,
+) -> (DetInode, LogicalTime)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp = send_and_update_time(guest, GlobalRequest::DeterminizeInode(inode, observed)).await;
     match resp.1 {
         GlobalResponse::DeterminizeInode(x) => x,
         _ => unreachable!(),
@@ -3754,6 +3896,19 @@ where
     let resp = send_and_update_time(guest, GlobalRequest::TouchFile(inode)).await;
     match resp.1 {
         GlobalResponse::TouchFile(x) => x,
+        _ => unreachable!(),
+    }
+}
+
+/// Set a file's virtual mtime to a guest-requested time.
+pub async fn set_file_mtime<G, T>(guest: &mut G, inode: RawInode, mtime: LogicalTime)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp = send_and_update_time(guest, GlobalRequest::SetFileMtime(inode, mtime)).await;
+    match resp.1 {
+        GlobalResponse::SetFileMtime(x) => x,
         _ => unreachable!(),
     }
 }
@@ -7053,11 +7208,12 @@ mod tests {
 
         let mut pool = super::InodePool::new();
         let t = LogicalTime::from_nanos(0);
+        let seen = super::ObservedMtime::Unobserved;
 
         let host_a = 221_742_951; // the value observed leaking into FileContents
         let host_b = 998_877_665;
-        let (a, _) = pool.add_inode(host_a, t);
-        let (b, _) = pool.add_inode(host_b, t);
+        let (a, _) = pool.add_inode(host_a, seen, t);
+        let (b, _) = pool.add_inode(host_b, seen, t);
 
         assert_ne!(a.as_raw(), host_a, "det inode must not be the host inode");
         assert_ne!(b.as_raw(), host_b, "det inode must not be the host inode");
@@ -7065,8 +7221,61 @@ mod tests {
         assert_eq!(b, DetInode::mint(2), "minting is monotonic");
 
         // Re-determinizing the same host inode is stable, not a fresh mint.
-        let (a_again, _) = pool.add_inode(host_a, t);
+        let (a_again, _) = pool.add_inode(host_a, seen, t);
         assert_eq!(a, a_again, "mapping must be stable per host inode");
+    }
+
+    /// Only an exact whole-second 0 or 1 host mtime is canonical
+    /// (https://github.com/rrnewton/hermit/issues/3639).
+    #[test]
+    fn only_exact_canonical_host_mtimes_are_kept() {
+        use super::ObservedMtime;
+
+        assert_eq!(
+            ObservedMtime::from_host_mtime(1, 0),
+            ObservedMtime::Canonical(LogicalTime::from_secs(1))
+        );
+        assert_eq!(
+            ObservedMtime::from_host_mtime(0, 0),
+            ObservedMtime::Canonical(LogicalTime::from_secs(0))
+        );
+        for (secs, nanos) in [(1, 5), (0, 1), (2, 0), (-1, 0), (1_600_000_000, 0)] {
+            assert_eq!(
+                ObservedMtime::from_host_mtime(secs, nanos),
+                ObservedMtime::HostSpecific,
+                "{secs}.{nanos:09} is a real timestamp, not a canonical one"
+            );
+        }
+    }
+
+    /// The first-seen policy is applied at the first stat, whichever syscall
+    /// minted the inode, and is not re-applied once resolved.
+    #[test]
+    fn first_seen_mtime_is_resolved_by_the_first_stat() {
+        use super::ObservedMtime;
+
+        let epoch = LogicalTime::from_secs(1_798_761_600);
+        let canonical = ObservedMtime::Canonical(LogicalTime::from_secs(1));
+        let mut pool = super::InodePool::new();
+
+        // An ordinary file reports the epoch.
+        let (_, mtime) = pool.add_inode(10, ObservedMtime::HostSpecific, epoch);
+        assert_eq!(mtime, epoch);
+        // A canonical file keeps its mtime.
+        let (_, mtime) = pool.add_inode(11, canonical, epoch);
+        assert_eq!(mtime, LogicalTime::from_secs(1));
+
+        // A read or getdents mints the inode first; the later stat decides.
+        let (_, mtime) = pool.add_inode(12, ObservedMtime::Unobserved, epoch);
+        assert_eq!(mtime, epoch, "an unresolved mtime reads as the epoch");
+        let (_, mtime) = pool.add_inode(12, canonical, epoch);
+        assert_eq!(mtime, LogicalTime::from_secs(1));
+
+        // Once resolved, a later observation does not change it.
+        let (_, mtime) = pool.add_inode(10, canonical, epoch);
+        assert_eq!(mtime, epoch);
+        let (_, mtime) = pool.add_inode(11, ObservedMtime::HostSpecific, epoch);
+        assert_eq!(mtime, LogicalTime::from_secs(1));
     }
 }
 

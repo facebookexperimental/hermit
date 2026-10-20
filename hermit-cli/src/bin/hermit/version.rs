@@ -47,16 +47,28 @@ impl Version {
         #[cfg(not(fbcode_build))]
         {
             // Single source of truth: the crate version from `Cargo.toml`,
-            // augmented with the build date and source revision emitted by
-            // `build.rs`. Produces, for example:
-            //   0.2.0 (2026-07-31, gabc123def456)
-            Self(format!(
-                "{} ({}, g{})",
+            // augmented with the build date and, for a release build, the
+            // source revision emitted by `build.rs`.
+            Self(cargo_version(
                 env!("CARGO_PKG_VERSION"),
                 env!("HERMIT_BUILD_DATE"),
                 env!("HERMIT_BUILD_GIT_SHA"),
             ))
         }
+    }
+}
+
+/// Formats a Cargo or OSS Buck build's version. A release build names its
+/// revision, for example `0.4.0 (2026-10-02, gabc123def456)`. A regular build
+/// embeds no revision (`unknown`, see `build_support::UNSTAMPED_GIT_SHA`) and
+/// says so: `0.4.0 (2026-10-02, source revision not embedded)`. A registry build
+/// has the published package version even though it carries no Git stamp.
+#[cfg(any(not(fbcode_build), test))]
+fn cargo_version(crate_version: &str, build_date: &str, git_sha: &str) -> String {
+    if git_sha == "unknown" {
+        format!("{crate_version} ({build_date}, source revision not embedded)")
+    } else {
+        format!("{crate_version} ({build_date}, g{git_sha})")
     }
 }
 
@@ -99,7 +111,28 @@ impl VersionOpts {
 
 #[cfg(test)]
 mod tests {
+    use super::cargo_version;
     use super::fbcode_version;
+
+    #[test]
+    fn cargo_version_names_a_stamped_revision() {
+        assert_eq!(
+            cargo_version("0.4.0", "2026-10-02", "abc123def456"),
+            "0.4.0 (2026-10-02, gabc123def456)"
+        );
+        assert_eq!(
+            cargo_version("0.4.0", "2026-10-02", "abc123def456-dirty"),
+            "0.4.0 (2026-10-02, gabc123def456-dirty)"
+        );
+    }
+
+    #[test]
+    fn cargo_version_of_an_unstamped_build_discloses_missing_revision() {
+        assert_eq!(
+            cargo_version("0.4.0", "2026-10-02", "unknown"),
+            "0.4.0 (2026-10-02, source revision not embedded)"
+        );
+    }
 
     #[test]
     fn fbcode_version_leads_with_the_crate_version() {

@@ -351,7 +351,13 @@ def check_family_registry(
 
 
 def compile_fixture(spec: FixtureSpec, output: Path) -> Path:
-    """Compile a fixture with the shared flags (mirrors run_matrix.py)."""
+    """Compile a fixture with the manifest runner's flags plus -D_GNU_SOURCE.
+
+    The manifest runner (ci/manifest-plan/src/runner.rs) compiles C fixtures
+    with -std=c11 -O2 -g -Wall -Wextra -Werror and each test's build.cflags, and
+    adds -D_GNU_SOURCE only when those cflags list it. This harness always
+    defines it, adds -I for this directory, and appends the fixture's own cflags.
+    """
     compiler = shutil.which(os.environ.get("CC", "cc"))
     if compiler is None:
         raise HarnessError("C compiler unavailable (set CC or install cc)")

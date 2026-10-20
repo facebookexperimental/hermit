@@ -528,9 +528,13 @@ fn main() {
     println!("rustc:{sum}");
 }
 EOF
+        # `--base-env=minimal` keeps the user's rustup directory off PATH, so
+        # call the run-owned toolchain link the fixture preparation made.
+        RUSTC="$FIXTURE_ROOT/toolchain/rustc"
+        test -x "$RUSTC"
         # GCC's linker driver races vfork/pipe completion under L2.
         # Clang keeps the ordering stable; suppress its build ID as well.
-        rustc --crate-name hermit_real_compat -C opt-level=1 -C debuginfo=0 \
+        "$RUSTC" --crate-name hermit_real_compat -C opt-level=1 -C debuginfo=0 \
             -C metadata=hermit-real-compat -C linker=/usr/bin/clang \
             -C link-arg=-Wl,--build-id=none \
             "$WORK_DIR/main.rs" -o "$WORK_DIR/program"

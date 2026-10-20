@@ -19,6 +19,9 @@ if [[ ! -f reverie/BUCK ]]; then
 fi
 
 cargo metadata --locked --format-version 1 --no-deps >/dev/null
+# A Buck target feature Reindeer does not resolve leaves its crates without a
+# target; refuse before the slow vendor step rather than at the alias step.
+"$repo_root/scripts/check-buck-reindeer-features.rs"
 
 # A fresh checkout has none of these generated paths. Removing only paths that
 # Git confirms are excluded makes repeated local use take the same path.
@@ -88,10 +91,17 @@ append_shared_cell_aliases() {
       echo "shared-cell alias '$crate' already exists in the generated BUCK" >&2
       exit 1
     fi
-    actual=$(grep -oE "^    name = \"$crate-[0-9][0-9a-zA-Z.]*\",$" "$buck" \
+    # grep exits 1 when it finds nothing, as for a crate with no target; under
+    # pipefail that would end the script here without a word, so that status
+    # is tolerated and the empty result is tested below. A read error (exit 2)
+    # still ends the script here, with grep's own message.
+    actual=$({ grep -oE "^    name = \"$crate-[0-9][0-9a-zA-Z.]*\",$" "$buck" || [[ $? -eq 1 ]]; } \
       | sed -E 's/^    name = "(.*)",$/\1/' | sort -V | tail -1)
     if [[ -z $actual ]]; then
-      echo "no versioned target for shared-cell alias '$crate' in $buck" >&2
+      echo "no versioned target for shared-cell alias '$crate' in $buck:" \
+        "no workspace member reaches $crate with the features" \
+        "shim/third-party/rust/reindeer.toml resolves them with" \
+        "(see scripts/check-buck-reindeer-features.rs)" >&2
       exit 1
     fi
     cat >>"$buck" <<EOT

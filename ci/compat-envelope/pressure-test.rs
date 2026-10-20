@@ -5,7 +5,7 @@
 //! [dependencies]
 //! chrono = "0.4"
 //! csv = "1"
-//! dagrun = { path = "../../agent-utils/rs/dagrun" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "1151317720218c8dd830a50d9f6bf10fc7d175e5" }
 //! hermit-manifest-plan = { path = "../manifest-plan" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
@@ -36,6 +36,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
 use std::process::Stdio;
+use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -166,6 +167,22 @@ const PRESSURE_RUN_TIMEOUT_SECONDS: i64 = 2 * 60 * 60;
 const PRESSURE_SCOPE_TIMEOUT_ENV: &str = "HERMIT_PRESSURE_SCOPE_TIMEOUT_SECONDS";
 const HERMETIC_TEST_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
+/// Runs a DBT cell's harness as uid 0 in a user namespace of its own, which
+/// owns a mount namespace of its own: the same shape as canonical validation's
+/// rootless `podman run --privileged` pinned root.
+///
+/// Every cell requests a fresh [`HERMETIC_TEST_WORKDIR`]. The other backends
+/// mount that tmpfs inside Hermit's own container. The DBT adapter refuses
+/// `--mount`, and Hermit mounts the tmpfs itself in a new mount namespace
+/// (`common/test-workdir`, `with_isolated_workdir`), which needs CAP_SYS_ADMIN
+/// in the user namespace that owns the caller. Run directly on the host, every
+/// DBT cell failed before its guest started with "unshare mount namespace:
+/// Operation not permitted" (289 of 289 cells;
+/// https://github.com/rrnewton/hermit/issues/3392). Without `--fork`, `unshare`
+/// replaces itself with the harness in the same process, so its cgroup,
+/// timeout and kill path are unchanged. Unlike podman it maps only uid and gid
+/// 0, and `/test` must already exist on the host.
+const DBT_NAMESPACE_WRAPPER: &str = "unshare --user --map-root-user --mount --";
 const DEFAULT_MANIFEST_GUEST_CAP: i64 = 4;
 const DEFAULT_KVM_GUEST_CAP: i64 = 4;
 const PORTABLE_CELL_MEMORY_BYTES: i64 = 3 * 1024 * 1024 * 1024;
@@ -295,6 +312,22 @@ Commands:
   emit-series --results DIR
       Re-read a completed run and append its per-cell results to the parent
       series store. Requires DEV_HERMIT_PARENT and does not run a guest.
+  verdicts --rows DIR --repetitions COUNT
+      Give each cell the repeated-run verdicts summarize prints (Terminal and
+      clean passes, failure classes, Sample classification, CLEAN/FLAKY/
+      FAILING/INCOMPLETE) from test-harness result rows that another runner
+      retained, such as a Buck/Tpx `--stress-runs` collection. DIR holds
+      cells/<lane-category-test-mode-backend>-repetition-NNNN/ directories,
+      each with that repetition's results.jsonl and, when the harness wrote one,
+      summary.json. A missing repetition directory counts as a missing
+      repetition. Repetitions must be independent observations of one commit:
+      a run id retained twice, or rows naming another commit, make that
+      repetition an infrastructure error. Rows only: the verify logs, runner
+      evidence, and plan that summarize also checks are not read, so a
+      rows-only CLEAN is weaker evidence than a summarized one. Needs no Hermit
+      checkout. Writes DIR/verdicts.json, which records the commit the rows
+      name; check it is the commit you meant to test. Exits nonzero, after
+      writing, unless every cell is CLEAN: flaky is red, as in summarize.
   self-test
       Test pressure-runner selection, timeout, execution-plan, and retained-
       evidence checks without running a guest.
@@ -787,6 +820,16 @@ fn validate_selection_shape(selection: &CellSelection) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The prefix a cell's harness command starts with: [`DBT_NAMESPACE_WRAPPER`]
+/// for a DBT cell, nothing for any other backend.
+fn dbt_namespace_prefix(backend: &str) -> String {
+    if backend == "dbt" {
+        format!("{DBT_NAMESPACE_WRAPPER} ")
+    } else {
+        String::new()
+    }
 }
 
 fn population_label(green: bool, probe_disabled: bool) -> &'static str {
@@ -2198,6 +2241,11 @@ fn run() -> Result<(), String> {
         print!("{USAGE}");
         return Ok(());
     }
+    if command == "verdicts" {
+        // Reads only the rows under --rows; it needs no Hermit checkout.
+        let (rows, repetitions) = verdicts_options(&mut args)?;
+        return verdicts(&rows, repetitions);
+    }
     let root = repo_root()?;
     match command.as_str() {
         "plan" => {
@@ -2377,6 +2425,375 @@ fn run() -> Result<(), String> {
         _ => return Err(format!("unknown command `{command}`\n\n{USAGE}")),
     }
     Ok(())
+}
+
+fn verdicts_options(
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+) -> Result<(PathBuf, usize), String> {
+    let (mut rows, mut repetitions) = (None, None);
+    while let Some(option) = args.next() {
+        if !matches!(option.as_str(), "--rows" | "--repetitions") {
+            return Err(format!("verdicts does not accept {option}\n\n{USAGE}"));
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| format!("verdicts {option} requires a value"))?;
+        let duplicate = if option == "--rows" {
+            rows.replace(PathBuf::from(value)).is_some()
+        } else {
+            let count = value
+                .parse::<usize>()
+                .ok()
+                .filter(|count| *count > 0)
+                .ok_or("verdicts --repetitions must be a positive integer")?;
+            repetitions.replace(count).is_some()
+        };
+        if duplicate {
+            return Err(format!("verdicts {option} may be given only once"));
+        }
+    }
+    match (rows, repetitions) {
+        (Some(rows), Some(repetitions)) => Ok((rows, repetitions)),
+        _ => Err("verdicts requires --rows DIR and --repetitions COUNT".into()),
+    }
+}
+
+/// One retained repetition read from result rows alone.
+struct RowsRepetition {
+    dir: PathBuf,
+    /// The cell the rows name, when it is the cell their directory names.
+    cell: Option<CellId>,
+    rows: Vec<CellResult>,
+    result: &'static str,
+    row_valid: bool,
+    evidence_errors: Vec<String>,
+    sample_evidence_errors: Vec<String>,
+    prepared_empty_result_file: bool,
+    rejected_result_history: bool,
+    retained_prerequisite: bool,
+}
+
+/// Read DIR/cells/<slug>-repetition-NNNN/results.jsonl. The result is the
+/// framework's recorded one; everything `summarize` would also check against
+/// runner evidence and artifacts is outside a rows-only reading.
+fn read_rows_repetition(dir: &Path, slug: &str) -> RowsRepetition {
+    let path = dir.join("results.jsonl");
+    let mut repetition = RowsRepetition {
+        dir: dir.to_path_buf(),
+        cell: None,
+        rows: Vec::new(),
+        result: "infrastructure-error",
+        row_valid: false,
+        evidence_errors: Vec::new(),
+        sample_evidence_errors: Vec::new(),
+        prepared_empty_result_file: false,
+        rejected_result_history: false,
+        retained_prerequisite: false,
+    };
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
+            // An empty history names no cell; `verdicts` asks the harness
+            // summary whether it was host-inapplicable.
+            repetition.prepared_empty_result_file = true;
+            return repetition;
+        }
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) | Err(_) => {
+            repetition
+                .sample_evidence_errors
+                .push(format!("missing result row {}", path.display()));
+            return repetition;
+        }
+    }
+    let rows = match read_current_result_rows(&path) {
+        Ok(rows) => rows,
+        Err(error) => {
+            repetition.rejected_result_history = true;
+            repetition.evidence_errors.push(error);
+            return repetition;
+        }
+    };
+    let cell = CellId {
+        lane: rows[0].lane.clone(),
+        category: rows[0].category.clone(),
+        test: rows[0].test.clone(),
+        mode: rows[0].mode.clone(),
+        backend: rows[0]
+            .backend
+            .clone()
+            .unwrap_or_else(|| "native".to_string()),
+    };
+    if base_cell_slug(&cell) == slug {
+        repetition.cell = Some(cell);
+    } else {
+        repetition.evidence_errors.push(format!(
+            "{} holds rows for `{}`, not for its directory's cell {slug}",
+            path.display(),
+            display_id(&cell)
+        ));
+    }
+    match cell_result_after_retries(&rows) {
+        Ok(row) => match (row.result, row.failure_class) {
+            (Some(recorded), class) if class == recorded.failure_class() => {
+                repetition.result = recorded.as_str();
+                repetition.row_valid = true;
+            }
+            (Some(recorded), class) => repetition.evidence_errors.push(format!(
+                "framework result {} carries failure_class {:?}, expected {:?}",
+                recorded.as_str(),
+                class,
+                recorded.failure_class()
+            )),
+            // An ERROR whose evidence named no product result (backend
+            // unavailable, launch refused, infrastructure, no result) is still
+            // a typed row; classify_nonpassing_repetition reads its class.
+            (None, Some(_)) => repetition.row_valid = true,
+            (None, None) => repetition.evidence_errors.push(format!(
+                "{} terminal attempt {} records neither a result nor a failure class",
+                path.display(),
+                row.attempt
+            )),
+        },
+        Err(error) => repetition.evidence_errors.push(error),
+    }
+    if !repetition.evidence_errors.is_empty() {
+        repetition.result = "infrastructure-error";
+        repetition.row_valid = false;
+    }
+    repetition.rows = rows;
+    repetition
+}
+
+/// The cell a slug names, recovered from a harness summary that reports it
+/// host-inapplicable: such a repetition writes no result row to name it.
+fn host_inapplicable_cell(dir: &Path, slug: &str) -> Option<CellId> {
+    let summary: JsonValue =
+        serde_json::from_str(&fs::read_to_string(dir.join("summary.json")).ok()?).ok()?;
+    let entry = summary
+        .get("host_inapplicable_cells")?
+        .as_array()?
+        .first()?;
+    let (test, mode) = (entry.get("test")?.as_str()?, entry.get("mode")?.as_str()?);
+    let backend = entry
+        .get("backend")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("native");
+    let suffix = format!("-{}", sanitize(&format!("{test}-{mode}-{backend}")));
+    let (lane, rest) = ["portable", "privileged"]
+        .into_iter()
+        .find_map(|lane| Some((lane, slug.strip_prefix(&format!("{lane}-"))?)))?;
+    let category = rest.strip_suffix(&suffix)?;
+    let cell = CellId {
+        lane: lane.into(),
+        category: category.into(),
+        test: test.into(),
+        mode: mode.into(),
+        backend: backend.into(),
+    };
+    (base_cell_slug(&cell) == slug).then_some(cell)
+}
+
+/// `verdicts`: fold rows retained by another runner (a Buck/Tpx stress
+/// collection) through the same per-repetition fold and table as summarize.
+fn verdicts(dir: &Path, repetitions: usize) -> Result<(), String> {
+    let cells_dir = dir.join("cells");
+    let mut by_slug = BTreeMap::<String, BTreeMap<usize, PathBuf>>::new();
+    for entry in fs::read_dir(&cells_dir)
+        .map_err(|error| format!("cannot read {}: {error}", cells_dir.display()))?
+    {
+        let entry =
+            entry.map_err(|error| format!("cannot read {}: {error}", cells_dir.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let parsed = name
+            .rsplit_once("-repetition-")
+            .filter(|(_, number)| number.len() == 4)
+            .and_then(|(slug, number)| Some((slug.to_string(), number.parse::<usize>().ok()?)))
+            .filter(|(_, number)| (1..=repetitions).contains(number));
+        let Some((slug, number)) = parsed else {
+            return Err(format!(
+                "{} is not a <cell>-repetition-NNNN directory for repetitions 1..={repetitions}",
+                entry.path().display()
+            ));
+        };
+        by_slug
+            .entry(slug)
+            .or_default()
+            .insert(number, entry.path());
+    }
+    if by_slug.is_empty() {
+        return Err(format!(
+            "{} holds no <cell>-repetition-NNNN directory; there is nothing to judge",
+            cells_dir.display()
+        ));
+    }
+    let mut cells = Vec::new();
+    let mut repeated = BTreeMap::<CellId, RepeatedCellTally>::new();
+    let mut errors = BTreeMap::<CellId, BTreeSet<String>>::new();
+    let mut unidentified = Vec::new();
+    // Repetitions must be independent observations of one source tree: every
+    // run id is retained once, and every row names the same commit.
+    let mut run_ids = BTreeMap::<String, String>::new();
+    let mut source: Option<(String, bool)> = None;
+    for (slug, retained) in &by_slug {
+        let samples = (1..=repetitions)
+            .map(|number| {
+                let dir = retained
+                    .get(&number)
+                    .cloned()
+                    .unwrap_or_else(|| cells_dir.join(format!("{slug}-repetition-{number:04}")));
+                (number, read_rows_repetition(&dir, slug))
+            })
+            .collect::<Vec<_>>();
+        let cell = samples
+            .iter()
+            .find_map(|(_, sample)| sample.cell.clone())
+            .or_else(|| {
+                samples.iter().find_map(|(_, sample)| {
+                    sample
+                        .prepared_empty_result_file
+                        .then(|| host_inapplicable_cell(&sample.dir, slug))
+                        .flatten()
+                })
+            });
+        let Some(cell) = cell else {
+            unidentified.push(slug.clone());
+            continue;
+        };
+        let tally = repeated.entry(cell.clone()).or_default();
+        for (number, mut sample) in samples {
+            if sample.prepared_empty_result_file {
+                // As in summarize, only the harness summary proves an empty
+                // history host-inapplicable (here without runner evidence).
+                match retained_host_inapplicable(&sample.dir, &cell) {
+                    Ok(true) => sample.retained_prerequisite = true,
+                    Ok(false) => sample.evidence_errors.push(format!(
+                        "{} has an empty result history and no host-inapplicable harness summary",
+                        sample.dir.display()
+                    )),
+                    Err(error) => sample.evidence_errors.push(error),
+                }
+            }
+            for row in &sample.rows {
+                let here = format!("{slug} repetition {number}");
+                if let Some(other) = run_ids.insert(row.run_id.clone(), here.clone()) {
+                    if other != here {
+                        sample.evidence_errors.push(format!(
+                            "run id {} was already retained by {other}; repetitions must be independent",
+                            row.run_id
+                        ));
+                    }
+                }
+                let named = (row.hermit_sha.clone(), row.source_tree_dirty);
+                match &source {
+                    None => source = Some(named),
+                    Some(expected) if *expected != named => sample.evidence_errors.push(format!(
+                        "row names hermit {} (dirty: {}), but the collection is {} (dirty: {})",
+                        named.0, named.1, expected.0, expected.1
+                    )),
+                    Some(_) => {}
+                }
+            }
+            if !sample.evidence_errors.is_empty() {
+                sample.result = "infrastructure-error";
+                sample.row_valid = false;
+            }
+            let retained_attempts = sample
+                .rows
+                .iter()
+                .map(|row| row.attempt as usize)
+                .max()
+                .unwrap_or(1);
+            fold_repetition(
+                tally,
+                &RepetitionSample {
+                    result: sample.result,
+                    rows: &sample.rows,
+                    retained_attempts,
+                    row_valid: sample.row_valid,
+                    evidence_error_count: sample.evidence_errors.len(),
+                    typed_no_comparison_refusal: false,
+                    prepared_empty_result_file: sample.prepared_empty_result_file,
+                    initial_evidence_valid: true,
+                    rejected_result_history: sample.rejected_result_history,
+                    proven_timeout: false,
+                    proven_oom: false,
+                    retained_prerequisite: sample.retained_prerequisite,
+                },
+                &mut sample.sample_evidence_errors,
+            );
+            errors.entry(cell.clone()).or_default().extend(
+                sample
+                    .evidence_errors
+                    .into_iter()
+                    .chain(sample.sample_evidence_errors),
+            );
+        }
+        cells.push(cell);
+    }
+    cells.sort();
+    let retried: usize = repeated.values().map(|tally| tally.retried).sum();
+    let retries = if retried == 0 {
+        "not recorded by result rows; no retained repetition needed a framework retry".to_string()
+    } else {
+        format!(
+            "not recorded by result rows; {retried} retained repetition(s) needed a framework retry"
+        )
+    };
+    let mut repeated_cells = print_repeated_cell_table(&cells, &repeated, &retries);
+    // Why a repetition was not a clean, trusted observation, per cell.
+    for (summary, cell) in repeated_cells.iter_mut().zip(&cells) {
+        summary["evidence_errors"] = json!(errors.get(cell).cloned().unwrap_or_default());
+    }
+    // Flaky is red: as in summarize, any cell short of CLEAN fails the command.
+    let red = repeated_cells
+        .iter()
+        .zip(&cells)
+        .filter(|(summary, _)| summary["verdict"] != json!("CLEAN"))
+        .map(|(summary, cell)| {
+            format!(
+                "{} is {}",
+                display_id(cell),
+                summary["verdict"].as_str().unwrap_or("unjudged")
+            )
+        })
+        .collect::<Vec<_>>();
+    let output = dir.join("verdicts.json");
+    let document = json!({
+        "schema": 1,
+        "evidence": "result rows only (no verify logs, runner evidence, or plan)",
+        "repetitions": repetitions,
+        "hermit_sha": source.as_ref().map(|(sha, _)| sha),
+        "source_tree_dirty": source.as_ref().map(|(_, dirty)| dirty),
+        "retried_repetitions": retried,
+        "cells": repeated_cells,
+        "unidentified_cells": unidentified,
+    });
+    fs::write(
+        &output,
+        serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("cannot write {}: {error}", output.display()))?;
+    println!("Wrote {}", output.display());
+    let mut problems = Vec::new();
+    if !unidentified.is_empty() {
+        problems.push(format!(
+            "no repetition of {} retained a row or host-inapplicable summary naming its cell; it has no verdict",
+            unidentified.join(", ")
+        ));
+    }
+    if !red.is_empty() {
+        problems.push(format!(
+            "{} of {} cell(s) are not CLEAN: {}",
+            red.len(),
+            cells.len(),
+            red.join(", ")
+        ));
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
 }
 
 fn print_sample(metadata: &RunMetadata) {
@@ -2877,89 +3294,254 @@ fn emit_series(results: &Path, checkout: &Path, fresh: bool) -> Result<(), Strin
              Set it to the dev-hermit checkout root and re-run."
                 .to_string()
         })?;
-
-    let metadata_path = results.join("run.json");
-    let metadata: RunMetadata = serde_json::from_str(
-        &fs::read_to_string(&metadata_path)
-            .map_err(|e| format!("cannot read {}: {e}", metadata_path.display()))?,
-    )
-    .map_err(|e| format!("invalid {}: {e}", metadata_path.display()))?;
-
-    // Deliberately NOT the checkout-HEAD guard `summarize` applies. That guard is
-    // right for reading a campaign you are standing in; emitting a RETAINED
-    // campaign from a checkout that has since moved is the normal case, and the
-    // tree being attributed is recorded in the campaign, not read from git.
-    let collected = collect_series_rows(results, current_result_policy(&metadata, fresh)?)?;
-    if collected.is_empty() {
-        return Err(format!(
-            "no per-cell results under {}; nothing to emit",
-            results.display()
-        ));
-    }
-    let run_id = if metadata.run_id.is_empty() {
-        results
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty() && *name != "." && *name != "..")
-            .ok_or_else(|| format!("{} has no usable run id", results.display()))?
-            .to_string()
-    } else {
-        metadata.run_id.clone()
-    };
-    let mut payload = String::new();
-    for (_, row) in &collected {
-        payload.push_str(
-            &serde_json::to_string(row).map_err(|e| format!("cannot encode a series row: {e}"))?,
-        );
-        payload.push('\n');
-    }
-
-    let script = Path::new(&parent).join("ci-hub/series/series.py");
-    if !script.is_file() {
-        return Err(format!(
-            "{} does not exist; DEV_HERMIT_PARENT does not look like a dev-hermit checkout",
-            script.display()
-        ));
-    }
-    let mut child = Command::new("python3")
-        .arg(&script)
-        .arg("append-cells")
-        .arg("--parent")
-        .arg(&parent)
-        .arg("--checkout")
-        .arg(checkout)
-        .arg("--producer")
-        .arg("pressure-test")
-        .arg("--run-id")
-        .arg(&run_id)
-        .arg("--tree")
-        .arg(&metadata.hermit_sha)
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot run {}: {e}", script.display()))?;
-    child
-        .stdin
-        .take()
-        .ok_or("series append stdin unavailable")?
-        .write_all(payload.as_bytes())
-        .map_err(|e| format!("cannot send rows to the series writer: {e}"))?;
-    let status = child
-        .wait()
-        .map_err(|e| format!("series append did not terminate readably: {e}"))?;
-    if !status.success() {
-        // A nonzero status keeps every rejected cell visible to the caller.
-        // append-cells can still have retained independent valid rows, so do
-        // not claim that the whole batch was rolled back.
-        return Err(format!(
-            "the series writer rejected one or more cell results (exit {:?}); valid completed rows, if any, were retained",
-            status.code()
-        ));
-    }
-    println!(
-        "emitted {} cell result(s) from run {run_id} to {parent}",
-        collected.len()
+    let emission = emit_series_to(
+        Path::new(&parent),
+        results,
+        checkout,
+        fresh,
+        SERIES_APPEND_CELLS_BOUND,
+        parity::AppendBounds::default(),
     );
+    if let Some(line) = &emission.parity {
+        eprintln!("pressure-test: {line}");
+    }
+    println!("{}", emission.cells?);
     Ok(())
+}
+
+/// How long [`emit_series`] waits on `series.py append-cells` before it
+/// kills the writer with its process group. The writer bounds each of its
+/// own steps -- the shared SeriesRow checker it may compile and run several
+/// times at 300 s a run, each git call at 60 s, the spool lock at 5 s -- so
+/// one still running after half an hour is hung, not slow.
+const SERIES_APPEND_CELLS_BOUND: Duration = Duration::from_secs(30 * 60);
+
+/// What [`emit_series_to`] did.
+struct SeriesEmission {
+    /// The cells' `emitted ...` line, or why they were not all appended.
+    cells: Result<String, String>,
+    /// The one `parity:` line of the parity append, which runs once the
+    /// cells' writer was started, whatever became of it or of them. `None`
+    /// when the emit stopped before that.
+    parity: Option<String>,
+}
+
+/// [`emit_series`] into the dev-hermit checkout `parent`: the cells to
+/// `series.py append-cells`, bounded by `cells_bound`, then the series'
+/// parity rows to `series.py append-parity`, bounded by `bounds`.
+///
+/// The cells reach their writer's stdin from an unlinked file
+/// ([`parity::unlinked_input`]), never a pipe. This script's prelude turns
+/// `SIGPIPE` into `_exit(0)`, so with a pipe a writer that exited before
+/// reading a payload larger than the pipe buffer (a usage error, a failed
+/// import) would end the whole pressure test on the spot with exit status 0
+/// and no parity append. The writer leads its own process group
+/// ([`parity::GroupChild`]), so one still running at `cells_bound` is
+/// killed with everything it started, and the emit reports that.
+fn emit_series_to(
+    parent: &Path,
+    results: &Path,
+    checkout: &Path,
+    fresh: bool,
+    cells_bound: Duration,
+    bounds: parity::AppendBounds,
+) -> SeriesEmission {
+    let mut parity_line = None;
+    let cells = (|| {
+        let metadata_path = results.join("run.json");
+        let metadata: RunMetadata = serde_json::from_str(
+            &fs::read_to_string(&metadata_path)
+                .map_err(|e| format!("cannot read {}: {e}", metadata_path.display()))?,
+        )
+        .map_err(|e| format!("invalid {}: {e}", metadata_path.display()))?;
+
+        // Deliberately NOT the checkout-HEAD guard `summarize` applies. That guard is
+        // right for reading a campaign you are standing in; emitting a RETAINED
+        // campaign from a checkout that has since moved is the normal case, and the
+        // tree being attributed is recorded in the campaign, not read from git.
+        let collected = collect_series_rows(results, current_result_policy(&metadata, fresh)?)?;
+        if collected.is_empty() {
+            return Err(format!(
+                "no per-cell results under {}; nothing to emit",
+                results.display()
+            ));
+        }
+        let run_id = if metadata.run_id.is_empty() {
+            results
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+                .ok_or_else(|| format!("{} has no usable run id", results.display()))?
+                .to_string()
+        } else {
+            metadata.run_id.clone()
+        };
+        let mut payload = String::new();
+        for (_, row) in &collected {
+            payload.push_str(
+                &serde_json::to_string(row)
+                    .map_err(|e| format!("cannot encode a series row: {e}"))?,
+            );
+            payload.push('\n');
+        }
+
+        let script = parent.join("ci-hub/series/series.py");
+        if !script.is_file() {
+            return Err(format!(
+                "{} does not exist; DEV_HERMIT_PARENT does not look like a dev-hermit checkout",
+                script.display()
+            ));
+        }
+        let input = parity::unlinked_input(payload.as_bytes())
+            .map_err(|e| format!("cannot stage the cell results for the series writer: {e}"))?;
+        let mut command = Command::new("python3");
+        command
+            .arg(&script)
+            .arg("append-cells")
+            .arg("--parent")
+            .arg(parent)
+            .arg("--checkout")
+            .arg(checkout)
+            .arg("--producer")
+            .arg("pressure-test")
+            .arg("--run-id")
+            .arg(&run_id)
+            .arg("--tree")
+            .arg(&metadata.hermit_sha)
+            .stdin(Stdio::from(input));
+        let child = parity::GroupChild::spawn(&mut command)
+            .map_err(|e| format!("cannot run {}: {e}", script.display()))?;
+        let status = child
+            .wait_bounded(cells_bound)
+            .map_err(|e| format!("series append did not terminate readably: {e}"));
+        // The series' parity rows go beside its cells whatever became of them:
+        // parity is measured after determinism and never decides the emit.
+        parity_line = Some(append_series_parity(
+            &script,
+            parent,
+            results,
+            &run_id,
+            &metadata.hermit_sha,
+            metadata.source_tree_dirty,
+            bounds,
+        ));
+        let Some(status) = status? else {
+            return Err(format!(
+                "the series writer did not finish within {cells_bound:?} and was killed with its \
+                 process group; some of these cell results may have been written"
+            ));
+        };
+        if !status.success() {
+            // A nonzero status keeps every rejected cell visible to the caller.
+            // append-cells can still have retained independent valid rows, so do
+            // not claim that the whole batch was rolled back.
+            return Err(format!(
+                "the series writer rejected one or more cell results (exit {:?}); valid completed rows, if any, were retained",
+                status.code()
+            ));
+        }
+        Ok(format!(
+            "emitted {} cell result(s) from run {run_id} to {}",
+            collected.len(),
+            parent.display()
+        ))
+    })();
+    SeriesEmission {
+        cells,
+        parity: parity_line,
+    }
+}
+
+/// Send one series' parity rows -- [`parity::node_ledger_sources`] over the
+/// `parity.status.json` and `parity.jsonl` its post-pass left in `results`,
+/// filed under the pressure-test lane and node -- to `series.py
+/// append-parity` with `--producer pressure-test`, through the same
+/// [`parity::append_ledger_rows`] validate uses. The outcome is one line and
+/// never an error: a refused output, a writer that predates `append-parity`,
+/// one that refuses the rows or one killed at its bound is named, with the
+/// rows left where they are.
+///
+/// The rows go out with `--source-tree-dirty` set to `source_tree_dirty`,
+/// which [`emit_series_to`] takes from the campaign's `run.json`: the tree
+/// state the campaign recorded when it started, which summarize and
+/// admission require every cell row to repeat
+/// ([`result_row_identity_and_invocation_match`]).
+///
+/// A pressure test has no plan that says which cells its post-pass owed, so,
+/// unlike validate, it cannot stand record-missing rows in for refused
+/// outputs; the line names the refusal instead. Likewise a post-pass that
+/// failed before it knew its scope leaves a status that names no cell and so
+/// yields no row; the line is then an `ERROR:` naming that state and its
+/// error, never the benign line for a series with no post-pass output at
+/// all.
+/// <https://github.com/rrnewton/hermit/issues/3301>
+fn append_series_parity(
+    script: &Path,
+    parent: &Path,
+    results: &Path,
+    run_id: &str,
+    tree: &str,
+    source_tree_dirty: bool,
+    bounds: parity::AppendBounds,
+) -> String {
+    let rows = match parity::node_ledger_sources(
+        results,
+        parity::PRESSURE_TEST_LEDGER_LANE,
+        parity::PRESSURE_TEST_LEDGER_NODE,
+        None,
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return format!(
+                "parity: ERROR: no parity rows appended; the post-pass outputs in {} were \
+                 refused: {error}",
+                results.display()
+            );
+        }
+    };
+    if rows.is_empty() {
+        if let Some(line) = unfinished_series_post_pass(results) {
+            return line;
+        }
+        return format!(
+            "parity: no parity post-pass output in {}; nothing appended",
+            results.display()
+        );
+    }
+    parity::append_ledger_rows(
+        &parity::LedgerAppend {
+            series: script,
+            parent,
+            producer: parity::ParityProducer::PressureTest,
+            run_id,
+            tree,
+            source_tree_dirty,
+            source: results,
+        },
+        &rows,
+        bounds,
+    )
+}
+
+/// The `ERROR:` line for a series whose `parity.status.json` says its
+/// post-pass failed or never finished, for [`append_series_parity`] when
+/// that status yielded no row. `None` when there is no status or it is
+/// complete; a status that cannot be read is already refused by
+/// [`parity::node_ledger_sources`].
+fn unfinished_series_post_pass(results: &Path) -> Option<String> {
+    let path = results.join(parity::PARITY_STATUS_JSON);
+    let status: parity::PostPassStatus = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+    let state = match status.state {
+        parity::PostPassState::Complete => return None,
+        parity::PostPassState::Running => "never finished",
+        parity::PostPassState::Failed => "failed",
+    };
+    Some(format!(
+        "parity: ERROR: the series post-pass in {} {state} and named no cell it owed ({}); \
+         no parity rows appended",
+        results.display(),
+        status.error.as_deref().unwrap_or("no error recorded")
+    ))
 }
 
 fn default_result_root(root: &Path) -> Result<PathBuf, String> {
@@ -4520,6 +5102,7 @@ fn write_plan_after_scorecard_check(
             } else {
                 ""
             };
+            let namespaces = dbt_namespace_prefix(&cell.backend);
             let harness = if selection.is_exact() {
                 let prebuilt = if selection.uses_shared_preparation() {
                     " --prebuilt"
@@ -4527,7 +5110,7 @@ fn write_plan_after_scorecard_check(
                     ""
                 };
                 format!(
-                    "{hermit_bin} target/debug/test-harness run {selector} --include-occasional{prebuilt}{no_retry} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    "{hermit_bin} {namespaces}target/debug/test-harness run {selector} --include-occasional{prebuilt}{no_retry} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
                     hermit_bin = EXACT_CELL_HERMIT_BIN,
                     selector = selector,
                     prebuilt = prebuilt,
@@ -4540,7 +5123,7 @@ fn write_plan_after_scorecard_check(
                 )
             } else {
                 format!(
-                    "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run {selector} --include-occasional --prebuilt{no_retry} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    "{namespaces}./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run {selector} --include-occasional --prebuilt{no_retry} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
                     selector = selector,
                     no_retry = no_retry,
                     test = shell_quote(&cell.test),
@@ -5742,6 +6325,8 @@ fn classify_result_from_typed_evidence(
         // the same bucket, so ordering between them is unobservable, and once
         // the timeout arm moved ahead of them they became neighbours with
         // identical blocks.
+        // `verification_logs_retained` is `RetainedVerificationLogs::complete_for`:
+        // only run 1's golden log after a match, and both logs after a divergence.
         || (mode == "verify"
             && matches!(verification_verdict, Some("matched" | "diverged"))
             && !verification_logs_retained)
@@ -6534,6 +7119,190 @@ fn repeated_run_has_unacceptable_product_result(
     repetitions.is_some() && !repeated_red && (total == 0 || clean_passes != total || retried > 0)
 }
 
+/// One cell's repeated-run evidence, accumulated one repetition at a time.
+#[derive(Clone, Copy, Debug, Default)]
+struct RepeatedCellTally {
+    terminal_passes: usize,
+    clean_passes: usize,
+    infrastructure_errors: usize,
+    retried: usize,
+    total: usize,
+    counts: RepeatedOutcomeCounts,
+}
+
+/// What one repetition's retained evidence established, as `fold_repetition`
+/// needs it. `summarize` derives it from the full retained run (runner
+/// evidence, artifacts, rows); `verdicts` from result rows alone.
+struct RepetitionSample<'a> {
+    result: &'a str,
+    rows: &'a [CellResult],
+    retained_attempts: usize,
+    row_valid: bool,
+    evidence_error_count: usize,
+    typed_no_comparison_refusal: bool,
+    prepared_empty_result_file: bool,
+    initial_evidence_valid: bool,
+    rejected_result_history: bool,
+    proven_timeout: bool,
+    proven_oom: bool,
+    retained_prerequisite: bool,
+}
+
+/// Fold one repetition into its cell's tally: the one place a repetition
+/// becomes terminal/clean/qualifying passes or a failure class. An inner
+/// result history that cannot be parsed is appended to
+/// `sample_evidence_errors`, which the caller also reports.
+fn fold_repetition(
+    tally: &mut RepeatedCellTally,
+    sample: &RepetitionSample<'_>,
+    sample_evidence_errors: &mut Vec<String>,
+) {
+    let RepetitionSample {
+        result,
+        rows,
+        retained_attempts,
+        row_valid,
+        evidence_error_count,
+        typed_no_comparison_refusal,
+        prepared_empty_result_file,
+        initial_evidence_valid,
+        rejected_result_history,
+        proven_timeout,
+        proven_oom,
+        retained_prerequisite,
+    } = *sample;
+    tally.total += 1;
+    tally.terminal_passes += usize::from(result == "pass");
+    tally.clean_passes += usize::from(repetition_passed_cleanly(result, rows));
+    tally.infrastructure_errors +=
+        usize::from(matches!(result, "infrastructure-error" | "sandbox-denied"));
+    tally.retried += usize::from(retained_attempts > 1);
+    let counts = &mut tally.counts;
+    counts.expected_repetitions += 1;
+    counts.clean_passes += usize::from(repetition_passed_cleanly(result, rows));
+    counts.retried_repetitions += usize::from(retained_attempts > 1);
+    let inner_history = if rows.is_empty() {
+        None
+    } else {
+        Some(inner_pressure_history(rows))
+    };
+    // A typed NoResult stamp legitimately has no comparison. Only
+    // that one verified reader refusal may be explained here; missing
+    // captures, golden output or other artifact errors stay incomplete.
+    let sample_artifacts_valid =
+        evidence_error_count == 0 || (typed_no_comparison_refusal && evidence_error_count == 1);
+    counts.unknown_history_repetitions += usize::from(
+        inner_history
+            .as_ref()
+            .is_some_and(|history| history.is_err())
+            || (row_valid && !sample_artifacts_valid),
+    );
+    if let Some(Err(error)) = &inner_history {
+        sample_evidence_errors.push(error.clone());
+    }
+    if result == "pass" {
+        counts.observed_repetitions += 1;
+        counts.terminal_passes += 1;
+        counts.qualifying_passes += usize::from(
+            evidence_error_count == 0
+                && sample_evidence_errors.is_empty()
+                && repetition_qualifies_for_promotion(result, rows),
+        );
+    } else {
+        let classification = if !sample_evidence_errors.is_empty() && !row_valid {
+            RepetitionClassification::Missing
+        } else {
+            let outer = classify_nonpassing_repetition(
+                result,
+                rows,
+                row_valid,
+                if prepared_empty_result_file {
+                    initial_evidence_valid
+                } else {
+                    sample_artifacts_valid
+                },
+                rejected_result_history,
+                proven_timeout,
+                proven_oom,
+                retained_prerequisite,
+            );
+            match &inner_history {
+                Some(Ok(inner)) => fold_pressure_history(outer, inner),
+                _ => outer,
+            }
+        };
+        match classification {
+            RepetitionClassification::ProductFailure => counts.product_failures += 1,
+            RepetitionClassification::InfrastructureFailure => counts.infrastructure_failures += 1,
+            RepetitionClassification::PrerequisiteFailure => counts.prerequisite_failures += 1,
+            RepetitionClassification::NoResult => counts.no_results += 1,
+            RepetitionClassification::Mixed => counts.mixed_repetitions += 1,
+            RepetitionClassification::Missing => counts.missing_repetitions += 1,
+        }
+        counts.observed_repetitions +=
+            usize::from(classification != RepetitionClassification::Missing);
+    }
+}
+
+/// Print the per-cell repeated-run table and the flake-verdict line, and return
+/// each cell's summary.json entry.
+fn print_repeated_cell_table(
+    cells: &[CellId],
+    repeated: &BTreeMap<CellId, RepeatedCellTally>,
+    retries: &str,
+) -> Vec<JsonValue> {
+    println!("Retries: {retries}");
+    println!();
+    println!(
+        "| Cell | Terminal passes | Clean passes | Product failures | Infrastructure failures | Prerequisite failures | No result | Mixed/missing | Unknown history | Result | Sample classification | Verdict |"
+    );
+    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |");
+    let mut verdicts = BTreeMap::<&'static str, usize>::new();
+    let mut repeated_cells = Vec::new();
+    for cell in cells {
+        let RepeatedCellTally {
+            terminal_passes,
+            clean_passes,
+            infrastructure_errors,
+            retried,
+            total,
+            counts,
+        } = repeated.get(cell).copied().unwrap_or_default();
+        let result = repeated_result_description(
+            terminal_passes,
+            clean_passes,
+            infrastructure_errors,
+            retried,
+            total,
+        );
+        let verdict = flake_verdict(counts);
+        *verdicts.entry(verdict).or_default() += 1;
+        println!(
+            "| `{}` | {terminal_passes}/{total} | {clean_passes}/{total} | {} | {} | {} | {} | {} | {} | {result} | {} | {verdict} |",
+            display_id(cell),
+            counts.product_failures,
+            counts.infrastructure_failures,
+            counts.prerequisite_failures,
+            counts.no_results,
+            counts.mixed_repetitions + counts.missing_repetitions,
+            counts.unknown_history_repetitions,
+            classify_pressure_sample(counts).as_str(),
+        );
+        repeated_cells.push(repeated_cell_summary(cell, counts, result));
+    }
+    println!();
+    println!(
+        "Flake verdicts over {} cell(s): {} CLEAN, {} FLAKY, {} FAILING, {} INCOMPLETE.",
+        cells.len(),
+        verdicts.get("CLEAN").copied().unwrap_or(0),
+        verdicts.get("FLAKY").copied().unwrap_or(0),
+        verdicts.get("FAILING").copied().unwrap_or(0),
+        verdicts.get("INCOMPLETE").copied().unwrap_or(0),
+    );
+    println!();
+    repeated_cells
+}
+
 fn repeated_cell_summary(cell: &CellId, counts: RepeatedOutcomeCounts, result: &str) -> JsonValue {
     let classification = classify_pressure_sample(counts);
     json!({
@@ -6737,9 +7506,62 @@ fn verification_report_path(artifact_dir: &Path) -> PathBuf {
     artifact_dir.join("verify-1.json")
 }
 
-fn retained_verification_logs(cell: &CellId, artifact_dir: &Path) -> Result<Vec<String>, String> {
+/// A divergent verify result must retain both runs' logs.
+///
+/// ⚠️ `scorecard.rs` matches THIS EXACT TEXT (`MISSING_RETAINED_VERIFY_LOGS`)
+/// to import a canonical DBT divergence whose logs are absent. Rewording it
+/// here alone silently turns that import into an ordinary refusal.
+const DIVERGED_VERIFY_LOGS_INCOMPLETE: &str =
+    "terminal verify result must retain exactly one nonempty run1 log and one nonempty run2 log";
+
+/// A matched verify result must retain run 1's golden log and nothing else.
+const MATCHED_VERIFY_LOGS_NOT_GOLDEN_ONLY: &str =
+    "terminal matched verify result must retain exactly one nonempty run1 log and no run2 log";
+
+/// The run logs one verify attempt retained in `verify-logs/verify-1`.
+///
+/// `hermit run --keep-logs` keeps only run 1's log after a match, as the golden
+/// log; run 2's log, which compared equal to it, is deleted
+/// (<https://github.com/rrnewton/hermit/issues/3301>). After a divergence it
+/// keeps both.
+#[derive(Debug, Default, PartialEq)]
+struct RetainedVerificationLogs {
+    run1: Option<String>,
+    run2: Option<String>,
+}
+
+impl RetainedVerificationLogs {
+    /// Whether these are exactly the captures a terminal `verdict` retains:
+    /// one nonempty run-1 log and no run-2 log after a match, one nonempty log
+    /// from each run after a divergence. No other verdict has a complete set.
+    fn complete_for(&self, verdict: Option<&str>) -> bool {
+        match verdict {
+            Some("matched") => self.run1.is_some() && self.run2.is_none(),
+            Some("diverged") => self.run1.is_some() && self.run2.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The retained capture paths, run 1's first.
+    fn paths(&self) -> Vec<String> {
+        self.run1.iter().chain(&self.run2).cloned().collect()
+    }
+}
+
+/// Read one verify attempt's retained run logs, refusing any capture that is
+/// empty, not a regular file, or duplicated.
+///
+/// A lone capture is refused too, except run 1's golden log under a `matched`
+/// `verdict`, which is exactly what `--keep-logs` retains after a match.
+/// Whether the set is complete for its verdict is the caller's check
+/// ([`RetainedVerificationLogs::complete_for`]).
+fn retained_verification_logs(
+    cell: &CellId,
+    artifact_dir: &Path,
+    verdict: Option<&str>,
+) -> Result<RetainedVerificationLogs, String> {
     if cell.mode != "verify" {
-        return Ok(Vec::new());
+        return Ok(RetainedVerificationLogs::default());
     }
     let directory = verification_report_path(artifact_dir)
         .parent()
@@ -6747,7 +7569,7 @@ fn retained_verification_logs(cell: &CellId, artifact_dir: &Path) -> Result<Vec<
         .join("verify-logs")
         .join("verify-1");
     if !directory.is_dir() {
-        return Ok(Vec::new());
+        return Ok(RetainedVerificationLogs::default());
     }
     let mut run1 = None;
     let mut run2 = None;
@@ -6797,64 +7619,14 @@ fn retained_verification_logs(cell: &CellId, artifact_dir: &Path) -> Result<Vec<
             ));
         }
     }
-    if run1.is_some() != run2.is_some() {
+    let golden_only = verdict == Some("matched") && run1.is_some() && run2.is_none();
+    if run1.is_some() != run2.is_some() && !golden_only {
         return Err(format!(
             "retained verify-log directory {} must contain exactly one nonempty run1 capture and one nonempty run2 capture",
             directory.display()
         ));
     }
-    Ok(run1.into_iter().chain(run2).collect())
-}
-
-fn normalized_ptrace_golden(cell: &CellId, artifact_dir: &Path) -> Result<Option<String>, String> {
-    if cell.mode != "verify" || cell.backend != "ptrace" {
-        return Ok(None);
-    }
-    let directory = verification_report_path(artifact_dir)
-        .parent()
-        .expect("verification report has a parent")
-        .join("verify-logs")
-        .join("verify-1");
-    let status_path = directory.join("normalized-ptrace-golden.status");
-    let path = directory.join("normalized-ptrace-golden.log");
-    if !status_path.exists() && !path.exists() {
-        return Ok(None);
-    }
-    if !status_path.is_file() {
-        return Err(format!(
-            "ptrace golden-log output {} exists without its numeric status {}",
-            path.display(),
-            status_path.display()
-        ));
-    }
-    let status_text = fs::read_to_string(&status_path)
-        .map_err(|e| format!("cannot read {}: {e}", status_path.display()))?;
-    let status = status_text.trim().parse::<i32>().map_err(|_| {
-        format!(
-            "{} contains nonnumeric log-diff exit `{}`",
-            status_path.display(),
-            status_text.trim()
-        )
-    })?;
-    if status != 0 {
-        return Err(format!(
-            "ptrace golden-log normalization failed with exit {status}; see {}",
-            directory.display()
-        ));
-    }
-    if !path.is_file()
-        || path
-            .metadata()
-            .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?
-            .len()
-            == 0
-    {
-        return Err(format!(
-            "ptrace golden-log normalization reported success without a nonempty {}",
-            path.display()
-        ));
-    }
-    Ok(Some(path.to_string_lossy().into_owned()))
+    Ok(RetainedVerificationLogs { run1, run2 })
 }
 
 fn read_verification_report(
@@ -7012,12 +7784,7 @@ fn summarize(
     }
 
     let mut by_backend: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
-    let mut sample_counts = BTreeMap::<CellId, RepeatedOutcomeCounts>::new();
-    let mut repeated_terminal_passes = BTreeMap::<CellId, usize>::new();
-    let mut repeated_clean_passes = BTreeMap::<CellId, usize>::new();
-    let mut repeated_infrastructure_errors = BTreeMap::<CellId, usize>::new();
-    let mut repeated_totals = BTreeMap::<CellId, usize>::new();
-    let mut retried_by_cell = BTreeMap::<CellId, usize>::new();
+    let mut repeated = BTreeMap::<CellId, RepeatedCellTally>::new();
     let mut retried_repetitions = 0usize;
     let mut attempted = 0usize;
     let mut passing = Vec::new();
@@ -7025,10 +7792,25 @@ fn summarize(
     // The verify histories of each cell's first repetition that this summary
     // accepted: the operands of the parity post-pass, one harness history per
     // cell. A first repetition it refused is handed over as its reason
-    // instead, so that side of a parity cell is unavailable, never measured
-    // and never reported missing.
+    // instead, typed as the condition the harness's own post-pass classifies
+    // the same way ([`parity_rejection`]): a missing or invalid row, verify
+    // logs that were not retained, or a cell that only the retained
+    // harness summary proves host-inapplicable. A harness or
+    // evidence defect alone is therefore unmeasured, in the floor as 0, and
+    // never an outcome that left no golden. Every other row that is the
+    // cell's own (valid: its identity, harness exit and terminal attempt
+    // match) and records a verify mismatch ([`parity::records_mismatch`]) is
+    // handed over as where it did, with what the summary refused about it if
+    // anything: a row of a later repetition, or of a first repetition refused
+    // for other evidence. That side's two runs diverged, so it has no
+    // deterministic log and its parity cells are nondeterministic, as the
+    // harness's post-pass finds from the same rows. Decision 1 of
+    // <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5895129378>
+    // reads "Any mismatch in an operand's attempt history means no golden".
+    // Rows that are not the cell's are no evidence either way.
     let mut parity_rows: Vec<CellResult> = Vec::new();
-    let mut parity_rejected: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut parity_rejected: BTreeMap<(String, String), parity::ParityRejection> = BTreeMap::new();
+    let mut parity_nondeterministic: BTreeMap<(String, String), String> = BTreeMap::new();
     for cell in &metadata.cells {
         for repetition in repetition_numbers(metadata.repetitions) {
             let slug = cell_run_slug(cell, repetition);
@@ -7293,6 +8075,9 @@ fn summarize(
                     None,
                 )
             };
+            // The evidence errors in the retained verify logs, which type a
+            // refused parity operand ([`parity_rejection`]).
+            let mut log_errors = 0usize;
             let mut typed_no_comparison_refusal = false;
             let verification = match artifact_dir.as_deref() {
                 Some(artifact_dir) => match read_verification_report(cell, artifact_dir) {
@@ -7326,44 +8111,31 @@ fn summarize(
                 .and_then(|report| report.get("verdict"))
                 .and_then(JsonValue::as_str);
             let verification_logs = match artifact_dir.as_deref() {
-                Some(artifact_dir) => match retained_verification_logs(cell, artifact_dir) {
-                    Ok(logs) => logs,
-                    Err(error) => {
-                        evidence_errors.push(error);
-                        Vec::new()
+                Some(artifact_dir) => {
+                    match retained_verification_logs(cell, artifact_dir, verification_verdict) {
+                        Ok(logs) => logs,
+                        Err(error) => {
+                            log_errors += 1;
+                            evidence_errors.push(error);
+                            RetainedVerificationLogs::default()
+                        }
                     }
-                },
-                None => Vec::new(),
+                }
+                None => RetainedVerificationLogs::default(),
             };
-            let normalized_ptrace_golden = match artifact_dir.as_deref() {
-                Some(artifact_dir) => match normalized_ptrace_golden(cell, artifact_dir) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        evidence_errors.push(error);
-                        None
+            let verification_logs_complete = verification_logs.complete_for(verification_verdict);
+            if cell.mode == "verify" && !verification_logs_complete {
+                match verification_verdict {
+                    Some("matched") => {
+                        log_errors += 1;
+                        evidence_errors.push(MATCHED_VERIFY_LOGS_NOT_GOLDEN_ONLY.into());
                     }
-                },
-                None => None,
-            };
-            if cell.mode == "verify"
-                && matches!(verification_verdict, Some("matched" | "diverged"))
-                && verification_logs.len() != 2
-            {
-                evidence_errors.push(
-                "terminal verify result must retain exactly one nonempty run1 log and one nonempty run2 log"
-                    .into(),
-            );
-            }
-            if cell.mode == "verify"
-                && cell.backend == "ptrace"
-                && matches!(verification_verdict, Some("matched" | "diverged"))
-                && normalized_ptrace_golden.is_none()
-                && !evidence_errors
-                    .iter()
-                    .any(|error| error.contains("golden-log normalization"))
-            {
-                evidence_errors
-                    .push("terminal ptrace verify result has no normalized golden INFO log".into());
+                    Some("diverged") => {
+                        log_errors += 1;
+                        evidence_errors.push(DIVERGED_VERIFY_LOGS_INCOMPLETE.into());
+                    }
+                    _ => {}
+                }
             }
             if invocation.is_none() {
                 evidence_errors.push("selected result has no complete recorded invocation".into());
@@ -7376,7 +8148,7 @@ fn summarize(
                 reason.as_deref(),
                 &cell.mode,
                 verification_verdict,
-                verification_logs.len() == 2,
+                verification_logs_complete,
                 evidence_errors.is_empty(),
             );
             // Current rows take their functional result from the framework.
@@ -7398,19 +8170,70 @@ fn summarize(
             if !evidence_errors.is_empty() {
                 result = "infrastructure-error";
             }
-            if cell.mode == parity::PARITY_MODE && repetition.is_none_or(|number| number == 1) {
-                if row_valid && evidence_errors.is_empty() {
+            if cell.mode == parity::PARITY_MODE {
+                let first = repetition.is_none_or(|number| number == 1);
+                if first && row_valid && evidence_errors.is_empty() {
                     parity_rows.extend(result_rows_for_history.iter().cloned());
                 } else {
-                    let why = if evidence_errors.is_empty() {
-                        format!("result {result} with no valid result row")
+                    if first {
+                        let why = if evidence_errors.is_empty() {
+                            format!("result {result} with no valid result row")
+                        } else {
+                            evidence_errors.join("; ")
+                        };
+                        let reason = format!("result row rejected by the series summary: {why}");
+                        let evidence = RefusedParityEvidence {
+                            // Exactly the samples' prerequisite failure below.
+                            host_inapplicable: retained_prerequisite
+                                && !row_valid
+                                && initial_evidence_valid
+                                && sample_evidence_errors.is_empty()
+                                && result_rows_for_history.is_empty()
+                                && !proven_timeout
+                                && !proven_oom,
+                            no_row: result_rows_for_history.is_empty()
+                                && matches!(result_file_size, None | Some(0)),
+                            row_valid,
+                            other_error: evidence_errors.len() > log_errors,
+                            log_error: log_errors > 0,
+                        };
+                        parity_rejected.insert(
+                            (cell.test.clone(), cell.backend.clone()),
+                            parity_rejection(reason, evidence),
+                        );
+                    }
+                    // Any other row that is the cell's own: of a later
+                    // repetition, or of a first repetition refused for other
+                    // evidence. The first attempt of the earliest such
+                    // repetition that recorded a verify mismatch, if any,
+                    // with what the summary refused about it. Rows that are
+                    // not the cell's are no evidence either way.
+                    let own_rows: &[CellResult] = if row_valid {
+                        &result_rows_for_history
                     } else {
-                        evidence_errors.join("; ")
+                        &[]
                     };
-                    parity_rejected.insert(
-                        (cell.test.clone(), cell.backend.clone()),
-                        format!("result row rejected by the series summary: {why}"),
-                    );
+                    if let Some(row) = own_rows.iter().find(|row| parity::records_mismatch(row)) {
+                        parity_nondeterministic
+                            .entry((cell.test.clone(), cell.backend.clone()))
+                            .or_insert_with(|| {
+                                let place = match repetition {
+                                    Some(number) => {
+                                        format!("repetition {number} attempt {}", row.attempt)
+                                    }
+                                    None => format!("attempt {}", row.attempt),
+                                };
+                                if evidence_errors.is_empty() {
+                                    format!("{place} recorded a verify mismatch")
+                                } else {
+                                    format!(
+                                        "{place} recorded a verify mismatch in a result row the \
+                                         series summary rejected: {}",
+                                        evidence_errors.join("; ")
+                                    )
+                                }
+                            });
+                    }
                 }
             }
             let retained_attempts = retained_attempt_count(
@@ -7431,93 +8254,28 @@ fn summarize(
                 .entry(result.to_string())
                 .or_default() += 1;
             if metadata.repetitions.is_some() {
-                *repeated_totals.entry(cell.clone()).or_default() += 1;
-                if result == "pass" {
-                    *repeated_terminal_passes.entry(cell.clone()).or_default() += 1;
-                }
-                if repetition_passed_cleanly(result, &result_rows_for_history) {
-                    *repeated_clean_passes.entry(cell.clone()).or_default() += 1;
-                }
-                if matches!(result, "infrastructure-error" | "sandbox-denied") {
-                    *repeated_infrastructure_errors
-                        .entry(cell.clone())
-                        .or_default() += 1;
-                }
-                let counts = sample_counts.entry(cell.clone()).or_default();
-                counts.expected_repetitions += 1;
-                counts.clean_passes +=
-                    usize::from(repetition_passed_cleanly(result, &result_rows_for_history));
-                counts.retried_repetitions += usize::from(retained_attempts > 1);
-                let inner_history = if result_rows_for_history.is_empty() {
-                    None
-                } else {
-                    Some(inner_pressure_history(&result_rows_for_history))
-                };
-                // A typed NoResult stamp legitimately has no comparison. Only
-                // that one verified reader refusal may be explained here; missing
-                // captures, golden output or other artifact errors stay incomplete.
-                let sample_artifacts_valid = evidence_errors.is_empty()
-                    || (typed_no_comparison_refusal && evidence_errors.len() == 1);
-                counts.unknown_history_repetitions += usize::from(
-                    inner_history
-                        .as_ref()
-                        .is_some_and(|history| history.is_err())
-                        || (row_valid && !sample_artifacts_valid),
+                fold_repetition(
+                    repeated.entry(cell.clone()).or_default(),
+                    &RepetitionSample {
+                        result,
+                        rows: &result_rows_for_history,
+                        retained_attempts,
+                        row_valid,
+                        evidence_error_count: evidence_errors.len(),
+                        typed_no_comparison_refusal,
+                        prepared_empty_result_file,
+                        initial_evidence_valid,
+                        rejected_result_history,
+                        proven_timeout,
+                        proven_oom,
+                        retained_prerequisite,
+                    },
+                    &mut sample_evidence_errors,
                 );
-                if let Some(Err(error)) = &inner_history {
-                    sample_evidence_errors.push(error.clone());
-                }
-                if result == "pass" {
-                    counts.observed_repetitions += 1;
-                    counts.terminal_passes += 1;
-                    counts.qualifying_passes += usize::from(
-                        evidence_errors.is_empty()
-                            && sample_evidence_errors.is_empty()
-                            && repetition_qualifies_for_promotion(result, &result_rows_for_history),
-                    );
-                } else {
-                    let classification = if !sample_evidence_errors.is_empty() && !row_valid {
-                        RepetitionClassification::Missing
-                    } else {
-                        let outer = classify_nonpassing_repetition(
-                            result,
-                            &result_rows_for_history,
-                            row_valid,
-                            if prepared_empty_result_file {
-                                initial_evidence_valid
-                            } else {
-                                sample_artifacts_valid
-                            },
-                            rejected_result_history,
-                            proven_timeout,
-                            proven_oom,
-                            retained_prerequisite,
-                        );
-                        match &inner_history {
-                            Some(Ok(inner)) => fold_pressure_history(outer, inner),
-                            _ => outer,
-                        }
-                    };
-                    match classification {
-                        RepetitionClassification::ProductFailure => counts.product_failures += 1,
-                        RepetitionClassification::InfrastructureFailure => {
-                            counts.infrastructure_failures += 1
-                        }
-                        RepetitionClassification::PrerequisiteFailure => {
-                            counts.prerequisite_failures += 1
-                        }
-                        RepetitionClassification::NoResult => counts.no_results += 1,
-                        RepetitionClassification::Mixed => counts.mixed_repetitions += 1,
-                        RepetitionClassification::Missing => counts.missing_repetitions += 1,
-                    }
-                    counts.observed_repetitions +=
-                        usize::from(classification != RepetitionClassification::Missing);
-                }
                 if retained_attempts > 1 {
                     retried_repetitions = retried_repetitions
                         .checked_add(1)
                         .ok_or("pressure retried-repetition count overflowed usize")?;
-                    *retried_by_cell.entry(cell.clone()).or_default() += 1;
                 }
             }
             if result == "pass" && metadata.repetitions.is_none() {
@@ -7565,10 +8323,14 @@ fn summarize(
                                 verification_report_path(&earlier_artifact_dir).display()
                             )
                         })?;
-                        let earlier_verification_logs =
-                            retained_verification_logs(cell, &earlier_artifact_dir)?;
-                        let earlier_normalized_ptrace_golden =
-                            crate::normalized_ptrace_golden(cell, &earlier_artifact_dir)?;
+                        let earlier_verification_logs = retained_verification_logs(
+                            cell,
+                            &earlier_artifact_dir,
+                            earlier_verification
+                                .get("verdict")
+                                .and_then(JsonValue::as_str),
+                        )?
+                        .paths();
                         let expected_result = match cell.mode.as_str() {
                             "verify" => ObservedResult::DeterminismFailure,
                             "replay" => ObservedResult::ReplayFailure,
@@ -7605,7 +8367,6 @@ fn summarize(
                             "result": earlier_result.as_str(),
                             "verification": earlier_verification,
                             "verification_logs": earlier_verification_logs,
-                            "normalized_ptrace_golden": earlier_normalized_ptrace_golden,
                             "evidence_errors": Vec::<String>::new(),
                             "runner_seen": runner.seen,
                             "runner_ok": runner.ok,
@@ -7638,8 +8399,7 @@ fn summarize(
                 "result_row_valid": row_valid,
                 "result": result,
                 "verification": verification,
-                "verification_logs": verification_logs,
-                "normalized_ptrace_golden": normalized_ptrace_golden,
+                "verification_logs": verification_logs.paths(),
                 "evidence_errors": evidence_errors,
                 "runner_seen": runner.seen,
                 "runner_ok": runner.ok,
@@ -7743,19 +8503,19 @@ fn summarize(
         println!();
     }
     let mut repeated_cells = Vec::new();
-    let repeated_terminal_pass_count: usize = repeated_terminal_passes.values().sum();
-    let repeated_clean_pass_count: usize = repeated_clean_passes.values().sum();
-    let repeated_total_count: usize = repeated_totals.values().sum();
+    let repeated_terminal_pass_count: usize = repeated.values().map(|t| t.terminal_passes).sum();
+    let repeated_clean_pass_count: usize = repeated.values().map(|t| t.clean_passes).sum();
+    let repeated_total_count: usize = repeated.values().map(|t| t.total).sum();
     let repeated_result = if metadata.repetitions.is_some() && metadata.is_exact() {
         let cell = &metadata.cells[0];
-        let terminal_passes = repeated_terminal_passes.get(cell).copied().unwrap_or(0);
-        let clean_passes = repeated_clean_passes.get(cell).copied().unwrap_or(0);
-        let infrastructure_errors = repeated_infrastructure_errors
-            .get(cell)
-            .copied()
-            .unwrap_or(0);
-        let retried = retried_by_cell.get(cell).copied().unwrap_or(0);
-        let total = repeated_totals.get(cell).copied().unwrap_or(0);
+        let RepeatedCellTally {
+            terminal_passes,
+            clean_passes,
+            infrastructure_errors,
+            retried,
+            total,
+            counts,
+        } = repeated.get(cell).copied().unwrap_or_default();
         let result = top_level_repeated_result_description(
             &metadata,
             terminal_passes,
@@ -7775,7 +8535,6 @@ fn summarize(
                 total,
             )
         );
-        let counts = sample_counts.get(cell).copied().unwrap_or_default();
         println!(
             "Sample classification for `{}`: {}; {}/{} qualifying first attempts.",
             display_id(cell),
@@ -7786,65 +8545,16 @@ fn summarize(
         repeated_cells.push(repeated_cell_summary(cell, counts, result));
         Some(result)
     } else if metadata.repetitions.is_some() {
-        println!(
-            "Retries: {}",
+        repeated_cells = print_repeated_cell_table(
+            &metadata.cells,
+            &repeated,
             if metadata.no_retry {
                 "off (--no-retry): every repetition is one first-attempt observation"
             } else {
                 "framework retry on; clean passes count first attempts"
-            }
+            },
         );
-        println!();
-        println!(
-            "| Cell | Terminal passes | Clean passes | Product failures | Infrastructure failures | Prerequisite failures | No result | Mixed/missing | Unknown history | Result | Sample classification | Verdict |"
-        );
-        println!(
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |"
-        );
-        let mut verdicts = BTreeMap::<&'static str, usize>::new();
-        for cell in &metadata.cells {
-            let terminal_passes = repeated_terminal_passes.get(cell).copied().unwrap_or(0);
-            let clean_passes = repeated_clean_passes.get(cell).copied().unwrap_or(0);
-            let infrastructure_errors = repeated_infrastructure_errors
-                .get(cell)
-                .copied()
-                .unwrap_or(0);
-            let retried = retried_by_cell.get(cell).copied().unwrap_or(0);
-            let total = repeated_totals.get(cell).copied().unwrap_or(0);
-            let result = repeated_result_description(
-                terminal_passes,
-                clean_passes,
-                infrastructure_errors,
-                retried,
-                total,
-            );
-            let counts = sample_counts.get(cell).copied().unwrap_or_default();
-            let verdict = flake_verdict(counts);
-            *verdicts.entry(verdict).or_default() += 1;
-            println!(
-                "| `{}` | {terminal_passes}/{total} | {clean_passes}/{total} | {} | {} | {} | {} | {} | {} | {result} | {} | {verdict} |",
-                display_id(cell),
-                counts.product_failures,
-                counts.infrastructure_failures,
-                counts.prerequisite_failures,
-                counts.no_results,
-                counts.mixed_repetitions + counts.missing_repetitions,
-                counts.unknown_history_repetitions,
-                classify_pressure_sample(counts).as_str(),
-            );
-            repeated_cells.push(repeated_cell_summary(cell, counts, result));
-        }
-        println!();
-        println!(
-            "Flake verdicts over {} cell(s): {} CLEAN, {} FLAKY, {} FAILING, {} INCOMPLETE.",
-            metadata.cells.len(),
-            verdicts.get("CLEAN").copied().unwrap_or(0),
-            verdicts.get("FLAKY").copied().unwrap_or(0),
-            verdicts.get("FAILING").copied().unwrap_or(0),
-            verdicts.get("INCOMPLETE").copied().unwrap_or(0),
-        );
-        println!();
-        let infrastructure_errors: usize = repeated_infrastructure_errors.values().sum();
+        let infrastructure_errors: usize = repeated.values().map(|t| t.infrastructure_errors).sum();
         let result = top_level_repeated_result_description(
             &metadata,
             repeated_terminal_pass_count,
@@ -7919,6 +8629,7 @@ fn summarize(
         &metadata,
         &parity_rows,
         &parity_rejected,
+        &parity_nondeterministic,
         &mut std::io::stdout(),
         &mut std::io::stderr(),
     );
@@ -7950,10 +8661,65 @@ fn summarize(
     Ok(())
 }
 
+/// What a verify cell's first repetition that the summary refused left
+/// behind, for [`parity_rejection`].
+#[derive(Clone, Copy, Debug, Default)]
+struct RefusedParityEvidence {
+    /// The retained harness summary proves the cell host-inapplicable, and
+    /// nothing contradicts it: the samples' prerequisite failure.
+    host_inapplicable: bool,
+    /// No result row was read, and the result history is absent or empty.
+    no_row: bool,
+    /// The rows were read and are the cell's: they match its identity, its
+    /// harness exit and the runner's terminal attempt, and carry complete
+    /// invocations.
+    row_valid: bool,
+    /// Evidence other than the retained verify logs refused the rows: the
+    /// harness exit, the verification report, the recorded invocation or the
+    /// recorded result.
+    other_error: bool,
+    /// The verify logs were not retained as the summary requires.
+    log_error: bool,
+}
+
+/// The typed reason a verify cell's refused first repetition is handed to
+/// the parity post-pass with ([`parity::PostPassConfig::rejected`]): the
+/// condition the harness's own post-pass classifies the same way
+/// ([`parity::ParityRejection::typed`]). A harness or evidence defect is
+/// therefore unmeasured, in the floor as 0, and never an outcome that left
+/// no golden; `infrastructure-error` stays the class of a row whose own
+/// typed result says so. <https://github.com/rrnewton/hermit/issues/3301>
+///
+/// In order, as the post-pass checks an operand:
+/// - the retained harness summary alone proves the cell host-inapplicable,
+///   so it left no log, like a `HOST-INAPPLICABLE` row;
+/// - no row was read from an absent or empty history: a missing row, like a
+///   cell with no history (the harness's `no-result-row`);
+/// - rows that are not the cell's, or that other evidence contradicts or
+///   cannot support: an invalid row, like a history the harness refuses;
+/// - a valid row whose verify logs were not retained as required.
+///
+/// A valid row that also recorded a verify mismatch is handed over as
+/// nondeterministic besides ([`parity::PostPassConfig::nondeterministic`]),
+/// which the post-pass checks first: the defect does not hide the mismatch.
+fn parity_rejection(reason: String, evidence: RefusedParityEvidence) -> parity::ParityRejection {
+    if evidence.host_inapplicable {
+        parity::ParityRejection::HostInapplicable(reason)
+    } else if evidence.no_row {
+        parity::ParityRejection::MissingRow(reason)
+    } else if !evidence.row_valid || evidence.other_error {
+        parity::ParityRejection::InvalidRow(reason)
+    } else if evidence.log_error {
+        parity::ParityRejection::LogNotRetained(reason)
+    } else {
+        parity::ParityRejection::InvalidRow(reason)
+    }
+}
+
 #[cfg(test)]
 thread_local! {
-    /// Set by a self-test to panic inside [`report_parity`], outside
-    /// [`parity::post_pass`] and its own panic guard.
+    /// Set by a self-test to panic inside [`pressure_parity`] once its scope
+    /// is resolved, outside [`parity::post_pass`] and its own panic guard.
     static PANIC_IN_SERIES_PARITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -7963,14 +8729,26 @@ thread_local! {
 /// or an `out` or `err` that cannot be written is reported where it can be,
 /// and neither `summary.json` nor the exit status changes. A post-pass that
 /// refused or panicked before measuring leaves no earlier summary's records
-/// behind. `rejected` holds the verify cells whose first repetition the
-/// summary refused, with the reason; their parity cells are unavailable.
+/// behind, and a failed `parity.status.json` naming its error and every cell
+/// it owed ([`parity::mark_failed`]; none when the panic came before its
+/// scope was known), so the parity append reports the failure instead of an
+/// empty report. `rejected` holds the verify cells whose first repetition the
+/// summary refused, with the typed reason ([`parity_rejection`]); their
+/// parity cells are never compared, and take the class the harness gives the
+/// same condition unless `nondeterministic` also names them.
+/// `nondeterministic` holds the verify cells a row of which is the cell's own
+/// and recorded a verify mismatch ([`parity::records_mismatch`]) outside the
+/// accepted first repetition the post-pass reads itself: in a later
+/// repetition, or in a first repetition the summary refused for other
+/// evidence. Each names where, and what the summary refused about that row
+/// if anything; their parity cells are nondeterministic.
 fn report_parity(
     root: &Path,
     results: &Path,
     metadata: &RunMetadata,
     rows: &[CellResult],
-    rejected: &BTreeMap<(String, String), String>,
+    rejected: &BTreeMap<(String, String), parity::ParityRejection>,
+    nondeterministic: &BTreeMap<(String, String), String>,
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
 ) {
@@ -7982,13 +8760,11 @@ fn report_parity(
     );
     config.jobs = usize::try_from(metadata.jobs).unwrap_or(1).max(1);
     config.rejected = rejected.clone();
+    config.nondeterministic = nondeterministic.clone();
     let mut warnings = Vec::new();
+    let mut scope = None;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        #[cfg(test)]
-        if PANIC_IN_SERIES_PARITY.with(|armed| armed.replace(false)) {
-            panic!("planted series post-pass panic");
-        }
-        pressure_parity(root, &config, metadata, rows, &mut warnings)
+        pressure_parity(root, &config, metadata, rows, &mut warnings, &mut scope)
     }));
     for warning in &warnings {
         let _ = writeln!(err, "pressure-test: {warning}");
@@ -8004,13 +8780,17 @@ fn report_parity(
                 "pressure-test: parity post-pass failed (exit status unaffected): {error}"
             );
         }
-        Err(_) => {
-            let cleared = parity::clear_outputs(&config);
+        Err(panic) => {
+            let error = format!(
+                "the series parity post-pass panicked: {}",
+                parity::panic_text(panic.as_ref())
+            );
+            let marked = parity::mark_failed(&config, &scope.unwrap_or_default(), &error);
             let _ = writeln!(
                 err,
-                "pressure-test: parity post-pass panicked (exit status unaffected)"
+                "pressure-test: parity post-pass panicked (exit status unaffected): {error}"
             );
-            if let Err(error) = cleared {
+            if let Err(error) = marked {
                 let _ = writeln!(err, "pressure-test: {error}");
             }
         }
@@ -8023,27 +8803,39 @@ fn report_parity(
 /// committed selection or of `--parity-select` is reported when the series
 /// ran its ptrace or its candidate verify cell, and an explicit cell with
 /// neither side in the series is dropped with a warning. `None` when nothing
-/// is in scope. When nothing is measured, because the scope is empty or
-/// cannot be resolved, the previous outputs are removed first.
+/// is in scope, after the previous outputs are removed. A scope that cannot
+/// be resolved leaves a failed status naming no cell
+/// ([`parity::mark_failed`]): the cells it owed are unknown, so the parity
+/// append reports the failure itself. `resolved` receives the scope as soon
+/// as it is known, so [`report_parity`] can name every owed cell if what
+/// follows panics.
 fn pressure_parity(
     root: &Path,
     config: &parity::PostPassConfig,
     metadata: &RunMetadata,
     rows: &[CellResult],
     warnings: &mut Vec<String>,
+    resolved: &mut Option<BTreeSet<parity::ParityCellId>>,
 ) -> Result<Option<parity::PostPassReport>, String> {
     let scope = match series_parity_scope(root, metadata) {
         Ok(scope) => scope,
         Err(error) => {
-            return Err(match parity::clear_outputs(config) {
-                Ok(()) => error,
-                Err(cleared) => format!("{error}; {cleared}"),
-            });
+            return Err(
+                match parity::mark_failed(config, &BTreeSet::new(), &error) {
+                    Ok(()) => error,
+                    Err(marked) => format!("{error}; {marked}"),
+                },
+            );
         }
     };
     warnings.extend(scope.warnings);
     if scope.cells.is_empty() {
         return parity::clear_outputs(config).map(|()| None);
+    }
+    *resolved = Some(scope.cells.clone());
+    #[cfg(test)]
+    if PANIC_IN_SERIES_PARITY.with(|armed| armed.replace(false)) {
+        panic!("planted series post-pass panic");
     }
     parity::post_pass(config, &scope.cells, rows).map(Some)
 }
@@ -9526,6 +10318,163 @@ fn pressure_sample_classification_self_test() -> Result<(), String> {
     };
     if classify_pressure_sample(all_mixed) != PressureSampleClassification::Incomplete {
         return Err("mixed repetition outcomes produced a product classification".into());
+    }
+    Ok(())
+}
+
+/// A DBT cell's harness, and no other cell's, starts under
+/// [`DBT_NAMESPACE_WRAPPER`], in both harness forms: an exact cell launches
+/// `target/debug/test-harness` directly, and a batch launches it through
+/// `ci/run-with-hermit-e2e-artifact.sh`. Every cell still requests the
+/// hermetic workdir, so the wrapper supplies the capability that request needs
+/// instead of replacing it.
+fn dbt_namespace_wrapper_self_test(
+    root: &Path,
+    checked_scorecard: &CheckedScorecard<'_>,
+    scratch: &Path,
+    green_batch_dag: &DagConfig,
+) -> Result<(), String> {
+    for backend in ["ptrace", "kvm", "liteinst", "sabre", "native"] {
+        if !dbt_namespace_prefix(backend).is_empty() {
+            return Err(format!(
+                "a {backend} cell would run under the DBT namespace wrapper"
+            ));
+        }
+    }
+    if dbt_namespace_prefix("dbt") != format!("{DBT_NAMESPACE_WRAPPER} ") {
+        return Err("a DBT cell no longer runs under the namespace wrapper".into());
+    }
+    let wrapped_exact =
+        format!("{EXACT_CELL_HERMIT_BIN} {DBT_NAMESPACE_WRAPPER} target/debug/test-harness run ");
+    let wrapped_batch = format!(
+        "{DBT_NAMESPACE_WRAPPER} ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run "
+    );
+    let check = |step: &Step, wrapped_form: &str, dbt: bool| -> Result<(), String> {
+        let wrapped =
+            step.cmd.contains(wrapped_form) && step.cmd.matches(DBT_NAMESPACE_WRAPPER).count() == 1;
+        let unwrapped = !step.cmd.contains("unshare");
+        let workdir = step.env.get(HERMETIC_TEST_WORKDIR_ENV).map(String::as_str)
+            == Some(HERMETIC_TEST_WORKDIR);
+        if (if dbt { wrapped } else { unwrapped }) && workdir {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} {} the DBT namespace wrapper or lost {HERMETIC_TEST_WORKDIR_ENV}={HERMETIC_TEST_WORKDIR}: {}",
+                step.tag(),
+                if dbt { "lacks" } else { "carries" },
+                step.cmd
+            ))
+        }
+    };
+    let one_cell_step = |name: &str, dag: &DagConfig| -> Result<Step, String> {
+        let cells: Vec<_> = dag
+            .steps
+            .iter()
+            .filter(|step| step.group == "cell")
+            .collect();
+        match cells.as_slice() {
+            [step] => Ok((*step).clone()),
+            _ => Err(format!("{name} has {} cell steps, not one", cells.len())),
+        }
+    };
+    let batch_is_dbt = |step: &Step| step.cmd.contains("--backend 'dbt'");
+    // One verify cell of each kind, red when the red population has one and
+    // green otherwise, so the check does not depend on how many DBT cells are
+    // green today.
+    let red = pressure_cells(root, &CellSelection::default())?;
+    let green = pressure_cells(
+        root,
+        &CellSelection {
+            green: true,
+            repetitions: Some(1),
+            ..CellSelection::default()
+        },
+    )?;
+    for dbt in [true, false] {
+        let (cell, green_population) = red
+            .selected
+            .iter()
+            .map(|cell| (cell, false))
+            .chain(green.selected.iter().map(|cell| (cell, true)))
+            .find(|(cell, _)| cell.id.mode == "verify" && (cell.id.backend == "dbt") == dbt)
+            .ok_or_else(|| {
+                format!(
+                    "self-test needs one executable {} verify cell, red or green",
+                    if dbt { "DBT" } else { "non-DBT" }
+                )
+            })?;
+        let plan = |form: &str, selection: &CellSelection| {
+            let results = scratch.join(format!("namespace-wrapper-{form}-{}", cell.id.backend));
+            write_plan_after_scorecard_check(
+                checked_scorecard,
+                &results,
+                &results.join("dag.json"),
+                selection,
+            )
+            .map(|(_, dag)| dag)
+        };
+        let exact = plan(
+            "exact",
+            &CellSelection {
+                green: green_population,
+                test: Some(cell.id.test.clone()),
+                mode: Some(cell.id.mode.clone()),
+                backend: Some(cell.id.backend.clone()),
+                repetitions: Some(1),
+                run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+                ..CellSelection::default()
+            },
+        )?;
+        let label = display_id(&cell.id);
+        check(
+            &one_cell_step(&format!("exact plan for {label}"), &exact)?,
+            &wrapped_exact,
+            dbt,
+        )?;
+        if green_population {
+            // Every green cell is in the green batch, which is checked below.
+            if !green_batch_dag
+                .steps
+                .iter()
+                .any(|step| step.group == "cell" && batch_is_dbt(step) == dbt)
+            {
+                return Err(format!(
+                    "green batch has no {} cell step, although {label} is green",
+                    if dbt { "DBT" } else { "non-DBT" }
+                ));
+            }
+        } else {
+            let cells_file = scratch.join(format!("namespace-wrapper-{}.jsonl", cell.id.backend));
+            fs::write(
+                &cells_file,
+                canonical_cells_jsonl(std::slice::from_ref(&cell.id))?,
+            )
+            .map_err(|error| error.to_string())?;
+            let batch = plan(
+                "batch",
+                &CellSelection {
+                    cells_file: Some(cells_file),
+                    repetitions: Some(1),
+                    run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+                    ..CellSelection::default()
+                },
+            )?;
+            let step = one_cell_step(&format!("cells-file plan for {label}"), &batch)?;
+            if batch_is_dbt(&step) != dbt {
+                return Err(format!(
+                    "cells-file plan for {label} selected another backend"
+                ));
+            }
+            check(&step, &wrapped_batch, dbt)?;
+        }
+    }
+    // The complete green batch: every backend and mode.
+    for step in green_batch_dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+    {
+        check(step, &wrapped_batch, batch_is_dbt(step))?;
     }
     Ok(())
 }
@@ -12915,6 +13864,7 @@ fn self_test(root: &Path) -> Result<(), String> {
                 .into(),
         );
     }
+    dbt_namespace_wrapper_self_test(root, &checked_scorecard, &scratch, &green_batch_dag)?;
     let mut missing_green_artifact = green_batch_dag.clone();
     missing_green_artifact
         .steps
@@ -13880,6 +14830,229 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     if read_current_result_rows(&appended_results)?.len() != 2 {
         return Err("the existing current retry history lost strict admission".into());
+    }
+    // `verdicts` folds rows another runner retained through the same fold as
+    // summarize. Fixture repetitions use distinct run ids: repetitions must be
+    // independent observations.
+    {
+        let rows_root = scratch.join("verdicts-rows");
+        let argv = [
+            "hermit",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            "fixture",
+        ];
+        let write = |root: &Path, cell: &CellId, number: usize, rows: &[CellResult]| {
+            let dir = root
+                .join("cells")
+                .join(format!("{}-repetition-{number:04}", base_cell_slug(cell)));
+            fs::create_dir_all(&dir)
+                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            let text = rows
+                .iter()
+                .map(|row| serde_json::to_string(row).map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, _>>()?
+                .join("\n");
+            fs::write(dir.join("results.jsonl"), format!("{text}\n"))
+                .map_err(|e| format!("cannot write verdicts fixture: {e}"))
+        };
+        let observation = |row: &CellResult, cell: &CellId, run: &str| {
+            let mut row = row.clone();
+            row.test = cell.test.clone();
+            row.run_id = run.into();
+            row.artifact_dir = format!("/retained/runs/{run}/cell");
+            row
+        };
+        let pass = matched_pass_row(&result_row, &argv, 0, (0, 0), None)?;
+        let mut error = first_row.clone();
+        error.outcome = "ERROR".into();
+        error.result = None;
+        error.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+        error.error_kind = Some("infrastructure".into());
+        let sample_c = CellId {
+            test: "sample/c".into(),
+            ..sample_a.clone()
+        };
+        // a: a clean pass, a divergence, and a repetition never retained.
+        write(
+            &rows_root,
+            &sample_a,
+            1,
+            &[observation(&pass, &sample_a, "a1")],
+        )?;
+        write(
+            &rows_root,
+            &sample_a,
+            2,
+            &[observation(&first_row, &sample_a, "a2")],
+        )?;
+        // b: three clean passes; c: three typed infrastructure ERRORs.
+        for number in 1..=3 {
+            write(
+                &rows_root,
+                &sample_b,
+                number,
+                &[observation(&pass, &sample_b, &format!("b{number}"))],
+            )?;
+            write(
+                &rows_root,
+                &sample_c,
+                number,
+                &[observation(&error, &sample_c, &format!("c{number}"))],
+            )?;
+        }
+        // Flaky is red: the command fails, after writing, unless every cell is
+        // CLEAN.
+        let judge =
+            |root: &Path, repetitions: usize| -> Result<(Result<(), String>, JsonValue), String> {
+                let outcome = verdicts(root, repetitions);
+                let written = serde_json::from_str(
+                    &fs::read_to_string(root.join("verdicts.json"))
+                        .map_err(|e| format!("cannot read verdicts.json: {e}"))?,
+                )
+                .map_err(|e| format!("invalid verdicts.json: {e}"))?;
+                Ok((outcome, written))
+            };
+        let (outcome, written) = judge(&rows_root, 3)?;
+        if !outcome.as_ref().is_err_and(|error| {
+            error.contains("2 of 3 cell(s) are not CLEAN") && error.contains("FLAKY")
+        }) {
+            return Err(format!("verdicts passed a FLAKY collection: {outcome:?}"));
+        }
+        let cell = |test: &str| {
+            written["cells"]
+                .as_array()
+                .and_then(|cells| {
+                    cells
+                        .iter()
+                        .find(|cell| cell["cell"]["test"] == json!(test))
+                })
+                .cloned()
+                .unwrap_or(JsonValue::Null)
+        };
+        let (a, b, c) = (cell("sample/a"), cell("sample/b"), cell("sample/c"));
+        let expect = |summary: &JsonValue, field: &str, value: JsonValue| summary[field] == value;
+        if written["cells"].as_array().map(Vec::len) != Some(3)
+            || written["hermit_sha"] != json!(sample_metadata.hermit_sha)
+            || !expect(&a, "verdict", json!("FLAKY"))
+            || !expect(&a, "passes", json!(1))
+            || !expect(&a, "clean_passes", json!(1))
+            || !expect(&a, "terminal_product_failures", json!(1))
+            || !expect(&a, "missing_repetitions", json!(1))
+            || !expect(&a, "total", json!(3))
+            || !expect(&b, "verdict", json!("CLEAN"))
+            || !expect(&b, "clean_passes", json!(3))
+            || !expect(&b, "observed_repetitions", json!(3))
+            || !expect(&b, "unknown_history_repetitions", json!(0))
+            || !expect(&b, "evidence_errors", json!([]))
+            || !expect(&c, "verdict", json!("INCOMPLETE"))
+            || !expect(&c, "infrastructure_failures", json!(3))
+            || !expect(&c, "missing_repetitions", json!(0))
+        {
+            return Err(format!(
+                "rows-only verdicts misfolded retained repetitions: {written}"
+            ));
+        }
+        // A copied row is not a second observation.
+        let copies = scratch.join("verdicts-copies");
+        let copied = observation(&pass, &sample_b, "same");
+        write(&copies, &sample_b, 1, std::slice::from_ref(&copied))?;
+        write(&copies, &sample_b, 2, std::slice::from_ref(&copied))?;
+        let (outcome, written) = judge(&copies, 2)?;
+        if outcome.is_ok()
+            || written["cells"][0]["verdict"] == json!("CLEAN")
+            || !written["cells"][0]["evidence_errors"]
+                .to_string()
+                .contains("already retained")
+        {
+            return Err(format!("verdicts counted a copied row twice: {written}"));
+        }
+        // Only an all-CLEAN collection succeeds; each refusal below turns the
+        // same three clean repetitions red through one altered repetition.
+        let clean_b = |root: &Path| {
+            (1..=3).try_for_each(|number| {
+                write(
+                    root,
+                    &sample_b,
+                    number,
+                    &[observation(&pass, &sample_b, &format!("b{number}"))],
+                )
+            })
+        };
+        let all_clean = scratch.join("verdicts-clean");
+        clean_b(&all_clean)?;
+        let (outcome, written) = judge(&all_clean, 3)?;
+        if outcome.is_err() || written["cells"][0]["verdict"] != json!("CLEAN") {
+            return Err(format!(
+                "verdicts refused an all-CLEAN collection: {outcome:?} {written}"
+            ));
+        }
+        let mut other_commit = observation(&pass, &sample_b, "b3");
+        other_commit.hermit_sha = "0123456789abcdef0123456789abcdef01234567".into();
+        let mut dirty = observation(&pass, &sample_b, "b3");
+        dirty.source_tree_dirty = !dirty.source_tree_dirty;
+        let altered: [(&str, Box<dyn Fn(&Path) -> Result<(), String>>, &str); 4] = [
+            (
+                "verdicts-other-commit",
+                Box::new(|root: &Path| {
+                    write(root, &sample_b, 3, std::slice::from_ref(&other_commit))
+                }),
+                "but the collection is",
+            ),
+            (
+                "verdicts-dirty",
+                Box::new(|root: &Path| write(root, &sample_b, 3, std::slice::from_ref(&dirty))),
+                "but the collection is",
+            ),
+            (
+                "verdicts-misplaced",
+                Box::new(|root: &Path| {
+                    write(root, &sample_b, 3, &[observation(&pass, &sample_c, "b3")])
+                }),
+                "not for its directory's cell",
+            ),
+            (
+                "verdicts-empty-history",
+                Box::new(|root: &Path| {
+                    let dir = root
+                        .join("cells")
+                        .join(format!("{}-repetition-0003", base_cell_slug(&sample_b)));
+                    fs::write(dir.join("results.jsonl"), "")
+                        .map_err(|e| format!("cannot empty {}: {e}", dir.display()))
+                }),
+                "no host-inapplicable harness summary",
+            ),
+        ];
+        for (name, alter, refusal) in &altered {
+            let root = scratch.join(name);
+            clean_b(&root)?;
+            alter(&root)?;
+            let (outcome, written) = judge(&root, 3)?;
+            if outcome.is_ok()
+                || written["cells"].as_array().map(Vec::len) != Some(1)
+                || written["cells"][0]["verdict"] == json!("CLEAN")
+                || written["cells"][0]["clean_passes"] != json!(2)
+                || !written["cells"][0]["evidence_errors"]
+                    .to_string()
+                    .contains(refusal)
+            {
+                return Err(format!(
+                    "{name}: verdicts did not refuse the altered repetition ({refusal}): {outcome:?} {written}"
+                ));
+            }
+        }
+        // Nothing to judge, or a directory that names no repetition, refuses.
+        let empty = scratch.join("verdicts-empty");
+        fs::create_dir_all(empty.join("cells"))
+            .map_err(|e| format!("cannot create empty fixture: {e}"))?;
+        fs::create_dir_all(rows_root.join("cells").join("not-a-repetition"))
+            .map_err(|e| format!("cannot create malformed fixture: {e}"))?;
+        if verdicts(&empty, 3).is_ok() || verdicts(&rows_root, 3).is_ok() {
+            return Err("verdicts accepted an empty or malformed rows directory".into());
+        }
     }
     let historical_results = scratch.join("historical-timeout-results.jsonl");
     let mut historical_rows = appended.clone();
@@ -14860,6 +16033,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             scheduler_turns: 13,
             virtual_nanoseconds: 35,
             syscalls: Some(6),
+            dispatch: None,
         }),
         run2: None,
     };
@@ -15188,8 +16362,18 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("retained result-row evidence crossed between repetitions".into());
     }
 
-    if !retained_verification_logs(&sample_a, &sample_artifact_dir)?.is_empty() {
-        return Err("missing verify-log directory produced retained logs".into());
+    // A missing verify-log directory retains nothing under every verdict, and
+    // nothing completes a terminal verdict.
+    for verdict in [Some("matched"), Some("diverged"), Some("no_result"), None] {
+        let logs = retained_verification_logs(&sample_a, &sample_artifact_dir, verdict)?;
+        if logs != RetainedVerificationLogs::default() {
+            return Err("missing verify-log directory produced retained logs".into());
+        }
+        if logs.complete_for(verdict) {
+            return Err(format!(
+                "no retained verify log completed a {verdict:?} verify result"
+            ));
+        }
     }
     let verification_path = verification_report_path(&sample_artifact_dir);
     let verification_directory = verification_path
@@ -15202,56 +16386,85 @@ fn self_test(root: &Path) -> Result<(), String> {
     let run2_log = verify_log_directory.join("run2_log_fixture.log");
     fs::write(&run1_log, "run one\n")
         .map_err(|e| format!("cannot write run1 verify-log fixture: {e}"))?;
-    if retained_verification_logs(&sample_a, &sample_artifact_dir).is_ok() {
-        return Err("retained verify-log evidence accepted a missing run2 capture".into());
+    // Run 1's golden log alone is exactly what `hermit run --keep-logs` retains
+    // after a match (https://github.com/rrnewton/hermit/issues/3301). It
+    // completes no other verdict, and outside a match the lone capture is
+    // refused as it always was.
+    let golden_only = retained_verification_logs(&sample_a, &sample_artifact_dir, Some("matched"))?;
+    if golden_only.run1.as_deref() != Some(run1_log.to_string_lossy().as_ref())
+        || golden_only.run2.is_some()
+        || !golden_only.complete_for(Some("matched"))
+    {
+        return Err("a matched verify result's lone nonempty run1 golden log was refused".into());
+    }
+    if golden_only.complete_for(Some("diverged")) {
+        return Err("a lone run1 capture completed a diverged verify result".into());
+    }
+    for verdict in [Some("diverged"), Some("no_result"), None] {
+        if retained_verification_logs(&sample_a, &sample_artifact_dir, verdict).is_ok() {
+            return Err(format!(
+                "retained verify-log evidence accepted a missing run2 capture for a {verdict:?} verify result"
+            ));
+        }
     }
     fs::write(&run2_log, "run two\n")
         .map_err(|e| format!("cannot write run2 verify-log fixture: {e}"))?;
-    if retained_verification_logs(&sample_a, &sample_artifact_dir)?.len() != 2 {
+    let pair = retained_verification_logs(&sample_a, &sample_artifact_dir, Some("diverged"))?;
+    if pair.paths()
+        != [
+            run1_log.to_string_lossy().into_owned(),
+            run2_log.to_string_lossy().into_owned(),
+        ]
+        || !pair.complete_for(Some("diverged"))
+    {
         return Err("one nonempty run1/run2 verify-log pair was refused".into());
     }
+    // A match that still holds run 2's log did not retain the golden log alone.
+    if retained_verification_logs(&sample_a, &sample_artifact_dir, Some("matched"))?
+        .complete_for(Some("matched"))
+    {
+        return Err("a matched verify result that retained a run2 log was accepted".into());
+    }
+    // Run 2's log without run 1's is refused under every verdict, a match
+    // included.
+    fs::remove_file(&run1_log)
+        .map_err(|e| format!("cannot remove run1 verify-log fixture: {e}"))?;
+    for verdict in [Some("matched"), Some("diverged"), Some("no_result"), None] {
+        if retained_verification_logs(&sample_a, &sample_artifact_dir, verdict).is_ok() {
+            return Err(format!(
+                "a lone run2 capture was accepted for a {verdict:?} verify result"
+            ));
+        }
+    }
+    fs::write(&run1_log, "run one\n")
+        .map_err(|e| format!("cannot restore run1 verify-log fixture: {e}"))?;
     let duplicate_run1 = verify_log_directory.join("run1_log_duplicate.log");
     fs::write(&duplicate_run1, "duplicate\n")
         .map_err(|e| format!("cannot write duplicate run1 fixture: {e}"))?;
-    if retained_verification_logs(&sample_a, &sample_artifact_dir).is_ok() {
-        return Err("duplicate retained run1 verify-log capture was accepted".into());
+    for verdict in [Some("matched"), Some("diverged")] {
+        if retained_verification_logs(&sample_a, &sample_artifact_dir, verdict).is_ok() {
+            return Err("duplicate retained run1 verify-log capture was accepted".into());
+        }
     }
     fs::remove_file(&duplicate_run1)
         .map_err(|e| format!("cannot remove duplicate run1 fixture: {e}"))?;
     fs::write(&run2_log, "").map_err(|e| format!("cannot empty run2 verify-log fixture: {e}"))?;
-    if retained_verification_logs(&sample_a, &sample_artifact_dir).is_ok() {
-        return Err("empty retained run2 verify-log capture was accepted".into());
+    for verdict in [Some("matched"), Some("diverged")] {
+        if retained_verification_logs(&sample_a, &sample_artifact_dir, verdict).is_ok() {
+            return Err("empty retained run2 verify-log capture was accepted".into());
+        }
     }
+    // An empty golden log is refused for a match too.
+    fs::remove_file(&run2_log)
+        .map_err(|e| format!("cannot remove run2 verify-log fixture: {e}"))?;
+    fs::write(&run1_log, "").map_err(|e| format!("cannot empty run1 verify-log fixture: {e}"))?;
+    if retained_verification_logs(&sample_a, &sample_artifact_dir, Some("matched")).is_ok() {
+        return Err("an empty matched run1 golden log was accepted".into());
+    }
+    fs::write(&run1_log, "run one\n")
+        .map_err(|e| format!("cannot restore run1 verify-log fixture: {e}"))?;
     fs::write(&run2_log, "run two\n")
         .map_err(|e| format!("cannot restore run2 verify-log fixture: {e}"))?;
-
-    let golden_status = verify_log_directory.join("normalized-ptrace-golden.status");
-    let golden_log = verify_log_directory.join("normalized-ptrace-golden.log");
-    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir)?.is_some() {
-        return Err("absent normalized ptrace golden produced an artifact".into());
-    }
-    fs::write(&golden_log, "canonical INFO\n")
-        .map_err(|e| format!("cannot write normalized golden fixture: {e}"))?;
-    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir).is_ok() {
-        return Err("normalized ptrace golden without status was accepted".into());
-    }
-    fs::remove_file(&golden_log)
-        .map_err(|e| format!("cannot remove normalized golden fixture: {e}"))?;
-    fs::write(&golden_status, "0\n")
-        .map_err(|e| format!("cannot write normalized golden status: {e}"))?;
-    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir).is_ok() {
-        return Err("normalized ptrace golden status without output was accepted".into());
-    }
-    fs::write(&golden_log, "canonical INFO\n")
-        .map_err(|e| format!("cannot restore normalized golden fixture: {e}"))?;
-    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir)?.is_none() {
-        return Err("complete normalized ptrace golden output/status pair was refused".into());
-    }
-    fs::write(&golden_status, "not-a-status\n")
-        .map_err(|e| format!("cannot mutate normalized golden status: {e}"))?;
-    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir).is_ok() {
-        return Err("nonnumeric normalized ptrace golden status was accepted".into());
-    }
 
     fs::write(&verification_path, "{")
         .map_err(|e| format!("cannot write malformed verification fixture: {e}"))?;
@@ -15273,7 +16486,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: no-hardlinks exact checkout (clean and under inherited Git locations), scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
+        "compatibility pressure-test self-test: no-hardlinks exact checkout (clean and under inherited Git locations), scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, and golden-only/pair verify-log brackets pass"
     );
     Ok(())
 }
@@ -16375,7 +17588,7 @@ mod pressure_sample_tests {
     }
 
     #[test]
-    fn summary_requires_retained_canonical_captures_and_golden_before_confirmed_failure() {
+    fn summary_requires_both_retained_captures_before_confirmed_failure() {
         let root = Path::new(file!())
             .canonicalize()
             .unwrap()
@@ -16452,18 +17665,15 @@ mod pressure_sample_tests {
             fs::create_dir_all(&logs).unwrap();
             let run1 = logs.join("run1_log_fixture.log");
             let run2 = logs.join("run2_log_fixture.log");
-            let golden = logs.join("normalized-ptrace-golden.log");
             fs::write(&run1, "INFO first\n").unwrap();
             fs::write(&run2, "INFO second\n").unwrap();
-            fs::write(&golden, "INFO normalized\n").unwrap();
-            fs::write(logs.join("normalized-ptrace-golden.status"), "0\n").unwrap();
             fs::write(
                 verification_report_path(&artifact),
                 inner.verification_report.as_ref().unwrap(),
             )
             .unwrap();
             if first_paths.is_none() {
-                first_paths = Some((run1, golden));
+                first_paths = Some((run1, run2));
             }
             let mut row = history_row("verify", "FAIL", 1, vec![inner.clone()]);
             row.run_id = run_id;
@@ -16520,13 +17730,25 @@ mod pressure_sample_tests {
             complete["repeated_cells"][0]["classification"],
             "confirmed-failing"
         );
-        let (run1, golden) = first_paths.unwrap();
-        for missing in [&run1, &golden] {
+        // A divergence retains both runs' logs; losing either one refuses the
+        // repetition with the exact text `scorecard.rs` imports on.
+        let (run1, run2) = first_paths.unwrap();
+        for missing in [&run1, &run2] {
             let saved = fs::read(missing).unwrap();
             fs::remove_file(missing).unwrap();
             let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
             assert!(error.contains("no trustworthy result"), "{error}");
             let incomplete = read();
+            assert!(
+                incomplete["rows"][0]["evidence_errors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|error| error == DIVERGED_VERIFY_LOGS_INCOMPLETE),
+                "{}: {}",
+                missing.display(),
+                incomplete["rows"][0]["evidence_errors"]
+            );
             assert_eq!(
                 incomplete["repeated_cells"][0]["classification"],
                 "incomplete",
@@ -16604,7 +17826,7 @@ mod pressure_sample_tests {
         fs::write(&retained_report_path, original_report).unwrap();
         fs::write(&first_row_path, original_row).unwrap();
 
-        // Keep every original missing-capture/golden/history control above. Now
+        // Keep every original missing-capture/history control above. Now
         // retain incidental environmental text on the actual ten typed rows,
         // then make one producer record contradict their independently valid
         // comparison. The same summary path must keep product accounting and
@@ -16672,7 +17894,7 @@ mod pressure_sample_tests {
                     .contains("disagrees with pressure consistency check determinism-failure")
             );
             fs::write(path, valid_row).unwrap();
-            for missing in [&run1, &golden] {
+            for missing in [&run1, &run2] {
                 let saved = fs::read(missing).unwrap();
                 fs::remove_file(missing).unwrap();
                 assert!(summarize(&root, &results, false, Some(&evidence), true).is_err());
@@ -16749,8 +17971,8 @@ mod pressure_sample_tests {
     }
 
     /// Retain `PROMOTION_REPETITIONS` diverged ptrace verify repetitions of
-    /// `selected`, each with its captures, golden and verification report, the
-    /// evidence a confirmed failure needs.
+    /// `selected`, each with both runs' captures and its verification report,
+    /// the evidence a confirmed failure needs.
     fn plant_diverged_verify_series(
         results: &Path,
         selected: &TrackedCell,
@@ -16782,12 +18004,6 @@ mod pressure_sample_tests {
             fs::create_dir_all(&logs).unwrap();
             fs::write(logs.join("run1_log_fixture.log"), "INFO first\n").unwrap();
             fs::write(logs.join("run2_log_fixture.log"), "INFO second\n").unwrap();
-            fs::write(
-                logs.join("normalized-ptrace-golden.log"),
-                "INFO normalized\n",
-            )
-            .unwrap();
-            fs::write(logs.join("normalized-ptrace-golden.status"), "0\n").unwrap();
             fs::write(
                 verification_report_path(&artifact),
                 inner.verification_report.as_ref().unwrap(),
@@ -16950,9 +18166,11 @@ mod pressure_sample_tests {
         // empty or truncated selection. It was 100 while the
         // portable-strict-compat-only run type emitted 189 generated pinned-root
         // probes; one host-run manifest bucket replaced them (fold 2 of
-        // https://github.com/rrnewton/hermit/issues/3448), which leaves 72.
+        // https://github.com/rrnewton/hermit/issues/3448), which left 72.
+        // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 deleted
+        // check.backend_parity_suites, one of those 72, which leaves 71.
         assert!(
-            headers.len() >= 72,
+            headers.len() >= 71,
             "{} pinned-root commands",
             headers.len()
         );
@@ -16994,15 +18212,130 @@ mod pressure_sample_tests {
             .unwrap_or_else(|| panic!("no parity line for {cell} in {records:?}"))
     }
 
+    /// A verify cell whose first repetition the summary refused reaches the
+    /// parity post-pass as the condition the harness's own post-pass
+    /// classifies the same way, checked in the post-pass's order. Every such
+    /// harness or evidence defect is unmeasured, in the floor as 0, as the
+    /// reference or as a candidate. Only a cell the retained harness summary
+    /// proves host-inapplicable leaves no golden, as a `HOST-INAPPLICABLE`
+    /// row does, and nothing the summary refuses is `infrastructure-error`.
+    #[test]
+    fn a_refused_parity_operand_takes_the_class_the_harness_gives_its_condition() {
+        use hermit_manifest_plan::parity::ParityRejection::HostInapplicable;
+        use hermit_manifest_plan::parity::ParityRejection::InvalidRow;
+        use hermit_manifest_plan::parity::ParityRejection::LogNotRetained;
+        use hermit_manifest_plan::parity::ParityRejection::MissingRow;
+        let evidence = RefusedParityEvidence::default();
+        let valid = RefusedParityEvidence {
+            row_valid: true,
+            ..evidence
+        };
+        let every_error = RefusedParityEvidence {
+            other_error: true,
+            log_error: true,
+            ..valid
+        };
+        let cases: [(
+            &str,
+            RefusedParityEvidence,
+            fn(String) -> parity::ParityRejection,
+        ); 7] = [
+            (
+                "proven host-inapplicable",
+                RefusedParityEvidence {
+                    host_inapplicable: true,
+                    no_row: true,
+                    other_error: true,
+                    ..evidence
+                },
+                HostInapplicable,
+            ),
+            (
+                "no row",
+                RefusedParityEvidence {
+                    no_row: true,
+                    other_error: true,
+                    ..evidence
+                },
+                MissingRow,
+            ),
+            (
+                "rows that are not the cell's",
+                RefusedParityEvidence {
+                    log_error: true,
+                    ..evidence
+                },
+                InvalidRow,
+            ),
+            ("contradicted by other evidence", every_error, InvalidRow),
+            (
+                "only other evidence",
+                RefusedParityEvidence {
+                    other_error: true,
+                    ..valid
+                },
+                InvalidRow,
+            ),
+            (
+                "logs",
+                RefusedParityEvidence {
+                    log_error: true,
+                    ..valid
+                },
+                LogNotRetained,
+            ),
+            ("no typed error", valid, InvalidRow),
+        ];
+        for (label, evidence, expected) in cases {
+            let rejection = parity_rejection(label.to_string(), evidence);
+            assert_eq!(rejection, expected(label.to_string()), "{label}");
+            assert_eq!(rejection.reason(), label);
+            let host_inapplicable = matches!(rejection, HostInapplicable(_));
+            for (operand, missing) in [
+                (
+                    parity::ParityOperand::Reference,
+                    parity::ParityVerdict::ReferenceMissing,
+                ),
+                (
+                    parity::ParityOperand::Candidate,
+                    parity::ParityVerdict::CandidateMissing,
+                ),
+            ] {
+                let (_, class) = rejection.typed(operand, missing);
+                assert_ne!(
+                    class,
+                    parity::UnavailableClass::InfrastructureError,
+                    "{label}"
+                );
+                assert_eq!(
+                    class.group(),
+                    if host_inapplicable {
+                        parity::UnavailableGroup::NoGolden
+                    } else {
+                        parity::UnavailableGroup::Unmeasured
+                    },
+                    "{label} as {operand:?}"
+                );
+            }
+        }
+    }
+
     /// The series' parity post-pass is the harness's post-pass, with the
     /// harness's scope rule. It runs after summary.json is written and changes
     /// no file but its own. A selected cell whose ptrace verify cell the series
-    /// ran and whose candidate it did not is candidate-missing with null
-    /// credit; a selected cell with neither side in the series is dropped with
-    /// a warning. A post-pass that measures nothing, because its scope is empty
-    /// or cannot be resolved, leaves no records of an earlier summary behind. A
-    /// verify cell whose first repetition the summary refused makes its parity
-    /// cells unavailable, with the summary's reason.
+    /// ran diverged is nondeterministic with null credit and no golden, before
+    /// its candidate, which the series did not run, is looked for: whether the
+    /// first repetition's own row records the mismatch or, when the summary
+    /// refused that row, a later repetition's row does, even one whose
+    /// evidence the summary refused. A first repetition refused for other
+    /// evidence whose row is the cell's own and recorded the mismatch counts
+    /// the same way. A selected cell with neither side in the series is
+    /// dropped with a warning. A post-pass that measures nothing, because its
+    /// scope is empty or cannot be resolved, leaves no records of an earlier
+    /// summary behind. A verify cell no row of which is the cell's own makes
+    /// its parity cells unmeasured, in the floor as 0, with the class the
+    /// harness gives the first repetition's condition and the summary's
+    /// reason for it.
     #[test]
     fn series_parity_post_pass_reports_missing_operands_and_leaves_the_summary_unchanged() {
         let root = checkout_root();
@@ -17121,17 +18454,39 @@ mod pressure_sample_tests {
         let records = read_parity_records(&parity_path);
         // The cell with neither side in the series has no line.
         assert_eq!(records.len(), 1, "{records:?}");
+        // Every repetition of the reference diverged, so the cell is
+        // nondeterministic, not candidate-missing: the reference has no
+        // deterministic golden log to compare a candidate against.
         let failed = parity_record(&records, &failed_cell);
-        assert_eq!(failed.verdict, parity::ParityVerdict::CandidateMissing);
+        assert_eq!(
+            (failed.verdict, failed.unavailable_class, failed.operand),
+            (
+                parity::ParityVerdict::Nondeterministic,
+                Some(parity::UnavailableClass::DeterminismMismatch),
+                Some(parity::ParityOperand::Reference)
+            ),
+            "{failed:?}"
+        );
         assert!(
             failed
                 .reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains(&format!(
-                    "the {} candidate verify cell of {} has no result row in this run",
-                    failed_cell.backend, failed_cell.test_id
+                .is_some_and(|reason| reason.starts_with(&format!(
+                    "the ptrace reference verify cell of {} failed determinism on attempt 1 (its \
+                 two runs diverged), so there is no deterministic golden log to compare against",
+                    failed_cell.test_id
                 ))),
             "{failed:?}"
+        );
+        assert_eq!(
+            (&failed.reference_log, &failed.candidate_log),
+            (&None, &None)
+        );
+        assert!(
+            !parity::golden_paths(&results, &failed_cell.test_id)
+                .unwrap()
+                .0
+                .exists()
         );
         for record in &records {
             record.validate().unwrap();
@@ -17153,6 +18508,7 @@ mod pressure_sample_tests {
             &metadata,
             &rows,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             &mut out,
             &mut err,
         );
@@ -17162,6 +18518,16 @@ mod pressure_sample_tests {
         );
         assert!(
             out.starts_with("pressure-test: parity: 1 cell(s) -> "),
+            "{out}"
+        );
+        assert!(
+            out.ends_with(
+                ": matched 0, diverged 0, nondeterministic 1, reference-missing 0, \
+                 candidate-missing 0, unavailable 0, inputs-not-equalized 0; measured 0; no \
+                 golden 1 (determinism-mismatch 1); not compared 0; unmeasured 0; none measured \
+                 with equal inputs; none measured with unequal inputs; 0 log-diff \
+                 comparison(s), 0 guest runs\n"
+            ),
             "{out}"
         );
         assert_eq!(err.lines().count(), 1, "{err}");
@@ -17181,7 +18547,11 @@ mod pressure_sample_tests {
         assert!(!status_path.exists());
 
         // A post-pass that fails is reported; the summary and the result stand,
-        // and no earlier records are left behind.
+        // and no earlier records are left behind. A scope that cannot be
+        // resolved leaves a failed status naming the error and no cell, since
+        // the cells it owed are unknown, so the parity append reports it
+        // (review A Low 6 of
+        // <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
         metadata.parity_select = explicit.clone();
         write_metadata(&metadata);
         summarize(&root, &results, false, Some(&evidence), true).unwrap();
@@ -17192,23 +18562,77 @@ mod pressure_sample_tests {
         summarize(&root, &results, false, Some(&evidence), true).unwrap();
         assert_eq!(fs::read(&summary_path).unwrap(), without);
         assert!(!parity_path.exists());
-        assert!(!status_path.exists());
+        let failed: parity::PostPassStatus =
+            serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
+        assert_eq!(failed.state, parity::PostPassState::Failed, "{failed:?}");
+        assert_eq!(
+            (failed.cells, failed.scope.clone(), failed.summary.clone()),
+            (0, Some(Vec::new()), None),
+            "{failed:?}"
+        );
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|error| error
+                    .contains("no manifest declares test \"no-such-bucket/no-such-test\"")),
+            "{failed:?}"
+        );
+        assert!(
+            parity::node_ledger_sources(
+                &results,
+                parity::PRESSURE_TEST_LEDGER_LANE,
+                parity::PRESSURE_TEST_LEDGER_NODE,
+                None,
+            )
+            .unwrap()
+            .is_empty()
+        );
 
-        // A first repetition the summary refused is never read: its parity
-        // cell is unavailable with the summary's reason, not missing.
+        // A first repetition the summary refused is never compared. Rows that
+        // contradict their harness exit are not the cell's own: an invalid
+        // row, like a history the harness refuses, and no evidence of a
+        // mismatch either way, although every one of them recorded one. The
+        // cell is unmeasured with the summary's reason, in the floor as 0. A
+        // refused reference does not take its test's cells out of the floor.
         metadata.parity_select = vec![failed_cell.to_string()];
         write_metadata(&metadata);
-        let harness_status = first_repetition.join("harness-status");
-        fs::write(&harness_status, "x\n").unwrap();
+        let harness_statuses: Vec<PathBuf> = (1..=PROMOTION_REPETITIONS)
+            .map(|repetition| {
+                results
+                    .join("cells")
+                    .join(cell_run_slug(&selected.id, Some(repetition)))
+                    .join("harness-status")
+            })
+            .collect();
+        for harness_status in &harness_statuses {
+            fs::write(harness_status, "x\n").unwrap();
+        }
         let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
         assert!(error.contains("produced no trustworthy result"), "{error}");
         let records = read_parity_records(&parity_path);
         assert_eq!(records.len(), 1, "{records:?}");
         let refused = parity_record(&records, &failed_cell);
         assert_eq!(
-            refused.verdict,
-            parity::ParityVerdict::Unavailable,
+            (refused.verdict, refused.unavailable_class, refused.operand),
+            (
+                parity::ParityVerdict::Unavailable,
+                Some(parity::UnavailableClass::NoResultRow),
+                Some(parity::ParityOperand::Reference)
+            ),
             "{refused:?}"
+        );
+        assert_eq!(
+            refused
+                .unavailable_class
+                .map(parity::UnavailableClass::group),
+            Some(parity::UnavailableGroup::Unmeasured),
+            "{refused:?}"
+        );
+        assert_eq!((refused.credit, refused.unequalized_credit), (None, None));
+        assert_eq!(
+            (&refused.reference_log, &refused.candidate_log),
+            (&None, &None)
         );
         let reason = refused.reason.as_deref().unwrap_or_default();
         assert!(
@@ -17219,7 +18643,120 @@ mod pressure_sample_tests {
             "{refused:?}"
         );
         refused.validate().unwrap();
-        fs::write(&harness_status, "1\n").unwrap();
+        // The same refused first repetition, but the later repetitions the
+        // summary accepts recorded the mismatch: the reference diverged, so
+        // the cell is nondeterministic, where the earliest of them says.
+        for harness_status in &harness_statuses[1..] {
+            fs::write(harness_status, "1\n").unwrap();
+        }
+        let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
+        assert!(error.contains("produced no trustworthy result"), "{error}");
+        let records = read_parity_records(&parity_path);
+        assert_eq!(records.len(), 1, "{records:?}");
+        let diverged = parity_record(&records, &failed_cell);
+        assert_eq!(
+            (
+                diverged.verdict,
+                diverged.unavailable_class,
+                diverged.operand
+            ),
+            (
+                parity::ParityVerdict::Nondeterministic,
+                Some(parity::UnavailableClass::DeterminismMismatch),
+                Some(parity::ParityOperand::Reference)
+            ),
+            "{diverged:?}"
+        );
+        assert_eq!(
+            diverged.reason.as_deref(),
+            Some(
+                format!(
+                    "the ptrace reference verify cell of {} failed determinism: repetition 2 \
+                     attempt 1 recorded a verify mismatch, so there is no deterministic golden \
+                     log to compare against",
+                    failed_cell.test_id
+                )
+                .as_str()
+            ),
+            "{diverged:?}"
+        );
+        diverged.validate().unwrap();
+
+        // A later repetition whose row is the cell's own but whose evidence
+        // the summary refused still recorded the mismatch. Decision 1 of
+        // <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5895129378>
+        // reads "Any mismatch in an operand's attempt history means no
+        // golden", so the cell is nondeterministic, and the reason names what
+        // the summary refused (review A Low 4 of
+        // <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
+        let run2_logs: Vec<PathBuf> = (1..=PROMOTION_REPETITIONS)
+            .map(|repetition| {
+                results
+                    .join("runs")
+                    .join(cell_evidence_run_id(
+                        &selected.id,
+                        Some(repetition),
+                        metadata.run_id_prefix.as_deref(),
+                    ))
+                    .join("attempt-1/verify-logs/verify-1/run2_log_fixture.log")
+            })
+            .collect();
+        for run2_log in &run2_logs[1..] {
+            fs::remove_file(run2_log).unwrap();
+        }
+        let refused_mismatch = |repetition: usize| {
+            let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
+            assert!(error.contains("produced no trustworthy result"), "{error}");
+            let records = read_parity_records(&parity_path);
+            assert_eq!(records.len(), 1, "{records:?}");
+            let record = parity_record(&records, &failed_cell);
+            assert_eq!(
+                (record.verdict, record.unavailable_class, record.operand),
+                (
+                    parity::ParityVerdict::Nondeterministic,
+                    Some(parity::UnavailableClass::DeterminismMismatch),
+                    Some(parity::ParityOperand::Reference)
+                ),
+                "{record:?}"
+            );
+            let reason = record.reason.as_deref().unwrap_or_default();
+            assert!(
+                reason.starts_with(&format!(
+                    "the ptrace reference verify cell of {} failed determinism: repetition \
+                     {repetition} attempt 1 recorded a verify mismatch in a result row the series \
+                     summary rejected: ",
+                    failed_cell.test_id
+                )),
+                "{record:?}"
+            );
+            assert!(
+                reason.contains(
+                    "must contain exactly one nonempty run1 capture and one nonempty run2 capture"
+                ),
+                "{record:?}"
+            );
+            assert!(
+                reason.ends_with(", so there is no deterministic golden log to compare against"),
+                "{record:?}"
+            );
+            assert_eq!(
+                (&record.reference_log, &record.candidate_log),
+                (&None, &None)
+            );
+            record.validate().unwrap();
+        };
+        refused_mismatch(2);
+        // The same when the first repetition's row is the cell's own but the
+        // summary refused its evidence: its mismatch is the earliest, and the
+        // harness's post-pass, which reads every attempt of the cell, finds
+        // such a mismatch before it looks for a log. Only rows that are not
+        // the cell's, as in the first refusal above, are no evidence.
+        fs::write(&harness_statuses[0], "1\n").unwrap();
+        fs::remove_file(&run2_logs[0]).unwrap();
+        refused_mismatch(1);
+        for run2_log in &run2_logs {
+            fs::write(run2_log, "INFO second\n").unwrap();
+        }
         cleanup.remove().unwrap();
     }
 
@@ -17228,9 +18765,13 @@ mod pressure_sample_tests {
     /// candidate is compared, through `summarize`, by the log-diff of the
     /// binary the cells ran, as unequalized credit. A panic in the post-pass,
     /// or an output that cannot be written, changes neither the summary nor
-    /// the result, and a panic leaves no earlier records behind. A cell whose
-    /// row is valid but whose retained evidence the summary refused is
-    /// unavailable with that reason and is not compared.
+    /// the result, and a panic leaves no earlier records behind. Each matched
+    /// cell retains only its run-1 golden log, as `hermit run --keep-logs` does
+    /// after a match. A cell whose row is valid but whose retained logs the
+    /// summary refused -- a match that kept run 2's log too, or lost its
+    /// golden log -- is not compared: it did not retain the logs the summary
+    /// requires, unmeasured (`log-not-retained`) with the summary's reason and
+    /// in the floor as 0.
     #[test]
     fn series_parity_post_pass_measures_only_the_verify_cells_summarize_accepted() {
         let root = checkout_root();
@@ -17341,7 +18882,7 @@ mod pressure_sample_tests {
         };
         let mut evidence = BTreeMap::new();
         let mut rows = Vec::new();
-        let mut run2_logs = BTreeMap::new();
+        let mut run_logs = BTreeMap::new();
         for id in &metadata.cells {
             let reference = id.backend == parity::PARITY_REFERENCE_BACKEND;
             let slug = cell_run_slug(id, Some(1));
@@ -17356,13 +18897,17 @@ mod pressure_sample_tests {
                 "INFO detcore a\nINFO detcore b\nINFO detcore {}\n",
                 if reference { "c" } else { "x" }
             );
+            // A match retains only run 1's golden log: `hermit run --keep-logs`
+            // deletes run 2's log, which matched it
+            // (https://github.com/rrnewton/hermit/issues/3301).
             fs::write(logs.join("run1_log_fixture.log"), &log).unwrap();
-            fs::write(logs.join("run2_log_fixture.log"), &log).unwrap();
-            run2_logs.insert(id.backend.clone(), logs.join("run2_log_fixture.log"));
-            if reference {
-                fs::write(logs.join("normalized-ptrace-golden.log"), &log).unwrap();
-                fs::write(logs.join("normalized-ptrace-golden.status"), "0\n").unwrap();
-            }
+            run_logs.insert(
+                id.backend.clone(),
+                (
+                    logs.join("run1_log_fixture.log"),
+                    logs.join("run2_log_fixture.log"),
+                ),
+            );
             let mut inner = comparison_attempt("verify", 0);
             inner.argv = vec![
                 hermit.to_string_lossy().into_owned(),
@@ -17418,6 +18963,22 @@ mod pressure_sample_tests {
 
         summarize(&root, &results, false, Some(&evidence), true).unwrap();
         let summary = fs::read(&summary_path).unwrap();
+        // Both matched cells pass on their golden log alone, and the summary
+        // names only that log.
+        let accepted: JsonValue = serde_json::from_slice(&summary).unwrap();
+        let accepted_rows = accepted["rows"].as_array().unwrap();
+        assert_eq!(accepted_rows.len(), metadata.cells.len(), "{accepted}");
+        for row in accepted_rows {
+            let backend = row["cell"]["backend"].as_str().unwrap();
+            assert_eq!(row["result"], "pass", "{row}");
+            assert_eq!(row["evidence_errors"], json!([]), "{row}");
+            assert_eq!(
+                row["verification_logs"],
+                json!([run_logs[backend].0.to_string_lossy()]),
+                "{row}"
+            );
+            assert!(row.get("normalized_ptrace_golden").is_none(), "{row}");
+        }
         let records = read_parity_records(&parity_path);
         let measured = parity_record(&records, &cell);
         assert_eq!(
@@ -17452,14 +19013,61 @@ mod pressure_sample_tests {
         assert!(golden.is_file() && sidecar.is_file());
         assert_eq!(log_diff_calls(), 1);
 
-        // A panic in the post-pass is reported and changes nothing else, and
-        // the records of the previous summary are gone.
+        // A panic in the post-pass is reported and changes nothing else: the
+        // records of the previous summary are gone, and a failed status names
+        // the panic and every cell the post-pass owed, so each is a
+        // record-missing row rather than an empty report (review A Low 6 of
+        // <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
         PANIC_IN_SERIES_PARITY.with(|armed| armed.set(true));
         summarize(&root, &results, false, Some(&evidence), true).unwrap();
         assert!(!PANIC_IN_SERIES_PARITY.with(std::cell::Cell::get));
         assert_eq!(fs::read(&summary_path).unwrap(), summary);
         assert!(!parity_path.exists());
-        assert!(!status_path.exists());
+        let owed = records
+            .iter()
+            .map(|record| parity::ParityCellId {
+                test_id: record.test_id.clone(),
+                backend: record.backend,
+            })
+            .collect::<BTreeSet<_>>()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let panicked = "the series parity post-pass panicked: planted series post-pass panic";
+        let failed: parity::PostPassStatus =
+            serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
+        assert_eq!(failed.state, parity::PostPassState::Failed, "{failed:?}");
+        assert_eq!(failed.error.as_deref(), Some(panicked), "{failed:?}");
+        assert_eq!(
+            (failed.cells, failed.scope.clone(), failed.summary.clone()),
+            (owed.len(), Some(owed.clone()), None),
+            "{failed:?}"
+        );
+        let owed_rows = parity::node_ledger_sources(
+            &results,
+            parity::PRESSURE_TEST_LEDGER_LANE,
+            parity::PRESSURE_TEST_LEDGER_NODE,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            owed_rows
+                .iter()
+                .map(|row| row.cell.clone())
+                .collect::<Vec<_>>(),
+            owed
+        );
+        let missing_reason = format!("parity post-pass failed: {panicked}");
+        for row in &owed_rows {
+            assert_eq!(
+                (row.verdict, row.reason.as_deref()),
+                (
+                    parity::LedgerVerdict::RecordMissing,
+                    Some(missing_reason.as_str())
+                ),
+                "{row:?}"
+            );
+        }
         assert_eq!(log_diff_calls(), 1);
         PANIC_IN_SERIES_PARITY.with(|armed| armed.set(true));
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -17469,13 +19077,16 @@ mod pressure_sample_tests {
             &metadata,
             &rows,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             &mut out,
             &mut err,
         );
         let err = String::from_utf8(err).unwrap();
         assert!(out.is_empty());
         assert!(
-            err.contains("pressure-test: parity post-pass panicked (exit status unaffected)"),
+            err.contains(&format!(
+                "pressure-test: parity post-pass panicked (exit status unaffected): {panicked}\n"
+            )),
             "{err}"
         );
 
@@ -17495,6 +19106,7 @@ mod pressure_sample_tests {
             &metadata,
             &rows,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             &mut Closed,
             &mut Closed,
         );
@@ -17504,30 +19116,62 @@ mod pressure_sample_tests {
             parity::ParityVerdict::Diverged
         );
 
-        // A valid row whose retained evidence the summary refused is not
-        // compared: its cell is unavailable with the summary's reason.
-        fs::remove_file(&run2_logs[cell.backend.as_str()]).unwrap();
-        let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
-        assert!(error.contains("produced no trustworthy result"), "{error}");
-        let records = read_parity_records(&parity_path);
-        let refused = parity_record(&records, &cell);
-        assert_eq!(
-            refused.verdict,
-            parity::ParityVerdict::Unavailable,
-            "{refused:?}"
-        );
-        let reason = refused.reason.as_deref().unwrap_or_default();
-        assert!(
-            reason.contains(&format!(
-                "the {} candidate verify cell of {}: result row rejected by the series summary: ",
-                cell.backend, cell.test_id
-            )) && reason.contains(
-                "terminal verify result must retain exactly one nonempty run1 log and one nonempty run2 log"
-            ),
-            "{refused:?}"
-        );
-        refused.validate().unwrap();
-        assert_eq!(log_diff_calls(), 2);
+        // A valid row whose retained logs the summary refused is not
+        // compared. A match that kept run 2's log beside its golden log is
+        // refused, and so is one that lost its golden log. Either way the
+        // candidate did not retain the logs the summary requires: unmeasured
+        // with the summary's reason, in the floor as 0, and the golden is
+        // still named.
+        let golden_text = golden.to_string_lossy().into_owned();
+        let (candidate_run1, candidate_run2) = &run_logs[cell.backend.as_str()];
+        let golden = fs::read(candidate_run1).unwrap();
+        for retained_run2 in [true, false] {
+            if retained_run2 {
+                fs::write(candidate_run2, &golden).unwrap();
+            } else {
+                fs::remove_file(candidate_run2).unwrap();
+                fs::remove_file(candidate_run1).unwrap();
+            }
+            let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
+            assert!(error.contains("produced no trustworthy result"), "{error}");
+            let records = read_parity_records(&parity_path);
+            let refused = parity_record(&records, &cell);
+            assert_eq!(
+                (refused.verdict, refused.unavailable_class, refused.operand),
+                (
+                    parity::ParityVerdict::CandidateMissing,
+                    Some(parity::UnavailableClass::LogNotRetained),
+                    Some(parity::ParityOperand::Candidate)
+                ),
+                "{refused:?}"
+            );
+            assert_eq!(
+                refused
+                    .unavailable_class
+                    .map(parity::UnavailableClass::group),
+                Some(parity::UnavailableGroup::Unmeasured),
+                "{refused:?}"
+            );
+            assert_eq!((refused.credit, refused.unequalized_credit), (None, None));
+            assert_eq!(
+                (
+                    refused.reference_log.as_deref(),
+                    refused.candidate_log.as_deref()
+                ),
+                (Some(golden_text.as_str()), None),
+                "{refused:?}"
+            );
+            let reason = refused.reason.as_deref().unwrap_or_default();
+            assert!(
+                reason.contains(&format!(
+                    "the {} candidate verify cell of {}: result row rejected by the series summary: ",
+                    cell.backend, cell.test_id
+                )) && reason.contains(MATCHED_VERIFY_LOGS_NOT_GOLDEN_ONLY),
+                "run2 retained: {retained_run2}: {refused:?}"
+            );
+            refused.validate().unwrap();
+            assert_eq!(log_diff_calls(), 2);
+        }
         cleanup.remove().unwrap();
     }
 
@@ -17975,5 +19619,679 @@ mod cpu_observation_reader_tests {
                 .is_none()
         );
         cleanup.remove().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod series_parity_append_tests {
+    //! The pressure-test parity append of
+    //! <https://github.com/rrnewton/hermit/issues/3301>: a series' post-pass
+    //! outputs reach `series.py append-parity` as `pressure-test` rows, and no
+    //! outcome of it is an error.
+    use super::*;
+
+    const TREE: &str = "d3a0a4ae3d168565595ae4157b25ab8efbb1861a";
+    const RUN: &str = "pressure-parity-fixture";
+
+    /// RUN 1953's first portable record, with this fixture's run id and the
+    /// `unavailable_class` and `operand` every record now carries (both
+    /// `null` for a measured verdict) inserted after its verdict.
+    fn diverged_record() -> String {
+        r#"{"schema":1,"test_id":"c-programs/aio-refusal","backend":"kvm","verdict":"diverged","unavailable_class":null,"operand":null,"inputs_equalized":false,"reason":null,"credit":null,"unequalized_credit":0.11320754716981132,"first_divergent_record":13,"left_len":106,"right_len":106,"matched_prefix":12,"first_difference":{"field":"token 12: `Ok(93824992251904)` vs `Ok(2117632)`","syscall":2,"scheduler_turn":1,"virtual_nanoseconds":1790651878158833000,"reference_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(93824992251904)","candidate_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(2117632)"},"reference_log":"ref.detlog","candidate_log":"run1_log","run_id":"RUN","hermit_sha":"TREE"}"#
+            .replace("RUN", RUN)
+            .replace("TREE", TREE)
+    }
+
+    /// A writer with `append-parity`: its `--help` exits 0, and an append
+    /// records its argv and stdin under the parent.
+    const WRITER: &str = r#"import json, pathlib, sys
+if sys.argv[1:] == ["append-parity", "--help"]:
+    print("usage: series.py append-parity --parent PARENT ...")
+    sys.exit(0)
+parent = pathlib.Path(sys.argv[sys.argv.index("--parent") + 1])
+parent.joinpath("captured.json").write_text(json.dumps({"argv": sys.argv[1:], "stdin": sys.stdin.read()}))
+print("fixture parity append accepted")
+"#;
+
+    /// A writer from before `append-parity`: like dev-hermit's `series.py`,
+    /// it answers an unknown subcommand with its usage and exit 2.
+    const LEGACY_WRITER: &str = r#"import json, pathlib, sys
+if "--parent" in sys.argv:
+    parent = pathlib.Path(sys.argv[sys.argv.index("--parent") + 1])
+    parent.joinpath("captured.json").write_text("{}")
+print("usage: series.py {append-cells,lint} ...", file=sys.stderr)
+print("series.py: error: argument command: invalid choice: 'append-parity'", file=sys.stderr)
+sys.exit(2)
+"#;
+
+    struct Fixture {
+        root: SelfTestDirectory,
+    }
+
+    impl Fixture {
+        /// A series result directory whose post-pass failed after measuring
+        /// one of its two cells, and a writer at `series.py`.
+        fn new(label: &str, writer: &str) -> Self {
+            let path = env::temp_dir().join(format!(
+                "hermit-pressure-self-test-parity-append-{}-{label}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            for dir in [path.join("parent"), path.join("results")] {
+                fs::create_dir_all(dir).unwrap();
+            }
+            fs::write(path.join("series.py"), writer).unwrap();
+            let status = json!({
+                "schema": 2, "state": "failed", "run_id": RUN, "hermit_sha": TREE,
+                "hermit_bin": "/src/hermit", "hermit_bin_sha256": null,
+                "records": "/results/parity.jsonl", "cells": 2,
+                "scope": ["c-programs/aio-refusal@kvm", "c-programs/cpuid-probe@liteinst"],
+                "summary": null, "error": "log-diff timed out",
+            });
+            fs::write(
+                path.join("results").join(parity::PARITY_STATUS_JSON),
+                status.to_string(),
+            )
+            .unwrap();
+            fs::write(
+                path.join("results").join(parity::PARITY_JSONL),
+                diverged_record() + "\n",
+            )
+            .unwrap();
+            Fixture {
+                root: SelfTestDirectory::new(path),
+            }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.root.path.join(name)
+        }
+
+        fn append(&self) -> String {
+            append_series_parity(
+                &self.path("series.py"),
+                &self.path("parent"),
+                &self.path("results"),
+                RUN,
+                TREE,
+                false,
+                parity::AppendBounds::default(),
+            )
+        }
+
+        fn captured(&self) -> Option<JsonValue> {
+            fs::read(self.path("parent/captured.json"))
+                .ok()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        }
+    }
+
+    #[test]
+    fn a_series_post_pass_reaches_append_parity_as_pressure_test_rows() {
+        let fixture = Fixture::new("rows", WRITER);
+        assert_eq!(
+            fixture.append(),
+            format!(
+                "parity: append-parity accepted 2 row(s) from {} (diverged 1, record-missing 1): \
+                 fixture parity append accepted",
+                fixture.path("results").display()
+            )
+        );
+        let captured = fixture.captured().expect("append-parity was called");
+        let argv = captured["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(argv[0], "append-parity");
+        let parent = fixture.path("parent").display().to_string();
+        for pair in [
+            ["--parent", parent.as_str()],
+            ["--producer", "pressure-test"],
+            ["--run-id", RUN],
+            ["--tree", TREE],
+            ["--source-tree-dirty", "false"],
+        ] {
+            assert!(
+                argv.windows(2).any(|window| window == pair),
+                "{pair:?} missing from {argv:?}"
+            );
+        }
+        let stdin = captured["stdin"].as_str().unwrap();
+        let rows = stdin
+            .lines()
+            .map(|line| serde_json::from_str::<JsonValue>(line).unwrap())
+            .collect::<Vec<_>>();
+        let seen = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["cell"].as_str().unwrap(),
+                    row["verdict"].as_str().unwrap(),
+                    row["source"]["lane"].as_str().unwrap(),
+                    row["source"]["node"].as_str().unwrap(),
+                    row["source"]["post_pass_state"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            seen,
+            [
+                (
+                    "c-programs/aio-refusal@kvm",
+                    "diverged",
+                    "pressure-test",
+                    "post-pass",
+                    "failed"
+                ),
+                (
+                    "c-programs/cpuid-probe@liteinst",
+                    "record-missing",
+                    "pressure-test",
+                    "post-pass",
+                    "failed"
+                ),
+            ]
+        );
+        assert_eq!(
+            rows[1]["reason"],
+            "parity post-pass failed: log-diff timed out"
+        );
+        // The record reaches the writer byte-for-byte as the post-pass wrote it.
+        assert!(
+            stdin
+                .lines()
+                .next()
+                .unwrap()
+                .contains(&format!(r#""record":{}"#, diverged_record())),
+            "{stdin}"
+        );
+    }
+
+    #[test]
+    fn a_writer_without_append_parity_is_named_and_leaves_the_rows() {
+        let fixture = Fixture::new("legacy", LEGACY_WRITER);
+        assert_eq!(
+            fixture.append(),
+            format!(
+                "parity: the series writer {} has no append-parity (`append-parity --help` \
+                 exit status: 2); 2 rows left in {} (diverged 1, record-missing 1)",
+                fixture.path("series.py").display(),
+                fixture.path("results").display()
+            )
+        );
+        assert!(
+            fixture.captured().is_none(),
+            "a legacy writer is only probed, never sent the rows"
+        );
+    }
+
+    #[test]
+    fn a_series_without_post_pass_output_appends_nothing() {
+        let fixture = Fixture::new("absent", WRITER);
+        fs::remove_file(fixture.path("results").join(parity::PARITY_STATUS_JSON)).unwrap();
+        fs::remove_file(fixture.path("results").join(parity::PARITY_JSONL)).unwrap();
+        assert_eq!(
+            fixture.append(),
+            format!(
+                "parity: no parity post-pass output in {}; nothing appended",
+                fixture.path("results").display()
+            )
+        );
+        assert!(fixture.captured().is_none());
+    }
+
+    #[test]
+    fn refused_outputs_and_a_refusing_writer_are_lines_not_failures() {
+        let refusing = WRITER.replace(
+            "print(\"fixture parity append accepted\")",
+            "sys.exit(\"fixture refusal\")",
+        );
+        let fixture = Fixture::new("refusing", &refusing);
+        let line = fixture.append();
+        assert!(
+            line.starts_with(
+                "parity: ERROR: append-parity refused them (exit status: 1): fixture refusal; \
+                 2 rows left in "
+            ),
+            "{line}"
+        );
+        // Records with no status beside them cannot be attributed.
+        fs::remove_file(fixture.path("results").join(parity::PARITY_STATUS_JSON)).unwrap();
+        let line = fixture.append();
+        assert!(
+            line.starts_with("parity: ERROR: no parity rows appended; the post-pass outputs in ")
+                && line.contains("has no parity.status.json beside it"),
+            "{line}"
+        );
+    }
+
+    /// A dev-hermit checkout under `root` whose `series.py` records every
+    /// append it is sent in `calls.jsonl`; its append-cells exits
+    /// `cells_exit`.
+    fn recording_parent(root: &Path, cells_exit: u8) -> PathBuf {
+        let parent = root.join("parent");
+        let series = parent.join("ci-hub/series");
+        fs::create_dir_all(&series).unwrap();
+        fs::write(
+            series.join("series.py"),
+            format!(
+                r#"import json, pathlib, sys
+args = sys.argv[1:]
+if args == ["append-parity", "--help"]:
+    sys.exit(0)
+parent = pathlib.Path(args[args.index("--parent") + 1])
+with parent.joinpath("calls.jsonl").open("a") as calls:
+    calls.write(json.dumps({{"argv": args, "stdin": sys.stdin.read()}}) + "\n")
+if args[0] == "append-cells" and {cells_exit}:
+    sys.exit({cells_exit})
+print("fixture " + args[0] + " accepted")
+"#
+            ),
+        )
+        .unwrap();
+        parent
+    }
+
+    fn recorded_calls(parent: &Path) -> Vec<(Vec<String>, Vec<JsonValue>)> {
+        let Ok(text) = fs::read_to_string(parent.join("calls.jsonl")) else {
+            return Vec::new();
+        };
+        text.lines()
+            .map(|line| {
+                let call: JsonValue = serde_json::from_str(line).unwrap();
+                let argv = call["argv"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_str().unwrap().to_string())
+                    .collect();
+                let stdin = call["stdin"]
+                    .as_str()
+                    .unwrap()
+                    .lines()
+                    .map(|row| serde_json::from_str(row).unwrap())
+                    .collect();
+                (argv, stdin)
+            })
+            .collect()
+    }
+
+    /// `emit_series`, the call site that sends a run's cells and then its
+    /// parity rows (E7 of the S12 review), reaches both writers with the
+    /// run's identity, sends the parity rows with the tree state the
+    /// campaign's `run.json` recorded, and sends them even when the cells
+    /// are refused.
+    #[test]
+    fn emitting_a_series_sends_its_cells_and_then_its_parity_rows() {
+        for (cells_exit, dirty) in [(0u8, false), (1, false), (0, true), (1, true)] {
+            let fixture = Fixture::new(&format!("emit-{cells_exit}-{dirty}"), WRITER);
+            let parent = recording_parent(&fixture.root.path, cells_exit);
+            let results = fixture.path("results");
+            let checkout = fixture.path("checkout");
+            fs::write(
+                results.join("run.json"),
+                json!({
+                    "schema": RUN_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
+                    "detcore_tree": "fixture-detcore-tree", "source_tree_dirty": dirty,
+                    "run_timeout_seconds": 60, "cells": [],
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let cell = results.join("cells/portable-aio-refusal-verify-kvm");
+            fs::create_dir_all(&cell).unwrap();
+            let row = json!({
+                "schema": CELL_RESULT_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
+                "source_tree_dirty": dirty, "test": "c-programs/aio-refusal",
+                "category": "c-programs", "lane": "portable", "mode": "verify",
+                "backend": "kvm", "classification": "required", "outcome": "PASS",
+                "attempt": 1, "run_index": 0, "argv": ["fixture"], "guest_argv": ["fixture"],
+                "env": {}, "cwd": "/", "shell_command": "fixture", "attempts": [],
+                "artifact_dir": "/retained/1",
+            });
+            fs::write(cell.join("results.jsonl"), format!("{row}\n")).unwrap();
+
+            let emission = emit_series_to(
+                &parent,
+                &results,
+                &checkout,
+                false,
+                SERIES_APPEND_CELLS_BOUND,
+                parity::AppendBounds::default(),
+            );
+            let expected_cells = if cells_exit == 0 {
+                Ok(format!(
+                    "emitted 1 cell result(s) from run {RUN} to {}",
+                    parent.display()
+                ))
+            } else {
+                Err(
+                    "the series writer rejected one or more cell results (exit Some(1)); \
+                     valid completed rows, if any, were retained"
+                        .to_string(),
+                )
+            };
+            assert_eq!(emission.cells, expected_cells);
+            assert_eq!(
+                emission.parity,
+                Some(format!(
+                    "parity: append-parity accepted 2 row(s) from {} (diverged 1, \
+                     record-missing 1): fixture append-parity accepted",
+                    results.display()
+                )),
+                "the parity rows go out whatever became of the cells"
+            );
+            let parent_arg = parent.display().to_string();
+            let checkout_arg = checkout.display().to_string();
+            let calls = recorded_calls(&parent);
+            let argv = calls
+                .iter()
+                .map(|(argv, _)| argv.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                argv,
+                [
+                    vec![
+                        "append-cells",
+                        "--parent",
+                        &parent_arg,
+                        "--checkout",
+                        &checkout_arg,
+                        "--producer",
+                        "pressure-test",
+                        "--run-id",
+                        RUN,
+                        "--tree",
+                        TREE,
+                    ],
+                    vec![
+                        "append-parity",
+                        "--parent",
+                        &parent_arg,
+                        "--producer",
+                        "pressure-test",
+                        "--run-id",
+                        RUN,
+                        "--tree",
+                        TREE,
+                        "--source-tree-dirty",
+                        if dirty { "true" } else { "false" },
+                    ],
+                ]
+            );
+            let cells = calls[0]
+                .1
+                .iter()
+                .map(|row| {
+                    (
+                        row["test"].as_str().unwrap(),
+                        row["backend"].as_str().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(cells, [("c-programs/aio-refusal", "kvm")]);
+            let parity_rows = calls[1]
+                .1
+                .iter()
+                .map(|row| {
+                    (
+                        row["cell"].as_str().unwrap(),
+                        row["verdict"].as_str().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                parity_rows,
+                [
+                    ("c-programs/aio-refusal@kvm", "diverged"),
+                    ("c-programs/cpuid-probe@liteinst", "record-missing"),
+                ]
+            );
+        }
+
+        // An emit that stops before offering the cells sends no parity rows
+        // either, and says why.
+        let fixture = Fixture::new("emit-unreadable", WRITER);
+        let parent = recording_parent(&fixture.root.path, 0);
+        let emission = emit_series_to(
+            &parent,
+            &fixture.path("results"),
+            &fixture.path("checkout"),
+            false,
+            SERIES_APPEND_CELLS_BOUND,
+            parity::AppendBounds::default(),
+        );
+        let error = emission
+            .cells
+            .expect_err("a run with no run.json emits nothing");
+        assert!(error.starts_with("cannot read "), "{error}");
+        assert_eq!(emission.parity, None);
+        assert!(recorded_calls(&parent).is_empty());
+    }
+
+    /// A series post-pass that failed before it knew its scope leaves a
+    /// failed status naming no cell, which yields no row. The line is an
+    /// `ERROR:` naming the failure, never the benign line for a series with
+    /// no post-pass output, and the writer is not called (review A Low 6 of
+    /// <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
+    #[test]
+    fn a_post_pass_that_named_no_cell_is_an_error_line() {
+        let fixture = Fixture::new("scopeless", WRITER);
+        let results = fixture.path("results");
+        fs::remove_file(results.join(parity::PARITY_JSONL)).unwrap();
+        for (state, error, line) in [
+            (
+                "failed",
+                json!("cannot derive the parity matrix: fixture"),
+                "failed and named no cell it owed (cannot derive the parity matrix: fixture)",
+            ),
+            (
+                "running",
+                JsonValue::Null,
+                "never finished and named no cell it owed (no error recorded)",
+            ),
+        ] {
+            let status = json!({
+                "schema": 2, "state": state, "run_id": RUN, "hermit_sha": TREE,
+                "hermit_bin": "/src/hermit", "hermit_bin_sha256": null,
+                "records": "/results/parity.jsonl", "cells": 0, "scope": [],
+                "summary": null, "error": error,
+            });
+            fs::write(results.join(parity::PARITY_STATUS_JSON), status.to_string()).unwrap();
+            assert_eq!(
+                fixture.append(),
+                format!(
+                    "parity: ERROR: the series post-pass in {} {line}; no parity rows appended",
+                    results.display()
+                )
+            );
+            assert!(
+                fixture.captured().is_none(),
+                "no row, so the writer is not called"
+            );
+        }
+    }
+
+    /// One verify cell of run [`RUN`] under `results`, as
+    /// [`emitting_a_series_sends_its_cells_and_then_its_parity_rows`] plants
+    /// it, carrying an environment variable `pad` bytes long.
+    fn plant_emittable_series(results: &Path, pad: usize) {
+        fs::write(
+            results.join("run.json"),
+            json!({
+                "schema": RUN_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
+                "detcore_tree": "fixture-detcore-tree", "source_tree_dirty": false,
+                "run_timeout_seconds": 60, "cells": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cell = results.join("cells/portable-aio-refusal-verify-kvm");
+        fs::create_dir_all(&cell).unwrap();
+        let row = json!({
+            "schema": CELL_RESULT_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
+            "source_tree_dirty": false, "test": "c-programs/aio-refusal",
+            "category": "c-programs", "lane": "portable", "mode": "verify",
+            "backend": "kvm", "classification": "required", "outcome": "PASS",
+            "attempt": 1, "run_index": 0, "argv": ["fixture"], "guest_argv": ["fixture"],
+            "env": {"PRESSURE_FIXTURE_PAD": "x".repeat(pad)}, "cwd": "/",
+            "shell_command": "fixture", "attempts": [], "artifact_dir": "/retained/1",
+        });
+        fs::write(cell.join("results.jsonl"), format!("{row}\n")).unwrap();
+    }
+
+    /// A dev-hermit checkout under `root` whose `series.py` reads and accepts
+    /// an append-parity and runs `cells`, Python with `args`, `parent`,
+    /// `json`, `os`, `stat`, `subprocess`, `sys` and `time` in scope, for an
+    /// append-cells.
+    fn scripted_parent(root: &Path, cells: &str) -> PathBuf {
+        let parent = root.join("parent");
+        let series = parent.join("ci-hub/series");
+        fs::create_dir_all(&series).unwrap();
+        let script = [
+            "import json, os, pathlib, stat, subprocess, sys, time",
+            "args = sys.argv[1:]",
+            "if args == ['append-parity', '--help']:",
+            "    sys.exit(0)",
+            "parent = pathlib.Path(args[args.index('--parent') + 1])",
+            "if args[0] == 'append-parity':",
+            "    sys.stdin.read()",
+            "    print('fixture append-parity accepted')",
+            "    sys.exit(0)",
+            cells,
+        ]
+        .join("\n");
+        fs::write(series.join("series.py"), script + "\n").unwrap();
+        parent
+    }
+
+    /// The parity line of an emit whose parity rows reached the writer.
+    fn accepted_parity(results: &Path) -> Option<String> {
+        Some(format!(
+            "parity: append-parity accepted 2 row(s) from {} (diverged 1, record-missing 1): \
+             fixture append-parity accepted",
+            results.display()
+        ))
+    }
+
+    /// The cells reach append-cells from an unlinked regular file, never a
+    /// pipe (review A Minor of
+    /// <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
+    /// A writer that exits without reading a payload larger than a pipe
+    /// buffer is reported by its exit status, and the parity rows still go
+    /// out; through a pipe, the next write would have met a closed reader,
+    /// which this script's prelude turns into exit status 0 for the whole
+    /// pressure test.
+    #[test]
+    fn the_cells_reach_their_writer_from_an_unlinked_file() {
+        let fixture = Fixture::new("emit-staged", WRITER);
+        let results = fixture.path("results");
+        plant_emittable_series(&results, 0);
+        let parent = scripted_parent(
+            &fixture.root.path,
+            "st = os.fstat(0)\n\
+             rows = len(sys.stdin.read().splitlines())\n\
+             seen = dict(regular=stat.S_ISREG(st.st_mode), links=st.st_nlink, rows=rows)\n\
+             parent.joinpath('stdin.json').write_text(json.dumps(seen))",
+        );
+        let emission = emit_series_to(
+            &parent,
+            &results,
+            &fixture.path("checkout"),
+            false,
+            SERIES_APPEND_CELLS_BOUND,
+            parity::AppendBounds::default(),
+        );
+        assert_eq!(
+            emission.cells,
+            Ok(format!(
+                "emitted 1 cell result(s) from run {RUN} to {}",
+                parent.display()
+            ))
+        );
+        assert_eq!(emission.parity, accepted_parity(&results));
+        let seen: JsonValue =
+            serde_json::from_slice(&fs::read(parent.join("stdin.json")).unwrap()).unwrap();
+        assert_eq!(seen, json!({"regular": true, "links": 0, "rows": 1}));
+
+        let fixture = Fixture::new("emit-unread", WRITER);
+        let results = fixture.path("results");
+        plant_emittable_series(&results, 256 * 1024);
+        let parent = scripted_parent(&fixture.root.path, "sys.exit(3)");
+        let emission = emit_series_to(
+            &parent,
+            &results,
+            &fixture.path("checkout"),
+            false,
+            SERIES_APPEND_CELLS_BOUND,
+            parity::AppendBounds::default(),
+        );
+        assert_eq!(
+            emission.cells,
+            Err(
+                "the series writer rejected one or more cell results (exit Some(3)); valid \
+                 completed rows, if any, were retained"
+                    .to_string()
+            )
+        );
+        assert_eq!(emission.parity, accepted_parity(&results));
+    }
+
+    /// An append-cells still running at its bound is killed with everything
+    /// it started, the emit says so, and the parity rows still go out
+    /// (review A Minor of
+    /// <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
+    /// The bound leaves the writer ample time to start its child first.
+    #[test]
+    fn a_hung_cells_writer_is_killed_with_its_process_group() {
+        let fixture = Fixture::new("emit-hung", WRITER);
+        let results = fixture.path("results");
+        plant_emittable_series(&results, 0);
+        let parent = scripted_parent(
+            &fixture.root.path,
+            "sleeper = subprocess.Popen(['sleep', '60'])\n\
+             parent.joinpath('sleeper.pid').write_text(str(sleeper.pid))\n\
+             time.sleep(60)",
+        );
+        let started = Instant::now();
+        let emission = emit_series_to(
+            &parent,
+            &results,
+            &fixture.path("checkout"),
+            false,
+            Duration::from_secs(5),
+            parity::AppendBounds::default(),
+        );
+        assert_eq!(
+            emission.cells,
+            Err(
+                "the series writer did not finish within 5s and was killed with its process \
+                 group; some of these cell results may have been written"
+                    .to_string()
+            )
+        );
+        assert_eq!(emission.parity, accepted_parity(&results));
+        assert!(started.elapsed() < Duration::from_secs(30));
+        // The writer's child was killed with it: its process is gone or
+        // awaits only its reaper.
+        let sleeper = fs::read_to_string(parent.join("sleeper.pid")).unwrap();
+        let stat = PathBuf::from(format!("/proc/{}/stat", sleeper.trim()));
+        let killed = || {
+            fs::read_to_string(&stat).map_or(true, |text| {
+                text.rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with(['Z', 'X']))
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !killed() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            killed(),
+            "the writer's child {} outlived it",
+            sleeper.trim()
+        );
     }
 }

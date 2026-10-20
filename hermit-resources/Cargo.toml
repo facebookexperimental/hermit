@@ -1,8 +1,13 @@
 [package]
 name = "hermit-resources"
 description = "Resource accounting and limit types for the Hermit deterministic execution engine."
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
+readme = "README.md"
+homepage = "https://hermetic-infra.org"
+documentation = "https://docs.rs/hermit-resources"
+keywords = ["linux", "hermit", "determinism", "debugging"]
+categories = ["development-tools::debugging", "development-tools::testing"]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
 

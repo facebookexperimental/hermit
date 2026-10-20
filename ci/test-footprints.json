@@ -45,7 +45,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `test-allocator`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify, test-allocator.",
+      "_why": "@generated: Cargo package `test-allocator`; reverse-dependent closure: detcore-dbt, detcore-liteinst, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify, test-allocator.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -73,6 +73,7 @@
         "test.command_strict_verify_on_host",
         "test.detcore_misc_on_host",
         "test.detcore_parallel_on_host",
+        "test.detcore_time_on_host",
         "test.detcore_unit_on_host",
         "test.envelope_levels",
         "test.hermit_integration_on_host",
@@ -90,7 +91,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-test-workdir`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-test-workdir, hermit-verify.",
+      "_why": "@generated: Cargo package `hermit-test-workdir`; reverse-dependent closure: detcore-dbt, detcore-liteinst, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-test-workdir, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -118,6 +119,7 @@
         "test.command_strict_verify_on_host",
         "test.detcore_misc_on_host",
         "test.detcore_parallel_on_host",
+        "test.detcore_time_on_host",
         "test.detcore_unit_on_host",
         "test.envelope_levels",
         "test.hermit_integration_on_host",
@@ -135,7 +137,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
+      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbt, detcore-liteinst, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -163,6 +165,7 @@
         "test.command_strict_verify_on_host",
         "test.detcore_misc_on_host",
         "test.detcore_parallel_on_host",
+        "test.detcore_time_on_host",
         "test.detcore_unit_on_host",
         "test.envelope_levels",
         "test.hermit_integration_on_host",
@@ -213,7 +216,22 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbt, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-manifest-plan, hermit-verify.",
+      "_why": "@generated: Cargo package `detcore-liteinst`; reverse-dependent closure: detcore-liteinst.",
+      "nodes": [
+        "build.workspace_on_host",
+        "doc.doctests_on_host",
+        "doc.rustdoc_on_host",
+        "lint.clippy_on_host",
+        "lint.rustfmt",
+        "test.regular_crates_on_host"
+      ],
+      "paths": [
+        "detcore-liteinst/**/*.rs",
+        "detcore-liteinst/Cargo.toml"
+      ]
+    },
+    {
+      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbt, detcore-liteinst, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-manifest-plan, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -242,6 +260,7 @@
         "test.command_strict_verify_on_host",
         "test.detcore_misc_on_host",
         "test.detcore_parallel_on_host",
+        "test.detcore_time_on_host",
         "test.detcore_unit_on_host",
         "test.envelope_levels",
         "test.hermit_integration_on_host",
@@ -278,7 +297,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-testutils`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
+      "_why": "@generated: Cargo package `detcore-testutils`; reverse-dependent closure: detcore-dbt, detcore-liteinst, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -306,6 +325,7 @@
         "test.command_strict_verify_on_host",
         "test.detcore_misc_on_host",
         "test.detcore_parallel_on_host",
+        "test.detcore_time_on_host",
         "test.detcore_unit_on_host",
         "test.envelope_levels",
         "test.hermit_integration_on_host",
@@ -523,12 +543,12 @@
       ]
     },
     {
-      "_why": "Backend-parity driver contract suites are outside Cargo targets. No validation DAG node runs run_matrix.py since test.dbt_parity was retired in slice S13 of https://github.com/rrnewton/hermit/issues/3301, so only the suites node is selected.",
+      "_why": "The e9patch preprocessing corpus and its manual driver moved out of tests/backend-parity in slice S13 of https://github.com/rrnewton/hermit/issues/3301. No validation lane has e9tool, so only the driver's contract test is selected.",
       "nodes": [
-        "check.backend_parity_suites"
+        "check.e9patch_corpus"
       ],
       "paths": [
-        "tests/backend-parity/**"
+        "tests/e9patch/**"
       ]
     },
     {
@@ -650,7 +670,8 @@
     "scripts/lib/**",
     ".github/workflows/ci-portable.yml",
     ".github/workflows/merge-gate.yml",
-    ".github/workflows/ci-privileged.yml"
+    ".github/workflows/ci-privileged.yml",
+    ".github/actions/**"
   ],
   "groups": {},
   "version": 2

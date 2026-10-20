@@ -20,7 +20,8 @@
     "scripts/lib/**",
     ".github/workflows/ci-portable.yml",
     ".github/workflows/merge-gate.yml",
-    ".github/workflows/ci-privileged.yml"
+    ".github/workflows/ci-privileged.yml",
+    ".github/actions/**"
   ],
   "ci_irrelevant": [
     "**/*.md",
@@ -46,7 +47,7 @@
   },
   "package_rules": [
     {
-      "_why": "Shared Detcore/CLI code drives the non-Cargo strict, backend-parity, and manifest harnesses.",
+      "_why": "Shared Detcore/CLI code drives the non-Cargo strict and manifest harnesses.",
       "packages": [
         "hermit-detcore",
         "detcore-model",
@@ -163,9 +164,9 @@
   ],
   "path_footprints": [
     {
-      "_why": "Backend-parity driver contract suites are outside Cargo targets. No validation DAG node runs run_matrix.py since test.dbt_parity was retired in slice S13 of https://github.com/rrnewton/hermit/issues/3301, so only the suites node is selected.",
-      "paths": ["tests/backend-parity/**"],
-      "nodes": ["check.backend_parity_suites"]
+      "_why": "The e9patch preprocessing corpus and its manual driver moved out of tests/backend-parity in slice S13 of https://github.com/rrnewton/hermit/issues/3301. No validation lane has e9tool, so only the driver's contract test is selected.",
+      "paths": ["tests/e9patch/**"],
+      "nodes": ["check.e9patch_corpus"]
     },
     {
       "_why": "The identity-fixture mutation guard and the fixtures it plants into moved to tests/c when backend-parity-c was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301).",

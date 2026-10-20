@@ -26,6 +26,8 @@ use dagrun::TestAttemptResult;
 use dagrun::TestResult;
 use dagrun::TestResults;
 use hermit_manifest_plan::cli_help::is_help_flag;
+use hermit_manifest_plan::imported_results;
+use hermit_manifest_plan::imported_results::IMPORT_RESULTS_ENV;
 use hermit_manifest_plan::parity;
 use hermit_manifest_plan::parity::ParityCellId;
 use hermit_manifest_plan::runner::CellId;
@@ -50,7 +52,7 @@ use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::retries_product_failures;
 use hermit_manifest_plan::runner::run_cell;
-use hermit_manifest_plan::runner::validate_source_sha;
+use hermit_manifest_plan::runner::validate_source_snapshot;
 use hermit_manifest_plan::runner::write_junit;
 use hermit_manifest_plan::self_test_selection;
 use hermit_manifest_plan::stress_series::HostCapabilities;
@@ -87,7 +89,7 @@ Commands:
   build                            Prepare selected test programs
   audit-compile                    Compile selected C test programs
   run                              Execute selected cells
-  parity compare                   Measure parity cells from a finished run's retained logs
+  parity <compare|export>          Measure parity from retained logs, or export ledger rows
   selftest <NAME>                  Run one repository tool's self-test
 
 Selection options:
@@ -108,9 +110,9 @@ Selection options:
 Source options:
   --repo-root <DIR>                Read manifests and programs from DIR and run hermit
                                    there (default: the checkout this binary was built in)
-  --source-sha <SHA>               DIR is a clean `git archive` of commit SHA with no Git
-                                   metadata: take the test inventory from its files and
-                                   record SHA as hermit_sha instead of asking git
+  --source-sha <SHA>               DIR is a clean `git archive` of commit SHA whose files
+                                   Git does not track: take the test inventory from its
+                                   files and record SHA as hermit_sha instead of asking git
 
 Execution and output options:
   --prebuilt                       Reuse prepared test programs (run only)
@@ -140,17 +142,21 @@ const PUBLIC_EXECUTION_ENVIRONMENT: &str =
   HERMIT_BIN=<PATH>                      Hermit executable; a relative path is under the
                                          repository root (default: target/debug/hermit)
   HERMIT_E2E_EMPTY_WORKDIR=/test         Use the isolated /test working directory
-  E2E_KEEP_VERIFY_LOGS=1                 Retain successful verification logs
+  E2E_KEEP_VERIFY_LOGS=1                 Retain verify logs (one golden log after a match)
   HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER=<N> Positive finite CPU-time multiplier
   HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER=<N> Positive finite wall-time multiplier";
 
 /// Read by `run` only: the parity post-pass after the determinism cells.
 const RUN_ENVIRONMENT: &str =
     "  E2E_PARITY_SELECT=<TEST@BACKEND,...>   Also measure these parity cells after the run
-  E2E_PARITY_POST_PASS=0                 Skip the parity post-pass (default: 1)";
+  E2E_PARITY_POST_PASS=0                 Skip the parity post-pass (default: 1)
+  E2E_IMPORT_RESULTS=<ROOT>              Run no cell: publish the rows another run left in
+                                         ROOT/<lane>/manifest_<category>/; a selected cell
+                                         with no row is an ERROR";
 
 const PARITY_HELP: &str = "\
 Usage: test-harness parity compare --artifacts <DIR> --cell <TEST@BACKEND> [OPTIONS]
+       test-harness parity export --e2e-root <DIR> [--expected-scope <FILE>]
 
 Measure parity cells from the logs a finished `run` retained, as its own
 post-pass does, without running any guest. Each cell compares TEST's verify
@@ -174,7 +180,25 @@ Options:
 
 Environment:
   HERMIT_BIN=<PATH>                      Hermit executable; a relative path is under the
-                                         repository root (default: target/debug/hermit)";
+                                         repository root (default: target/debug/hermit)
+
+`parity export` reads every DIR/<lane>/<node>/parity.status.json and the
+parity.jsonl beside it, and prints one parity ledger source row per parity
+cell those post-passes owed, as JSONL on stdout, for series.py append-parity.
+A complete post-pass yields one row per record. A failed or running one
+yields the records it wrote plus a record-missing row for each other cell its
+status names. With --expected-scope, a JSON object mapping \"<lane>/<node>\" to
+the \"<test>@<backend>\" cells that node should have measured, a planned node
+with no status yields a record-missing row per expected cell, and so does
+each expected cell a node's status leaves out of its scope. It runs no guest
+and writes nothing. Any inconsistency (a record that fails validation, a
+count that disagrees with its status, a record outside the scope) is an error
+and prints no rows. validate, which must not lose a cell, instead appends a
+record-missing row for each cell the refused node's expected scope owed.
+
+Export options:
+  --e2e-root <DIR>                 The run's e2e result root, holding <lane>/<node>/
+  --expected-scope <FILE>          The cells each planned node owed (see above)";
 
 const FILTER_OPTIONS: &str = "  --lane <portable|privileged>
   --category <CATEGORY>
@@ -191,9 +215,9 @@ const REPO_ROOT_OPTION: &str =
                                    checkout this binary was built in)";
 
 const SOURCE_SHA_OPTION: &str =
-    "  --source-sha <SHA>               DIR is a clean `git archive` of commit SHA with no Git
-                                   metadata: take the test inventory from its files and
-                                   record SHA as hermit_sha instead of asking git";
+    "  --source-sha <SHA>               DIR is a clean `git archive` of commit SHA whose files
+                                   Git does not track: take the test inventory from its
+                                   files and record SHA as hermit_sha instead of asking git";
 
 const AMBIENT_PREPARATION_ENVIRONMENT: &str =
     "  HOME=<PATH>                            Base for default Rust toolchain homes
@@ -813,13 +837,13 @@ fn validate_args(command: &str, args: &Args) {
         fail("--tpx-json is accepted by run only");
     }
     if let Some(sha) = args.source_sha.as_deref() {
-        if args.repo_root.is_none() {
+        let Some(repo_root) = args.repo_root.as_deref() else {
             fail(
                 "--source-sha describes a --repo-root source snapshot; pass --repo-root DIR \
                  naming the `git archive` of that commit",
             );
-        }
-        validate_source_sha(sha).unwrap_or_else(|error| fail(error));
+        };
+        validate_source_snapshot(repo_root, sha).unwrap_or_else(|error| fail(error));
     }
     if !matches!(command, "build" | "run") && args.jobs.is_some() {
         fail("--jobs is accepted by build and run only");
@@ -879,7 +903,10 @@ fn main() -> ExitCode {
         .unwrap_or_else(|| fail("missing command; try `test-harness --help`"));
     let values = values.collect::<Vec<_>>();
     if command == "parity" {
-        let request = parse_parity_compare(values);
+        let request = match parse_parity(values) {
+            ParityRequest::Compare(request) => request,
+            ParityRequest::Export(request) => return parity_export(&request),
+        };
         let root = root(None);
         let manifests = ManifestSet::load(&root).unwrap_or_else(|error| fail(error));
         run_manifest_plan(&root, None);
@@ -2651,13 +2678,30 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         fail(error);
     }
     let capacity = scheduled_worker_capacity(args);
+    let import_root = std::env::var_os(IMPORT_RESULTS_ENV).map(PathBuf::from);
     let planned_verify = planned_verify(&cells);
-    let parity_scope = parity_scope(root, manifests, &planned_verify);
-    let context = RunContext::from_env(
-        root.to_path_buf(),
-        args.prebuilt,
-        args.source_sha.as_deref(),
-    )
+    // An imported run has no verify logs of its own to compare.
+    let parity_scope = if import_root.is_some() {
+        if std::env::var_os("E2E_PARITY_SELECT").is_some()
+            || std::env::var_os("E2E_PARITY_POST_PASS").is_some()
+        {
+            eprintln!(
+                "test-harness: {IMPORT_RESULTS_ENV} is set: the parity post-pass and E2E_PARITY_SELECT are ignored"
+            );
+        }
+        BTreeSet::new()
+    } else {
+        parity_scope(root, manifests, &planned_verify)
+    };
+    let context = if import_root.is_some() {
+        RunContext::for_import(root.to_path_buf(), args.source_sha.as_deref())
+    } else {
+        RunContext::from_env(
+            root.to_path_buf(),
+            args.prebuilt,
+            args.source_sha.as_deref(),
+        )
+    }
     .unwrap_or_else(|e| fail(e))
     .with_scheduled_worker_capacity(capacity)
     .with_parity_retained(parity::retention_closure(&parity_scope, &planned_verify));
@@ -2685,6 +2729,36 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             results_path.display()
         ))
     });
+    mark_parity_running(&parity_scope, &context, &results_path);
+    let imported = import_root.as_deref().map(|import_root| {
+        let earns_retry = |cell: &SelectedCell, row: &CellResult| {
+            attempt_earns_retry(args.retries, cell, row)
+        };
+        let host_inapplicable = |cell: &SelectedCell| {
+            host_inapplicable_reason(
+                &cell.test.requires,
+                cell.id.backend.as_deref(),
+                &context.host_capabilities,
+            )
+            .map(|(_, reason)| reason)
+        };
+        let policy = imported_results::ImportPolicy {
+            earns_retry: &earns_retry,
+            host_inapplicable: &host_inapplicable,
+        };
+        let imported =
+            imported_results::load(import_root, &cells, &context, &results_path, &policy)
+                .unwrap_or_else(|error| fail(format!("{IMPORT_RESULTS_ENV}: {error}")));
+        eprintln!(
+            "test-harness: importing {} selected cell(s) from {} (rows of {} run(s)); {} have no result; {} producer retr(ies) this run would not have made were dropped",
+            cells.len(),
+            import_root.display(),
+            imported.source_run_ids.len(),
+            imported.missing,
+            imported.dropped_retries
+        );
+        imported
+    });
     let mut indexed_results = Vec::new();
     let mut attempt_results = vec![Vec::new(); cells.len()];
     let mut failed = false;
@@ -2699,6 +2773,15 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         capacity,
         |index, emit| {
             let cell = &cells[index];
+            if let Some(imported) = &imported {
+                let rows = &imported.cells[index].rows;
+                for (position, row) in rows.iter().enumerate() {
+                    if !emit(row.clone(), position + 1 < rows.len()) {
+                        break;
+                    }
+                }
+                return;
+            }
             if let Some((_, reason)) = host_inapplicable_reason(
                 &cell.test.requires,
                 cell.id.backend.as_deref(),
@@ -2918,7 +3001,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     }
     failed |= !run_failures.is_empty();
     write_junit(&junit, &results).unwrap();
-    let summary = serde_json::json!({
+    let mut summary = serde_json::json!({
         "schema": 1,
         "cells": results.len(),
         "passed": results.iter().filter(|result| result.outcome == "PASS").count(),
@@ -2941,6 +3024,14 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             }))
             .collect::<Vec<_>>(),
     });
+    if let (Some(import_root), Some(imported)) = (&import_root, &imported) {
+        summary["imported"] = serde_json::json!({
+            "root": import_root,
+            "source_run_ids": imported.source_run_ids,
+            "missing_cells": imported.missing,
+            "dropped_retries": imported.dropped_retries,
+        });
+    }
     fs::write(
         results_path.parent().unwrap().join("summary.json"),
         serde_json::to_vec_pretty(&summary).unwrap(),
@@ -3123,6 +3214,35 @@ fn parity_scope(
     }
 }
 
+/// Before any cell runs, remove an earlier run's parity outputs and, with a
+/// cell in scope, write `parity.status.json` in the `running` state naming
+/// every cell in scope. A process killed before its post-pass finishes then
+/// still says which parity cells it owed, so the ledger export
+/// ([`parity::node_ledger_sources`]) reports each as `record-missing` instead
+/// of dropping it. Like the post-pass, a failure here is reported and changes
+/// nothing else.
+fn mark_parity_running(scope: &BTreeSet<ParityCellId>, context: &RunContext, results_path: &Path) {
+    let Some(artifacts) = results_path.parent() else {
+        return;
+    };
+    let config = parity::PostPassConfig::new(
+        artifacts,
+        &context.hermit_bin,
+        &context.run_id,
+        &context.source_sha,
+    );
+    let marked = if scope.is_empty() {
+        parity::clear_outputs(&config)
+    } else {
+        parity::mark_running(&config, scope)
+    };
+    if let Err(error) = marked {
+        eprintln!(
+            "test-harness: parity status not marked running (exit status unaffected): {error}"
+        );
+    }
+}
+
 /// Run the parity post-pass over this process's rows once `results.jsonl`,
 /// JUnit and `summary.json` are final. It writes only `parity.jsonl`,
 /// `parity.status.json` and `parity/` beside them, inside the enclosing
@@ -3188,19 +3308,89 @@ struct ParityCompareRequest {
     jobs: usize,
 }
 
-fn parse_parity_compare(values: Vec<String>) -> ParityCompareRequest {
+#[derive(Debug, PartialEq)]
+struct ParityExportRequest {
+    e2e_root: PathBuf,
+    expected_scope: Option<PathBuf>,
+}
+
+enum ParityRequest {
+    Compare(ParityCompareRequest),
+    Export(ParityExportRequest),
+}
+
+fn parse_parity(values: Vec<String>) -> ParityRequest {
     if values.iter().any(|value| is_help_flag(value)) {
         println!("{PARITY_HELP}");
         std::process::exit(0);
     }
     let mut values = values.into_iter();
     match values.next().as_deref() {
-        Some("compare") => {}
+        Some("compare") => ParityRequest::Compare(parse_parity_compare(values)),
+        Some("export") => ParityRequest::Export(parse_parity_export(values)),
         Some(other) => fail(format!(
-            "unknown parity command {other:?}; expected `parity compare`"
+            "unknown parity command {other:?}; expected `parity compare` or `parity export`"
         )),
         None => fail("parity requires a command; try `test-harness parity --help`"),
     }
+}
+
+fn parse_parity_export(mut values: impl Iterator<Item = String>) -> ParityExportRequest {
+    let mut e2e_root = None;
+    let mut expected_scope = None;
+    while let Some(flag) = values.next() {
+        match flag.as_str() {
+            "--e2e-root" => set_once(&mut e2e_root, &mut values, "--e2e-root"),
+            "--expected-scope" => set_once(&mut expected_scope, &mut values, "--expected-scope"),
+            other => fail(format!(
+                "unknown option {other} for parity export; try `test-harness parity --help`"
+            )),
+        }
+    }
+    ParityExportRequest {
+        e2e_root: PathBuf::from(e2e_root.unwrap_or_else(|| {
+            fail(
+                "parity export requires --e2e-root <DIR>, the run's e2e result root \
+                     holding <lane>/<node>/parity.status.json",
+            )
+        })),
+        expected_scope: expected_scope.map(PathBuf::from),
+    }
+}
+
+/// `test-harness parity export`: the ledger source rows of a finished run's
+/// post-passes, one JSON object per line, for `series.py append-parity`.
+fn parity_export(request: &ParityExportRequest) -> ExitCode {
+    let expected = request.expected_scope.as_ref().map(|path| {
+        let text = fs::read_to_string(path)
+            .unwrap_or_else(|error| fail(format!("cannot read {}: {error}", path.display())));
+        parity::parse_expected_scope(&text)
+            .unwrap_or_else(|error| fail(format!("{}: {error}", path.display())))
+    });
+    let rows =
+        parity::ledger_sources(&request.e2e_root, expected.as_ref()).unwrap_or_else(|error| {
+            fail(format!(
+                "parity export printed no rows: {error}. Inspect the named parity file; \
+                 `test-harness parity compare --artifacts <that node> --cell <TEST@BACKEND>` \
+                 re-measures a cell from the run's retained logs"
+            ))
+        });
+    let mut out = std::io::stdout().lock();
+    for row in &rows {
+        let line = serde_json::to_string(row).expect("a validated ledger source row serializes");
+        if let Err(error) = writeln!(out, "{line}") {
+            fail(format!("cannot write parity export rows: {error}"));
+        }
+    }
+    eprintln!(
+        "test-harness: parity export: {} source row(s) from {}",
+        rows.len(),
+        request.e2e_root.display()
+    );
+    ExitCode::SUCCESS
+}
+
+fn parse_parity_compare(mut values: impl Iterator<Item = String>) -> ParityCompareRequest {
     let mut artifacts = None;
     let mut output = None;
     let mut jobs = None;
@@ -3320,6 +3510,7 @@ mod tests {
     use super::PINNED_COMMAND_PREFIX;
     use super::PINNED_COMMAND_SEPARATOR;
     use super::PREBUILT_COMMAND_PREFIX;
+    use super::SelectedCell;
     use super::TestResults;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
@@ -3566,32 +3757,765 @@ report.write_bytes((root/'verification.json').read_bytes())
                     )
                 })
                 .collect::<BTreeSet<_>>();
-            // The single-log `log-diff` call is the ptrace cell's own golden
-            // normalization, part of its ordinary verification. A two-log
-            // comparison would be recorded as "compare".
-            assert_eq!(calls.len(), 4, "{scenario}: {calls:#?}");
+            // One guest run per cell and no `log-diff` of either kind. The
+            // ptrace golden-log normalization, a fourth, single-log call here
+            // until https://github.com/rrnewton/hermit/issues/3301, was
+            // removed: parity canonicalizes run 1's log when it compares. The
+            // fake still records a single-log call as "normalize" and a
+            // two-log comparison as "compare", so either would fail this.
+            assert_eq!(calls.len(), 3, "{scenario}: {calls:#?}");
             assert_eq!(
                 kinds,
                 BTreeSet::from([
                     "custom:kvm:false".to_string(),
-                    "normalize:-:false".to_string(),
                     "run:kvm:false".to_string(),
                     "run:ptrace:false".to_string(),
                 ]),
                 "{scenario}: no ptrace reference run and no log-diff comparison"
             );
-            let normalized = calls
-                .iter()
-                .find(|call| call["kind"] == "normalize")
-                .unwrap();
             assert!(
-                normalized["argv"][1]
-                    .as_str()
-                    .unwrap()
-                    .contains("/parity-mixed-verify-ptrace/"),
-                "{scenario}: only the ptrace cell's own log is normalized: {normalized}"
+                calls
+                    .iter()
+                    .all(|call| call["kind"] != "normalize" && call["kind"] != "compare"),
+                "{scenario}: E2E_KEEP_VERIFY_LOGS launched a log-diff: {calls:#?}"
             );
         }
+    }
+
+    /// The manifests of the import-mode fixtures: one test whose CI cells are
+    /// verify@ptrace, verify@kvm and custom@kvm.
+    fn write_import_fixture(path: &std::path::Path) {
+        use serde_json::json;
+
+        let manifests_dir = path.join("tests/e2e/manifests");
+        fs::create_dir_all(&manifests_dir).unwrap();
+        fs::write(
+            manifests_dir.join("defaults.yaml"),
+            "schema: 3\ntimeout_seconds: 10\ncpu_timeout_seconds: 5\n",
+        )
+        .unwrap();
+        let disabled = json!({"ci": false, "backends_enabled": [], "backends_disabled": {
+            "ptrace": "Not selected by this control", "dbt": "Not selected by this control",
+            "kvm": "Not selected by this control", "sabre": "Not selected by this control",
+            "liteinst": "Not selected by this control"
+        }});
+        fs::write(manifests_dir.join("imported.yaml"), serde_json::to_vec(&json!({
+            "schema": 3, "bucket": "imported", "test": [{
+                "id": "imported/control", "description": "Import mode control",
+                "lane": "portable", "occasional": false, "direct": ["/bin/true"],
+                "observation": {"status": true, "stdout": true, "stderr": true},
+                "modes": {
+                    "verify": {"ci": true, "backends_enabled": ["ptrace", "kvm"],
+                        "backends_disabled": {"dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"}},
+                    "naked": {"ci": false, "backends_enabled": [],
+                        "backends_disabled": {"native": "Not selected by this CI control"}},
+                    "chaos": disabled, "replay": disabled,
+                    "custom": {"ci": true, "backends_enabled": ["kvm"],
+                        "backends_disabled": {"ptrace": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"},
+                        "assert": {"runs": 1}}
+                }
+            }]
+        })).unwrap()).unwrap();
+    }
+
+    /// A row as `ci/buck-e2e/ingest.py` leaves it: the producer execution was
+    /// its own `--no-retry` harness run (run id `run_id`, outer attempt 1), and
+    /// the ingest numbered it `attempt` in Tpx's execution order.
+    fn import_producer_row(
+        producer: &hermit_manifest_plan::runner::RunContext,
+        cell: &hermit_manifest_plan::runner::SelectedCell,
+        run_id: String,
+        attempt: u64,
+        outcome: &str,
+    ) -> CellResult {
+        use hermit_manifest_plan::runner::ObservedResult;
+        use hermit_manifest_plan::runner::host_inapplicable_result;
+        use hermit_manifest_plan::runner::infrastructure_error_result;
+
+        let mut context = producer.with_attempt(1);
+        context.run_id = run_id;
+        let mut row = infrastructure_error_result(&context, cell, String::new());
+        match outcome {
+            // A producer never writes one: it reports host inapplicability
+            // only in summary.json.
+            "HOST-INAPPLICABLE" => {
+                row = host_inapplicable_result(&context, cell, "producer: no kvm".into());
+            }
+            "PASS" => {
+                row.outcome = "PASS".into();
+                row.error_kind = None;
+                row.reason = None;
+                row.result = Some(ObservedResult::Pass);
+                row.failure_class = None;
+            }
+            "FAIL" => {
+                row.outcome = "FAIL".into();
+                row.error_kind = None;
+                row.reason = None;
+                row.result = Some(ObservedResult::DeterminismFailure);
+                row.failure_class = Some(FailureClass::ProductFailure);
+            }
+            // An infrastructure ERROR, which this run's policy never retries.
+            "ERROR" => row.reason = Some("producer infrastructure error".into()),
+            _ => unreachable!(),
+        }
+        row.require_current_classification().unwrap();
+        row.require_cpu_observations().unwrap();
+        row.attempt = attempt;
+        row
+    }
+
+    fn import_summary_cell(mode: &str, backend: &str) -> serde_json::Value {
+        serde_json::json!({"test": "imported/control", "mode": mode, "backend": backend})
+    }
+
+    /// The `evidence_complete_executions` entry of the execution that wrote
+    /// `row`.
+    fn import_execution(row: &CellResult) -> serde_json::Value {
+        serde_json::json!({
+            "test": row.test, "mode": row.mode, "backend": row.backend, "run_id": row.run_id
+        })
+    }
+
+    /// `E2E_IMPORT_RESULTS` executes no cell: it re-publishes the rows a Buck
+    /// run left under `<root>/<lane>/manifest_<category>/`. A complete import
+    /// passes with every attempt rebound to this run. Each way an imported
+    /// cell could end better than an executed run would have makes it end
+    /// worse instead: a selected cell with no row (the executed-equals-plan
+    /// gate); rows of another commit, a dirty tree, another stamped binary,
+    /// other test source, other timeouts or CPU evidence bound elsewhere; a
+    /// history no producer writes (an attempt after a PASS, a repeated or
+    /// out-of-order attempt, a HOST-INAPPLICABLE row); a producer retry this
+    /// run would not have made, after an infrastructure ERROR or under
+    /// `--no-retry`; a host-inapplicable claim this machine does not confirm,
+    /// or one alongside rows; and a PASS whose own execution has no
+    /// evidence-complete record.
+    #[test]
+    fn import_mode_republishes_rows_and_a_missing_cell_is_an_error() {
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::process::ExitCode;
+
+        use hermit_manifest_plan::imported_results::bucket_dir;
+        use hermit_manifest_plan::runner::RunContext;
+        use serde_json::json;
+
+        const CHILD: &str = "HERMIT_IMPORT_MODE_FIXTURE";
+        const NO_RETRY: &str = "HERMIT_IMPORT_MODE_FIXTURE_NO_RETRY";
+        const TEST: &str = "tests::import_mode_republishes_rows_and_a_missing_cell_is_an_error";
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        const STALE: &str = "fedcba9876543210fedcba9876543210fedcba98";
+        if let Some(fixture) = std::env::var_os(CHILD) {
+            // The fixture is the `git archive` --source-sha names: Git tracks
+            // none of its files.
+            let fixture = PathBuf::from(fixture);
+            let mut values = vec![
+                "--category".into(),
+                "imported".into(),
+                "--ci-only".into(),
+                "--prebuilt".into(),
+                "--repo-root".into(),
+                fixture.display().to_string(),
+                "--source-sha".into(),
+                SHA.into(),
+                "--results".into(),
+                fixture.join("out/results.jsonl").display().to_string(),
+                "--junit".into(),
+                fixture.join("out/junit.xml").display().to_string(),
+            ];
+            if std::env::var_os(NO_RETRY).is_some() {
+                values.push("--no-retry".into());
+            }
+            let args = parse(values.into_iter());
+            validate_args("run", &args);
+            let manifests = ManifestSet::load(&fixture).unwrap();
+            let code = super::run(&fixture, &manifests, &args);
+            std::process::exit(if code == ExitCode::SUCCESS { 0 } else { 1 });
+        }
+
+        for scenario in [
+            "complete",
+            "missing",
+            "stale",
+            "dirty",
+            "stamped",
+            "test-source",
+            "timeouts",
+            "binding",
+            "stale-first-row",
+            "untrusted-retry",
+            "no-retry",
+            "pass-then-fail",
+            "pass-then-error",
+            "pass-then-pass",
+            "duplicate-attempt",
+            "file-order",
+            "file-order-pass-first",
+            "rowless-first-execution",
+            "host-inapplicable-then-fail",
+            "host-inapplicable-row",
+            "unconfirmed",
+            "conflict",
+            "evidence",
+            "evidence-elsewhere",
+        ] {
+            let fixture = std::env::temp_dir().join(format!(
+                "hermit-harness-import-{}-{:?}-{scenario}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            fs::create_dir(&fixture).unwrap();
+            let path = fixture.as_path();
+            write_import_fixture(path);
+
+            // The rows a Buck run would have left: each cell ran in its own
+            // harness process with its own run id; custom@kvm failed its first
+            // execution and passed its Tpx retry. Every execution recorded
+            // complete evidence unless the scenario withholds it.
+            let manifests = ManifestSet::load(path).unwrap();
+            let selection = parse(
+                ["--category", "imported", "--ci-only"]
+                    .into_iter()
+                    .map(String::from),
+            );
+            let cells = run_cells(&manifests, &selection).unwrap();
+            assert_eq!(cells.len(), 3, "verify@ptrace, verify@kvm, custom@kvm");
+            let producer = RunContext::for_import(path.to_path_buf(), Some(SHA)).unwrap();
+            let mut rows = Vec::new();
+            let mut evidence = Vec::new();
+            for (index, cell) in cells.iter().enumerate() {
+                let ptrace = cell.id.backend.as_deref() == Some("ptrace");
+                let verify_kvm = cell.id.mode == "verify" && !ptrace;
+                if verify_kvm && matches!(scenario, "missing" | "unconfirmed") {
+                    continue;
+                }
+                // (attempt, outcome), in file order.
+                let attempts: &[(u64, &str)] = match (cell.id.mode.as_str(), scenario) {
+                    ("custom", "untrusted-retry") => &[(1, "ERROR"), (2, "PASS")],
+                    ("custom", "pass-then-fail") => &[(1, "PASS"), (2, "FAIL")],
+                    ("custom", "pass-then-error") => &[(1, "PASS"), (2, "ERROR")],
+                    ("custom", "pass-then-pass") => &[(1, "PASS"), (2, "PASS")],
+                    ("custom", "duplicate-attempt") => &[(1, "PASS"), (1, "FAIL")],
+                    ("custom", "file-order") => &[(2, "FAIL"), (1, "PASS")],
+                    // Sorted by attempt, this history would end in a PASS.
+                    ("custom", "file-order-pass-first") => &[(2, "PASS"), (1, "FAIL")],
+                    // The first execution died before writing a row, and the
+                    // ingest still numbered it attempt 1.
+                    ("custom", "rowless-first-execution") => &[(2, "PASS")],
+                    ("custom", "host-inapplicable-then-fail") => {
+                        &[(1, "HOST-INAPPLICABLE"), (2, "FAIL")]
+                    }
+                    ("custom", _) => &[(1, "FAIL"), (2, "PASS")],
+                    (_, "host-inapplicable-row") if verify_kvm => &[(1, "HOST-INAPPLICABLE")],
+                    _ => &[(1, "PASS")],
+                };
+                for (number, &(attempt, outcome)) in attempts.iter().enumerate() {
+                    let mut producer = producer.clone();
+                    let stale = match scenario {
+                        "stale" => ptrace,
+                        // Only custom@kvm's failed first execution: its
+                        // passing retry is current.
+                        "stale-first-row" => cell.id.mode == "custom" && number == 0,
+                        _ => false,
+                    };
+                    if stale {
+                        producer.source_sha = STALE.into();
+                    }
+                    let mut row = import_producer_row(
+                        &producer,
+                        cell,
+                        format!("buck-producer-{index}-{number}"),
+                        attempt,
+                        outcome,
+                    );
+                    // A binary stamped with this commit's short sha is this
+                    // commit's binary.
+                    if verify_kvm {
+                        row.binary_build_sha = Some(SHA[..12].into());
+                    }
+                    if ptrace {
+                        match scenario {
+                            "dirty" => row.source_tree_dirty = true,
+                            "stamped" => row.binary_build_sha = Some(STALE[..12].into()),
+                            "test-source" => row.test_sha256 = "0".repeat(64),
+                            "timeouts" => row.execution_wall_timeout_seconds = Some(999),
+                            "binding" => {
+                                row.cpu_observations.as_mut().unwrap().binding.run_id =
+                                    "another-producer-run".into();
+                            }
+                            _ => {}
+                        }
+                    }
+                    let withheld = match scenario {
+                        "evidence" => verify_kvm,
+                        // Only custom@kvm's failed first execution has it.
+                        "evidence-elsewhere" => cell.id.mode == "custom" && outcome == "PASS",
+                        _ => false,
+                    };
+                    if !withheld {
+                        evidence.push(import_execution(&row));
+                    }
+                    rows.push(serde_json::to_string(&row).unwrap());
+                }
+            }
+            let import = path.join("import");
+            let bucket = bucket_dir(&import, "portable", "imported");
+            fs::create_dir_all(&bucket).unwrap();
+            fs::write(bucket.join("results.jsonl"), rows.join("\n") + "\n").unwrap();
+            let host_inapplicable_cells = match scenario {
+                "unconfirmed" => vec![import_summary_cell("verify", "kvm")],
+                "conflict" => vec![import_summary_cell("verify", "ptrace")],
+                _ => vec![],
+            }
+            .into_iter()
+            .map(|mut cell| {
+                cell["reason"] = "producer: this machine lacks kvm".into();
+                cell
+            })
+            .collect::<Vec<_>>();
+            fs::write(
+                bucket.join("summary.json"),
+                serde_json::to_vec(&json!({
+                    "host_inapplicable_cells": host_inapplicable_cells,
+                    "evidence_complete_executions": evidence,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let mut command = Command::new("timeout");
+            command
+                .args(["--kill-after=2s", "30s"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env(CHILD, path)
+                .env("E2E_IMPORT_RESULTS", &import)
+                // This machine can run every fixture cell, whatever the host.
+                .env("HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT", "kvm")
+                .env("HERMIT_BIN", path.join("no-hermit-is-launched"))
+                .env("E2E_RESULT_ROOT", path.join("artifacts"))
+                .env("E2E_BUILD_ROOT", path.join("build"))
+                .env("E2E_RUN_ID", "import-consumer")
+                .env("E2E_MACHINE_SHORTNAME", "import-control")
+                .env("E2E_KERNEL_VERSION", "import-control")
+                .env("DAGRUN_TEST_COUNTS_PATH", path.join("counts.json"));
+            if scenario == "no-retry" {
+                command.env(NO_RETRY, "1");
+            }
+            let result = command.output().unwrap();
+            let context = format!(
+                "{scenario}: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                result.status.code(),
+                Some(if scenario == "complete" { 0 } else { 1 }),
+                "{context}"
+            );
+            let published = fs::read_to_string(path.join("out/results.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<CellResult>(line).unwrap())
+                .collect::<Vec<_>>();
+            let summary: serde_json::Value =
+                serde_json::from_slice(&fs::read(path.join("out/summary.json")).unwrap()).unwrap();
+            assert_eq!(summary["cells"], 3, "{context}");
+            for row in &published {
+                assert_eq!(row.run_id, "import-consumer", "{context}");
+                row.require_cpu_observations().unwrap();
+            }
+            let errors = published
+                .iter()
+                .filter(|row| row.outcome == "ERROR")
+                .map(|row| {
+                    (
+                        row.mode.as_str(),
+                        row.backend.as_deref(),
+                        row.error_kind.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let custom = published
+                .iter()
+                .filter(|row| row.mode == "custom")
+                .map(|row| (row.attempt, row.outcome.as_str()))
+                .collect::<Vec<_>>();
+            let expected_error = match scenario {
+                "complete" => None,
+                "missing" => Some(("verify", Some("kvm"), Some("import-missing"))),
+                "stale" | "dirty" | "stamped" | "test-source" | "timeouts" | "binding" => {
+                    Some(("verify", Some("ptrace"), Some("import-stale")))
+                }
+                "stale-first-row" => Some(("custom", Some("kvm"), Some("import-stale"))),
+                "untrusted-retry" => Some(("custom", Some("kvm"), Some("infrastructure"))),
+                // Its FAIL is the verdict, and a FAIL is not an ERROR.
+                "no-retry" => None,
+                "pass-then-fail"
+                | "pass-then-error"
+                | "pass-then-pass"
+                | "duplicate-attempt"
+                | "file-order"
+                | "file-order-pass-first"
+                | "rowless-first-execution"
+                | "host-inapplicable-then-fail" => {
+                    Some(("custom", Some("kvm"), Some("import-history")))
+                }
+                "host-inapplicable-row" => Some(("verify", Some("kvm"), Some("import-history"))),
+                "unconfirmed" => Some((
+                    "verify",
+                    Some("kvm"),
+                    Some("import-host-inapplicable-unconfirmed"),
+                )),
+                "conflict" => Some(("verify", Some("ptrace"), Some("import-conflict"))),
+                "evidence" => Some(("verify", Some("kvm"), Some("import-evidence-incomplete"))),
+                "evidence-elsewhere" => {
+                    Some(("custom", Some("kvm"), Some("import-evidence-incomplete")))
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(errors, Vec::from_iter(expected_error), "{context}");
+            assert_eq!(
+                summary["errors"],
+                u64::from(expected_error.is_some()),
+                "{context}"
+            );
+            // Each history no producer writes is refused for its own reason.
+            let history_reason = match scenario {
+                "pass-then-fail" | "pass-then-error" | "pass-then-pass" => {
+                    Some("attempt 2 follows terminal outcome PASS")
+                }
+                "duplicate-attempt" => {
+                    Some("attempt 1 does not follow the preceding attempts; expected 2")
+                }
+                "file-order" | "file-order-pass-first" | "rowless-first-execution" => {
+                    Some("attempt 2 does not follow the preceding attempts; expected 1")
+                }
+                "host-inapplicable-then-fail" | "host-inapplicable-row" => {
+                    Some("imported attempt 1 is a HOST-INAPPLICABLE row")
+                }
+                _ => None,
+            };
+            if let Some(expected) = history_reason {
+                let reason = published
+                    .iter()
+                    .find(|row| row.error_kind.as_deref() == Some("import-history"))
+                    .and_then(|row| row.reason.as_deref())
+                    .unwrap_or_default();
+                assert!(reason.contains(expected), "{reason}\n{context}");
+            }
+            // Every row is checked, not only the one that decides the cell.
+            if scenario == "stale-first-row" {
+                let reason = published
+                    .iter()
+                    .find(|row| row.error_kind.as_deref() == Some("import-stale"))
+                    .and_then(|row| row.reason.as_deref())
+                    .unwrap_or_default();
+                let expected = format!("imported row was built from {STALE}, this run is {SHA}");
+                assert!(reason.contains(&expected), "{reason}\n{context}");
+            }
+            assert_eq!(
+                summary["imported"]["missing_cells"],
+                u64::from(scenario == "missing"),
+                "{context}"
+            );
+            assert_eq!(
+                summary["imported"]["dropped_retries"],
+                u64::from(matches!(scenario, "untrusted-retry" | "no-retry")),
+                "{context}"
+            );
+            match scenario {
+                // The producer's retry after an infrastructure ERROR is not
+                // one this run would have made: the ERROR is the verdict.
+                // Under --no-retry, no retry is: the first FAIL is.
+                "untrusted-retry" => assert_eq!(custom, vec![(1, "ERROR")], "{context}"),
+                "no-retry" => {
+                    assert_eq!(custom, vec![(1, "FAIL")], "{context}");
+                    assert_eq!(summary["failed"], 1, "{context}");
+                }
+                // One import ERROR replaces custom@kvm's rows.
+                "pass-then-fail"
+                | "pass-then-error"
+                | "pass-then-pass"
+                | "duplicate-attempt"
+                | "file-order"
+                | "file-order-pass-first"
+                | "rowless-first-execution"
+                | "host-inapplicable-then-fail"
+                | "stale-first-row"
+                | "evidence-elsewhere" => assert_eq!(custom, vec![(1, "ERROR")], "{context}"),
+                // Both custom@kvm attempts are published, in order.
+                _ => assert_eq!(custom, vec![(1, "FAIL"), (2, "PASS")], "{context}"),
+            }
+            // JUnit and the dagrun counts report the same final outcomes, and
+            // the counts each cell's published attempts.
+            let failed = u64::from(scenario == "no-retry");
+            assert_eq!(summary["failed"], failed, "{context}");
+            let junit = fs::read_to_string(path.join("out/junit.xml")).unwrap();
+            let header = format!(
+                "tests=\"3\" failures=\"{failed}\" errors=\"{}\" skipped=\"0\"",
+                u64::from(expected_error.is_some())
+            );
+            assert!(junit.contains(&header), "{junit}\n{context}");
+            let counts: serde_json::Value =
+                serde_json::from_slice(&fs::read(path.join("counts.json")).unwrap()).unwrap();
+            let by_id = |results: &serde_json::Value| {
+                let mut results = results.as_array().unwrap().clone();
+                results.sort_by_key(|result| result["id"].as_str().unwrap().to_string());
+                results
+            };
+            let expected_counts = cells
+                .iter()
+                .map(|cell| {
+                    let history = published
+                        .iter()
+                        .filter(|row| row.mode == cell.id.mode && row.backend == cell.id.backend)
+                        .collect::<Vec<_>>();
+                    json!({
+                        "id": format!(
+                            "imported/control [{}/{}]",
+                            cell.id.backend.as_deref().unwrap_or("native"),
+                            cell.id.mode
+                        ),
+                        "result": if history.last().unwrap().outcome == "PASS" { "pass" } else { "fail" },
+                        "attempts": history.len(),
+                    })
+                })
+                .collect::<serde_json::Value>();
+            assert_eq!(counts["schema"], 2, "{context}");
+            assert_eq!(counts["executed_tests"], 3, "{context}");
+            assert_eq!(
+                by_id(&counts["results"]),
+                by_id(&expected_counts),
+                "{context}"
+            );
+            if scenario == "complete" {
+                assert_eq!(published.len(), 4, "{context}");
+                assert_eq!(summary["passed"], 3, "{context}");
+                assert_eq!(
+                    by_id(&counts["results"]),
+                    by_id(&json!([
+                        {"id": "imported/control [kvm/custom]", "result": "pass", "attempts": 2},
+                        {"id": "imported/control [kvm/verify]", "result": "pass", "attempts": 1},
+                        {"id": "imported/control [ptrace/verify]", "result": "pass", "attempts": 1}
+                    ])),
+                    "{context}"
+                );
+                assert_eq!(
+                    summary["imported"]["source_run_ids"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    4,
+                    "{context}"
+                );
+            }
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    /// A producer's host-inapplicable claim stands only when this machine
+    /// lacks a capability the cell needs, and the published row carries this
+    /// machine's reason, not the producer's. No environment can make a host
+    /// capability absent, so this drives `imported_results::load` with the
+    /// policy the harness would build on such a machine.
+    #[test]
+    fn import_mode_host_inapplicable_claim_needs_this_machines_confirmation() {
+        use hermit_manifest_plan::imported_results;
+        use hermit_manifest_plan::imported_results::bucket_dir;
+        use hermit_manifest_plan::runner::RunContext;
+        use serde_json::json;
+
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        let fixture = std::env::temp_dir().join(format!(
+            "hermit-harness-import-claim-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        write_import_fixture(&fixture);
+        let manifests = ManifestSet::load(&fixture).unwrap();
+        let selection = parse(
+            ["--category", "imported", "--ci-only"]
+                .into_iter()
+                .map(String::from),
+        );
+        let cells = run_cells(&manifests, &selection).unwrap();
+        let context = RunContext::for_import(fixture.clone(), Some(SHA)).unwrap();
+        let import = fixture.join("import");
+        let bucket = bucket_dir(&import, "portable", "imported");
+        fs::create_dir_all(&bucket).unwrap();
+        let (rows, evidence): (Vec<_>, Vec<_>) = cells
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| cell.id.backend.as_deref() == Some("ptrace"))
+            .map(|(index, cell)| {
+                let row = import_producer_row(
+                    &context,
+                    cell,
+                    format!("buck-producer-{index}"),
+                    1,
+                    "PASS",
+                );
+                (serde_json::to_string(&row).unwrap(), import_execution(&row))
+            })
+            .unzip();
+        fs::write(bucket.join("results.jsonl"), rows.join("\n") + "\n").unwrap();
+        let claims = [("verify", "kvm"), ("custom", "kvm")]
+            .into_iter()
+            .map(|(mode, backend)| {
+                let mut cell = import_summary_cell(mode, backend);
+                cell["reason"] = "producer's reason".into();
+                cell
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            bucket.join("summary.json"),
+            serde_json::to_vec(&json!({
+                "host_inapplicable_cells": claims,
+                "evidence_complete_executions": evidence,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // This machine lacks KVM for verify@kvm only.
+        let earns_retry = |_: &SelectedCell, _: &CellResult| true;
+        let host_inapplicable = |cell: &SelectedCell| {
+            (cell.id.mode == "verify" && cell.id.backend.as_deref() == Some("kvm"))
+                .then(|| "this machine lacks kvm".to_string())
+        };
+        let policy = imported_results::ImportPolicy {
+            earns_retry: &earns_retry,
+            host_inapplicable: &host_inapplicable,
+        };
+        let imported = imported_results::load(
+            &import,
+            &cells,
+            &context,
+            &fixture.join("out/results.jsonl"),
+            &policy,
+        )
+        .unwrap();
+        let mut verdicts = cells
+            .iter()
+            .zip(&imported.cells)
+            .map(|(cell, imported)| {
+                let [row] = imported.rows.as_slice() else {
+                    panic!("one row per cell: {:?}", imported.rows);
+                };
+                (
+                    format!("{}@{}", cell.id.mode, cell.id.backend.as_deref().unwrap()),
+                    (
+                        row.outcome.clone(),
+                        row.error_kind.clone(),
+                        row.reason.clone().unwrap_or_default(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let (outcome, error_kind, reason) = verdicts.remove("custom@kvm").unwrap();
+        assert_eq!(
+            (outcome.as_str(), error_kind.as_deref()),
+            ("ERROR", Some("import-host-inapplicable-unconfirmed"))
+        );
+        assert!(reason.contains("producer's reason"), "{reason}");
+        assert_eq!(
+            verdicts,
+            BTreeMap::from([
+                ("verify@ptrace".into(), ("PASS".into(), None, String::new())),
+                (
+                    "verify@kvm".into(),
+                    (
+                        "HOST-INAPPLICABLE".into(),
+                        None,
+                        "this machine lacks kvm".into()
+                    )
+                ),
+            ])
+        );
+        assert_eq!(imported.missing, 0);
+        fs::remove_dir_all(&fixture).unwrap();
+    }
+
+    /// An imported row records whether this checkout is dirty, as an executed
+    /// row does: clean producer rows do not make a dirty checkout's run look
+    /// clean. (`run` in the fixture above names a `--source-sha` snapshot,
+    /// which is clean by construction and is refused where Git tracks the
+    /// files, so this drives `imported_results::load` directly.)
+    #[test]
+    fn import_mode_marks_the_rows_of_a_dirty_checkout_dirty() {
+        use hermit_manifest_plan::imported_results;
+        use hermit_manifest_plan::imported_results::bucket_dir;
+        use hermit_manifest_plan::runner::RunContext;
+        use serde_json::json;
+
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        let fixture = std::env::temp_dir().join(format!(
+            "hermit-harness-import-dirty-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        write_import_fixture(&fixture);
+        let manifests = ManifestSet::load(&fixture).unwrap();
+        let selection = parse(
+            ["--category", "imported", "--ci-only"]
+                .into_iter()
+                .map(String::from),
+        );
+        let cells = run_cells(&manifests, &selection).unwrap();
+        let clean = RunContext::for_import(fixture.clone(), Some(SHA)).unwrap();
+        let import = fixture.join("import");
+        let bucket = bucket_dir(&import, "portable", "imported");
+        fs::create_dir_all(&bucket).unwrap();
+        let (rows, evidence): (Vec<_>, Vec<_>) = cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                let row =
+                    import_producer_row(&clean, cell, format!("buck-producer-{index}"), 1, "PASS");
+                (serde_json::to_string(&row).unwrap(), import_execution(&row))
+            })
+            .unzip();
+        fs::write(bucket.join("results.jsonl"), rows.join("\n") + "\n").unwrap();
+        fs::write(
+            bucket.join("summary.json"),
+            serde_json::to_vec(&json!({"evidence_complete_executions": evidence})).unwrap(),
+        )
+        .unwrap();
+        let earns_retry = |_: &SelectedCell, _: &CellResult| false;
+        let host_inapplicable = |_: &SelectedCell| None::<String>;
+        let policy = imported_results::ImportPolicy {
+            earns_retry: &earns_retry,
+            host_inapplicable: &host_inapplicable,
+        };
+        for dirty in [false, true] {
+            let mut context = clean.clone();
+            context.source_dirty = dirty;
+            let imported = imported_results::load(
+                &import,
+                &cells,
+                &context,
+                &fixture.join("out/results.jsonl"),
+                &policy,
+            )
+            .unwrap();
+            let published = imported
+                .cells
+                .iter()
+                .flat_map(|cell| &cell.rows)
+                .map(|row| (row.outcome.as_str(), row.source_tree_dirty))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                published,
+                vec![("PASS", dirty); 3],
+                "dirty checkout: {dirty}"
+            );
+        }
+        fs::remove_dir_all(&fixture).unwrap();
     }
 
     /// The parity post-pass of <https://github.com/rrnewton/hermit/issues/3301>
@@ -3788,19 +4712,22 @@ report.write_bytes((root/'verification.json').read_bytes())
             include_str!("../../tests/fixtures/fake-parity-log-diff.py"),
         )
         .unwrap();
-        // One fake hermit: `run` is a guest execution and is counted; the
-        // single-log `log-diff` is ptrace golden normalization; a two-log
-        // `log-diff` is a parity comparison. The scenario is a list of words:
+        // One fake hermit: `run` is a guest execution and is counted; a
+        // single-log `log-diff`, the ptrace golden normalization removed for
+        // https://github.com/rrnewton/hermit/issues/3301, is counted so that
+        // its return fails the test; a two-log `log-diff` is a parity
+        // comparison. The scenario is a list of words:
         // parity/beta's liteinst cell fails determinism unless it has `pass`,
         // and `mutated` changes every candidate's second detcore message.
         let hermit = fixture.join("hermit");
-        // This fake starts about 150 times per test run, so it imports only
-        // `os`. `-IS` skips the site-packages scan at every start, the
-        // `--help` and version probes exit before any import, and each
-        // invocation record is written as the literal line `json.dumps`
-        // produces for it: the cell directory names are ASCII slugs with no
-        // quote or backslash. Importing json and pathlib cost more than the
-        // rest of the script. The log-diff stand-in starts with `-IS` too.
+        // This fake starts at every probe, guest run and `log-diff` of the
+        // test, so it imports only `sys` and, past the probes, `os`. `-IS`
+        // skips the site-packages scan at every start, the `--help` and
+        // version probes exit before `os` is imported, and each invocation
+        // record is written as the literal line `json.dumps` produces for
+        // it: the cell directory names are ASCII slugs with no quote or
+        // backslash. Importing json and pathlib cost more than the rest of
+        // the script. The log-diff stand-in starts with `-IS` too.
         fs::write(
             &hermit,
             r#"#!/usr/bin/python3 -IS
@@ -4129,8 +5056,8 @@ sys.exit(1 if failed else 0)
             );
             assert_eq!(
                 count(calls, "normalize"),
-                2,
-                "E2E_KEEP_VERIFY_LOGS normalizes each ptrace golden"
+                0,
+                "E2E_KEEP_VERIFY_LOGS retains logs and launches no golden-log normalization"
             );
         }
         assert_eq!(count(&none_calls, "compare"), 0);
@@ -4150,7 +5077,8 @@ sys.exit(1 if failed else 0)
         );
         assert!(
             five_stdout.contains(
-                "mean credit 1.0000 over 3 measured with equal inputs; none measured with \
+                "measured 3; no golden 1 (determinism-mismatch 1); not compared 1; unmeasured 0; \
+                 mean credit 1.0000 over 3 measured with equal inputs; none measured with \
                  unequal inputs"
             ),
             "{five_stdout}"
@@ -4166,7 +5094,7 @@ sys.exit(1 if failed else 0)
                 "parity/alpha@kvm=Matched",
                 "parity/alpha@liteinst=Matched",
                 "parity/beta@kvm=Matched",
-                "parity/beta@liteinst=Unavailable",
+                "parity/beta@liteinst=Nondeterministic",
             ]
         );
         assert!(
@@ -4185,7 +5113,7 @@ sys.exit(1 if failed else 0)
                 "parity/alpha@kvm=Diverged",
                 "parity/alpha@liteinst=Diverged",
                 "parity/beta@kvm=Diverged",
-                "parity/beta@liteinst=Unavailable",
+                "parity/beta@liteinst=Nondeterministic",
             ]
         );
         // The harness launched every kvm and liteinst verify cell, and their
@@ -4695,8 +5623,11 @@ sys.exit(1 if failed else 0)
         // because the corpus's programs are host-installed (fold 1 of
         // https://github.com/rrnewton/hermit/issues/3448).
         // +1 direct for portablecompat.manifest_compat, the corpus-only run
-        // type's bucket, which also runs on the host.
-        assert_eq!((pinned, direct), (19, 18));
+        // type's bucket, which also runs on the host, and +1 for
+        // sabrecompat.manifest_compat, the SaBRe run type's host bucket, and
+        // +1 for strictcompat.manifest_compat, the strict run type's, and +1
+        // for rrcompat.manifest_compat, the rr run type's.
+        assert_eq!((pinned, direct), (19, 21));
     }
 
     /// With the committed parity selection, the full profile's harness
@@ -4760,7 +5691,22 @@ sys.exit(1 if failed else 0)
         // cell, so the selected cells and their reports are unchanged.
         assert_eq!(nodes, 16);
         let lines = reported.values().map(Vec::len).sum::<usize>();
-        assert_eq!((selection.len(), lines), (194, 194));
+        // Six earlier and three socket KVM verify candidates satisfy the unchanged selection rule.
+        // https://github.com/rrnewton/reverie/issues/891
+        // So does the poll-readiness KVM candidate: https://github.com/rrnewton/reverie/issues/620
+        // The epoll-pwait2 candidate adds one: https://github.com/rrnewton/reverie/issues/905
+        // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
+        // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+        // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+        // The 2026-10-03 SaBRe promotion (timeouts::SABRE_2026_10_03_*)
+        // selects 89 folded SaBRe verify candidates under the same rule.
+        assert_eq!(
+            (selection.len(), lines),
+            (
+                194 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89,
+                194 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89
+            )
+        );
         assert_eq!(reported.keys().cloned().collect::<BTreeSet<_>>(), selection);
         let duplicated = reported
             .iter()
@@ -4777,11 +5723,38 @@ sys.exit(1 if failed else 0)
             .filter(|cell| !explicitly.contains_key(*cell))
             .map(ToString::to_string)
             .collect::<Vec<_>>();
+        // 628 applicable, 624 reported and 4 not until fold 3 of
+        // https://github.com/rrnewton/hermit/issues/3448 gave 212 compat rows a
+        // SaBRe verify cell, which makes their SaBRe parity cell applicable.
+        // e2e.manifest_compat plans the ptrace side of 185 of them. The other
+        // 27 are the rows only the SaBRe run type runs, so no full node plans
+        // either side of their cell; so are the 3 single-image rows
+        // lua-direct, perl-direct and df-direct.
         assert_eq!(
             (applicable.len(), explicitly.len(), unreported.len()),
-            (628, 624, 4),
+            // The six earlier and three socket KVM verify enables add nine
+            // applicable cells, all reported.
+            // https://github.com/rrnewton/reverie/issues/891
+            // The poll-readiness KVM cell is reported too: https://github.com/rrnewton/reverie/issues/620
+            // The epoll-pwait2 candidate is reported too: https://github.com/rrnewton/reverie/issues/905
+            // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
+            // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+            // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+            // The 2026-10-03 SaBRe promotion makes 120 more cells applicable,
+            // each reported by the node that plans its ptrace side; its 8
+            // red-to-green cells were already applicable and reported.
+            (
+                628 + 6 + 3 + 1 + 215 + 1 + 1 + 1 + 1 + 120,
+                624 + 6 + 3 + 1 + 185 + 1 + 1 + 1 + 1 + 120,
+                4 + 30,
+            ),
             "{unreported:?}"
         );
+        let sabre_only = unreported
+            .iter()
+            .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
+            .count();
+        assert_eq!(sabre_only, 30, "{unreported:?}");
     }
 
     #[test]
@@ -4820,7 +5793,15 @@ sys.exit(1 if failed else 0)
             .iter()
             .filter(|row| row["backend"] == "kvm")
             .collect::<Vec<_>>();
-        assert_eq!(kvm.len(), 244);
+        // Six additional KVM verify selections retain the same host-capability contract.
+        // https://github.com/rrnewton/reverie/issues/891
+        // Three socket selections: https://github.com/rrnewton/reverie/issues/891.
+        // One poll-readiness selection: https://github.com/rrnewton/reverie/issues/620.
+        // One epoll-pwait2 selection: https://github.com/rrnewton/reverie/issues/905.
+        // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
+        // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+        // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+        assert_eq!(kvm.len(), 244 + 6 + 3 + 1 + 1 + 1 + 1 + 1);
         let missing = kvm
             .iter()
             .filter(|row| !capabilities(row).contains(&"kvm".to_string()))
@@ -5282,7 +6263,6 @@ sys.exit(1 if failed else 0)
         let shards: serde_json::Value =
             serde_json::from_str(include_str!("../../../portable-shards.json")).unwrap();
         let expected_aliases = [
-            "check.backend_parity_suites",
             // A hosted twin since the one-build change of 2026-09-30 moved
             // the local check into the pinned root.
             "check.dbt_runtime_abi",
@@ -5293,6 +6273,7 @@ sys.exit(1 if failed else 0)
             "test.detcore_unit",
             "test.detcore_misc",
             "test.detcore_parallel",
+            "test.detcore_time",
             "test.regular_crates",
             "test.hermit_integration",
             "test.arbitrary_binaries",
@@ -5340,8 +6321,12 @@ sys.exit(1 if failed else 0)
         // (ci/check-shard-coverage.sh enforces that against the committed cell
         // plan). shared-futex-c and util-c left the integration shard once
         // https://github.com/rrnewton/hermit/pull/3213 gave each a portable cell
-        // (25 to 23), and test.dbt_parity left the dbt-parity shard in slice
-        // S13 of https://github.com/rrnewton/hermit/issues/3301 (23 to 22).
+        // (25 to 23). In slice S13 of
+        // https://github.com/rrnewton/hermit/issues/3301, test.dbt_parity left
+        // the dbt-parity shard (23 to 22; the shard is now dbt-runtime-abi) and
+        // check.backend_parity_suites left the integration shard when
+        // tests/backend-parity was retired (22 to 21). test.detcore_time joined
+        // the unit shard when it was enrolled (21 to 22).
         assert_eq!(physical_rows, 22);
         assert_eq!(resolved.len(), 22);
         assert_eq!(actual_aliases, expected_aliases);

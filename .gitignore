@@ -25,9 +25,6 @@ envelope.json
 # must not taint source provenance or the version string.
 /ignored/
 
-# Backend-parity observations belong to the outer dev-hermit compat scorecard.
-/tests/backend-parity/matrix.tsv
-
 # dagrun's per-checkout profile store. The DAG runner writes it into
 # whatever checkout it runs in, so without this every scripts/validate.rs run leaves its
 # own tree dirty and `ci-hub validate-run` then REFUSES the next run in that
@@ -48,3 +45,9 @@ buck-out/
 /shim/third-party/rust/.cargo/
 /shim/third-party/rust/BUCK
 /shim/third-party/rust/vendor/
+/shim/rust-sysroot/
+/.buck2
+/ci/buck-e2e/staged/
+/shim/third-party/libunwind/staged/
+/shim/third-party/cmake/staged/
+/shim/third-party/xz/staged/

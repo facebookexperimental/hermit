@@ -1032,6 +1032,74 @@ mod tests {
     }
 
     #[test]
+    fn top_level_help_states_what_the_defaults_actually_are() {
+        let mut command = command_without_epoch_env();
+        // Compare whitespace-normalized text so terminal wrapping cannot matter.
+        let help = command
+            .render_long_help()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        // The old text promised identical output with no epoch caveat, said
+        // networking was disallowed, and named a ~/.hermit store nothing uses.
+        for stale in [
+            "networking is disallowed",
+            "bitwise identical",
+            "~/.hermit",
+            "content addressible",
+            "Record mode has no `--network` flag",
+        ] {
+            assert!(!help.contains(stale), "stale claim {stale:?} in:\n{help}");
+        }
+        for claim in [
+            "functions of their controlled inputs",
+            "`hermit run` starts it at the host's current time",
+            "--epoch=2026-01-01T00:00:00Z",
+            "In run and record mode, by default (`--network=local`)",
+            "only a loopback interface",
+            "A recording stores its choice",
+            "`hermit record start --verify-with-gdbex` defaults to, and requires, `--network=host`",
+            "The DBT backend does not apply `--network` yet",
+            "`$XDG_CACHE_HOME/hermit`, which is `~/.cache/hermit`",
+            "`--data-dir` or `HERMIT_DATA_DIR`",
+        ] {
+            assert!(help.contains(claim), "missing {claim:?} in:\n{help}");
+        }
+
+        // The help names `local` as the default; keep that tied to the parser.
+        let run = command.find_subcommand_mut("run").unwrap();
+        let network = run
+            .get_arguments()
+            .find(|arg| arg.get_id() == "network")
+            .expect("run --network");
+        assert_eq!(network.get_default_values(), ["local"]);
+
+        // The help describes `--network` for run and record mode only; if
+        // another subcommand gains one, the help must say what it does. The
+        // record default is tied to the parser by
+        // record_start::tests::record_networking_defaults_to_local_like_run.
+        fn network_args(command: &clap::Command) -> Vec<String> {
+            let mut found: Vec<String> = command
+                .get_arguments()
+                .filter(|arg| arg.get_long() == Some("network"))
+                .map(|_| command.get_name().to_string())
+                .collect();
+            for sub in command.get_subcommands() {
+                found.extend(network_args(sub));
+            }
+            found
+        }
+        let record = command.find_subcommand("record").unwrap();
+        // `hermit record PROGRAM` is shorthand for `hermit record start PROGRAM`.
+        assert_eq!(network_args(record), ["record", "start"]);
+        assert_eq!(
+            network_args(command.find_subcommand("run").unwrap()),
+            ["run"]
+        );
+    }
+
+    #[test]
     fn run_epoch_environment_and_cli_precedence() {
         const CHILD: &str = "HERMIT_EPOCH_PRECEDENCE_TEST_CHILD";
         const ENV_EPOCH: &str = "2000-12-31T23:59:59.123456789Z";
@@ -1386,6 +1454,46 @@ mod tests {
                 .policy()
                 .as_str(),
             "all_records_v1"
+        );
+    }
+
+    /// The DBT backend observes a counted-branch or statistics divergence
+    /// before the log comparison, so its logs can match while the published
+    /// verdict is a divergence. `--keep-logs` keeps a single golden log after a
+    /// match, so the DBT arm must mark such a match overridden with exactly the
+    /// predicates that later turn the verdict into a divergence
+    /// (`finalize_dbt_verification` for the clock, `DbtSummaryComparison::apply`
+    /// for the statistics). Otherwise run 2's log of a divergent run would be
+    /// deleted. DBT cannot execute in unit tests, so the wiring is pinned here
+    /// and `verify::tests::an_overridden_match_keeps_both_logs_in_the_failure_directory`
+    /// proves what an overridden match retains.
+    #[test]
+    fn dbt_backend_divergence_overrides_a_log_match_for_retention() {
+        let source = include_str!("backends.rs");
+        let start = source
+            .find("= compare_two_runs(")
+            .expect("DBT arm must compare two runs");
+        let options = source[start..]
+            .find("ComparisonOptions {")
+            .map(|offset| &source[start + offset..])
+            .expect("DBT comparison must build ComparisonOptions");
+        let block = &options[..options.find("\n        },").expect("options block end")];
+        let normalized = block.split_whitespace().collect::<Vec<_>>().join(" ");
+        let backend_divergence =
+            "branch_clock_diverged || summary_comparison.requires_log_retention(),";
+        for field in [
+            format!("keep_logs: keep_logs || {backend_divergence}"),
+            format!("match_overridden: {backend_divergence}"),
+        ] {
+            assert_eq!(
+                normalized.matches(&field).count(),
+                1,
+                "the DBT comparison must state `{field}` exactly once"
+            );
+        }
+        assert!(
+            source.contains("let branch_clock_diverged = !branch_clock_comparison.matched();"),
+            "the retention predicate must be the same clock comparison the verdict uses"
         );
     }
 

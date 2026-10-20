@@ -23,6 +23,7 @@ use regex::Regex;
 
 use super::kvm_cancellation::bounded_command_with_timeout;
 use super::kvm_cancellation::bounded_read;
+use super::kvm_cancellation::bounded_verify_command;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -192,8 +193,8 @@ pub(super) fn run() {
         ];
         let mut command = super::hermit_command(&args);
         command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
-        let status =
-            bounded_command_with_timeout(&mut command, &directory, Duration::from_secs(57));
+        let (status, run2_log) =
+            bounded_verify_command(&mut command, &directory, Duration::from_secs(57));
         assert_eq!(
             status.code(),
             Some(expected_status),
@@ -246,17 +247,37 @@ pub(super) fn run() {
             assert_eq!(operand.stderr_bytes, 0);
             assert_eq!(operand.stderr_sha256, Digest::new(b"").to_string());
         }
-        for prefix in ["run1_log_", "run2_log_"] {
-            let matches: Vec<_> = fs::read_dir(&logs)
+        let retained = |prefix: &str| -> Vec<_> {
+            fs::read_dir(&logs)
                 .unwrap()
-                .map(|e| e.unwrap().path())
-                .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(prefix))
-                .collect();
-            assert_eq!(matches.len(), 1, "one retained log per actual guest");
-            let log =
-                String::from_utf8(bounded_read(&matches[0], 64 * MIB)).expect("complete trace");
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(prefix)
+                })
+                .collect()
+        };
+        // After a match `--keep-logs` keeps only run 1's log, the golden copy;
+        // run 2's log, which matched it, is deleted. Its capture is checked in
+        // its place.
+        let golden = retained("run1_log_");
+        assert_eq!(
+            golden.len(),
+            1,
+            "one retained golden log of the matched guest"
+        );
+        assert!(
+            retained("run2_log_").is_empty(),
+            "a matched verification must not retain run 2's log"
+        );
+        let run2_log = run2_log.expect("run 2's log, captured while the command ran");
+        for path in [&golden[0], &run2_log] {
+            let log = String::from_utf8(bounded_read(path, 64 * MIB)).expect("complete trace");
             assert_lifecycle(&log, expected_status);
         }
+        fs::remove_file(&run2_log).expect("remove run 2's checked log");
         completed += 1;
         eprintln!("KVM signal retirement mode {mode}: two positive guests and full INFO match");
     }

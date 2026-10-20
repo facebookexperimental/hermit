@@ -529,6 +529,27 @@ fn terminal_child_wait_spec(
     }
 }
 
+fn validate_wait4_arguments(pid: libc::pid_t, options: WaitPidFlag) -> Result<(), Errno> {
+    let allowed_options = WaitPidFlag::WNOHANG
+        | WaitPidFlag::WUNTRACED
+        | WaitPidFlag::WCONTINUED
+        | WaitPidFlag::__WNOTHREAD
+        | WaitPidFlag::__WCLONE
+        | WaitPidFlag::__WALL;
+
+    // Linux kernel/exit.c:kernel_wait4 rejects unknown option bits before it
+    // interprets the pid selector.
+    if options.bits() & !allowed_options.bits() != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // The same function returns ESRCH for INT_MIN before looking for children,
+    // because negating that selector is not representable as a pid_t.
+    if pid == libc::pid_t::MIN {
+        return Err(Errno::ESRCH);
+    }
+    Ok(())
+}
+
 fn child_wait_can_retry_after_stale(spec: ChildWaitSpec) -> bool {
     !matches!(spec.selector, ChildWaitSelector::Exact(_))
 }
@@ -1593,6 +1614,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut rsrc = Resources::new(dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("wait4");
+
+        validate_wait4_arguments(call.pid(), call.options())?;
 
         let parent = guest.thread_state().detpid.expect("detpid unset");
         // Stop/continue events need a backend waitability callback. Non-SIGCHLD
@@ -2905,6 +2928,43 @@ mod tests {
         assert_eq!(
             exact_wait_poll_decision(false, false, Some(ExactChildWaitState::Running)),
             ExactWaitPollDecision::Retry
+        );
+    }
+
+    #[test]
+    fn wait4_argument_validation_follows_linux_precedence() {
+        let valid_bits = [0, 1, 3, 29, 30, 31];
+        for bit in valid_bits {
+            let options = WaitPidFlag::from_bits_retain((1_u32 << bit) as libc::c_int);
+            assert_eq!(validate_wait4_arguments(-1, options), Ok(()), "bit {bit}");
+        }
+
+        for bit in (0..u32::BITS).filter(|bit| !valid_bits.contains(bit)) {
+            let options = WaitPidFlag::from_bits_retain((1_u32 << bit) as libc::c_int);
+            assert_eq!(
+                validate_wait4_arguments(-1, options),
+                Err(Errno::EINVAL),
+                "bit {bit}"
+            );
+        }
+
+        // Only INT_MIN is refused: every other pid, including the nearest
+        // process-group selector, must still reach the wait.
+        for pid in [libc::pid_t::MIN + 1, -2, 0, 1, libc::pid_t::MAX] {
+            assert_eq!(
+                validate_wait4_arguments(pid, WaitPidFlag::empty()),
+                Ok(()),
+                "pid {pid}"
+            );
+        }
+        assert_eq!(
+            validate_wait4_arguments(libc::pid_t::MIN, WaitPidFlag::empty()),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(
+            validate_wait4_arguments(libc::pid_t::MIN, WaitPidFlag::from_bits_retain(0x10)),
+            Err(Errno::EINVAL),
+            "invalid options must win over the INT_MIN selector"
         );
     }
 

@@ -45,8 +45,10 @@ impl Record {
         dir: &Path,
         mountinfo_root_rewrites: Vec<MountInfoRootRewrite>,
         mountinfo_mount_ids: Option<Vec<u64>>,
+        local_networking: Option<bool>,
     ) -> Result<Self, Error> {
         let mut metadata = Metadata::new(&command)?;
+        metadata.local_networking = local_networking;
         metadata.mountinfo_root_rewrites = mountinfo_root_rewrites;
         metadata.mountinfo_mount_ids_captured = mountinfo_mount_ids.is_some();
         metadata.mountinfo_mount_ids = mountinfo_mount_ids.unwrap_or_default();

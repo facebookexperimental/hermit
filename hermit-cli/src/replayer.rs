@@ -45,11 +45,11 @@ use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
 use reverie::syscalls::AddrMut;
+use reverie::syscalls::Chdir;
 use reverie::syscalls::Close;
 use reverie::syscalls::Dup3;
 use reverie::syscalls::EfdFlags;
 use reverie::syscalls::Eventfd2;
-use reverie::syscalls::Fchdir;
 use reverie::syscalls::Fcntl;
 use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::Flock;
@@ -72,10 +72,6 @@ fn capture_guest_fd(pid: Pid, fd: libc::c_int) -> (Option<std::os::fd::OwnedFd>,
         Err(error) if error.raw_os_error() == Some(libc::EBADF) => (None, None),
         Err(error) => (None, Some(error.to_string())),
     }
-}
-
-fn replay_root(pid: Pid) -> Option<PathBuf> {
-    std::fs::canonicalize(format!("/proc/{}/root", pid.as_raw())).ok()
 }
 
 fn same_guest_open_file_description(
@@ -439,7 +435,11 @@ impl Tool for Replayer {
             Syscall::Pwritev2(syscall) => {
                 Ok(self.handle_write_family(guest, syscall.into()).await?)
             }
-            Syscall::Access(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3598)
+            Syscall::Access(_) | Syscall::Faccessat(_) | Syscall::Other(Sysno::faccessat2, _) => {
+                self.handle_simple(guest, syscall).await
+            }
             Syscall::Lseek(_) => self.handle_optional_fd_position(guest, syscall).await,
             Syscall::Stat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Fstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
@@ -451,14 +451,47 @@ impl Tool for Replayer {
             Syscall::Getdents(syscall) => self.handle_getdents(guest, syscall).await,
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Madvise(syscall) => self.handle_madvise(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
             Syscall::Open(_) | Syscall::Openat(_) => {
                 self.handle_virtual_fd_create(guest, syscall).await
             }
             Syscall::Openat2(call) => self.handle_openat2(guest, call).await,
             Syscall::Close(_) => self.handle_close(guest, syscall).await,
-            Syscall::Fchdir(call) => self.handle_fchdir(guest, call).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3598)
+            Syscall::Chdir(_) | Syscall::Fchdir(_) => {
+                self.handle_working_directory_change(guest, syscall).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Getcwd(call) => self.handle_getcwd(guest, call).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3601): the descriptor may be a placeholder,
+            // so the recorded result is returned without running the call.
+            Syscall::Fsync(_) | Syscall::Fdatasync(_) | Syscall::Syncfs(_) => {
+                self.handle_simple(guest, syscall).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Fchmod(_) | Syscall::Fchown(_) => {
+                self.handle_descriptor_metadata_change(guest, syscall).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Fsetxattr(_)
+            | Syscall::Fremovexattr(_)
+            | Syscall::Setxattr(_)
+            | Syscall::Lsetxattr(_)
+            | Syscall::Removexattr(_)
+            | Syscall::Lremovexattr(_) => self.handle_xattr_change(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3601)
+            Syscall::Getxattr(_)
+            | Syscall::Lgetxattr(_)
+            | Syscall::Fgetxattr(_)
+            | Syscall::Listxattr(_)
+            | Syscall::Llistxattr(_)
+            | Syscall::Flistxattr(_) => self.handle_xattr_query(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#2373)
             Syscall::Flock(call) => self.handle_flock(guest, call).await,
@@ -516,6 +549,8 @@ impl Tool for Replayer {
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
             Syscall::Ppoll(syscall) => self.handle_ppoll(guest, syscall).await,
+            Syscall::Select(syscall) => self.handle_select(guest, syscall).await,
+            Syscall::Pselect6(syscall) => self.handle_pselect6(guest, syscall).await,
             Syscall::EpollWait(syscall) => self.handle_epoll_wait(guest, syscall).await,
             Syscall::Getsockopt(syscall) => self.handle_sockopt_family(guest, syscall.into()).await,
             Syscall::Getpeername(syscall) => {
@@ -540,6 +575,17 @@ impl Tool for Replayer {
             | Syscall::Symlinkat(_)
             | Syscall::Fchmodat(_)
             | Syscall::Utimensat(_) => self.handle_confined_path_mutation(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            Syscall::Rename(_)
+            | Syscall::Link(_)
+            | Syscall::Symlink(_)
+            | Syscall::Chmod(_)
+            | Syscall::Chown(_)
+            | Syscall::Lchown(_)
+            | Syscall::Mknod(_) => self.handle_confined_path_mutation(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#3598): rmdir shares unlink's optional removal.
+            Syscall::Rmdir(_) => self.handle_optional_path_removal(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Other(Sysno::close_range, _) => self.handle_close_range(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1279,10 +1325,16 @@ impl Replayer {
         if !metadata.file_type().is_dir() {
             return false;
         }
-        let Some(root) = replay_root(pid) else {
+        // Compare directory objects, not procfs link text. The guest may live in
+        // a mount namespace the replayer cannot name, such as a private tmpfs at
+        // `/test`, where the two link texts never share a prefix.
+        let (Ok(root), Ok(directory)) = (
+            crate::record_replay_path::open_process_root(pid),
+            crate::record_replay_path::open_process_directory_fd(pid, fd),
+        ) else {
             return false;
         };
-        std::fs::canonicalize(path).is_ok_and(|path| path.starts_with(root))
+        crate::record_replay_path::directory_is_beneath(&root, &directory).unwrap_or(false)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1314,37 +1366,86 @@ impl Replayer {
         Ok(request)
     }
 
-    fn open_path_in_replay_root<G: Guest<Self>>(
+    /// Decides whether a recorded regular-file open names a file replay may
+    /// open for real: a file replay itself materialized, a file the open creates,
+    /// or, for `O_TMPFILE`, a directory. Resolution starts from descriptors for
+    /// the guest's root and base directory, so it sees the guest's mounts and
+    /// symlinks rather than the replayer's. An `O_CREAT` open first creates the
+    /// missing parent directories inside the replay root.
+    ///
+    /// A path that crosses a procfs symlink (`/proc/<pid>/root`,
+    /// `/proc/self/fd/<n>`, or `/dev/fd/<n>` through `/proc/self/fd`) is
+    /// refused before any directory is created. Its text names a path inside
+    /// the replay root, but the guest's kernel follows the link to the linked
+    /// object, which may be a host file outside it.
+    fn open_materializes_in_replay_root<G: Guest<Self>>(
         &self,
         guest: &G,
         dirfd: libc::c_int,
         path: &Path,
-    ) -> Option<PathBuf> {
-        let root = replay_root(guest.pid())?;
-
-        let candidate = if let Ok(relative) = path.strip_prefix(Path::new("/")) {
-            root.join(relative)
+        flags: OFlag,
+    ) -> bool {
+        let pid = guest.pid();
+        let Ok(root) = crate::record_replay_path::open_process_root(pid) else {
+            return false;
+        };
+        let start = if path.is_absolute() {
+            crate::record_replay_path::open_process_root(pid)
+        } else if dirfd == libc::AT_FDCWD {
+            crate::record_replay_path::open_process_cwd(pid)
         } else {
-            let base = if dirfd == libc::AT_FDCWD {
-                format!("/proc/{}/cwd", guest.pid().as_raw())
-            } else {
-                format!("/proc/{}/fd/{dirfd}", guest.pid().as_raw())
-            };
-            let base = std::fs::canonicalize(base).ok()?;
-            if !base.starts_with(&root) {
-                return None;
-            }
-            base.join(path)
+            crate::record_replay_path::open_process_directory_fd(pid, dirfd)
         };
-
-        let resolved = match std::fs::canonicalize(&candidate) {
-            Ok(path) => path,
-            Err(_) => {
-                let parent = std::fs::canonicalize(candidate.parent()?).ok()?;
-                parent.join(candidate.file_name()?)
-            }
+        let Ok(start) = start else {
+            return false;
         };
-        resolved.starts_with(&root).then_some(resolved)
+        if !crate::record_replay_path::directory_is_beneath(&root, &start).unwrap_or(false) {
+            return false;
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        if flags.contains(OFlag::O_CREAT)
+            && let Some(parent) = parent
+            && let Err(error) =
+                crate::record_replay_path::ensure_directory_path_follow_final_without_procfs_symlinks(
+                    &root, &start, parent,
+                )
+            && error.raw_os_error() == Some(libc::ELOOP)
+        {
+            return false;
+        }
+        let metadata =
+            |object: &OwnedFd| std::fs::metadata(format!("/proc/self/fd/{}", object.as_raw_fd()));
+        match crate::record_replay_path::resolve_existing_path_without_procfs_symlinks(
+            &root, &start, path,
+        ) {
+            Ok(resolved) => match metadata(&resolved.object) {
+                Ok(found) if flags.contains(OFlag::O_TMPFILE) => found.is_dir(),
+                Ok(found) if found.file_type().is_file() => {
+                    materialized_file_is_registered(pid, &found)
+                }
+                _ => false,
+            },
+            Err(error)
+                if error.raw_os_error() == Some(libc::ENOENT)
+                    && flags.contains(OFlag::O_CREAT)
+                    && !flags.contains(OFlag::O_TMPFILE) =>
+            {
+                // Only the final component may be missing.
+                match parent {
+                    None => true,
+                    Some(parent) => {
+                        crate::record_replay_path::resolve_existing_path_without_procfs_symlinks(
+                            &root, &start, parent,
+                        )
+                    }
+                    .and_then(|resolved| metadata(&resolved.object))
+                    .is_ok_and(|found| found.is_dir()),
+                }
+            }
+            Err(_) => false,
+        }
     }
 
     fn materialize_recorded_directory<G: Guest<Self>>(
@@ -1406,40 +1507,16 @@ impl Replayer {
             let (dirfd, path, flags) = self.open_request(guest, syscall).unwrap_or_else(|error| {
                 panic!("could not decode successful recorded open: {error}")
             });
-            let candidate = (event.materialize == OpenMaterialization::RegularFile)
-                .then(|| self.open_path_in_replay_root(guest, dirfd, &path))
-                .flatten();
-            if let Some(candidate) = &candidate
-                && flags.contains(OFlag::O_CREAT)
-                && let Some(parent) = candidate.parent()
-            {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let materialize = if event.materialize == OpenMaterialization::Directory {
-                self.materialize_recorded_directory(guest, syscall, dirfd, &path, flags)
+            let materialize = match event.materialize {
+                OpenMaterialization::Directory => self
+                    .materialize_recorded_directory(guest, syscall, dirfd, &path, flags)
                     .unwrap_or_else(|error| {
                         panic!("failed to materialize recorded open directory: {error}")
-                    })
-            } else {
-                candidate.as_ref().is_some_and(|candidate| {
-                    if flags.contains(OFlag::O_TMPFILE) {
-                        return candidate.is_dir();
-                    }
-                    match (event.materialize, std::fs::metadata(candidate)) {
-                        (OpenMaterialization::RegularFile, Ok(metadata))
-                            if metadata.file_type().is_file() =>
-                        {
-                            materialized_file_is_registered(guest.pid(), &metadata)
-                        }
-                        (OpenMaterialization::RegularFile, Err(error))
-                            if error.kind() == std::io::ErrorKind::NotFound
-                                && flags.contains(OFlag::O_CREAT) =>
-                        {
-                            true
-                        }
-                        _ => false,
-                    }
-                })
+                    }),
+                OpenMaterialization::RegularFile => {
+                    self.open_materializes_in_replay_root(guest, dirfd, &path, flags)
+                }
+                OpenMaterialization::None => false,
             };
             if materialize {
                 match guest.inject_with_retry(syscall).await {
@@ -1584,6 +1661,15 @@ impl Replayer {
             Syscall::Mknodat(call) => self.dirfd_is_confined(pid, call.dirfd()),
             Syscall::Fchownat(call) => self.dirfd_is_confined(pid, call.dirfd()),
             Syscall::Fchmodat(call) => self.dirfd_is_confined(pid, call.dirfd()),
+            // TODO-HUMAN-REVIEW(#3598): the legacy forms resolve relative
+            // paths against the working directory, like AT_FDCWD.
+            Syscall::Rename(_)
+            | Syscall::Link(_)
+            | Syscall::Symlink(_)
+            | Syscall::Chmod(_)
+            | Syscall::Chown(_)
+            | Syscall::Lchown(_)
+            | Syscall::Mknod(_) => true,
             Syscall::Utimensat(call) => self.dirfd_is_confined(pid, call.dirfd()),
             Syscall::Symlinkat(call) => self.dirfd_is_confined(pid, call.newdirfd()),
             Syscall::Linkat(call) => {
@@ -1653,17 +1739,216 @@ impl Replayer {
         recorded
     }
 
-    async fn handle_fchdir<G: Guest<Self>>(
+    // TODO-HUMAN-REVIEW(PR-3601)
+    /// Replays a metadata change made through a descriptor: fchmod or fchown.
+    /// A placeholder descriptor has no metadata to change, so the recorded
+    /// result stands alone. A file in the replay root gets the change
+    /// reapplied, because later path calls such as chmod run there and must
+    /// find what the recording found.
+    async fn handle_descriptor_metadata_change<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        syscall: Fchdir,
+        syscall: Syscall,
     ) -> Result<i64, Errno> {
-        if self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
-            self.handle_replayed_side_effect(guest, syscall.into(), "fchdir")
-                .await
-        } else {
-            self.handle_simple(guest, syscall.into()).await
+        let fd = match syscall {
+            Syscall::Fchmod(call) => call.fd(),
+            Syscall::Fchown(call) => call.fd(),
+            _ => unreachable!("descriptor metadata handler received {syscall:?}"),
+        };
+        let recorded = next_event!(guest, Return);
+        if let Ok(expected) = recorded
+            && self.fd_is_in_replay_root(guest.pid(), fd)
+        {
+            match guest.inject_with_retry(syscall).await {
+                Ok(actual) => assert_eq!(
+                    actual, expected,
+                    "replayed descriptor metadata change returned a different result"
+                ),
+                Err(error) => {
+                    panic!(
+                        "replayed descriptor metadata change {syscall:?} failed after recording returned {expected}: {error}"
+                    );
+                }
+            }
         }
+        recorded
+    }
+
+    // TODO-HUMAN-REVIEW(PR-3601)
+    /// Replays an xattr change from its recorded result. Every xattr query
+    /// also replays from the recording, so the guest never reads the replay
+    /// root's attributes directly. The kernel and filesystems do, for every
+    /// namespace but `user.`: `system.` holds POSIX and NFSv4 ACLs, which
+    /// govern access and later creations; `security.` holds file capabilities
+    /// and the labels security modules (SELinux, Smack, IMA, EVM) consult on
+    /// access and exec; `trusted.` is read by filesystems such as overlayfs.
+    /// Those govern calls replay runs live, so a change to one of them that
+    /// the recording saw succeed on a file in the replay root must establish
+    /// its end state there, even a read-only one (EROFS), or replay refuses to
+    /// continue. A `user.` change is carried over where the replay root can
+    /// take it and otherwise kept virtual: nothing that replay runs live can
+    /// observe it.
+    ///
+    /// The replay root is built without the host's attributes, so its starting
+    /// state may differ from the recording's. A set therefore runs without
+    /// XATTR_CREATE or XATTR_REPLACE: whatever was there, the attribute ends up
+    /// holding the recorded value. A removal that finds no attribute (ENODATA)
+    /// ends in the recorded state too.
+    ///
+    /// A file the replay root lacks (a placeholder descriptor, ENOENT or
+    /// ENOTDIR) keeps the change virtual, whatever the name, as other path
+    /// mutations do. No live call can reach such a file:
+    /// tools that copy a file's ACL to their output, such as strip, and
+    /// installs that set a capability on a staged binary both change files
+    /// outside the recorded tree.
+    async fn handle_xattr_change<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let pid = guest.pid();
+        // The path calls take no dirfd; a relative path resolves against the
+        // working directory, which replay keeps inside the root.
+        let (in_replay_root, name, live_call, is_removal) = {
+            let memory = guest.memory();
+            let read = |name: Option<reverie::syscalls::CStrPtr<'_>>| {
+                name.ok_or(Errno::EFAULT)
+                    .and_then(|name| name.read(&memory))
+            };
+            match syscall {
+                Syscall::Fsetxattr(call) => (
+                    self.fd_is_in_replay_root(pid, call.fd()),
+                    read(call.name()),
+                    Syscall::Fsetxattr(call.with_flags(0)),
+                    false,
+                ),
+                Syscall::Setxattr(call) => (
+                    true,
+                    read(call.name()),
+                    Syscall::Setxattr(call.with_flags(0)),
+                    false,
+                ),
+                Syscall::Lsetxattr(call) => (
+                    true,
+                    read(call.name()),
+                    Syscall::Lsetxattr(call.with_flags(0)),
+                    false,
+                ),
+                Syscall::Fremovexattr(call) => (
+                    self.fd_is_in_replay_root(pid, call.fd()),
+                    read(call.name()),
+                    syscall,
+                    true,
+                ),
+                Syscall::Removexattr(call) => (true, read(call.name()), syscall, true),
+                Syscall::Lremovexattr(call) => (true, read(call.name()), syscall, true),
+                _ => unreachable!("xattr change handler received {syscall:?}"),
+            }
+        };
+        let recorded = next_event!(guest, Return)?;
+        let name = name.unwrap_or_else(|error| {
+            panic!("could not read the name of recorded xattr change {syscall:?}: {error}")
+        });
+        let governs_live_calls = !name.to_bytes().starts_with(b"user.");
+        // A placeholder descriptor names a file the replay root lacks.
+        let outcome = if in_replay_root {
+            guest.inject_with_retry(live_call).await.map(drop)
+        } else {
+            Err(Errno::ENOENT)
+        };
+        match outcome {
+            Ok(()) => {}
+            Err(Errno::ENODATA) if is_removal => {}
+            Err(error @ (Errno::ENOENT | Errno::ENOTDIR)) => {
+                tracing::debug!(?syscall, %error, "replay xattr change kept virtual");
+            }
+            Err(error) if !governs_live_calls => {
+                tracing::debug!(?syscall, %error, "replay xattr change kept virtual");
+            }
+            Err(error) => panic!(
+                "replay root could not take recorded change to {name:?} {syscall:?}: {error}"
+            ),
+        }
+        Ok(recorded)
+    }
+
+    // TODO-HUMAN-REVIEW(#3598)
+    /// Replay `chdir(2)` or `fchdir(2)` from its recorded result and move the
+    /// replay process's working directory with it. A successful recording
+    /// carries the directory the call actually entered; that directory is
+    /// created inside the replay root, as for a recorded `O_DIRECTORY` open,
+    /// and entered by that resolved name. Neither the spelled path nor the
+    /// descriptor is reused: the path may cross a host symlink or `..` that the
+    /// replay root lacks, and the descriptor may be a replay placeholder. Every
+    /// later `AT_FDCWD`-relative or legacy relative-path replay mutation trusts
+    /// `/proc/<pid>/cwd`, so a stale or wrong directory would land them
+    /// elsewhere; the resulting cwd is checked against the recording.
+    async fn handle_working_directory_change<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let entered = PathBuf::from(std::ffi::OsString::from_vec(next_event!(guest, Bytes)?));
+        assert!(
+            entered.is_absolute(),
+            "recorded {syscall:?} entered a relative directory {entered:?}"
+        );
+        self.materialize_recorded_directory(
+            guest,
+            syscall,
+            libc::AT_FDCWD,
+            &entered,
+            OFlag::empty(),
+        )
+        .unwrap_or_else(|error| {
+            panic!("failed to materialize recorded working directory {entered:?}: {error}")
+        });
+        // The injection stack holds well under PATH_MAX, so enter the directory
+        // in pieces: the root first, then runs of components, each of which
+        // fits the buffer. A single component is at most NAME_MAX bytes.
+        let mut path = [0_u8; 512];
+        let mut pieces = vec![b"/".to_vec()];
+        for component in entered.components().skip(1) {
+            let component = component.as_os_str().as_bytes();
+            let last = pieces.last_mut().expect("pieces starts non-empty");
+            let separator = usize::from(!last.ends_with(b"/"));
+            if last.len() + separator + component.len() < path.len() {
+                if separator == 1 {
+                    last.push(b'/');
+                }
+                last.extend_from_slice(component);
+            } else {
+                pieces.push(component.to_vec());
+            }
+        }
+        for piece in pieces {
+            assert!(
+                piece.len() < path.len(),
+                "path component of {entered:?} exceeds NAME_MAX"
+            );
+            path.fill(0);
+            path[..piece.len()].copy_from_slice(&piece);
+            let mut stack = guest.stack().await;
+            let path_addr = stack.push(path);
+            let path_ptr = PathPtr::from_ptr(unsafe {
+                path_addr.cast::<u8>().as_ptr().cast::<libc::c_char>()
+            })
+            .expect("guest stack address is non-null");
+            let _path_guard = stack.commit()?;
+            if let Err(error) = guest
+                .inject_with_retry(Chdir::new().with_path(Some(path_ptr)))
+                .await
+            {
+                panic!("replayed {syscall:?} into recorded {entered:?} failed: {error}");
+            }
+        }
+        let actual = crate::record_replay_path::process_cwd_path(guest.tid())
+            .unwrap_or_else(|error| panic!("could not read replayed working directory: {error}"));
+        assert_eq!(
+            actual, entered,
+            "replayed {syscall:?} entered a different directory than the recording"
+        );
+        Ok(0)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

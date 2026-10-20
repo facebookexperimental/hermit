@@ -144,6 +144,19 @@ impl fmt::Display for E9patchPatchShapeSnapshot {
 
 impl BackendStatsSnapshot for E9patchPatchShapeSnapshot {
     const BACKEND_NAME: &'static str = "e9patch";
+
+    /// The rewrite's site counts only. Preparation dispatches nothing; the
+    /// run's dispatch counts come from the tracer that runs the image.
+    fn dispatch_stats(&self) -> Option<reverie::DispatchStats> {
+        Some(reverie::DispatchStats::new(
+            Self::BACKEND_NAME,
+            reverie::DispatchCounters::default(),
+            reverie::SiteCounters::from_rewrite(
+                self.shape.candidate_rips(),
+                self.shape.patched_rips(),
+            ),
+        ))
+    }
 }
 
 /// A [`BackendStatsSource`] over a captured e9patch patch-shape snapshot.
@@ -511,17 +524,12 @@ fn prepare_in_impl(
             snapshot.original.display()
         ))
     })?;
-    let (b0_sites, b0_total) = parse_metric(&diagnostic, "num_patched_B0").map_err(|reason| {
+    let b0_sites = signal_fallback_sites(&diagnostic, total).map_err(|reason| {
         Error::msg(format!(
             "e9tool did not report unambiguous B0 coverage for {}: {reason}:\n{diagnostic}",
             snapshot.original.display()
         ))
     })?;
-    if b0_total != total {
-        return Err(Error::msg(
-            "e9tool B0 coverage total did not match its recovered-site total",
-        ));
-    }
     if b0_sites != 0 {
         return Err(Error::msg(format!(
             "e9tool used B0 signal fallback for {b0_sites} sites in {}; refusing a rewrite that \
@@ -1126,6 +1134,29 @@ fn parse_metric(diagnostic: &str, name: &str) -> Result<(usize, usize), String> 
     found.ok_or_else(|| format!("missing {name} field"))
 }
 
+/// The number of sites e9tool rewrote with its B0 signal fallback.
+///
+/// e9tool prints `num_patched_B0` only while the B0 tactic is enabled, and
+/// this rewrite disables it, so the pinned tool omits the field. An omitted
+/// field therefore means no B0 site: a site that needed B0 stays unpatched,
+/// which `validate_patch_coverage` already refuses. A printed field must still
+/// be unambiguous and cover every recovered site.
+fn signal_fallback_sites(diagnostic: &str, recovered: usize) -> Result<usize, String> {
+    let printed = diagnostic
+        .lines()
+        .any(|line| line.trim_start().starts_with("num_patched_B0"));
+    if !printed {
+        return Ok(0);
+    }
+    let (b0_sites, b0_total) = parse_metric(diagnostic, "num_patched_B0")?;
+    if b0_total != recovered {
+        return Err(format!(
+            "B0 coverage total {b0_total} did not match the recovered-site total {recovered}"
+        ));
+    }
+    Ok(b0_sites)
+}
+
 fn validate_patch_coverage(
     patched: usize,
     recovered: usize,
@@ -1172,6 +1203,21 @@ mod tests {
         assert_eq!(
             parse_metric(summary, "num_patched_B1"),
             Err("missing num_patched_B1 field".into())
+        );
+
+        assert_eq!(signal_fallback_sites(summary, 2), Ok(1));
+        assert_eq!(
+            signal_fallback_sites(summary, 3),
+            Err("B0 coverage total 2 did not match the recovered-site total 3".into())
+        );
+        // The pinned e9tool omits the B0 line when the tactic is disabled.
+        assert_eq!(
+            signal_fallback_sites("num_patched = 2 / 2 (100.00%)\n", 2),
+            Ok(0)
+        );
+        assert_eq!(
+            signal_fallback_sites("num_patched_B0 = one / 2\n", 2),
+            Err("malformed num_patched_B0 value".into())
         );
 
         let duplicate = format!("{summary}num_patched = 2 / 2 (100.00%)\n");

@@ -1346,8 +1346,8 @@ fn self_test() {
     // nodes, while explicit backend affinity still limits e2e cells to DBT.
     let rp_dbt = derive_run_plan(&dbt, &shards, &plan, &dag);
     check(
-        "dbt ⇒ dbt-parity shard",
-        rp_dbt.shards.contains(&"dbt-parity".to_string()),
+        "dbt ⇒ dbt-runtime-abi shard",
+        rp_dbt.shards.contains(&"dbt-runtime-abi".to_string()),
     );
     check(
         "dbt ⇒ hermit reverse-dep sabre shard",

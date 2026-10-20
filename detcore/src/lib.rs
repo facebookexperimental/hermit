@@ -573,6 +573,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// A common hook called at the start of *every* handler, just after we receive
     /// control from the guest.
     async fn pre_handler_hook<G: Guest<Self>>(&self, guest: &mut G, precise_branch: bool) {
+        // A handler that left early (an error return) may not have cleared
+        // this; no request made by this new handler belongs to that syscall.
+        guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
         let dettid = guest.thread_state().dettid;
         let evs = self.update_logical_time_rcbs(guest, precise_branch).await;
 
@@ -1035,16 +1038,95 @@ impl<T: RecordOrReplay> Detcore<T> {
         );
         Ok(())
     }
+}
 
-    fn display_syscall_finished<'a, M: MemoryAccess>(
-        syscall: &'a Syscall,
-        memory: &'a M,
-    ) -> reverie::syscalls::Display<'a, M, Syscall> {
-        match syscall {
-            Syscall::Fstat(_) => syscall.display(memory), //FIXME: T136880615 - fstat structure isn't fully deterministic yet
-            _ => syscall.display_with_outputs(memory),
+/// Render a finished syscall for the `finish syscall` DETLOG line.
+///
+/// Output pointers are dereferenced only when the kernel can have written
+/// them. Linux leaves the output buffer of the syscalls listed in
+/// [`failure_leaves_outputs_unwritten`] untouched when they fail with any errno
+/// other than EFAULT, so rendering it would publish whatever the guest
+/// happened to have there -- typically uninitialized stack -- as if it were a
+/// result, and two otherwise identical runs would diverge on it
+/// (<https://github.com/rrnewton/hermit/issues/3153>). For those syscalls such
+/// a failure renders the pointer arguments without their pointees; the errno
+/// is printed next to this rendering from the result itself.
+///
+/// EFAULT keeps the outputs rendered, because it is also the error of a copy
+/// that faulted part way: `copy_to_user()` may already have stored a prefix of
+/// the struct, which the guest can read and DETLOG must show. A tool error is
+/// not a guest errno and proves nothing about the buffer, so it keeps them
+/// rendered too.
+///
+/// Every other syscall keeps rendering its outputs on failure, because some
+/// Linux syscalls do write an output on an error return (for example
+/// `gettimeofday` stores `tv` before it faults on a bad `tz`). Hiding such an
+/// output would remove real evidence from DETLOG.
+fn display_syscall_finished<'a, M: MemoryAccess>(
+    syscall: &'a Syscall,
+    memory: &'a M,
+    result: &Result<i64, Error>,
+) -> reverie::syscalls::Display<'a, M, Syscall> {
+    match syscall {
+        Syscall::Fstat(_) => syscall.display(memory), //FIXME: T136880615 - fstat structure isn't fully deterministic yet
+        _ if failure_proves_outputs_unwritten(result)
+            && failure_leaves_outputs_unwritten(syscall) =>
+        {
+            syscall.display(memory)
         }
+        _ => syscall.display_with_outputs(memory),
     }
+}
+
+/// Syscalls whose output buffer Linux does not write when the syscall fails
+/// with an errno other than EFAULT, restricted to those whose output the pinned Reverie formatter dereferences.
+///
+/// This is deliberately a list of syscalls PROVEN not to write on failure,
+/// rather than a list of exceptions that do: a syscall missing from it keeps
+/// its outputs rendered, which can at worst show stale guest memory, whereas a
+/// syscall wrongly missing from an exception list would silently hide a value
+/// the kernel really wrote.
+///
+/// Kernel behaviour (Linux `fs/stat.c`, `kernel/time/posix-timers.c`):
+///
+/// - `stat`, `lstat`, `fstat`, `newfstatat`: `vfs_stat()`, `vfs_lstat()`,
+///   `vfs_fstat()` and `vfs_fstatat()` return their error before
+///   `cp_new_stat()` is called, so the `struct stat` is never copied out.
+///   Hermit's `handle_stat_family` likewise returns the injected syscall's
+///   error before it rewrites the buffer.
+/// - `statx`: `do_statx()` returns the `vfs_statx()` error before
+///   `cp_statx()` copies the `struct statx` out.
+/// - `clock_gettime`: `put_timespec64()` runs only when
+///   `kc->clock_get_timespec()` succeeded (`if (!error && put_timespec64(..))`),
+///   and an unknown clock returns `-EINVAL` before that. Hermit's
+///   `handle_clock_gettime` writes `tp` only on its success path.
+///
+/// In every case the one failure that follows a copy attempt is the `-EFAULT`
+/// from the copy itself, where `copy_to_user()` may have stored a prefix of
+/// the struct before faulting. [`failure_proves_outputs_unwritten`] therefore
+/// keeps rendering EFAULT failures, so that partial prefix stays visible.
+///
+/// `gettimeofday` is intentionally absent: `SYSCALL_DEFINE2(gettimeofday)` in
+/// `kernel/time/time.c` stores `tv` and then returns `-EFAULT` if copying
+/// `tz` faults, so its rendered output can be kernel-written on failure.
+fn failure_leaves_outputs_unwritten(syscall: &Syscall) -> bool {
+    matches!(
+        syscall,
+        Syscall::Stat(_)
+            | Syscall::Lstat(_)
+            | Syscall::Fstat(_)
+            | Syscall::Newfstatat(_)
+            | Syscall::Statx(_)
+            | Syscall::ClockGettime(_)
+    )
+}
+
+/// Whether `result` is a failure that, for a syscall listed in
+/// [`failure_leaves_outputs_unwritten`], proves Linux stored no output: a
+/// guest errno other than EFAULT. EFAULT can follow a partial copy, and a
+/// tool error is not the syscall's result.
+fn failure_proves_outputs_unwritten(result: &Result<i64, Error>) -> bool {
+    matches!(result, Err(Error::Errno(errno)) if *errno != Errno::EFAULT)
 }
 
 #[reverie::tool]
@@ -1622,6 +1704,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // A new thread or process is never the backend runtime's
                     // bootstrapping thread, so it starts outside any window.
                     uncharged_bootstrap_syscalls: 0,
+                    in_uncharged_bootstrap_syscall: false,
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,
@@ -1977,6 +2060,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // never reset: the first syscall after the window continues from the
         // value the window left. See https://github.com/rrnewton/hermit/issues/3338
         // and https://github.com/rrnewton/hermit/pull/3430#issuecomment-5928691696.
+        //
+        // The scheduler turns such a syscall needs are withheld the same way.
+        // Handling an uncharged syscall can still commit scheduler turns (for
+        // example the file resources of a read of /proc/self/maps), and each
+        // committed turn normally advances global time by the per-turn
+        // scheduler cost. While the syscall is being handled the thread is
+        // marked `in_uncharged_bootstrap_syscall`, `tool_global::resource_request`
+        // copies that mark into the request, and the scheduler does not
+        // advance global time for a marked turn unless it is an IO-polling
+        // retry, whose time enforces timeouts. Without this, a LiteInst run of
+        // the clock-trajectory fixture reached its first clock read 11.5 ms of
+        // virtual time later than with it, and each exec added 12.0 ms more
+        // (measured locally), which was enough for its sysinfo uptime to
+        // differ from the ptrace backend's on the hosted runner
+        // (https://github.com/rrnewton/hermit/issues/3517). A charged syscall
+        // (one that observes virtual time, or any past the cap) is not marked,
+        // so its turns advance the clock as everywhere else.
         let in_backend_runtime_bootstrap = guest.is_backend_runtime_bootstrap();
         let new_count = {
             // which results from not being able to borrow guest twice.
@@ -1988,11 +2088,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // The one exception is the bootstrap window described above: on the bootstrapping
             // thread, up to MAX_UNCHARGED_BOOTSTRAP_SYSCALLS syscalls per window that do not
             // observe virtual time are left uncharged.
-            if thread_state.charge_syscall_time(in_backend_runtime_bootstrap, call.number()) {
+            let charged =
+                thread_state.charge_syscall_time(in_backend_runtime_bootstrap, call.number());
+            if charged {
                 thread_state
                     .thread_logical_time
                     .add_syscall_with_cost(syscall_cost_ns);
             }
+            thread_state.in_uncharged_bootstrap_syscall = !charged;
             // This only folds the thread's new user and system time into the process total.
             // An uncharged syscall added none, so it needs no guard.
             thread_state.account_process_cpu_time();
@@ -2864,7 +2967,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             "[syscall][detcore, dtid {}] finish syscall #{}: {} = {:?}",
             dettid,
             new_count,
-            Self::display_syscall_finished(&call, &guest.memory()),
+            display_syscall_finished(&call, &guest.memory(), &res),
             res
         );
 
@@ -2917,6 +3020,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .await;
         }
 
+        // The syscall is finished; a turn the post-hook takes (a timeslice
+        // end) is the thread's own and advances global time as usual.
+        guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
         self.post_handler_hook(guest).await;
 
         // Defense-in-depth: unless the backend already owns this guarantee,
@@ -3742,6 +3848,298 @@ mod thread_cpu_time_tests {
             assert!(system > LogicalTime::ZERO);
             assert!(user < parent.thread_logical_time.user_cpu_time());
             assert!(system <= parent.thread_logical_time.system_cpu_time());
+        }
+    }
+}
+
+/// Regression tests for <https://github.com/rrnewton/hermit/issues/3153>: a
+/// failed syscall must not render an output buffer the kernel never wrote.
+///
+/// Each buffer is pre-filled with sentinel values standing in for the
+/// uninitialized guest stack the issue observed, and the rendering is checked
+/// through the same `finish syscall` format the DETLOG line uses.
+#[cfg(test)]
+mod finished_syscall_display_tests {
+    use std::ffi::CString;
+
+    use reverie::syscalls::AddrMut;
+    use reverie::syscalls::AtFlags;
+    use reverie::syscalls::ClockGettime;
+    use reverie::syscalls::ClockId;
+    use reverie::syscalls::Gettimeofday;
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::Newfstatat;
+    use reverie::syscalls::PathPtr;
+    use reverie::syscalls::StatPtr;
+    use reverie::syscalls::Statx;
+    use reverie::syscalls::StatxMask;
+    use reverie::syscalls::StatxPtr;
+    use reverie::syscalls::Timespec;
+    use reverie::syscalls::TimespecMutPtr;
+    use reverie::syscalls::Timeval;
+    use reverie::syscalls::TimevalMutPtr;
+
+    use super::*;
+
+    /// A value no real `st_size` or timestamp in these tests can take.
+    const SENTINEL: i64 = 0x5EED_0BAD_F00D;
+
+    /// Render exactly what the `finish syscall` DETLOG line renders.
+    fn finish_line(syscall: &Syscall, result: Result<i64, Error>) -> String {
+        let memory = LocalMemory::new();
+        format!(
+            "{} = {:?}",
+            display_syscall_finished(syscall, &memory, &result),
+            result
+        )
+    }
+
+    fn sentinel_stat() -> libc::stat {
+        // SAFETY: all-zero is a valid `struct stat`.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        stat.st_mode = libc::S_IFREG | 0o644;
+        stat.st_size = SENTINEL;
+        stat
+    }
+
+    fn sentinel_statx() -> libc::statx {
+        // SAFETY: all-zero is a valid `struct statx`.
+        let mut statx: libc::statx = unsafe { std::mem::zeroed() };
+        statx.stx_mode = (libc::S_IFREG | 0o644) as u16;
+        statx.stx_size = SENTINEL as u64;
+        statx
+    }
+
+    fn newfstatat(path: &CString, stat: &libc::stat) -> Syscall {
+        Syscall::Newfstatat(
+            Newfstatat::new()
+                .with_dirfd(libc::AT_FDCWD)
+                .with_path(PathPtr::from_ptr(path.as_ptr()))
+                .with_stat(StatPtr::from_ptr(stat as *const libc::stat))
+                .with_flags(AtFlags::empty()),
+        )
+    }
+
+    fn statx(path: &CString, statx: &libc::statx) -> Syscall {
+        Syscall::Statx(
+            Statx::new()
+                .with_dirfd(libc::AT_FDCWD)
+                .with_path(PathPtr::from_ptr(path.as_ptr()))
+                .with_flags(AtFlags::empty())
+                .with_mask(StatxMask::STATX_BASIC_STATS)
+                .with_statx(StatxPtr::from_ptr(statx as *const libc::statx)),
+        )
+    }
+
+    fn assert_no_struct_rendered(line: &str) {
+        assert!(!line.contains("st_mode"), "rendered st_mode: {line}");
+        assert!(!line.contains("st_size"), "rendered st_size: {line}");
+        assert!(
+            !line.contains(&SENTINEL.to_string()),
+            "rendered the unwritten sentinel: {line}"
+        );
+    }
+
+    #[test]
+    fn failed_newfstatat_renders_pointer_and_errno_but_not_the_buffer() {
+        let path = CString::new("/nonexistent/issue-3153").unwrap();
+        let stat = sentinel_stat();
+        let line = finish_line(&newfstatat(&path, &stat), Err(Errno::ENOENT.into()));
+
+        assert_no_struct_rendered(&line);
+        assert!(
+            line.contains(&format!("{:p}", &stat as *const libc::stat)),
+            "stat pointer missing: {line}"
+        );
+        assert!(
+            line.contains("\"/nonexistent/issue-3153\""),
+            "path missing: {line}"
+        );
+        assert!(line.contains("ENOENT"), "errno missing: {line}");
+    }
+
+    #[test]
+    fn successful_newfstatat_still_renders_the_buffer() {
+        let path = CString::new("/dev/null").unwrap();
+        let stat = sentinel_stat();
+        let line = finish_line(&newfstatat(&path, &stat), Ok(0));
+
+        assert!(
+            line.contains(&format!(
+                "{:p} -> {{st_mode=SFlag(S_IFREG) | 0644, st_size={}, ...}}",
+                &stat as *const libc::stat, SENTINEL
+            )),
+            "stat struct missing: {line}"
+        );
+    }
+
+    #[test]
+    fn failed_statx_renders_pointer_and_errno_but_not_the_buffer() {
+        let path = CString::new("/nonexistent/issue-3153").unwrap();
+        let buf = sentinel_statx();
+        let line = finish_line(&statx(&path, &buf), Err(Errno::ENOENT.into()));
+
+        assert_no_struct_rendered(&line);
+        assert!(
+            line.contains(&format!("{:p}", &buf as *const libc::statx)),
+            "statx pointer missing: {line}"
+        );
+        assert!(line.contains("ENOENT"), "errno missing: {line}");
+    }
+
+    #[test]
+    fn successful_statx_still_renders_the_buffer() {
+        let path = CString::new("/dev/null").unwrap();
+        let buf = sentinel_statx();
+        let line = finish_line(&statx(&path, &buf), Ok(0));
+
+        assert!(
+            line.contains(&format!(
+                "{:p} -> {{st_mode=SFlag(S_IFREG) | 0644, st_size={}, ...}}",
+                &buf as *const libc::statx, SENTINEL
+            )),
+            "statx struct missing: {line}"
+        );
+    }
+
+    #[test]
+    fn failed_clock_gettime_does_not_render_the_timespec() {
+        let tp = Timespec {
+            tv_sec: SENTINEL,
+            tv_nsec: 0,
+        };
+        let call = Syscall::ClockGettime(
+            ClockGettime::new()
+                .with_clockid(ClockId::CLOCK_MONOTONIC)
+                .with_tp(Some(TimespecMutPtr(
+                    AddrMut::from_ptr(&tp as *const Timespec).unwrap(),
+                ))),
+        );
+
+        let failed = finish_line(&call, Err(Errno::EINVAL.into()));
+        assert!(!failed.contains("tv_sec"), "rendered tv_sec: {failed}");
+        assert!(
+            failed.contains(&format!("{:p}", &tp as *const Timespec)),
+            "tp pointer missing: {failed}"
+        );
+        assert!(failed.contains("EINVAL"), "errno missing: {failed}");
+
+        let succeeded = finish_line(&call, Ok(0));
+        assert!(
+            succeeded.contains(&format!("tv_sec: {SENTINEL}")),
+            "timespec missing on success: {succeeded}"
+        );
+    }
+
+    /// EFAULT is also the error of a copy-out that faulted part way, after
+    /// `copy_to_user()` stored a prefix the guest can read, so it must keep
+    /// the buffer rendered for every allowlisted syscall.
+    #[test]
+    fn efault_failures_still_render_a_possible_partial_copy() {
+        let path = CString::new("/dev/null").unwrap();
+        let stat = sentinel_stat();
+        let line = finish_line(&newfstatat(&path, &stat), Err(Errno::EFAULT.into()));
+        assert!(
+            line.contains(&format!(
+                "{:p} -> {{st_mode=SFlag(S_IFREG) | 0644, st_size={}, ...}}",
+                &stat as *const libc::stat, SENTINEL
+            )),
+            "partial stat copy hidden on EFAULT: {line}"
+        );
+        assert!(line.contains("EFAULT"), "errno missing: {line}");
+
+        let buf = sentinel_statx();
+        let line = finish_line(&statx(&path, &buf), Err(Errno::EFAULT.into()));
+        assert!(
+            line.contains(&format!(
+                "{:p} -> {{st_mode=SFlag(S_IFREG) | 0644, st_size={}, ...}}",
+                &buf as *const libc::statx, SENTINEL
+            )),
+            "partial statx copy hidden on EFAULT: {line}"
+        );
+
+        let tp = Timespec {
+            tv_sec: SENTINEL,
+            tv_nsec: 0,
+        };
+        let call = Syscall::ClockGettime(
+            ClockGettime::new()
+                .with_clockid(ClockId::CLOCK_MONOTONIC)
+                .with_tp(Some(TimespecMutPtr(
+                    AddrMut::from_ptr(&tp as *const Timespec).unwrap(),
+                ))),
+        );
+        let line = finish_line(&call, Err(Errno::EFAULT.into()));
+        assert!(
+            line.contains(&format!("tv_sec: {SENTINEL}")),
+            "partial timespec copy hidden on EFAULT: {line}"
+        );
+    }
+
+    /// A tool error is not the syscall's result and proves nothing about the
+    /// buffer, so only a guest errno other than EFAULT hides it.
+    #[test]
+    fn only_non_efault_guest_errnos_prove_the_buffer_unwritten() {
+        for errno in [Errno::ENOENT, Errno::EINVAL, Errno::EBADF, Errno::ENOMEM] {
+            assert!(failure_proves_outputs_unwritten(&Err(errno.into())));
+        }
+        assert!(!failure_proves_outputs_unwritten(
+            &Err(Errno::EFAULT.into())
+        ));
+        assert!(!failure_proves_outputs_unwritten(&Ok(0)));
+        assert!(!failure_proves_outputs_unwritten(&Err(Error::Tool(
+            anyhow::anyhow!("tool failure")
+        ))));
+
+        let path = CString::new("/dev/null").unwrap();
+        let stat = sentinel_stat();
+        let line = finish_line(
+            &newfstatat(&path, &stat),
+            Err(Error::Tool(anyhow::anyhow!("tool failure"))),
+        );
+        assert!(
+            line.contains(&format!("st_size={SENTINEL}")),
+            "buffer hidden on a tool error: {line}"
+        );
+    }
+
+    /// `gettimeofday` stores `tv` before it can fail with `EFAULT` on a bad
+    /// `tz`, so a failed call can carry a kernel-written output. It must stay
+    /// rendered: suppressing it would hide real evidence from DETLOG.
+    #[test]
+    fn failed_gettimeofday_still_renders_the_timeval() {
+        let tv = Timeval {
+            tv_sec: SENTINEL,
+            tv_usec: 0,
+        };
+        let call = Syscall::Gettimeofday(
+            Gettimeofday::new()
+                .with_tv(Some(TimevalMutPtr(
+                    AddrMut::from_ptr(&tv as *const Timeval).unwrap(),
+                )))
+                .with_tz(None),
+        );
+
+        let line = finish_line(&call, Err(Errno::EFAULT.into()));
+        assert!(
+            line.contains(&format!("tv_sec: {SENTINEL}")),
+            "kernel-written timeval hidden on failure: {line}"
+        );
+        assert!(line.contains("EFAULT"), "errno missing: {line}");
+    }
+
+    /// `fstat` never renders its buffer (T136880615); the result must not
+    /// change that in either direction.
+    #[test]
+    fn fstat_never_renders_the_buffer() {
+        let stat = sentinel_stat();
+        let call = Syscall::Fstat(
+            reverie::syscalls::Fstat::new()
+                .with_fd(3)
+                .with_stat(StatPtr::from_ptr(&stat as *const libc::stat)),
+        );
+        for result in [Ok(0), Err(Errno::EBADF.into())] {
+            assert_no_struct_rendered(&finish_line(&call, result));
         }
     }
 }

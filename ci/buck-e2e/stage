@@ -1,0 +1,117 @@
+#!/bin/bash
+# Stage the e2e inputs Buck does not build yet into ci/buck-e2e/staged/ (gitignored):
+#
+#   bin/        test-harness + hermit-manifest-plan (release: the debug front door costs
+#               ~0.65 CPU-s per cell, which Buck pays once per cell)
+#   install/    the backend resource bundle (hermit-install: DynamoRIO, SaBRe, e9patch,
+#               liteinst runtime) plus the libunwind runtime closure, published with
+#               ci/publish-hermit-e2e-artifact.sh
+#   hermit      the cargo validate-profile hermit, for -c hermit_e2e.hermit=staged
+#   src/        `git archive HEAD`: the source snapshot cells read (no .git, no submodules)
+#   build/      `test-harness build` fixtures for every CI-selected cell, built from src/
+#   run-state/  the compat fixtures (tests/compat/prepare_real_compat_fixtures.sh)
+#   SOURCE_SHA  HEAD
+#
+# usage: ci/buck-e2e/stage --from-cargo [--target-dir DIR]   build them here with cargo
+#        ci/buck-e2e/stage --bundle DIR                       copy them from a prebuilt bundle
+#                                                             (bin/ build/ src/ run-state/
+#                                                             hermit/{hermit,install} PROVENANCE.json)
+#        ci/buck-e2e/stage -h|--help
+# Cells use the Buck-built hermit unless -c hermit_e2e.hermit=staged. Reflinks when it can.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+root=$(cd "$here/../.." && pwd)
+staged=$here/staged
+mode= bundle= target_dir=$root/target
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --from-cargo) mode=cargo; shift ;;
+        --bundle) mode=bundle; bundle=$(realpath "$2"); shift 2 ;;
+        --target-dir) target_dir=$2; shift 2 ;;
+        -h | --help) awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "${BASH_SOURCE[0]}"; exit 0 ;;
+        *) echo "ci/buck-e2e/stage: unknown argument $1" >&2; exit 2 ;;
+    esac
+done
+[[ -n $mode ]] || { echo "usage: ci/buck-e2e/stage --from-cargo [--target-dir DIR] | --bundle DIR" >&2; exit 2; }
+rm -rf "${staged:?}"
+mkdir -p "$staged"
+
+if [[ $mode == bundle ]]; then
+    for part in bin build src run-state; do
+        cp -a --reflink=auto "$bundle/$part" "$staged/$part"
+    done
+    cp -a --reflink=auto "$bundle/hermit/install" "$staged/install"
+    cp -a --reflink=auto "$bundle/hermit/hermit" "$staged/hermit"
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_sha"])' "$bundle/PROVENANCE.json" >"$staged/SOURCE_SHA"
+    echo "staged $(du -sh "$staged" | cut -f1) from $bundle (source $(cat "$staged/SOURCE_SHA"))"
+    exit 0
+fi
+
+sha=$(git -C "$root" rev-parse HEAD)
+[[ -z $(git -C "$root" status --porcelain --untracked-files=no) ]] ||
+    { echo "ci/buck-e2e/stage: commit first; cells record SOURCE_SHA=$sha" >&2; exit 2; }
+tmp=$(mktemp -d)
+trap 'rm -rf "${tmp:?}"' EXIT
+
+# patchelf sets the staged hermit's runtime search path. Hosts without it (the host
+# recorded in docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts" has no
+# patchelf package) use the static binary from the pinned PyPI wheel, fetched
+# once into ignored/host-tools/ and checked against its sha256.
+patchelf=${PATCHELF:-$(command -v patchelf || true)}
+if [[ -z $patchelf ]]; then
+    wheel=patchelf-0.19.1.0-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.musllinux_1_1_x86_64.whl
+    wheel_sha256=a8f6331ccf40c345507279f755f4a38c2cb00b9efda746fd43c17713cce0aba4
+    tools=$root/ignored/host-tools/patchelf-0.19.1.0
+    patchelf=$tools/patchelf-0.19.1.0.data/scripts/patchelf
+    if [[ ! -x $patchelf ]]; then
+        proxy=()
+        command -v with-proxy >/dev/null && proxy=(with-proxy)
+        mkdir -p "$tmp/wheel"
+        "${proxy[@]}" python3 -m pip download --quiet --no-deps --only-binary=:all: \
+            --dest "$tmp/wheel" patchelf==0.19.1.0
+        echo "$wheel_sha256  $tmp/wheel/$wheel" | sha256sum --check --quiet ||
+            { echo "ci/buck-e2e/stage: downloaded $wheel does not match its pinned sha256" >&2; exit 1; }
+        rm -rf "$tools"
+        mkdir -p "$tools"
+        python3 -m zipfile -e "$tmp/wheel/$wheel" "$tools"
+        chmod +x "$patchelf"
+    fi
+fi
+
+# 1. Binaries: the release harness, the validate-profile hermit and its install bundle.
+cargo build --manifest-path "$root/Cargo.toml" --locked --release -p hermit-manifest-plan --bins --target-dir "$target_dir"
+cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p detcore-dbt --target-dir "$target_dir"
+cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit --bin hermit \
+    --features hermit/third-party-backends --target-dir "$target_dir"
+# hermit-install's build script stages install_pkg/ next to the profile directories and
+# links libdetcore_sabre.so into it (`--bin hermit` above filters both packages out).
+cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-install -p detcore-sabre \
+    --target-dir "$target_dir"
+mkdir -p "$staged/bin"
+for b in test-harness hermit-manifest-plan; do
+    strip --strip-debug -o "$staged/bin/$b" "$target_dir/release/$b"
+done
+
+# 2. hermit + install/ in the published E2E layout, with the libunwind runtime closure.
+cp -aL "$target_dir/install_pkg" "$tmp/install_pkg"
+mkdir -p "$tmp/install_pkg/rsrcs/hermit-runtime"
+for lib in libunwind.so.8 libunwind-x86_64.so.8; do
+    install -m 644 "$(readlink -f "/usr/lib64/$lib")" "$tmp/install_pkg/rsrcs/hermit-runtime/$lib"
+done
+install -m 755 "$target_dir/validate/hermit" "$tmp/hermit"
+"$patchelf" --force-rpath --set-rpath '$ORIGIN/../install_pkg/rsrcs/hermit-runtime:$ORIGIN/install/rsrcs/hermit-runtime' "$tmp/hermit"
+"$root/ci/publish-hermit-e2e-artifact.sh" "$tmp/hermit" "$tmp/published" "$tmp/pointer" "$tmp/install_pkg" >/dev/null
+published=$(cat "$tmp/pointer")
+cp -a "$published/install" "$staged/install"
+cp -a "$published/hermit" "$staged/hermit"
+
+# 3. The source snapshot, and fixtures built from it exactly as a cell sees it.
+mkdir -p "$staged/src" "$staged/build"
+git -C "$root" archive "$sha" | tar x -C "$staged/src"
+for lane in portable privileged; do
+    VALIDATE_RUN_STATE="$staged/run-state" E2E_RESULT_ROOT="$tmp/results" E2E_BUILD_ROOT="$staged/build" E2E_RUN_ID=buck-e2e-stage \
+        "$staged/bin/test-harness" build --repo-root "$staged/src" --source-sha "$sha" --ci-only --lane "$lane" --jobs 32 >/dev/null
+done
+env -C "$staged/src" ./tests/compat/prepare_real_compat_fixtures.sh "$staged/run-state/strict-compat/real-compat-fixtures" >/dev/null
+echo "$sha" >"$staged/SOURCE_SHA"
+echo "staged $(du -sh "$staged" | cut -f1) for $sha"

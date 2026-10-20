@@ -121,7 +121,9 @@ printf 'kernel=%s\ninitramfs=%s\nartifacts=%s\n' \
 # TODO-HUMAN-REVIEW(#553)
 # The ptrace verifier captures guest stdout without replaying it. Run the exact
 # guest once under strict mode to assert the init success marker, then run the
-# same command under --verify for the L2 comparison.
+# same command under --verify --verify-strict for the canonical (bitwise) L2
+# comparison. A plain --verify is the lossy Stripped comparison and cannot
+# establish L2.
 guest_command=(
   "$qemu_bin"
   -nodefaults
@@ -140,7 +142,7 @@ guest_command=(
   -append 'console=ttyS0 panic=-1 rdinit=/init'
 )
 boot_command=("$hermit_bin" --log info run --strict -- "${guest_command[@]}")
-verify_command=("$hermit_bin" --log info run --strict --verify \
+verify_command=("$hermit_bin" --log info run --strict --verify --verify-strict \
   --verify-json "$verify_report" -- "${guest_command[@]}")
 
 setsid --wait "${boot_command[@]}" >"$boot_stdout" 2>"$boot_stderr" &
@@ -221,8 +223,11 @@ cat "$verifier_stderr" >&2
 if ((status != 0)); then
   fail "QEMU strict L2 verification exited with status $status"
 fi
-"$VERIFICATION_REPORT_BIN" matched "$verify_report" || \
-  fail "typed verification report did not match"
+[[ -s $verify_report ]] || fail "Hermit published no typed verification report"
+"$VERIFICATION_REPORT_BIN" canonical-match "$verify_report" || {
+  cat "$verify_report" >&2
+  fail "typed verification report did not establish non-vacuous bitwise parity"
+}
 stop_active_group
 
 printf 'QEMU strict L2 boot passed.\n'

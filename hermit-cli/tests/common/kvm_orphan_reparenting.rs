@@ -248,8 +248,8 @@ pub(super) fn run() {
             assert_eq!(operand.stderr_bytes, 0);
             assert_eq!(operand.stderr_sha256, Digest::new(b"").to_string());
         }
-        for prefix in ["run1_log_", "run2_log_"] {
-            let matches: Vec<_> = fs::read_dir(&logs)
+        let retained = |prefix: &str| -> Vec<_> {
+            fs::read_dir(&logs)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| {
@@ -258,10 +258,21 @@ pub(super) fn run() {
                         .to_string_lossy()
                         .starts_with(prefix)
                 })
-                .collect();
-            assert_eq!(matches.len(), 1, "one retained log per actual guest");
-            assert!(!bounded_read(&matches[0], 64 * MIB).is_empty());
-        }
+                .collect()
+        };
+        // After a match `--keep-logs` keeps only run 1's log, the golden copy;
+        // run 2's log, which matched it, is deleted.
+        let golden = retained("run1_log_");
+        assert_eq!(
+            golden.len(),
+            1,
+            "one retained golden log of the matched guest"
+        );
+        assert!(!bounded_read(&golden[0], 64 * MIB).is_empty());
+        assert!(
+            retained("run2_log_").is_empty(),
+            "a matched verification must not retain run 2's log"
+        );
         completed += 1;
         eprintln!("KVM reparenting mode {mode}: two actual guests and full INFO match");
     }

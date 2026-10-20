@@ -34,6 +34,7 @@ use reverie::syscalls::ProtFlags;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
+use reverie::syscalls::StatxMask;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
@@ -391,6 +392,31 @@ const DETERMINISTIC_NETNS_COOKIE: u64 = 1;
 // Above Linux's PID range and below the high-bit IDs used by kernel autobind.
 const DETERMINISTIC_NETLINK_PORT_ID_BASE: u32 = 0x4000_0000;
 
+/// Does the new guest descriptor `fd` reopen an anonymous pipe that the same
+/// process already holds as a scheduler-managed pipe (`managed_pipe_fds`)?
+///
+/// Both `/proc/<pid>/fd/<fd>` links read `pipe:[<inode>]` for the same pipe.
+/// A named FIFO links to its path, and on ptrace a host pipe is never in
+/// `managed_pipe_fds` (see `scheduler_managed_pipe_fds` for SaBRe), so neither
+/// matches: a host writer is outside the scheduler and must not be polled as if
+/// it were a guest
+/// (<https://github.com/rrnewton/hermit/pull/3534#issuecomment-5962369261>).
+fn reopens_scheduler_managed_pipe(pid: i32, fd: RawFd, managed_pipe_fds: &[RawFd]) -> bool {
+    let link = |fd: RawFd| std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok();
+    let Some(opened) = link(fd) else {
+        return false;
+    };
+    if !opened
+        .to_str()
+        .is_some_and(|name| name.starts_with("pipe:["))
+    {
+        return false;
+    }
+    managed_pipe_fds
+        .iter()
+        .any(|&held| held != fd && link(held).as_ref() == Some(&opened))
+}
+
 /// The path the kernel resolved an open descriptor to, read from the guest's
 /// own `/proc/<pid>/fd/<fd>` link. This is the evidence authority for "which
 /// object was opened": it is produced by the kernel from the descriptor itself,
@@ -438,6 +464,39 @@ fn timer_slack_witness_open(path: &Path, call: syscalls::Openat) -> Option<sysca
     let flags = call.flags();
     (flags.bits() & libc::O_ACCMODE != libc::O_RDONLY)
         .then(|| call.with_flags(flags & !OFlag::from_bits_truncate(libc::O_ACCMODE)))
+}
+
+/// Writes back the guest bytes that the utimensat lookup buffer covered.
+fn restore_lookup_buffer<M: MemoryAccess>(memory: &mut M, buffer: StatPtr, saved: &[u8]) {
+    if memory.write_exact(buffer.0.cast(), saved).is_err() {
+        info!("Could not restore the guest bytes under the utimensat lookup buffer.");
+    }
+}
+
+/// Whether the utimensat lookup buffer overlaps the guest memory Linux reads
+/// for `call`: the path through its NUL and, with `guest_times`, the two
+/// timespecs. A path that cannot be read counts as overlapping, so that the
+/// kernel, not a lookup, reports the fault.
+fn utimensat_input_overlaps<M: MemoryAccess>(
+    memory: &M,
+    call: &syscalls::Utimensat,
+    guest_times: bool,
+    buffer: StatPtr,
+) -> bool {
+    use reverie::syscalls::FromToRaw;
+
+    let start = buffer.0.as_raw();
+    let end = start + std::mem::size_of::<libc::stat>();
+    let overlaps = |addr: usize, len: usize| addr < end && start < addr.saturating_add(len);
+    let path = call.path().is_some_and(|path| match path.read(memory) {
+        Ok(path) => overlaps(call.path().into_raw(), path.as_os_str().len() + 1),
+        Err(_) => true,
+    });
+    let times = guest_times
+        && call
+            .times()
+            .is_some_and(|times| overlaps(times.as_raw(), std::mem::size_of::<[Timespec; 2]>()));
+    path || times
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -761,6 +820,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         Ok(total)
     }
+    /// Set the kernel's O_NONBLOCK on `fd`'s open file description, keeping its
+    /// other status flags. The caller records the change with
+    /// `maybe_set_nonblocking_fd`; the guest-visible flags are unchanged.
+    async fn inject_physical_nonblocking<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<(), Errno> {
+        let flags = guest
+            .inject(syscalls::Fcntl::new().with_fd(fd).with_cmd(F_GETFL))
+            .await?;
+        guest
+            .inject(
+                syscalls::Fcntl::new()
+                    .with_fd(fd)
+                    .with_cmd(F_SETFL(flags as i32 | OFlag::O_NONBLOCK.bits())),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Inject an extra fstat to retrieve file metadata.
     ///
     /// The kernel needs a writable `struct stat` in the guest. It is staged
@@ -993,7 +1073,40 @@ impl<T: RecordOrReplay> Detcore<T> {
                         FdType::Regular
                     }
                 });
+                // A guest-created pipe reopened by path (`/dev/stdin`,
+                // `/proc/self/fd/N`, bash's `< <(cmd)` as `/dev/fd/63`) is a NEW open
+                // file description, so it carries neither the Pipe type nor the
+                // physical O_NONBLOCK that `handle_pipe2` gave the original. Left as a
+                // physically blocking Regular fd, a read that waits for a writer blocks
+                // in the kernel while holding the scheduler turn, and the writer never
+                // runs (https://github.com/rrnewton/hermit/issues/1850). Give it the
+                // same treatment as `handle_pipe2`: Pipe type plus a Detcore-internal
+                // physical O_NONBLOCK, which F_GETFL hides from the guest. Only a pipe
+                // this process already holds as scheduler-managed qualifies; a host
+                // pipe or a named FIFO keeps `deterministic_read`'s Regular handling.
+                // Gated like the forced O_NONBLOCK in F_SETFL: Replayer's descriptor
+                // is an eventfd placeholder, so record and replay would not classify
+                // alike.
+                let fd_type = if fd_type == FdType::Regular
+                    && self.cfg.use_nonblocking_sockets()
+                    && !self.cfg.recordreplay_modes
+                    && !call.flags().contains(OFlag::O_PATH)
+                    && reopens_scheduler_managed_pipe(
+                        guest.pid().as_raw(),
+                        fd,
+                        &guest.thread_state().scheduler_managed_pipe_fds(),
+                    )
+                    && (call.flags().contains(OFlag::O_NONBLOCK)
+                        || self.inject_physical_nonblocking(guest, fd).await.is_ok())
+                {
+                    FdType::Pipe
+                } else {
+                    fd_type
+                };
                 self.add_fd(guest, fd, call.flags(), fd_type).await?;
+                if fd_type == FdType::Pipe {
+                    self.maybe_set_nonblocking_fd(guest, fd);
+                }
                 // Classify the spelling the guest used FIRST. Several kinds are
                 // defined by that spelling and MUST keep it: `/proc/self/...`,
                 // `/proc/thread-self/...` and the mountinfo aliases all resolve
@@ -1730,9 +1843,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }])?;
                 return Ok(0);
             }
-            // Zero-count reads only serve to detect errors.
-            let res = guest.inject(Syscall::from(call)).await?;
-            return Ok(res);
+            // A zero-count read transfers nothing on a file or stream, but on a
+            // datagram or SEQPACKET socket it consumes a pending message. Its
+            // result goes through record/replay: a replayed descriptor may be
+            // a placeholder whose own zero-count read fails differently.
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3601)
+            return self
+                .record_or_replay_preserving_tool_errors(guest, call)
+                .await;
         }
 
         let needs_procfs_snapshot = guest
@@ -1833,9 +1952,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         if call.len() == 0 {
-            // Zero-count reads only serve to detect errors.
-            let res = guest.inject(Syscall::from(call)).await?;
-            return Ok(res);
+            // As for read, a zero-count pread's result goes through
+            // record/replay.
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3601)
+            return self
+                .record_or_replay_preserving_tool_errors(guest, call)
+                .await;
         }
 
         let offset = usize::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
@@ -2920,7 +3043,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     //   - using virtual inode instead of real inodes. The virtual inodes
     //     increase monolitically and won't be re-used (like ext4)
     //   - use logical modtime which could be used by program like GNU make
-    //     to determine file changes
+    //     to determine file changes. A file first seen with a canonical host
+    //     mtime (`CANONICAL_FILE_MTIME_SECONDS`, e.g. the Nix store's 1) keeps
+    //     it; any other first-seen file reports the epoch.
+    //   - atime, ctime and btime always report the epoch: the kernel sets ctime
+    //     and btime itself, so even for a Nix store file they are real
+    //     timestamps, and Hermit keeps no per-file atime.
     async fn determinize_stat<G, S>(
         &self,
         guest: &mut G,
@@ -2935,6 +3063,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let mut stat: DetStat = stat.into();
         let (d_ino, global_mtime) = match inode_override {
+            // The container's stdio streams have fixed inodes and always
+            // report the epoch: whatever backs them on the host (a pipe, a
+            // terminal, a redirected file) is not part of the guest's view.
             Some(inode) => {
                 let nanos = cfg
                     .epoch
@@ -2943,7 +3074,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     as u64;
                 (inode, LogicalTime::from_nanos(nanos))
             }
-            None => determinize_inode(guest, stat.inode).await,
+            None => {
+                // statx fills stx_mtime only when it reports STATX_MTIME.
+                let observed = if stat.mask.contains(StatxMask::STATX_MTIME) {
+                    ObservedMtime::from_host_mtime(stat.mtime.tv_sec, stat.mtime.tv_nsec)
+                } else {
+                    ObservedMtime::Unobserved
+                };
+                determinize_inode_observing_mtime(guest, stat.inode, observed).await
+            }
         };
         stat.inode = d_ino.as_raw(); // Reveal only the deterministic inode.
 
@@ -3107,7 +3246,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             //
             // SHRINKING IS DELIBERATELY LEFT ALONE. It is always permitted for
             // an unprivileged process, it is process-local with no host-derived
-            // input, and `tests/backend-parity/fixtures/pipe_capacity.c` locks
+            // input, and `tests/c/pipe_capacity.c` locks
             // it as a guest-visible contract: that fixture shrinks to one page
             // and requires the value to round-trip. Clamping every
             // `F_SETPIPE_SZ` to the pinned capacity would break that contract
@@ -3606,18 +3745,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Utime,
     ) -> Result<i64, Errno> {
-        let mut stack = guest.stack().await;
-        let mut memory = guest.memory();
-        let tp: AddrMut<[Timespec; 2]> = stack.reserve();
-
-        let tp_val = match call.times() {
+        let times = match call.times() {
             None => {
                 let now: Timespec = thread_observe_time(guest).await.into();
                 [now, now]
             }
             Some(times) => {
-                let utimptr = times;
-                let utimbuf = memory.read_value(utimptr)?;
+                let utimbuf = guest.memory().read_value(times)?;
                 [
                     Timespec {
                         tv_sec: utimbuf.actime,
@@ -3631,15 +3765,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         };
 
-        memory.write_value(tp, &tp_val)?;
-        stack.commit()?;
-
         let utimensat = syscalls::Utimensat::new()
             .with_dirfd(libc::AT_FDCWD)
-            .with_path(call.path())
-            .with_times(Some(tp.into()));
+            .with_path(call.path());
 
-        self.handle_utimensat(guest, utimensat).await
+        self.set_file_times(guest, utimensat, Some(times)).await
     }
 
     /// utimes syscall
@@ -3648,19 +3778,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Utimes,
     ) -> Result<i64, Errno> {
-        let mut memory = guest.memory();
+        let utimensat = syscalls::Utimensat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(call.filename());
 
-        let tp: AddrMut<[Timespec; 2]> = match call.times() {
+        match call.times() {
             None => {
                 let now: Timespec = thread_observe_time(guest).await.into();
-                let mut stack = guest.stack().await;
-                let tp: AddrMut<[Timespec; 2]> = stack.reserve();
-                memory.write_value(tp, &[now, now])?;
-                stack.commit()?;
-                tp
+                self.set_file_times(guest, utimensat, Some([now, now]))
+                    .await
             }
             Some(times) => {
                 // Convert the timeval array to a timespec array.
+                let mut memory = guest.memory();
                 let tvs = memory.read_value(times)?;
                 let tp: Addr<[Timespec; 2]> = times.cast();
 
@@ -3669,16 +3799,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let tp = unsafe { tp.into_mut() };
 
                 memory.write_value(tp, &[tvs[0].into(), tvs[1].into()])?;
-                tp
+                self.set_file_times(guest, utimensat.with_times(Some(tp.into())), None)
+                    .await
             }
-        };
-
-        let utimensat = syscalls::Utimensat::new()
-            .with_dirfd(libc::AT_FDCWD)
-            .with_path(call.filename())
-            .with_times(Some(tp.into()));
-
-        self.handle_utimensat(guest, utimensat).await
+        }
     }
 
     /// ustimensat syscall
@@ -3687,7 +3811,216 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Utimensat,
     ) -> Result<i64, Errno> {
+        self.set_file_times(guest, call, None).await
+    }
+
+    /// Performs a utimensat call and copies the mtime it sets into the virtual
+    /// mtime. With `staged` the times are first pushed onto the guest's scratch
+    /// stack and replace the call's `times` pointer; utime and utimes(NULL)
+    /// build their times that way.
+    async fn set_file_times<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Utimensat,
+        staged: Option<[Timespec; 2]>,
+    ) -> Result<i64, Errno> {
+        if !guest.config().virtualize_metadata {
+            return self.utimensat_without_lookup(guest, call, staged).await;
+        }
+        // Without thread sequentialization another guest thread can swap the
+        // target away and back around the call, so that both lookups name a
+        // file the kernel did not update. No lookup can tell the two apart,
+        // so the virtual mtime is left alone.
+        if !guest.config().sequentialize_threads {
+            return self.utimensat_without_lookup(guest, call, staged).await;
+        }
+        // The scratch stack starts 128 bytes below the stack pointer and its
+        // addresses are computed by subtraction, so a stack pointer too close
+        // to zero to hold the staged times and the lookup buffer would stop
+        // Hermit rather than reach Linux.
+        let scratch = 128
+            + staged.map_or(0, |_| std::mem::size_of::<[Timespec; 2]>())
+            + std::mem::size_of::<libc::stat>();
+        if usize::try_from(guest.regs().await.rsp).map_or(true, |rsp| rsp <= scratch) {
+            info!(
+                "Guest stack pointer cannot hold the utimensat target lookup; \
+                 leaving the virtual mtime unchanged."
+            );
+            return self.utimensat_without_lookup(guest, call, staged).await;
+        }
+
+        // The staged times and the buffer for the target lookups share one
+        // scratch stack, and its guard is held until the last injected syscall
+        // has run, so that neither the kernel's read of the times nor a lookup
+        // finds the other's bytes, or a restored stack, at its address.
+        let mut stack = guest.stack().await;
+        let staged_call = match staged {
+            Some(times) => call.with_times(Some(stack.push(times))),
+            None => call,
+        };
+        let statptr: StatPtr = StatPtr(stack.reserve());
+        // The scratch stack lies below the guest's red zone, where a raw
+        // syscall may keep its own path or times. Writing the lookup buffer
+        // over either would change the call before Linux reads it.
+        if utimensat_input_overlaps(&guest.memory(), &call, staged.is_none(), statptr) {
+            info!(
+                "utimensat inputs overlap the target lookup buffer; \
+                 leaving the virtual mtime unchanged."
+            );
+            drop(stack);
+            return self.utimensat_without_lookup(guest, call, staged).await;
+        }
+        // The buffer's address range can still share its pages with guest data
+        // through a second shared mapping, which no address comparison sees.
+        // Its bytes are saved here and put back after the commit and after
+        // each lookup, so the lookups and the call read their inputs unchanged
+        // and the guest keeps its memory.
+        let mut saved = [0u8; std::mem::size_of::<libc::stat>()];
+        if guest
+            .memory()
+            .read_exact(statptr.0.cast(), &mut saved)
+            .is_err()
+        {
+            info!(
+                "Guest stack scratch cannot hold the utimensat target lookup; \
+                 leaving the virtual mtime unchanged."
+            );
+            drop(stack);
+            return self.utimensat_without_lookup(guest, call, staged).await;
+        }
+        let _guard = match stack.commit() {
+            Ok(guard) => guard,
+            // The lookup buffer only serves the virtual update, so a scratch
+            // stack that cannot hold it, for example one next to the guard
+            // page, must not keep the guest's own call from reaching Linux.
+            // The commit writes page by page, so it can fail after writing a
+            // lower writable page; those bytes are put back first.
+            Err(_) => {
+                info!(
+                    "Guest stack scratch cannot hold the utimensat target lookup; \
+                     leaving the virtual mtime unchanged."
+                );
+                restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
+                return self.utimensat_without_lookup(guest, call, staged).await;
+            }
+        };
+        restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
+        let call = staged_call;
+
+        // The kernel applies the new times to the real file, but the guest
+        // observes the virtual mtime, which otherwise only moves on writes. Copy
+        // the requested mtime into it so that `tar` extraction, `cp -p` and
+        // `touch -r` restore a file's mtime and `make` compares the times the
+        // build asked for rather than the order in which files were unpacked.
+        //
+        // Nothing below may change the syscall's result: an unreadable `times`
+        // or a failed lookup only skips the virtual update, and the kernel
+        // reports its own error for the call itself.
+        let mtime = match (staged, call.times()) {
+            (Some([_, mtime]), _) => Some(mtime),
+            (None, None) => Some(Timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_NOW,
+            }),
+            (None, Some(times)) => guest
+                .memory()
+                .read_value(times)
+                .ok()
+                .map(|[_, mtime]| mtime),
+        }
+        .filter(|mtime| mtime.tv_nsec != libc::UTIME_OMIT);
+        let before = match mtime {
+            Some(_) => self.utimensat_target(guest, &call, statptr).await,
+            None => None,
+        };
+        restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
+
+        let res = self.record_or_replay(guest, call).await?;
+
+        // Update only the inode the kernel modified. No other guest thread
+        // runs during the call, but a process outside the container can still
+        // rename, unlink or replace the target; the target is resolved before
+        // and after the call, and the update is skipped unless both name the
+        // same file. Equal lookups alone do not show that the kernel updated
+        // that file: the name may have been swapped away and back during the
+        // call, or an inode number reused. So an explicit mtime is copied only
+        // when the file holds it, truncated to the filesystem's granularity,
+        // and the virtual mtime takes the value the kernel stored, which is
+        // what stat reports on Linux. `UTIME_NOW` has no such witness.
+        let (Some(mtime), Some(before)) = (mtime, before) else {
+            return Ok(res);
+        };
+        let after = self.utimensat_target(guest, &call, statptr).await;
+        restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
+        let Some(after) = after else {
+            return Ok(res);
+        };
+        if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino) {
+            return Ok(res);
+        }
+        if mtime.tv_nsec == libc::UTIME_NOW {
+            touch_file(guest, after.st_ino).await;
+            return Ok(res);
+        }
+        const NANOS_PER_SEC: i128 = 1_000_000_000;
+        let requested = i128::from(mtime.tv_sec) * NANOS_PER_SEC + i128::from(mtime.tv_nsec);
+        let stored = i128::from(after.st_mtime) * NANOS_PER_SEC + i128::from(after.st_mtime_nsec);
+        // Linux truncates the requested time down to the filesystem's
+        // granularity, at most a second on the filesystems builds use.
+        if (0..NANOS_PER_SEC).contains(&(requested - stored)) {
+            let nanos = u64::try_from(stored.max(0)).unwrap_or(u64::MAX);
+            set_file_mtime(guest, after.st_ino, LogicalTime::from_nanos(nanos)).await;
+        }
+        Ok(res)
+    }
+
+    /// Performs a utimensat call without the virtual mtime update. Staged
+    /// times are then the only scratch-stack allocation, as they were before
+    /// the update existed.
+    async fn utimensat_without_lookup<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Utimensat,
+        staged: Option<[Timespec; 2]>,
+    ) -> Result<i64, Errno> {
+        let Some(times) = staged else {
+            return self.record_or_replay(guest, call).await;
+        };
+        let mut stack = guest.stack().await;
+        let call = call.with_times(Some(stack.push(times)));
+        let _guard = stack.commit()?;
         self.record_or_replay(guest, call).await
+    }
+
+    /// The metadata of the file a utimensat call targets, with the same target
+    /// selection: the descriptor itself for `futimens` (a NULL path), else a
+    /// path walk honoring the flags utimensat accepts. `None` if the lookup
+    /// fails.
+    async fn utimensat_target<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &syscalls::Utimensat,
+        statptr: StatPtr<'_>,
+    ) -> Option<libc::stat> {
+        let lookup = match call.path() {
+            None => Syscall::Fstat(
+                syscalls::Fstat::new()
+                    .with_fd(call.dirfd())
+                    .with_stat(Some(statptr)),
+            ),
+            Some(path) => {
+                let allowed = libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
+                Syscall::Newfstatat(
+                    syscalls::Newfstatat::new()
+                        .with_dirfd(call.dirfd())
+                        .with_path(Some(path))
+                        .with_stat(Some(statptr))
+                        .with_flags(AtFlags::from_bits_truncate(call.flags() & allowed)),
+                )
+            }
+        };
+        self.record_or_replay(guest, lookup).await.ok()?;
+        statptr.read(&guest.memory()).ok()
     }
 
     /// socket system call.
@@ -4731,7 +5064,7 @@ mod test {
         ));
     }
 
-    /// Shrinking stays legal. `tests/backend-parity/fixtures/pipe_capacity.c`
+    /// Shrinking stays legal. `tests/c/pipe_capacity.c`
     /// shrinks to one page and requires the value to round-trip, so a blanket
     /// clamp to the pinned capacity would break a guest-visible contract this
     /// repository already locked.

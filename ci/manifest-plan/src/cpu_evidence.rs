@@ -98,6 +98,10 @@ pub enum InvocationRole {
         attempt_index: String,
         backend: RequiredNullable<String>,
     },
+    /// Read-only history: the runner no longer launches this process (its
+    /// ptrace golden-log normalization was removed for
+    /// <https://github.com/rrnewton/hermit/issues/3301>), but results written
+    /// before then still record it, and they must keep parsing and validating.
     PtraceNormalization {
         execution_ordinal: u64,
     },
@@ -190,7 +194,15 @@ pub struct LiveCpuEnabled {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveCpuSource {
+    /// agent-utils `proccpu`: the summed CPU of the live members of the
+    /// leader's process group, found by scanning every process on the host.
+    /// The sum falls when a member exits.
     AgentUtilsPairedPidfdStatV1,
+    /// `usage_usec` from `cpu.stat` of a cgroup v2 created for exactly this
+    /// invocation, which the child joined before exec. It charges every
+    /// process in that cgroup, including one that left the process group, and
+    /// the kernel counter never decreases.
+    CgroupV2InvocationCpuStatV1,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
@@ -505,6 +517,12 @@ impl LiveCpuEnabled {
                 high.cpu_usec >= first.cpu_usec && high.cpu_usec >= last.cpu_usec,
                 "high water is below an endpoint",
             )?;
+            if self.source == LiveCpuSource::CgroupV2InvocationCpuStatV1 {
+                require(
+                    last.cpu_usec == high.cpu_usec,
+                    "cgroup CPU counter decreased",
+                )?;
+            }
             require(
                 self.valid_polls <= last.poll - first.poll + 1,
                 "valid poll count exceeds point interval",
@@ -1395,6 +1413,56 @@ pub(crate) mod tests {
         assert!(!valid(&later_unavailable));
         row["cpu_observations"]["invocations"][0]["returned_cpu_charge"]["cpu_usec"] = json!(9);
         assert!(!valid(&row));
+    }
+
+    #[test]
+    fn each_live_source_is_named_and_the_cgroup_counter_cannot_fall() {
+        for (source, name) in [
+            (
+                LiveCpuSource::AgentUtilsPairedPidfdStatV1,
+                "agent_utils_paired_pidfd_stat_v1",
+            ),
+            (
+                LiveCpuSource::CgroupV2InvocationCpuStatV1,
+                "cgroup_v2_invocation_cpu_stat_v1",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&source).unwrap(), json!(name));
+            assert_eq!(
+                serde_json::from_value::<LiveCpuSource>(json!(name)).unwrap(),
+                source
+            );
+        }
+        let rising = |source: &str| {
+            let mut row = executed_row();
+            let live = &mut row["cpu_observations"]["invocations"][0]["live"];
+            *live = enabled();
+            live["source"] = json!(source);
+            live["first"]["cpu_usec"] = json!(7);
+            live["last"]["cpu_usec"] = json!(9);
+            live["high_water"] = live["last"].clone();
+            row
+        };
+        for source in [
+            "agent_utils_paired_pidfd_stat_v1",
+            "cgroup_v2_invocation_cpu_stat_v1",
+        ] {
+            assert!(valid(&rising(source)), "{source}");
+            let raw = serde_json::to_string(&rising(source)).unwrap();
+            assert!(crate::ledger::read_schema10_source_result(raw.as_bytes()).is_ok());
+        }
+        // The process-group scan loses an exited member's CPU, so its sum may
+        // fall (enabled() records 9 then 7); a cgroup's usage_usec may not.
+        let mut falling = executed_row();
+        falling["cpu_observations"]["invocations"][0]["live"] = enabled();
+        assert!(valid(&falling));
+        falling["cpu_observations"]["invocations"][0]["live"]["source"] =
+            json!("cgroup_v2_invocation_cpu_stat_v1");
+        assert!(!valid(&falling));
+        let unknown = rising("cgroup_v1_cpuacct");
+        assert!(!valid(&unknown));
+        let raw = serde_json::to_string(&unknown).unwrap();
+        assert!(crate::ledger::read_schema10_source_result(raw.as_bytes()).is_err());
     }
 
     #[test]

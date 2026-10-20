@@ -22,9 +22,13 @@
 //! The extraction is corroborated by the counts the bash itself declares:
 //! `strict` dumped **191** rows against `STRICT_COMPAT_TOTAL=191`, and `sabre`
 //! dumped **212** against `SABRE_COMPAT_TOTAL=212` — exact, independent matches.
-//! `rr` dumps 174 admitted rows which the driver then filters to the 139
-//! `RR_COMPAT_PASSING_LABELS` (the bash filters at the same point, inside
-//! `rr_compatibility_probe`), and `e9patch` dumps 172 admitted rows.
+//! (The SaBRe rows have since moved into tests/e2e/manifests/compat.yaml as the
+//! sabre-compat-only run type's cells, and `corpus-sabre.json` is gone.)
+//! `rr` dumped 174 admitted rows which the driver then filtered to the 139
+//! `RR_COMPAT_PASSING_LABELS` (the bash filtered at the same point, inside
+//! `rr_compatibility_probe`), and `e9patch` dumps 172 admitted rows. (The rr
+//! rows have since moved into tests/e2e/manifests/compat.yaml as the
+//! rr-compat-only run type's replay cells, and `corpus-rr.json` is gone.)
 //!
 //! # Why a data file rather than Rust literals
 //!
@@ -123,17 +127,11 @@ pub fn load(root: &Path, mode: &str, paths: &CorpusPaths) -> Result<Vec<CorpusRo
 /// rows were added: the corpus reached netlink only incidentally through `ip`,
 /// `ss`, and every `python3` row, none of which asserted anything about a reply,
 /// so no cell would have failed if detcore stopped normalizing netlink at all.
+///
+/// The strict-compat-only run type no longer reads this file: since
+/// 2026-10-02 its rows are the compat.yaml `variants` cells compat/strict-<row>.
+/// The super suite's portable strict rows still do.
 pub const STRICT_COMPAT_TOTAL: usize = 193;
-
-/// `RR_COMPAT_EXPECTED` (validate.sh:1117). The exact set measured to pass
-/// record/replay. Raising this without a fresh sweep produces a phantom ratchet.
-pub const RR_COMPAT_EXPECTED: usize = 139;
-
-/// `SABRE_COMPAT_EXPECTED` (validate.sh:1121) — the blocking floor.
-pub const SABRE_COMPAT_EXPECTED: usize = 207;
-
-/// `SABRE_COMPAT_TOTAL` (validate.sh:1124) — the measured corpus size.
-pub const SABRE_COMPAT_TOTAL: usize = 212;
 
 /// `E9PATCH_COMPAT_TOTAL` (validate.sh:1125).
 pub const E9PATCH_COMPAT_TOTAL: usize = 155;
@@ -193,178 +191,6 @@ pub fn portable_super_only() -> BTreeMap<&'static str, &'static str> {
         ("node", "Node.js runtime startup workload"),
     ])
 }
-
-/// `RR_COMPAT_KNOWN_FAILURES` (validate.sh:1181). Strict-corpus programs measured
-/// to FAIL record/replay, hence excluded from the R/R passing ratchet.
-pub fn rr_known_failures() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::from([
-        (
-            "g++",
-            "replay diverges (thread 13, ~event 132): C++ front-end header/.gch path resolution (readlink vs newfstatat) desyncs the event stream",
-        ),
-        (
-            "ar",
-            "replay diverges (thread 11, ~event 3): archive workload teardown (execveat rm -rf) reorders against the recorded stream",
-        ),
-        (
-            "strip",
-            "replay diverges at replayer/mod.rs:776 after a clean record",
-        ),
-        (
-            "gprof",
-            "replay diverges at replayer/mod.rs:776 after a clean record",
-        ),
-        (
-            "gcov",
-            "replay diverges at replayer/mod.rs:776 after a clean record",
-        ),
-    ])
-}
-
-/// `RR_COMPAT_PASSING_LABELS` (validate.sh:1191) — exactly the rows measured to
-/// pass record/replay. Size is asserted against [`RR_COMPAT_EXPECTED`] at startup,
-/// reproducing the bash's own parse-time guard (validate.sh:1219).
-pub const RR_PASSING_LABELS: &[&str] = &[
-    "echo",
-    "seq",
-    "cat",
-    "wc",
-    "head",
-    "base64",
-    "id",
-    "lua",
-    "perl",
-    "awk",
-    "bc",
-    "sqlite3",
-    "bash",
-    "gcc",
-    "make",
-    "bzip2",
-    "gzip",
-    "xz",
-    "zstd",
-    "openssl",
-    "sort",
-    "uniq",
-    "tr",
-    "cut",
-    "tee",
-    "paste",
-    "comm",
-    "join",
-    "find",
-    "stat",
-    "file",
-    "basename",
-    "dirname",
-    "env",
-    "printenv",
-    "uname",
-    "factor",
-    "expr",
-    "dd",
-    "df",
-    "du",
-    "hostname",
-    "whoami",
-    "groups",
-    "tty",
-    "nproc",
-    "arch",
-    "realpath",
-    "readlink",
-    "sha256sum",
-    "sha1sum",
-    "md5sum",
-    "wc-lines",
-    "nl",
-    "expand",
-    "unexpand",
-    "test",
-    "bracket",
-    "printf",
-    "sleep",
-    "stdbuf",
-    "nohup",
-    "nice",
-    "ionice",
-    "taskset",
-    "chrt",
-    "flock",
-    "logger",
-    "getopt",
-    "column",
-    "hexdump",
-    "xxd",
-    "strings",
-    "od",
-    "sum",
-    "cksum",
-    "b2sum",
-    "tsort",
-    "ptx",
-    "pinky",
-    "logname",
-    "users",
-    "uptime",
-    "grep",
-    "egrep",
-    "fgrep",
-    "sed",
-    "date",
-    "cal",
-    "yes",
-    "tac",
-    "rev",
-    "fold",
-    "fmt",
-    "shuf",
-    "numfmt",
-    "split",
-    "cmp",
-    "rmdir",
-    "mkfifo",
-    "mkdir",
-    "node",
-    "diff",
-    "cp",
-    "install",
-    "tar",
-    "mv",
-    "rm",
-    "touch",
-    "chmod",
-    "java",
-    "python3",
-    "git",
-    "true",
-    "pwd",
-    "base32",
-    "sha224sum",
-    "sha384sum",
-    "sha512sum",
-    "pr",
-    "ls",
-    "xargs",
-    "iconv",
-    "as",
-    "ld",
-    "nm",
-    "objcopy",
-    "objdump",
-    "ranlib",
-    "readelf",
-    "size",
-    "addr2line",
-    "c++filt",
-    "elfedit",
-    "cpp",
-    "ruby",
-    "dc",
-    "tcl",
-    "free",
-];
 
 /// `COMPAT_SUMMARY_CATEGORIES` (validate.sh:1160), in the bash's print order.
 pub const CATEGORIES: &[&str] = &[

@@ -49,3 +49,10 @@ extra_srcs = [
 AR = "/usr/bin/ar"
 CC = "/usr/bin/gcc"
 CXX = "/usr/bin/g++"
+# DynamoRIO's CMake build. The cmake target is the host's cmake for local builds and a
+# self-contained staged cmake under the RE modes (RE workers have none); see
+# shim/third-party/cmake/BUCK. buildscript_run makes env paths relative to the build
+# script's cwd, where reverie-dbt runs cmake.
+CMAKE = "$(location //third-party/cmake:cmake-dir)/bin/cmake"
+# reverie-dbt builds DynamoRIO with `cmake --build --parallel $NUM_JOBS` (default 1).
+NUM_JOBS = "32"

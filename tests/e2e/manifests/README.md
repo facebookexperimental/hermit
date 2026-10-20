@@ -30,7 +30,9 @@ Seven buckets currently contain calibrated blocking workloads:
 - `applications.yaml`
 - `c-programs.yaml` (eight calibrated Buck-derived C probes)
 - `compat.yaml` (the 189-program strict compatibility corpus, written as a
-  `corpus` section; five of its rows are diagnostics)
+  `corpus` section; five of its rows are diagnostics; it also holds the
+  `sabre-compat-only` run type's SaBRe cells and its 27 extra rows, and the
+  `strict-compat-only` run type's 193 strict variant tests)
 
 Eight additional `*-c.yaml`/`c-programs.yaml` buckets make 180 more C guests
 centrally discoverable. Eight `c-programs.yaml` entries have calibrated
@@ -51,12 +53,12 @@ include ptrace so the reference behavior is established before another backend
 ratchets it.
 
 `ci/matrix-symmetry-baseline.json` records the small amount of older policy
-debt: ptrace-less manifest rows and guest fixtures owned by a backend-specific
-or legacy backend-parity driver. `hermit-manifest-plan` requires that baseline
-to match exactly, so private corpora cannot grow. Migrating a baseline entry to
-a shared manifest is allowed, but the same change must remove it from the
-baseline. This makes the shared test identity the row axis; backend support or
-gaps remain cells of that one row rather than creating backend-private rows.
+debt: ptrace-less manifest rows and guest fixtures owned by a driver for one
+backend or for e9patch preprocessing. `hermit-manifest-plan` requires that
+baseline to match exactly, so private corpora cannot grow. Migrating a baseline
+entry to a shared manifest is allowed, but the same change must remove it from
+the baseline. This makes the shared test identity the row axis; backend support
+or gaps remain cells of that one row rather than creating backend-private rows.
 
 ## Schema contract
 
@@ -321,8 +323,11 @@ must be non-empty, keys must name backends in `backends_enabled`, and the
 table is rejected outside `verify` mode.
 
 These keys carry the DBT cases of the retired strict parity matrix
-(`tests/backend-parity/run_matrix.py --backend dbt --strict`, see
-https://github.com/rrnewton/hermit/issues/3301). The matrix compared the
+(`run_matrix.py --backend dbt --strict`). That driver was deleted with
+`tests/backend-parity/` under https://github.com/rrnewton/hermit/issues/3301;
+its last version is
+https://github.com/rrnewton/hermit/blob/82e24cc0e6fac0f7f9a8dac4b4b25d9ad8e3231d/tests/backend-parity/run_matrix.py.
+The matrix compared the
 stdout of three `--strict` runs with one attempt. A verify cell compares two
 runs, their stdout and their recorded event streams, and like every manifest
 cell a failed attempt is retried once; a passing retry passes the cell and the
@@ -333,7 +338,8 @@ specific configuration:
 
 ```yaml
       verify:
-        hermit_args: [--no-virtualize-cpuid, --max-timeslice=disabled]
+        hermit_args:
+          ptrace: [--no-virtualize-cpuid, --max-timeslice=disabled]
         hermit_args_reason: The corpus records this configuration
         env: {TMPDIR: /tmp}
         comparator: stripped
@@ -342,7 +348,8 @@ specific configuration:
           ptrace: A bounded probe; its failure is reported, not blocking
 ```
 
-- `hermit_args` are Hermit `run` flags added after the runner's own. Only
+- `hermit_args` are Hermit `run` flags added after the runner's own, per
+  enabled backend: a backend not named gets none. Only
   `--no-virtualize-cpuid` and `--max-timeslice=VALUE` are accepted. Each
   relaxes determinism, so a non-empty `hermit_args_reason` is required and
   every flag is recorded, with that reason, in the result row's
@@ -389,7 +396,27 @@ recipe before validation, so the harness, the front door and every audit see
 ordinary tests: id `<bucket>/<id or label>`, one CI verify cell on the
 section's `backend` carrying its `verify` settings, and every other mode and
 backend disabled with a stated reason. `diagnostic.rows` names, per row label,
-why that row's cell is a diagnostic, with its own shortened budget. A row's
+why that row's cell is a diagnostic, with its own shortened budget, and
+`heavy.rows` why that row's cell gets a longer one. `focused` adds a verify cell
+on one more backend to every row except those its `except` names (each with
+the reason that backend is disabled there), labelled with a run type (below),
+so the default run type does not run it; it shares the section's verify
+settings except `hermit_args`, which stay on the section's backend. Each
+`variants` entry adds one more test per row except those its `except` groups
+name (each group with its reason): id `<bucket>/<id_prefix><id or label>`,
+labelled with the entry's run type, with one verify cell on the section's
+backend that keeps the section's environment and comparator but takes its
+`hermit_args` (none unless stated), budget, `slow_reason` and
+`no_retry_reason` from the entry and is never a diagnostic; the entry's own
+`unselected` lists its cells measured red. An entry with `mode: replay`
+instead gives each test one replay cell on ptrace (`hermit record start`
+then replay, compared by the harness), with the entry's budget and
+`slow_reason` but no `hermit_args`, environment, comparator or
+`no_retry_reason`, which a replay cell does not take; the default is
+`mode: verify`. A row's own
+`labels` put all of its cells in those run types. `unselected` lists cells
+measured red: each stays enabled with `ci: false` and a `ci_disabled_reason`
+carrying the class's `result`, `evidence` (an issue) and `reason`. A row's
 `argv` is a `direct` argv list, run without a shell; in it `{{ROOT_DIR}}` is
 the repository root and `{{VALIDATE_RUN_STATE}}` the validation's per-run state
 directory (`$VALIDATE_RUN_STATE`). A row that names the latter is refused, not
@@ -402,10 +429,18 @@ failure stays a failure. `compat.yaml` declares it because each of its programs
 ran once per validation as its own node before the corpus moved here.
 
 A test may carry `labels` (lowercase words joined by `-`, unique), naming the
-run types it belongs to. `test-harness run --label LABEL[,LABEL...]` keeps only
-the tests carrying at least one named label, so one bucket node can serve
-several run types. A label that no test carries is refused, so a typo cannot
-select nothing and pass.
+run types it belongs to, and a non-naked mode may carry `labels` per enabled
+backend, adding run types to that one cell. A cell's run types are its test's
+labels plus its mode's labels for its backend, or `full` (the default run type)
+when both are empty. `test-harness run --label LABEL[,LABEL...]` keeps only the
+cells carrying at least one named run type, and a selection without `--label`
+selects `full`, so a cell labelled only with a focused run type is required by
+that run type's bucket node and by nothing else; ci/expected-e2e-plan.json and
+every full, portable, hosted and quick node select `full`. A bucket node that
+selects a run type declares it in its static source (`ManifestSpec::label` in
+ci/manifest-plan/src/validation_dag_static.rs), carries only that DAG label, and
+owns that run type's required cells. A label that no cell carries is refused,
+so a typo cannot select nothing and pass.
 
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for

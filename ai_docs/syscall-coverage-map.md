@@ -12,21 +12,21 @@ counted.
 
 | Classification | Count | Share of 382 |
 | --- | ---: | ---: |
-| DETERMINIZED | 69 | 18.1% |
-| PASSTHROUGH | 19 | 5.0% |
+| DETERMINIZED | 70 | 18.3% |
+| PASSTHROUGH | 18 | 4.7% |
 | BLOCKED | 3 | 0.8% |
 | MISSING | 291 | 76.2% |
 
-"DETERMINIZED" includes partial models. Of those 69 entries, only
+"DETERMINIZED" includes partial models. Of those 70 entries, only
 `getrandom` and `getcpu` are unconditional full replacements of their
 nondeterministic outputs. Six more have complete deterministic output/effect
 only in the relevant configured mode: `alarm`, `pause`,
 `clock_gettime`, `clock_getres`, `time`, and `sched_yield`. The other
-61 are partial models that still use the host kernel, cover only some commands
+62 are partial models that still use the host kernel, cover only some commands
 or file-descriptor types, or depend on a stable filesystem/network environment.
 
 Release `hermit run` subscribes to 78 syscall numbers. That set comprises the
-69 determinized entries, six explicit passthroughs, and three blocked entries.
+70 determinized entries, five explicit passthroughs, and three blocked entries.
 Normal CLI defaults enable scheduling, deterministic I/O, time virtualization,
 and metadata virtualization, so all conditional subscription groups are active
 unless the user opts out. A debug build instead uses `Subscription::all()`.
@@ -127,7 +127,7 @@ Important partial-model details:
 
 Always-trapped passthroughs:
 
-- `mmap`, `utimensat`, and `epoll_pwait`.
+- `mmap` and `epoll_pwait`.
 - `add_key`, `request_key`, and `keyctl`; their source TODO calls out
   key-serial virtualization.
 
@@ -320,7 +320,7 @@ header.
 | 129 | `rt_sigqueueinfo` | MISSING | none | none | No Detcore-specific release coverage. |
 | 130 | `rt_sigsuspend` | MISSING | none | none | No Detcore-specific release coverage. |
 | 131 | `sigaltstack` | PASSTHROUGH | none | none | Explicit passthrough arm, but no release subscription; reached only in debug or via an extra subscriber. |
-| 132 | `utime` | DETERMINIZED | always | partial | NULL timestamp inputs use logical time, then the update reaches the host filesystem. |
+| 132 | `utime` | DETERMINIZED | always | partial | NULL timestamp inputs use logical time, then the update reaches the host filesystem and the virtual mtime, as for `utimensat`. |
 | 133 | `mknod` | MISSING | none | none | No Detcore-specific release coverage. |
 | 134 | `uselib` | MISSING | none | none | No Detcore-specific release coverage. |
 | 135 | `personality` | MISSING | none | none | No Detcore-specific release coverage. |
@@ -423,7 +423,7 @@ header.
 | 232 | `epoll_wait` | DETERMINIZED | always | partial | Internal waits use deterministic nonblocking polling; external/record modes use host blocking timing. |
 | 233 | `epoll_ctl` | DETERMINIZED | always | partial | Scheduler checkpoint plus kernel epoll state; event object semantics are not modeled. |
 | 234 | `tgkill` | MISSING | none | none | Native PID/TID signal targeting bypasses the scheduler model. |
-| 235 | `utimes` | DETERMINIZED | always | partial | NULL timestamp inputs use logical time, then the update reaches the host filesystem. |
+| 235 | `utimes` | DETERMINIZED | always | partial | NULL timestamp inputs use logical time, then the update reaches the host filesystem and the virtual mtime, as for `utimensat`. |
 | 236 | `vserver` | MISSING | none | none | No Detcore-specific release coverage. |
 | 237 | `mbind` | MISSING | none | none | No Detcore-specific release coverage. |
 | 238 | `set_mempolicy` | MISSING | none | none | No Detcore-specific release coverage. |
@@ -468,7 +468,7 @@ header.
 | 277 | `sync_file_range` | MISSING | none | none | No Detcore-specific release coverage. |
 | 278 | `vmsplice` | MISSING | none | none | Pipe I/O bypasses resource ordering and blocking handling. |
 | 279 | `move_pages` | MISSING | none | none | No Detcore-specific release coverage. |
-| 280 | `utimensat` | PASSTHROUGH | always | none | Subscribed handler directly forwards to record/replay or the host kernel. |
+| 280 | `utimensat` | DETERMINIZED | always | partial | Host call, then the mtime the kernel stored (the requested one truncated to the filesystem's granularity), or logical now for `UTIME_NOW`, becomes the target inode's virtual mtime; skipped if the target changes identity around the call or does not hold the requested mtime, and when the guest's scratch stack cannot hold the lookup buffer or the buffer would overlap the call's path or times. |
 | 281 | `epoll_pwait` | PASSTHROUGH | always | none | Empty scheduler checkpoint, then host call; blocking, timeout, and signal-mask behavior are not determinized. |
 | 282 | `signalfd` | DETERMINIZED | always | partial | Tracks descriptor type/flags only; most subsequent object operations remain missing or host-backed. |
 | 283 | `timerfd_create` | DETERMINIZED | always | partial | Tracks descriptor type/flags only; most subsequent object operations remain missing or host-backed. |

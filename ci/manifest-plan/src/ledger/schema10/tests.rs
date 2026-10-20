@@ -785,8 +785,25 @@ fn pre_fold_expected_json(expected_json: &str) -> String {
     }
     // 276 portable and 3 privileged folded cells, plus the DBT verify cells slice
     // S13 (https://github.com/rrnewton/hermit/issues/3301) selected for the folded
-    // tests c-programs/pid-probe (portable) and c-programs/cpuid-probe (privileged).
-    assert_eq!(restored, 281, "277 portable and 4 privileged folded cells");
+    // tests c-programs/pid-probe (portable) and c-programs/cpuid-probe (privileged),
+    // plus the ptrace replay cell https://github.com/rrnewton/hermit/pull/3580
+    // selected for the folded test c-programs/poll-readiness (portable).
+    // This reconstructed plan uses today's population, including six earlier and
+    // three socket KVM verify cells from https://github.com/rrnewton/reverie/issues/891.
+    // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
+    // One epoll-pwait2 KVM row joins the reconstructed population:
+    // https://github.com/rrnewton/reverie/issues/905
+    // One ordinary syncfs KVM row joins the same live population:
+    // https://github.com/rrnewton/reverie/issues/838
+    // The pipe owner/signal row adds one: https://github.com/rrnewton/reverie/pull/910.
+    // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+    // The 2026-10-03 SaBRe promotion (timeouts::SABRE_2026_10_03_*) adds 89
+    // portable SaBRe verify cells of folded tests.
+    assert_eq!(
+        restored,
+        282 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89,
+        "381 portable and 4 privileged folded cells"
+    );
     serde_json::to_string(&expected).unwrap()
 }
 
@@ -950,9 +967,21 @@ fn generated_plan_populations_preserve_command_policy() {
     // https://github.com/rrnewton/hermit/issues/3448 adds the 189 portable
     // ptrace verify cells of the strict compatibility corpus, which ran as
     // generated compat.<label> nodes before; every plan below carries them on
-    // both sides, so only its count moves.
+    // both sides, so only its count moves. The same holds for the two ptrace
+    // replay cells https://github.com/rrnewton/hermit/pull/3580 selects.
     let compat = crate::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT;
-    let total = 900 + compat;
+    let select = crate::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT;
+    // The 2026-10-03 SaBRe promotion adds 128 portable SaBRe verify cells.
+    let sabre = crate::timeouts::SABRE_2026_10_03_SELECTED_CI_CELL_COUNT;
+    // https://github.com/rrnewton/reverie/issues/891 selects six more portable
+    // KVM verify cells; keep the earlier populations as explicit baselines.
+    // Three more socket KVM verify selections: https://github.com/rrnewton/reverie/issues/891.
+    // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
+    // One epoll-pwait2 KVM verify selection: https://github.com/rrnewton/reverie/issues/905.
+    // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
+    // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+    // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+    let total = 900 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 + 1 + sabre;
     assert!(exact_rng_population(&raw_expected, total));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(expected_cells.len(), total);
@@ -991,7 +1020,18 @@ fn generated_plan_populations_preserve_command_policy() {
         .filter(|cell| cell.lane == "portable" && cell.backend != "kvm")
         .cloned()
         .collect::<Vec<_>>();
-    assert_eq!(hosted_cells.len(), 893 + compat - 241);
+    // The six earlier and three socket KVM cells are also excluded, so the hosted total is unchanged.
+    // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
+    assert_eq!(
+        hosted_cells.len(),
+        // The new KVM row is also excluded from hosted runs: https://github.com/rrnewton/reverie/issues/905.
+        // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
+        // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+        // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+        // The SaBRe cells are portable and not KVM, so hosted runs keep them.
+        893 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 + 1 + sabre
+            - (241 + 6 + 3 + 1 + 1 + 1 + 1 + 1)
+    );
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
         current_hosted.planned_backend_parity_relations().unwrap(),
@@ -1038,7 +1078,11 @@ fn generated_plan_populations_preserve_command_policy() {
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
             LAST_LIVE_HOSTED_PARITY_SELECTOR,
-            893 + compat,
+            // This pre-exclusion shape also owns the new KVM row: https://github.com/rrnewton/reverie/issues/905.
+            // The ordinary syncfs KVM row adds one too: https://github.com/rrnewton/reverie/issues/838.
+            // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+            // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+            893 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 + 1 + sabre,
         ),
     ] {
         let mut live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
@@ -1152,13 +1196,37 @@ fn generated_plan_populations_preserve_command_policy() {
                 .cloned()
                 .map(BackendParityRelation::ptrace)
                 .collect::<Vec<_>>();
-            assert_eq!(expected_relations.len(), if active { 174 } else { 0 });
+            // These pre-fold-shaped plans use today's population, including six earlier and three socket KVM cells.
+            // https://github.com/rrnewton/reverie/issues/891
+            // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
+            assert_eq!(
+                expected_relations.len(),
+                // One epoll-pwait2 KVM relation: https://github.com/rrnewton/reverie/issues/905.
+                // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
+                // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+                // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+                // The 89 promoted folded SaBRe verify cells add one relation each.
+                if active {
+                    174 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89
+                } else {
+                    0
+                }
+            );
             assert_eq!(
                 plan.planned_backend_parity_relations().unwrap(),
                 expected_relations
             );
             if active {
-                for (backend, count) in [("kvm", 75), ("liteinst", 97), ("sabre", 1), ("dbt", 1)] {
+                for (backend, count) in [
+                    // The same sole added candidate: https://github.com/rrnewton/reverie/issues/905.
+                    // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
+                    // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+                    // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+                    ("kvm", 75 + 6 + 3 + 1 + 1 + 1 + 1 + 1),
+                    ("liteinst", 97),
+                    ("sabre", 1 + 89),
+                    ("dbt", 1),
+                ] {
                     assert_eq!(
                         expected_relations
                             .iter()

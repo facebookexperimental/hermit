@@ -21,6 +21,7 @@ use reverie::syscalls::AddrMut;
 use reverie::syscalls::Fcntl;
 use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::Ftruncate;
+use reverie::syscalls::Getcwd;
 use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
 use reverie::syscalls::Getuid;
@@ -42,6 +43,7 @@ use super::Replayer;
 use crate::event::FileCloneImage;
 use crate::event::ReplayFdKind;
 use crate::event::deterministic_ioctl_error;
+use crate::event::xattr_query_output;
 use crate::vectored_offset;
 
 #[repr(C)]
@@ -783,10 +785,14 @@ impl Replayer {
 
         assert!(event.bytes.len() <= syscall.len());
 
-        guest
-            .memory()
-            .write_exact(syscall.buf().unwrap(), &event.bytes)
-            .unwrap();
+        // A read that transferred nothing never touched the buffer, and it may
+        // be NULL.
+        if !event.bytes.is_empty() {
+            guest
+                .memory()
+                .write_exact(syscall.buf().unwrap(), &event.bytes)
+                .unwrap();
+        }
         Ok(event.bytes.len() as i64)
     }
 
@@ -799,11 +805,14 @@ impl Replayer {
 
         assert!(buf.len() <= syscall.len());
 
-        // Write out the buffer.
-        guest
-            .memory()
-            .write_exact(syscall.buf().unwrap(), &buf)
-            .unwrap();
+        // Write out the buffer. A read that transferred nothing never touched
+        // it, and it may be NULL.
+        if !buf.is_empty() {
+            guest
+                .memory()
+                .write_exact(syscall.buf().unwrap(), &buf)
+                .unwrap();
+        }
         Ok(buf.len() as i64)
     }
 
@@ -1168,6 +1177,55 @@ impl Replayer {
         guest
             .memory()
             .write_exact(syscall.buf().unwrap().cast::<u8>(), &buf)?;
+        Ok(buf.len() as i64)
+    }
+
+    // TODO-HUMAN-REVIEW(PR-3601)
+    /// Replays an xattr query from the recording without asking the replay
+    /// process: its descriptor may be a placeholder and its paths live in the
+    /// replay chroot. A sized query writes back the recorded value bytes; a
+    /// zero-size query returns the recorded length the value needs.
+    pub(super) async fn handle_xattr_query<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let (buf, size) = xattr_query_output(&syscall)
+            .unwrap_or_else(|| unreachable!("xattr query replay called for {syscall:?}"));
+        if size == 0 {
+            return next_event!(guest, Return);
+        }
+        let bytes = next_event!(guest, Bytes)?;
+        assert!(
+            bytes.len() <= size,
+            "recorded xattr value of {} bytes exceeds the {size}-byte buffer",
+            bytes.len()
+        );
+        if !bytes.is_empty() {
+            guest.memory().write_exact(
+                buf.expect("a recorded non-empty xattr value had an output buffer"),
+                &bytes,
+            )?;
+        }
+        Ok(bytes.len() as i64)
+    }
+
+    // TODO-HUMAN-REVIEW(#3598)
+    /// Writes back the recorded working directory, including its NUL, without
+    /// asking the replay process, whose working directory lives in the replay
+    /// chroot rather than the recording's namespace.
+    pub(super) async fn handle_getcwd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Getcwd,
+    ) -> Result<i64, Errno> {
+        let buf = next_event!(guest, Bytes)?;
+
+        debug_assert!(buf.len() <= syscall.size());
+
+        guest
+            .memory()
+            .write_exact(syscall.buf().ok_or(Errno::EFAULT)?.cast::<u8>(), &buf)?;
         Ok(buf.len() as i64)
     }
 

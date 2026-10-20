@@ -128,7 +128,7 @@ fn kvm_mountinfo_uses_its_synthetic_namespace_identity() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let guest = compile_guest(
         "mountinfo_device_identity",
-        "tests/backend-parity/fixtures/mountinfo_device_identity.c",
+        "tests/c/mountinfo_device_identity.c",
         &[],
     );
     let run = || {

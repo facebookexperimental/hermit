@@ -8,6 +8,9 @@
 
 //! SaBRe plugin that executes Hermit's Detcore tool inside each guest process.
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod glibc_compat;
+
 use std::ffi::CString;
 use std::ffi::OsStr;
 use std::ffi::OsString;

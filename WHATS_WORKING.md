@@ -71,6 +71,11 @@ $HERMIT run --strict --verify -- <program> [args...]
   Stripped Detcore logs. Selected numeric, address, path, and time fields are
   removed before the log comparison, so this is not bit-for-bit parity and not L2.
   On success you get: `:: Success: deterministic. Determinism verified.`
+  followed by a `:: Compared: ...` line that names what the match rests on.
+  For a plain `--verify` that line says the log comparison was the lossy
+  Stripped one and is not a bitwise comparison. With `--verify-strict` it ends
+  `bitwise parity established` only when `--verify-json` reports
+  `bitwise_parity: true`.
   On failure: `:: Failure: nondeterministic.`
 
 Two useful notes about the sandbox:

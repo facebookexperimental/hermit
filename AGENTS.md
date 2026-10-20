@@ -569,63 +569,92 @@ gh issue view <number> -R rrnewton/hermit
 
 Network configuration is an environment requirement, not an authentication
 workaround. Create, edit, or close issues only when the task explicitly calls
-for that repository-side change.
+for that repository-side change. Filing a product defect, as "Evidence,
+Ownership, and Task Closure" below requires, is always such a call.
 
-## Task Closure Policy
+## Evidence, Ownership, and Task Closure
 
-Closing a task and landing the change are two different facts, and they are
-recorded by two different tags. Phantom closures — a task that reads as
-delivered while the work never reached `main` — are a recurring, expensive
-failure mode, which is what the second tag exists to prevent. The rules below
-are mandatory for every implementation and review agent.
+Publishing a change and landing it are two different facts. Phantom closures —
+work that reads as delivered while it never reached `main` — are a recurring,
+expensive failure mode. The rules below are mandatory for every implementation
+and review agent.
 
-1. **You close your own task.** When your work is done, post the evidence, add
-   the `implemented` tag, and close the task yourself with
-   `tg update <task> --status closed`. Closure is not routed through a
-   coordinator. Leaving a finished, evidenced task open is itself a defect: it
-   hides the task from every queue that reads status, and the parent's health
-   tick reports `implemented` without `closed` as a lifecycle violation.
-2. **The implementor adds `implemented`; whoever lands the change adds
-   `landed`.** Both are tags, not TaskGraph statuses, and carrying them
-   separately is what makes "closed but not landed" a cheap query. `implemented`
-   means the feature branch is pushed and a pull request is open against
-   `rrnewton/hermit:main` — it does not claim a landing. Preserve the task's
-   existing tags when recording the transition and evidence:
+Where things are recorded. The policy is stated once, in the dev-hermit parent
+`AGENTS.md` section "Task lists, pull-request ownership, and durable records";
+in short:
 
-   ```bash
-   tg note <task> "IMPLEMENTED: https://github.com/rrnewton/hermit/pull/<n> \
-     | branch <feature-branch> @ <40-hex SHA> | base origin/main <SHA> \
-     | validation: <exact commands + results, assurance level, backend>"
-   tg update <task> --tags <existing-tags>,implemented
-   tg update <task> --status closed
-   ```
+- **Product defects** in Hermit (determinism bugs, wrong syscall behaviour,
+  crashes, backend gaps) go to a GitHub issue in `rrnewton/hermit`. Search for
+  an existing issue first.
+- **Durable findings** (an investigation result, a measurement, a recipe
+  another agent needs) go in a GitHub issue, a pull-request comment, or a
+  tracked report. A to-do list entry is not a durable record.
+- **The record for a change is its pull request.** The PR description or a PR
+  comment carries the exact tested 40-hex head SHA, the base SHA, and the
+  validation: exact commands and results, assurance level, and backend. A
+  branch name alone is not evidence.
+- **The owner of a pull request** is the single
+  `Owner: <agent-name> (<harness>, <host>) since <UTC timestamp>` line in its
+  description.
+- **TaskGraph (`tg`) is ORC's short-term to-do list and dispatch memory.** It is
+  not a record, it does not decide who owns a pull request, and agents outside
+  ORC do not use it.
 
-   The PR link and the exact tested SHA are required, not optional. A branch
-   name alone is not evidence.
-3. **Adversarial review confirms the work exists in the PR.** Before a task's
-   `implemented` tag is trusted, a reviewer independently verifies that the claimed
-   change is actually present in the pull request diff, that the cited tests
-   exist and were run at the PR head SHA, and that the reported assurance level
-   (L0–L4), backend, and relaxations match reality. A claim that does not
-   survive this check must lose the `implemented` tag.
-4. **A closed task tagged `implemented` but not `landed` is unlanded work, and
-   it stays visible as exactly that.** Do not add `landed` for an open,
+1. **Implemented means an open pull request with evidence; landed means on
+   `main`.** "Implemented" means the feature branch is pushed and a pull request
+   is open against `rrnewton/hermit:main` with the evidence above. It does not
+   claim a landing.
+2. **Adversarial review confirms the work exists in the PR.** Before an
+   implementation claim is trusted, a reviewer independently verifies that the
+   claimed change is actually present in the pull request diff, that the cited
+   tests exist and were run at the PR head SHA, and that the reported assurance
+   level (L0–L4), backend, and relaxations match reality. A claim that does not
+   survive this check is withdrawn in a PR comment.
+3. **Unlanded work stays visible as exactly that.** Do not describe an open,
    in-review, validation-red, awaiting-merge, or blocked-on-a-dependency pull
-   request. Removing a tag is how a false claim is retracted: if the published
-   artifact disappears or the implementation claim proves false, drop
-   `implemented` and say so in a note. Do not invent a status that TaskGraph
-   does not have.
-5. **Add `landed` once the commit is on `main`, verified against freshly
-   fetched ancestry.** A local green run, a GitHub state field, or a label is
-   not landing evidence. Recording the landing through the dev-hermit parent's
-   `./ci-hub/bin/close-task <task> --code <PR-or-full-SHA> --repo <owner/repo>
-   --source <checkout>` additionally writes the `CLOSURE-VERIFIED` note, which
-   is what the parent's health tick currently reads to discharge landing debt.
+   request as landed. If the published artifact disappears or the
+   implementation claim proves false, say so in the PR.
+4. **Landed requires freshly fetched ancestry.** A local green run, a GitHub
+   state field, or a label is not landing evidence. The change has landed when
+   its commit is on `main` according to freshly fetched ancestry; record the
+   merge SHA in a PR comment.
+
+### Under ORC: closing a TaskGraph task
+
+When an ORC task tracks the work, two tags carry the two facts above, and
+carrying them separately is what makes "closed but not landed" a cheap query.
+They are tags, not TaskGraph statuses; do not invent a status that TaskGraph
+does not have.
+
+- **You close your own task.** When the pull request is open with its evidence,
+  add the `implemented` tag and close the task yourself with
+  `tg update <task> --status closed`. Closure is not routed through a
+  coordinator. Leaving a finished, evidenced task open is itself a defect: it
+  hides the task from every ORC queue that reads status, and the parent's health
+  tick reports `implemented` without `closed` as a lifecycle violation. Preserve
+  the task's existing tags:
+
+  ```bash
+  tg note <task> "IMPLEMENTED: https://github.com/rrnewton/hermit/pull/<n> \
+    | branch <feature-branch> @ <40-hex SHA> | base origin/main <SHA> \
+    | validation: <exact commands + results, assurance level, backend>"
+  tg update <task> --tags <existing-tags>,implemented
+  tg update <task> --status closed
+  ```
+
+- **The implementor adds `implemented`; whoever lands the change adds
+  `landed`,** once rule 4 holds. Recording the landing through the dev-hermit
+  parent's `./ci-hub/bin/close-task <task> --code <PR-or-full-SHA> --repo
+  <owner/repo> --source <checkout>` additionally writes the `CLOSURE-VERIFIED`
+  note, which is what the parent's health tick currently reads to discharge
+  landing debt.
+- A claim withdrawn under rule 2 or 3 also loses the `implemented` tag.
 
 ### Landed vs. Not Landed
 
-Use these concrete examples to decide which tags a closed task carries. When in
-doubt, claim the weaker tag and say why in a task note.
+Use these concrete examples to decide what you may claim in the pull request
+and, under ORC, which tags a closed task carries. When in doubt, claim the
+weaker state and say why in the pull request.
 
 **`landed`:**
 
@@ -634,15 +663,15 @@ doubt, claim the weaker tag and say why in a task note.
 - A coordinated Hermit/Reverie change: both PRs merged, the parent gitlink(s)
   updated to the exact landed SHAs, and the pair revalidated.
 
-**`implemented` but not `landed` (close the task; the tag carries the debt):**
+**`implemented` but not `landed` (under ORC, close the task; the tag carries the debt):**
 
 - Branch pushed, PR open, exact-head validation green, awaiting merge.
 - PR open but validation red, or an exact-head receipt missing/stale — report
-  the exact failure in a note.
+  the exact failure in the pull request.
 - Work committed and pushed but blocked on another PR or a reverie pin bump —
   name the blocker and the dependency SHAs.
 
-**Neither tag — the work is not done, so the task stays open:**
+**Neither — the work is not done (under ORC, the task stays open):**
 
 - Code written but uncommitted or not pushed. Do not use a stash as a handoff.
 - "It builds/tests pass locally" with no pushed branch and no open PR.

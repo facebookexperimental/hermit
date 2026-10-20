@@ -28,9 +28,9 @@
  * is issued on a small file that was just written, so writeback completes
  * promptly and the WAIT flags do not turn into an unbounded block.
  *
- * ptrace and DBT drive the full barrier set; if KVM's ElfExecutor does not
- * implement sync_file_range it refuses deterministically with ENOSYS, recorded
- * as a KVM gap in matrix.tsv (mirrors the syncfs gap in fsync_durability).
+ * ptrace and DBT drive the full barrier set. KVM's ElfExecutor forwards
+ * sync_file_range to the host descriptor, and the KVM verify cell for
+ * c-programs/sync-file-range in tests/e2e/manifests/c-programs.yaml is enabled.
  */
 
 #ifndef SYNC_FILE_RANGE_WAIT_BEFORE

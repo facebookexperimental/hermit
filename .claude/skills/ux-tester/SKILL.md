@@ -53,21 +53,25 @@ observed facts separate from hypotheses about the cause.
 
 ## File Every Problem
 
-Create one TaskGraph task per independent problem; do not bury defects only in
-chat or combine unrelated symptoms into one task. Search first and reuse an
-existing task for the same defect. Use a symptom-focused title and include
+File one GitHub issue in `rrnewton/hermit` per independent problem; these are
+product defects, and product defects go to GitHub issues (TaskGraph is ORC's
+to-do list, not a record). Do not bury defects only in chat or combine
+unrelated symptoms into one issue. Search first and comment on an existing
+issue for the same defect. Use a symptom-focused title and include
 reproduction steps, expected behavior, actual behavior, user impact, evidence,
-and a concrete acceptance check. Choose honest impact, effort, priority, tags,
-and parent/project relationships, for example:
+and a concrete acceptance check. Write the body in a file with a quoted heredoc
+and pass it with `--body-file`, for example:
 
 ```bash
-tg add "Help output leaks internal source comments" \
-  --impact 50 --effort 0.5 --tags ux,bug \
-  --blocks <owning-task-or-goal> \
-  --description "Repro: ... Expected: ... Actual: ... Acceptance: ..."
+cat > /tmp/issue-body.md <<'EOF'
+Repro: ... Expected: ... Actual: ... Impact: ... Acceptance: ...
+EOF
+gh issue create -R rrnewton/hermit \
+  --title "Help output leaks internal source comments" \
+  --body-file /tmp/issue-body.md
 ```
 
-Report the created task IDs beside the corresponding findings. If no problem is
+Report each issue's full URL beside the corresponding finding. If no problem is
 found, say so explicitly; do not invent work to satisfy the checklist.
 
 ## Canonical Catch

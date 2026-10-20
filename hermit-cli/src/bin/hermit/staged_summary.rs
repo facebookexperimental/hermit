@@ -1100,7 +1100,7 @@ mod tests {
         assert!(init.status.success());
         fs::write(
             root.join(".gitignore"),
-            include_bytes!("../../../../.gitignore"),
+            include_bytes!("../../../tests/fixtures/staged-summary.gitignore"),
         )
         .unwrap();
         let destination = root.join("ignored/artifacts/summary.json");

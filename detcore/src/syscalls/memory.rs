@@ -102,10 +102,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Apply a deterministic policy to madvise(2).
     ///
     /// Ptrace/DBT forward hints and supported advice with guest-visible semantics.
-    /// Record/replay accepts pure hints as no-ops and rejects guest-semantic advice
-    /// because replay replaces file mappings with anonymous mappings. Reclaim and
-    /// asynchronous VM-policy
-    /// advice receives fixed success without exposing host memory pressure. Resource-
+    /// Record/replay accepts pure hints as no-ops and passes guest-semantic advice
+    /// to the recorder and replayer, which record and restore the effects that
+    /// differ because replay replaces file mappings with anonymous mappings.
+    /// Reclaim and asynchronous VM-policy advice receives fixed success without exposing host memory pressure. Resource-
     /// dependent, backing-store, and hardware-failure operations receive fixed errors.
     /// KVM accepts pure hints as no-ops and reports ENOSYS for guest-visible semantics
     /// its executor cannot provide.
@@ -126,26 +126,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 _ => Ok(0),
             };
         }
-        if self.cfg.recordreplay_modes {
-            match action {
-                MadviseAction::ForwardHint => {
-                    crate::detlog!(
-                        "[dtid {}] madvise hint {} accepted as record/replay no-op",
-                        guest.thread_state().dettid,
-                        advice,
-                    );
-                    return Ok(0);
-                }
-                MadviseAction::ForwardSemantic => {
-                    crate::detlog!(
-                        "[dtid {}] madvise advice {} unsupported in record/replay",
-                        guest.thread_state().dettid,
-                        advice,
-                    );
-                    return Err(Errno::ENOSYS.into());
-                }
-                MadviseAction::Ignore | MadviseAction::Reject(_) | MadviseAction::Unknown => {}
-            }
+        if self.cfg.recordreplay_modes && action == MadviseAction::ForwardHint {
+            crate::detlog!(
+                "[dtid {}] madvise hint {} accepted as record/replay no-op",
+                guest.thread_state().dettid,
+                advice,
+            );
+            return Ok(0);
         }
 
         match action {

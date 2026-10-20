@@ -33,11 +33,10 @@ endif
 # immediately saturating every hardware thread. Override on smaller shared hosts.
 THIRD_PARTY_BUILD_JOBS ?= 64
 
-# Hermit debug binary used by the per-backend parity targets below. Override to
-# point the matrix at a prebuilt binary and skip the build step, e.g.
+# Hermit binary that validate-kvm and validate-dbt below hand to test-harness as
+# HERMIT_BIN. Override to run those cells against a prebuilt binary, e.g.
 #   make validate-kvm HERMIT_DEBUG_BIN=/path/to/hermit
 HERMIT_DEBUG_BIN ?= target/debug/hermit
-RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .DEFAULT_GOAL := build
 
@@ -81,8 +80,10 @@ install-deps: install-hooks check-submodules ## Build and stage all third-party 
 install-hooks: ## Install this checkout's git pre-commit hooks (Reverie pin policy)
 	@./scripts/setup-hooks.sh
 
-release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm/liteinst)
-	$(CARGO) build --release --locked -p hermit
+# A release build stamps the source revision into `hermit --version`; regular
+# builds do not (see hermit-cli/build_support.rs, `HERMIT_STAMP_GIT_SHA`).
+release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm)
+	HERMIT_STAMP_GIT_SHA=1 $(CARGO) build --release --locked -p hermit
 
 # `make build` produces target/debug/hermit but never rebuilds an existing
 # target/release/hermit. A release binary left over from an earlier
@@ -93,8 +94,10 @@ release-core: check-submodules ## Build the lean core-only release binary (ptrac
 # release binary (rebuild-or-remove: rebuild explicitly with `make release-core`).
 # "Current" means the embedded --version SHA equals HEAD's `git rev-parse
 # --short=12` on a clean worktree with no `-dirty` marker, matching how
-# hermit-cli/build.rs stamps the binary. A dirty worktree can't be verified, so
-# any existing release binary is treated as stale and removed.
+# `make release-core` stamps the binary. A dirty worktree can't be verified, so
+# any existing release binary is treated as stale and removed. So is an
+# unstamped binary (a plain `cargo build --release`, whose --version says
+# `dev build`), because nothing in it names the commit it was built from.
 prune-stale-release: ## Remove target/release/hermit if stale (not built from current HEAD/worktree)
 	@bin=target/release/hermit; \
 	if [ ! -x "$$bin" ]; then \
@@ -108,6 +111,8 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 	elif [ -n "$$head" ] && printf '%s' "$$ver" | grep -q "$$head" && ! printf '%s' "$$ver" | grep -q -- '-dirty'; then \
 		echo "make: prune-stale-release: kept $$bin (built from current HEAD, worktree clean)"; \
 		exit 0; \
+	elif printf '%s' "$$ver" | grep -q 'dev build'; then \
+		reason="unstamped '$$ver' cannot be checked against HEAD g$$head"; \
 	else \
 		reason="built from '$$ver', HEAD is g$$head"; \
 	fi; \
@@ -196,6 +201,7 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	./ci/hermetic/assert-build-dependencies.sh --self-test
 	./ci/hermetic/check-image-provenance.rs
 	./ci/hermetic/tests/test-retry-fetch.sh
+	./ci/apt-install-cached-test.sh
 	python3 ./ci/hermetic/run-in-pinned-root-cache-test.py
 	./scripts/check-checker-scheduling.rs --self-test
 	./scripts/check-checker-scheduling.rs
@@ -217,8 +223,12 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh $(_VALIDATE_PIN_ARG)
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
 	./scripts/check-record-version-floor.rs
+	./scripts/check-buck-reindeer-features.rs
+	./scripts/patch-reverie-dbt-buck.rs --check-inventory
 	./scripts/core-review-protocol-lint-test.sh
 	python3 ./ci/test_audit_test_binary_registration.py
+	python3 ./ci/test_buck_e2e_ingest.py
+	python3 ./ci/test_buck_e2e_verdict.py
 	./ci/run-with-reverie-dbt-budget-test.sh
 
 # The unit tests carried by rust-script entrypoints are their own CI node,
@@ -237,8 +247,8 @@ help: ## Show this help (the list of make targets)
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@printf '\nPer-backend validate targets run ONLY one backend'"'"'s compatibility\n'
 	@printf 'corpus, for a tight per-backend iteration loop. Runtimes are approximate:\n'
-	@printf '  validate-kvm       KVM parity corpus     (needs /dev/kvm)            ~5-15 min\n'
-	@printf '  validate-dbt       DBT parity corpus     (third-party-backends)      ~5-15 min\n'
+	@printf '  validate-kvm       KVM manifest cells    (needs /dev/kvm)            not yet timed\n'
+	@printf '  validate-dbt       DBT manifest cells    (third-party-backends)      not yet timed\n'
 	@printf '  validate-sabre     SaBRe corpus          (needs HERMIT_SABRE_BINARY) ~10-20 min\n'
 	@printf '  validate-liteinst  LiteInst strict corpus                            ~5-15 min\n'
 	@printf '  validate-e9patch   e9patch corpus        (needs HERMIT_E9PATCH_BACKEND) ~5-20 min\n'
@@ -336,23 +346,26 @@ check-submodules: checkout-all ## Initialize if needed, then verify (build path)
 # Each target runs ONLY its backend's compatibility corpus so a backend lane
 # agent can iterate tightly without paying for the full cross-backend suite.
 # They wrap the pre-existing mechanisms rather than adding new ones:
-#   * KVM and DBT (real Detcore backends) -> the backend-parity matrix,
-#     scoped to one backend with `run_matrix.py --backend <backend>`. The
-#     validation DAG no longer runs this matrix: since slice S13 of
-#     https://github.com/rrnewton/hermit/issues/3301 its DBT cases are DBT
-#     verify cells of the c-programs and system-utils manifests.
+#   * KVM and DBT (real Detcore backends) -> the E2E manifest runner,
+#     `test-harness run --backend <backend>`, which runs that backend's
+#     required cells in every manifest. It runs no ptrace cell, so its parity
+#     post-pass has no reference to compare against; `test-harness parity
+#     compare` measures parity from a run that retained both sides' logs.
 #   * SaBRe / LiteInst / e9patch          -> the Rust driver's focused
 #     `--<backend>-compat-only` profiles, which self-build the release binary
 #     and any backend artifacts.
 # ---------------------------------------------------------------------------
 
-validate-kvm: check-submodules ## Run ONLY the KVM backend parity corpus (needs /dev/kvm)
+validate-kvm: check-submodules ## Run ONLY the KVM cells of the E2E manifests (needs /dev/kvm)
+	@test -r /dev/kvm && test -w /dev/kvm || { echo 'validate-kvm: /dev/kvm is not readable and writable, so no KVM cell can run here' >&2; exit 1; }
 	cargo build -p hermit
-	$(RUN_MATRIX) --hermit $(HERMIT_DEBUG_BIN) --backend kvm --probe-gaps --require-backend
+	cargo build -p hermit-manifest-plan --bin test-harness
+	HERMIT_BIN=$(abspath $(HERMIT_DEBUG_BIN)) target/debug/test-harness run --backend kvm
 
-validate-dbt: check-submodules ## Run ONLY the DBT backend parity corpus (third-party-backends feature)
+validate-dbt: check-submodules ## Run ONLY the DBT cells of the E2E manifests (third-party-backends feature)
 	cargo build -p hermit --features third-party-backends
-	$(RUN_MATRIX) --hermit $(HERMIT_DEBUG_BIN) --backend dbt --probe-gaps --require-backend
+	cargo build -p hermit-manifest-plan --bin test-harness
+	HERMIT_BIN=$(abspath $(HERMIT_DEBUG_BIN)) target/debug/test-harness run --backend dbt
 
 validate-sabre: check-submodules ## Run ONLY the SaBRe compatibility corpus (needs HERMIT_SABRE_BINARY)
 	./scripts/validate.rs --sabre-compat-only

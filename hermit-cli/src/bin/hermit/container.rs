@@ -566,8 +566,8 @@ pub(super) fn image_container(
 }
 
 /// A [`default_container`] hardened with the deterministic identity mounts
-/// (frozen `/etc/group`, hidden nscd cache) that `run` mode applies. Record and
-/// replay use this so guest NSS resolution matches `run` and does not reach
+/// (frozen `/etc/group`, hidden nscd cache) that `run` mode applies. Replay
+/// uses this so guest NSS resolution matches `run` and does not reach
 /// nondeterministic host identity state. The returned [`IdentityGuard`] must be
 /// held until after `Container::run` returns.
 pub(super) fn deterministic_container() -> Result<(Container, IdentityGuard), Error> {
@@ -937,7 +937,7 @@ pub(super) const CONTAINER_INIT_ARMING_STALL: std::time::Duration =
 /// -- every spelling, including `record --verify` -- calls [`Container::run`]
 /// directly at six sites in `record_start.rs` and never goes through
 /// `with_container`. Those containers come from `recording_container()` ->
-/// `deterministic_container()` -> `default_container(true)`, which unshares
+/// `configured_container()` -> `default_container(true)`, which unshares
 /// `Namespace::PID`, so each one is a namespace init with exactly the bug the
 /// guards exist to fix. An adversarial review of the original change caught this:
 /// the claim that "all entry points funnel through `with_container`" was FALSE,

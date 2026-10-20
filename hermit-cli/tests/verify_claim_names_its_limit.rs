@@ -54,6 +54,27 @@ fn verify(with_io_buffers: bool) -> (String, serde_json::Value) {
     )
 }
 
+/// The console phrase that claims bitwise parity. It must appear exactly when
+/// the published report says `bitwise_parity: true`.
+const BITWISE_PARITY_CLAIM: &str = "bitwise parity established";
+
+/// Run `/bin/true` under a plain `--verify` (the lossy `Stripped` comparison,
+/// no `--verify-strict`) and return (stderr, parsed verify JSON).
+fn verify_plain() -> (String, serde_json::Value) {
+    let json = tempfile::NamedTempFile::new().expect("temp file");
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--strict", "--verify", "--verify-json"])
+        .arg(json.path())
+        .args(["--", "/bin/true"])
+        .output()
+        .expect("failed to start hermit");
+    let text = std::fs::read_to_string(json.path()).expect("verify json");
+    (
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        serde_json::from_str(&text).expect("verify json parses"),
+    )
+}
+
 /// Guard: `/bin/true` must actually verify, or neither assertion below means
 /// anything.
 fn assert_matched(report: &serde_json::Value) {
@@ -84,6 +105,10 @@ fn a_verdict_without_buffer_content_does_not_claim_determinism() {
          comparison, so an unqualified claim overstates what was \
          established.\nstderr:\n{stderr}"
     );
+    assert!(
+        !stderr.contains(BITWISE_PARITY_CLAIM),
+        "the report says bitwise_parity is false, so the console must not claim it.\nstderr:\n{stderr}"
+    );
 }
 
 #[test]
@@ -103,6 +128,34 @@ fn a_verdict_with_buffer_content_may_claim_determinism() {
         !stderr.contains("output-buffer CONTENT was not compared"),
         "the qualification must NOT appear when content WAS compared, or it is noise rather \
          than information.\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(BITWISE_PARITY_CLAIM),
+        "the report says bitwise_parity is true, so the console should say so.\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_plain_verify_says_its_match_is_not_bitwise() {
+    // A plain `--verify` prints the same "Determinism verified" sentence as
+    // `--verify-strict`, but its log comparison is the lossy Stripped one. The
+    // line after the sentence must say so and must not claim bitwise parity.
+    let (stderr, report) = verify_plain();
+    assert_matched(&report);
+    assert_eq!(report["bitwise_parity"], false);
+    assert_eq!(report["comparison"]["strip_lines"], true);
+    assert!(
+        stderr.contains("Success: deterministic. Determinism verified."),
+        "the success sentence is kept verbatim for its consumers.\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(BITWISE_PARITY_CLAIM),
+        "a Stripped match is not bitwise parity.\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("under the lossy Stripped comparison")
+            && stderr.contains("This is not a bitwise comparison; add --verify-strict for one."),
+        "the console must say which comparison the match rests on.\nstderr:\n{stderr}"
     );
 }
 

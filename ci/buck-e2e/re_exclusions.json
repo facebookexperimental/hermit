@@ -1,0 +1,279 @@
+{
+ "generated_by": "derive_re_exclusions.py m2-local-1 m3-hybrid-pmu-1",
+ "schema": 1,
+ "tests": {
+  "c-programs/proc-locks": {
+   "cells": [
+    "c-programs/proc-locks/verify@ptrace",
+    "c-programs/proc-locks/verify@sabre"
+   ],
+   "evidence": [
+    {
+     "cell": "c-programs/proc-locks/verify@ptrace",
+     "local_run": "m2-local-1",
+     "re_error_kind": "infrastructure",
+     "re_reason": "proc-locks snapshot lease: No such file or directory (os error 2)",
+     "re_runs": [
+      "m3-hybrid-pmu-1"
+     ],
+     "re_verdicts": [
+      "FAIL"
+     ]
+    },
+    {
+     "cell": "c-programs/proc-locks/verify@sabre",
+     "local_run": "m2-local-1",
+     "re_error_kind": "infrastructure",
+     "re_reason": "proc-locks snapshot lease: No such file or directory (os error 2)",
+     "re_runs": [
+      "m3-hybrid-pmu-1"
+     ],
+     "re_verdicts": [
+      "FAIL"
+     ]
+    }
+   ],
+   "reason": "RE infrastructure: proc-locks snapshot lease: No such file or directory (os error 2)"
+  },
+  "compat/curl": {
+   "cells": [
+    "compat/curl/verify@ptrace"
+   ],
+   "evidence": [
+    {
+     "cell": "compat/curl/verify@ptrace",
+     "local_run": "m2-local-1",
+     "re_error_kind": null,
+     "re_reason": "verify exited with status 125 before producing a terminal comparison",
+     "re_runs": [
+      "m3-hybrid-pmu-1"
+     ],
+     "re_verdicts": [
+      "FAIL"
+     ]
+    }
+   ],
+   "reason": "the guest exits 37 on the RE worker image (passes locally)"
+  },
+  "compat/iostat": {
+   "cells": [
+    "compat/iostat/verify@ptrace"
+   ],
+   "evidence": [
+    {
+     "cell": "compat/iostat/verify@ptrace",
+     "local_run": "m2-local-1",
+     "re_error_kind": "incomplete-verification-evidence",
+     "re_reason": "stripped verification recorded no comparison at all (verdict=no_result)",
+     "re_runs": [
+      "m3-hybrid-pmu-1"
+     ],
+     "re_verdicts": [
+      "FAIL"
+     ]
+    }
+   ],
+   "reason": "/usr/bin/iostat is not installed on RE (guest-program-not-found)"
+  },
+  "compat/mpstat-softirqs": {
+   "cells": [
+    "compat/mpstat-softirqs/verify@ptrace"
+   ],
+   "evidence": [
+    {
+     "cell": "compat/mpstat-softirqs/verify@ptrace",
+     "local_run": "m2-local-1",
+     "re_error_kind": "incomplete-verification-evidence",
+     "re_reason": "stripped verification recorded no comparison at all (verdict=no_result)",
+     "re_runs": [
+      "m3-hybrid-pmu-1"
+     ],
+     "re_verdicts": [
+      "FAIL"
+     ]
+    }
+   ],
+   "reason": "/usr/bin/mpstat is not installed on RE (guest-program-not-found)"
+  },
+  "compat/openssl": {
+   "cells": [
+    "compat/openssl/verify@ptrace"
+   ],
+   "evidence": [
+    {
+     "cell": "compat/openssl/verify@ptrace",
+     "local_run": "m2-local-1",
+     "re_error_kind": null,
+     "re_reason": "verify exited with status 125 before producing a terminal comparison",
+     "re_runs": [
+      "m3-hybrid-pmu-1"
+     ],
+     "re_verdicts": [
+      "FAIL"
+     ]
+    }
+   ],
+   "reason": "the guest exits 1 on the RE worker image (passes locally)"
+  },
+  "compat/patch": {
+   "cells": [
+    "compat/patch/verify@ptrace"
+   ],
+   "evidence": [
+    {
+     "cell": "compat/patch/verify@ptrace",
+     "local_run": "m2-local-1",
+     "re_error_kind": null,
+     "re_reason": "verify exited with status 125 before producing a terminal comparison",
+     "re_runs": [
+      "m3-hybrid-pmu-1"
+     ],
+     "re_verdicts": [
+      "FAIL"
+     ]
+    }
+   ],
+   "reason": "a command it runs is not installed on RE (exit 127)"
+  },
+  "compat/pidstat-disk": {
+   "cells": [
+    "compat/pidstat-disk/verify@ptrace"
+   ],
+   "evidence": [
+    {
+     "cell": "compat/pidstat-disk/verify@ptrace",
+     "local_run": "m2-local-1",
+     "re_error_kind": "incomplete-verification-evidence",
+     "re_reason": "stripped verification recorded no comparison at all (verdict=no_result)",
+     "re_runs": [
+      "m3-hybrid-pmu-1"
+     ],
+     "re_verdicts": [
+      "FAIL"
+     ]
+    }
+   ],
+   "reason": "/usr/bin/pidstat is not installed on RE (guest-program-not-found)"
+  },
+  "compat/sar-resource-tables": {
+   "cells": [
+    "compat/sar-resource-tables/verify@ptrace"
+   ],
+   "evidence": [
+    {
+     "cell": "compat/sar-resource-tables/verify@ptrace",
+     "local_run": "m2-local-1",
+     "re_error_kind": "incomplete-verification-evidence",
+     "re_reason": "stripped verification recorded no comparison at all (verdict=no_result)",
+     "re_runs": [
+      "m3-hybrid-pmu-1"
+     ],
+     "re_verdicts": [
+      "FAIL"
+     ]
+    }
+   ],
+   "reason": "/usr/bin/sar is not installed on RE (guest-program-not-found)"
+  },
+  "compat/stat": {
+   "cells": [
+    "compat/stat/verify@ptrace"
+   ],
+   "evidence": [
+    {
+     "cell": "compat/stat/verify@ptrace",
+     "local_run": "m2-local-1",
+     "re_error_kind": null,
+     "re_reason": "verify exited with status 125 before producing a terminal comparison",
+     "re_runs": [
+      "m3-hybrid-pmu-1"
+     ],
+     "re_verdicts": [
+      "FAIL"
+     ]
+    }
+   ],
+   "reason": "the guest exits 1 on the RE worker image (passes locally)"
+  },
+  "compat/wget-localhost": {
+   "cells": [
+    "compat/wget-localhost/verify@ptrace"
+   ],
+   "evidence": [
+    {
+     "cell": "compat/wget-localhost/verify@ptrace",
+     "local_run": "m2-local-1",
+     "re_error_kind": "wall-timeout",
+     "re_reason": "cell exceeded 60 wall s backstop (59 s CPU budget)",
+     "re_runs": [
+      "m3-hybrid-pmu-1"
+     ],
+     "re_verdicts": [
+      "FAIL"
+     ]
+    }
+   ],
+   "reason": "exceeds its budget on RE (cell exceeded 60 wall s backstop (59 s CPU budget))"
+  },
+  "compat/xz": {
+   "cells": [
+    "compat/xz/verify@ptrace"
+   ],
+   "evidence": [
+    {
+     "cell": "compat/xz/verify@ptrace",
+     "local_run": "m2-local-1",
+     "re_error_kind": null,
+     "re_reason": "verify exited with status 125 before producing a terminal comparison",
+     "re_runs": [
+      "m3-hybrid-pmu-1"
+     ],
+     "re_verdicts": [
+      "FAIL"
+     ]
+    }
+   ],
+   "reason": "a command it runs is not installed on RE (exit 127)"
+  },
+  "compat/xz-roundtrip": {
+   "cells": [
+    "compat/xz-roundtrip/verify@ptrace"
+   ],
+   "evidence": [
+    {
+     "cell": "compat/xz-roundtrip/verify@ptrace",
+     "local_run": "m2-local-1",
+     "re_error_kind": null,
+     "re_reason": "verify exited with status 125 before producing a terminal comparison",
+     "re_runs": [
+      "m3-hybrid-pmu-1"
+     ],
+     "re_verdicts": [
+      "FAIL"
+     ]
+    }
+   ],
+   "reason": "a command it runs is not installed on RE (exit 127)"
+  },
+  "system-utils/overflow-gid-resolves": {
+   "cells": [
+    "system-utils/overflow-gid-resolves/verify@ptrace"
+   ],
+   "evidence": [
+    {
+     "cell": "system-utils/overflow-gid-resolves/verify@ptrace",
+     "local_run": "m2-local-1",
+     "re_error_kind": null,
+     "re_reason": "verify exited with status 125 before producing a terminal comparison",
+     "re_runs": [
+      "m3-hybrid-pmu-1"
+     ],
+     "re_verdicts": [
+      "FAIL"
+     ]
+    }
+   ],
+   "reason": "the guest exits 1 on the RE worker image (passes locally)"
+  }
+ }
+}

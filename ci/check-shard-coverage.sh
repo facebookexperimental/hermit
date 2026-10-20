@@ -624,10 +624,32 @@ workflow_e2e_uses_pinned_result_root() {
         grep -Fqx '            sudo sysctl -w kernel.perf_event_paranoid=-1' <<<"$body"
 }
 
+# The `packages:` input of every step in JOB that uses the cached apt-install
+# action (.github/actions/apt-install), one line per step. Only a `packages:`
+# line inside such a step counts, so a package named in a comment or in another
+# step's input does not satisfy a caller. A trailing ` # ...` is a YAML comment
+# that the action never receives, so it is stripped before the caller matches.
+workflow_job_apt_packages() {
+    local job=$1 workflow_text=$2 body
+    body=$(workflow_job_body "$job" "$workflow_text") || return 1
+    awk '
+        /^      - / { action = "" }
+        $0 == "        uses: ./.github/actions/apt-install" { action = "apt"; next }
+        action == "apt" && /^          packages:[[:space:]]/ {
+            line = $0
+            sub(/^          packages:[[:space:]]*/, "", line)
+            sub(/[[:space:]]+#.*$/, "", line)
+            print line
+            action = ""
+        }
+    ' <<<"$body"
+}
+
 workflow_e2e_prepares_btrfs() {
-    local workflow_text=$1 body
+    local workflow_text=$1 body packages
     body=$(workflow_job_body e2e "$workflow_text") || return 1
-    grep -Eq '^          sudo apt-get install -y .* btrfs-progs( |$)' <<<"$body" &&
+    packages=$(workflow_job_apt_packages e2e "$workflow_text") || return 1
+    grep -Eq '(^| )btrfs-progs( |$)' <<<"$packages" &&
         grep -Fqx '      - name: Provide Btrfs sysfs state for system-utils' <<<"$body" &&
         grep -Fqx "        if: matrix.slug == 'system_utils'" <<<"$body" &&
         grep -Fqx '          sudo truncate -s 128M /tmp/hermit-ci-btrfs.img' <<<"$body" &&
@@ -758,9 +780,12 @@ workflow_wiring_contract() {
             regular pattern 'parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-*' "$workflow_text"
 }
 
-# check.backend_parity_suites_on_host runs target/validate/verification-report
-# (build.workspace_on_host builds in the validate profile) after the debug tree
-# crosses a job boundary. Guard all three parts of that contract:
+# test.hermit_integration_on_host (the debug "integration" shard) runs the
+# verification_report_cli and verification_report_consumers tests, which execute
+# target/validate/verification-report (build.workspace_on_host builds in the
+# validate profile) through env!("CARGO_BIN_EXE_verification-report") after the
+# debug tree crosses the build-debug -> test-debug job boundary. Guard all three
+# parts of that contract:
 # producer existence, archive membership, and executable consumer assertion.
 # The mutation bracket proves the guard rejects the original omission instead
 # of passing merely because the binary is mentioned somewhere in the workflow.
@@ -1095,6 +1120,40 @@ if [[ $missing_btrfs_setup == "$workflow_text" ]]; then
 elif workflow_wiring_contract "$missing_btrfs_setup"; then
     echo "check-shard-coverage.sh: FAIL — workflow guard accepted missing Btrfs setup" >&2
     status=1
+fi
+btrfs_package_line=$(grep -E '^          packages: (.* )?btrfs-progs( |$)' <<<"$workflow_text" || true)
+if [[ $(grep -c . <<<"$btrfs_package_line") != 1 ]]; then
+    echo "check-shard-coverage.sh: FAIL — expected exactly one apt-install packages line naming btrfs-progs" >&2
+    status=1
+else
+    without_btrfs_package=${workflow_text/"$btrfs_package_line"/"${btrfs_package_line/ btrfs-progs/}"}
+    if [[ $without_btrfs_package == "$workflow_text" ]]; then
+        echo "check-shard-coverage.sh: FAIL — btrfs-progs package mutation did not change the workflow fixture" >&2
+        status=1
+    elif workflow_wiring_contract "$without_btrfs_package"; then
+        echo "check-shard-coverage.sh: FAIL — workflow guard accepted an E2E job that does not install btrfs-progs" >&2
+        status=1
+    fi
+    btrfs_package_step=$'        uses: ./.github/actions/apt-install\n        with:\n'"$btrfs_package_line"
+    btrfs_package_elsewhere=${workflow_text/"$btrfs_package_step"/$'        uses: ./.github/actions/not-apt-install\n        with:\n'"$btrfs_package_line"}
+    if [[ $btrfs_package_elsewhere == "$workflow_text" ]]; then
+        echo "check-shard-coverage.sh: FAIL — btrfs-progs action mutation did not change the workflow fixture" >&2
+        status=1
+    elif workflow_wiring_contract "$btrfs_package_elsewhere"; then
+        echo "check-shard-coverage.sh: FAIL — workflow guard accepted btrfs-progs outside the apt-install action" >&2
+        status=1
+    fi
+    # A trailing ` # ...` is a YAML comment the action never receives, so a
+    # btrfs-progs that survives only there is not installed. This exercises
+    # the comment stripping in workflow_job_apt_packages.
+    btrfs_package_commented=${workflow_text/"$btrfs_package_line"/"${btrfs_package_line/ btrfs-progs/} # btrfs-progs"}
+    if [[ $btrfs_package_commented == "$workflow_text" ]]; then
+        echo "check-shard-coverage.sh: FAIL — btrfs-progs comment mutation did not change the workflow fixture" >&2
+        status=1
+    elif workflow_wiring_contract "$btrfs_package_commented"; then
+        echo "check-shard-coverage.sh: FAIL — workflow guard accepted btrfs-progs named only in a trailing YAML comment" >&2
+        status=1
+    fi
 fi
 btrfs_slug="        if: matrix.slug == 'system_utils'"
 wrong_btrfs_slug=${workflow_text/"$btrfs_slug"/"        if: matrix.slug == 'applications'"}

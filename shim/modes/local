@@ -1,0 +1,2 @@
+--config
+build.execution_platforms=gh_facebook_buck2_shims_meta//platforms:local

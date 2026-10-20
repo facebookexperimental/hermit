@@ -43,7 +43,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! dagrun = { path = "../agent-utils/rs/dagrun" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "1151317720218c8dd830a50d9f6bf10fc7d175e5" }
 //! hermit-manifest-plan = { path = "../ci/manifest-plan" }
 //! serde_json = "1"
 //! toml = "0.8.23"
@@ -1165,10 +1165,10 @@ fn usage() -> &'static str {
      \x20 --portable       Alias for the portable-only level.\n\
      \n\
      Focused gates (run one matrix/lane and exit):\n\
-     \x20 --strict-compat-only          Run the blocking legacy stripped app matrix.\n\
+     \x20 --strict-compat-only          Only the compat bucket's strict cells (label strict-compat-only).\n\
      \x20 --portable-strict-compat-only Only the strict compatibility bucket (compat.yaml), release Hermit.\n\
-     \x20 --rr-compat-only              Gate the known-passing record/replay matrix.\n\
-     \x20 --sabre-compat-only           Gate the measured SaBRe matrix.\n\
+     \x20 --rr-compat-only              Only the compat bucket's record/replay cells (label rr-compat-only).\n\
+     \x20 --sabre-compat-only           Only the compat bucket's SaBRe cells (label sabre-compat-only).\n\
      \x20 --e9patch-compat-only         Gate core + installed e9patch legacy stripped apps.\n\
      \x20 --liteinst-compat-only        Run the portable CI liteinst_strict test.\n\
      \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
@@ -2095,16 +2095,12 @@ const STRICT_EXECUTION_FLAG: &str = "--strict";
 /// Legacy below-L2 compatibility modes whose Hermit-option prefix must carry
 /// [`STRICT_EXECUTION_FLAG`].
 ///
-/// `CompatMode::Rr` is deliberately absent rather than overlooked: it renders
-/// `record start --verify --verify-strict`, a different path with a different
-/// evidence policy and no `--strict` marker, so folding it into this list would
-/// assert something untrue about it.
-const LEGACY_BELOW_L2_STRICT_MODES: [CompatMode; 4] = [
-    CompatMode::Strict,
-    CompatMode::PortableStrict,
-    CompatMode::Sabre,
-    CompatMode::E9patch,
-];
+/// The rr run type is deliberately absent rather than overlooked: it was never a
+/// legacy stripped-verify mode (it rendered `record start --verify
+/// --verify-strict`), and since 2026-10-02 its rows are compat.yaml replay cells
+/// the harness runs, not a `CompatMode`.
+const LEGACY_BELOW_L2_STRICT_MODES: [CompatMode; 2] =
+    [CompatMode::PortableStrict, CompatMode::E9patch];
 
 /// Whether a rendered plan is missing the literal strict flag from Hermit's
 /// option prefix.
@@ -2251,11 +2247,12 @@ const SUBMODULE_SERVICE_FIXTURE_SOURCES: &[&str] = &[
 
 /// Exercise the real bootstrap boundary around the first DAG node.
 ///
-/// With agent-utils populated, the Rust driver can start and a missing rr
-/// checkout must become a schema-4 FAILED result from `pre.submodules`, even
-/// though cgroup setup replaces the process first. With agent-utils absent,
-/// rust-script cannot build the driver; that remains a pre-driver bootstrap
-/// failure and must not manufacture a typed result.
+/// The driver's dagrun dependency is a pinned git revision, so rust-script
+/// builds it from a clone with no submodules at all. A missing rr checkout must
+/// then become a schema-4 FAILED result from `pre.submodules`, even though
+/// cgroup setup replaces the process first: once compiled from the copied
+/// sources with every submodule absent, and once from the original root's
+/// prepared scripts with only agent-utils populated.
 fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, String> {
     fn run_fixture(
         checkout: &Path,
@@ -2320,6 +2317,14 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             .env_remove("VALIDATE_RUN_STATE")
             .env_remove(RUN_STATE_SCOPE_REEXEC_ENV)
             .env_remove(OWN_SCOPE_DEADLINE_ENV)
+            // The enclosing validation's run identity names its durable log,
+            // and both cases run in this one checkout: an inherited
+            // E2E_RUN_ID gives the second case the first case's log name and
+            // its reservation fails with EEXIST. A new top-level run mints
+            // its own identity and result and build roots.
+            .env_remove("E2E_RUN_ID")
+            .env_remove("E2E_RESULT_ROOT")
+            .env_remove("E2E_BUILD_ROOT")
             .env_remove(PARENT_ENV)
             .env_remove(TOOL_ROOT_ENV)
             .env_remove(TOOL_AUTHORITY_ENV)
@@ -2332,7 +2337,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_PID")
             .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE");
         if prepared_source_root.is_none() {
-            // Only the missing-agent-utils case tests copied-source compilation.
+            // Only the no-submodules case tests copied-source compilation.
             // It must reach real rust-script, not a prepared executable.
             command
                 .env_remove("HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED")
@@ -2435,25 +2440,46 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         )?;
     }
 
+    // `.gitmodules` lists third-party/rr first, so both cases fail on it.
+    fn expect_missing_rr_result(
+        case: &str,
+        output: &std::process::Output,
+        result_path: &Path,
+    ) -> Result<(), String> {
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = ValidationServiceResult::from_json_slice(
+            &std::fs::read(result_path).map_err(|error| {
+                format!(
+                    "submodule service result ({case}): pre.submodules failure wrote no typed \
+                     result: {error}; status={:?} output={rendered}",
+                    output.status.code()
+                )
+            })?,
+        )?;
+        if output.status.code() != Some(1)
+            || result.final_validate_status != FinalValidateStatus::Failed
+            || result.exit_code != 1
+            || result.executed_nodes != 1
+            || !rendered.contains("pre.submodules")
+            || !rendered.contains("third-party/rr")
+            || !rendered.contains("FINAL_VALIDATE_STATUS: FAILED")
+        {
+            return Err(format!(
+                "submodule service result ({case}): missing rr was not attributed to the real \
+                 first DAG node: status={:?} result={result:?} output={rendered}",
+                output.status.code()
+            ));
+        }
+        Ok(())
+    }
+
     let bootstrap_result = fixture.path().join("bootstrap-result.json");
     let bootstrap = run_fixture(&checkout, None, &bootstrap_result, ledger.path())?;
-    let bootstrap_output = format!(
-        "{}{}",
-        String::from_utf8_lossy(&bootstrap.stdout),
-        String::from_utf8_lossy(&bootstrap.stderr)
-    );
-    if bootstrap.status.success()
-        || bootstrap_result.exists()
-        || String::from_utf8_lossy(&bootstrap.stdout).contains(FINAL_VALIDATE_STATUS_PREFIX)
-        || !bootstrap_output.contains("agent-utils")
-    {
-        return Err(format!(
-            "submodule service result: missing agent-utils did not remain a diagnosed bootstrap failure: \
-             status={:?} result_exists={} output={bootstrap_output}",
-            bootstrap.status.code(),
-            bootstrap_result.exists()
-        ));
-    }
+    expect_missing_rr_result("no submodules", &bootstrap, &bootstrap_result)?;
 
     checked_command(
         scratch_git()
@@ -2493,36 +2519,9 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
 
     let result_path = fixture.path().join("service-result.json");
     let output = run_fixture(&checkout, Some(root), &result_path, ledger.path())?;
-    let rendered = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let result = ValidationServiceResult::from_json_slice(&std::fs::read(&result_path).map_err(
-        |error| {
-            format!(
-                "submodule service result: pre.submodules failure wrote no typed result: {error}; \
-                 status={:?} output={rendered}",
-                output.status.code()
-            )
-        },
-    )?)?;
-    if output.status.code() != Some(1)
-        || result.final_validate_status != FinalValidateStatus::Failed
-        || result.exit_code != 1
-        || result.executed_nodes != 1
-        || !rendered.contains("pre.submodules")
-        || !rendered.contains("third-party/rr")
-        || !rendered.contains("FINAL_VALIDATE_STATUS: FAILED")
-    {
-        return Err(format!(
-            "submodule service result: missing rr was not attributed to the real first DAG node: \
-             status={:?} result={result:?} output={rendered}",
-            output.status.code()
-        ));
-    }
+    expect_missing_rr_result("agent-utils present", &output, &result_path)?;
 
-    Ok("missing agent-utils stays a bootstrap failure; with agent-utils present, missing rr is a typed pre.submodules failure across scope re-exec".into())
+    Ok("with no submodules the driver builds from copied sources and missing rr is a typed pre.submodules failure; with agent-utils present it stays one across scope re-exec".into())
 }
 
 /// Pin the measured resource policy for the shard-coverage guard.
@@ -2961,6 +2960,7 @@ fn self_test_runner_log_isolation_bracket() -> Result<String, String> {
 fn self_test() -> Result<(), String> {
     println!("  {}", self_test_runner_log_isolation_bracket()?);
     inner_freshness_skip_cli_bracket()?;
+    plan_export_dirtiness_bracket()?;
     run_owned_cache_bracket()?;
     run_state_path_bracket()?;
     println!(
@@ -3017,30 +3017,10 @@ fn self_test() -> Result<(), String> {
                 D::PortableDiagnostic,
                 false,
             ),
-            // Strict keeps its historical exemption, and only Strict has it.
-            (
-                CompatMode::Strict,
-                false,
-                true,
-                false,
-                D::KnownFailClosedExempt,
-                false,
-            ),
-            (
-                CompatMode::Strict,
-                true,
-                true,
-                false,
-                D::PassedButListedFailClosed,
-                false,
-            ),
-            (CompatMode::Strict, false, false, false, D::Blocking, true),
             // No other mode consults either table: a failure blocks whatever the tables say.
-            (CompatMode::Sabre, false, true, false, D::Blocking, true),
-            (CompatMode::Sabre, false, false, true, D::Blocking, true),
-            (CompatMode::Sabre, true, true, false, D::Passed, false),
             (CompatMode::E9patch, false, true, false, D::Blocking, true),
-            (CompatMode::Rr, false, true, false, D::Blocking, true),
+            (CompatMode::E9patch, false, false, true, D::Blocking, true),
+            (CompatMode::E9patch, true, true, false, D::Passed, false),
         ];
         for (mode, ok, listed, diag, want, want_blocking) in cases.iter().copied() {
             let got = classify(mode, ok, listed, diag);
@@ -3224,25 +3204,6 @@ fn self_test() -> Result<(), String> {
                  measured population: base={passed}/{measured} {blocking:?}, with unknown={unknown_passed}/{unknown_measured} {unknown_blocking:?}"
             ));
         }
-        // And the same planted table under Strict must exempt the listed failure, so the
-        // bracket also pins that the two modes still differ.
-        let (_, _, strict_blocking, strict_nonblocking) = compat_summary_with_tables(
-            CompatMode::Strict,
-            "compat.",
-            &outcomes,
-            &planted_known,
-            &planted_diag,
-        );
-        if strict_blocking.iter().any(|l| l == "listed_fails") {
-            return Err(format!(
-                "Strict lost its historical exemption for a listed row: {strict_blocking:?}"
-            ));
-        }
-        if strict_nonblocking != BTreeSet::from(["compat.listed_fails".to_string()]) {
-            return Err(format!(
-                "Strict nonblocking failures did not retain exactly its listed exemption: {strict_nonblocking:?}"
-            ));
-        }
     }
 
     // Strict-execution bracket for the legacy below-L2 compatibility modes.
@@ -3263,7 +3224,7 @@ fn self_test() -> Result<(), String> {
                  legacy below-L2 run would not use strict execution: {rendered:?}"
             ));
         }
-        if matches!(mode, CompatMode::Strict | CompatMode::PortableStrict)
+        if mode == CompatMode::PortableStrict
             && !rendered[..guest_separator]
                 .windows(2)
                 .any(|pair| pair == ["--env", "TMPDIR=/tmp"])
@@ -4135,13 +4096,6 @@ fn self_test() -> Result<(), String> {
     // drift guard for a MECHANICALLY EXTRACTED table: if someone edits a corpus
     // JSON without moving the corresponding ratchet, or vice versa, the extraction
     // has silently diverged from the numbers the gates are judged against.
-    if validate_corpus::RR_PASSING_LABELS.len() != validate_corpus::RR_COMPAT_EXPECTED {
-        return Err(format!(
-            "R/R label set has {} rows, expected {}",
-            validate_corpus::RR_PASSING_LABELS.len(),
-            validate_corpus::RR_COMPAT_EXPECTED
-        ));
-    }
     let root = repo_root();
     let paths = validate_corpus::CorpusPaths {
         root_dir: "/nonexistent",
@@ -4161,27 +4115,6 @@ fn self_test() -> Result<(), String> {
             validate_corpus::STRICT_COMPAT_TOTAL
         ));
     }
-    let sabre = count("sabre")?;
-    if sabre != validate_corpus::SABRE_COMPAT_TOTAL {
-        return Err(format!(
-            "sabre corpus has {sabre} rows, SABRE_COMPAT_TOTAL is {}",
-            validate_corpus::SABRE_COMPAT_TOTAL
-        ));
-    }
-    // rr admits a superset and is filtered to the measured-passing labels; what
-    // must hold is that every passing label is actually present to be measured.
-    let rr_rows = validate_corpus::load(&root, "rr", &paths)?;
-    let present: BTreeSet<&str> = rr_rows.iter().map(|r| r.label.as_str()).collect();
-    let missing: Vec<&&str> = validate_corpus::RR_PASSING_LABELS
-        .iter()
-        .filter(|l| !present.contains(**l))
-        .collect();
-    if !missing.is_empty() {
-        return Err(format!(
-            "{} R/R passing label(s) are absent from the rr corpus and could never be measured: {missing:?}",
-            missing.len()
-        ));
-    }
     // e9patch admits a superset of its gated total (rows gate only when the
     // program is installed), so the invariant is >=, not ==.
     let e9 = count("e9patch")?;
@@ -4191,11 +4124,7 @@ fn self_test() -> Result<(), String> {
             validate_corpus::E9PATCH_COMPAT_TOTAL
         ));
     }
-    println!(
-        "  corpora: strict={strict} sabre={sabre} rr={} (filtered to {}) e9patch={e9}",
-        rr_rows.len(),
-        validate_corpus::RR_COMPAT_EXPECTED
-    );
+    println!("  corpora: strict={strict} e9patch={e9}");
     // Policy/data brackets are inert: none runs a gate, publishes a label,
     // writes the real ledger, or touches a PR. The one deliberate exception is
     // nested_scope_self_test: it uses a fresh disposable scope with strict
@@ -6069,7 +5998,7 @@ fn super_plan_bracket() -> Result<(), String> {
         "super.build_release_hermit",
         "super.sqlite_veryquick_strict_determinism",
         "super.pmu_analyze_hello_race_stress_calibrated_skid",
-        "superstress.ptrace_strict_verify_01",
+        "superstress.ptrace_strict_verify",
         "superstress.kvm_available",
         "super-compatprep.fixtures",
         "compat.rustc",
@@ -6077,6 +6006,33 @@ fn super_plan_bracket() -> Result<(), String> {
         if !tags.contains(want) {
             return Err(format!("super plan: node {want} is missing"));
         }
+    }
+    // Each stress probe is one node whose repetitions are rows of its
+    // structured test results; the pass-rate table reads nothing else.
+    let stress: Vec<_> = plan
+        .cfg
+        .steps
+        .iter()
+        .filter(|step| step.group == "superstress" && !step.job.ends_with("_available"))
+        .collect();
+    let reporting = stress
+        .iter()
+        .filter(|step| {
+            step.result_manifests.iter().flatten().any(|manifest| {
+                matches!(
+                    manifest,
+                    ResultManifest::StructuredTestResults(structured)
+                        if structured.owner == step.tag()
+                )
+            })
+        })
+        .count();
+    if stress.len() != validate_super::STRESS_PROBES.len() || reporting != stress.len() {
+        return Err(format!(
+            "super plan: want one result-reporting node per stress probe ({}), found {} node(s), {reporting} reporting",
+            validate_super::STRESS_PROBES.len(),
+            stress.len()
+        ));
     }
     if !plan.super_mode {
         return Err("super plan: super_mode must be set so the stress table is printed".into());
@@ -7178,15 +7134,16 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         };
         // A fail-closed bucket omits --allow-empty; the generator and this
         // check read the one list in hermit_manifest_plan.
-        let selector =
-            hermit_manifest_plan::validation_dag::manifest_selector_flags(&manifest.category);
+        // Lane, category, a focused run type's --label and the category's
+        // fail-closed/diagnostic flags: the one source the generator reads.
+        let selection =
+            hermit_manifest_plan::validation_dag::manifest_bucket_selection(&tag, manifest);
         (
             format!(
                 "{launcher}target/debug/test-harness run \
-            --lane {} --category {} {selector}{exclusions}{jobs} \
+            {selection}{exclusions}{jobs} \
             --results \"$E2E_RESULT_ROOT/{bucket}/results.jsonl\" \
-            --junit \"$E2E_RESULT_ROOT/{bucket}/junit.xml\"",
-                manifest.lane, manifest.category
+            --junit \"$E2E_RESULT_ROOT/{bucket}/junit.xml\""
             ),
             Path::new(&bucket).join("results.jsonl"),
         )
@@ -7657,6 +7614,285 @@ fn append_validate_series(
         String::from_utf8_lossy(&output.stdout).trim()
     );
     Ok(true)
+}
+
+/// The parity cells each planned manifest node's post-pass owes, keyed
+/// `<lane>/manifest_<category>` as the node's result directory is, from the
+/// same rule the harness applies (`parity::resolve_scope` over the node's
+/// planned verify cells, with the node's `E2E_PARITY_SELECT` and
+/// `E2E_PARITY_POST_PASS`). A node withheld whole as host-inapplicable never
+/// starts and owes nothing. A node that runs with only some of its cells
+/// withheld owes its whole scope: its harness resolves the scope over every
+/// planned verify cell, the withheld ones included, before any cell runs. It
+/// only matters for a node that left no `parity.status.json` at all, or an
+/// unfinished schema-1 one: a harness that started names its own scope in the
+/// status it writes before any cell runs.
+/// <https://github.com/rrnewton/hermit/issues/3301>
+fn validate_parity_expected_scope<'a>(
+    root: &Path,
+    steps: impl IntoIterator<Item = &'a Step>,
+    host_inapplicable: &[validate_plan::HostInapplicableNode],
+) -> Result<hermit_manifest_plan::parity::ExpectedScope, String> {
+    use hermit_manifest_plan::parity;
+    let withheld = host_inapplicable
+        .iter()
+        .filter(|node| !node.runs())
+        .map(|node| node.tag.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut manifests = None;
+    let mut expected = parity::ExpectedScope::new();
+    for step in steps {
+        let Some(manifest) = step.manifest.as_ref() else {
+            continue;
+        };
+        if validation_step_identity(step) != ValidationStepIdentity::ManifestRun
+            || !matches!(manifest.lane.as_str(), "portable" | "privileged")
+            || withheld.contains(step.tag().as_str())
+        {
+            continue;
+        }
+        let setting = |name: &str| {
+            step.env
+                .get(name)
+                .cloned()
+                .or_else(|| std::env::var(name).ok())
+        };
+        match setting(parity::PARITY_POST_PASS_ENV).as_deref() {
+            None | Some("1") => {}
+            Some("0") => continue,
+            Some(other) => {
+                return Err(format!(
+                    "{} is {other:?} for {}; the harness refuses to start",
+                    parity::PARITY_POST_PASS_ENV,
+                    step.tag()
+                ));
+            }
+        }
+        let (selection, _) = manifest_step_policy(step)?;
+        if manifests.is_none() {
+            manifests = Some(
+                ManifestSet::load(root)
+                    .map_err(|error| format!("cannot load E2E manifests: {error}"))?,
+            );
+        }
+        let manifests = manifests.as_ref().expect("loaded above");
+        let planned = manifests
+            .select(&selection)
+            .map_err(|error| format!("cannot select cells for {}: {error}", step.tag()))?
+            .into_iter()
+            .filter(|cell| cell.id.mode == parity::PARITY_MODE)
+            .filter_map(|cell| cell.id.backend.map(|backend| (cell.id.test, backend)))
+            .collect::<BTreeSet<_>>();
+        let explicit = setting(parity::PARITY_SELECT_ENV);
+        let scope = parity::resolve_scope(root, manifests, explicit.as_deref(), &planned)
+            .map_err(|error| format!("{}: {error}", step.tag()))?;
+        if !scope.cells.is_empty() {
+            expected
+                .entry(format!(
+                    "{}/manifest_{}",
+                    manifest.lane,
+                    manifest.category.replace('-', "_")
+                ))
+                .or_default()
+                .extend(scope.cells);
+        }
+    }
+    Ok(expected)
+}
+
+/// The tree state this run's cell rows carry, for the parity rows appended
+/// beside them. Each `results.jsonl` row records the `source_tree_dirty`
+/// verdict of the harness process that wrote it, and
+/// [`append_validate_series`] sends those rows, from this same snapshot, to
+/// `series.py append-cells`, which skips `HOST-INAPPLICABLE` rows and
+/// refuses any other row without a bool. The parity post-pass ran in those
+/// same harness processes, so its rows take their verdict: dirty if any row
+/// is dirty. With no executed row there is no verdict, and the caller must
+/// not default one.
+fn cell_rows_source_tree_dirty(
+    cells: &validate_cell_results::CapturedResults,
+) -> Result<bool, String> {
+    let mut dirty = None;
+    for (file, line, row) in cells.rows(false)? {
+        if row.get("outcome").and_then(serde_json::Value::as_str) == Some("HOST-INAPPLICABLE") {
+            continue;
+        }
+        let Some(row_dirty) = row
+            .get("source_tree_dirty")
+            .and_then(serde_json::Value::as_bool)
+        else {
+            return Err(format!(
+                "{}:{line} records no bool source_tree_dirty, so the tree state is unknown",
+                file.display()
+            ));
+        };
+        dirty = Some(dirty.unwrap_or(false) || row_dirty);
+    }
+    dirty.ok_or_else(|| {
+        format!(
+            "no executed cell result under {} records the tree state",
+            cells.root().display()
+        )
+    })
+}
+
+/// Send this run's parity rows, as `parity::ledger_sources` reads them from
+/// the post-pass outputs under `e2e_result_root`, to the parent's
+/// `series.py append-parity` through `parity::append_ledger_rows`, which
+/// probes the writer, bounds it by `bounds` and kills it (with anything it
+/// started) at its bound. Parity is measured after determinism and never
+/// decides the run, so nothing here fails it: the outcome is one line for the
+/// log, `None` when there is no parent to append to. A tool root whose writer
+/// has no `append-parity` is named, with the rows left where they are, so the
+/// run can be exported later with `test-harness parity export`.
+///
+/// The rows go out with `--source-tree-dirty` from `cells`, the snapshot
+/// the series append sent, through [`cell_rows_source_tree_dirty`]; a run
+/// whose cell rows give no verdict leaves its parity rows too, because the
+/// writer never defaults the tree state.
+///
+/// When `ledger_sources` refuses the run's outputs, the rows come from
+/// `parity::expected_ledger_sources` instead: every node it can read keeps
+/// its rows, a refused node owes each cell of its expected scope a
+/// `record-missing` row with `post_pass_state` `refused`, and the line starts
+/// with a WARNING naming each refusal. Only a run with no expected scope to
+/// fall back on appends nothing, and says so as an ERROR.
+/// <https://github.com/rrnewton/hermit/issues/3301>
+fn append_validate_parity(
+    parent: Option<&Path>,
+    tool_root: Option<&Path>,
+    e2e_result_root: &Path,
+    cells: &validate_cell_results::CapturedResults,
+    expected: Option<&hermit_manifest_plan::parity::ExpectedScope>,
+    run_id: Option<&str>,
+    tree: &str,
+    bounds: hermit_manifest_plan::parity::AppendBounds,
+) -> Option<String> {
+    use hermit_manifest_plan::parity;
+    let parent = parent?;
+    let (rows, refused) = match parity::ledger_sources(e2e_result_root, expected) {
+        Ok(rows) => (rows, Vec::new()),
+        Err(error) => match expected.filter(|expected| !expected.is_empty()) {
+            None => {
+                return Some(format!(
+                    "parity: ERROR: no parity rows appended; the post-pass outputs under {} \
+                     were refused, and no expected scope names the cells they owed: {error}",
+                    e2e_result_root.display()
+                ));
+            }
+            Some(expected) => match parity::expected_ledger_sources(e2e_result_root, expected) {
+                Ok(fallback) => fallback,
+                Err(fallback_error) => {
+                    return Some(format!(
+                        "parity: ERROR: no parity rows appended; the post-pass outputs under {} \
+                         were refused ({error}), and the expected scope could not stand in for \
+                         them: {fallback_error}",
+                        e2e_result_root.display()
+                    ));
+                }
+            },
+        },
+    };
+    let line = if rows.is_empty() {
+        format!(
+            "parity: no parity cells were in scope under {}; nothing appended",
+            e2e_result_root.display()
+        )
+    } else {
+        let left = |why: &str| {
+            format!(
+                "parity: {why}; {} rows left in {} ({})",
+                rows.len(),
+                e2e_result_root.display(),
+                parity::ledger_row_counts(&rows)
+            )
+        };
+        match (tool_root, run_id.filter(|run_id| !run_id.is_empty())) {
+            (None, _) => left("no executable tool root"),
+            (Some(_), None) => left("E2E_RUN_ID is missing"),
+            (Some(tool_root), Some(run_id)) => match cell_rows_source_tree_dirty(cells) {
+                Err(why) => left(&why),
+                Ok(source_tree_dirty) => parity::append_ledger_rows(
+                    &parity::LedgerAppend {
+                        series: &tool_root.join("ci-hub/series/series.py"),
+                        parent,
+                        producer: parity::ParityProducer::Validate,
+                        run_id,
+                        tree,
+                        source_tree_dirty,
+                        source: e2e_result_root,
+                    },
+                    &rows,
+                    bounds,
+                ),
+            },
+        }
+    };
+    if refused.is_empty() {
+        return Some(line);
+    }
+    Some(format!(
+        "parity: WARNING: the post-pass outputs were refused in {} place(s), so each cell the \
+         expected scope owed there is a record-missing row ({}); {}",
+        refused.len(),
+        refused.join("; "),
+        line.strip_prefix("parity: ").unwrap_or(&line)
+    ))
+}
+
+/// Append this run's parity rows through [`append_validate_parity`], under
+/// the same gate as the scorecard ([`should_write_scorecard`]). Parity is
+/// measured after determinism and never decides the run: every outcome is one
+/// `validate: parity:` log line.
+///
+/// Both cleanup paths, the interrupted run's and the completed run's, call it
+/// after the run's ledger row is written and before the local scorecard
+/// writeback, which publishes the rows it spooled. It runs inside the cleanup
+/// critical section, where INT, TERM and HUP are ignored, and the append can
+/// wait up to its default bounds (a 60 s probe and a 300 s append). No stop
+/// signal can cut that wait short, so it must never run before the ledger
+/// row: the run's record would wait on parity, which decides nothing.
+/// <https://github.com/rrnewton/hermit/issues/3301>
+#[allow(clippy::too_many_arguments)]
+fn append_run_parity<'a>(
+    root: &Path,
+    nested: bool,
+    off_the_record: bool,
+    release_builder: &str,
+    steps: impl IntoIterator<Item = &'a Step>,
+    host_inapplicable: &[validate_plan::HostInapplicableNode],
+    parent: Option<&Path>,
+    tool_root: Option<&Path>,
+    e2e_result_root: &Path,
+    cells: &validate_cell_results::CapturedResults,
+    tree: &str,
+) {
+    if !should_write_scorecard(nested, off_the_record, release_builder) {
+        return;
+    }
+    let expected = match validate_parity_expected_scope(root, steps, host_inapplicable) {
+        Ok(expected) => Some(expected),
+        Err(error) => {
+            eprintln!(
+                "validate: parity: expected scope unavailable, so a planned node that left \
+                 no parity status is not reported as record-missing: {error}"
+            );
+            None
+        }
+    };
+    let run_id = std::env::var("E2E_RUN_ID").ok();
+    if let Some(line) = append_validate_parity(
+        parent,
+        tool_root,
+        e2e_result_root,
+        cells,
+        expected.as_ref(),
+        run_id.as_deref(),
+        tree,
+        hermit_manifest_plan::parity::AppendBounds::default(),
+    ) {
+        eprintln!("validate: {line}");
+    }
 }
 
 /// Merge one top-level validate's completed per-cell rows into the tracked
@@ -8197,6 +8433,107 @@ fn worktree_dirty_at(git: fn() -> Command, root: &Path) -> bool {
     unstaged
         || !foreign_porcelain_at(git, root, &["ls-files", "--others", "--exclude-standard"])
             .is_empty()
+}
+
+/// The two dirtiness answers read once at admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AdmissionDirtiness {
+    /// [`tree_dirty`]: the tree differs from HEAD in a way validate did not cause.
+    tree: bool,
+    /// [`worktree_dirty`]: the working tree carries changes `git add` would
+    /// capture. This answer drives the hard gate.
+    worktree: bool,
+}
+
+/// The output path of a plan export (`--write-constructed-dag` or
+/// `--write-generated-plan`), when this run is one.
+///
+/// The export block in `run` selects on this same function, so the run that
+/// skips the admission dirtiness reads is exactly the run that returns at that
+/// block.
+fn plan_export_path(args: &Args) -> Option<&PathBuf> {
+    args.write_constructed_dag
+        .as_ref()
+        .or(args.write_generated_plan.as_ref())
+}
+
+/// Read the admission dirtiness, except for a plan export.
+///
+/// A plan export executes nothing, the dirty-tree gate already ignores it, and
+/// it returns before any later reader of these answers. Reading them anyway
+/// walks the whole checkout up to three times (`git status` also visits every
+/// submodule), which was most of an export's system time; the
+/// `selftest.scorecard` node runs one export under a 15 CPU-second cap. `None`
+/// is not "clean": `run` takes the answers out with `expect` after the export
+/// block, so a reordering that let an export reach a reader would stop the run
+/// loudly instead of treating the checkout as clean.
+fn admission_dirtiness(
+    plan_export: bool,
+    read: impl FnOnce() -> AdmissionDirtiness,
+) -> Option<AdmissionDirtiness> {
+    if plan_export { None } else { Some(read()) }
+}
+
+/// A plan export never reads the admission dirtiness, and every other run
+/// reads it exactly once and keeps both answers.
+fn plan_export_dirtiness_bracket() -> Result<(), String> {
+    for flag in ["--write-constructed-dag", "--write-generated-plan"] {
+        let args = parse_argv(&["full".into(), flag.into(), "/tmp/plan.json".into()])
+            .map_err(|code| format!("plan export dirtiness: {flag} refused with exit {code}"))?;
+        if plan_export_path(&args) != Some(&PathBuf::from("/tmp/plan.json")) {
+            return Err(format!(
+                "plan export dirtiness: {flag} is not recognised as a plan export"
+            ));
+        }
+        let mut reads = 0;
+        let answer = admission_dirtiness(plan_export_path(&args).is_some(), || {
+            reads += 1;
+            AdmissionDirtiness {
+                tree: true,
+                worktree: true,
+            }
+        });
+        if reads != 0 || answer.is_some() {
+            return Err(format!(
+                "plan export dirtiness: {flag} read the checkout's dirtiness {reads} time(s)"
+            ));
+        }
+    }
+    for argv in [vec!["full".to_string()], vec!["--show-plan".to_string()]] {
+        let args = parse_argv(&argv)
+            .map_err(|code| format!("plan export dirtiness: {argv:?} refused with exit {code}"))?;
+        if plan_export_path(&args).is_some() {
+            return Err(format!(
+                "plan export dirtiness: {argv:?} was taken for a plan export"
+            ));
+        }
+        for expected in [
+            AdmissionDirtiness {
+                tree: true,
+                worktree: false,
+            },
+            AdmissionDirtiness {
+                tree: false,
+                worktree: true,
+            },
+        ] {
+            let mut reads = 0;
+            let answer = admission_dirtiness(plan_export_path(&args).is_some(), || {
+                reads += 1;
+                expected
+            });
+            if reads != 1 || answer != Some(expected) {
+                return Err(format!(
+                    "plan export dirtiness: {argv:?} read {reads} time(s) and kept {answer:?}, \
+                     expected one read keeping {expected:?}"
+                ));
+            }
+        }
+    }
+    println!(
+        "  plan export dirtiness: both export flags skip the checkout walks; other runs read both answers once"
+    );
+    Ok(())
 }
 
 /// Whether this checkout is one of ci-hub's disposable validate worktrees.
@@ -11341,9 +11678,6 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             selection_mode = "selected";
         }
         let (compat, compat_prefix) = match label {
-            "strict-compat-only" => (Some(CompatMode::Strict), Some("strictcompat.")),
-            "rr-compat-only" => (Some(CompatMode::Rr), Some("rrcompat.")),
-            "sabre-compat-only" => (Some(CompatMode::Sabre), Some("sabrecompat.")),
             "e9patch-compat-only" => (Some(CompatMode::E9patch), Some("e9patchcompat.")),
             _ => (None, None),
         };
@@ -11453,6 +11787,11 @@ fn generated_focused_compat_partition(
             "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after the lane's pinned-root release build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of portablecompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the lane before the bucket runs.",
             fixtures.display()
         );
+    } else if mode == CompatMode::E9patch {
+        prep.description = format!(
+            "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after compatprep.hermit_release and the files-only NSS fixture: {REAL_COMPAT_FIXTURE_CONTENTS}. Every {namespace} probe depends on it, and the rows that run tests/compat/real_compat_workload.sh read these run-owned files through REAL_COMPAT_FIXTURES instead of the checkout. A fixture that fails to build or a missing host tool stops the e9patch-compat-only profile before any probe runs.",
+            fixtures.display()
+        );
     }
 
     let mut steps = Vec::new();
@@ -11475,9 +11814,16 @@ fn generated_focused_compat_partition(
             9 * 1024 * 1024 * 1024,
         );
         install.labels = vec![label.into()];
+        install.description = format!(
+            "Runs `cargo build --release --locked -p detcore-dbt`, then a release build of hermit with third-party-backends together with detcore-dbt, detcore-sabre and hermit-install, both through ci/run-with-reverie-dbt-budget.sh (which sets Cargo's job count from the calibrated DBT build budget), and finally `test -x` on target/install_pkg/rsrcs/e9patch and e9tool. The {namespace} probes run the host release Hermit built by compatprep.hermit_release, which finds its packaged resources, the e9patch and e9tool binaries among them, through target/install_pkg; this node stages that tree for the e9patch-compat-only profile. If hermit-install stops staging e9tool, the final `test -x` fails here instead of in every probe."
+        );
         let mut nss = nsswitch_fixture_node(&nsswitch);
         nss.group = format!("{namespace}prep");
         nss.labels = vec![label.into()];
+        nss.description = format!(
+            "Writes a files-only nsswitch.conf (every database, aliases through shadow, set to \"files\") to {} with mkdir and printf. The six probes whoami, groups, pinky, logname, tar and chown bind it read-only over /etc/nsswitch.conf, because they look up user and group names that the host may resolve through an identity daemon; pinning them to files keeps that host race out of the e9patch compatibility measurement. It runs after release_resources, and the lane's fixtures node waits for it. It fails only if the run-state directory cannot be created or written, which shows as a mkdir or printf error.",
+            nsswitch.display()
+        );
         nss.deps = vec![install.tag()];
         prep.deps.push(nss.tag());
         steps.push(install);
@@ -11518,6 +11864,7 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     // live in hermit-manifest-plan's private static source.
     let anchor_tags = [
         "build.e2e_artifact",
+        "build.host_hermit_link",
         "compatprep.hermit_release",
         "gate.manifest",
         "setup.nextest",
@@ -11583,16 +11930,63 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     portable_prep.labels = vec!["full".into(), "portable".into()];
     steps.push(portable_prep);
 
+    // The SaBRe run type's rows are the compat.yaml cells labelled
+    // sabre-compat-only, run by the static node sabrecompat.manifest_compat
+    // against the validation's one Hermit build; this node prepares the files
+    // those rows read, at the path the rows name.
+    let mut sabre_prep = prepare_fixtures_node_dep(
+        "sabrecompatprep.fixtures",
+        &portable_fixtures,
+        "build.host_hermit_link",
+    );
+    sabre_prep.group = "sabrecompatprep".into();
+    sabre_prep.desc = "Prepare the fixture files the SaBRe run type's compat cells read".into();
+    sabre_prep.description = format!(
+        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, once build.host_hermit_link has linked the validation's one Hermit build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of sabrecompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the run type before the bucket runs.",
+        portable_fixtures.display()
+    );
+    sabre_prep.labels = vec!["sabre-compat-only".into()];
+    steps.push(sabre_prep);
+
+    // The strict run type's rows are the compat.yaml cells labelled
+    // strict-compat-only, run the same way by strictcompat.manifest_compat.
+    let mut strict_prep = prepare_fixtures_node_dep(
+        "strictcompatprep.fixtures",
+        &portable_fixtures,
+        "build.host_hermit_link",
+    );
+    strict_prep.group = "strictcompatprep".into();
+    strict_prep.desc = "Prepare the fixture files the strict run type's compat cells read".into();
+    strict_prep.description = format!(
+        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, once build.host_hermit_link has linked the validation's one Hermit build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of strictcompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the run type before the bucket runs.",
+        portable_fixtures.display()
+    );
+    strict_prep.labels = vec!["strict-compat-only".into()];
+    steps.push(strict_prep);
+
+    // The rr run type's rows are the compat.yaml replay cells labelled
+    // rr-compat-only, run the same way by rrcompat.manifest_compat.
+    let mut rr_prep = prepare_fixtures_node_dep(
+        "rrcompatprep.fixtures",
+        &portable_fixtures,
+        "build.host_hermit_link",
+    );
+    rr_prep.group = "rrcompatprep".into();
+    rr_prep.desc = "Prepare the fixture files the rr run type's compat cells read".into();
+    rr_prep.description = format!(
+        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, once build.host_hermit_link has linked the validation's one Hermit build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of rrcompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the run type before the bucket runs.",
+        portable_fixtures.display()
+    );
+    rr_prep.labels = vec!["rr-compat-only".into()];
+    steps.push(rr_prep);
+
     for (mode, namespace, label) in [
         (
             CompatMode::PortableStrict,
             "portablecompat",
             "portable-strict-compat-only",
         ),
-        (CompatMode::Strict, "strictcompat", "strict-compat-only"),
-        (CompatMode::Sabre, "sabrecompat", "sabre-compat-only"),
         (CompatMode::E9patch, "e9patchcompat", "e9patch-compat-only"),
-        (CompatMode::Rr, "rrcompat", "rr-compat-only"),
     ] {
         steps.extend(generated_focused_compat_partition(
             root, tmp, mode, namespace, label,
@@ -11614,6 +12008,15 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     );
     super_prep.group = "super-compatprep".into();
     super_prep.labels = vec!["super".into()];
+    super_prep.description = format!(
+        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after super.build_release_hermit: {REAL_COMPAT_FIXTURE_CONTENTS}. The super-only compatibility rows ({}) depend on it; the rows that run tests/compat/real_compat_workload.sh read these files through REAL_COMPAT_FIXTURES, and rustc calls the toolchain link it makes because --base-env=minimal keeps the user's rustup directory off PATH. A fixture that fails to build or a missing host tool stops those rows.",
+        super_fixtures.display(),
+        validate_corpus::portable_super_only()
+            .keys()
+            .map(|label| format!("compat.{label}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     steps.push(super_prep);
     let only = validate_corpus::portable_super_only()
         .keys()
@@ -13187,9 +13590,9 @@ fn outcome_is_failure(outcome: &StepOutcome) -> bool {
 /// Compatibility rows have their own policy classification, so only their
 /// separately counted blocking rows plus failures outside the matrix belong in
 /// the total. Every other profile already counts its failed DAG nodes in
-/// `blocking_failure_nodes`. In particular, the super stress table groups those
-/// same failed repetition nodes by probe for display; adding that grouped count
-/// here would count one failure once as a node and again as a probe.
+/// `blocking_failure_nodes`. In particular, the super stress table counts the
+/// failed repetition rows inside those same failed probe nodes; adding that
+/// count here would count one failure once as a node and again as rows.
 fn effective_failure_count(
     compat: Option<CompatMode>,
     blocking_failure_nodes: usize,
@@ -13407,7 +13810,7 @@ fn summary_listing_bracket() -> Result<String, String> {
     }
     // Compatibility is deliberately different: its policy owns the matrix
     // rows, while only failures outside that matrix are added.
-    if effective_failure_count(Some(CompatMode::Strict), 99, 2, 1) != 3 {
+    if effective_failure_count(Some(CompatMode::PortableStrict), 99, 2, 1) != 3 {
         return Err(
             "failure count: compatibility matrix and structural failure populations were not kept separate"
                 .into(),
@@ -13841,11 +14244,7 @@ fn compat_summary_with_attempts(
         // ONE decision, read twice: once for what to print and once for whether the row
         // blocks. Before this the two were separate arms of the same `if`, which is how a
         // reporting change can silently become an exemption.
-        // `display_name()` deliberately renders Strict and PortableStrict identically, but these
-        // two modes treat a listed row in OPPOSITE ways, so the message must distinguish them or
-        // the reader cannot tell an exemption from a blocking report.
         let mode_label = match mode {
-            CompatMode::Strict => "--strict",
             CompatMode::PortableStrict => "--portable-strict",
             other => other.display_name(),
         };
@@ -13862,12 +14261,6 @@ fn compat_summary_with_attempts(
                     "  WARN {label} passed but is listed as known fail-closed under {} \
                      ({}); the EXPECTATION is STALE -- drop it from the known-failure table",
                     mode_label, known[label]
-                );
-            }
-            CompatDisposition::KnownFailClosedExempt => {
-                println!(
-                    "  WARN {label} known fail-closed under --strict ({}; nonblocking)",
-                    known[label]
                 );
             }
             CompatDisposition::KnownFailClosedBlocking => {
@@ -13898,7 +14291,7 @@ fn compat_summary_with_attempts(
     // forever -- it can neither fail (nothing ran it) nor be reported stale (it never passed),
     // so the table grows entries no run can retire. Naming them is reporting only; it changes
     // no verdict.
-    if matches!(mode, CompatMode::Strict | CompatMode::PortableStrict) {
+    if mode == CompatMode::PortableStrict {
         let unmeasured: Vec<&str> = known
             .keys()
             .copied()
@@ -13931,18 +14324,6 @@ fn compat_summary_with_attempts(
         format!("{passed}/{measured}")
     );
     println!("P/M means passing/measured; failures are M-P. Unmeasured rows are excluded from M.");
-    if mode == CompatMode::Rr {
-        // Name the rows deliberately EXCLUDED from the R/R ratchet. A denominator
-        // that silently drops five known divergences reads as full coverage.
-        let excluded = validate_corpus::rr_known_failures();
-        println!(
-            "R/R ratchet excludes {} program(s) measured to diverge on replay:",
-            excluded.len()
-        );
-        for (label, why) in &excluded {
-            println!("  - {label}: {why}");
-        }
-    }
     (
         passed,
         measured,
@@ -14437,15 +14818,29 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
     ]);
     // (tag, withheld, selected), measured from ci/expected-e2e-plan.json: the
     // kvm-backend rows of each bucket against all of its rows.
+    // https://github.com/rrnewton/reverie/issues/891 adds six portable KVM
+    // verify cells to both populations; three socket cells add another explicit +3.
+    // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
+    // One epoll-pwait2 KVM verification row: https://github.com/rrnewton/reverie/issues/905.
+    // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
+    // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+    // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+    // The 2026-10-03 SaBRe promotion (timeouts::SABRE_2026_10_03_*) adds 128
+    // portable SaBRe verify cells, none of them kvm: 116 c-programs, 10
+    // system-utils, 1 determinism-stress-c and 1 language-runtimes.
     let portable_partial: &[(&str, usize, usize)] = &[
         ("e2e.manifest_applications", 1, 4),
-        ("e2e.manifest_c_programs", 195, 742),
+        (
+            "e2e.manifest_c_programs",
+            195 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
+            744 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 116,
+        ),
         ("e2e.manifest_data_handling", 1, 7),
         ("e2e.manifest_debugger_c", 1, 4),
         ("e2e.manifest_determinism_stress", 2, 8),
-        ("e2e.manifest_determinism_stress_c", 2, 14),
-        ("e2e.manifest_language_runtimes", 14, 33),
-        ("e2e.manifest_system_utils", 25, 74),
+        ("e2e.manifest_determinism_stress_c", 2, 14 + 1),
+        ("e2e.manifest_language_runtimes", 14, 33 + 1),
+        ("e2e.manifest_system_utils", 25, 74 + 10),
     ];
     let privileged_partial: &[(&str, usize, usize)] = &[
         ("privileged-e2e.manifest_c_programs", 1, 4),
@@ -14508,27 +14903,27 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
 
     // The plan rows themselves: every kvm cell names kvm, so the accounting
     // counts them in their buckets with KVM present and withholds them with it
-    // absent.
+    // absent. One epoll-pwait2 KVM row is added by https://github.com/rrnewton/reverie/issues/905.
     let present = read_bucket_cells(root, &BTreeMap::new())?;
     let c_programs = present
         .iter()
         .find(|b| b.lane == "portable" && b.category == "c-programs")
         .ok_or("host-inapplicable cells: required plan lost portable/c-programs")?;
-    if c_programs.selected != 742 || c_programs.withheld != 0 {
+    if c_programs.selected != 744 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 116 || c_programs.withheld != 0 {
         return Err(format!(
-            "host-inapplicable cells: with KVM present all 742 portable/c-programs cells must be \
+            "host-inapplicable cells: with KVM present all 874 portable/c-programs cells must be \
              counted and none withheld: {c_programs:?}"
         ));
     }
     let absent = read_bucket_cells(root, &kvm_absent)?;
     let withheld: usize = absent.iter().map(|b| b.withheld).sum();
-    if withheld != 244
+    if withheld != 244 + 6 + 3 + 1 + 1 + 1 + 1 + 1
         || absent
             .iter()
             .any(|b| b.withheld > 0 && b.capabilities != ["kvm"])
     {
         return Err(format!(
-            "host-inapplicable cells: with KVM absent exactly the 244 kvm cells must be withheld, \
+            "host-inapplicable cells: with KVM absent exactly the 258 kvm cells must be withheld, \
              by kvm alone; got {withheld}: {absent:?}"
         ));
     }
@@ -14592,7 +14987,7 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
         let (complete, exit, result) = judge(&plan, "e2e.manifest_c_programs");
         if complete || exit != NO_RESULT_EXIT_CODE as u8 || result != "no_result" {
             return Err(format!(
-                "host-inapplicable cells: a passing {label} node whose 195 kvm cells were \
+                "host-inapplicable cells: a passing {label} node whose 205 kvm cells were \
                  withheld must leave the run incomplete; got complete={complete} exit={exit} \
                  result={result}"
             ));
@@ -14656,7 +15051,7 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
     }
 
     println!(
-        "  host-inapplicable cells: plan rows 244 kvm withheld / 742 portable c-programs counted, \
+        "  host-inapplicable cells: plan rows 258 kvm withheld / 874 portable c-programs counted, \
          portable 8 running recorded / 0 withheld, full 10 running recorded / 1 withheld, \
          qualifying 2 complete / violating 2 NO_RESULT, attribution 1 shared / 2 refused"
     );
@@ -14732,15 +15127,27 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
     };
 
     // (tag, kvm cells, selected cells), measured from ci/expected-e2e-plan.json.
+    // The +6 earlier and +3 socket KVM verify selections are documented at
+    // https://github.com/rrnewton/reverie/issues/891.
+    // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
+    // One epoll-pwait2 KVM verification row: https://github.com/rrnewton/reverie/issues/905.
+    // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
+    // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+    // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+    // The 128 SaBRe verify cells of 2026-10-03 add only selected cells, as above.
     let portable: &[(&str, usize, usize)] = &[
         ("e2e.manifest_applications", 1, 4),
-        ("e2e.manifest_c_programs", 195, 742),
+        (
+            "e2e.manifest_c_programs",
+            195 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
+            744 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 116,
+        ),
         ("e2e.manifest_data_handling", 1, 7),
         ("e2e.manifest_debugger_c", 1, 4),
         ("e2e.manifest_determinism_stress", 2, 8),
-        ("e2e.manifest_determinism_stress_c", 2, 14),
-        ("e2e.manifest_language_runtimes", 14, 33),
-        ("e2e.manifest_system_utils", 25, 74),
+        ("e2e.manifest_determinism_stress_c", 2, 14 + 1),
+        ("e2e.manifest_language_runtimes", 14, 33 + 1),
+        ("e2e.manifest_system_utils", 25, 74 + 10),
     ];
     let full_privileged: &[(&str, usize, usize)] = &[
         ("privileged-e2e.manifest_applications", 1, 1),
@@ -14752,7 +15159,11 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
         ("privileged-only-e2e.manifest_c_programs", 1, 4),
         ("privileged-only-e2e.manifest_system_utils", 1, 2),
     ];
-    let c_programs: &[(&str, usize, usize)] = &[("e2e.manifest_c_programs", 195, 742)];
+    let c_programs: &[(&str, usize, usize)] = &[(
+        "e2e.manifest_c_programs",
+        195 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
+        744 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 116,
+    )];
     // (label, argv, expected (tag, kvm cells, selected cells) rows, node-level kvm tag)
     type RefusedCase<'a> = (
         &'a str,
@@ -14941,8 +15352,8 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
     }
 
     println!(
-        "  committed cell capability: KVM absent refuses 5 selections (portable 8 nodes / 241 \
-         kvm cells, --only full and --only portable c-programs 195 of 742, full 11 nodes, \
+        "  committed cell capability: KVM absent refuses 5 selections (portable 8 nodes / 255 \
+         kvm cells, --only full and --only portable c-programs 209 of 874, full 11 nodes, \
          privileged 3 nodes) with the graph unchanged; every capability present admits all 5 \
          unchanged; 3 kvm-free selections admitted with KVM absent; unreadable plan refused"
     );
@@ -16352,7 +16763,7 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
             // are unchanged.
             "--diagnostic-results" => {}
             "--lane" | "--category" | "--test" | "--mode" | "--backend" | "--exclude-backend"
-            | "--exclude-category" | "--results" | "--junit" | "--jobs" => {
+            | "--exclude-category" | "--label" | "--results" | "--junit" | "--jobs" => {
                 index += 1;
                 let value = argv
                     .get(index)
@@ -16371,6 +16782,8 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
                     // The quick verify smoke omits the host-bound strict
                     // compatibility corpus; model it like the backend omission.
                     "--exclude-category" => selection.exclude_categories.push(value.clone()),
+                    // A focused run type's bucket selects its labelled cells.
+                    "--label" => selection.labels.push(value.clone()),
                     _ => {}
                 }
             }
@@ -16408,6 +16821,11 @@ fn manifest_step_policy(step: &Step) -> Result<(Selection, bool), String> {
             || selection.test != manifest.test
             || selection.mode != manifest.mode
             || selection.backend != manifest.backend
+            || selection.labels
+                != hermit_manifest_plan::validation_dag::manifest_run_type(&step.tag())
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect::<Vec<_>>()
         {
             return Err(format!(
                 "retry bounds: {} command disagrees with its declared manifest selector",
@@ -16501,7 +16919,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "36");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "38");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -16527,7 +16945,7 @@ mod nextest_timeout_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names.len(),
-            35,
+            37,
             "update the exact CI inventory with new KVM tests"
         );
         let required_cases = [
@@ -16693,8 +17111,27 @@ mod nextest_timeout_tests {
                 .unwrap()
                 .len(),
             // 900 before the strict compatibility corpus moved into
-            // compat.yaml (fold 1 of https://github.com/rrnewton/hermit/issues/3448).
-            900 + hermit_manifest_plan::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT,
+            // compat.yaml (fold 1 of https://github.com/rrnewton/hermit/issues/3448),
+            // plus the select replay cells of
+            // https://github.com/rrnewton/hermit/pull/3580, plus the six KVM verify cells of
+            // https://github.com/rrnewton/reverie/issues/891.
+            900 + hermit_manifest_plan::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
+                + hermit_manifest_plan::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT
+                + 6
+                // Three socket selections: https://github.com/rrnewton/reverie/issues/891.
+                + 3
+                // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
+                + 1
+                // One zero-time epoll-pwait2 KVM verify selection: https://github.com/rrnewton/reverie/issues/905.
+                + 1
+                // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
+                + 1
+                // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+                + 1
+                // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+                + 1
+                // The 128 SaBRe verify cells promoted on 2026-10-03.
+                + hermit_manifest_plan::timeouts::SABRE_2026_10_03_SELECTED_CI_CELL_COUNT,
             "timeout accounting must not change the shipped required-cell population"
         );
         let selection = Selection {
@@ -16968,8 +17405,14 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
         // https://github.com/rrnewton/hermit/issues/3448). 37 since
         // portablecompat.manifest_compat replaced the 189 generated
         // portablecompat.<program> probes of the portable-strict-compat-only
-        // run type (fold 2 of the same issue).
-        assert_eq!(steps.len(), 37);
+        // run type (fold 2 of the same issue). 38 since
+        // sabrecompat.manifest_compat replaced the 212 sabrecompat.<program>
+        // probes of the sabre-compat-only run type (fold 3). 39 since
+        // strictcompat.manifest_compat replaced the 193 strictcompat.<program>
+        // probes of the strict-compat-only run type (fold 4). 40 since
+        // rrcompat.manifest_compat replaced the 139 rrcompat.<program> probes
+        // of the rr-compat-only run type (fold 5).
+        assert_eq!(steps.len(), 40);
         for step in steps {
             let (selection, prebuilt) = manifest_step_policy(step).unwrap();
             assert_eq!(prebuilt, step.tag() != "quick.e2e_verify", "{}", step.tag());
@@ -17529,11 +17972,12 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .ok_or("retry bounds: privileged lane is absent")?;
     for (tag, expected) in [
         ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
-        // The shipped KVM selection contains 35 run_kvm_ declarations and
-        // the unchanged initialized-VM setup control. The eight-mode timer,
-        // two-role retirement and six-mode reparenting tests each count as
-        // one selected test.
-        ("privileged-only-test.cli_kvm", 36usize),
+        // The shipped KVM selection contains 37 run_kvm_ declarations (35
+        // plus the two gettimeofday EFAULT regressions) and the unchanged
+        // initialized-VM setup control. The eight-mode timer, two-role
+        // retirement and six-mode reparenting tests each count as one
+        // selected test.
+        ("privileged-only-test.cli_kvm", 38usize),
     ] {
         let step = privileged
             .steps
@@ -20582,15 +21026,17 @@ fn compat_test_results(
     TestResults::current(executed, 0, results)
 }
 
-/// Add a focused compatibility lane's direct rows (`strictcompat.*`,
-/// `sabrecompat.*`, ...) to the exact test denominator.
+/// Add a focused compatibility lane's direct rows (`e9patchcompat.*`) to the
+/// exact test denominator.
 ///
 /// Before those lanes were flattened, a nested validate published a single
 /// structured-count file to one outer step. The direct steps already carry
 /// stronger typed terminal outcomes and attempts, so the outer producer now
 /// consumes those facts itself. (The portable strict corpus reports through
 /// its manifest bucket instead: e2e.manifest_compat, and
-/// portablecompat.manifest_compat in the corpus-only lane.) A failed
+/// portablecompat.manifest_compat in the corpus-only lane; so do the SaBRe,
+/// strict and rr run types, through sabrecompat.manifest_compat,
+/// strictcompat.manifest_compat and rrcompat.manifest_compat.) A failed
 /// count-bearing non-compatibility node still leaves the passed count unknown;
 /// flattening must not turn an inexact base count into an exact-looking total.
 fn run_test_counts(
@@ -24954,16 +25400,19 @@ fn run(
     // that exists nowhere in history and cannot be reproduced or compared.
     // Skipped for a nested payload: the outer run already made this judgement
     // about the same checkout, and a second answer could only disagree.
-    let dirty_at_admission = tree_dirty();
-    let wt_dirty = worktree_dirty();
-    if args.write_constructed_dag.is_none()
-        && args.write_generated_plan.is_none()
-        && dirty_worktree_requires_refusal(
+    // A plan export neither runs this gate nor reads the answers; see
+    // [`admission_dirtiness`].
+    let admission = admission_dirtiness(plan_export_path(&args).is_some(), || AdmissionDirtiness {
+        tree: tree_dirty(),
+        worktree: worktree_dirty(),
+    });
+    if admission.is_some_and(|dirtiness| {
+        dirty_worktree_requires_refusal(
             nesting.nested,
-            wt_dirty,
+            dirtiness.worktree,
             args.skip_inner_dirty_working_tree_and_rebase_freshness_checks,
         )
-    {
+    }) {
         eprintln!("validate: refusing to run on a dirty working tree.");
         eprintln!(
             "  HEAD {} has uncommitted working-tree changes, so a record anchored to it",
@@ -25418,11 +25867,7 @@ fn run(
     // Print the plan and exit. This makes "what will actually run, and under what
     // caps" reviewable without spending a validate slot — and it is how the
     // declared-caps claim above can be checked by eye rather than trusted.
-    if let Some(path) = args
-        .write_constructed_dag
-        .as_ref()
-        .or(args.write_generated_plan.as_ref())
-    {
+    if let Some(path) = plan_export_path(&args) {
         if plan.second.is_some() {
             return RunSummary::refused(
                 2,
@@ -25461,6 +25906,11 @@ fn run(
             ],
         );
     }
+    // Every plan export returned just above, so the admission answers were read.
+    let AdmissionDirtiness {
+        tree: dirty_at_admission,
+        worktree: wt_dirty,
+    } = admission.expect("only a plan export skips the admission dirtiness, and it returned above");
     if args.show_plan {
         let mut all: Vec<&DagConfig> = vec![&plan.cfg];
         if let Some(s) = &plan.second {
@@ -26095,6 +26545,9 @@ fn run(
             }
         }
     };
+    // Parity is not appended here: each path below appends it after its
+    // ledger row (`append_run_parity`), because the append can wait minutes
+    // and nothing in this section may hold the run's record back for it.
     // Stop the monitor and take the peak ONCE, here, so the ledger and the
     // summary cannot disagree about how crowded the box was.
     let (peak_active, peak_live) = match &monitor {
@@ -26308,6 +26761,26 @@ fn run(
         } else {
             None
         };
+        // Parity goes out after the ledger row, as in a completed run, and
+        // before the writeback that publishes what it spooled.
+        append_run_parity(
+            &root,
+            nesting.nested,
+            args.allow_local_off_the_record_run,
+            release_builder,
+            execution_plan.cfg.steps.iter().chain(
+                execution_plan
+                    .second
+                    .iter()
+                    .flat_map(|second| second.steps.iter()),
+            ),
+            &plan.host_inapplicable,
+            parent.as_deref(),
+            tool_root.as_deref(),
+            &e2e_result_root,
+            &raw_snapshot,
+            &commit,
+        );
         // This is below the interrupted run's ledger write. Keep the checkout
         // lock held while the generated files are replaced, so a second local
         // validate cannot begin against the tree between those two operations.
@@ -26374,30 +26847,14 @@ fn run(
         let prefix = plan
             .compat_prefix
             .expect("compatibility plans carry their committed tag prefix");
-        let (passed, measured, blocking, nonblocking) =
+        // No remaining compat mode has a passing floor: the rr run type's, the
+        // only one, went with its per-program nodes on 2026-10-02, and its
+        // bucket fails on any selected cell that fails instead.
+        let (_passed, measured, blocking, nonblocking) =
             print_compat_summary(mode, prefix, &outcomes, &attempts);
         compat_blocking = blocking.len();
         compat_nonblocking = nonblocking;
         compat_measured = Some(measured);
-        let floor = match mode {
-            CompatMode::Sabre => Some(validate_corpus::SABRE_COMPAT_EXPECTED),
-            CompatMode::Rr => Some(validate_corpus::RR_COMPAT_EXPECTED),
-            CompatMode::Strict | CompatMode::PortableStrict | CompatMode::E9patch => None,
-        };
-        if let Some(f) = floor {
-            if passed < f {
-                println!(
-                    "❌ {} ratchet: {passed}/{measured} passing, floor {f} — BELOW FLOOR",
-                    mode.display_name()
-                );
-                ok = false;
-            } else {
-                println!(
-                    "✅ {} ratchet: {passed}/{measured} passing, floor {f} — met",
-                    mode.display_name()
-                );
-            }
-        }
         if !blocking.is_empty() {
             println!(
                 "❌ {} blocking failures ({}): {}",
@@ -26411,10 +26868,10 @@ fn run(
     // Super stress pass rates, from typed outcomes rather than a scraped report.
     if plan.super_mode {
         let reps = validate_super::repetitions();
-        let rates = validate_classification::stress_rates(&classification, reps);
-        // This is a per-PROBE display summary. The failed repetition nodes are
-        // already in `blocking_failures`, so the grouped count must not be added
-        // to the final node count.
+        let rates = validate_classification::stress_rates(&classification, &outcomes, reps);
+        // This is a per-PROBE display summary of repetition rows. A probe node
+        // with a failed repetition is already in `blocking_failures`, so the
+        // row count must not be added to the final node count.
         print_super_stress_verdict(&rates, reps, jobs, host_cpus);
     }
 
@@ -26791,6 +27248,27 @@ fn run(
             }
         }
     }
+
+    // Parity goes out after the ledger row and the receipt, neither of which
+    // may wait on it, and before the writeback that publishes what it spooled.
+    append_run_parity(
+        &root,
+        nesting.nested,
+        args.allow_local_off_the_record_run,
+        release_builder,
+        execution_plan.cfg.steps.iter().chain(
+            execution_plan
+                .second
+                .iter()
+                .flat_map(|second| second.steps.iter()),
+        ),
+        &plan.host_inapplicable,
+        parent.as_deref(),
+        tool_root.as_deref(),
+        &e2e_result_root,
+        &raw_snapshot,
+        &commit,
+    );
 
     // This must remain below the ledger append and receipt publication. Writing
     // the generated scorecard sooner changes the working tree while the run is
@@ -27235,6 +27713,644 @@ fn stop_test_seam(
 }
 
 #[cfg(test)]
+mod parity_append_tests {
+    //! The validate parity append of
+    //! <https://github.com/rrnewton/hermit/issues/3301>: what reaches
+    //! `series.py append-parity`, and that no outcome of it fails the run.
+    use super::*;
+
+    const TREE: &str = "d3a0a4ae3d168565595ae4157b25ab8efbb1861a";
+    const RUN: &str = "validate-parity-fixture";
+
+    /// RUN 1953's first portable record, with this fixture's run id and the
+    /// `unavailable_class` and `operand` every record now carries (both
+    /// `null` for a measured verdict) inserted after its verdict.
+    fn diverged_record() -> String {
+        r#"{"schema":1,"test_id":"c-programs/aio-refusal","backend":"kvm","verdict":"diverged","unavailable_class":null,"operand":null,"inputs_equalized":false,"reason":null,"credit":null,"unequalized_credit":0.11320754716981132,"first_divergent_record":13,"left_len":106,"right_len":106,"matched_prefix":12,"first_difference":{"field":"token 12: `Ok(93824992251904)` vs `Ok(2117632)`","syscall":2,"scheduler_turn":1,"virtual_nanoseconds":1790651878158833000,"reference_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(93824992251904)","candidate_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(2117632)"},"reference_log":"ref.detlog","candidate_log":"run1_log","run_id":"RUN","hermit_sha":"TREE"}"#
+            .replace("RUN", RUN)
+            .replace("TREE", TREE)
+    }
+
+    fn status(state: &str, scope: &[&str], error: Option<&str>) -> String {
+        serde_json::json!({
+            "schema": 2, "state": state, "run_id": RUN, "hermit_sha": TREE,
+            "hermit_bin": "/src/hermit", "hermit_bin_sha256": null,
+            "records": "/results/parity.jsonl", "cells": scope.len(), "scope": scope,
+            "summary": null, "error": error,
+        })
+        .to_string()
+    }
+
+    /// A `results.jsonl` row as the harness writes it, reduced to what the
+    /// parity append reads from it: its outcome, and the tree state the
+    /// harness process that wrote it saw.
+    fn cell_row(outcome: &str, dirty: bool) -> String {
+        serde_json::json!({
+            "schema": 4, "run_id": RUN, "hermit_sha": TREE,
+            "test": "c-programs/aio-refusal", "lane": "portable", "mode": "verify",
+            "backend": "kvm", "outcome": outcome, "source_tree_dirty": dirty,
+        })
+        .to_string()
+    }
+
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        /// A run whose portable node measured one cell on a clean tree and
+        /// whose privileged node's post-pass failed, with a writer at
+        /// `tool/ci-hub/series/series.py`.
+        fn new(label: &str, writer: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "validate-parity-append-{}-{label}-{}",
+                std::process::id(),
+                epoch_now()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let portable = root.join("e2e/portable/manifest_c_programs");
+            let privileged = root.join("e2e/privileged/manifest_c_programs");
+            for dir in [
+                root.join("parent"),
+                root.join("tool/ci-hub/series"),
+                portable.clone(),
+                privileged.clone(),
+            ] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            std::fs::write(root.join("tool/ci-hub/series/series.py"), writer).unwrap();
+            std::fs::write(
+                portable.join("parity.status.json"),
+                status("complete", &["c-programs/aio-refusal@kvm"], None),
+            )
+            .unwrap();
+            std::fs::write(portable.join("parity.jsonl"), diverged_record() + "\n").unwrap();
+            std::fs::write(
+                portable.join("results.jsonl"),
+                cell_row("PASS", false) + "\n",
+            )
+            .unwrap();
+            std::fs::write(
+                privileged.join("parity.status.json"),
+                status(
+                    "failed",
+                    &[
+                        "c-programs/cpuid-probe@kvm",
+                        "c-programs/cpuid-probe@liteinst",
+                    ],
+                    Some("log-diff timed out"),
+                ),
+            )
+            .unwrap();
+            Fixture { root }
+        }
+
+        fn expected(&self) -> hermit_manifest_plan::parity::ExpectedScope {
+            hermit_manifest_plan::parity::parse_expected_scope(
+                r#"{"portable/manifest_system_utils": ["system-utils/ls@sabre"]}"#,
+            )
+            .unwrap()
+        }
+
+        fn append(&self, parent: bool) -> Option<String> {
+            self.append_with(
+                parent,
+                Some(&self.expected()),
+                hermit_manifest_plan::parity::AppendBounds::default(),
+            )
+        }
+
+        fn append_with(
+            &self,
+            parent: bool,
+            expected: Option<&hermit_manifest_plan::parity::ExpectedScope>,
+            bounds: hermit_manifest_plan::parity::AppendBounds,
+        ) -> Option<String> {
+            append_validate_parity(
+                parent.then(|| self.root.join("parent")).as_deref(),
+                Some(&self.root.join("tool")),
+                &self.root.join("e2e"),
+                &validate_cell_results::CapturedResults::capture(&self.root.join("e2e")),
+                expected,
+                Some(RUN),
+                TREE,
+                bounds,
+            )
+        }
+
+        fn captured_rows(&self) -> Vec<(String, String, String)> {
+            let captured = self.captured().expect("append-parity was called");
+            captured["stdin"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    let row = serde_json::from_str::<serde_json::Value>(line).unwrap();
+                    (
+                        row["cell"].as_str().unwrap().to_string(),
+                        row["verdict"].as_str().unwrap().to_string(),
+                        row["source"]["post_pass_state"]
+                            .as_str()
+                            .unwrap()
+                            .to_string(),
+                    )
+                })
+                .collect()
+        }
+
+        fn captured(&self) -> Option<serde_json::Value> {
+            std::fs::read(self.root.join("parent/captured.json"))
+                .ok()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        }
+
+        /// The cell results of `node`'s `manifest_c_programs` bucket.
+        fn results(&self, node: &str) -> PathBuf {
+            self.root
+                .join("e2e")
+                .join(node)
+                .join("manifest_c_programs/results.jsonl")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// A writer with `append-parity`: it answers the `--help` probe with
+    /// exit 0, as dev-hermit's `series.py` does for a subcommand it has.
+    const WRITER: &str = r#"import json, pathlib, sys
+if sys.argv[1:] == ["append-parity", "--help"]:
+    print("usage: series.py append-parity --parent P --producer X --run-id R --tree T")
+    sys.exit(0)
+parent = pathlib.Path(sys.argv[sys.argv.index("--parent") + 1])
+parent.joinpath("captured.json").write_text(json.dumps({"argv": sys.argv[1:], "stdin": sys.stdin.read()}))
+print("fixture parity append accepted")
+"#;
+
+    /// A writer that predates `append-parity`: dev-hermit's `series.py`
+    /// answers a subcommand it does not have with its usage and exit 2.
+    const LEGACY_WRITER: &str = r#"import pathlib, sys
+if "--parent" in sys.argv:
+    pathlib.Path(sys.argv[sys.argv.index("--parent") + 1]).joinpath("captured.json").write_text("{}")
+sys.stderr.write("usage: series.py {append-cells,prune-cells} ...\nseries.py: error: argument command: invalid choice: 'append-parity'\n")
+sys.exit(2)
+"#;
+
+    #[test]
+    fn complete_failed_and_absent_nodes_all_reach_append_parity() {
+        let fixture = Fixture::new("rows", WRITER);
+        let line = fixture.append(true).unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "parity: append-parity accepted 4 row(s) from {} (diverged 1, record-missing \
+                 3): fixture parity append accepted",
+                fixture.root.join("e2e").display()
+            )
+        );
+        let captured = fixture.captured().expect("append-parity was called");
+        let argv = captured["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(argv[0], "append-parity");
+        let parent = fixture.root.join("parent").display().to_string();
+        for pair in [
+            ["--parent", parent.as_str()],
+            ["--producer", "validate"],
+            ["--run-id", RUN],
+            ["--tree", TREE],
+            ["--source-tree-dirty", "false"],
+        ] {
+            assert!(
+                argv.windows(2).any(|window| window == pair),
+                "{pair:?} missing from {argv:?}"
+            );
+        }
+        let rows = captured["stdin"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let seen = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["cell"].as_str().unwrap().to_string(),
+                    row["verdict"].as_str().unwrap().to_string(),
+                    row["source"]["post_pass_state"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expect = |cell: &str, verdict: &str, state: &str| {
+            (cell.to_string(), verdict.to_string(), state.to_string())
+        };
+        assert_eq!(
+            seen,
+            [
+                expect("c-programs/aio-refusal@kvm", "diverged", "complete"),
+                expect("system-utils/ls@sabre", "record-missing", "absent"),
+                expect("c-programs/cpuid-probe@kvm", "record-missing", "failed"),
+                expect(
+                    "c-programs/cpuid-probe@liteinst",
+                    "record-missing",
+                    "failed"
+                ),
+            ]
+        );
+        // The record reaches the writer byte-for-byte as the post-pass wrote
+        // it: same fields, same order, so the raw row text contains it.
+        let first_line = captured["stdin"].as_str().unwrap().lines().next().unwrap();
+        assert!(
+            first_line.contains(&format!(r#""record":{}"#, diverged_record())),
+            "the record reaches the writer byte-for-byte: {first_line}"
+        );
+        assert_eq!(
+            rows[2]["reason"],
+            "parity post-pass failed: log-diff timed out"
+        );
+    }
+
+    /// The rows go out with the tree state of the cell rows the series
+    /// append sent: clean while every executed row is clean (a
+    /// `HOST-INAPPLICABLE` row, which `append-cells` skips, does not count),
+    /// dirty once any executed row is dirty. With no executed row, or a row
+    /// without the bool, there is no verdict, and the rows are left rather
+    /// than sent with a default.
+    #[test]
+    fn the_cell_rows_tree_state_reaches_append_parity() {
+        let sent = |fixture: &Fixture| {
+            let line = fixture.append(true).unwrap();
+            assert!(
+                line.starts_with("parity: append-parity accepted 4 row(s) from "),
+                "{line}"
+            );
+            let captured = fixture.captured().expect("append-parity was called");
+            let argv = captured["argv"].as_array().unwrap().clone();
+            let flag = argv
+                .iter()
+                .position(|arg| arg == "--source-tree-dirty")
+                .expect("--source-tree-dirty was sent");
+            argv[flag + 1].as_str().unwrap().to_string()
+        };
+
+        let clean = Fixture::new("tree-clean", WRITER);
+        std::fs::write(
+            clean.results("privileged"),
+            cell_row("HOST-INAPPLICABLE", true) + "\n",
+        )
+        .unwrap();
+        assert_eq!(sent(&clean), "false");
+
+        let dirty = Fixture::new("tree-dirty", WRITER);
+        std::fs::write(
+            dirty.results("privileged"),
+            cell_row("PASS", false) + "\n" + &cell_row("FAIL", true) + "\n",
+        )
+        .unwrap();
+        assert_eq!(sent(&dirty), "true");
+
+        let left = |fixture: &Fixture, why: String| {
+            format!(
+                "parity: {why}; 4 rows left in {} (diverged 1, record-missing 3)",
+                fixture.root.join("e2e").display()
+            )
+        };
+
+        let none = Fixture::new("tree-none", WRITER);
+        std::fs::remove_file(none.results("portable")).unwrap();
+        assert_eq!(
+            none.append(true).unwrap(),
+            left(
+                &none,
+                format!(
+                    "no executed cell result under {} records the tree state",
+                    none.root.join("e2e").display()
+                )
+            )
+        );
+        assert!(
+            none.captured().is_none(),
+            "nothing is sent without a verdict"
+        );
+
+        let unknown = Fixture::new("tree-unknown", WRITER);
+        let no_tree_state = r#"{"schema":4,"outcome":"PASS"}"#.to_string() + "\n";
+        std::fs::write(unknown.results("portable"), no_tree_state).unwrap();
+        assert_eq!(
+            unknown.append(true).unwrap(),
+            left(
+                &unknown,
+                format!(
+                    "{}:1 records no bool source_tree_dirty, so the tree state is unknown",
+                    unknown.results("portable").display()
+                )
+            )
+        );
+        assert!(
+            unknown.captured().is_none(),
+            "nothing is sent without a verdict"
+        );
+    }
+
+    #[test]
+    fn a_writer_without_append_parity_is_named_and_leaves_the_rows() {
+        let fixture = Fixture::new("legacy", LEGACY_WRITER);
+        assert_eq!(
+            fixture.append(true).unwrap(),
+            format!(
+                "parity: the series writer {} has no append-parity (`append-parity --help` \
+                 exit status: 2); 4 rows left in {} (diverged 1, record-missing 3)",
+                fixture.root.join("tool/ci-hub/series/series.py").display(),
+                fixture.root.join("e2e").display()
+            )
+        );
+        assert!(
+            fixture.captured().is_none(),
+            "a legacy writer is only probed, never asked to append"
+        );
+    }
+
+    /// A writer that never finishes is killed at its bound; the run goes on
+    /// with one line saying so.
+    #[test]
+    fn a_hanging_writer_is_killed_at_its_bound_and_is_a_line() {
+        let hanging = WRITER.replace(
+            "parent = pathlib.Path(",
+            "import time\ntime.sleep(60)\nparent = pathlib.Path(",
+        );
+        let fixture = Fixture::new("hanging", &hanging);
+        let started = std::time::Instant::now();
+        let line = fixture
+            .append_with(
+                true,
+                Some(&fixture.expected()),
+                hermit_manifest_plan::parity::AppendBounds {
+                    probe: std::time::Duration::from_secs(60),
+                    append: std::time::Duration::from_millis(300),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "parity: ERROR: append-parity did not finish within 300ms and was killed, so \
+                 the ledger may hold some of these rows; 4 rows left in {} \
+                 (diverged 1, record-missing 3)",
+                fixture.root.join("e2e").display()
+            )
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        assert!(fixture.captured().is_none());
+    }
+
+    #[test]
+    fn with_the_gate_off_nothing_is_called() {
+        let fixture = Fixture::new("gate", WRITER);
+        assert_eq!(fixture.append(false), None);
+        assert!(fixture.captured().is_none());
+        // The gate the call site applies before calling at all.
+        assert!(!should_write_scorecard(true, false, RELEASE_BUILDER_CARGO));
+        assert!(!should_write_scorecard(false, true, RELEASE_BUILDER_CARGO));
+        assert!(should_write_scorecard(false, false, RELEASE_BUILDER_CARGO));
+    }
+
+    #[test]
+    fn refused_outputs_and_a_refusing_writer_are_lines_not_failures() {
+        let refusing = WRITER.replace(
+            "print(\"fixture parity append accepted\")",
+            "sys.exit(\"fixture refusal\")",
+        );
+        let fixture = Fixture::new("refusing", &refusing);
+        let line = fixture.append(true).unwrap();
+        assert!(
+            line.starts_with("parity: ERROR: append-parity refused them (exit status: 1): fixture refusal; 4 rows left in "),
+            "{line}"
+        );
+        // Records with no status beside them cannot be attributed, and with
+        // no expected scope to stand in for them nothing is appended.
+        let stray = fixture.root.join("e2e/portable/manifest_system_utils");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("parity.jsonl"), diverged_record() + "\n").unwrap();
+        let line = fixture
+            .append_with(
+                true,
+                None,
+                hermit_manifest_plan::parity::AppendBounds::default(),
+            )
+            .unwrap();
+        assert!(
+            line.starts_with(
+                "parity: ERROR: no parity rows appended; the post-pass outputs under "
+            ) && line.contains("no expected scope names the cells they owed")
+                && line.contains("has no parity.status.json beside it"),
+            "{line}"
+        );
+    }
+
+    /// Refused outputs in one node do not take the run's other rows with
+    /// them: the refused node's expected cells are appended as
+    /// `record-missing` rows with `post_pass_state` `refused`, the other
+    /// nodes' rows are appended as read, and the line starts with a WARNING
+    /// naming the refusal.
+    #[test]
+    fn refused_node_outputs_still_owe_their_expected_cells() {
+        let fixture = Fixture::new("refused-node", WRITER);
+        let stray = fixture.root.join("e2e/portable/manifest_system_utils");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("parity.jsonl"), diverged_record() + "\n").unwrap();
+        let line = fixture.append(true).unwrap();
+        let e2e = fixture.root.join("e2e");
+        assert_eq!(
+            line,
+            format!(
+                "parity: WARNING: the post-pass outputs were refused in 1 place(s), so each cell \
+                 the expected scope owed there is a record-missing row \
+                 (portable/manifest_system_utils: {} has no parity.status.json beside it, so \
+                 its records cannot be attributed); append-parity accepted 4 row(s) from {} \
+                 (diverged 1, record-missing 3): fixture parity append accepted",
+                stray.join("parity.jsonl").display(),
+                e2e.display()
+            )
+        );
+        let expect = |cell: &str, verdict: &str, state: &str| {
+            (cell.to_string(), verdict.to_string(), state.to_string())
+        };
+        assert_eq!(
+            fixture.captured_rows(),
+            [
+                expect("c-programs/aio-refusal@kvm", "diverged", "complete"),
+                expect("system-utils/ls@sabre", "record-missing", "refused"),
+                expect("c-programs/cpuid-probe@kvm", "record-missing", "failed"),
+                expect(
+                    "c-programs/cpuid-probe@liteinst",
+                    "record-missing",
+                    "failed"
+                ),
+            ]
+        );
+    }
+
+    /// The committed DAG's manifest nodes owe exactly the committed
+    /// selection in `parity::PARITY_CELLS_PATH`, each cell to one node, and
+    /// the privileged c-programs node owes exactly the selected cells of the
+    /// one test it runs, c-programs/cpuid-probe. RUN 1953 measured 192 cells
+    /// (190 portable, 2 privileged). 2be6440ddd6 then selected
+    /// c-programs/pid-probe@dbt (portable) and c-programs/cpuid-probe@dbt
+    /// (privileged), which makes 194 (191 and 3). The sizes are derived from
+    /// the snapshot, so a selection change moves them with it; the
+    /// snapshot's own freshness test keeps it equal to the manifests. A node
+    /// whose environment turns the post-pass off owes nothing, and so does a
+    /// node withheld whole. A node that runs with only some cells withheld
+    /// owes its whole scope, so if it leaves no parity status, every cell of
+    /// that scope is a `record-missing` row, and the `parity:` line counts
+    /// every one of them.
+    #[test]
+    fn the_committed_nodes_owe_the_committed_selection() {
+        let root = test_source_root();
+        let steps = validate_plan::validation_config(&root).unwrap().steps;
+        let expected = validate_parity_expected_scope(&root, steps.iter(), &[]).unwrap();
+        let snapshot: hermit_manifest_plan::parity::ParityCells = serde_json::from_str(
+            &std::fs::read_to_string(root.join(hermit_manifest_plan::parity::PARITY_CELLS_PATH))
+                .unwrap(),
+        )
+        .unwrap();
+        let committed = snapshot
+            .cells
+            .iter()
+            .filter(|cell| cell.selected)
+            .map(|cell| format!("{}@{}", cell.test_id, cell.backend))
+            .collect::<BTreeSet<_>>();
+        let owed = expected
+            .values()
+            .flatten()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            owed.len(),
+            committed.len(),
+            "a cell is owed twice or not at all"
+        );
+        assert_eq!(owed.into_iter().collect::<BTreeSet<_>>(), committed);
+        let privileged = committed
+            .iter()
+            .filter(|cell| cell.starts_with("c-programs/cpuid-probe@"))
+            .count();
+        let sizes = expected
+            .iter()
+            .map(|(node, cells)| (node.as_str(), cells.len()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sizes,
+            [
+                ("portable/manifest_c_programs", committed.len() - privileged),
+                ("privileged/manifest_c_programs", privileged)
+            ]
+        );
+        assert!(
+            expected["privileged/manifest_c_programs"]
+                .iter()
+                .all(|cell| cell.test_id == "c-programs/cpuid-probe")
+        );
+
+        let mut off = steps.clone();
+        for step in &mut off {
+            if step.tag().contains("privileged") {
+                step.env.insert("E2E_PARITY_POST_PASS".into(), "0".into());
+            }
+        }
+        let expected = validate_parity_expected_scope(&root, off.iter(), &[]).unwrap();
+        assert_eq!(
+            expected.keys().collect::<Vec<_>>(),
+            ["portable/manifest_c_programs"]
+        );
+        let withheld = steps
+            .iter()
+            .filter(|step| {
+                step.manifest.as_ref().is_some_and(|manifest| {
+                    manifest.lane == "portable" && manifest.category == "c-programs"
+                })
+            })
+            .map(|step| validate_plan::HostInapplicableNode {
+                tag: step.tag(),
+                capability: validate_plan::HostCapability::Kvm,
+                evidence: "fixture".into(),
+                cells: None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!withheld.is_empty());
+        let expected = validate_parity_expected_scope(&root, steps.iter(), &withheld).unwrap();
+        assert_eq!(
+            expected.keys().collect::<Vec<_>>(),
+            ["privileged/manifest_c_programs"]
+        );
+
+        // A node that runs with only some cells withheld still starts its
+        // harness, which names its whole scope, withheld cells included, so it
+        // owes that scope like a node that ran in full.
+        let partly = withheld
+            .into_iter()
+            .map(|node| validate_plan::HostInapplicableNode {
+                cells: Some(validate_plan::WithheldCells {
+                    withheld: 1,
+                    selected: 2,
+                }),
+                ..node
+            })
+            .collect::<Vec<_>>();
+        let partly_expected = validate_parity_expected_scope(&root, steps.iter(), &partly).unwrap();
+        assert_eq!(
+            partly_expected,
+            validate_parity_expected_scope(&root, steps.iter(), &[]).unwrap()
+        );
+        // So when it leaves no parity status, each cell it owes is a
+        // `record-missing` row, the most adverse ledger verdict, where the
+        // node withheld whole owes no row at all.
+        let run = Fixture {
+            root: std::env::temp_dir().join(format!(
+                "validate-parity-partly-withheld-{}-{}",
+                std::process::id(),
+                epoch_now()
+            )),
+        };
+        let e2e = run.root.join("e2e");
+        std::fs::create_dir_all(&e2e).unwrap();
+        let portable_rows = |expected: &hermit_manifest_plan::parity::ExpectedScope| {
+            hermit_manifest_plan::parity::ledger_sources(&e2e, Some(expected))
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.source.lane == "portable")
+                .collect::<Vec<_>>()
+        };
+        let rows = portable_rows(&partly_expected);
+        assert_eq!(rows.len(), committed.len() - privileged);
+        assert!(rows.iter().all(|row| {
+            row.verdict == hermit_manifest_plan::parity::LedgerVerdict::RecordMissing
+                && row.source.post_pass_state
+                    == hermit_manifest_plan::parity::LedgerPostPassState::Absent
+        }));
+        // The `parity:` line counts the rows it is given by verdict, with
+        // `ledger_row_counts`, so none of them drops out of it.
+        let all =
+            hermit_manifest_plan::parity::ledger_sources(&e2e, Some(&partly_expected)).unwrap();
+        assert_eq!(
+            hermit_manifest_plan::parity::ledger_row_counts(&all),
+            format!("record-missing {}", committed.len())
+        );
+        assert!(portable_rows(&expected).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod committed_selection_preservation_tests {
     use super::*;
 
@@ -27371,7 +28487,7 @@ mod committed_selection_preservation_tests {
                 // ci/portable-shards.json.
                 assert!(
                     stdout.contains(
-                        "67 committed hosted-portable steps each assigned to exactly one hosted job"
+                        "68 committed hosted-portable steps each assigned to exactly one hosted job"
                     ),
                     "{stdout}"
                 );
@@ -27499,6 +28615,7 @@ mod committed_selection_preservation_tests {
             "test.command_strict_verify",
             "test.detcore_misc",
             "test.detcore_parallel",
+            "test.detcore_time",
             "test.detcore_unit",
             "test.envelope_levels",
             "test.hermit_integration",
@@ -27524,8 +28641,9 @@ mod committed_selection_preservation_tests {
         // the one bucket e2e.manifest_compat_on_host (fold 1 of
         // https://github.com/rrnewton/hermit/issues/3448); 206 until
         // test.dbt_parity_on_host was retired (slice S13 of
-        // https://github.com/rrnewton/hermit/issues/3301).
-        assert_eq!(expected.len(), 16);
+        // https://github.com/rrnewton/hermit/issues/3301). 17 since
+        // test.detcore_time_on_host was enrolled.
+        assert_eq!(expected.len(), 17);
         let requested = [public.join(","), "e2e.manifest_compat".into()].join(",");
         for only in [false, true] {
             let mut argv = if only {
@@ -30356,8 +31474,14 @@ mod raw_census_publication_tests {
         // https://github.com/rrnewton/hermit/issues/3448). 37 since
         // portablecompat.manifest_compat replaced the 189 generated
         // portablecompat.<program> probes of the portable-strict-compat-only
-        // run type (fold 2 of the same issue).
-        assert_eq!(publishers.len(), 37);
+        // run type (fold 2 of the same issue). 38 since
+        // sabrecompat.manifest_compat replaced the 212 sabrecompat.<program>
+        // probes of the sabre-compat-only run type (fold 3). 39 since
+        // strictcompat.manifest_compat replaced the 193 strictcompat.<program>
+        // probes of the strict-compat-only run type (fold 4). 40 since
+        // rrcompat.manifest_compat replaced the 139 rrcompat.<program> probes
+        // of the rr-compat-only run type (fold 5).
+        assert_eq!(publishers.len(), 40);
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
             let expects_proc_locks_runtime = matches!(

@@ -125,10 +125,23 @@ fn smaps_consumers_are_deterministic_under_strict_verify() {
         "Shared_Clean",
         "Shared_Dirty",
         "Private_Clean",
+        "Private_Dirty",
         "Referenced",
+        "Anonymous",
         "KSM",
+        "LazyFree",
+        "AnonHugePages",
+        "ShmemPmdMapped",
+        "FilePmdMapped",
+        "Shared_Hugetlb",
+        "Private_Hugetlb",
+        "Swap",
         "SwapPss",
+        "Locked",
     ];
+    // Fields every supported kernel prints. Each must appear and read zero, so
+    // the assertion cannot pass merely because the host omitted a leaking row.
+    const REQUIRED_FIELDS: &[&str] = &["Rss", "Private_Dirty", "Anonymous", "Swap", "Locked"];
 
     let _guard = hermit_run_lock();
     let smaps = read_smaps();
@@ -147,6 +160,7 @@ fn smaps_consumers_are_deterministic_under_strict_verify() {
         "smaps omitted nonzero mapping sizes:\n{smaps}"
     );
     let mut accounting_rows = 0;
+    let mut seen = std::collections::BTreeSet::new();
     for line in smaps.lines() {
         let Some((label, value)) = line.split_once(':') else {
             continue;
@@ -158,12 +172,16 @@ fn smaps_consumers_are_deterministic_under_strict_verify() {
                 "smaps retained host accounting in {line}"
             );
             accounting_rows += 1;
+            seen.insert(label);
         }
     }
     assert!(
         accounting_rows > 5,
         "smaps omitted expected accounting rows:\n{smaps}"
     );
+    for field in REQUIRED_FIELDS {
+        assert!(seen.contains(field), "smaps omitted {field}:\n{smaps}");
+    }
 
     let cases = [
         ProgramCase {

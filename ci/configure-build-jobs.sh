@@ -632,8 +632,334 @@ fi
 # MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged. Client
 # preparation still rebuilds the on-demand client from the new client.c. This is
 # source-identity carry, not a new timing sample or runtime qualification.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO f4a19322a925268f855b9b5cad1c05fb71817246 (2026-10-02): from
+# b4aa7f80542a5edd8e0dc30aea7f9626c9c8a359, the 10-commit range (vDSO fail-closed
+# patching, LiteInst newborn TIDs, safeptrace docs, and the family 19h model A0h
+# skid margin) changes reverie-dbt only in native/client.c,
+# scripts/test-example-tools.sh and a new tests/fixtures/vdso_fail_closed.c (tree
+# 12c917f3efdfbc31f65bbcdba9b6aae3f5253f04 -> c513f8f99c52e047591e8526da6332a099dde509).
+# None is an input to the DynamoRIO SDK recipe key above. Cargo.toml remains blob
+# 0e24d047d544a3daae2d6350270b26ceb74139d1, build.rs remains blob
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0, native/CMakeLists.txt remains blob
+# bcfb298a4f87ed190d7fdc52393e01d1245a8fe3 and DynamoRIO remains tree
+# 117d54d744df23921c531d0fe08537249f5a510a; third-party remains tree
+# fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a; root Cargo.toml remains blob
+# 4168dea2771f18a00fb1afdfd2218efba415ecbb; rust-toolchain.toml remains blob
+# b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9. CMAKE/CMAKE_GENERATOR selection,
+# MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged. Client
+# preparation still rebuilds the on-demand client from the new client.c. This is
+# source-identity carry, not a new timing sample or runtime qualification.
+# CARRY TO d766df20b7809d707e29bf7ceff24d3f52f0a3dc (2026-10-03): from
+# f4a19322a925268f855b9b5cad1c05fb71817246, the 30-commit range (the shared dispatch-stats record,
+# libc 0.2.190, the gdbstub T packet and breakpoint fixes, KVM descriptor fixes,
+# alias tests, LiteInst fallback switches, and the reverie-sabre-stats Buck target)
+# changes reverie-dbt only in native/client.c, a new native/reverie_vdso_symbols.h,
+# src/backend_stats.rs and a new tests/vdso_symbol_header.rs (tree
+# c513f8f99c52e047591e8526da6332a099dde509 -> ee627a7227998bdd91018dab1efbe6ab7964ec6b).
+# None is an input to the DynamoRIO SDK recipe key above. Cargo.toml remains blob
+# 0e24d047d544a3daae2d6350270b26ceb74139d1, build.rs remains blob
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0, native/CMakeLists.txt remains blob
+# bcfb298a4f87ed190d7fdc52393e01d1245a8fe3 and DynamoRIO remains tree
+# 117d54d744df23921c531d0fe08537249f5a510a; third-party remains tree
+# fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a; root Cargo.toml remains blob
+# 4168dea2771f18a00fb1afdfd2218efba415ecbb; rust-toolchain.toml remains blob
+# b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9. CMAKE/CMAKE_GENERATOR selection,
+# MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged. Client
+# preparation still rebuilds the on-demand client from the new client.c. This is
+# source-identity carry, not a new timing sample or runtime qualification.
+# CARRY TO 9976e29c1151acf258609d9d32eba86f112054ac (2026-10-03): from
+# d766df20b7809d707e29bf7ceff24d3f52f0a3dc, the DynamoRIO SDK inputs listed below
+# are byte-identical. This is source-identity carry, not a new timing sample.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO 3a196cfb9dbb775900a1acb02890b8ca10aedd0c (2026-10-03): from
+# 9976e29c1151acf258609d9d32eba86f112054ac, the DynamoRIO SDK inputs listed below
+# are byte-identical. The 2-commit range (the held-signal fix-forwards of
+# https://github.com/rrnewton/reverie/pull/831) changes only reverie-ptrace and a
+# reverie-liteinst test. This is source-identity carry, not a new timing sample.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO d4971bca43fd65749b9d2a9c4fd5c7dee00ad505 (2026-10-03): diagnostic consumer of
+# https://github.com/rrnewton/reverie/pull/903, from 3a196cfb9dbb775900a1acb02890b8ca10aedd0c.
+# The KVM candidate and intervening ptrace changes leave all seven SDK
+# recipe/provenance inputs below byte-identical. This is source-identity carry,
+# not a new timing sample, canonical validation, or a manifest activation.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO c3fe1dc3493f32b5d81a0a9babbae8ba758bf02d (2026-10-03): landed producer for
+# https://github.com/rrnewton/reverie/pull/903. Relative to the diagnostic
+# candidate d4971bca43fd65749b9d2a9c4fd5c7dee00ad505, all seven DBT recipe/provenance
+# inputs below are byte-identical; the additional main commit changes only
+# ptrace code and tests. This is source-identity carry, not a timing sample.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO 5914bcb59a45038a12400ae30d03ebc0c1382b79 (2026-10-03): source-only candidate
+# for https://github.com/rrnewton/reverie/issues/905. All seven DBT
+# recipe/provenance objects are identical to c3fe1dc3493f32b5d81a0a9babbae8ba758bf02d.
+# This carries the existing budget by source identity, not a new timing sample.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget remain unchanged.
+# CARRY TO 107734a16487797251d40b5efa7013d3436797bf: landed epoll_pwait2 producer for
+# https://github.com/rrnewton/reverie/pull/907 . Seven DBT recipe/provenance
+# inputs below equal the landing-base producer c3fe1dc3493f32b5d81a0a9babbae8ba758bf02d.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# Source identity carries the existing CMAKE/CMAKE_GENERATOR policy,
+# MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds; no new timing claim.
+# CARRY TO f49afefd16b72af4452475aa383a372d57a5d9de (2026-10-03): from
+# 107734a16487797251d40b5efa7013d3436797bf, the DynamoRIO SDK inputs listed below
+# are byte-identical. The 4-commit range (the held-signal seccomp
+# fix-forwards of https://github.com/rrnewton/reverie/pull/831) changes only
+# reverie-ptrace and touches no reverie-dbt input. This is source-identity
+# carry, not a new timing sample.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO b4ffc27d4376d5a0ee9d42170652e89c8501d2a6 (2026-10-03): from
+# f49afefd16b72af4452475aa383a372d57a5d9de, the DynamoRIO SDK inputs listed below
+# are byte-identical. The 3-commit range (fix-forward 13 of
+# https://github.com/rrnewton/reverie/pull/831 in reverie-ptrace, and two
+# reverie-kvm syncfs commits) touches no reverie-dbt input. This is
+# source-identity carry, not a new timing sample.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO 41550078fb631c9d07ea71a3c5a44126e5cb87ef (2026-10-03): from
+# b4ffc27d4376d5a0ee9d42170652e89c8501d2a6, the DynamoRIO SDK inputs listed below
+# are byte-identical. The 11-commit range (fix-forward 14 of
+# https://github.com/rrnewton/reverie/pull/831 in reverie-ptrace, and ten
+# reverie-kvm pipe-owner and shared-mapping commits) touches no reverie-dbt
+# input. This is source-identity carry, not a new timing sample.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO 6c79fbafa8e49e60ccc79de984b7cdca3c9b0c5c (2026-10-03): from
+# 41550078fb631c9d07ea71a3c5a44126e5cb87ef; all seven recorded DynamoRIO build inputs
+# below are byte-identical. This adopts the ordinary-file fork repair in
+# https://github.com/rrnewton/reverie/pull/919 and preserves intervening main.
+# Source identity carries the calibration; no new timing sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO dbb8e5b6962312f4ee0e6046098ddae18574f818 (2026-10-04): from
+# 6c79fbafa8e49e60ccc79de984b7cdca3c9b0c5c; all seven recorded DynamoRIO build inputs
+# below are byte-identical. This adopts the launch lock of
+# https://github.com/rrnewton/reverie/issues/912 (reverie-process and
+# reverie-ptrace) and three reverie-ptrace test commits; none touches a
+# reverie-dbt input. Source identity carries the calibration; no new timing
+# sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO 51186070ef15bb4471b4d8801ff77ee385c793f2 (2026-10-04): from
+# dbb8e5b6962312f4ee0e6046098ddae18574f818; all seven recorded DynamoRIO build inputs
+# below are byte-identical. The 1-commit range (the reverie-kvm host metadata
+# timestamp commit of https://github.com/rrnewton/hermit/issues/3695) touches
+# no reverie-dbt input.
+# Source identity carries the calibration; no new timing sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO d646498e4c5ec2fbdd48d9eb0cfc26dfb4468918 (2026-10-04): from
+# 51186070ef15bb4471b4d8801ff77ee385c793f2; all seven recorded DynamoRIO build inputs
+# below are byte-identical. The 1-commit range (the reverie-kvm synthetic carrier
+# provenance commit of https://github.com/rrnewton/reverie/issues/933) touches
+# no reverie-dbt input.
+# Source identity carries the calibration; no new timing sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO 6b037bcad73db1ad6f23597e4a3ee624994c37da (2026-10-04): from
+# d646498e4c5ec2fbdd48d9eb0cfc26dfb4468918; all seven recorded DynamoRIO build inputs
+# below are byte-identical. The 1-commit range (the reverie-kvm carrier
+# timestamp-class fix-forward for https://github.com/rrnewton/reverie/issues/933) touches
+# no reverie-dbt input.
+# Source identity carries the calibration; no new timing sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO 2b7ad37be26698367fc6a3990760f972e9816dcb (2026-10-04): from
+# 6b037bcad73db1ad6f23597e4a3ee624994c37da; all seven recorded DynamoRIO build inputs
+# below are byte-identical. The 1-commit range (the launch lock's descriptor
+# allocation retry of https://github.com/rrnewton/reverie/issues/930) changes
+# reverie-process and reverie-ptrace and touches no reverie-dbt input.
+# Source identity carries the calibration; no new timing sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO 034ebf294e3e863805d2971d85499a0041f67e8b (2026-10-04): from
+# 2b7ad37be26698367fc6a3990760f972e9816dcb; all seven recorded DynamoRIO build inputs
+# below are byte-identical. The 1-commit range (the reverie-kvm carrier
+# timestamp-class fix-forward for https://github.com/rrnewton/reverie/issues/933) touches
+# no reverie-dbt input.
+# Source identity carries the calibration; no new timing sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO b8ef6a829634d51e79ebc4c24e11c5dd5fac205c (2026-10-04): from 034ebf294e3e863805d2971d85499a0041f67e8b; all seven
+# recorded DynamoRIO build inputs are byte-identical. The 0.4.1 stable-build,
+# package-metadata and pidfd compatibility work touches no DBT build input.
+# Source identity carries the existing calibration; no new timing sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO a11a42836893fb7aa7ade69e6b9c723777e70c95 (2026-10-04): from b8ef6a829634d51e79ebc4c24e11c5dd5fac205c; all seven
+# recorded DynamoRIO build inputs are byte-identical. The 0.4.1 stable-build,
+# package-metadata and pidfd compatibility work touches no DBT build input.
+# Source identity carries the existing calibration; no new timing sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO 7b3168b7af405ca0f4af25fba73afa913e47d90c (2026-10-04): from a11a42836893fb7aa7ade69e6b9c723777e70c95; all seven
+# recorded DynamoRIO build inputs are byte-identical. The SDK stack and
+# post-exec owner fixes touch no DBT build input; no new timing sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# PRIVATE SDK MAIN CARRY TO 2eee28d3f2a32d3cdc6052cb2de60588026df5d4 (2026-10-05).
+# The main recipe is f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21.
+# From the prior 7b3168b7af405ca0f4af25fba73afa913e47d90c, build.rs changes
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 -> e05db6238bf07c96d8a850c5635a8c48590f20b7:
+# native jobs are additionally capped at available CPUs. The other six recorded
+# inputs are unchanged; this carries the reviewed main source without a new timing sample.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: e05db6238bf07c96d8a850c5635a8c48590f20b7
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR, MAX_PARALLEL_JOBS=16 and the 1050 effective-job-seconds limit stay unchanged.
+# Public SDK archives use release facf55df5c77b517eaef4650dfa23e28b74c5438 separately;
+# its build.rs retains the b024 recipe and its DBT manifest adds only publish=false.
+# PRIVATE SDK MAIN CARRY TO c7a1ed25bca339daa0e69241353fc9882da63d7a (2026-10-05).
+# From 2eee28d3f2a32d3cdc6052cb2de60588026df5d4; all seven recorded DynamoRIO build inputs
+# remain byte-identical. The F85 recipe, available-CPU cap, 16-job clamp
+# and 1050 effective-job-seconds budget retain their existing behavior.
+# Adaptive controller/wait changes introduce no new DBT timing sample.
+# Public SDK package source is separately release fdd3a2d94fa978c3c7025be211b87526a67400c8;
+# its seven recipe inputs match the prior facf release, retaining the
+# existing B024 recipe. This is source provenance, not new calibration.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c7a1ed25bca339daa0e69241353fc9882da63d7a ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c7a1ed25bca339daa0e69241353fc9882da63d7a (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

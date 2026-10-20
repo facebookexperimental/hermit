@@ -367,6 +367,18 @@ pub struct Resources {
     /// for the scheduler's cross-task signal wakeup.
     #[serde(default)]
     pub(crate) signal_interrupt_errno: Option<i32>,
+    /// Set by `tool_global::resource_request` when this request is made while
+    /// the thread is handling a syscall whose cost is withheld because it
+    /// belongs to a backend-runtime bootstrap window (see
+    /// `ThreadState::charge_syscall_time`). The scheduler withholds the
+    /// per-turn scheduler time of such a turn, unless it is an IO-polling
+    /// retry, for the same reason the syscall cost is withheld: the turn
+    /// exists only because the backend's runtime made the syscall, so charging
+    /// it would make guest-visible virtual time depend on the backend. `false`
+    /// for every request from a backend without such a runtime, and for
+    /// requests that do not go through `resource_request`.
+    #[serde(default)]
+    pub(crate) backend_runtime_bootstrap: bool,
 }
 
 impl fmt::Debug for Resources {
@@ -379,6 +391,9 @@ impl fmt::Debug for Resources {
             .field("fyi", &self.fyi);
         if let Some(errno) = self.signal_interrupt_errno {
             debug.field("signal_interrupt_errno", &errno);
+        }
+        if self.backend_runtime_bootstrap {
+            debug.field("backend_runtime_bootstrap", &true);
         }
         debug.finish()
     }
@@ -393,6 +408,7 @@ impl Resources {
             poll_attempt: 0,
             fyi: String::new(),
             signal_interrupt_errno: None,
+            backend_runtime_bootstrap: false,
         }
     }
 
@@ -417,6 +433,7 @@ impl Resources {
             (Some(left), Some(right)) => assert_eq!(left, right),
             (Some(_), None) => {}
         }
+        self.backend_runtime_bootstrap |= other.backend_runtime_bootstrap;
     }
 
     pub fn set_signal_interrupt_errno(&mut self, errno: Errno) {

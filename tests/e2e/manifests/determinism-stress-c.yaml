@@ -399,13 +399,14 @@ test:
       verify:
         ci:
           ptrace: true
+          sabre: true
           kvm: true
         backends_enabled:
           - ptrace
+          - sabre
           - kvm
         backends_disabled:
           dbt: This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately
-          sabre: Forwarded-DETLOG SaBRe verification exits during the first run before producing guest output; the historical stdout-only qualification is insufficient
           liteinst: This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
       naked:
         ci: false

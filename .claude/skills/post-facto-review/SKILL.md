@@ -73,8 +73,8 @@ should be UPDATED, not replaced. Three predicates gate a close:
    deficient", "not closure-grade", and "does not meet the bar" are verdicts,
    not reviews. A reviewer who cannot name what to change has not finished the
    review, and the PR is not ready to be rejected.
-3. **"A task exists in the TaskGraph" is NOT a valid reason to close.**
-   Deferring the work to a task does not satisfy rule 1 and never substitutes
+3. **"A task exists in the TaskGraph" (or any to-do list) is NOT a valid reason
+   to close.** Deferring the work to a task does not satisfy rule 1 and never substitutes
    for a successor PR. A task is neither a guarantee the work happens nor an
    artifact on `main`. Owner-cited fleet measurement, 2026-08-07: 106 tasks
    tagged `implemented` → 38 landed → 4 met their stated goal. Closing a PR

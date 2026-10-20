@@ -11,6 +11,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::fs::File;
+#[cfg(feature = "sabre")]
 use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -37,6 +38,8 @@ use hermit::Backend;
 use hermit::Context;
 use hermit::DetConfig;
 use hermit::Error;
+use hermit::LITEINST_IN_GUEST_ENV;
+use hermit::LiteinstRuntime;
 use hermit::Shebang;
 use hermit::SkidOvershootError;
 use hermit::happens_before::DebugInfoResolver;
@@ -71,12 +74,14 @@ use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
 use super::verify::NoResultReason;
+use super::verify::SecondRun;
 use super::verify::VerificationReport;
 use super::verify::VerificationRun;
 use super::verify::VerificationRuntime;
 use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
 use super::verify::default_failed_verify_log_retention;
+use super::verify::emit_compared_guest_output;
 use super::verify::retain_logs_after_verification_error;
 use super::verify::retain_verification_error;
 use super::verify::retain_verification_logs;
@@ -93,8 +98,10 @@ use super::verify::write_verification_json;
 
 const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
+#[cfg(feature = "sabre")]
 const NORMALIZED_SABRE_DETLOG_TIMESTAMP: &str = "1970-01-01T00:00:00.000000Z";
 
+#[cfg(feature = "sabre")]
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
@@ -318,6 +325,7 @@ fn take_verify_summary_before_next_run(path: &Path) -> Result<Option<RunSummary>
     Ok(summary)
 }
 
+#[cfg(feature = "sabre")]
 fn extract_sabre_detlogs(path: &Path, stderr: &mut Vec<u8>) -> Result<usize, Error> {
     let mut log = OpenOptions::new().append(true).open(path)?;
     let mut guest_stderr = Vec::with_capacity(stderr.len());
@@ -636,9 +644,14 @@ pub struct RunOpts {
     #[clap(long = "print-verify-logs", alias = "verify-logs", requires = "verify")]
     print_verify_logs: bool,
 
-    /// Retain both captured verification logs after either a match or a
-    /// divergence. Logs are written under --verify-log-dir when provided;
-    /// otherwise under $XDG_STATE_HOME/hermit/verify-logs (normally
+    /// Retain the captured verification logs after the comparison. After a
+    /// match, only the first run's log is kept, as the golden log; the second
+    /// run's log, which compared equal to it under the selected comparison
+    /// policy, is deleted. After a divergence, a no-result, or an error, both
+    /// logs are kept, or only the first run's when verification stopped before
+    /// a second run.
+    /// Logs are written under --verify-log-dir when provided; otherwise under
+    /// $XDG_STATE_HOME/hermit/verify-logs (normally
     /// ~/.local/state/hermit/verify-logs). The final paths are printed.
     #[clap(long, requires = "verify")]
     keep_logs: bool,
@@ -803,6 +816,11 @@ pub struct RunOpts {
     /// not have to recover any count from the presentation banner.
     #[clap(skip)]
     e9patch_engagement: Option<BackendEngagement>,
+
+    /// The root-image rewrite's sites in the dispatch record's terms; every
+    /// count is unmeasured when the root executable was not an ELF image.
+    #[clap(skip)]
+    e9patch_sites: Option<reverie::SiteCounters>,
 }
 
 pub(super) fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
@@ -888,6 +906,24 @@ pub enum NetworkingMode {
     Host,
     // None, // TODO: no network interface at all
     // Record, // TODO: record network traffic only, not other syscalls.
+}
+
+impl NetworkingMode {
+    /// Apply this networking mode to a container. `run` and `record start`
+    /// both build their containers through this one function, so a recording
+    /// sees the same network as the run it records. `analyze_networking`
+    /// forces an isolated namespace even under `host`.
+    pub(crate) fn configure(self, container: &mut Container, analyze_networking: bool) {
+        match self {
+            NetworkingMode::Local => {
+                container.local_networking_only();
+            }
+            NetworkingMode::Host if analyze_networking => {
+                container.local_networking_only();
+            }
+            NetworkingMode::Host => {}
+        }
+    }
 }
 
 // Upper case will work, but prefer lower case.
@@ -2174,6 +2210,65 @@ fn skid_margin_override_is_available_to_liteinst_host_hybrid() {
     );
 }
 
+#[cfg(test)]
+fn liteinst_in_guest_refusal(
+    runtime: LiteinstRuntime,
+    options: &[&str],
+) -> Result<(), anyhow::Error> {
+    let mut argv = vec!["hermit", "--backend=liteinst", "run"];
+    argv.extend_from_slice(options);
+    argv.push("fakeprog");
+    run_opts_for(&argv).refuse_unqualified_liteinst_in_guest_options(runtime)
+}
+
+#[test]
+fn liteinst_in_guest_refuses_options_it_cannot_honour() {
+    // The default maximum timeslice is on, and the in-guest Tool host cannot
+    // deliver its timer.
+    let error = liteinst_in_guest_refusal(LiteinstRuntime::InGuest, &[]).unwrap_err();
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    assert!(
+        error.to_string().contains("pass --max-timeslice=disabled"),
+        "{error:#}"
+    );
+    for (option, reason) in [
+        ("--verify", "--verify compares Detcore's internal logs"),
+        (
+            "--run-evidence-dir=/unused/new-path",
+            "--run-evidence-dir has not been qualified",
+        ),
+        ("--timeout=3", "--timeout has not been qualified"),
+        ("--skid-margin=500", "--skid-margin configures"),
+        ("--gdbserver", "--gdbserver needs the ptrace tracer"),
+    ] {
+        let error = liteinst_in_guest_refusal(
+            LiteinstRuntime::InGuest,
+            &["--max-timeslice=disabled", option],
+        )
+        .unwrap_err();
+        assert!(
+            error.downcast_ref::<PolicyRefusal>().is_some(),
+            "{option}: {error:#}"
+        );
+        assert!(error.to_string().contains(reason), "{option}: {error:#}");
+    }
+    liteinst_in_guest_refusal(LiteinstRuntime::InGuest, &["--max-timeslice=disabled"]).unwrap();
+}
+
+#[test]
+fn liteinst_host_hybrid_is_not_subject_to_the_in_guest_refusals() {
+    liteinst_in_guest_refusal(
+        LiteinstRuntime::HostHybrid,
+        &[
+            "--verify",
+            "--timeout=3",
+            "--skid-margin=500",
+            "--gdbserver",
+        ],
+    )
+    .unwrap();
+}
+
 #[test]
 fn deprecated_preemption_timeout_alias_round_trips_canonically() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--preemption-timeout=100000", "fakeprog"]);
@@ -3168,6 +3263,53 @@ impl RunOpts {
         }
     }
 
+    /// Where this run hosts Detcore when it uses LiteInst. Every other backend,
+    /// and `--namespace-only` (which runs no backend), reports the hybrid so the
+    /// selector variable is read only when it can matter.
+    fn liteinst_runtime(&self) -> Result<LiteinstRuntime, Error> {
+        if self.namespace_only || self.selected_backend() != Backend::Liteinst {
+            return Ok(LiteinstRuntime::HostHybrid);
+        }
+        LiteinstRuntime::from_env()
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3635): Review the in-guest LiteInst option refusals.
+    /// Refuses options that in-guest LiteInst cannot honour yet, so a run never
+    /// silently drops one of them.
+    fn refuse_unqualified_liteinst_in_guest_options(
+        &self,
+        runtime: LiteinstRuntime,
+    ) -> Result<(), Error> {
+        if runtime != LiteinstRuntime::InGuest {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        let reason = if config.max_timeslice.is_some() {
+            "it cannot deliver Detcore's preemption timer yet (the in-guest Tool host refuses \
+             set_timer with ENOSYS), so the run would fail at its first timeslice; pass \
+             --max-timeslice=disabled"
+        } else if self.verify {
+            "--verify compares Detcore's internal logs, and the in-guest Tool does not forward \
+             its records to Hermit yet"
+        } else if self.run_evidence_dir.is_some() {
+            "--run-evidence-dir has not been qualified for the in-guest runtime"
+        } else if self.timeout.is_some() {
+            "--timeout has not been qualified for the in-guest runtime, whose run future does \
+             not kill the guest when it is dropped"
+        } else if self.skid_margin.is_some() {
+            "--skid-margin configures the Reverie ptrace PMU timer, which the in-guest runtime \
+             does not arm"
+        } else if config.gdbserver {
+            "--gdbserver needs the ptrace tracer, which the in-guest runtime does not attach"
+        } else {
+            return Ok(());
+        };
+        Err(Error::new(PolicyRefusal).context(format!(
+            "{LITEINST_IN_GUEST_ENV}=1 (in-guest LiteInst) refuses this run: {reason}"
+        )))
+    }
+
     /// Which comparator a `--verify` run uses, as a function of the request
     /// ALONE.
     ///
@@ -3176,8 +3318,8 @@ impl RunOpts {
     /// Backend::Kvm`, so plain KVM verification bypassed internal-log comparison
     /// entirely and `--verify-strict` could not reach the canonical comparator on
     /// that backend at all. The special case was not narrowed, it was removed:
-    /// every backend now retains both logs and picks its comparator here from
-    /// `verify_verbose`/`verify_strict` only.
+    /// every backend now compares both captured logs and picks its comparator
+    /// here from `verify_verbose`/`verify_strict` only.
     ///
     /// Removing a branch leaves nothing behind to notice its return, so
     /// `comparator_choice_does_not_depend_on_the_backend` pins the absence
@@ -3214,6 +3356,8 @@ impl RunOpts {
             diagnostic_full_trace: self.verify_verbose,
             compare_io_buffers: config.detlog_io_buffers,
             keep_logs: self.keep_logs,
+            // `verify` sets this when a skid overshoot overrides the match.
+            match_overridden: false,
             failed_log_retention: (!self.keep_logs).then(default_failed_verify_log_retention),
             record_envelope: RecordEnvelope::all_records_v1(),
             // Read from the LIVE config, not a constant: `--no-virtualize-time`
@@ -3304,6 +3448,10 @@ impl RunOpts {
         if let Some(path) = &self.backend_engagement_json {
             clear_machine_record(path, "backend engagement")?;
         }
+        // Before `--verify` reads stdin to its end below: a run that in-guest
+        // LiteInst refuses must not wait for its input. `validate_args` repeats
+        // the check for its other callers.
+        self.refuse_unqualified_liteinst_in_guest_options(self.liteinst_runtime()?)?;
         if self.verify {
             validate_log_level(global)?;
         }
@@ -3476,10 +3624,20 @@ impl RunOpts {
         }
 
         if backend == Backend::Liteinst {
-            self.verify_liteinst_activation()?;
-            eprintln!(
-                "hermit: [liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
-            );
+            match self.liteinst_runtime()? {
+                LiteinstRuntime::HostHybrid => {
+                    self.verify_liteinst_activation()?;
+                    eprintln!(
+                        "hermit: [liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+                    );
+                }
+                // The probe above asserts the hybrid's trap/hook split, which
+                // does not describe an in-guest Tool. Nothing has started the
+                // guest yet, so this names the configuration, not an outcome.
+                LiteinstRuntime::InGuest => eprintln!(
+                    "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool; the host-hybrid activation probe does not apply"
+                ),
+            }
         }
 
         if self.no_namespace {
@@ -3520,9 +3678,15 @@ impl RunOpts {
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
-        let perf_supported =
-            !self.arms_reverie_ptrace_pmu_timer() || reverie_ptrace::is_perf_supported();
-        self.validate_args_with_perf_support(perf_supported)
+        let liteinst_runtime = self.liteinst_runtime()?;
+        // In-guest LiteInst arms no ptrace PMU timer. Reporting perf as present
+        // keeps `--max-timeslice` from being downgraded with a warning, so the
+        // refusal below sees it and stops the run instead.
+        let perf_supported = !self.arms_reverie_ptrace_pmu_timer()
+            || liteinst_runtime == LiteinstRuntime::InGuest
+            || reverie_ptrace::is_perf_supported();
+        self.validate_args_with_perf_support(perf_supported)?;
+        self.refuse_unqualified_liteinst_in_guest_options(liteinst_runtime)
     }
 
     /// Whether this run would arm Reverie ptrace's PMU timer for
@@ -3759,8 +3923,8 @@ impl RunOpts {
         // gdb client, so `hermit run --gdbserver` silently hangs waiting for a
         // connection that can never arrive. Fall back to host networking so the
         // debugger can attach. This mirrors how replay-mode gdbserver already
-        // works: replay never unshares the network namespace, which is exactly why
-        // its gdbserver is reachable from the host.
+        // works: a gdb-served replay never unshares the network namespace, which
+        // is exactly why its gdbserver is reachable from the host.
         if self.det_opts.det_config.gdbserver && self.network == NetworkingMode::Local {
             if self.analyze_networking {
                 anyhow::bail!(
@@ -4355,6 +4519,7 @@ impl RunOpts {
                 mapped_sites: 0,
                 b0_sites: 0,
             });
+            self.e9patch_sites = Some(reverie::SiteCounters::default());
             eprintln!(
                 ":: Backend: e9patch preprocessing + ptrace runtime; mapped_sites=0; \
                  main_executable=non-ELF; preprocessing=not-applicable"
@@ -4373,6 +4538,10 @@ impl RunOpts {
             b0_sites: u64::try_from(prepared.b0_sites)
                 .map_err(|_| Error::msg("e9patch B0-site count does not fit u64"))?,
         });
+        self.e9patch_sites = Some(reverie::SiteCounters::from_rewrite(
+            prepared.candidate_sites as u64,
+            prepared.patched_sites as u64,
+        ));
         if prepared.patched_sites != 0 {
             self.validate_e9patch_mount_targets()?;
             self.validate_e9patch_source_visibility(&prepared.binary)?;
@@ -4666,7 +4835,7 @@ impl RunOpts {
 
         eprintln!(":: {}", "Run1...".yellow().bold());
 
-        let (mut out1, skid_overshoots_run1) = match run_verification_execution(
+        let (out1, skid_overshoots_run1) = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run1,
             || run1_options.run_verify(log1_file, global),
@@ -4698,6 +4867,9 @@ impl RunOpts {
                 return Err(error);
             }
         };
+        #[cfg(feature = "sabre")]
+        let mut out1 = out1;
+        #[cfg(feature = "sabre")]
         let sabre_syscalls1 = match (self.selected_backend() == Backend::Sabre)
             .then(|| extract_sabre_detlogs(&log1_path, &mut out1.stderr))
             .transpose()
@@ -4827,7 +4999,7 @@ impl RunOpts {
         restore_standard_fd_status_flags(fd_flags_before_run1);
 
         eprintln!(":: {}", "Run2...".yellow().bold());
-        let (mut out2, skid_overshoots_run2) = match run_verification_execution(
+        let (out2, skid_overshoots_run2) = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run2,
             || run2_options.run_verify(log2_file, global),
@@ -4861,6 +5033,9 @@ impl RunOpts {
                 return Err(error);
             }
         };
+        #[cfg(feature = "sabre")]
+        let mut out2 = out2;
+        #[cfg(feature = "sabre")]
         if let Some(sabre_syscalls1) = sabre_syscalls1 {
             let sabre_syscalls2 = match extract_sabre_detlogs(&log2_path, &mut out2.stderr) {
                 Ok(count) => count,
@@ -4896,13 +5071,12 @@ impl RunOpts {
         // verified" on a run that the same command with hashing enabled
         // reports as diverged. Claiming
         // determinism there was the defect, so the sentence now names its limit.
-        let comparison_options = self.verification_comparison_options();
+        let mut comparison_options = self.verification_comparison_options();
         let success_message = if !comparison_options.compare_io_buffers {
             // The "Determinism verified" marker is RETAINED verbatim and the
-            // qualification appended after it. That is not politeness: ~110
-            // files in this repository assert on that exact substring -- Rust
-            // integration tests, tests/e2e/lib/**/*.sh, and the backend-parity
-            // Python harnesses -- so replacing the sentence would be a
+            // qualification appended after it. That is not politeness: ~95
+            // Rust integration-test files under hermit-cli/tests assert on
+            // that exact substring, so replacing the sentence would be a
             // project-wide contract change rather than a wording fix. Appending
             // keeps every consumer working while the reader still learns the
             // limit.
@@ -4927,6 +5101,11 @@ impl RunOpts {
                 Some(out1.status),
             )?;
         }
+        // A skid overshoot makes this verification an infrastructure error
+        // below, whatever the comparison finds, so a log match is not the
+        // verdict. `--keep-logs` then retains both logs, as every other error
+        // path does, instead of the single golden log kept after a match.
+        comparison_options.match_overridden = skid_overshoots > 0;
         let mut outcome = compare_two_runs(
             ComparedRun {
                 output: &out1,
@@ -4960,7 +5139,7 @@ impl RunOpts {
         if skid_overshoots > 0 {
             return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
         }
-        announce_verification_outcome(&outcome, success_message, failure_message);
+        announce_verification_outcome(&outcome, SecondRun::Rerun, success_message, failure_message);
 
         // On divergence, still return the nonzero status and skip
         // the backend banner — but EMIT THE GUEST'S OUTPUT FIRST when both runs
@@ -4988,10 +5167,7 @@ impl RunOpts {
         // result is unaffected; only the diagnostic gains the bytes it was
         // discarding.
         if !outcome.verified() {
-            if out1.stdout == out2.stdout && out1.stderr == out2.stderr {
-                std::io::stdout().write_all(&out1.stdout)?;
-                std::io::stderr().write_all(&out1.stderr)?;
-            }
+            emit_compared_guest_output(false, &out1, &out2)?;
             return outcome.into_exit_status();
         }
         let status = outcome.guest_status;
@@ -5006,8 +5182,7 @@ impl RunOpts {
         if let Some(backend_banner) = backend_banner {
             eprintln!(":: Backend: {backend_banner}");
         }
-        std::io::stdout().write_all(&out1.stdout)?;
-        std::io::stderr().write_all(&out1.stderr)?;
+        emit_compared_guest_output(true, &out1, &out2)?;
         Ok(status)
     }
 
@@ -5108,31 +5283,14 @@ impl RunOpts {
             let rootfs = crate::image::materialize_rootfs(image)?;
             let (mut container, identity_sources) =
                 image_container(&rootfs, tmpfs, self.pin_threads, self.tmp.is_none())?;
-            match &self.network {
-                NetworkingMode::Local => {
-                    container.local_networking_only();
-                }
-                NetworkingMode::Host if self.analyze_networking => {
-                    container.local_networking_only();
-                }
-                NetworkingMode::Host => {}
-            }
+            self.network
+                .configure(&mut container, self.analyze_networking);
             return Ok((container, identity_sources));
         }
 
         let mut container = default_container(self.pin_threads);
-
-        match &self.network {
-            NetworkingMode::Local => {
-                container.local_networking_only();
-            }
-            NetworkingMode::Host => {
-                // This conflict/invariant should could be resolved upstream:
-                if self.analyze_networking {
-                    container.local_networking_only();
-                }
-            }
-        }
+        self.network
+            .configure(&mut container, self.analyze_networking);
 
         let PreparedMounts {
             mounts,
@@ -5422,34 +5580,59 @@ impl RunOpts {
             self.summary_json.as_deref(),
             guest_capture,
             |summary_json| {
-                if capture_output || (guest_capture.is_some() && backend == Backend::Kvm) {
-                    let out = hermit::run_with_output_backend_timeout(
-                        command,
-                        config,
-                        self.summary,
-                        summary_json,
-                        backend,
-                        timeout,
-                    )?;
-                    if let Some(capture) = guest_capture {
-                        capture.write_kvm_virtual_console(&out.stdout, &out.stderr)?;
-                        Ok((out.status, None))
+                let result =
+                    if capture_output || (guest_capture.is_some() && backend == Backend::Kvm) {
+                        let out = hermit::run_with_output_backend_timeout(
+                            command,
+                            config,
+                            self.summary,
+                            summary_json,
+                            backend,
+                            timeout,
+                        )?;
+                        if let Some(capture) = guest_capture {
+                            capture.write_kvm_virtual_console(&out.stdout, &out.stderr)?;
+                            (out.status, None)
+                        } else {
+                            (out.status, Some(out))
+                        }
                     } else {
-                        Ok((out.status, Some(out)))
-                    }
-                } else {
-                    let status = hermit::run_with_backend_timeout(
-                        command,
-                        config,
-                        self.summary,
-                        summary_json,
-                        backend,
-                        timeout,
-                    )?;
-                    Ok((status, None))
-                }
+                        let status = hermit::run_with_backend_timeout(
+                            command,
+                            config,
+                            self.summary,
+                            summary_json,
+                            backend,
+                            timeout,
+                        )?;
+                        (status, None)
+                    };
+                self.relabel_e9patch_dispatch_stats(summary_json)?;
+                Ok(result)
             },
         )
+    }
+
+    /// The e9patch spelling runs on the ptrace runtime, which records its
+    /// dispatch as ptrace's. Attribute that record to e9patch, with the
+    /// sites the rewrite measured; the tracer's stop counts stand, since a
+    /// patched site still reaches it through a ptrace stop.
+    fn relabel_e9patch_dispatch_stats(&self, summary_json: &Option<PathBuf>) -> Result<(), Error> {
+        let (Some(path), Some(sites)) = (summary_json, self.e9patch_sites) else {
+            return Ok(());
+        };
+        let mut summary: RunSummary = serde_json::from_slice(
+            &fs::read(path)
+                .with_context(|| format!("reading the e9patch run summary {}", path.display()))?,
+        )
+        .with_context(|| format!("parsing the e9patch run summary {}", path.display()))?;
+        let Some(record) = summary.dispatch_stats.as_mut() else {
+            return Ok(());
+        };
+        record.backend = Backend::E9patch.as_str().to_owned();
+        record.sites = sites;
+        fs::write(path, serde_json::to_string_pretty(&summary)? + "\n")
+            .with_context(|| format!("writing the e9patch run summary {}", path.display()))
     }
 
     fn run_verify_in_container(
@@ -5501,14 +5684,16 @@ impl RunOpts {
         config.fdinfo_unlisted_mount_ids.clear();
         self.save_config_to_disk()?;
 
-        hermit::run_with_output_backend_timeout_and_skid_overshoots(
+        let result = hermit::run_with_output_backend_timeout_and_skid_overshoots(
             command,
             config,
             self.summary,
             &self.summary_json,
             self.runtime_backend(),
             None,
-        )
+        )?;
+        self.relabel_e9patch_dispatch_stats(&self.summary_json)?;
+        Ok(result)
     }
 }
 
@@ -5698,9 +5883,15 @@ mod tests {
 
     #[test]
     fn verification_report_is_published_before_success_is_announced() {
-        let source = include_str!("run.rs");
+        // Search only the code before this test module. Searching the whole
+        // file let the literals below match themselves, so the ordering check
+        // passed whatever the code did.
+        let source = include_str!("run.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("test module")
+            .0;
         let verification = source
-            .split_once("let outcome = compare_two_runs(")
+            .split_once("let mut outcome = compare_two_runs(")
             .expect("verification comparison")
             .1;
         let publish = verification
@@ -5710,6 +5901,61 @@ mod tests {
             .find("announce_verification_outcome(&outcome")
             .expect("verification announcement");
         assert!(publish < announce);
+        // Run mode compares two independent runs, never a replay, so its match
+        // line must not use the replay wording for the time note.
+        let call = &verification[announce..];
+        let call = &call[..call.find(");").expect("end of announcement call")];
+        assert!(call.contains("SecondRun::Rerun"), "{call}");
+    }
+
+    /// A skid overshoot turns whatever the comparison finds into an
+    /// infrastructure error (`SkidOvershootError`), so a log match is not the
+    /// verdict, and `--keep-logs` must keep both logs, as every other error
+    /// path does, instead of the golden log alone
+    /// (https://github.com/rrnewton/hermit/issues/3301). `verify` says so by
+    /// setting `match_overridden` on the options it compares with; verify.rs's
+    /// `an_overridden_match_keeps_both_logs_in_the_failure_directory` and the
+    /// overridden rows of `verification_log_retention_matches_the_cli_contract`
+    /// pin what an overridden match retains. A skid overshoot cannot be
+    /// provoked on demand, so the statement is pinned in the source.
+    #[test]
+    fn skid_overshoot_overrides_a_log_match_for_retention() {
+        let source = include_str!("run.rs");
+        // Search only the production code: this test names the statements it
+        // looks for, so the whole file always contains them.
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("run.rs has a test module")
+            .0;
+        let total =
+            "let skid_overshoots = skid_overshoots_run1.saturating_add(skid_overshoots_run2);";
+        let overridden = "comparison_options.match_overridden = skid_overshoots > 0;";
+        let compared = "let mut outcome = compare_two_runs(";
+        for statement in [total, overridden, compared] {
+            assert_eq!(
+                production.matches(statement).count(),
+                1,
+                "run.rs must contain `{statement}` exactly once"
+            );
+        }
+        let total_at = production.find(total).unwrap();
+        let overridden_at = production.find(overridden).unwrap();
+        let compared_at = production.find(compared).unwrap();
+        assert!(
+            total_at < overridden_at && overridden_at < compared_at,
+            "the skid total must mark the match overridden before the runs are compared"
+        );
+        assert!(
+            !production[overridden_at + overridden.len()..compared_at]
+                .contains("comparison_options"),
+            "nothing may replace the options between the override and the comparison"
+        );
+        let call = &production[compared_at..];
+        let call = &call[..call.find(")?;").expect("the comparison call ends")];
+        assert!(
+            call.trim_end().ends_with("comparison_options,"),
+            "the runs must be compared with the options that carry the override:\n{call}"
+        );
     }
 
     #[test]
@@ -6020,6 +6266,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn extracts_sabre_detlogs_and_preserves_guest_stderr() {
         let log = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(

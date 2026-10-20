@@ -29,9 +29,13 @@ explicit policy:
 - Normal ptrace/DBT runs forward `MADV_NORMAL`, `MADV_RANDOM`,
   `MADV_SEQUENTIAL`, `MADV_WILLNEED`, `MADV_DONTNEED`, and supported advice
   with guest-visible fork, dump, or guard semantics. Record/replay treats pure
-  hints as fixed-success no-ops and returns fixed `ENOSYS` for every guest-semantic
-  advice because replay replaces file mappings with anonymous mappings and cannot
-  reproduce their mapping-dependent effects.
+  hints as fixed-success no-ops and runs guest-semantic advice live in both
+  recording and replay. Because replay replaces file mappings with anonymous
+  mappings, the recording also stores the file-backed contents left after
+  `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED` and `MADV_GUARD_REMOVE`, which replay
+  writes over its zero pages, and the prefix of the range that
+  `MADV_WIPEONFORK` covered before Linux refused a private file mapping, which
+  is the only part replay advises.
 - Host-pressure-dependent reclaim, KSM, and THP controls (`MADV_FREE`, `MADV_COLD`,
   `MADV_PAGEOUT`, and related advice) return fixed success after alignment and
   overflow validation without consulting backend-specific mapping state.

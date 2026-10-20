@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::canonical_verdict::LogCompareStrictness;
 use crate::canonical_verdict::Verdict;
 pub use crate::host_capability::CapabilityVerdict as HostCapabilityVerdict;
 pub use crate::host_capability::HostCapabilities;
@@ -236,6 +237,22 @@ pub struct SeriesNoVerdictEvidence {
 pub struct SeriesPressureEvidence {
     pub evidence_sha256: String,
     pub attempts: Vec<SeriesPressureAttempt>,
+}
+
+/// The comparison a non-canonical verify verdict was reached under.
+///
+/// The series writer records it only on a `verify` row whose cell declares
+/// the manifest's stripped comparator and whose passed, diverged or errored
+/// outcome came from a stripped comparison attempt. Such a match is a real
+/// determinism result, but it is below canonical bitwise parity, so the row
+/// says so instead of reading like a canonical one. Canonical rows, and rows
+/// whose verdict no comparison supports, omit the object, so the only value
+/// a reader accepts is `{"strictness": "stripped", "bitwise_parity": false}`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesComparison {
+    pub strictness: LogCompareStrictness,
+    pub bitwise_parity: bool,
 }
 
 /// The manifest declaration under which a verify cell may pass although its
@@ -473,6 +490,11 @@ pub struct SeriesPayload {
     /// expected nonzero guest exit. Rows without a declaration omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_guest_exit: Option<SeriesDeclaredGuestExit>,
+    /// Present only on a verify row whose verdict came from the declared
+    /// stripped comparator (see [`SeriesComparison`]). Canonical rows and
+    /// every row written before the field existed omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<SeriesComparison>,
     pub run_index: u64,
     #[serde(default)]
     pub attempt: Option<u64>,
@@ -714,6 +736,43 @@ impl SeriesRow {
         }
         if let Some(declared) = &self.series.declared_guest_exit {
             self.validate_declared_guest_exit(declared)?;
+        }
+        if let Some(comparison) = &self.series.comparison {
+            self.validate_comparison(comparison)?;
+        }
+        Ok(())
+    }
+
+    /// Refuse a comparison object the series writer cannot produce. The
+    /// writer records only the stripped, non-bitwise comparison, only for a
+    /// verify cell, and only when a comparison decided a passed, diverged or
+    /// errored outcome. A canonical comparison carries no object, so a row
+    /// claiming one, or claiming bitwise parity here, is refused rather than
+    /// read as a stronger result.
+    fn validate_comparison(&self, comparison: &SeriesComparison) -> Result<(), String> {
+        if self.schema != SeriesSchema::V3 {
+            return Err("comparison is supported only by stress-series/v3".into());
+        }
+        if comparison.strictness != LogCompareStrictness::Stripped || comparison.bitwise_parity {
+            return Err(format!(
+                "comparison must be strictness stripped with bitwise_parity false, got strictness {} with bitwise_parity {}; canonical rows carry no comparison",
+                comparison.strictness, comparison.bitwise_parity
+            ));
+        }
+        let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
+        if mode != "verify" {
+            return Err(format!(
+                "comparison is recorded only for verify cells, got mode {mode:?}"
+            ));
+        }
+        if !matches!(
+            self.series.outcome,
+            SeriesOutcome::Passed | SeriesOutcome::Diverged | SeriesOutcome::Errored
+        ) {
+            return Err(format!(
+                "outcome {:?} reached no comparison and must not carry one",
+                self.series.outcome.as_str()
+            ));
         }
         Ok(())
     }
@@ -1423,6 +1482,7 @@ mod tests {
                 no_verdict_evidence: None,
                 pressure_evidence: None,
                 declared_guest_exit: None,
+                comparison: None,
                 run_index: 1,
                 attempt: None,
                 num_runs: 1,

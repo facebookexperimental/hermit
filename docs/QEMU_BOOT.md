@@ -28,7 +28,11 @@ between booting and comparing repeated runs is explained under
   preemption when running the strict profile.
 
 Run the commands in this guide from the Hermit repository root unless stated
-otherwise. Build Hermit:
+otherwise. Build Hermit. This rebuilds `target/release/hermit`, which
+`target/install_pkg/hermit` links to, with default features; if you built the
+`dbt`, `sabre`, and `e9patch` backends from the README, use
+`cargo build --release --workspace --features hermit/third-party-backends`
+instead so the rebuild keeps them:
 
 ```bash
 cargo build --release -p hermit --bin hermit
