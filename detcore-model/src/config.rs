@@ -192,9 +192,9 @@ pub struct Config {
     #[clap(long = "no-virtualize-cpuid", action = clap::ArgAction::SetFalse)]
     pub virtualize_cpuid: bool,
 
-    /// The CPU the guest sees: x86-64-v2 (the default) or x86-64-v3, offered
-    /// only on qualified ptrace hosts. The long help states what the
-    /// qualification leaves uncovered.
+    /// The CPU the guest sees: virtual x86-64-v2/v3 or intercepted host
+    /// features without hardware randomness. The long help states each
+    /// profile's host requirements and determinism limits.
     #[clap(long, value_enum, default_value_t, long_help = crate::cpu_profile::CPU_PROFILE_LONG_HELP)]
     #[serde(default)]
     pub cpu_profile: crate::cpu_profile::CpuProfile,

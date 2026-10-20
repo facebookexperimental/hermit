@@ -65,6 +65,7 @@ impl Replay {
         mounts: &[Mount],
     ) -> Result<Self, Error> {
         let metadata = Metadata::load(dir)?;
+        crate::cpu_profile_admission::check_record_or_replay(metadata.cpu_profile)?;
         if let Some(reason) = &metadata.replay_refused {
             return Err(anyhow::anyhow!(
                 "This recording cannot be replayed faithfully: {reason}"
@@ -93,8 +94,10 @@ impl Replay {
         // A v3 recording replays only on a host that qualifies with the same
         // host facts, under the same table
         // (https://github.com/rrnewton/hermit/issues/4243).
-        if !metadata.cpu_profile.is_default() {
-            let refuse = |why: String| crate::cpu_profile_admission::CpuProfileRefusal(why);
+        if metadata.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
+            let refuse = |why: String| {
+                crate::cpu_profile_admission::CpuProfileRefusal::new(metadata.cpu_profile, why)
+            };
             let recorded = crate::cpu_profile_admission::precheck_replay(
                 metadata.cpu_profile,
                 metadata.cpu_profile_host.as_ref(),

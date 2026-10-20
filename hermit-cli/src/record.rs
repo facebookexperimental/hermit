@@ -45,6 +45,7 @@ impl Record {
         proc_level: Option<detcore_model::config::ProcLevel>,
         cpu_profile: detcore_model::cpu_profile::CpuProfile,
     ) -> Result<Self, Error> {
+        crate::cpu_profile_admission::check_record_or_replay(cpu_profile)?;
         let mut metadata = Metadata::new(&command)?;
         metadata.local_networking = local_networking;
         // A recording always names its level, so its replay does not depend
@@ -57,14 +58,16 @@ impl Record {
             None
         } else {
             let request = crate::cpu_profile_admission::record_or_replay_request(false);
-            let (_probe, host) = crate::cpu_profile_admission::admit(&request)
-                .map_err(crate::cpu_profile_admission::CpuProfileRefusal)?;
+            let (_probe, host) = crate::cpu_profile_admission::admit(&request).map_err(|why| {
+                crate::cpu_profile_admission::CpuProfileRefusal::new(cpu_profile, why)
+            })?;
             Some(host)
         };
         metadata.cpu_profile = cpu_profile;
         metadata.cpu_profile_host = cpu_profile_host.clone();
-        metadata.cpu_profile_residual =
-            (!cpu_profile.is_default()).then(|| detcore_model::cpu_profile::V3_RESIDUAL.to_owned());
+        metadata.cpu_profile_residual = (cpu_profile
+            == detcore_model::cpu_profile::CpuProfile::X86_64V3)
+            .then(|| detcore_model::cpu_profile::V3_RESIDUAL.to_owned());
         metadata.mountinfo_root_rewrites = mountinfo.root_rewrites;
         metadata.container_mount_table = mountinfo.container_mount_table;
         metadata.mountinfo_mount_ids_captured = mountinfo_mount_ids.is_some();

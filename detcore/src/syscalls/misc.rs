@@ -404,6 +404,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(guest.inject(call).await?)
             }
 
+            // The host profile exposes the native XSAVE layout, including
+            // dynamic components, so Linux must answer its permission queries
+            // and apply requests to the guest task itself. Preserve its masks,
+            // pointer checks and errno rather than the fixed-profile policy:
+            // Linux v7.1.3, fpu_xstate_prctl, arch/x86/kernel/fpu/xstate.c:1840.
+            // https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/arch/x86/kernel/fpu/xstate.c?h=v7.1.3#n1840
+            ArchPrctlCmd::Other(
+                ARCH_GET_XCOMP_SUPP
+                | ARCH_GET_XCOMP_PERM
+                | ARCH_GET_XCOMP_GUEST_PERM
+                | ARCH_REQ_XCOMP_PERM
+                | ARCH_REQ_XCOMP_GUEST_PERM,
+                _,
+            ) if self.cfg.cpu_profile == detcore_model::cpu_profile::CpuProfile::HostNoRdrand => {
+                Ok(guest.inject(call).await?)
+            }
+
             // Under x86-64-v3 the guest's XGETBV and XSAVE run on the host, so
             // the xstate queries answer with the host's masks, captured at
             // startup on a host without dynamic features and bound in the

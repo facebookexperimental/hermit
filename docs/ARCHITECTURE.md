@@ -450,8 +450,8 @@ The same emulation path is shared by CPUID and the RDTSC family — only the
 
 ### CPUID: what Detcore reports
 
-Detcore does not pass the host's real CPUID through. It serves a fixed,
-conservative table (`detcore/src/cpuid.rs`) modeled on an older Intel part, with
+By default Detcore serves a fixed, conservative table (`detcore/src/cpuid.rs`)
+modeled on an older Intel part, with
 nondeterministic feature bits — notably `RDRAND` — masked off. Reporting that a
 feature is absent is how Hermit steers a guest onto a deterministic fallback
 path: a well-behaved program that checks CPUID before using `RDRAND`, `RDSEED`,
@@ -463,6 +463,15 @@ CPUID virtualization is controlled by `Config::virtualize_cpuid`
 it only helps programs that *ask* before they act. A program that executes
 `RDRAND` unconditionally is unaffected by the CPUID table — trapping the
 instruction itself requires the KVM/SVM backend.
+
+The opt-in `--cpu-profile=host-no-rdrand` also traps every CPUID, but derives
+its answers from native host CPUID. Detcore clears hardware randomness and
+unvirtualized timing/profiling features, normalizes CPU identity fields, and
+reports leaf 0x15 consistently with its virtual TSC. It preserves the host's
+complete XSAVE leaf 0xD; the guest's XGETBV/XSAVE and XCOMP controls operate on
+the real kernel state. This is a host-specific compatibility profile, without
+the virtual v3 profile's XSAVE qualification. Its requirements and remaining
+determinism limits are described in the [user guide](USER_GUIDE.md#host-cpu-features-without-hardware-randomness).
 
 ### CPUID faulting: Intel vs AMD
 

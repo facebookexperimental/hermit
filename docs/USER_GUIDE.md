@@ -690,6 +690,7 @@ the default equal-priority policy.
 | `--no-virtualize-time` | Uses host time; also requires `--no-virtualize-metadata`. |
 | `--no-virtualize-cpuid` | Exposes host CPUID behavior. |
 | `--cpu-profile x86-64-v3` | Gives the guest an x86-64-v3 CPU instead of the default x86-64-v2; see below. |
+| `--cpu-profile host-no-rdrand` | Intercepts CPUID and returns host features with hardware randomness and unvirtualized timing features hidden; ptrace only, with CPUID faulting required. |
 
 Disabling a virtualization feature introduces a host-dependent input. Do it to
 diagnose compatibility problems, not when asserting full reproducibility.
@@ -730,6 +731,48 @@ v3:
 > hypervisor that behaves differently only on other instruction paths, or on VM
 > exits the guest cannot see, is not excluded. Firmware (SMM) entries cannot be
 > checked at all. Default runs use x86-64-v2, which this does not affect.
+
+#### Host CPU features without hardware randomness
+
+`hermit run --cpu-profile=host-no-rdrand` keeps CPUID intercepted, but answers
+with the host CPU's features. This lets software requiring x86-64-v3 (such as
+CentOS 10 glibc) use those instructions on a capable host even when the virtual
+v3 profile's XSAVE qualification refuses it. For example:
+
+```bash
+hermit run --cpu-profile=host-no-rdrand --epoch=2023-01-01T00:00:00Z -- ./program
+```
+
+RDRAND (leaf 1 ECX bit 30) and RDSEED (leaf 7.0 EBX bit 18) are hidden, so
+feature-detecting libraries such as libstdc++'s `std::random_device` use the
+randomness Hermit virtualizes. TSX (HLE, RTM, TSXLDTRK), RDPID, WAITPKG,
+MONITOR/MWAIT, MONITORX/MWAITX, RDPRU, AMD lightweight profiling, architectural
+performance monitoring, VIA XSTORE randomness, and hypervisor-specific clock
+interfaces are also hidden. CPU identity fields
+(APIC, core and node IDs) are zeroed so tracer migration does not change them.
+Other host features remain visible, including every XSAVE leaf 0xD subleaf;
+Linux's XCOMP queries and permission requests operate on the guest's real
+kernel state. RDTSC and RDTSCP still trap and return virtual time, with RDTSCP's
+CPU ID zero. Leaf 0x15 reports the virtual TSC's one-billion cycles per logical
+second; leaf 0x16 retains the host's static frequency metadata.
+
+Results are **host CPU model specific**: cross-host builds need the same CPU
+model, topology and compatible kernel/XSTATE settings. Intel hybrid and AMD
+heterogeneous CPUs are refused because different core types can report different
+features. This mode skips v3's XSTATE_BV
+qualification; host save/restore activity can still affect XSAVE output and
+signal-frame register metadata. CPUID masking guides programs that check
+features before using them; it does not trap unconditional RDRAND/RDSEED or
+the other hidden instructions. Keep input files and the environment fixed,
+and verify the actual build across repeated runs.
+
+`hermit host-capabilities --cpu-profile=host-no-rdrand` checks CPUID faulting.
+A host or kernel without faulting is refused clearly, and every exec must
+retain interception; the mode never falls back to native CPUID. It requires
+the ptrace backend and virtual time, and conflicts with
+`--no-virtualize-cpuid`, `--no-virtualize-time`, and execution modes that bypass
+Detcore. Record/replay currently refuses this profile because recordings do
+not bind its complete host CPU state. Use a virtual profile for recordings.
 
 ### File System, Environment, And Network
 

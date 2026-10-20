@@ -195,6 +195,8 @@ static LEADER_PTHREAD_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static THREAD_JOIN_AFTER_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_PROFILE_V3_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_PROFILE_V3_LAZY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CPUID_HOST_NO_RDRAND_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static RANDOM_DEVICE_HOST_NO_RDRAND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static NESTED_VFORK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1686,6 +1688,28 @@ fn cpuid_profile_v3_guest() -> &'static Path {
             "cpuid-profile-v3 guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn random_device_host_no_rdrand_guest() -> &'static Path {
+    RANDOM_DEVICE_HOST_NO_RDRAND_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let build_root = process_build_root("random-device-host-no-rdrand");
+        fs::create_dir_all(&build_root).expect("create random-device guest directory");
+        let guest = build_root.join("random_device_host_no_rdrand");
+        let output = Command::new("c++")
+            .args(["-std=c++17", "-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/random_device_host_no_rdrand.cpp"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("compile std::random_device guest");
+        assert!(
+            output.status.success(),
+            "std::random_device guest compilation failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
         );
         guest
     })
@@ -3819,6 +3843,9 @@ fn strip_ansi_sgr(input: &str) -> String {
 /// gone green anyway.
 #[derive(Clone, Copy)]
 enum Refusal {
+    /// Hermit cannot provide the requested determinism policy on this host or
+    /// with these options, and refuses before launching the guest.
+    Policy,
     /// Hermit itself refused and NO GUEST WAS LAUNCHED: a contradictory flag
     /// pair, an unwritable log path, a denied capability, a backend used outside
     /// its supported command. The caller's tooling or invocation is at fault.
@@ -3834,6 +3861,7 @@ enum Refusal {
 impl Refusal {
     fn code(self) -> i32 {
         match self {
+            Refusal::Policy => HERMIT_POLICY_REFUSAL_EXIT,
             Refusal::Hermit => HERMIT_INTERNAL_FAILURE_EXIT,
             Refusal::GuestNotFound => GUEST_PROGRAM_NOT_FOUND_EXIT,
             Refusal::GuestNotExecutable => GUEST_PROGRAM_NOT_EXECUTABLE_EXIT,
@@ -3842,6 +3870,7 @@ impl Refusal {
 
     fn describe(self) -> &'static str {
         match self {
+            Refusal::Policy => "a determinism-policy refusal (no guest launched)",
             Refusal::Hermit => "a hermit-internal refusal (no guest launched)",
             Refusal::GuestNotFound => "a guest-program-not-found refusal",
             Refusal::GuestNotExecutable => "a guest-program-not-executable refusal",
@@ -37508,6 +37537,377 @@ fn a_leader_pthread_exit_leaves_its_group_running_at_bitwise_parity() {
                 .expect("the verdict must be JSON");
         assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
     }
+}
+
+/// An unavailable CPUID-faulting facility or a native hybrid CPU must refuse
+/// the host profile before the guest runs. A qualifying host must run it:
+/// another policy refusal is never accepted as unavailable-hardware evidence.
+fn host_no_rdrand_succeeded_or_refused(
+    status: Option<i32>,
+    stdout: &str,
+    log: &str,
+    expected_guest_code: i32,
+) -> bool {
+    let probe = Command::new(compiled_c_guest(
+        &CPUID_HOST_NO_RDRAND_GUEST,
+        "cpuid_host_no_rdrand",
+    ))
+    .arg("--faulting-probe")
+    .output()
+    .expect("run independent native CPUID-faulting probe");
+    let unavailable = match probe.status.code() {
+        Some(0) => {
+            assert_eq!(probe.stdout, b"faulting available\n", "{probe:?}");
+            let host_max = std::arch::x86_64::__cpuid_count(0, 0).eax;
+            let intel_hybrid =
+                host_max >= 7 && std::arch::x86_64::__cpuid_count(7, 0).edx & (1 << 15) != 0;
+            let extended_max = std::arch::x86_64::__cpuid_count(0x8000_0000, 0).eax;
+            let amd_heterogeneous = extended_max >= 0x8000_0026
+                && std::arch::x86_64::__cpuid_count(0x8000_0026, 0).eax & (1 << 30) != 0;
+            (intel_hybrid || amd_heterogeneous).then_some("this is a hybrid CPU")
+        }
+        Some(77) => {
+            assert_eq!(probe.stdout, b"faulting unavailable\n", "{probe:?}");
+            Some("CPUID faulting is unavailable")
+        }
+        _ => panic!("native faulting probe failed unexpectedly: {probe:?}"),
+    };
+    if let Some(reason) = unavailable {
+        assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{stdout}\n{log}");
+        assert!(
+            log.contains("--cpu-profile host-no-rdrand refused:") && log.contains(reason),
+            "native probe reports {reason}, but the CLI did not explain it:\n{log}"
+        );
+        assert!(stdout.is_empty(), "a refused guest ran: {stdout}");
+        false
+    } else {
+        assert_eq!(status, Some(expected_guest_code), "{stdout}\n{log}");
+        true
+    }
+}
+
+fn host_cpuid_rows(stdout: &str) -> Vec<[u32; 6]> {
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("row "))
+        .map(|row| {
+            row.split_whitespace()
+                .map(|word| u32::from_str_radix(word, 16).expect("CPUID hexadecimal word"))
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("CPUID leaf, subleaf and four registers")
+        })
+        .collect()
+}
+
+/// The oracle is the native guest's CPUID, with only the documented exceptions
+/// applied here independently of Detcore. Comparing complete words preserves
+/// ordinary host features (including AVX2 and the native XSAVE layout), and
+/// catches an accidentally widened mask as well as leaked nondeterminism.
+#[test]
+fn cpu_profile_host_no_rdrand_matches_host_cpuid_and_xsave() {
+    let guest = compiled_c_guest(&CPUID_HOST_NO_RDRAND_GUEST, "cpuid_host_no_rdrand");
+    let native = Command::new(guest)
+        .arg("--native")
+        .output()
+        .expect("run native CPUID oracle");
+    assert!(native.status.success(), "{native:?}");
+    let native = String::from_utf8(native.stdout).unwrap();
+    let mut expected = host_cpuid_rows(&native);
+    assert!(!expected.is_empty(), "native probe printed no CPUID rows");
+    let max_basic = expected.iter().find(|row| row[0..2] == [0, 0]).unwrap()[2];
+    let max_extended = expected
+        .iter()
+        .find(|row| row[0..2] == [0x8000_0000, 0])
+        .unwrap()[2];
+    for [leaf, subleaf, a, b, c, d] in &mut expected {
+        match (*leaf, *subleaf) {
+            (leaf, _) if leaf == max_basic + 1 || leaf == max_extended + 1 => {
+                // An invalid-leaf alias must not resurrect masked features.
+                [a, b, c, d].into_iter().for_each(|word| *word = 0);
+            }
+            (1, _) => {
+                *b &= 0x00ff_ffff; // Physical APIC ID.
+                *c &= !((1 << 3) | (1 << 30) | (1 << 31)); // MONITOR, RDRAND, hypervisor.
+            }
+            (7, 0) => {
+                *b &= !((1 << 4) | (1 << 11) | (1 << 18)); // HLE, RTM, RDSEED.
+                *c &= !((1 << 5) | (1 << 22)); // WAITPKG, RDPID.
+                *d &= !(1 << 16); // TSXLDTRK.
+            }
+            (7, 1) => *a &= !(1 << 8), // Architectural performance monitoring.
+            // MONITOR/MWAIT, PMU, hypervisor timing interfaces and AMD LWP.
+            (5 | 0xa | 0x23 | 0x4000_0000..=0x7fff_ffff | 0x8000_001c, _) => {
+                [a, b, c, d].into_iter().for_each(|word| *word = 0);
+            }
+            (0xb | 0x1f, _) => *d = 0, // x2APIC ID.
+            (0x15, _) => {
+                *a = 1;
+                *b = 1;
+                *c = 1_000_000_000; // Hermit's TSC ticks once per virtual nanosecond.
+                *d = 0;
+            }
+            (0x8000_0001, _) => *c &= !((1 << 15) | (1 << 29)), // LWP, MWAITX.
+            (0x8000_0008, _) => {
+                *b &= !(1 << 4); // RDPRU.
+                *d &= 0xffff; // RDPRU's maximum ECX selector.
+            }
+            (0x8000_001e, _) => {
+                *a = 0;
+                *b &= !0xff; // Core ID, preserving threads per core.
+                *c &= !0xff; // Node ID, preserving nodes per processor.
+            }
+            (0x8000_0026, _) => *d = 0, // Extended APIC ID.
+            (0xc000_0001, _) => *d &= !((1 << 2) | (1 << 3)), // VIA XSTORE.
+            _ => {}
+        }
+    }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--cpu-profile=host-no-rdrand",
+            "--timeout=60",
+            "--",
+            guest.to_str().unwrap(),
+        ]),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout")).unwrap();
+    if !host_no_rdrand_succeeded_or_refused(status.and_then(|s| s.code()), &stdout, &log, 0) {
+        return;
+    }
+    assert_eq!(host_cpuid_rows(&stdout), expected, "{stdout}\n{log}");
+    let xcomp = |text: &str| {
+        text.lines()
+            .filter(|line| line.starts_with("xcomp "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(xcomp(&stdout), xcomp(&native), "XCOMP must match native");
+    assert_eq!(xcomp(&stdout).len(), 3, "missing XCOMP queries");
+    assert!(stdout.contains("check rdrand hidden: ok\n"), "{stdout}");
+    assert!(stdout.contains("check rdseed hidden: ok\n"), "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("check "))
+            .all(|line| line.ends_with(": ok")),
+        "{stdout}"
+    );
+}
+
+/// libstdc++'s ordinary random_device selects its source using CPUID. Two
+/// complete strict runs must produce the same samples and INFO events when
+/// hardware RNG features are hidden, rather than selecting native RDRAND.
+#[test]
+fn cpu_profile_host_no_rdrand_random_device_has_bitwise_parity() {
+    let guest = random_device_host_no_rdrand_guest();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict.to_str().unwrap(),
+            "--cpu-profile=host-no-rdrand",
+            "--timeout=60",
+            "--",
+            guest.to_str().unwrap(),
+        ]),
+        directory.path(),
+        Duration::from_secs(300),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout")).unwrap();
+    if !host_no_rdrand_succeeded_or_refused(status.and_then(|s| s.code()), &stdout, &log, 0) {
+        return;
+    }
+    let samples = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(samples.len(), 16, "{stdout}");
+    for (i, sample) in samples.iter().enumerate() {
+        let hex = sample
+            .strip_prefix(&format!("sample {i:02} "))
+            .unwrap_or_else(|| panic!("invalid sample: {sample}"));
+        assert_eq!(hex.len(), 8, "{sample}");
+        u32::from_str_radix(hex, 16).expect("random_device must print a 32-bit value");
+    }
+    assert!(
+        samples.iter().any(|sample| !sample.ends_with("00000000")),
+        "random_device returned only zeros"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(verdict).unwrap()).unwrap();
+    assert_eq!(report["bitwise_parity"], true, "{report}\n{log}");
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "no {side} INFO messages compared: {report}"
+        );
+    }
+}
+
+/// Flip only the oracle's RDRAND feature bit after executing intercepted
+/// CPUID. It must reject that observation, even on a host without RDRAND.
+#[test]
+fn cpu_profile_host_no_rdrand_oracle_rejects_an_advertised_rdrand() {
+    let guest = compiled_c_guest(&CPUID_HOST_NO_RDRAND_GUEST, "cpuid_host_no_rdrand");
+    let output = hermit(&[
+        "run",
+        "--strict",
+        "--cpu-profile=host-no-rdrand",
+        "--timeout=60",
+        "--",
+        guest.to_str().unwrap(),
+        "--inject-rdrand",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let log = String::from_utf8_lossy(&output.stderr);
+    if !host_no_rdrand_succeeded_or_refused(output.status.code(), &stdout, &log, 1) {
+        return;
+    }
+    assert!(stdout.contains("check rdrand hidden: FAIL\n"), "{stdout}");
+    assert_eq!(stdout.matches(": FAIL\n").count(), 1, "{stdout}");
+}
+
+/// A real kernel refusal of ARCH_SET_CPUID must fail closed, before any guest
+/// output. The filter permits other arch_prctl operations, including the
+/// loader's ARCH_SET_FS, so it simulates missing faulting rather than a broken
+/// host process. The filter is an explicit relaxation only for this refusal.
+#[test]
+fn cpu_profile_host_no_rdrand_refuses_when_faulting_is_unavailable() {
+    let mut command = hermit_command_under_host_filter(&[
+        "run",
+        "--cpu-profile=host-no-rdrand",
+        "--",
+        "/bin/echo",
+        "guest must not run",
+    ]);
+    // SAFETY: only async-signal-safe syscalls run in the child before exec.
+    unsafe {
+        command.pre_exec(|| {
+            let mut filter = [
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 0,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 3,
+                    k: libc::SYS_arch_prctl as u32,
+                },
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 16,
+                }, // args[0]
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 1,
+                    k: 0x1012,
+                }, // ARCH_SET_CPUID
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: 0x0005_0000 | libc::ENODEV as u32,
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: 0x7fff_0000,
+                },
+            ];
+            set_seccomp_filter(&mut filter)
+        });
+    }
+    let output = hermit_test::hermit_output("host profile without CPUID faulting", &mut command);
+    assert_hermit_refusal_contains(
+        &output,
+        Refusal::Policy,
+        &[
+            "--cpu-profile host-no-rdrand refused:",
+            "CPUID faulting is unavailable",
+        ],
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "the refused guest ran: {output:?}"
+    );
+}
+
+#[test]
+fn cpu_profile_host_no_rdrand_refuses_bypass_modes_and_recording() {
+    let cases: [(&[&str], &[&str], &str); 5] = [
+        (&["--backend=kvm"], &[], "--backend=kvm cannot provide"),
+        (
+            &[],
+            &["--no-virtualize-cpuid"],
+            "CPUID must remain intercepted",
+        ),
+        (
+            &[],
+            &["--no-virtualize-time", "--no-virtualize-metadata"],
+            "RDTSC/RDTSCP features require Hermit's virtual time",
+        ),
+        (
+            &[],
+            &["--strace-only"],
+            "--strace-only runs without CPUID and TSC interception",
+        ),
+        (
+            &[],
+            &["--namespace-only"],
+            "--namespace-only runs without CPUID interception",
+        ),
+    ];
+    for (global, run, reason) in cases {
+        let mut args = global.to_vec();
+        args.extend(["run", "--cpu-profile=host-no-rdrand"]);
+        args.extend(run);
+        args.extend(["--", "/bin/echo", "guest must not run"]);
+        let output = hermit(&args);
+        assert_hermit_refusal_contains(
+            &output,
+            Refusal::Policy,
+            &["--cpu-profile host-no-rdrand refused:", reason],
+        );
+        assert!(output.stdout.is_empty(), "{args:?}: guest ran: {output:?}");
+    }
+    let output = hermit(&[
+        "record",
+        "start",
+        "--cpu-profile=host-no-rdrand",
+        "--",
+        "/bin/echo",
+        "guest must not run",
+    ]);
+    assert_hermit_refusal_contains(
+        &output,
+        Refusal::Policy,
+        &[
+            "--cpu-profile host-no-rdrand refused:",
+            "record/replay is not supported",
+        ],
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "the refused guest ran: {output:?}"
+    );
 }
 
 /// The x86-64-v3 CPU profile refuses by name every run it cannot qualify,

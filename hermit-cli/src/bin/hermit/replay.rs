@@ -119,7 +119,10 @@ impl ReplayOpts {
         }
 
         let metadata = hermit.recording_metadata(id)?;
-        if !metadata.cpu_profile.is_default() {
+        hermit::cpu_profile_admission::check_record_or_replay(metadata.cpu_profile).map_err(
+            |refusal| Error::new(super::container::PolicyRefusal).context(refusal.to_string()),
+        )?;
+        if metadata.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
             // A v3 recording replays only on a qualifying host; qualify before
             // the container, as `record start` does. The replayer compares the
             // host facts (https://github.com/rrnewton/hermit/issues/4243).

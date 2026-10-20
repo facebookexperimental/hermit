@@ -14,8 +14,8 @@ use raw_cpuid::CpuIdResult;
 use sha2::Digest;
 use sha2::Sha256;
 
-/// The CPUID table a guest sees: the fixed x86-64-v2 table, or the x86-64-v3
-/// table built from it (<https://github.com/rrnewton/hermit/issues/4243>).
+/// The CPUID answers a guest sees: a virtual v2/v3 table, or the host's
+/// answers with nondeterministic instruction features and CPU IDs removed.
 #[derive(Debug, Clone, Copy)]
 pub struct InterceptedCpuid {
     profile: CpuProfile,
@@ -113,10 +113,36 @@ impl InterceptedCpuid {
             CpuProfile::X86_64V3 => Self::v3(cfg.cpu_profile_host.as_ref().expect(
                 "--cpu-profile x86-64-v3 reached Detcore without the qualified host's xstate facts",
             )),
+            CpuProfile::HostNoRdrand => Self {
+                profile: CpuProfile::HostNoRdrand,
+                xsave: [[0; 4]; XSAVE_SUBLEAVES],
+            },
         }
     }
 
     pub fn cpuid(&self, leaf: u32, subleaf: u32) -> Option<CpuIdResult> {
+        if self.profile == CpuProfile::HostNoRdrand {
+            // Invalid native leaves can alias the highest basic leaf. Do not
+            // let aliases evade the sanitization associated with that leaf.
+            // Hypervisor leaves include vendor-specific clocks that are not
+            // virtualized; hide that interface and its leaf-1 declaration.
+            let base = match leaf {
+                0..=0x3fff_ffff => 0,
+                0x8000_0000..=0xbfff_ffff => 0x8000_0000,
+                0xc000_0000..=0xcfff_ffff => 0xc000_0000,
+                _ => return Some(cpuid_result(0, 0, 0, 0)),
+            };
+            let max = std::arch::x86_64::__cpuid_count(base, 0).eax;
+            if max < base || max >= base.saturating_add(0x1000_0000) || leaf > max {
+                return Some(cpuid_result(0, 0, 0, 0));
+            }
+            let native = std::arch::x86_64::__cpuid_count(leaf, subleaf);
+            return Some(mask_host_cpuid(
+                leaf,
+                subleaf,
+                cpuid_result(native.eax, native.ebx, native.ecx, native.edx),
+            ));
+        }
         let request = leaf as usize;
         let mut result = if request >= 0x80000000 && request < 0x80000000 + EXTENDED_CPUIDS.len() {
             EXTENDED_CPUIDS[request - 0x80000000]
@@ -224,6 +250,9 @@ impl InterceptedCpuid {
         let bugs = match self.profile {
             CpuProfile::X86_64V2 => CPUINFO_BUGS,
             CpuProfile::X86_64V3 => CPUINFO_BUGS_V3,
+            // The virtual profiles' fixed vulnerability lists describe their
+            // invented CPUs, not this host. Do not invent a host bug list.
+            CpuProfile::HostNoRdrand => "",
         };
         render_cpuinfo(
             |leaf, subleaf| {
@@ -233,6 +262,49 @@ impl InterceptedCpuid {
             bugs,
         )
     }
+}
+
+/// Preserve the native ISA and XSAVE layout while steering feature-detecting
+/// guests away from instructions whose results bypass Detcore. This does not
+/// trap unconditional RDRAND/RDSEED (or the other masked instructions).
+///
+/// RDTSC and RDTSCP remain advertised: both trap through PR_SET_TSC, and
+/// Detcore supplies logical nanoseconds with TSC_AUX zero. RDPID reads the
+/// real TSC_AUX without trapping, so it must not be advertised. Leaf 0xD is
+/// deliberately unchanged, including subleaf 1 and components beyond PKRU:
+/// native XGETBV/XSAVE instructions need the host kernel's complete layout.
+fn mask_host_cpuid(leaf: u32, subleaf: u32, mut r: CpuIdResult) -> CpuIdResult {
+    match (leaf, subleaf) {
+        (1, _) => {
+            r.ecx &= !((1 << 3) | (1 << 30) | (1 << 31)); // MONITOR, RDRAND, hypervisor
+            r.ebx &= 0x00ff_ffff; // initial APIC ID: virtual CPU zero
+        }
+        (7, 0) => {
+            r.ebx &= !((1 << 4) | (1 << 11) | (1 << 18)); // HLE, RTM, RDSEED
+            r.ecx &= !((1 << 5) | (1 << 22)); // WAITPKG, RDPID
+            r.edx &= !(1 << 16); // TSXLDTRK
+        }
+        (7, 1) => r.eax &= !(1 << 8), // architectural performance monitoring extension
+        (5 | 0xa | 0x23 | 0x8000_001c, _) => return cpuid_result(0, 0, 0, 0), // monitor/performance counters
+        (0xb | 0x1f, _) => r.edx = 0,                                         // x2APIC ID
+        // Detcore's virtual TSC advances at one cycle per logical nanosecond.
+        // A native ratio would make a guest convert those cycles incorrectly.
+        (0x15, _) => return cpuid_result(1, 1, 1_000_000_000, 0),
+        (0x8000_0001, _) => r.ecx &= !((1 << 15) | (1 << 29)), // LWP, MONITORX/MWAITX
+        (0x8000_0008, _) => {
+            r.ebx &= !(1 << 4); // RDPRU: host counters
+            r.edx &= 0xffff; // maximum RDPRU selector
+        }
+        (0x8000_001e, _) => {
+            r.eax = 0; // extended APIC ID
+            r.ebx &= !0xff; // core ID, preserve threads-per-core
+            r.ecx &= !0xff; // node ID, preserve nodes-per-processor
+        }
+        (0x8000_0026, _) => r.edx = 0, // AMD extended topology APIC ID
+        (0xc000_0001, _) => r.edx &= !((1 << 2) | (1 << 3)), // VIA XSTORE RNG
+        _ => {}
+    }
+    r
 }
 
 /// [`InterceptedCpuid::cpuinfo`] for the CPU whose CPUID answers as `leaf`
@@ -749,6 +821,109 @@ mod tests {
 
     fn registers(result: CpuIdResult) -> [u32; 4] {
         [result.eax, result.ebx, result.ecx, result.edx]
+    }
+
+    #[test]
+    fn host_profile_masks_nondeterministic_instructions_and_cpu_identity() {
+        // Feed every bit set, including features absent on the test host.
+        // Expected masks are independent of the implementation branches.
+        for (leaf, subleaf, cleared) in [
+            (1, 0, [0, 0xff00_0000, (1 << 3) | (1 << 30) | (1 << 31), 0]),
+            (
+                7,
+                0,
+                [
+                    0,
+                    (1 << 4) | (1 << 11) | (1 << 18),
+                    (1 << 5) | (1 << 22),
+                    1 << 16,
+                ],
+            ),
+            (7, 1, [1 << 8, 0, 0, 0]),
+            (0xb, 3, [0, 0, 0, u32::MAX]),
+            (0x1f, 2, [0, 0, 0, u32::MAX]),
+            (0x8000_0001, 0, [0, 0, (1 << 15) | (1 << 29), 0]),
+            (0x8000_0008, 0, [0, 1 << 4, 0, 0xffff_0000]),
+            (0x8000_001e, 0, [u32::MAX, 0xff, 0xff, 0]),
+            (0x8000_0026, 1, [0, 0, 0, u32::MAX]),
+            (0xc000_0001, 0, [0, 0, 0, (1 << 2) | (1 << 3)]),
+        ] {
+            let actual = mask_host_cpuid(
+                leaf,
+                subleaf,
+                cpuid_result(u32::MAX, u32::MAX, u32::MAX, u32::MAX),
+            );
+            assert_eq!(
+                registers(actual),
+                cleared.map(|mask| !mask),
+                "{leaf:#x}.{subleaf}"
+            );
+        }
+        for leaf in [5, 0xa, 0x23, 0x8000_001c] {
+            assert_eq!(
+                registers(mask_host_cpuid(leaf, 0, cpuid_result(1, 2, 3, 4))),
+                [0; 4]
+            );
+        }
+        assert_eq!(
+            registers(mask_host_cpuid(
+                0x15,
+                0,
+                cpuid_result(2, 200, 24_000_000, 0)
+            )),
+            [1, 1, 1_000_000_000, 0]
+        );
+    }
+
+    #[test]
+    fn host_profile_preserves_xsave_subleaves_and_ordinary_host_features() {
+        let profile = InterceptedCpuid::for_config(&crate::Config {
+            cpu_profile: CpuProfile::HostNoRdrand,
+            ..Default::default()
+        });
+        for (leaf, subleaf) in
+            (0..64)
+                .map(|subleaf| (0xd, subleaf))
+                .chain([(0, 0), (7, 2), (0x8000_0000, 0)])
+        {
+            let native = std::arch::x86_64::__cpuid_count(leaf, subleaf);
+            assert_eq!(
+                registers(profile.cpuid(leaf, subleaf).unwrap()),
+                [native.eax, native.ebx, native.ecx, native.edx],
+                "{leaf:#x}.{subleaf}"
+            );
+        }
+        let native = std::arch::x86_64::__cpuid_count(0x8000_0001, 0);
+        let guest = profile.cpuid(0x8000_0001, 0).unwrap();
+        // RDTSCP remains available, and is virtualized by the RDTSC handler.
+        assert_eq!(guest.edx, native.edx);
+        assert_eq!(profile.cpuid(1, 0).unwrap().ecx & (1 << 30), 0);
+        assert_eq!(profile.cpuid(7, 0).unwrap().ebx & (1 << 18), 0);
+        for leaf in [0x4000_0000, 0x4000_0010, 0x7fff_ffff, 0xffff_ffff] {
+            assert_eq!(registers(profile.cpuid(leaf, 0).unwrap()), [0; 4]);
+        }
+    }
+
+    #[test]
+    fn host_profile_requires_interception_and_virtual_time_but_not_v3_facts() {
+        let mut config = crate::Config {
+            cpu_profile: CpuProfile::HostNoRdrand,
+            ..Default::default()
+        };
+        assert_eq!(crate::cpu_profile_admission_refusal(&config), None);
+        config.virtualize_cpuid = false;
+        assert!(
+            crate::cpu_profile_admission_refusal(&config)
+                .unwrap()
+                .contains("CPUID interception")
+        );
+        config.virtualize_cpuid = true;
+        config.virtualize_time = false;
+        assert!(
+            crate::cpu_profile_admission_refusal(&config)
+                .unwrap()
+                .contains("virtual time")
+        );
     }
 
     #[test]

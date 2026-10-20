@@ -519,15 +519,27 @@ pub fn v3_feature_words() -> Vec<(u32, u32, usize, u32)> {
     cpuid::v3_feature_words()
 }
 
-/// Why a v3 configuration cannot run at all, or `None`: Detcore answers a v3
+/// Why a CPU profile configuration cannot run at all, or `None`. Host mode
+/// requires CPUID and time virtualization; Detcore answers a v3
 /// guest from the qualified host's facts, so a configuration without them is
 /// refused rather than given a guessed leaf 0xD. Whether those facts came from
 /// a real qualification is Hermit's to check, at its launch functions
 /// (`cpu_profile_admission::refuse_unadmitted_launch`), before any backend
 /// starts (<https://github.com/rrnewton/hermit/issues/4243>).
 pub fn cpu_profile_admission_refusal(cfg: &Config) -> Option<&'static str> {
-    (!cfg.cpu_profile.is_default() && cfg.cpu_profile_host.is_none())
-        .then_some("the configuration carries no qualified host facts")
+    use detcore_model::cpu_profile::CpuProfile;
+    match cfg.cpu_profile {
+        CpuProfile::X86_64V3 if cfg.cpu_profile_host.is_none() => {
+            Some("the configuration carries no qualified host facts")
+        }
+        CpuProfile::HostNoRdrand if !cfg.virtualize_cpuid => {
+            Some("CPUID interception is required; remove --no-virtualize-cpuid")
+        }
+        CpuProfile::HostNoRdrand if !cfg.virtualize_time => {
+            Some("virtual time is required for RDTSC/RDTSCP; remove --no-virtualize-time")
+        }
+        _ => None,
+    }
 }
 
 /// The digest of the CPUID table and bound host xstate facts `cfg` selects,
@@ -3627,26 +3639,26 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
             result => result?,
         }
-        // Under x86-64-v3 the guest's CPUID must come from Detcore's table: a
-        // native CPUID would show the host's features and leaf 0xD. Reverie
-        // re-arms CPUID faulting for each new image before this callback and
-        // only warns when that fails, so a v3 run ends here, by name, instead
-        // of running on with the host's CPUID
-        // (https://github.com/rrnewton/hermit/issues/4243).
-        if self.cfg.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3
-            && !guest.has_cpuid_interception()
-        {
-            let message = "--cpu-profile x86-64-v3 refused: CPUID faulting is not active for \
-                           this image, so the guest would see the host's CPUID";
+        // Every non-default profile requires Detcore's CPUID answers. Ptrace
+        // verifies faulting before each new image; this backend-independent
+        // guard also refuses a missing interception capability before the
+        // image executes. Native CPUID must never leak hardware randomness
+        // under host-no-rdrand (https://github.com/rrnewton/hermit/issues/4534).
+        if !self.cfg.cpu_profile.is_default() && !guest.has_cpuid_interception() {
+            let message = format!(
+                "--cpu-profile {} refused: CPUID faulting is not active for this image, \
+                 so the guest would see the host's CPUID; use a host and kernel with CPUID faulting",
+                self.cfg.cpu_profile
+            );
             error!("{message}");
             let _ = writeln!(crate::util::RetryingStderr, "{message}");
             tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
                 .await;
         }
-        // A v3 configuration without host facts ends here, by name, before the
-        // guest's first instruction, instead of reaching the CPUID table.
+        // Refuse an invalid profile configuration before the guest's first
+        // instruction, instead of reaching its CPUID provider.
         if let Some(why) = cpu_profile_admission_refusal(&self.cfg) {
-            let message = format!("--cpu-profile x86-64-v3 refused: {why}");
+            let message = format!("--cpu-profile {} refused: {why}", self.cfg.cpu_profile);
             error!("{message}");
             let _ = writeln!(crate::util::RetryingStderr, "{message}");
             tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)

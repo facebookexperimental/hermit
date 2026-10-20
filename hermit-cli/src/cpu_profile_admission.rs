@@ -6,29 +6,40 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Whether a run may use `--cpu-profile x86-64-v3`, and the host facts it
-//! binds when it may (<https://github.com/rrnewton/hermit/issues/4243>).
+//! Admission for intercepted CPU profiles: v3 binds qualified host XSTATE
+//! facts; host-no-rdrand requires CPUID faulting without the v3 qualification.
 //!
-//! Every class the startup qualification cannot cover is refused by name; the
-//! run never falls back to v2.
+//! Every class the v3 startup qualification cannot cover is refused by name.
+//! Neither nondefault profile silently falls back to v2 or native CPUID.
 
 use detcore_model::cpu_profile::CpuProfile;
 use detcore_model::cpu_profile::HostXstate;
 
 use crate::xstate_probe;
 
-/// Why a v3 run is refused, as one sentence after "--cpu-profile x86-64-v3
-/// refused: ".
+/// Why a profile is refused, after "--cpu-profile <profile> refused: ".
 pub type AdmissionRefusal = String;
 
-/// A refused x86-64-v3 recording or replay, carried as an error so that it
+/// A refused CPU profile, carried as an error so that it
 /// crosses the container boundary as a policy refusal (exit 122).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CpuProfileRefusal(pub AdmissionRefusal);
+pub struct CpuProfileRefusal {
+    pub profile: CpuProfile,
+    pub reason: AdmissionRefusal,
+}
+
+impl CpuProfileRefusal {
+    pub fn new(profile: CpuProfile, reason: impl Into<String>) -> Self {
+        Self {
+            profile,
+            reason: reason.into(),
+        }
+    }
+}
 
 impl std::fmt::Display for CpuProfileRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "--cpu-profile x86-64-v3 refused: {}", self.0)
+        write!(f, "--cpu-profile {} refused: {}", self.profile, self.reason)
     }
 }
 
@@ -41,6 +52,7 @@ pub fn record_or_replay_request(gdbserver: bool) -> AdmissionRequest<'static> {
         backend: "ptrace",
         ptrace: true,
         virtualize_cpuid: true,
+        virtualize_time: true,
         strace_only: false,
         gdbserver,
         namespace_only: false,
@@ -86,6 +98,7 @@ pub struct AdmissionRequest<'a> {
     pub backend: &'a str,
     pub ptrace: bool,
     pub virtualize_cpuid: bool,
+    pub virtualize_time: bool,
     pub strace_only: bool,
     pub gdbserver: bool,
     /// `--namespace-only`, which runs the guest with no Detcore at all.
@@ -127,6 +140,156 @@ pub fn check_request(request: &AdmissionRequest<'_>) -> Result<(), AdmissionRefu
              XSAVE header bits the qualification binds"
                 .into(),
         );
+    }
+    Ok(())
+}
+
+/// The host profile must intercept CPUID and TSC on ptrace. Unlike v3, it
+/// retains host XSAVE behavior and does not claim the XSTATE qualification.
+pub fn check_host_no_rdrand_request(
+    request: &AdmissionRequest<'_>,
+) -> Result<(), AdmissionRefusal> {
+    if !request.ptrace {
+        return Err(format!(
+            "--backend={} cannot provide this profile's required CPUID faulting; \
+             use --backend=ptrace",
+            request.backend
+        ));
+    }
+    if request.namespace_only {
+        return Err(
+            "--namespace-only runs without CPUID interception; remove --namespace-only".into(),
+        );
+    }
+    if request.strace_only {
+        return Err(
+            "--strace-only runs without CPUID and TSC interception; remove --strace-only".into(),
+        );
+    }
+    if !request.virtualize_cpuid {
+        return Err("CPUID must remain intercepted; remove --no-virtualize-cpuid".into());
+    }
+    if !request.virtualize_time {
+        return Err(
+            "the host's RDTSC/RDTSCP features require Hermit's virtual time; \
+             remove --no-virtualize-time"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+const CPUID_FAULTING_REMEDY: &str = "use a CPU and Linux kernel with CPUID faulting support (capable AMD CPUs need \
+     Linux 6.17 or its CPUID-faulting backport)";
+
+fn check_host_no_rdrand_cpuid(host: &dyn HostCpuid) -> Result<(), AdmissionRefusal> {
+    let intel_hybrid = host.cpuid(0, 0)[0] >= 7 && host.cpuid(7, 0)[3] & (1 << 15) != 0;
+    // AMD advertises heterogeneous cores independently of Intel's hybrid bit:
+    // Linux identifies X86_FEATURE_AMD_HTR_CORES through this extended leaf.
+    let amd_heterogeneous = host.cpuid(0x8000_0000, 0)[0] >= 0x8000_0026
+        && host.cpuid(0x8000_0026, 0)[0] & (1 << 30) != 0;
+    if intel_hybrid || amd_heterogeneous {
+        return Err(
+            "this is a hybrid CPU whose CPUID features can change between core types; \
+             use a homogeneous CPU host for --cpu-profile=host-no-rdrand"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Probe the Linux CPUID-faulting API in a child. Disabling CPUID in the
+/// tracer would also fault Rust's and libc's own feature detection, so only
+/// the forked child changes its state. After fork the child uses only libc
+/// syscalls and `_exit`, without allocation, locks or unwinding.
+pub fn qualify_host_no_rdrand() -> Result<(), AdmissionRefusal> {
+    const ARCH_GET_CPUID: libc::c_int = 0x1011;
+    const ARCH_SET_CPUID: libc::c_int = 0x1012;
+    // SAFETY: the child calls only async-signal-safe operations below.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(format!(
+            "cannot probe CPUID faulting: fork failed ({}); resolve the process-resource \
+             failure and retry",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if child == 0 {
+        // SAFETY: these arch_prctl operations take integer arguments only.
+        unsafe {
+            let initial = libc::syscall(libc::SYS_arch_prctl, ARCH_GET_CPUID, 0);
+            if initial != 0 && initial != 1 {
+                libc::_exit(1);
+            }
+            if libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, 0) != 0 {
+                libc::_exit(2);
+            }
+            if libc::syscall(libc::SYS_arch_prctl, ARCH_GET_CPUID, 0) != 0 {
+                libc::_exit(3);
+            }
+            libc::_exit(0);
+        }
+    }
+    let mut status = 0;
+    loop {
+        // SAFETY: child is our live child PID and status points to one int.
+        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+        if waited == child {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(format!(
+                "cannot probe CPUID faulting: waitpid failed ({error}); resolve the child \
+                 process failure and retry"
+            ));
+        }
+    }
+    let failure = if libc::WIFEXITED(status) {
+        match libc::WEXITSTATUS(status) {
+            0 => return check_host_no_rdrand_cpuid(&NativeCpuid),
+            1 => "ARCH_GET_CPUID did not return a valid initial state",
+            2 => "ARCH_SET_CPUID(0) failed",
+            3 => "ARCH_GET_CPUID did not confirm that CPUID was disabled",
+            _ => "the CPUID-faulting probe exited unexpectedly",
+        }
+    } else {
+        "the CPUID-faulting probe did not exit normally"
+    };
+    Err(format!(
+        "CPUID faulting is unavailable: {failure}; {CPUID_FAULTING_REMEDY}"
+    ))
+}
+
+static HOST_NO_RDRAND_ADMITTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Admit host CPUID only after the required interception has been proved.
+pub fn admit_host_no_rdrand(request: &AdmissionRequest<'_>) -> Result<(), AdmissionRefusal> {
+    admit_host_no_rdrand_with(request, qualify_host_no_rdrand)
+}
+
+fn admit_host_no_rdrand_with(
+    request: &AdmissionRequest<'_>,
+    probe: impl FnOnce() -> Result<(), AdmissionRefusal>,
+) -> Result<(), AdmissionRefusal> {
+    check_host_no_rdrand_request(request)?;
+    probe()?;
+    HOST_NO_RDRAND_ADMITTED.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// A recording currently binds only the v3 host facts, not a complete native
+/// CPUID snapshot. Refuse host mode before writing metadata or launching a
+/// guest rather than accidentally treating it as v3.
+pub fn check_record_or_replay(profile: CpuProfile) -> Result<(), CpuProfileRefusal> {
+    if profile == CpuProfile::HostNoRdrand {
+        return Err(CpuProfileRefusal::new(
+            profile,
+            "record/replay is not supported because recording metadata does not bind \
+             the host CPUID state; use `hermit run --cpu-profile=host-no-rdrand --verify` \
+             for repeated runs, or record with --cpu-profile=x86-64-v2 or x86-64-v3",
+        ));
     }
     Ok(())
 }
@@ -328,7 +491,8 @@ pub fn precheck_replay(
     recorded: Option<&HostXstate>,
     recorded_digest: Option<&str>,
 ) -> Result<HostXstate, CpuProfileRefusal> {
-    let refuse = |why: String| CpuProfileRefusal(why);
+    check_record_or_replay(profile)?;
+    let refuse = |why: String| CpuProfileRefusal::new(profile, why);
     let recorded = recorded.cloned().ok_or_else(|| {
         refuse("the recording names the profile but carries no host facts".into())
     })?;
@@ -395,12 +559,11 @@ fn admit_with(
     Ok(ADMITTED.get_or_init(|| qualified).clone())
 }
 
-/// Refuses a launch of an x86-64-v3 configuration that this process's
-/// admission did not produce. Hermit's launch functions call this before any
-/// backend starts, so a library caller cannot run a v3 guest on host facts of
-/// its own, on another backend, or without the floating-point register write
-/// ban: the facts must be exactly the ones [`admit`] bound after the host
-/// qualified, and [`admit`] is the only way to bind them.
+/// Refuses a nondefault profile launch that this process did not admit.
+/// Hermit's library launch functions call this before any backend starts.
+/// Host mode requires its faulting proof and interception options; v3 also
+/// requires exactly the host facts [`admit`] bound after qualification and
+/// its floating-point register write ban.
 pub fn refuse_unadmitted_launch(
     config: &detcore::Config,
     ptrace: bool,
@@ -408,7 +571,27 @@ pub fn refuse_unadmitted_launch(
     if config.cpu_profile.is_default() {
         return Ok(());
     }
-    let refuse = |why: &str| Err(CpuProfileRefusal(why.to_owned()));
+    let refuse = |why: &str| Err(CpuProfileRefusal::new(config.cpu_profile, why));
+    if config.cpu_profile == CpuProfile::HostNoRdrand {
+        let request = AdmissionRequest {
+            backend: if ptrace { "ptrace" } else { "non-ptrace" },
+            ptrace,
+            virtualize_cpuid: config.virtualize_cpuid,
+            virtualize_time: config.virtualize_time,
+            strace_only: false,
+            gdbserver: config.gdbserver,
+            namespace_only: false,
+        };
+        check_host_no_rdrand_request(&request)
+            .map_err(|why| CpuProfileRefusal::new(config.cpu_profile, why))?;
+        if !HOST_NO_RDRAND_ADMITTED.load(std::sync::atomic::Ordering::Acquire) {
+            return refuse(
+                "this process did not verify CPUID faulting; call admit_host_no_rdrand \
+                 before launching the guest",
+            );
+        }
+        return Ok(());
+    }
     if !ptrace {
         return refuse("only the ptrace backend is qualified");
     }
@@ -490,6 +673,7 @@ mod tests {
             backend,
             ptrace: backend == "ptrace",
             virtualize_cpuid: true,
+            virtualize_time: true,
             strace_only: false,
             gdbserver: false,
             namespace_only: false,
@@ -533,7 +717,136 @@ mod tests {
         assert!(check_request(&r).unwrap_err().contains("--namespace-only"));
     }
 
-    /// The launch certificate, in one process (no other test admits): a v3
+    #[test]
+    fn host_profile_requires_interception_and_virtual_time() {
+        let mut host = qualifying_host();
+        assert_eq!(check_host_no_rdrand_cpuid(&host), Ok(()));
+        host.0.get_mut(&(7, 0)).unwrap()[3] |= 1 << 15;
+        assert!(
+            check_host_no_rdrand_cpuid(&host)
+                .unwrap_err()
+                .contains("use a homogeneous CPU host")
+        );
+        host.0.get_mut(&(7, 0)).unwrap()[3] &= !(1 << 15);
+        host.0.insert((0x8000_0000, 0), [0x8000_0026, 0, 0, 0]);
+        host.0.insert((0x8000_0026, 0), [1 << 30, 0, 0, 0]);
+        assert!(
+            check_host_no_rdrand_cpuid(&host)
+                .unwrap_err()
+                .contains("use a homogeneous CPU host")
+        );
+        host.0.get_mut(&(0x8000_0026, 0)).unwrap()[0] = 0;
+        assert_eq!(check_host_no_rdrand_cpuid(&host), Ok(()));
+        // An unsupported leaf can alias a supported leaf; honor the maximum.
+        host.0.get_mut(&(0x8000_0000, 0)).unwrap()[0] = 0x8000_0025;
+        host.0.get_mut(&(0x8000_0026, 0)).unwrap()[0] = 1 << 30;
+        assert_eq!(check_host_no_rdrand_cpuid(&host), Ok(()));
+        assert_eq!(check_host_no_rdrand_request(&request("ptrace")), Ok(()));
+        for backend in [
+            "kvm",
+            "dbt",
+            "sabre",
+            "liteinst",
+            "in-guest-trap",
+            "e9patch",
+        ] {
+            let refusal = check_host_no_rdrand_request(&request(backend)).unwrap_err();
+            assert!(
+                refusal.contains(&format!("--backend={backend}")),
+                "{refusal}"
+            );
+            assert!(refusal.contains("use --backend=ptrace"), "{refusal}");
+        }
+        for (r, option) in [
+            (
+                AdmissionRequest {
+                    virtualize_cpuid: false,
+                    ..request("ptrace")
+                },
+                "--no-virtualize-cpuid",
+            ),
+            (
+                AdmissionRequest {
+                    virtualize_time: false,
+                    ..request("ptrace")
+                },
+                "--no-virtualize-time",
+            ),
+            (
+                AdmissionRequest {
+                    strace_only: true,
+                    ..request("ptrace")
+                },
+                "--strace-only",
+            ),
+            (
+                AdmissionRequest {
+                    namespace_only: true,
+                    ..request("ptrace")
+                },
+                "--namespace-only",
+            ),
+        ] {
+            let refusal =
+                admit_host_no_rdrand_with(&r, || panic!("invalid request probed")).unwrap_err();
+            assert!(refusal.contains(&format!("remove {option}")), "{refusal}");
+        }
+        // Only v3 binds qualified FPU register state and forbids gdb writes.
+        let mut gdb = request("ptrace");
+        gdb.gdbserver = true;
+        assert_eq!(check_host_no_rdrand_request(&gdb), Ok(()));
+    }
+
+    #[test]
+    fn host_profile_refuses_absent_faulting_and_requires_admission_to_launch() {
+        let mut config = detcore::Config {
+            cpu_profile: CpuProfile::HostNoRdrand,
+            ..Default::default()
+        };
+        let unadmitted = refuse_unadmitted_launch(&config, true).unwrap_err();
+        assert!(unadmitted.reason.contains("did not verify CPUID faulting"));
+        let simulated = "CPUID faulting is unavailable: ARCH_SET_CPUID(0) failed";
+        let refusal =
+            admit_host_no_rdrand_with(&request("ptrace"), || Err(simulated.into())).unwrap_err();
+        assert_eq!(refusal, simulated);
+        assert!(refuse_unadmitted_launch(&config, true).is_err());
+
+        // A successful CPUID probe admits without v3 host facts or XSTATE
+        // calibration. The launch still rechecks interception requirements.
+        admit_host_no_rdrand_with(&request("ptrace"), || Ok(())).unwrap();
+        assert_eq!(refuse_unadmitted_launch(&config, true), Ok(()));
+        assert!(refuse_unadmitted_launch(&config, false).is_err());
+        config.virtualize_cpuid = false;
+        assert!(refuse_unadmitted_launch(&config, true).is_err());
+        config.virtualize_cpuid = true;
+        config.virtualize_time = false;
+        assert!(refuse_unadmitted_launch(&config, true).is_err());
+    }
+
+    #[test]
+    fn host_profile_recordings_are_refused_before_v3_host_checks() {
+        for profile in [CpuProfile::X86_64V2, CpuProfile::X86_64V3] {
+            assert_eq!(check_record_or_replay(profile), Ok(()));
+        }
+        let refused = check_record_or_replay(CpuProfile::HostNoRdrand).unwrap_err();
+        assert_eq!(refused.profile, CpuProfile::HostNoRdrand);
+        assert!(refused.reason.contains("record/replay is not supported"));
+        assert!(
+            refused
+                .reason
+                .contains("hermit run --cpu-profile=host-no-rdrand --verify")
+        );
+        assert_eq!(
+            precheck_replay(CpuProfile::HostNoRdrand, None, None),
+            Err(refused)
+        );
+        assert_eq!(
+            CpuProfileRefusal::new(CpuProfile::HostNoRdrand, "no faulting").to_string(),
+            "--cpu-profile host-no-rdrand refused: no faulting"
+        );
+    }
+
+    /// The launch certificate, in one process (no other test admits v3): a v3
     /// configuration with facts but no admission is refused; a refused
     /// request neither probes nor forbids floating-point writes; an admission
     /// forbids them before it is visible, and then exactly the admitted facts
@@ -558,7 +871,10 @@ mod tests {
             ..Default::default()
         };
         let unadmitted = refuse_unadmitted_launch(&config, true).unwrap_err();
-        assert!(unadmitted.0.contains("did not qualify"), "{unadmitted}");
+        assert!(
+            unadmitted.reason.contains("did not qualify"),
+            "{unadmitted}"
+        );
         assert_eq!(
             refuse_unadmitted_launch(&detcore::Config::default(), false),
             Ok(())
@@ -601,7 +917,9 @@ mod tests {
         config.cpu_profile_host = Some(other);
         let forged = refuse_unadmitted_launch(&config, true).unwrap_err();
         assert!(
-            forged.0.contains("not the ones this process qualified"),
+            forged
+                .reason
+                .contains("not the ones this process qualified"),
             "{forged}"
         );
         config.cpu_profile_host = None;
@@ -648,7 +966,7 @@ mod tests {
             Some("the qualification it passed")
         );
         assert_eq!(
-            CpuProfileRefusal("why".into()).to_string(),
+            CpuProfileRefusal::new(CpuProfile::X86_64V3, "why").to_string(),
             "--cpu-profile x86-64-v3 refused: why"
         );
     }

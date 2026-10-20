@@ -11,7 +11,7 @@
 use serde::Deserialize;
 use serde::Serialize;
 
-/// Which x86-64 microarchitecture level the virtual CPUID table describes.
+/// Which intercepted CPUID answers the guest receives.
 #[derive(
     Debug,
     Clone,
@@ -36,6 +36,11 @@ pub enum CpuProfile {
     #[value(name = "x86-64-v3")]
     #[serde(rename = "x86-64-v3")]
     X86_64V3,
+    /// Host CPUID with hardware-randomness and unvirtualized timing features
+    /// hidden. Requires CPUID faulting and virtual time on the ptrace backend.
+    #[value(name = "host-no-rdrand")]
+    #[serde(rename = "host-no-rdrand")]
+    HostNoRdrand,
 }
 
 impl CpuProfile {
@@ -50,6 +55,7 @@ impl CpuProfile {
         match self {
             CpuProfile::X86_64V2 => "x86-64-v2",
             CpuProfile::X86_64V3 => "x86-64-v3",
+            CpuProfile::HostNoRdrand => "host-no-rdrand",
         }
     }
 }
@@ -122,9 +128,34 @@ macro_rules! v3_residual {
 /// the `--cpu-profile` help, `--verify` output, the recording and the docs.
 pub const V3_RESIDUAL: &str = v3_residual!();
 
+/// The host-profile caveat, shared by help and admission diagnostics.
+#[macro_export]
+macro_rules! host_no_rdrand_residual {
+    () => {
+        "With --cpu-profile host-no-rdrand, CPUID remains intercepted, but its answers \
+         come from the host CPU with hardware-randomness and unvirtualized timing \
+         features hidden. Results are host-CPU-model specific: cross-host builds need \
+         the same CPU model and compatible kernel/XSTATE settings and CPU topology. Host XSAVE behavior \
+         is retained without the x86-64-v3 XSTATE qualification, so programs inspecting \
+         XSAVE or signal-register metadata have no determinism guarantee. Programs must honor \
+         the advertised feature bits; unconditional RDRAND or RDSEED is not trapped \
+         by this profile."
+    };
+}
+
+pub const HOST_NO_RDRAND_RESIDUAL: &str = host_no_rdrand_residual!();
+
 /// The long help of `--cpu-profile`, for `hermit run` and `hermit record start`.
 pub const CPU_PROFILE_LONG_HELP: &str = concat!(
-    "The CPU the guest sees: x86-64-v2 (the default) or x86-64-v3. v3 is offered only on \
+    "The CPU the guest sees: x86-64-v2 (the default), x86-64-v3, or host-no-rdrand. \
+     host-no-rdrand is available for `hermit run` on the ptrace backend with CPUID \
+     faulting and virtual time; it refuses hosts without CPUID faulting instead of \
+     allowing native CPUID. RDRAND and RDSEED are hidden. Check availability with \
+     `hermit host-capabilities --cpu-profile host-no-rdrand`. Recording and replay \
+     with host-no-rdrand are not supported.\n\n",
+    host_no_rdrand_residual!(),
+    "\n\n",
+    "v3 is offered only on \
      the ptrace backend, on hosts that pass a startup qualification \
      (`hermit host-capabilities --cpu-profile x86-64-v3` runs it alone). A recording binds \
      the host facts its guest's answers come from, and replay refuses a host where any of \
@@ -149,5 +180,6 @@ mod tests {
         assert_eq!(CpuProfile::default(), CpuProfile::X86_64V2);
         assert!(CpuProfile::X86_64V2.is_default());
         assert!(!CpuProfile::X86_64V3.is_default());
+        assert!(!CpuProfile::HostNoRdrand.is_default());
     }
 }

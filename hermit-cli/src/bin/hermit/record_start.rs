@@ -555,7 +555,10 @@ impl StartOpts {
     }
 
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        if !self.cpu_profile.is_default() {
+        hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
+            |refusal| Error::new(crate::container::PolicyRefusal).context(refusal.to_string()),
+        )?;
+        if self.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
             super::verify::CPU_PROFILE_V3_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
             // Qualify here, before any container: a refusal ends the command at
             // once, and the recorder and replayer reuse the result.
@@ -642,7 +645,8 @@ impl StartOpts {
             eprintln!("\n{}\n", "RECORDING COMPLETE!".yellow().bold());
             // A v3 recording replays only to the end: a GDB- or DAP-served
             // replay runs a gdbserver, which v3 refuses.
-            let autopilot_only = !self.cpu_profile.is_default();
+            let autopilot_only =
+                self.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3;
             for (label, command) in
                 replay_hint_commands(&recording.id.to_string(), self.data_dir.as_deref())
                     .into_iter()

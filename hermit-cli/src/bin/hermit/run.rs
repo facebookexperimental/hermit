@@ -6108,10 +6108,9 @@ impl RunOpts {
     /// it would only reach the build-feature refusal one run later. Such a
     /// build skips it, and `refuse_liteinst_without_the_feature` names the
     /// missing feature instead.
-    /// Admits `--cpu-profile x86-64-v3` on this host and binds the host facts
-    /// the guest's leaf 0xD and xstate answers come from, or refuses the run
-    /// by name (<https://github.com/rrnewton/hermit/issues/4243>). A v2 run is
-    /// untouched.
+    /// Admit a nondefault CPU profile, with its own required host checks.
+    /// v3 binds qualified XSTATE facts; host-no-rdrand requires CPUID faulting
+    /// without running the v3 XSTATE qualification. A v2 run is untouched.
     fn admit_cpu_profile(&mut self) -> Result<(), Error> {
         let config = &self.det_opts.det_config;
         if config.cpu_profile.is_default() {
@@ -6122,10 +6121,20 @@ impl RunOpts {
             backend: backend.as_str(),
             ptrace: backend == Backend::Ptrace,
             virtualize_cpuid: config.virtualize_cpuid,
+            virtualize_time: config.virtualize_time,
             strace_only: self.strace_only,
             gdbserver: config.gdbserver,
             namespace_only: self.namespace_only,
         };
+        if config.cpu_profile == detcore_model::cpu_profile::CpuProfile::HostNoRdrand {
+            hermit::cpu_profile_admission::admit_host_no_rdrand(&request).map_err(|refusal| {
+                Error::new(PolicyRefusal)
+                    .context(format!("--cpu-profile host-no-rdrand refused: {refusal}"))
+            })?;
+            tracing::info!("--cpu-profile host-no-rdrand admitted: CPUID faulting verified");
+            eprintln!("{}", detcore_model::cpu_profile::HOST_NO_RDRAND_RESIDUAL);
+            return Ok(());
+        }
         match hermit::cpu_profile_admission::admit(&request) {
             Ok((probe, host)) => {
                 tracing::info!(
@@ -10231,8 +10240,8 @@ impl RunOpts {
     ///   specification, so `run` hands the scheduler none.
     /// - `--verify-run`: only `main` dispatches to `verify_run()`.
     /// - `--backend-engagement-json`: only `main` writes it.
-    /// - `--cpu-profile x86-64-v3`: only `main` runs the host qualification
-    ///   and admits the profile (<https://github.com/rrnewton/hermit/issues/4243>).
+    /// - Nondefault `--cpu-profile`: only `main` runs the required host checks
+    ///   and admits the profile.
     ///
     /// `--skid-margin` is not listed: `hermit analyze` and `hermit bisect`
     /// install it for their trials themselves (`install_pmu_config`).
@@ -10243,7 +10252,12 @@ impl RunOpts {
             // Only `main` runs the host qualification the profile admits with.
             (
                 !self.det_opts.det_config.cpu_profile.is_default(),
-                "--cpu-profile x86-64-v3",
+                match self.det_opts.det_config.cpu_profile {
+                    detcore_model::cpu_profile::CpuProfile::HostNoRdrand => {
+                        "--cpu-profile host-no-rdrand"
+                    }
+                    _ => "--cpu-profile x86-64-v3",
+                },
             ),
             (self.verify_run.is_some(), "--verify-run"),
             (self.happens_before.is_some(), "--happens-before"),

@@ -23,8 +23,8 @@ pub struct HostCapabilitiesOpts {
     json: bool,
 
     /// Also run the startup qualification of this CPU profile and report its
-    /// verdict. For x86-64-v3 that is the XINUSE probe; a host that fails it
-    /// is reported with the reason and exit status 122.
+    /// verdict. x86-64-v3 runs the XINUSE probe; host-no-rdrand checks CPUID
+    /// faulting without the XINUSE probe. A refusal names its reason and exits 122.
     #[clap(long, value_enum)]
     cpu_profile: Option<CpuProfile>,
 }
@@ -172,6 +172,29 @@ fn qualify_cpu_profile(profile: CpuProfile) -> Result<ExitStatus, Error> {
             "{profile}: QUALIFIED — the default profile needs no qualification"
         )?;
         return Ok(ExitStatus::Exited(0));
+    }
+    if profile == CpuProfile::HostNoRdrand {
+        return match hermit::cpu_profile_admission::qualify_host_no_rdrand() {
+            Ok(()) => {
+                writeln!(
+                    stdout,
+                    "{profile}: QUALIFIED — CPUID faulting verified with \
+                     ARCH_GET_CPUID / ARCH_SET_CPUID(0); CPUID remains intercepted"
+                )?;
+                writeln!(
+                    stdout,
+                    "{}",
+                    detcore_model::cpu_profile::HOST_NO_RDRAND_RESIDUAL
+                )?;
+                Ok(ExitStatus::Exited(0))
+            }
+            Err(refusal) => {
+                writeln!(stdout, "{profile}: REFUSED — {refusal}")?;
+                Ok(ExitStatus::Exited(
+                    detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+                ))
+            }
+        };
     }
     // The whole host qualification a v3 run admits with, not the probe alone.
     match hermit::cpu_profile_admission::qualify_host() {
