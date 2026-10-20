@@ -10,8 +10,11 @@ controller) receives SIGUSR1, which `hermit run --signal-at turn=N:SIGUSR1`
 sends after scheduler turn N.
 
 usage: signal_at_snapshot.py QEMU WORKDIR
-Prints "snapshot bytes=<n> sha256=<hex>". QEMU is given paths relative to
-WORKDIR, so the snapshot does not depend on where WORKDIR is.
+Prints "snapshot bytes=<n> sha256=<hex>" and exits 0 only when every QMP
+command succeeded, the migration completed, QEMU exited 0 and the snapshot is
+not empty; otherwise it says why on stderr and exits 1. It writes "waiting for
+SIGUSR1" to stderr once QMP is ready. QEMU is given paths relative to WORKDIR,
+so the snapshot does not depend on where WORKDIR is.
 """
 
 import hashlib
@@ -31,16 +34,27 @@ def on_usr1(signo, frame):
     signalled = True
 
 
+def fail(message):
+    print("signal_at_snapshot: " + message, file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
 def qmp(sock_file, command, arguments=None):
+    """Send a QMP command and return its "return" value; fail on an error."""
     message = {"execute": command}
     if arguments is not None:
         message["arguments"] = arguments
     sock_file.write((json.dumps(message) + "\n").encode())
     sock_file.flush()
     while True:
-        reply = json.loads(sock_file.readline())
-        if "return" in reply or "error" in reply:
-            return reply
+        line = sock_file.readline()
+        if not line:
+            fail("QMP {} got no reply: QEMU closed the socket".format(command))
+        reply = json.loads(line)
+        if "error" in reply:
+            fail("QMP {} failed: {}".format(command, reply["error"]))
+        if "return" in reply:
+            return reply["return"]
 
 
 def main():
@@ -69,16 +83,25 @@ def main():
     sock_file = sock.makefile("rwb")
     json.loads(sock_file.readline())
     qmp(sock_file, "qmp_capabilities")
+    print("waiting for SIGUSR1", file=sys.stderr, flush=True)
     while not signalled:
         time.sleep(0.001)
     qmp(sock_file, "stop")
     qmp(sock_file, "migrate", {"uri": "file:" + snapshot})
-    while qmp(sock_file, "query-migrate")["return"].get("status") not in (
-        "completed", "failed", "cancelled"):
+    while True:
+        status = qmp(sock_file, "query-migrate").get("status")
+        if status in ("completed", "failed", "cancelled"):
+            break
         time.sleep(0.001)
+    if status != "completed":
+        fail("the migration did not complete: status={}".format(status))
     qmp(sock_file, "quit")
-    proc.wait()
+    exit_status = proc.wait()
+    if exit_status != 0:
+        fail("QEMU exited with status {}".format(exit_status))
     data = open(snapshot, "rb").read()
+    if not data:
+        fail("the snapshot is empty")
     print("snapshot bytes={} sha256={}".format(len(data), hashlib.sha256(data).hexdigest()))
 
 

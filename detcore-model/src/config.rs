@@ -871,9 +871,12 @@ pub struct Config {
 
     /// Send SIGNAL to the run's root process once the scheduler has committed
     /// turn N, as a timer expiry is sent (`turn=N:SIGNAL`, SIGNAL a name such
-    /// as `SIGUSR1` or a number). The turn is a deterministic point of the
-    /// run, so a process in the run that waits for the signal acts at the
-    /// same point every time: for example a controller that stops QEMU and
+    /// as `SIGUSR1` or a number, not SIGKILL or SIGSTOP). It is sent before
+    /// the next turn is selected, after the first `COMMIT turn M` with M >= N:
+    /// turn numbers also count the turns the scheduler skips, so if turn N
+    /// was skipped, after the next commit. The turn is a deterministic point
+    /// of the run, so a process in the run that waits for the signal acts at
+    /// the same point every time: for example a controller that stops QEMU and
     /// saves a snapshot there. The run itself goes on. Only with
     /// `--sequentialize-threads`, where the scheduler numbers turns.
     #[clap(long, value_name = "turn=N:SIGNAL", value_parser = parse_signal_at)]
@@ -1818,6 +1821,18 @@ fn parse_signal_at(src: &str) -> Result<SignalAt, String> {
         Err(_) => signal.parse::<nix::sys::signal::Signal>(),
     }
     .map_err(|_| format!("{signal:?} in {src:?} names no signal"))?;
+    // Neither can be caught, blocked or ignored, so Linux acts on them in the
+    // kernel at once: SIGKILL retires the root outside the scheduler's
+    // SIGKILL retirement protocol, and SIGSTOP stops it outside the schedule.
+    if matches!(
+        signal,
+        nix::sys::signal::Signal::SIGKILL | nix::sys::signal::Signal::SIGSTOP
+    ) {
+        return Err(format!(
+            "{signal} in {src:?} cannot be caught or blocked; --signal-at sends only \
+             signals the guest can handle"
+        ));
+    }
     Ok(SignalAt {
         turn,
         signal: signal as i32,
@@ -4338,6 +4353,39 @@ mod tests {
                 bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
             assert_eq!(read, wire.len());
             assert_eq!(decoded.signal_at, signal_at);
+        }
+    }
+
+    /// `--signal-at` takes `turn=N:SIGNAL` with SIGNAL a name or a number.
+    /// SIGKILL and SIGSTOP are refused, by name or number: the kernel acts on
+    /// them at once, outside the scheduler's protocols for them.
+    #[test]
+    fn signal_at_parses_a_turn_and_a_catchable_signal() {
+        let usr1 = SignalAt {
+            turn: 500,
+            signal: libc::SIGUSR1,
+        };
+        assert_eq!(parse_signal_at("turn=500:SIGUSR1"), Ok(usr1));
+        assert_eq!(parse_signal_at("turn=500:10"), Ok(usr1));
+        for refused in [
+            "turn=500:SIGKILL",
+            "turn=500:9",
+            "turn=500:SIGSTOP",
+            "turn=500:19",
+        ] {
+            let error = parse_signal_at(refused).unwrap_err();
+            assert!(
+                error.contains("cannot be caught or blocked"),
+                "{refused}: {error}"
+            );
+        }
+        for malformed in [
+            "turn=500",
+            "500:SIGUSR1",
+            "turn=-1:SIGUSR1",
+            "turn=5:SIGNOPE",
+        ] {
+            assert!(parse_signal_at(malformed).is_err(), "{malformed}");
         }
     }
 

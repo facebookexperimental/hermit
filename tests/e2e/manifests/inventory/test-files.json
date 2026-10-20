@@ -4406,9 +4406,15 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/qemu-boot/fake_qmp_qemu.py",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/qemu-boot/fake_qmp_qemu.py is owned by hermit-cli/tests/cli.rs: the CLI test signal_at_snapshot_controller_counts_only_a_completed_snapshot gives it to tests/qemu-boot/signal_at_snapshot.py in place of qemu-system-x86_64. It speaks just enough QMP to make a migration fail, be cancelled, return a QMP error, or exit nonzero, so the test can check that the controller reports each as a failure rather than a snapshot."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/qemu-boot/signal_at_snapshot.py",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/qemu-boot/signal_at_snapshot.py is owned by hermit-cli/tests/cli.rs: the CLI test signal_at_stops_qemu_at_the_same_point_in_two_runs runs it as the root process of two hermit runs with --signal-at turn=3000:SIGUSR1; it stops a firmware-only QEMU machine over QMP when the signal arrives and saves a migration snapshot, which must be byte-identical in both runs (minibeads dh-3w3ia). It is not run where the host has no qemu-system-x86_64."
+      "why": "tests/qemu-boot/signal_at_snapshot.py is owned by hermit-cli/tests/cli.rs: the CLI tests signal_at_stops_qemu_at_the_same_point_in_two_runs and signal_at_snapshot_controller_counts_only_a_completed_snapshot run it; the first runs it as the root process of two hermit runs with --signal-at turn=3000:SIGUSR1; it stops a firmware-only QEMU machine over QMP when the signal arrives and saves a migration snapshot, which must be byte-identical in both runs (minibeads dh-3w3ia). It is not run where the host has no qemu-system-x86_64."
     },
     {
       "disposition": "special-driver",

@@ -4250,6 +4250,71 @@ fn a_work_span_report_path_with_a_parent_component_is_refused() {
     plain.validate_work_span_report_visibility().unwrap();
 }
 
+/// `--signal-at` is accepted on the ptrace backend, with or without e9patch
+/// preprocessing, and refused before launch wherever it would not reach the
+/// guest: every other backend (on KVM a host kill reaches the sandbox
+/// monitor), `--namespace-only` and `--lite`, `--strace-only` and
+/// `--no-sequentialize-threads`.
+#[test]
+fn signal_at_is_refused_where_it_would_not_reach_the_guest() {
+    for backend in ["ptrace", "e9patch"] {
+        let backend = format!("--backend={backend}");
+        let argv = [
+            "hermit",
+            backend.as_str(),
+            "run",
+            "--signal-at=turn=5:SIGUSR1",
+            "fakeprog",
+        ];
+        if let Err(error) = run_opts_for(&argv).validate_args_with_perf_support(true) {
+            assert!(
+                !error.to_string().contains("signal-at"),
+                "{argv:?}: {error}"
+            );
+        }
+    }
+    let mut refused: Vec<(Vec<String>, String)> =
+        ["dbt", "liteinst", "in-guest-trap", "sabre", "kvm"]
+            .iter()
+            .map(|backend| {
+                (
+                    vec![format!("--backend={backend}"), "run".to_owned()],
+                    format!("backend `{backend}` is refused"),
+                )
+            })
+            .collect();
+    for (flag, expected) in [
+        (
+            "--namespace-only",
+            "--namespace-only (--lite) runs the guest natively",
+        ),
+        (
+            "--lite",
+            "--namespace-only (--lite) runs the guest natively",
+        ),
+        ("--strace-only", "--strace-only turns sequentialization off"),
+        (
+            "--no-sequentialize-threads",
+            "cannot be combined with --no-sequentialize-threads",
+        ),
+    ] {
+        refused.push((vec!["run".to_owned(), flag.to_owned()], expected.to_owned()));
+    }
+    for (prefix, expected) in refused {
+        let mut argv = vec!["hermit".to_owned()];
+        argv.extend(prefix);
+        argv.extend([
+            "--signal-at=turn=5:SIGUSR1".to_owned(),
+            "fakeprog".to_owned(),
+        ]);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let error = run_opts_for(&argv)
+            .validate_args_with_perf_support(true)
+            .unwrap_err();
+        assert!(error.to_string().contains(&expected), "{argv:?}: {error}");
+    }
+}
+
 /// `--pipe-wake-latency` parses, is rendered into the reproduce command and
 /// round-trips, keeping `0` distinct from unset. It is refused wherever it
 /// would be ignored: without sequentialized threads, with `--namespace-only`
@@ -7282,6 +7347,40 @@ impl RunOpts {
                     "--futex-wake-yields has been tested only on the ptrace backend (and e9patch \
                      preprocessing, which runs on it); backend `{}` is refused until its \
                      handoff is tested",
+                    backend.as_str()
+                );
+            }
+        }
+        // `--signal-at` is sent by Detcore's scheduler, through the signal
+        // path of the ptrace backend (with or without e9patch preprocessing).
+        // Every other launch would accept it and never send it, or send it
+        // somewhere other than the guest: on KVM the root is virtual and a
+        // host kill reaches the sandbox monitor. So they refuse it before
+        // launch.
+        if let Some(at) = config.signal_at {
+            if self.namespace_only {
+                anyhow::bail!(
+                    "--signal-at={at} needs Detcore's scheduler; --namespace-only (--lite) runs \
+                     the guest natively, without it"
+                );
+            }
+            if self.strace_only {
+                anyhow::bail!(
+                    "--signal-at={at} counts the turns of sequentialized threads; --strace-only \
+                     turns sequentialization off"
+                );
+            }
+            if !config.sequentialize_threads {
+                anyhow::bail!(
+                    "--signal-at={at} counts the turns of sequentialized threads; it cannot be \
+                     combined with --no-sequentialize-threads"
+                );
+            }
+            if !matches!(backend, Backend::Ptrace | Backend::E9patch) {
+                anyhow::bail!(
+                    "--signal-at is supported only on the ptrace backend (and e9patch \
+                     preprocessing, which runs on it); backend `{}` is refused until it sends \
+                     the signal to the guest",
                     backend.as_str()
                 );
             }

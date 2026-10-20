@@ -8180,6 +8180,145 @@ fn signal_at_stops_qemu_at_the_same_point_in_two_runs() {
     assert_eq!(snapshots[0], snapshots[1]);
 }
 
+/// `--signal-at=turn=N` is sent once turn N has been committed and before
+/// the next turn: in the `--log info` trace of a run, the send comes after
+/// the line `COMMIT turn N` and before any later COMMIT, and names turn N.
+/// Under `--no-namespace` (which `--strict` refuses) the root keeps its host
+/// pid as its id, and the signal still reaches it.
+#[test]
+fn signal_at_is_sent_after_commit_n_and_before_the_next_commit() {
+    let guest = compiled_c_guest(&SIGNAL_AT_TURN_GUEST, "signal_at_turn");
+    let guest = guest.to_str().unwrap();
+    let commit = |line: &str| -> Option<u64> {
+        let rest = line.split(" COMMIT turn ").nth(1)?;
+        rest.split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()
+    };
+    for namespace in [&["--strict"][..], &["--no-namespace"][..]] {
+        let mut args = vec!["--log", "info", "run"];
+        args.extend_from_slice(namespace);
+        args.extend(["--signal-at=turn=500:SIGUSR1", "--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let received = stdout(&output);
+        assert!(
+            received.starts_with("signal at iteration ") && !received.contains("iteration -1"),
+            "{namespace:?}: the root got no signal: {received}"
+        );
+        let log = stderr(&output);
+        let lines: Vec<&str> = log.lines().collect();
+        let send = lines
+            .iter()
+            .position(|line| line.contains("(--signal-at turn=500)"))
+            .unwrap_or_else(|| panic!("{namespace:?}: no --signal-at send in the log"));
+        assert!(
+            lines[send].contains("after committed turn 500:"),
+            "{namespace:?}: {}",
+            lines[send]
+        );
+        assert!(
+            lines.iter().any(|line| commit(line) == Some(500)),
+            "{namespace:?}: turn 500 was not committed, so this run cannot pin the boundary"
+        );
+        let before = lines[..send].iter().rev().find_map(|line| commit(line));
+        assert_eq!(
+            before,
+            Some(500),
+            "{namespace:?}: the last commit before the send"
+        );
+    }
+}
+
+/// The QEMU snapshot controller counts a snapshot only when it is one: with
+/// a stand-in QEMU (tests/qemu-boot/fake_qmp_qemu.py) it prints the snapshot
+/// and exits 0 when every step succeeds, and exits 1 with the reason when
+/// the migration failed or was cancelled, a QMP command failed, QEMU
+/// exited nonzero, or the snapshot is empty. Runs natively; needs only python3.
+#[test]
+fn signal_at_snapshot_controller_counts_only_a_completed_snapshot() {
+    let test = "signal_at_snapshot_controller_counts_only_a_completed_snapshot";
+    let python = Path::new("/usr/bin/python3");
+    if !python.is_file() {
+        eprintln!("{test}: NOT RUN: /usr/bin/python3 is not installed");
+        return;
+    }
+    let scripts = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("tests/qemu-boot");
+    for (case, env, expected) in [
+        ("completed", &[][..], None),
+        (
+            "failed",
+            &[("FAKE_QEMU_MIGRATION_STATUS", "failed")][..],
+            Some("status=failed"),
+        ),
+        (
+            "cancelled",
+            &[("FAKE_QEMU_MIGRATION_STATUS", "cancelled")][..],
+            Some("status=cancelled"),
+        ),
+        (
+            "migrate error",
+            &[("FAKE_QEMU_ERROR_ON", "migrate")][..],
+            Some("QMP migrate failed"),
+        ),
+        (
+            "exit 23",
+            &[("FAKE_QEMU_EXIT", "23")][..],
+            Some("QEMU exited with status 23"),
+        ),
+        (
+            "empty",
+            &[("FAKE_QEMU_EMPTY_SNAPSHOT", "1")][..],
+            Some("the snapshot is empty"),
+        ),
+    ] {
+        let dir = process_build_root(&format!("signal-at-controller-{}", case.replace(' ', "-")));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create the case's directory");
+        let mut child = Command::new(python)
+            .arg(scripts.join("signal_at_snapshot.py"))
+            .arg(scripts.join("fake_qmp_qemu.py"))
+            .arg(&dir)
+            .envs(env.iter().copied())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the controller");
+        let mut stderr_lines = std::io::BufReader::new(child.stderr.take().unwrap()).lines();
+        let ready = stderr_lines.next().and_then(Result::ok).unwrap_or_default();
+        assert_eq!(ready, "waiting for SIGUSR1", "{case}");
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGUSR1).expect("signal it");
+        let rest: Vec<String> = stderr_lines.map_while(Result::ok).collect();
+        let output = child.wait_with_output().expect("wait for the controller");
+        let out = String::from_utf8_lossy(&output.stdout);
+        match expected {
+            None => {
+                assert!(output.status.success(), "{case}: {rest:?}");
+                assert!(
+                    out.starts_with("snapshot bytes=13 sha256="),
+                    "{case}: {out}"
+                );
+            }
+            Some(reason) => {
+                // EXIT-CLASS: guest. The controller runs natively, not under
+                // hermit, and exits 1 when the snapshot is not a snapshot.
+                assert_eq!(output.status.code(), Some(1), "{case}: {rest:?}");
+                assert!(out.is_empty(), "{case}: printed a snapshot: {out}");
+                assert!(
+                    rest.iter().any(|line| line.contains(reason)),
+                    "{case}: {rest:?}"
+                );
+            }
+        }
+    }
+}
+
 /// Under `--no-namespace`, a mount holding the guest's working directory is
 /// shown, and a host mount that is neither a base mountpoint nor a launch
 /// mount stays hidden: a file on it reports, in fdinfo `mnt_id`, the row of

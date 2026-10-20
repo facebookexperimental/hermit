@@ -2012,9 +2012,13 @@ pub struct Scheduler {
     /// A cached copy of the same (immutable) field in Config.
     stop_after_turn: Option<u64>,
 
-    /// `Config::signal_at`: the turn after which the run's root process is
-    /// sent the signal, until it is sent.
+    /// `Config::signal_at`: the turn after whose commit the run's root
+    /// process is sent the signal, until it is sent.
     signal_at: Option<detcore_model::config::SignalAt>,
+    /// The number of the last `COMMIT turn`, set where `unblock_guest`
+    /// commits it. `turn` itself names the next turn and also advances on
+    /// the turns the scheduler skips.
+    last_committed_turn: Option<u64>,
     /// A cached copy of the same (immutable) field in Config.
     stop_after_iter: Option<u64>,
     /// A cached copy of the same (immutable) field in Config.
@@ -2192,6 +2196,11 @@ use self::replayer::DesyncStats;
 use self::replayer::Replayer;
 
 impl ThreadTree {
+    /// The run's root process: the one thread added without a parent.
+    pub fn root(&self) -> Option<DetTid> {
+        self.root
+    }
+
     /// Internal helper. Add a [child] process to the tree, with the parent being `None`
     /// if it's the root of the tree.
     fn add_edge(&mut self, parent: Option<DetTid>, child: DetTid) {
@@ -3897,6 +3906,7 @@ impl Scheduler {
             stacktrace_events,
             stop_after_turn: cfg.stop_after_turn,
             signal_at: cfg.signal_at,
+            last_committed_turn: None,
             stop_after_iter: cfg.stop_after_iter,
             recordreplay_modes: cfg.recordreplay_modes,
             fast_timer_period: LogicalTime::from_nanos(
@@ -7221,26 +7231,34 @@ impl Scheduler {
             .is_some_and(|dettid| dettid.as_raw() == observed)
     }
 
-    /// `--signal-at` (`Config::signal_at`): once turn N has been committed,
-    /// send the signal to the run's root process as a timer expiry is sent.
-    /// It runs here, before the next thread is selected, where every thread
-    /// is parked, so the send lands at the same point of every run.
+    /// `--signal-at` (`Config::signal_at`): once a turn numbered N or later
+    /// has been committed (`last_committed_turn`), send the signal to the
+    /// run's root process as a timer expiry is sent. It runs at the end of
+    /// `step2_drain_prefix`, after its barriers and before the next thread is
+    /// selected, where every thread is parked, so the send lands at the same
+    /// point of every run. The root is the thread tree's root, which is not
+    /// `ROOT_DETPID` under `--no-namespace`. A root that has exited gets
+    /// nothing.
     fn send_signal_at(&mut self) {
         let Some(at) = self.signal_at else {
             return;
         };
-        if self.turn < at.turn {
+        let Some(committed) = self.last_committed_turn.filter(|turn| *turn >= at.turn) else {
             return;
-        }
+        };
         self.signal_at = None;
+        let Some(root) = self.thread_tree.root() else {
+            warn!("[scheduler] --signal-at: the run has no root process to signal");
+            return;
+        };
         match Signal::try_from(at.signal) {
             Ok(signal) => {
                 info!(
-                    "[scheduler] after turn {}: sending {} to the root process (--signal-at)",
-                    self.turn, signal
+                    "[scheduler] after committed turn {}: sending {} to the root process {} \
+                     (--signal-at turn={})",
+                    committed, signal, root, at.turn
                 );
-                let root = crate::consts::ROOT_DETPID;
-                self.fire_alarm(root, DetTid::from_raw(root.as_raw()), signal);
+                self.fire_alarm(DetPid::from_raw(root.as_raw()), root, signal);
             }
             Err(_) => warn!("[scheduler] --signal-at names no signal: {}", at.signal),
         }
@@ -7258,7 +7276,6 @@ impl Scheduler {
             return Err(SkipTurn);
         }
         self.flush_parent_death_signals();
-        self.send_signal_at();
         if self.sigkill_fence_holds() {
             // A SIGKILLed process was retired at the kill turn: select no
             // turn until its physical exit is accounted and published to its
@@ -7332,6 +7349,10 @@ impl Scheduler {
         self.step2a_wait_for_background_entry()?;
         self.step2a_wait_for_exited_leaders()?;
         self.step2a_wait_for_exited_threads()?;
+        // After every barrier, as a timer's signal is sent: a thread on its
+        // way into a background call under a temporary mask has installed
+        // it, so host timing cannot choose which thread takes the signal.
+        self.send_signal_at();
         Ok(())
     }
 
@@ -14017,6 +14038,7 @@ impl Scheduler {
         if self.work_span.enabled {
             self.work_span_commit(dtid, work_span_request.as_ref());
         }
+        self.last_committed_turn = Some(self.turn);
         self.turn += 1;
         let answer = if fatal_alarm {
             SchedResponse::InGuestFatalAlarm
@@ -25412,6 +25434,8 @@ mod test {
     /// leaves unblocked, could reach it on its way into the kernel or not, as
     /// host timing decided (https://github.com/rrnewton/hermit/issues/3993).
     /// A call that sleeps under the thread's own mask needs no barrier.
+    /// `--signal-at` sends its process-directed signal behind the same
+    /// barrier: nothing while it holds, once it has settled.
     #[test]
     fn a_background_call_with_a_temporary_mask_holds_the_schedule_until_the_kernel_installs_it() {
         let alrm = kernel_signal_bit(libc::SIGALRM);
@@ -25434,14 +25458,29 @@ mod test {
                 Some(alrm),
             );
             let case = format!("own={own:#x} installed_then_left={installed_then_left:?}");
+            // The root's `--signal-at` turn has been committed.
+            scheduler.signal_at = Some(detcore_model::config::SignalAt {
+                turn: 7,
+                signal: libc::SIGALRM,
+            });
+            scheduler.last_committed_turn = Some(7);
+            scheduler.test_sent_signals = Some(Vec::new());
+            let sent = |scheduler: &Scheduler| scheduler.test_sent_signals.as_ref().unwrap().len();
             let Some(installed) = installed_then_left else {
                 assert!(scheduler.background_entry_barriers.is_empty(), "{case}");
                 assert!(scheduler.step2_drain_prefix().is_ok(), "{case}");
+                assert_eq!(sent(&scheduler), 1, "{case}");
                 continue;
             };
             // Still on its way into the kernel, under its own mask.
             assert!(scheduler.step2_drain_prefix().is_err(), "{case}");
             assert!(scheduler.step2_drain_prefix().is_err(), "{case}");
+            assert_eq!(
+                sent(&scheduler),
+                0,
+                "{case}: sent before the barrier settled"
+            );
+            assert!(scheduler.signal_at.is_some(), "{case}");
             if installed {
                 scheduler
                     .test_kernel_signal_states
@@ -25453,6 +25492,46 @@ mod test {
             }
             assert!(scheduler.step2_drain_prefix().is_ok(), "{case}");
             assert!(scheduler.background_entry_barriers.is_empty(), "{case}");
+            assert_eq!(sent(&scheduler), 1, "{case}");
+            assert_eq!(scheduler.signal_at, None, "{case}");
+        }
+    }
+
+    /// `--signal-at turn=N` is sent once a turn numbered N or later has been
+    /// committed, and only then: not when `turn`, which names the next turn
+    /// and also counts skipped ones, has passed N while the last commit is
+    /// earlier. If turn N itself was skipped, the next commit sends it. It
+    /// goes to the thread tree's root, here 100 rather than `ROOT_DETPID`
+    /// (as under `--no-namespace`), and only once.
+    #[test]
+    fn signal_at_is_sent_after_the_first_commit_numbered_n_or_later() {
+        for (commits, sent_after) in [(&[4u64, 5, 6][..], Some(5u64)), (&[3, 4, 6][..], Some(6))] {
+            let (mut scheduler, root, _creator, _child) = sigchld_family(libc::SIGCHLD);
+            scheduler.models_signal_targets = true;
+            scheduler.signal_at = Some(detcore_model::config::SignalAt {
+                turn: 5,
+                signal: libc::SIGUSR1,
+            });
+            scheduler.test_sent_signals = Some(Vec::new());
+            assert!(scheduler.step2_drain_prefix().is_ok());
+            for commit in commits {
+                // Skipped turns have moved `turn` past the commit.
+                scheduler.turn = commit + 2;
+                scheduler.last_committed_turn = Some(*commit);
+                assert!(scheduler.step2_drain_prefix().is_ok());
+                let sent = scheduler.test_sent_signals.clone().unwrap();
+                if Some(*commit) < sent_after {
+                    assert!(sent.is_empty(), "{commits:?}: sent after commit {commit}");
+                } else {
+                    assert_eq!(sent.len(), 1, "{commits:?}: after commit {commit}");
+                    assert_eq!(sent[0].1, libc::SIGUSR1);
+                    assert_eq!(
+                        scheduler.thread_tree.thread_to_leader.get(&sent[0].0),
+                        Some(&DetPid::from_raw(root.as_raw())),
+                        "{commits:?}: not sent to the root process"
+                    );
+                }
+            }
         }
     }
 
