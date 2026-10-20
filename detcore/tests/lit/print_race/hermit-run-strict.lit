@@ -1,4 +1,7 @@
-// We see a precise alternating behavior with round-robin scheduling:
+// We see a precise alternating behavior with round-robin scheduling. Which
+// thread writes first is a property of the scheduler, not of this test, so
+// accept either and check determinism with --verify instead.
 RUN: %hermit --log=error run -- %me | FileCheck %s
-CHECK: {{((ba){200})}}
+RUN: %hermit run --verify -- %me
+CHECK: {{^((ab){200}|(ba){200})$}}
 CHECK-EMPTY:

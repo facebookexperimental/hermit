@@ -1,2 +1,6 @@
-RUN: %hermit run -- %me | FileCheck %s
-CHECK: 1111111111
+// Strict mode serializes the two writers, so exactly one thread's ten bytes
+// survive. Which thread wins is a property of the scheduler, not of this test,
+// so accept either and check determinism with --verify instead.
+RUN: %hermit run --env=TMPDIR=/tmp -- %me | FileCheck %s
+RUN: %hermit run --env=TMPDIR=/tmp --verify -- %me
+CHECK: {{^(1{10}|2{10})$}}
