@@ -958,6 +958,13 @@
         {
           "lane": "portable",
           "category": "applications",
+          "test": "applications/example-timed-progress-bar",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
           "test": "applications/git-repository-workflow",
           "mode": "verify",
           "backend": "kvm"
@@ -28194,6 +28201,13 @@
         {
           "lane": "privileged",
           "category": "applications",
+          "test": "applications/kvm-python-examples",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "privileged",
+          "category": "applications",
           "test": "applications/kvm-shell-environment",
           "mode": "verify",
           "backend": "kvm"
@@ -28673,6 +28687,13 @@
           "lane": "portable",
           "category": "applications",
           "test": "applications/c-toolchain-workflow",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
+          "test": "applications/example-timed-progress-bar",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -32790,6 +32811,13 @@
         {
           "lane": "privileged",
           "category": "applications",
+          "test": "applications/kvm-python-examples",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "privileged",
+          "category": "applications",
           "test": "applications/kvm-shell-environment",
           "mode": "verify",
           "backend": "kvm"
@@ -33736,6 +33764,13 @@
           "test": "applications/example-timed-progress-bar",
           "mode": "verify",
           "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
+          "test": "applications/example-timed-progress-bar",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -43913,6 +43948,13 @@
         {
           "lane": "privileged",
           "category": "applications",
+          "test": "applications/kvm-python-examples",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "privileged",
+          "category": "applications",
           "test": "applications/kvm-shell-environment",
           "mode": "verify",
           "backend": "kvm"
@@ -51668,6 +51710,13 @@
           "test": "applications/example-timed-progress-bar",
           "mode": "verify",
           "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
+          "test": "applications/example-timed-progress-bar",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -69486,6 +69535,13 @@
         "category": "applications"
       },
       "result_manifests": [
+        {
+          "lane": "privileged",
+          "category": "applications",
+          "test": "applications/kvm-python-examples",
+          "mode": "verify",
+          "backend": "kvm"
+        },
         {
           "lane": "privileged",
           "category": "applications",

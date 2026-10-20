@@ -45433,6 +45433,42 @@
       ],
       "test": "compat/zstd-roundtrip",
       "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "applications",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "python3"
+      ],
+      "test": "applications/example-timed-progress-bar",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "applications",
+      "classification": "required",
+      "cpu_timeout_seconds": 25,
+      "lane": "privileged",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "kvm",
+        "python3"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "applications/kvm-python-examples",
+      "timeout_seconds": 74
     }
   ],
   "schema": 1

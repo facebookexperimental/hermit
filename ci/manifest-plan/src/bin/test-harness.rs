@@ -8347,8 +8347,10 @@ sys.exit(1 if failed else 0)
         // left are rustc, javac, java and node, whose ptrace cells are the
         // super suite's, and timeout, whose ptrace cell is unselected.
         // 1 + 5 after example-timed-progress-bar's complete DBT fixture
-        // qualified 20/20 and joined full; its KVM parity cell remains unreported.
-        assert_eq!(unreported.len(), 1 + 5, "{unreported:?}");
+        // qualified 20/20 and joined full; its KVM parity cell stayed
+        // unreported until its ptrace verify cell, the reference, joined full
+        // after two clean nightly pressure sweeps (2026-10-19 and 2026-10-20).
+        assert_eq!(unreported.len(), 5, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
@@ -11342,7 +11344,14 @@ sys.exit(1 if failed else 0)
             "{test} does not enable {backend}"
         );
         let emptied = enabled.is_empty();
-        // A per-backend hermit_args_reason is keyed like hermit_args.
+        // `ci` is one flag for the mode or a map of its backends.
+        let required = match mode.get("ci") {
+            Some(Value::Bool(ci)) => *ci,
+            Some(Value::Mapping(ci)) => ci.get(backend).and_then(Value::as_bool) == Some(true),
+            _ => false,
+        };
+        // A per-backend hermit_args_reason is keyed like hermit_args, and a
+        // per-backend budget like the cell it bounds.
         for per_backend in [
             "ci",
             "expected_stdout",
@@ -11350,6 +11359,9 @@ sys.exit(1 if failed else 0)
             "hermit_args",
             "hermit_args_reason",
             "env_by_backend",
+            "timeout_seconds",
+            "cpu_timeout_seconds",
+            "slow_reason",
         ] {
             if let Some(map) = mode.get_mut(per_backend).and_then(Value::as_mapping_mut) {
                 map.remove(backend);
@@ -11372,10 +11384,21 @@ sys.exit(1 if failed else 0)
             backend.into(),
             "un-flipped by the sync-cells round-trip test".into(),
         );
+        for budget in ["timeout_seconds", "cpu_timeout_seconds", "slow_reason"] {
+            if mode
+                .get(budget)
+                .and_then(Value::as_mapping)
+                .is_some_and(serde_yaml::Mapping::is_empty)
+            {
+                mode.remove(budget);
+            }
+        }
         // A required mode with no enabled backend is refused, so taking its
         // last backend also makes it optional, with a reason, as a real
-        // un-flip of a single-backend mode (a ptrace replay cell) would.
-        if emptied && mode.get("ci").and_then(Value::as_bool) == Some(true) {
+        // un-flip of a single-backend mode (a ptrace replay cell, or the KVM
+        // cell of applications/kvm-python-examples, whose `ci` and budgets are
+        // maps of that one backend) would.
+        if emptied && required {
             mode.insert("ci".into(), false.into());
             mode.insert(
                 "ci_disabled_reason".into(),
