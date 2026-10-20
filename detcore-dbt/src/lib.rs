@@ -5000,7 +5000,6 @@ mod tests {
         "open",
         "openat",
         "pause",
-        "pidfd_getfd",
         "pidfd_open",
         "pidfd_send_signal",
         "pipe",
@@ -5547,8 +5546,6 @@ mod tests {
             libc::SYS_splice,
             libc::SYS_keyctl,
             libc::SYS_ioctl,
-            libc::SYS_recvmsg,
-            libc::SYS_recvmmsg,
             libc::SYS_read,
             libc::SYS_readlink,
             libc::SYS_readlinkat,
@@ -5557,6 +5554,16 @@ mod tests {
                 copied_child_action(sysnum),
                 0,
                 "non-strict copied child must allow syscall {sysnum}"
+            );
+        }
+        // recvmsg and recvmmsg never run natively in a copied child: an
+        // SCM_RIGHTS message could import another process's description. Under
+        // the non-strict policy the call does not run and answers EPERM.
+        for sysnum in [libc::SYS_recvmsg, libc::SYS_recvmmsg] {
+            assert_eq!(
+                copied_child_action(sysnum),
+                -libc::EPERM,
+                "non-strict copied child must answer EPERM for syscall {sysnum}"
             );
         }
         for sysnum in [
