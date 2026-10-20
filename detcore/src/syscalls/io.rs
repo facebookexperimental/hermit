@@ -1161,10 +1161,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(guest.inject(call).await?);
         }
 
-        // Linux copies pselect6's outer { sigmask, sigsetsize } wrapper before
-        // validating the timeout. Copy only the wrapper here; validation of the
-        // pointed-to signal mask remains below, after timeout validation.
-        let sigmask_argument = match call.sigmask() {
+        // Linux copies pselect6's outer { sigmask, sigsetsize } wrapper, then
+        // validates the timeout, then reads the inner mask (fs/select.c,
+        // https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/select.c?h=v6.12#n800
+        // and #n752). Linux checks the wrapper here; its words are read only
+        // after the timeout, because a tracer read can fail where the kernel's
+        // copy succeeds: a write-only page is readable on x86, but not to
+        // process_vm_readv. Read first, a malformed timeout there returned
+        // EFAULT, not Linux's EINVAL (dh-obsc8).
+        let sigmask_wrapper = match call.sigmask() {
             Some(argument) => {
                 // A split read can fall back to PTRACE_PEEKDATA for the final
                 // word, bypassing PROT_NONE or reporting EIO for an unmapped
@@ -1200,7 +1205,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // Success would mean the backend did not validate the probe.
                     Ok(_) => return Err(Errno::EIO.into()),
                 }
-                let argument: Pselect6SigmaskArg = guest.memory().read_value(argument.cast())?;
                 Some(argument)
             }
             None => None,
@@ -1213,6 +1217,30 @@ impl<T: RecordOrReplay> Detcore<T> {
             None => None,
         };
         let timeout = raw_timeout.map(ppoll_timeout_duration).transpose()?;
+        // Word by word, as `read_kernel_sigset` reads a mask: the probe above
+        // showed Linux can copy both words, and on ptrace a word-sized read
+        // is PTRACE_PEEKDATA, which reaches a write-only page that
+        // process_vm_readv refuses. Backends that read through
+        // process_vm_readv at every size (DBT, SaBRe, LiteInst and
+        // in-guest-trap) still fail there with EFAULT, as does the timeout's
+        // own read on every tracer-read backend
+        // (https://github.com/rrnewton/hermit/issues/4530).
+        let sigmask_argument = match sigmask_wrapper {
+            Some(argument) => {
+                let sigmask: usize = guest.memory().read_value(argument.cast::<usize>())?;
+                let second = argument
+                    .as_raw()
+                    .checked_add(std::mem::size_of::<usize>())
+                    .and_then(Addr::<usize>::from_raw)
+                    .ok_or(Errno::EFAULT)?;
+                let sigsetsize: usize = guest.memory().read_value(second)?;
+                Some(Pselect6SigmaskArg {
+                    sigmask,
+                    sigsetsize,
+                })
+            }
+            None => None,
+        };
         if let Some(argument) = sigmask_argument
             && argument.sigmask != 0
         {

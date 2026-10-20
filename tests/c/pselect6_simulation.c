@@ -131,6 +131,72 @@ static int run_wrapper_boundary(int unmap_tail) {
   return failed;
 }
 
+// The wrapper on a page that is read-only, write-only, then both: Linux
+// copies it in each case (x86 cannot map a page writable but unreadable).
+// With a malformed timeout it then fails with EINVAL; with a zero timeout it
+// returns 0. Either way the wrapper and timeout are left as they were. A
+// tracer cannot read a write-only page with process_vm_readv, and Hermit's
+// run mode read the wrapper that way before the timeout: both calls failed
+// with EFAULT (dh-obsc8).
+static int run_wrapper_permissions(void) {
+  long page = sysconf(_SC_PAGESIZE);
+  if (page <= 0) {
+    return 1;
+  }
+  void* mapping = mmap(
+      NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+      -1, 0);
+  if (mapping == MAP_FAILED) {
+    perror("mmap");
+    return 1;
+  }
+  sigset_t temporary;
+  sigemptyset(&temporary);
+  struct pselect6_sigmask_arg* wrapper = mapping;
+  *wrapper = (struct pselect6_sigmask_arg){&temporary, sizeof(uint64_t)};
+  const int protections[] = {PROT_READ, PROT_WRITE, PROT_READ | PROT_WRITE};
+  for (unsigned i = 0; i < sizeof(protections) / sizeof(protections[0]); ++i) {
+    if (mprotect(mapping, (size_t)page, protections[i]) != 0) {
+      perror("mprotect");
+      return 1;
+    }
+    struct timespec malformed = {.tv_sec = 0, .tv_nsec = 1000000000};
+    errno = 0;
+    long result =
+        syscall(SYS_pselect6, 0, NULL, NULL, NULL, &malformed, wrapper);
+    int error = errno;
+    if (result != -1 || error != EINVAL || wrapper->sigmask != &temporary ||
+        wrapper->sigsetsize != sizeof(uint64_t) || malformed.tv_sec != 0 ||
+        malformed.tv_nsec != 1000000000) {
+      fprintf(
+          stderr,
+          "pselect6 timeout validation did not precede reading a wrapper on "
+          "a page with protection %d: result=%ld errno=%d\n",
+          protections[i],
+          result,
+          error);
+      return 1;
+    }
+    struct timespec zero = {.tv_sec = 0, .tv_nsec = 0};
+    errno = 0;
+    result = syscall(SYS_pselect6, 0, NULL, NULL, NULL, &zero, wrapper);
+    error = errno;
+    if (result != 0 || wrapper->sigmask != &temporary ||
+        wrapper->sigsetsize != sizeof(uint64_t) || zero.tv_sec != 0 ||
+        zero.tv_nsec != 0) {
+      fprintf(
+          stderr,
+          "zero-timeout pselect6 with a wrapper on a page with protection %d: "
+          "result=%ld errno=%d\n",
+          protections[i],
+          result,
+          error);
+      return 1;
+    }
+  }
+  return munmap(mapping, (size_t)page) != 0;
+}
+
 static int run_argument_validation_order(void) {
   struct timespec malformed = {.tv_sec = 0, .tv_nsec = 1000000000};
   errno = 0;
@@ -180,7 +246,8 @@ static int run_argument_validation_order(void) {
         errno);
     return 1;
   }
-  if (run_wrapper_boundary(0) != 0 || run_wrapper_boundary(1) != 0) {
+  if (run_wrapper_boundary(0) != 0 || run_wrapper_boundary(1) != 0 ||
+      run_wrapper_permissions() != 0) {
     return 1;
   }
   return 0;
