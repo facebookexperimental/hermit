@@ -32475,6 +32475,88 @@ fn a_handler_that_raises_its_own_signal_does_not_hold_the_cpu() {
     }
 }
 
+/// `--work-span-report` is an observer: a run with it schedules exactly as one
+/// without it. The witness is the handler that raises its own signal, whose
+/// deliveries are bounded only by the continuation limit, which reads the
+/// requests the report also samples; an earlier form of the report wrapped
+/// those requests, and with it on the scheduler's log changed and, without a
+/// timeslice, the run did not end. Compared here: every committed and skipped
+/// turn's record (its number, thread, resources and virtual time), and the
+/// guest's output. The report itself has commits, ordered spans, and its list
+/// of what it does not model.
+#[test]
+fn the_work_span_report_leaves_signal_continuations_unchanged() {
+    let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
+    // Outside /tmp, which the run container replaces.
+    let reports = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    // Every committed and skipped turn: its number, thread, resources and
+    // virtual time.
+    let scheduler_lines = |output: &Output| -> Vec<String> {
+        stderr(output)
+            .lines()
+            .filter(|line| line.contains("COMMIT turn"))
+            .map(str::to_owned)
+            .collect()
+    };
+    for mode in ["resignal", "resignal-getpid"] {
+        for extra in [None, Some("--max-timeslice=disabled")] {
+            let report = reports
+                .path()
+                .join(format!("{mode}-{}.json", extra.is_some()));
+            let flag = format!("--work-span-report={}", report.display());
+            let mut runs = Vec::new();
+            for with_report in [false, true] {
+                let mut args = vec!["--log=info", "run", "--strict"];
+                args.extend(extra);
+                if with_report {
+                    args.push(flag.as_str());
+                }
+                args.extend(["--", guest.as_str(), mode]);
+                let output = hermit(&args);
+                assert_success(&output, &args);
+                assert_eq!(stdout(&output), "stopped, resignaled 1\n", "{args:?}");
+                runs.push(scheduler_lines(&output));
+            }
+            assert!(!runs[0].is_empty(), "{mode} {extra:?}: no scheduler lines");
+            assert_eq!(
+                runs[0], runs[1],
+                "{mode} {extra:?}: the report changed the schedule"
+            );
+            let written: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+            assert!(written["commits"].as_u64().unwrap() > 0, "{written}");
+            assert!(
+                written["span_lo_ns"].as_u64().unwrap() <= written["span_hi_ns"].as_u64().unwrap(),
+                "{written}"
+            );
+            assert!(
+                written["unmodelled"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("wait_causes")),
+                "{written}"
+            );
+        }
+    }
+
+    // A report under host /tmp, which the container replaces, is refused
+    // before the guest runs rather than lost at the end.
+    let hidden = tempfile::tempdir().unwrap();
+    let flag = format!(
+        "--work-span-report={}",
+        hidden.path().join("ws.json").display()
+    );
+    let args = ["run", flag.as_str(), "--", "/bin/echo", "guest-ran"];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert!(log.contains("class=cli-error"), "{log}");
+    assert!(
+        log.contains("is not visible inside the run container"),
+        "{log}"
+    );
+    assert_eq!(stdout(&output), "", "the guest ran before the refusal");
+}
+
 /// A handler that runs past `--target-timeslice` ends the reader's slice at
 /// its next signal stop. That stop yields, and its delivery then waits behind
 /// the other runnable threads, as Linux reschedules (TIF_NEED_RESCHED) before

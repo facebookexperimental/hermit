@@ -1149,6 +1149,8 @@ fn record_or_replay_config_with_timer_support(
         // the option existed, and record mode's own scheduling, have no
         // hand-off (https://github.com/rrnewton/hermit/issues/4380).
         pipe_wake_latency: None,
+        // A `hermit run` option; record and replay do not gather it.
+        work_span_report: None,
         scheduler_turn_cost: default_config.scheduler_turn_cost,
         seed: default_config.seed,
         rng_seed: default_config.rng_seed,

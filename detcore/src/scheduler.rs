@@ -31,6 +31,7 @@ pub(crate) mod signal_control;
 pub(crate) mod signal_lists;
 mod sleep_signal;
 pub mod timed_waiters;
+pub(crate) mod work_span;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -1577,6 +1578,9 @@ pub struct Scheduler {
     /// queue empty. With `turn`, it names a point in the schedule for the
     /// rejoin log, because such a wake does not advance `turn`.
     empty_queue_wakes: u64,
+    /// Work and span of the schedule (`--work-span-report`, [`work_span`]);
+    /// empty when off.
+    work_span: work_span::WorkSpanState,
     #[cfg(test)]
     host_signal_attempts: u64,
     /// Turns that `do_a_turn_blocking` ran through the controlled loop.
@@ -3008,6 +3012,7 @@ async fn sched_loop_inner(
                     drop(sched);
                     exit_on_scheduler_refusal(&refusal);
                 }
+                sched.write_work_span_report();
                 if let Some(observer) = &observer {
                     observer("run queue empty; scheduler completed");
                 }
@@ -3986,6 +3991,7 @@ impl Scheduler {
             shared_queue_scheduler_signals: Default::default(),
             rejoin_stalled_since: None,
             empty_queue_wakes: 0,
+            work_span: work_span::WorkSpanState::new(cfg),
             #[cfg(test)]
             host_signal_attempts: 0,
             #[cfg(test)]
@@ -4941,11 +4947,12 @@ impl Scheduler {
         self.remove_blocking_entries(dtid);
         self.retire_sigalrm_thread(*dtid, *detpid);
         // The process's last thread: its shared queue goes with it.
-        if self
+        let last_of_process = self
             .process_signal_targets(*detpid)
             .iter()
-            .all(|thread| thread == dtid)
-        {
+            .all(|thread| thread == dtid);
+        self.work_span_retire_thread(*dtid, *detpid);
+        if last_of_process {
             self.shared_queue_scheduler_signals.remove(detpid);
             // The generation stays, so that no publication older than one
             // already taken can bring dispositions back.
@@ -5051,10 +5058,12 @@ impl Scheduler {
         {
             self.namespace_zap_victims.remove(&registered);
             self.reparent_orphans(registered);
+            self.work_span_parent_gone(registered);
         }
         if !live_process_thread {
             let _ = self.begin_physical_process_exit(*detpid);
             self.reparent_orphans(*detpid);
+            self.work_span_parent_gone(*detpid);
             self.logically_exited_processes.insert(*detpid);
             // The kill a namespace's end owed it has arrived.
             self.namespace_zap_victims.remove(detpid);
@@ -5324,6 +5333,7 @@ impl Scheduler {
                 continue;
             };
             self.thread_tree.reparent_child(child, reaper, owner);
+            self.work_span_adopt(exited, reaper, child);
             #[cfg(test)]
             self.reparentings.push((child, reaper));
             info!(
@@ -5626,6 +5636,7 @@ impl Scheduler {
         // leader's went with the leader (`logically_kill_thread` above).
         self.transfer_thread_timer_copies(caller, new_leader);
         self.discarded_at_send.rekey_thread(caller, new_leader);
+        self.work_span_transfer_thread(caller, new_leader);
 
         let survivor_priority = match replay_resume {
             Some((next_tid, _)) if next_tid == new_leader => REPLAY_FOREGROUND_PRIORITY,
@@ -9266,6 +9277,7 @@ impl Scheduler {
             return false;
         }
         self.wake_child_waiters(parent, child);
+        self.work_span_forget_exit(parent, child);
         self.completed_physical_process_exits.remove(&child);
         self.sigkilled_processes.remove(&child);
         self.thread_tree.process_parent.remove(&child);
@@ -12677,6 +12689,7 @@ impl Scheduler {
                 .push_poller(dettid, self.get_priority(dettid), rs.poll_attempt);
             // Before the count reset below hides that this is a retry.
             self.note_sigalrm_polling_wait(dettid, rs);
+            self.work_span_note_wait(dettid, rs);
             trace!(
                 "[dtid {}] after deprioritizing polling request, run queue: {:?}",
                 dettid, &self.run_queue
@@ -12697,6 +12710,9 @@ impl Scheduler {
                         rs.blocked_signal_mask,
                         resp,
                     );
+                    if blocked.is_err() {
+                        self.work_span_note_wait(dettid, rs);
+                    }
                     if rs.replay_served_from_log
                         && matches!(rid, ResourceID::BlockingExternalIO(_))
                         && self.blocked.external_io_blockers.contains_key(&dettid)
@@ -13886,6 +13902,17 @@ impl Scheduler {
             ),
             _ => (false, false, false),
         };
+        // The committed request, read before `clear_nextturn` empties it.
+        let work_span_request = self
+            .work_span
+            .enabled
+            .then(|| {
+                self.next_turns
+                    .get(&dtid)
+                    .and_then(|turn| turn.req.try_read())
+                    .and_then(Result::ok)
+            })
+            .flatten();
         self.progress_epoch += 1;
         self.last_commit_at.insert(dtid, self.progress_epoch);
         let previous_grant = self.guest_state_polled_at.remove(&dtid);
@@ -13916,6 +13943,9 @@ impl Scheduler {
         if let Err(error) = self.clear_nextturn(dtid) {
             self.fail_parked(dtid, error);
             return Err(SkipTurn);
+        }
+        if self.work_span.enabled {
+            self.work_span_commit(dtid, work_span_request.as_ref());
         }
         self.turn += 1;
         let answer = if fatal_alarm {

@@ -765,6 +765,24 @@ pub struct Config {
     #[clap(long, value_name = "nanos")]
     pub pipe_wake_latency: Option<u64>,
 
+    /// Write a work/span report of the run's schedule to this path as JSON when the run ends
+    /// normally: work (the sum of every thread's guest CPU time, in virtual nanoseconds), a
+    /// lower span over the scheduler's certain happens-before edges (program order, spawn, a
+    /// child's exit to the wait that reaps it, conflicting resources), and an upper span that
+    /// also orders a thread that waited after everything other threads did meanwhile. The
+    /// report lists the dependencies it does not model: what a wait waited for and who sent a
+    /// signal, so the lower span can be optimistic; and what passes without a wait (data, an end
+    /// of file or a peer's close found on a channel, a pending signal taken by `sigtimedwait`,
+    /// shared memory, files and devices), which neither span orders; and the CPU time of a call a
+    /// thread was running outside the schedule when it was killed. An observer: no scheduling
+    /// decision reads it, so the schedule
+    /// and the guest's results are those of a run without it, except that Hermit's own command
+    /// line, which a guest can read as PID 1's, shows the option. Needs sequentialized threads
+    /// and the ptrace backend. Unset (the default), nothing is gathered.
+    #[serde(default)]
+    #[clap(long, value_name = "path")]
+    pub work_span_report: Option<std::path::PathBuf>,
+
     /// Virtual nanoseconds that each committed scheduler turn adds to the global clock, before
     /// `--clock-multiplier` (default 500000). The charge keeps time moving while threads take
     /// turns without running. Every thread observes it as a jump in time across a thread switch,
@@ -1470,6 +1488,9 @@ impl fmt::Display for Config {
         }
         if let Some(latency) = self.pipe_wake_latency {
             write!(f, " --pipe-wake-latency={}", latency)?;
+        }
+        if let Some(report) = &self.work_span_report {
+            write!(f, " --work-span-report={}", report.display())?;
         }
         if let Some(cost) = self.scheduler_turn_cost {
             write!(f, " --scheduler-turn-cost={}", cost)?;
@@ -2485,7 +2506,10 @@ mod legacy_backend_json {
     /// written and reads as absent.
     /// `signal_delivery_check_fatal` matters only where the copy is kept, so
     /// it is never written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 18] = [
+    /// `work_span_report` came after it as well: the report is written by the
+    /// scheduler, not the in-guest runtime, so it is never written and reads
+    /// as unset.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 19] = [
         "backend",
         "record_host_inputs",
         "guest_may_inherit_a_terminal",
@@ -2504,6 +2528,7 @@ mod legacy_backend_json {
         "container_mount_table",
         "mountinfo_mount_namespace",
         "signal_delivery_check_fatal",
+        "work_span_report",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -2649,7 +2674,8 @@ mod legacy_backend_json {
                     | "scheduler_turn_cost"
                     | "pipe_wake_latency"
                     | "container_mount_table"
-                    | "mountinfo_mount_namespace",
+                    | "mountinfo_mount_namespace"
+                    | "work_span_report",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
@@ -2929,7 +2955,8 @@ mod legacy_backend_json {
                 | "signal_state_copy"
                 | "container_mount_table"
                 | "mountinfo_mount_namespace"
-                | "signal_delivery_check_fatal" => Ok(()),
+                | "signal_delivery_check_fatal"
+                | "work_span_report" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -3581,7 +3608,8 @@ mod tests {
                 | "signal_state_copy"
                 | "container_mount_table"
                 | "mountinfo_mount_namespace"
-                | "signal_delivery_check_fatal" => {}
+                | "signal_delivery_check_fatal"
+                | "work_span_report" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -3598,11 +3626,11 @@ mod tests {
         // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
         // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`,
         // `signal_state_copy`, `container_mount_table`,
-        // `mountinfo_mount_namespace` and `signal_delivery_check_fatal` none:
-        // fourteen more keys, and seventeen fewer, so three keys fewer than
-        // fields.
+        // `mountinfo_mount_namespace`, `signal_delivery_check_fatal` and
+        // `work_span_report` none: fourteen more keys, and eighteen fewer, so
+        // four keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 3);
+        assert_eq!(fields.len(), keys.len() + 4);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -4503,6 +4531,29 @@ mod tests {
 
         config.runs_post_fork = RunsPostFork::Random;
         assert!(config.to_string().contains(" --runs-post-fork=random"));
+    }
+
+    #[test]
+    fn the_work_span_report_is_off_by_default_and_never_enters_the_legacy_form() {
+        assert_eq!(Config::default().work_span_report, None);
+        let on = Config::try_parse_from(["detcore", "--work-span-report=/tmp/ws.json"]).unwrap();
+        assert_eq!(
+            on.work_span_report.as_deref(),
+            Some(std::path::Path::new("/tmp/ws.json"))
+        );
+        assert!(on.to_string().contains(" --work-span-report=/tmp/ws.json"));
+        let reparsed: Config = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert_eq!(reparsed.work_span_report, on.work_span_report);
+        let mut old = serde_json::to_value(Config::default()).unwrap();
+        old.as_object_mut().unwrap().remove("work_span_report");
+        let old: Config = serde_json::from_value(old).unwrap();
+        assert_eq!(old.work_span_report, None);
+        let legacy = to_legacy_backend_json(&on).unwrap();
+        assert!(!legacy.contains("work_span_report"), "{legacy}");
+        assert_eq!(
+            from_legacy_backend_json(&legacy).unwrap().work_span_report,
+            None
+        );
     }
 
     #[test]

@@ -1133,7 +1133,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // runner::tests::a_parity_probe_does_not_borrow_another_backends_shared_flag_reason
     // and cli_help::test_harness_refuses_parity_inputs_outside_a_verify_probe
     // (pressure-test --parity-all's probe inputs): 1_786.
-    ("test.regular_crates", 1_786),
+    // And the detcore-model work-span-report config test: 1_787, listed.
+    ("test.regular_crates", 1_787),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1701,7 +1702,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4515): 1058, listed.
     // And metadata::tests::record_and_replay_never_read_sigreturn_reports
     // (https://github.com/rrnewton/hermit/pull/4510): 1059, listed.
-    ("test.hermit_unit", 1059),
+    // And run::work_span_report_is_refused_where_there_are_no_turns,
+    // run::a_manifest_leaves_out_the_work_span_report and
+    // run::a_work_span_report_path_with_a_parent_component_is_refused: 1062,
+    // listed.
+    ("test.hermit_unit", 1062),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2609,7 +2614,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // only_a_short_read_below_a_page_can_end_the_capture): 2180.
     // And +2 from c5eb858a: 2182.
     // And a forced-only wait-mask unit (signal_shadow): 2183.
-    ("test.detcore_unit", 2183),
+    // And the thirty-five scheduler::work_span units (--work-span-report):
+    // 2218, listed.
+    ("test.detcore_unit", 2218),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3774,7 +3781,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_reader_whose_handler_yields_gets_past_it_at_the_senders_slice_end and
     // a_grant_inside_a_handler_ends_its_delivery_continuation_under_record
     // (https://github.com/rrnewton/hermit/pull/4510): 577, listed.
-    ("test.cli", 577),
+    // And the_work_span_report_leaves_signal_continuations_unchanged: 578,
+    // listed.
+    ("test.cli", 578),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4249,7 +4258,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two statx mount-ID tests: 507, listed.
     // And a_vfork_parent_resumes_at_its_childs_exec, re-landed: 507.
     // And the same four 4510 tests: 511, listed.
-    ("test.cli_on_host", 511),
+    // And the same work-span-report identity test: 512.
+    ("test.cli_on_host", 512),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4617,7 +4627,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // capture units (the same as test.detcore_unit): 2180.
     // And +2 from c5eb858a: 2182.
     // And the same forced-only wait-mask unit: 2183.
-    ("test.detcore_unit_on_host", 2183),
+    // And the same thirty-five scheduler::work_span units: 2218, listed.
+    ("test.detcore_unit_on_host", 2218),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4939,7 +4950,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same four K3b unit tests: 1055.
     // And the same three units: 1058, listed.
     // And the same sigreturn-report pin: 1059, listed.
-    ("test.hermit_unit_on_host", 1059),
+    // And the same three work-span-report units: 1062, listed.
+    ("test.hermit_unit_on_host", 1062),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5115,7 +5127,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1, the same d1870efe runner unit as the local node: 1_769.
     // And +3, the same parity-probe runner units and harness refusal test as
     // the local node: 1_772.
-    ("test.regular_crates_on_host", 1_772),
+    // And the same detcore-model work-span-report config test: 1_773.
+    ("test.regular_crates_on_host", 1_773),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

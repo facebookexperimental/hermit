@@ -990,6 +990,10 @@ mod tests {
         ),
         ("futex-wake-yields", &["--futex-wake-yields"]),
         ("pipe-wake-latency", &["--pipe-wake-latency=1000000"]),
+        (
+            "work-span-report",
+            &["--work-span-report=/tmp/work-span.json"],
+        ),
         ("scheduler-turn-cost", &["--scheduler-turn-cost=10000"]),
         ("sigint-instakill", &["--sigint-instakill"]),
         ("warn-non-zero-binds", &["--warn-non-zero-binds"]),

@@ -3990,6 +3990,129 @@ fn futex_wake_yields_parses_round_trips_and_is_refused_where_inert() {
     }
 }
 
+/// `--work-span-report` is refused wherever the report would be empty or
+/// lost: without sequentialized threads, with `--strace-only` or
+/// `--namespace-only`, with `--image`
+/// (whose root the report would be written into), and on backends other than
+/// ptrace (and e9patch preprocessing, which runs on it).
+#[test]
+fn work_span_report_is_refused_where_there_are_no_turns() {
+    let mut accepted = run_opts_for(&["hermit", "run", "--work-span-report=/var/ws.json", "prog"]);
+    accepted.validate_args_with_perf_support(true).unwrap();
+    for (argv, expected) in [
+        (
+            vec![
+                "hermit",
+                "run",
+                "--no-sequentialize-threads",
+                "--work-span-report=/tmp/ws.json",
+                "prog",
+            ],
+            "--no-sequentialize-threads",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--strace-only",
+                "--work-span-report=/tmp/ws.json",
+                "prog",
+            ],
+            "--strace-only",
+        ),
+        (
+            vec![
+                "hermit",
+                "--backend=dbt",
+                "run",
+                "--work-span-report=/var/ws.json",
+                "prog",
+            ],
+            "backend `dbt` is refused",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--namespace-only",
+                "--work-span-report=/var/ws.json",
+                "prog",
+            ],
+            "--namespace-only",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--image=busybox",
+                "--work-span-report=/var/ws.json",
+                "prog",
+            ],
+            "--image",
+        ),
+        (
+            vec![
+                "hermit",
+                "--backend=liteinst",
+                "run",
+                "--work-span-report=/var/ws.json",
+                "prog",
+            ],
+            "backend `liteinst` is refused",
+        ),
+    ] {
+        let error = run_opts_for(&argv)
+            .validate_args_with_perf_support(true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{argv:?}: {error}");
+    }
+}
+
+/// A run manifest leaves `--work-span-report` out, as it does every output
+/// destination, so a rerun with `--from` does not overwrite the original
+/// report; the saved run configuration keeps it.
+#[test]
+fn a_manifest_leaves_out_the_work_span_report() {
+    let argv = [
+        "hermit",
+        "run",
+        "--work-span-report=/var/ws.json",
+        "/bin/true",
+    ];
+    let matches = <crate::Args as clap::CommandFactory>::command()
+        .try_get_matches_from(argv)
+        .unwrap();
+    let args = crate::args_from_matches_with_clock(&matches, SystemTime::now).unwrap();
+    let crate::Subcommand::Run(ro) = args.command else {
+        panic!("{argv:?} is not a `run` command");
+    };
+    let config = ro.saved_run_config().unwrap();
+    let (mut global, mut run) = crate::run_config::to_manifest_parts(&config).unwrap();
+    assert!(run.contains_key("work-span-report"), "{run:?}");
+    crate::manifest::drop_outputs(&mut global, &mut run);
+    assert!(!run.contains_key("work-span-report"), "{run:?}");
+}
+
+/// A report path with a `..` component, which the container can resolve
+/// into its private `/tmp`, is refused before the guest runs.
+#[test]
+fn a_work_span_report_path_with_a_parent_component_is_refused() {
+    let ro = run_opts_for(&[
+        "hermit",
+        "run",
+        "--work-span-report=/var/../tmp/ws.json",
+        "prog",
+    ]);
+    let error = ro
+        .validate_work_span_report_visibility()
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("`..` component"), "{error}");
+    let plain = run_opts_for(&["hermit", "run", "--work-span-report=/var/ws.json", "prog"]);
+    plain.validate_work_span_report_visibility().unwrap();
+}
+
 /// `--pipe-wake-latency` parses, is rendered into the reproduce command and
 /// round-trips, keeping `0` distinct from unset. It is refused wherever it
 /// would be ignored: without sequentialized threads, with `--namespace-only`
@@ -6609,6 +6732,7 @@ impl RunOpts {
         }
         // After the event listing, which runs no guest and writes no summary.
         self.validate_summary_json_visibility()?;
+        self.validate_work_span_report_visibility()?;
         if self.happens_before.is_some() {
             // Resolve the spec against the guest binary's debug info now and cache
             // it so every subsequent `effective_det_config()` (including both
@@ -6986,6 +7110,43 @@ impl RunOpts {
             if config.pipe_wake_latency_in_effect().is_none() {
                 anyhow::bail!(
                     "--pipe-wake-latency={latency} would have no effect with these options"
+                );
+            }
+        }
+        // `--work-span-report` reads the scheduler's commits; a launch that
+        // has none would write a report of nothing, so it is refused.
+        if let Some(report) = &config.work_span_report {
+            let report = report.display();
+            if self.namespace_only {
+                anyhow::bail!(
+                    "--work-span-report={report} needs Detcore's scheduler; --namespace-only \
+                     (--lite) runs the guest natively, without it"
+                );
+            }
+            if self.strace_only {
+                anyhow::bail!(
+                    "--work-span-report={report} reads the turns of sequentialized threads; \
+                     --strace-only turns sequentialization off"
+                );
+            }
+            if !config.sequentialize_threads {
+                anyhow::bail!(
+                    "--work-span-report={report} reads the turns of sequentialized threads; it \
+                     cannot be combined with --no-sequentialize-threads"
+                );
+            }
+            if self.image.is_some() {
+                anyhow::bail!(
+                    "--work-span-report={report} is written from inside the run container, and \
+                     --image (a prototype) replaces its root, so the report would be lost"
+                );
+            }
+            if !matches!(backend, Backend::Ptrace | Backend::E9patch) {
+                anyhow::bail!(
+                    "--work-span-report weighs turns by the guest CPU time the ptrace backend's \
+                     tool measures, and has been checked on that backend only (and on e9patch \
+                     preprocessing, which runs on it); backend `{}` is refused",
+                    backend.as_str()
                 );
             }
         }
@@ -7895,15 +8056,65 @@ impl RunOpts {
     /// earlier). `--no-namespace` has no private mounts, and `--image` (a
     /// prototype) replaces the whole root, which this mapping does not model.
     fn validate_summary_json_visibility(&self) -> Result<(), Error> {
-        let Some(path) = self.summary_json.as_deref() else {
+        if self.namespace_only || self.image.is_some() || self.selected_backend() == Backend::Dbt {
+            return Ok(());
+        }
+        self.validate_output_visibility("--summary-json", "summary", self.summary_json.as_deref())
+    }
+
+    /// The `--work-span-report` counterpart of
+    /// `validate_summary_json_visibility`. Every mode that would not write
+    /// the report (`--namespace-only`, `--image`, backends other than ptrace)
+    /// is refused earlier, so none is exempt here.
+    ///
+    /// The path is checked as the container will resolve it: with private
+    /// mounts, a `..` component is refused (the container's mounts can
+    /// resolve it into a hidden directory, as `/var/../tmp` resolves into the
+    /// private `/tmp`), and an absolute path is checked again through its
+    /// parent directory's host resolution, so a symlinked parent directory
+    /// into a hidden one is refused too.
+    fn validate_work_span_report_visibility(&self) -> Result<(), Error> {
+        let Some(path) = self.det_opts.det_config.work_span_report.as_deref() else {
             return Ok(());
         };
-        if self.no_namespace
-            || self.namespace_only
-            || self.image.is_some()
-            || self.selected_backend() == Backend::Dbt
-            || !path.is_absolute()
+        if !self.no_namespace
+            && path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
         {
+            anyhow::bail!(
+                "--work-span-report {} has a `..` component, which the run container's mounts can \
+                 resolve into a directory it hides, losing the report. Name the directory directly.",
+                path.display()
+            );
+        }
+        self.validate_output_visibility("--work-span-report", "report", Some(path))?;
+        if path.is_absolute()
+            && let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+            && let Ok(resolved) = std::fs::canonicalize(parent)
+            && resolved != parent
+        {
+            self.validate_output_visibility(
+                "--work-span-report",
+                "report",
+                Some(&resolved.join(name)),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Refuse an output file the run writes from inside its container
+    /// (`flag`'s `what`) at a path the container hides.
+    fn validate_output_visibility(
+        &self,
+        flag: &str,
+        what: &str,
+        path: Option<&Path>,
+    ) -> Result<(), Error> {
+        let Some(path) = path else {
+            return Ok(());
+        };
+        if self.no_namespace || !path.is_absolute() {
             return Ok(());
         }
         let hidden = match self.mapped_host_program(path) {
@@ -7931,7 +8142,7 @@ impl RunOpts {
                 )
             };
             anyhow::bail!(
-                "--summary-json {} is not visible inside the run container: {cause}. The summary \
+                "{flag} {} is not visible inside the run container: {cause}. The {what} \
                  is written from inside the container, so it would be lost. {remedy}",
                 path.display()
             );

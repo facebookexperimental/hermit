@@ -108,6 +108,7 @@ const RUN_OUTPUTS: &[&str] = &[
     "verify-json",
     "verify-log-dir",
     "verify-run",
+    "work-span-report",
 ];
 
 /// Removes the output destinations from a manifest's `global` and `run`
