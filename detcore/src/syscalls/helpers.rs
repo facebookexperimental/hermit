@@ -3166,6 +3166,76 @@ where
     )
 }
 
+/// The internal failure, if any, that `refusal` names, for thread `dettid`
+/// handling the guest's `sysno`. `UnsupportedOperation::ToolDecided` is a
+/// backend's statement that it left a call Detcore injected to the Tool,
+/// because the Tool decides that call on every backend (the KVM executor's
+/// CPU, scheduling, priority, id, getrandom, prlimit64, membarrier, seccomp
+/// and getpgrp calls). Detcore answers every such call itself, except the
+/// getpgrp that a clone3 race passes through to the backend
+/// (https://github.com/rrnewton/hermit/issues/4531); so one that reached the
+/// backend is a Detcore defect or that race, never an answer for the guest.
+/// Every other refusal belongs to the call site that injected it and is not
+/// judged here.
+pub(crate) fn tool_decided_injection_failure(
+    refusal: Option<reverie::UnsupportedRefusal>,
+    dettid: DetTid,
+    sysno: Sysno,
+) -> Option<String> {
+    refusal
+        .filter(|refusal| refusal.operation == reverie::UnsupportedOperation::ToolDecided)
+        .map(|refusal| {
+            format!(
+                "HERMIT_INTERNAL_FAILURE class=tool-decided-injection dtid={dettid} \
+                 syscall={sysno}: the backend refused a call Detcore injected, as one the Tool \
+                 decides on every backend ({}); Detcore must answer it itself",
+                refusal.diagnostic
+            )
+        })
+}
+
+/// Ends the run as an internal failure when the last call Detcore injected
+/// while handling the guest's `sysno` came back with a `ToolDecided` refusal
+/// ([`tool_decided_injection_failure`]), instead of letting its ENOSYS reach
+/// the guest. The panic text and the error log carry
+/// `HERMIT_INTERNAL_FAILURE class=tool-decided-injection`; the CLI's own
+/// summary line classifies the run as `class=container-child-panic`.
+///
+/// This is not a general guard. That no Detcore path injects one of these
+/// calls on KVM rests on an audit of Detcore's handlers. The one known
+/// exception is a race: under --no-sequentialize-threads a sibling can
+/// rewrite clone3's argument struct between Detcore's read and the KVM
+/// executor's, so a child Detcore marks as in a nested PID namespace passes
+/// its getpgrp through to the backend (tracked in
+/// https://github.com/rrnewton/hermit/issues/4531). This check mitigates
+/// that path: it runs once per syscall event, after Detcore's handler
+/// returns and before the result is used, and a backend's refusal describes
+/// only the latest injection, so it sees a handler's pass-through when that
+/// is the event's last injection. It does not see:
+/// - an injection of one of these calls followed by another injection in the
+///   same event, which clears the first one's refusal;
+/// - a refusal that a consumer takes and filters first, such as
+///   `report_backend_signal_refusal` (signal.rs), behind the
+///   thread-directed process signal capability that is false on KVM;
+/// - injections from Tool callbacks other than the syscall handler (signal
+///   events, thread start, post-exec, exit, timers);
+/// - `tail_inject`, whose result goes straight to the guest.
+///
+/// A general guard needs a Reverie API hook and is not part of this change.
+pub(crate) fn fail_on_tool_decided_injection<T, G>(guest: &mut G, sysno: Sysno)
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let dettid = guest.thread_state().dettid;
+    if let Some(failure) =
+        tool_decided_injection_failure(guest.take_unsupported_refusal(), dettid, sysno)
+    {
+        tracing::error!("{failure}");
+        panic!("{failure}");
+    }
+}
+
 /// The policy of `Detcore::refuse_unserviceable_operation`, for a caller that
 /// holds the guest but not the tool. `panic_on_unsupported_syscalls` is the
 /// setting of that name: the tool's own copy in the method, the guest's
@@ -7360,5 +7430,58 @@ mod temporary_mask_tests {
             assert_eq!(continuation_mask(call, &Ok(0)), Restored, "{call:?}");
         }
         assert_eq!(continuation_mask(read, &restart), Restored);
+    }
+}
+
+#[cfg(test)]
+mod tool_decided_injection_tests {
+    use super::*;
+
+    fn refusal(operation: reverie::UnsupportedOperation) -> Option<reverie::UnsupportedRefusal> {
+        Some(reverie::UnsupportedRefusal::new(
+            operation,
+            Errno::ENOSYS,
+            "KVM leaves this call to the Tool",
+        ))
+    }
+
+    /// Only a `ToolDecided` refusal of an injected call is a Detcore defect;
+    /// no refusal, or a refusal another call site owns (flock, process
+    /// groups, a signal), is not judged here.
+    #[test]
+    fn only_a_tool_decided_refusal_is_an_internal_failure() {
+        let dettid = DetTid::from_raw(7);
+        let failure = tool_decided_injection_failure(
+            refusal(reverie::UnsupportedOperation::ToolDecided),
+            dettid,
+            Sysno::getpgrp,
+        )
+        .expect("a ToolDecided refusal is an internal failure");
+        assert!(
+            failure.starts_with(
+                "HERMIT_INTERNAL_FAILURE class=tool-decided-injection dtid=7 syscall=getpgrp"
+            ),
+            "{failure}"
+        );
+        assert!(
+            failure.contains("KVM leaves this call to the Tool"),
+            "{failure}"
+        );
+        assert_eq!(
+            tool_decided_injection_failure(None, dettid, Sysno::getpgrp),
+            None
+        );
+        for operation in [
+            reverie::UnsupportedOperation::Flock,
+            reverie::UnsupportedOperation::ProcessGroups,
+            reverie::UnsupportedOperation::Signal,
+            reverie::UnsupportedOperation::NonLeaderExec,
+        ] {
+            assert_eq!(
+                tool_decided_injection_failure(refusal(operation), dettid, Sysno::getpgrp),
+                None,
+                "{operation:?}"
+            );
+        }
     }
 }

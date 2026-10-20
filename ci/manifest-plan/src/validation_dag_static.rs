@@ -2616,7 +2616,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a forced-only wait-mask unit (signal_shadow): 2183.
     // And the thirty-five scheduler::work_span units (--work-span-report):
     // 2218, listed.
-    ("test.detcore_unit", 2218),
+    // And the two tool-decided tripwire units of the LinuxEmu D1 pin
+    // (an_injected_tool_decided_call_ends_the_run,
+    // only_a_tool_decided_refusal_is_an_internal_failure): 2220.
+    ("test.detcore_unit", 2220),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4628,7 +4631,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from c5eb858a: 2182.
     // And the same forced-only wait-mask unit: 2183.
     // And the same thirty-five scheduler::work_span units: 2218, listed.
-    ("test.detcore_unit_on_host", 2218),
+    // And the two tool-decided tripwire units of the LinuxEmu D1 pin: 2220.
+    ("test.detcore_unit_on_host", 2220),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

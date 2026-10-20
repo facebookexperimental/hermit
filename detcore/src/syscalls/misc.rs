@@ -1211,6 +1211,8 @@ mod tests {
             refusal: Option<reverie::UnsupportedOperation>,
             recorded: Option<reverie::UnsupportedRefusal>,
             injections: Mutex<usize>,
+            /// The one call this guest expects to be injected.
+            expected: Sysno,
         }
 
         struct NoStack;
@@ -1283,7 +1285,7 @@ mod tests {
                 panic!("a mirror must not daemonize")
             }
             async fn inject<S: SyscallInfo>(&mut self, call: S) -> Result<i64, Errno> {
-                assert_eq!(call.number(), Sysno::setsid);
+                assert_eq!(call.number(), self.expected);
                 *self.injections.lock().unwrap() += 1;
                 if let Err(errno) = self.answer {
                     self.recorded = self.refusal.map(|operation| {
@@ -1346,6 +1348,7 @@ mod tests {
                     refusal,
                     recorded: None,
                     injections: Mutex::new(0),
+                    expected: Sysno::setsid,
                 };
                 let result = tool
                     .mirror_group_change(
@@ -1368,6 +1371,52 @@ mod tests {
                 assert_eq!(*guest.injections.lock().unwrap(), 1);
                 assert_eq!(guest.recorded, None, "a reported refusal must be taken");
             }
+        }
+
+        /// The tripwire for the calls KVM leaves to the Tool, on the path of
+        /// the clone3 race (https://github.com/rrnewton/hermit/issues/4531):
+        /// a getpgrp from a nested PID namespace, the one Detcore handler
+        /// that passes one of them through to the backend, comes back with
+        /// the backend's `ToolDecided` refusal, and the tripwire then panics
+        /// with its internal-failure marker. The test calls the handler and
+        /// then the tripwire directly; it does not cover the tripwire's call
+        /// site in `handle_syscall_event`.
+        #[tokio::test]
+        #[should_panic(expected = "HERMIT_INTERNAL_FAILURE class=tool-decided-injection")]
+        async fn an_injected_tool_decided_call_ends_the_run() {
+            let process = DetPid::from_raw(23);
+            let config = Config::default();
+            let global = GlobalState::init_global_state(&config).await;
+            let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
+            let mut thread = crate::ThreadState::new(process, &config, ());
+            thread.detpid = Some(process);
+            thread.nested_pid_namespace = true;
+            let mut guest = MirrorGuest {
+                config: &config,
+                global: &global,
+                thread,
+                sender: Tid::from_raw(process.as_raw()),
+                answer: Err(Errno::ENOSYS),
+                refusal: Some(reverie::UnsupportedOperation::ToolDecided),
+                recorded: None,
+                injections: Mutex::new(0),
+                expected: Sysno::getpgrp,
+            };
+            let result = tool
+                .handle_group_or_session_getter(
+                    &mut guest,
+                    reverie::syscalls::Syscall::Getpgrp(reverie::syscalls::Getpgrp::new()),
+                )
+                .await;
+            assert_eq!(*guest.injections.lock().unwrap(), 1);
+            assert!(
+                matches!(result, Err(Error::Errno(Errno::ENOSYS))),
+                "{result:?}"
+            );
+            crate::syscalls::helpers::fail_on_tool_decided_injection::<
+                crate::record_or_replay::NoopTool,
+                _,
+            >(&mut guest, Sysno::getpgrp);
         }
     }
 

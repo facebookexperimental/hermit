@@ -2317,7 +2317,17 @@ fi
 # host-adapter tuple on the API13 replay above. The incoming a778f36c reader
 # correction is preserved; native/SDK inputs and inventory989 stay unchanged.
 # No new budget calibration or runtime identity is inferred from this replay.
-expected_pin=39bc362bbaad7a6eae5598654c644eab5122900d
+# CARRY TO 1223ccc24cbce6da347d4053ce223058de52ce2a (2026-10-20): from
+# 39bc362bbaad7a6eae5598654c644eab5122900d. One commit (kvm lane, LinuxEmu
+# shrink D1: the executor's answers to the 32 calls Detcore decides are
+# deleted and refused with the new typed refusal
+# UnsupportedOperation::ToolDecided). It changes reverie/src/unsupported.rs,
+# reverie-kvm/src, reverie-kvm/tests and reverie-kvm/README.md only; git diff
+# is empty under reverie-dbt/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory (989), SDK and native inputs,
+# calibrated budget, job width and limits are unchanged from the 39bc362b
+# entry.
+expected_pin=1223ccc24cbce6da347d4053ce223058de52ce2a
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

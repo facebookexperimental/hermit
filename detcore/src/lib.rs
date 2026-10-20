@@ -4865,6 +4865,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
             }
         };
+        // A call Detcore injected that the backend left to the Tool
+        // (`UnsupportedOperation::ToolDecided`), such as the getpgrp a clone3
+        // race passes through (https://github.com/rrnewton/hermit/issues/4531),
+        // ends the run as an internal failure before its ENOSYS can reach the
+        // guest, when it is the event's last injection. The check reads only
+        // the handler's latest refusal, and only if no consumer took it
+        // first; it is not a general guard (see
+        // `fail_on_tool_decided_injection`).
+        crate::syscalls::helpers::fail_on_tool_decided_injection::<T, G>(guest, call.number());
 
         // A copy may already have changed guest memory before reporting a
         // terminal backend error. Do not perform even the syscall-result
