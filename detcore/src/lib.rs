@@ -2946,7 +2946,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     /// timer entry) exist only in configurations it refuses. A signal outside
     /// 1 to 64 is `EINVAL`. A configuration in which the commit could not
     /// keep the protocol, or a thread holding a claimed `SIGCHLD`, is refused
-    /// here, before any turn, with `EOPNOTSUPP` (`two_phase_refusal`).
+    /// here, before any turn, with `EPROTONOSUPPORT` (`two_phase_refusal`):
+    /// Detcore has opted in, and `EOPNOTSUPP` is left to mean that a Tool has
+    /// not (Reverie's contract, step 4).
     async fn announce_signal_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2968,7 +2970,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 signal,
                 reason
             );
-            return Err(Errno::EOPNOTSUPP);
+            return Err(Errno::EPROTONOSUPPORT);
         }
         let stop = self.inbound_stop(guest);
         let turn = self
@@ -2991,19 +2993,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     /// read confirmed it, in ptrace's order: what the dequeue settles
     /// (`inbound_dequeued`), what the announcement's turn left
     /// (`inbound_turn_settled`, which also gives the delivery its ordinal),
-    /// what the granted delivery settles (`inbound_delivered`), and the
-    /// delivery's record (`check_and_record_delivery`, whose
-    /// `Guest::deliver_signal` is the backend's check of its prediction and
-    /// whose siginfo read gets none). An announcement this thread does not
+    /// what the granted delivery settles (`inbound_delivered`), the delivery
+    /// check (`check_delivery_to_record`, whose `Guest::deliver_signal` is
+    /// the backend's check of its prediction and whose siginfo read gets
+    /// none), and, if the check approves, the record
+    /// (`record_checked_delivery`). An announcement this thread does not
     /// hold, signal and token both, is `EINVAL`; a drop decision, which only
     /// refused configurations make, is `EPROTO`.
     ///
     /// It must not wait for a turn. The announcement refused every
     /// configuration in which one of its parts files a scheduler request; if
     /// the thread was granted a turn all the same, the backend's final read
-    /// no longer holds, so the commit fails closed with `EDEADLK`, after
-    /// `inbound_delivered`'s effects but before the record. Any `Err` ends
-    /// the run.
+    /// no longer holds, so the commit fails closed with `EDEADLK`, before the
+    /// delivery is recorded. It checks twice: after `inbound_delivered`'s
+    /// effects, before the delivery check, and after the delivery check
+    /// (whose `Guest::deliver_signal` must not wait for a turn), before the
+    /// record. Any `Err` ends the run.
     async fn commit_signal_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3046,16 +3051,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
             return Err(Errno::EDEADLK);
         }
-        crate::syscalls::signal_shadow::check_and_record_delivery(guest, held.signal).await;
-        #[cfg(test)]
-        Self::note_test_phase("recorded");
+        let record =
+            crate::syscalls::signal_shadow::check_delivery_to_record(guest, held.signal).await;
         if guest.thread_state().scheduler_grants != grants {
             warn!(
-                "[dtid {}] recording announced signal {} was granted a turn",
+                "[dtid {}] checking announced signal {} was granted a turn",
                 guest.thread_state().dettid,
                 held.signal
             );
             return Err(Errno::EDEADLK);
+        }
+        if record {
+            crate::syscalls::signal_shadow::record_checked_delivery(guest, held.signal);
         }
         Ok(())
     }

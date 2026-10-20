@@ -2393,8 +2393,16 @@ fi
 # root Cargo.toml, Cargo.lock and rust-toolchain.toml, so inventory 997, SDK
 # and native inputs, calibrated budget, job width and limits carry unchanged
 # from the ae4467b3 entry.
+# CARRY TO 87c88c0dd13ea91d8b764370da8c70f447c2ee7b (2026-10-20): from
+# 9c993c8528f1b05a5c0241eaff98f73817853d02. One commit (signals lane, the
+# two-phase signal hooks' contract: EOPNOTSUPP vs EPROTONOSUPPORT, and a
+# trait-level test). It changes reverie/src/tool.rs, reverie/src/guest.rs and
+# reverie/tests/signal_bridge.rs only; git diff is empty under reverie-dbt/
+# and third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so inventory 997, SDK and native inputs, calibrated
+# budget, job width and limits carry unchanged from the 9c993c85 entry.
 
-expected_pin=9c993c8528f1b05a5c0241eaff98f73817853d02
+expected_pin=87c88c0dd13ea91d8b764370da8c70f447c2ee7b
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

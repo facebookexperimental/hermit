@@ -45,6 +45,9 @@ thread_local! {
     /// Whether the next delivered part grants the thread a turn, as a part
     /// filing a scheduler request would.
     static GRANT_DURING_COMMIT: Cell<bool> = const { Cell::new(false) };
+    /// Whether the next delivery check grants the thread a turn, as a
+    /// `Guest::deliver_signal` that waited for one would.
+    static GRANT_DURING_CHECK: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Records that Detcore ran `phase` of a delivery on this thread.
@@ -55,6 +58,14 @@ pub(crate) fn note_phase(phase: &'static str) {
 /// Counts a scheduler grant in `thread`, once, if a test asked for one.
 pub(crate) fn grant_during_commit_if_asked<T>(thread: &mut ThreadState<T>) {
     if GRANT_DURING_COMMIT.with(|ask| ask.replace(false)) {
+        thread.scheduler_grants += 1;
+    }
+}
+
+/// Counts a scheduler grant in `thread`, once, if a test asked for one during
+/// the delivery check.
+pub(crate) fn grant_during_check_if_asked<T>(thread: &mut ThreadState<T>) {
+    if GRANT_DURING_CHECK.with(|ask| ask.replace(false)) {
         thread.scheduler_grants += 1;
     }
 }
@@ -330,7 +341,8 @@ async fn a_number_outside_1_to_64_is_refused_before_any_turn() {
 
 /// Every configuration in which a commit could file a scheduler request, or
 /// would read the thread's queues or the delivery's siginfo, is refused at
-/// the announcement with `EOPNOTSUPP`, before any turn.
+/// the announcement with `EPROTONOSUPPORT` (Detcore has opted in, so not
+/// `EOPNOTSUPP`), before any turn.
 #[tokio::test]
 async fn configurations_the_commit_cannot_keep_are_refused_before_any_turn() {
     type Adjust = fn(&mut Config);
@@ -369,7 +381,7 @@ async fn configurations_the_commit_cannot_keep_are_refused_before_any_turn() {
         );
         assert_eq!(
             tool.announce_signal_event(&mut guest, libc::SIGUSR1).await,
-            Err(Errno::EOPNOTSUPP),
+            Err(Errno::EPROTONOSUPPORT),
             "{name}"
         );
         assert!(turns(&guest).is_empty(), "{name}: a turn was taken");
@@ -379,14 +391,14 @@ async fn configurations_the_commit_cannot_keep_are_refused_before_any_turn() {
 }
 
 /// A thread holding a claimed `SIGCHLD`, whose placement must come before its
-/// delivery's turn, is refused before any turn.
+/// delivery's turn, is refused before any turn, with `EPROTONOSUPPORT`.
 #[tokio::test]
 async fn a_claimed_sigchld_is_refused_before_any_turn() {
     let (tool, mut guest) = setup();
     guest.thread.claimed_sigchld = true;
     assert_eq!(
         tool.announce_signal_event(&mut guest, libc::SIGCHLD).await,
-        Err(Errno::EOPNOTSUPP)
+        Err(Errno::EPROTONOSUPPORT)
     );
     assert!(turns(&guest).is_empty());
     assert!(guest.thread.claimed_sigchld);
@@ -424,8 +436,8 @@ async fn a_second_announcement_continues_a_first_whose_handler_runs() {
 }
 
 /// The commit runs the delivery's parts in ptrace's order: what the dequeue
-/// settles, what the granted delivery settles, then the record. The
-/// announcement runs none of them.
+/// settles, what the granted delivery settles, the delivery check, then the
+/// record. The announcement runs none of them.
 #[tokio::test]
 async fn commit_runs_the_dequeue_the_delivery_and_the_record_in_order() {
     let (tool, mut guest) = setup();
@@ -435,7 +447,10 @@ async fn commit_runs_the_dequeue_the_delivery_and_the_record_in_order() {
     tool.commit_signal_event(&mut guest, announcement)
         .await
         .unwrap();
-    assert_eq!(take_phases(), ["dequeued", "delivered", "recorded"]);
+    assert_eq!(
+        take_phases(),
+        ["dequeued", "delivered", "checked", "recorded"]
+    );
 }
 
 /// A commit during which the thread is granted a turn fails closed with
@@ -452,5 +467,27 @@ async fn a_turn_granted_during_a_commit_fails_it_before_the_record() {
         Err(Errno::EDEADLK)
     );
     assert_eq!(take_phases(), ["dequeued", "delivered"]);
+    assert!(guest.thread.signal_announcements.is_empty());
+}
+
+/// A turn granted during the delivery check (as a `Guest::deliver_signal`
+/// that waited for one would) fails the commit with `EDEADLK` before the
+/// delivery is recorded.
+///
+/// The grant is simulated: in the configurations a commit runs in today the
+/// kernel's signal state is not the guest's, so the check accepts the delivery
+/// without calling `Guest::deliver_signal`, and nothing reaches it from a
+/// commit until in-guest Detcore keeps that copy (A5 3c.0).
+#[tokio::test]
+async fn a_turn_granted_during_the_check_fails_the_commit_before_the_record() {
+    let (tool, mut guest) = setup();
+    let announcement = announce(&tool, &mut guest, libc::SIGUSR1).await;
+    take_phases();
+    GRANT_DURING_CHECK.with(|ask| ask.set(true));
+    assert_eq!(
+        tool.commit_signal_event(&mut guest, announcement).await,
+        Err(Errno::EDEADLK)
+    );
+    assert_eq!(take_phases(), ["dequeued", "delivered", "checked"]);
     assert!(guest.thread.signal_announcements.is_empty());
 }

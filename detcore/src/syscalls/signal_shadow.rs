@@ -750,6 +750,21 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    if check_delivery_to_record(guest, signal).await {
+        record_checked_delivery(guest, signal);
+    }
+}
+
+/// The check half of [`check_and_record_delivery`]: whether `signal`'s
+/// delivery is to be recorded, after the copy has caught up and
+/// `Guest::deliver_signal` has checked it. A two-phase commit
+/// (`Tool::commit_signal_event`) runs it, checks that it was granted no turn
+/// (its `deliver_signal` must not wait for one), and only then records.
+pub(crate) async fn check_delivery_to_record<G, T>(guest: &mut G, signal: i32) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
     let had_copy = guest.thread_state().signal_shadow.is_some();
     // At a delivery stop the kernel has not installed the handler mask yet.
     take_unreported(guest);
@@ -757,9 +772,28 @@ where
     reconcile_returns(guest, "signal delivery");
     // A signal the kernel does not deliver at this resume is delivered, and
     // recorded, at a later stop, if at all.
-    if check_delivery(guest, signal, had_copy).await {
-        commit_delivery(guest, signal);
+    let record = check_delivery(guest, signal, had_copy).await;
+    // A two-phase commit's test sees the check made, and can grant a turn in
+    // it, as a `deliver_signal` that waited for one would
+    // (`signal_announcement_tests`).
+    #[cfg(test)]
+    {
+        crate::signal_announcement_tests::note_phase("checked");
+        crate::signal_announcement_tests::grant_during_check_if_asked(guest.thread_state_mut());
     }
+    record
+}
+
+/// The record half of [`check_and_record_delivery`], for a delivery its
+/// check half approved: the copy enters the handler.
+pub(crate) fn record_checked_delivery<G, T>(guest: &mut G, signal: i32)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    #[cfg(test)]
+    crate::signal_announcement_tests::note_phase("recorded");
+    commit_delivery(guest, signal);
 }
 
 /// [`check_and_record_delivery`] without the check, for a delivery the
