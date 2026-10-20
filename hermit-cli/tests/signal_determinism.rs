@@ -1649,6 +1649,16 @@ fn assert_sigreturn_chained(how: &str, from_registers: u32, chained: [&str; 2]) 
     assert!(noise.is_empty(), "mode {mode}: {noise:#?}");
 }
 
+/// Inside sigsuspend, a temporary mask that differs from the thread's own
+/// only in SIGSEGV, a signal Linux can force-deliver. The delivery is checked
+/// and approved. Before, Detcore's copy took the kernel's mask for a forced
+/// delivery's clear and gave itself up
+/// (`skipped={"copy given up at this delivery": 1}`).
+#[test]
+fn ptrace_delivery_check_keeps_its_copy_when_the_wait_mask_differs_only_in_forced_signals() {
+    assert_counters("suspend-forced-only-difference", &[ONE_APPROVAL]);
+}
+
 /// A blocked signal does not end a sleep, and is delivered, once, at the
 /// unblock.
 #[test]

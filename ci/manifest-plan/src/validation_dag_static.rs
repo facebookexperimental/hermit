@@ -2608,7 +2608,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_guest_root_whose_host_waiters_gave_up_shows_once_through_the_filter,
     // only_a_short_read_below_a_page_can_end_the_capture): 2180.
     // And +2 from c5eb858a: 2182.
-    ("test.detcore_unit", 2182),
+    // And a forced-only wait-mask unit (signal_shadow): 2183.
+    ("test.detcore_unit", 2183),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2964,7 +2965,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4526), listed: 306.
     // And a fault at a handler's first instruction (A5 step 3.2b part 4): 307.
     // And two chained deliveries at rt_sigreturn's exit: 309.
-    ("test.hermit_integration_3", 309),
+    // And a wait mask differing only in forced signals: 310.
+    ("test.hermit_integration_3", 310),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4613,7 +4615,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Minus the /proc/locks end-of-list unit and plus the seven /proc/locks
     // capture units (the same as test.detcore_unit): 2180.
     // And +2 from c5eb858a: 2182.
-    ("test.detcore_unit_on_host", 2182),
+    // And the same forced-only wait-mask unit: 2183.
+    ("test.detcore_unit_on_host", 2183),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4717,7 +4720,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 for a fault at a handler's first instruction: 653.
     // And +2 for two chained deliveries at rt_sigreturn's exit: 655.
     // And +3 from c5eb858a: 655.
-    ("test.hermit_integration_on_host", 655),
+    // And +1 for a wait mask differing only in forced signals: 656.
+    ("test.hermit_integration_on_host", 656),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

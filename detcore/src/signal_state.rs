@@ -280,6 +280,12 @@ pub(crate) struct ThreadSignals {
     /// own mask, if the call had not started.
     #[serde(default)]
     pub(crate) wait_mask: Option<Sigset>,
+    /// With `wait_mask`, whether the kernel ran that wait, from the call's
+    /// own raw result before any normalization: a not-run report
+    /// (`-ERESTARTSYS`, the signal came first) means its mask was never
+    /// installed. `None` where nothing recorded it.
+    #[serde(default)]
+    pub(crate) wait_ran: Option<bool>,
     /// The `uc_sigmask` of each handler frame entered and not yet known to
     /// have returned, innermost last. A backend that reports `rt_sigreturn`
     /// pops one per return ([`ThreadSignals::sigreturn`]); where the kernel
@@ -310,6 +316,7 @@ impl ThreadSignals {
             blocked: blocked & !UNBLOCKABLE,
             saved: None,
             wait_mask: None,
+            wait_ran: None,
             activations: Vec::new(),
             observed: Vec::new(),
             verify_at_entry: false,
@@ -450,6 +457,7 @@ pub(crate) fn deliver(
     if action.is_caught() {
         // A handler ends the wait; an ignored signal does not.
         thread.wait_mask = None;
+        thread.wait_ran = None;
         if !thread.enter_handler(signal, &action) {
             return Ok(None);
         }

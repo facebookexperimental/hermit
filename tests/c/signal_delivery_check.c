@@ -407,6 +407,29 @@ int main(int argc, char** argv) {
         (long long)(sa_mask | bit(SIGALRM) | (in_frame ? 0 : bit(SIGSEGV))));
     expect("frame mask", (long long)handler_frame_mask, (long long)saved);
     expect("mask after sigsuspend", (long long)current_mask(), (long long)saved);
+  } else if (!strcmp(mode, "suspend-forced-only-difference")) {
+    // As suspend, with a temporary mask that differs from the thread's own
+    // only in SIGSEGV, a signal Linux can force-deliver: own {SIGINT,
+    // SIGSEGV}, temporary {SIGINT}. Detcore's copy took the kernel's mask for
+    // a forced delivery's clear and gave itself up, leaving the delivery and
+    // every later one unchecked (A5 step 3.2b follow-up).
+    catch_signal(SIGALRM, 0);
+    uint64_t saved = own | bit(SIGSEGV);
+    set_mask(saved);
+    arm_alarm();
+    sigset_t temporary;
+    sigemptyset(&temporary);
+    sigaddset(&temporary, SIGINT);
+    result = sigsuspend(&temporary);
+    error = errno;
+    expect("sigsuspend", result, -1);
+    expect("sigsuspend errno", error, EINTR);
+    expect(
+        "handler mask",
+        (long long)handler_mask,
+        (long long)(own | sa_mask | bit(SIGALRM)));
+    expect("frame mask", (long long)handler_frame_mask, (long long)saved);
+    expect("mask after sigsuspend", (long long)current_mask(), (long long)saved);
   } else if (!strcmp(mode, "realtime")) {
     catch_signal(SIGRTMIN + 3, 0);
     union sigval value = {.sival_int = 7};

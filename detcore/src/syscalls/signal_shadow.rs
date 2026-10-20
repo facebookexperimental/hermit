@@ -246,6 +246,7 @@ where
     };
     shadow.thread.settle();
     shadow.thread.wait_mask = None;
+    shadow.thread.wait_ran = None;
     reconcile_returns(guest, "syscall entry");
 }
 
@@ -752,7 +753,7 @@ where
     let had_copy = guest.thread_state().signal_shadow.is_some();
     // At a delivery stop the kernel has not installed the handler mask yet.
     take_unreported(guest);
-    take_wait_outcome(guest);
+    take_wait_outcome(guest).await;
     reconcile_returns(guest, "signal delivery");
     // A signal the kernel does not deliver at this resume is delivered, and
     // recorded, at a later stop, if at all.
@@ -770,7 +771,7 @@ where
     T: RecordOrReplay,
 {
     take_unreported(guest);
-    take_wait_outcome(guest);
+    futures::executor::block_on(take_wait_outcome(guest));
     reconcile_returns(guest, "signal delivery");
     commit_delivery(guest, signal);
 }
@@ -1295,16 +1296,32 @@ where
 /// before the call started, which depends on host timing (see
 /// `record_or_replay_rt_sigsuspend`). The kernel's current mask tells which;
 /// any other mask is left for the checks that follow to report.
-fn take_wait_outcome<G, T>(guest: &mut G)
+///
+/// The masks are compared with the signals Linux can force-deliver left out
+/// ([`forced`]), since a forced delivery the copy did not see can clear one.
+/// When the wait's mask and the copy's differ only in such signals, that
+/// comparison cannot tell them apart, and an exact one alone can mislead: a
+/// forced clear only takes bits out, and can turn the copy's mask into the
+/// wait's. Then the copy keeps its own mask if the kernel holds it exactly,
+/// and takes the wait's if the kernel holds that exactly and either it has a
+/// bit the copy's lacks (no clear adds one) or the call's raw result says the
+/// kernel ran the wait ([`kernel_ran_the_wait`]), installing its mask over
+/// any earlier clear. Any other subset of either mask gives the copy up
+/// quietly, as a forced delivery's clear; a kernel mask with a bit neither
+/// mask has is left to the checks that follow to report.
+async fn take_wait_outcome<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let Some((wait_mask, saved)) = guest
-        .thread_state()
-        .signal_shadow
-        .as_ref()
-        .map(|shadow| (shadow.thread.wait_mask, shadow.thread.saved))
+    let Some((wait_mask, saved, blocked)) =
+        guest.thread_state().signal_shadow.as_ref().map(|shadow| {
+            (
+                shadow.thread.wait_mask,
+                shadow.thread.saved,
+                shadow.thread.blocked,
+            )
+        })
     else {
         return;
     };
@@ -1314,29 +1331,98 @@ where
     let Some(kernel) = read_or_give_up(guest, "signal delivery") else {
         return;
     };
+    let compared = !(reserved() | forced());
+    let same = |a: KernelSigset, b: KernelSigset| a & compared == b & compared;
+    let exact = |a: KernelSigset, b: KernelSigset| a & !reserved() == b & !reserved();
+    // A temporary-mask restore no handler took has happened if the kernel
+    // already shows the restored mask (the wait returned to the guest).
+    let settled = match saved {
+        Some(saved) if same(kernel.blocked, saved) => Some(saved),
+        _ => None,
+    };
+    let current = settled.unwrap_or(blocked);
+    let forced_only = |wait: KernelSigset| same(wait, current) && !exact(wait, current);
+    let take_wait = match wait_mask {
+        Some(wait) if forced_only(wait) && same(kernel.blocked, wait) => {
+            // A forced delivery only takes bits out of the kernel's mask. So
+            // the copy's own mask, held exactly, stays; and the wait's,
+            // held exactly, was installed if it has a bit the copy's lacks,
+            // and otherwise only if the call's raw result says the kernel
+            // ran it. Any other subset of either mask can be a forced clear,
+            // which gives the copy up; a kernel mask with a bit neither has
+            // no forced delivery explains, and is left to the checks that
+            // follow to report, as before.
+            let subset = |a: KernelSigset, b: KernelSigset| a & !b & !reserved() == 0;
+            if exact(kernel.blocked, current) {
+                None
+            } else if exact(kernel.blocked, wait)
+                && (wait & !current & !reserved() != 0 || kernel_ran_the_wait(guest).await)
+            {
+                Some(wait)
+            } else if subset(kernel.blocked, current) || subset(kernel.blocked, wait) {
+                forced_changed(guest, "signal delivery");
+                return;
+            } else {
+                None
+            }
+        }
+        Some(wait) if same(kernel.blocked, wait) && !same(current, wait) => Some(wait),
+        _ => None,
+    };
     let Some(shadow) = guest.thread_state_mut().signal_shadow.as_mut() else {
         return;
     };
-    let compared = !(reserved() | forced());
-    let same = |a: KernelSigset, b: KernelSigset| a & compared == b & compared;
-    // A temporary-mask restore no handler took has happened if the kernel
-    // already shows the restored mask (the wait returned to the guest).
-    if let Some(saved) = saved
-        && same(kernel.blocked, saved)
-    {
+    if settled.is_some() {
         shadow.thread.settle();
     }
-    if let Some(wait_mask) = wait_mask
-        && same(kernel.blocked, wait_mask)
-        && !same(shadow.thread.blocked, wait_mask)
-    {
-        shadow.thread.interrupted_under_temporary_mask(wait_mask);
+    if let Some(wait) = take_wait {
+        shadow.thread.interrupted_under_temporary_mask(wait);
     }
     // The outcome was chosen with the forced signals left out. A forced
     // delivery's clear gives the copy up now; any other difference is left to
     // the next check, which reports it.
     if compare(kernel.blocked, shadow.thread.blocked) == Compared::ForcedOnly {
         forced_changed(guest, "signal delivery");
+    }
+}
+
+/// Whether the kernel ran the temporary-mask wait this delivery stop ends,
+/// and so installed its mask: the call's own raw result, before any
+/// normalization, was not the not-run report ([`note_wait_ran`]; only
+/// rt_sigsuspend records it today, so other waits never count as run here).
+/// Two more conditions tie it to this stop: Detcore finished the call
+/// interrupted (`-EINTR` or `-ERESTARTNOHAND`), and the stop's `orig_ax`
+/// still names that call, so the thread has not run on.
+async fn kernel_ran_the_wait<G, T>(guest: &mut G) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    const ERESTARTNOHAND: i64 = 514;
+    let ran = guest
+        .thread_state()
+        .signal_shadow
+        .as_ref()
+        .and_then(|shadow| shadow.thread.wait_ran);
+    if ran != Some(true) {
+        return false;
+    }
+    let Some(reverie::Interruption::Return { syscall, result }) =
+        guest.thread_state().delivery_interruption
+    else {
+        return false;
+    };
+    if result != -i64::from(libc::EINTR) && result != -ERESTARTNOHAND {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        guest.regs().await.orig_rax as i64 == syscall
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = syscall;
+        false
     }
 }
 
@@ -1900,6 +1986,22 @@ where
     }
 }
 
+/// Records whether the kernel ran the wait whose mask [`note_wait_mask`]
+/// noted, from the call's raw result: `ran` is false for the not-run report
+/// (`-ERESTARTSYS`), whose mask the kernel never installed. Read by
+/// [`kernel_ran_the_wait`].
+pub(crate) fn note_wait_ran<G, T>(guest: &mut G, ran: bool)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if let Some(shadow) = guest.thread_state_mut().signal_shadow.as_mut()
+        && shadow.thread.wait_mask.is_some()
+    {
+        shadow.thread.wait_ran = Some(ran);
+    }
+}
+
 /// Reports a divergence once, by name, drops this thread's copy and marks the
 /// actions it shares unknown, so no sharing thread reports the consequence
 /// again. Every source of a copy error that host timing could decide gives
@@ -2438,6 +2540,232 @@ mod tests {
                 vec![USR1 | USR2],
                 "the frame saves the thread's own mask either way"
             );
+        }
+    }
+
+    /// The same when the wait's mask and the thread's own differ only in
+    /// signals Linux can force-deliver: masks alone cannot tell the wait's
+    /// mask from a forced clear of the own one, so the copy follows the
+    /// kernel only when the record agrees, and otherwise gives itself up
+    /// quietly, as for a forced delivery, never reporting a divergence.
+    #[test]
+    fn a_wait_mask_differing_only_in_forced_signals_is_taken_only_with_evidence() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let action = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        let int = 1 << (libc::SIGINT - 1);
+        let ill = sigbit(libc::SIGILL);
+        let fpe = sigbit(libc::SIGFPE);
+        assert_eq!((ill | fpe) & forced(), ill | fpe);
+        let interrupted = reverie::Interruption::Return {
+            syscall: libc::SYS_rt_sigsuspend,
+            result: -514,
+        };
+        let usr1 = sigbit(libc::SIGUSR1);
+        let returned = |result: i64| reverie::Interruption::Return {
+            syscall: libc::SYS_rt_sigsuspend,
+            result,
+        };
+        let sigsuspend = libc::SYS_rt_sigsuspend;
+        // (own mask, wait mask, kernel's mask at the stop, record at the
+        // stop, the stop's orig_ax, the wait's raw outcome) -> the copy's mask
+        // afterwards, or None for a quiet give-up; and how many register reads
+        // the decision made.
+        let cases = [
+            (
+                ill | fpe,
+                0,
+                0,
+                Some(interrupted),
+                sigsuspend,
+                Some(true),
+                Some(0),
+                1,
+                "the kernel ran the wait",
+            ),
+            (
+                ill | fpe,
+                0,
+                0,
+                Some(returned(-4)),
+                sigsuspend,
+                Some(true),
+                Some(0),
+                1,
+                "the wait ended with EINTR",
+            ),
+            (
+                ill | fpe,
+                0,
+                ill | fpe,
+                None,
+                sigsuspend,
+                None,
+                Some(ill | fpe),
+                0,
+                "the signal came first",
+            ),
+            (
+                ill | fpe,
+                0,
+                ill | fpe,
+                Some(interrupted),
+                sigsuspend,
+                Some(true),
+                Some(ill | fpe),
+                0,
+                "the own mask held exactly stays, whatever the record says",
+            ),
+            (
+                0,
+                ill,
+                ill,
+                None,
+                sigsuspend,
+                None,
+                Some(ill),
+                0,
+                "the wait's mask holds a bit the own lacks: installed",
+            ),
+            (
+                ill | fpe,
+                0,
+                0,
+                None,
+                sigsuspend,
+                None,
+                None,
+                0,
+                "the wait's mask, but no sign it ran: a forced clear may have made it",
+            ),
+            (
+                ill | fpe,
+                0,
+                0,
+                Some(interrupted),
+                sigsuspend,
+                Some(false),
+                None,
+                0,
+                "ERESTARTNOHAND normalized from a not-run report: the mask was never installed",
+            ),
+            (
+                ill | fpe,
+                0,
+                0,
+                Some(returned(-513)),
+                sigsuspend,
+                Some(true),
+                None,
+                0,
+                "a restart, not an interrupted wait",
+            ),
+            (
+                ill | fpe,
+                0,
+                0,
+                Some(interrupted),
+                -1,
+                Some(true),
+                None,
+                1,
+                "the thread ran on since the wait (orig_ax -1)",
+            ),
+            (
+                ill | fpe,
+                0,
+                fpe,
+                None,
+                sigsuspend,
+                None,
+                None,
+                0,
+                "neither mask: a forced clear of SIGILL",
+            ),
+            (
+                0,
+                ill,
+                0,
+                Some(interrupted),
+                sigsuspend,
+                Some(true),
+                Some(0),
+                0,
+                "the wait ran and lost SIGILL to a forced clear: the own mask, exactly",
+            ),
+            (
+                ill,
+                0,
+                usr1,
+                None,
+                sigsuspend,
+                None,
+                Some(ill),
+                0,
+                "an ordinary signal differs: decided as before, left for the delivery check to report",
+            ),
+            (
+                ill,
+                0,
+                fpe,
+                None,
+                sigsuspend,
+                None,
+                Some(ill),
+                0,
+                "a forced bit neither mask has, which no forced delivery adds: left for the delivery check",
+            ),
+            (
+                ill,
+                0,
+                ill | fpe,
+                Some(interrupted),
+                sigsuspend,
+                Some(true),
+                Some(ill),
+                0,
+                "the own mask plus a forced bit: left for the delivery check",
+            ),
+        ];
+        for (own, wait, at_stop, record, orig_ax, ran, expected, reads, why) in cases {
+            let mut guest = seeded(&kernel, own);
+            kernel.set(own, 0, int);
+            record_rt_sigaction(&mut guest, libc::SIGINT, Some(action), None, &Ok(0));
+            at_syscall_entry(&mut guest);
+            note_wait_mask(&mut guest, wait);
+            if let Some(ran) = ran {
+                note_wait_ran(&mut guest, ran);
+            }
+            kernel.set(at_stop, 0, int);
+            guest.thread.delivery_interruption = record;
+            guest.delivery.orig_rax = Some(orig_ax);
+            record_delivery(&mut guest, libc::SIGINT);
+            assert_eq!(
+                guest.delivery.registers_read, reads,
+                "register reads: {why}"
+            );
+            match expected {
+                Some(mask) => {
+                    let shadow = guest
+                        .thread
+                        .signal_shadow
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("copy given up: {why}"));
+                    assert_eq!(shadow.thread.blocked, mask | int, "{why}");
+                    assert_eq!(
+                        shadow.thread.activations,
+                        vec![own],
+                        "the frame saves the thread's own mask: {why}"
+                    );
+                }
+                None => assert!(guest.thread.signal_shadow.is_none(), "kept: {why}"),
+            }
+            assert!(!guest.thread.signal_shadow_lost, "a divergence: {why}");
         }
     }
 
