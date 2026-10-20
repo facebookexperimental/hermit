@@ -82,7 +82,18 @@ fn host_mtime(path: &Path) -> Duration {
         .expect("mtime is before 1970")
 }
 
-fn hermit_run(extra: &[&str], script: &str, args: &[&Path]) -> Output {
+/// A fresh, empty directory for the guest to start in. /bin/sh stats its cwd,
+/// and a busy directory's st_size changes between the two --verify runs. The
+/// validation runs that request `HERMIT_E2E_EMPTY_WORKDIR` get Hermit's pinned
+/// /test tmpfs instead, which `configure_guest_execution` installs; /test does
+/// not exist on every host, so the flags are not hardcoded here.
+fn empty_workdir(root: &Path) -> PathBuf {
+    let workdir = root.join("workdir");
+    fs::create_dir_all(&workdir).expect("failed to create the guest working directory");
+    workdir
+}
+
+fn hermit_run(workdir: &Path, extra: &[&str], script: &str, args: &[&Path]) -> Output {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "5s", "90s"])
@@ -90,20 +101,9 @@ fn hermit_run(extra: &[&str], script: &str, args: &[&Path]) -> Output {
         .args(["--log=info", "--backend=ptrace", "run", "--strict"])
         .args(extra)
         .arg(format!("--epoch={EPOCH}"))
-        // Start the guest in a fresh tmpfs. From the host cwd, /bin/sh stats
-        // every ancestor of it, and a busy home directory's st_size changes
-        // between the two --verify runs.
-        .args([
-            "--base-env=minimal",
-            "--mount=type=tmpfs,target=/test",
-            "--workdir=/test",
-            "--",
-            "/bin/sh",
-            "-c",
-            script,
-            "sh",
-        ])
-        .args(args);
+        .args(["--base-env=minimal", "--", "/bin/sh", "-c", script, "sh"])
+        .args(args)
+        .current_dir(workdir);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
     let output = command
@@ -145,6 +145,7 @@ fn canonical_host_mtimes_survive_first_sight_and_others_read_as_epoch() {
     "#;
     let report = root.path().join("verify.json");
     let output = hermit_run(
+        &empty_workdir(root.path()),
         &[
             "--verify",
             "--verify-strict",
@@ -201,6 +202,7 @@ fn cp_preserve_copies_a_canonical_mtime_to_the_host() {
     let copy = root.path().join("copy");
 
     let output = hermit_run(
+        &empty_workdir(root.path()),
         &[],
         r#"cp -p "$1" "$2" && date -r "$2" +%s.%N"#,
         &[&source, &copy],
