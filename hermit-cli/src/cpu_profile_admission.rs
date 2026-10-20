@@ -21,7 +21,7 @@ use nix::unistd::Pid;
 
 use crate::xstate_probe;
 
-/// Why a profile is refused, after "--cpu-profile <profile> refused: ".
+/// Why a profile is refused, after `--cpu-profile <profile> refused: `.
 pub type AdmissionRefusal = String;
 
 /// A refused CPU profile, carried as an error so that it
