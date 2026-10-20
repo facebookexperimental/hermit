@@ -804,7 +804,12 @@ impl RecordVersion {
 // 0x17e, 0x17f or 0x180 recording (0x17d from before or after 50727c68)
 // whose capture caught the race would replay different guest bytes, so it
 // is refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x181);
+// 0x181 -> 0x182 (coordinator-assigned HIGHEST_SHIPPED + 1): private DBT
+// client/runtime images now stay inside DynamoRIO's reserved arena instead
+// of consuming application address space. Guest mappings can therefore use
+// different addresses from an older runtime even though the record schema
+// is unchanged; refuse old recordings rather than replay different values.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x182);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -829,7 +834,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x181);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x181;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x182;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

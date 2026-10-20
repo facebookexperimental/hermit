@@ -2403,8 +2403,29 @@ fi
 # rust-toolchain.toml, so the inventory (989), SDK and native inputs,
 # calibrated budget, job width and limits are unchanged from the 39bc362b
 # entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 1223ccc24cbce6da347d4053ce223058de52ce2a ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 1223ccc24cbce6da347d4053ce223058de52ce2a (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 811b51a045bb5b407462a275b9fbf39c079b599a (2026-10-20): from
+# 39bc362bbaad7a6eae5598654c644eab5122900d. Runtime-private image ownership
+# changes eight DynamoRIO inputs; this is not an SDK byte-equality carry.
+# Eight maintained fixture files increase the DBT inventory from 989 to 997.
+# Root manifests/lock/toolchain and build recipe are unchanged. The new SDK
+# cc88b6aeec196aae9831e0fca0d660970a62041b1045e95d44522eb329975422
+# built in 26.77 seconds at 7 effective jobs (187.40 job-seconds, NUM_JOBS=8),
+# below the existing 572 job-second ratchet. Preserve calibrated limits/jobs;
+# this bounded sample does not recalibrate them or carry old package identity.
+# Actual newly pinned Detcore runtime qualification remains required.
+# CARRY TO afb616c424b4ba3b22d0ce3618d60b6bc89b8ef7 (2026-10-20): only the existing
+# private-loader test gains complete image-plus-guard containment assertions,
+# and the README documents fatal ownership failures. Production/SDK inputs,
+# build recipe, inventory997 and calibrated limits are unchanged from 811b51a.
+# This is source equality for calibration, not a new runtime/package receipt.
+# CARRY TO a61244297e040b9ec908dd35f65b004204fa0ea4 (2026-10-20): replay the reviewed
+# placement repair onto published 1223ccc24cbce6da347d4053ce223058de52ce2a.
+# The incoming KVM LinuxEmu D1 changes do not overlap placement inputs; the
+# complete DBT tree, SDK recipe and inventory997 equal reviewed afb616c4.
+# Keep both histories and calibrated limits. This source equality carries
+# the SDK budget only, not prior runtime identity or exact-head test results.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a61244297e040b9ec908dd35f65b004204fa0ea4 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a61244297e040b9ec908dd35f65b004204fa0ea4 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
