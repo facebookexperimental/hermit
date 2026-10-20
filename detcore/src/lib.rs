@@ -3065,6 +3065,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // that made it, which Detcore did not finish for it.
                     delivery_interruption: None,
                     delivery_frame_handler: 0,
+                    delivery_frame_signal: 0,
+                    delivery_frame_orig_ax: 0,
                     delivery_counters: Default::default(),
                     // The threads of a process share the record of what the
                     // scheduler holds for it; a new process has nothing

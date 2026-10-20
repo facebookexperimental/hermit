@@ -242,6 +242,76 @@ static void expect(const char* what, long long actual, long long expected) {
   }
 }
 
+// The reenter-fault mode's SIGUSR1 handler, in assembly so that its
+// registers are known. Its first instruction loads through r12; it then
+// clears r12 and jumps back to that instruction, which now faults: a SIGSEGV
+// at the handler's first instruction, with rdi, rsi, rdx and rsp still as
+// Linux left them for the SIGUSR1 frame. No conditional branch runs between
+// the frame and the fault, so no timer preemption comes between them under
+// Hermit. The SIGSEGV handler resumes at reenter_done, whose `ret` returns
+// through the SIGUSR1 frame's restorer.
+void reenter_handler(int);
+extern char reenter_done[];
+__asm__(
+    ".text\n"
+    ".globl reenter_handler\n"
+    ".type reenter_handler, @function\n"
+    "reenter_handler:\n"
+    "  movq (%r12), %rax\n"
+    "  xorl %r12d, %r12d\n"
+    "  jmp reenter_handler\n"
+    ".globl reenter_done\n"
+    "reenter_done:\n"
+    "  ret\n"
+    ".size reenter_handler, .-reenter_handler\n");
+
+// The sigreturn-chained-* modes' SIGUSR1 handler. With SIGILL and SIGFPE
+// blocked by its sa_mask, it sends itself both, then takes them out of the
+// frame's saved mask. rt_sigreturn installs that mask, and at its exit Linux
+// delivers one, then the other chained right after the first one's frame
+// (A5 step 3.2b part 4). Both are queued with rt_tgsigqueueinfo and a
+// positive si_code, which only a thread sending to itself may use, unless
+// sigreturn_chained_tkill: then SIGILL is sent by tgkill (SI_TKILL). Measured
+// natively and under Hermit alike: queued, SIGILL is delivered first and
+// SIGFPE chained; with tgkill, SIGFPE (the one with a positive code) first
+// and SIGILL chained.
+static volatile sig_atomic_t sigreturn_chained_tkill;
+
+static void on_usr1_queue_two(int sig, siginfo_t* info, void* context) {
+  (void)sig;
+  (void)info;
+  ucontext_t* uc = context;
+  pid_t pid = getpid();
+  pid_t tid = (pid_t)syscall(SYS_gettid);
+  siginfo_t queued;
+  memset(&queued, 0, sizeof queued);
+  queued.si_pid = pid;
+  if (sigreturn_chained_tkill) {
+    syscall(SYS_tgkill, pid, tid, SIGILL);
+  } else {
+    queued.si_signo = SIGILL;
+    queued.si_code = ILL_ILLOPN;
+    syscall(SYS_rt_tgsigqueueinfo, pid, tid, SIGILL, &queued);
+  }
+  queued.si_signo = SIGFPE;
+  queued.si_code = FPE_INTDIV;
+  syscall(SYS_rt_tgsigqueueinfo, pid, tid, SIGFPE, &queued);
+  sigdelset(&uc->uc_sigmask, SIGILL);
+  sigdelset(&uc->uc_sigmask, SIGFPE);
+}
+
+static volatile sig_atomic_t fault_at_handler_entry;
+
+static void on_reenter_fault(int sig, siginfo_t* info, void* context) {
+  (void)sig;
+  ucontext_t* uc = context;
+  fault_at_handler_entry = uc->uc_mcontext.gregs[REG_RIP] == (greg_t)reenter_handler &&
+      uc->uc_mcontext.gregs[REG_RDI] == SIGUSR1 && info->si_code == SEGV_MAPERR &&
+      info->si_addr == NULL;
+  handled++;
+  uc->uc_mcontext.gregs[REG_RIP] = (greg_t)reenter_done;
+}
+
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "";
   const uint64_t own = bit(SIGINT);
@@ -792,6 +862,55 @@ int main(int argc, char** argv) {
     expect("handled before the unblock", handled, 0);
     set_mask(own);
     expect("handler mask", (long long)handler_mask, (long long)(own | sa_mask | bit(SIGSYS)));
+  } else if (!strcmp(mode, "sigreturn-chained-queued") ||
+             !strcmp(mode, "sigreturn-chained-tkill")) {
+    // Two synchronous signals Linux delivers at rt_sigreturn's exit, the
+    // second chained after the first one's frame (on_usr1_queue_two).
+    sigreturn_chained_tkill = !strcmp(mode, "sigreturn-chained-tkill");
+    catch_signal_with(SIGILL, 0, 1);
+    catch_signal_with(SIGFPE, 0, 1);
+    struct sigaction usr1;
+    memset(&usr1, 0, sizeof usr1);
+    usr1.sa_sigaction = on_usr1_queue_two;
+    usr1.sa_flags = SA_SIGINFO;
+    sigemptyset(&usr1.sa_mask);
+    sigaddset(&usr1.sa_mask, SIGILL);
+    sigaddset(&usr1.sa_mask, SIGFPE);
+    expect("sigaction SIGUSR1", sigaction(SIGUSR1, &usr1, NULL), 0);
+    raise(SIGUSR1);
+    expect("handled twice", handled, 2);
+    handled = 1;
+  } else if (!strcmp(mode, "reenter-fault")) {
+    // A SIGUSR1 handler that comes back to its own first instruction, which
+    // faults there: the SIGSEGV stop shows the SIGUSR1 frame's registers,
+    // but the thread ran user code since that frame, so the SIGSEGV is not a
+    // delivery chained at the same exit (A5 step 3.2b part 4).
+    struct sigaction usr1;
+    memset(&usr1, 0, sizeof usr1);
+    usr1.sa_handler = reenter_handler;
+    sigemptyset(&usr1.sa_mask);
+    expect("sigaction SIGUSR1", sigaction(SIGUSR1, &usr1, NULL), 0);
+    struct sigaction segv;
+    memset(&segv, 0, sizeof segv);
+    segv.sa_sigaction = on_reenter_fault;
+    segv.sa_flags = SA_SIGINFO;
+    sigemptyset(&segv.sa_mask);
+    expect("sigaction SIGSEGV", sigaction(SIGSEGV, &segv, NULL), 0);
+    // tgkill by hand, so that r12 holds a readable address at the syscall's
+    // exit, where the kernel delivers SIGUSR1; rt_sigreturn puts r12 back.
+    static long readable;
+    register long r12 __asm__("r12") = (long)&readable;
+    long ret;
+    __asm__ volatile("syscall"
+                     : "=a"(ret)
+                     : "0"((long)SYS_tgkill),
+                       "D"((long)getpid()),
+                       "S"((long)syscall(SYS_gettid)),
+                       "d"((long)SIGUSR1),
+                       "r"(r12)
+                     : "rcx", "r11", "memory");
+    expect("tgkill", ret, 0);
+    expect("fault at the handler's first instruction", fault_at_handler_entry, 1);
   } else if (!strcmp(mode, "ignored")) {
     signal(SIGUSR1, SIG_IGN);
     raise(SIGUSR1);

@@ -927,9 +927,80 @@ fn sees_syscall(nr: i64) -> bool {
     usize::try_from(nr).is_ok_and(|nr| reverie::syscalls::Sysno::new(nr).is_some())
 }
 
-/// What the thread was doing at this delivery stop, for the backend's check of
-/// the syscall registers, and whether it was taken from the registers
-/// themselves rather than from Detcore's record.
+/// `sizeof(struct ucontext)` on x86-64 Linux (`include/uapi/asm-generic/ucontext.h`):
+/// `uc_flags` and `uc_link` (8 bytes each), `stack_t uc_stack` (24),
+/// `struct sigcontext uc_mcontext` (256) and the kernel's 8-byte
+/// `uc_sigmask`. Not libc's `ucontext_t`, which is larger.
+#[cfg(target_arch = "x86_64")]
+const KERNEL_UCONTEXT_SIZE: u64 = 304;
+
+/// Whether `regs` are the registers Linux leaves when it has just built a
+/// frame for `signal`'s handler at `handler`, at a stop whose `orig_ax` was
+/// `orig_ax`, so that no guest instruction has run since: a chained delivery
+/// at the same exit. Linux v6.12 `x64_setup_rt_frame`
+/// (https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/arch/x86/kernel/signal_64.c?h=v6.12#n202)
+/// sets `rdi` to the signal, `rsi` to the frame's siginfo, `rdx` to its
+/// ucontext, `rip` to the handler and `rsp` to the frame, whose layout is
+/// `struct rt_sigframe { pretcode; uc; info; }` (`arch/x86/include/asm/sigframe.h`).
+/// `get_sigframe` puts the frame 8 bytes below a 16-byte boundary
+/// (https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/arch/x86/kernel/signal.c?h=v6.12#n144).
+/// Neither writes `orig_ax`, while every later entry to the kernel other
+/// than by a syscall sets it to -1
+/// (https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/arch/x86/entry/entry_64.S?h=v6.12#n344).
+///
+/// The handler's address alone was matched again by a handler whose code
+/// returns to its own first instruction (Codex review of A5 step 3.2). Some
+/// stops still match that are not chained: a signal that reaches the
+/// handler's first instruction after the guest came back to it with these
+/// registers unchanged, when the frame's delivery stop had `orig_ax` -1, or
+/// a fault there (which `delivery_interruption` excludes by its siginfo,
+/// `synchronous_with_a_kernel_code`).
+/// `rax`, which Linux sets to 0 too, is not checked: a syscall the tool
+/// injects at the stop leaves its result there (`reverie::Interruption`).
+/// x32 and ia32 frames have another layout and never match.
+#[cfg(target_arch = "x86_64")]
+fn at_frame_entry(regs: &libc::user_regs_struct, handler: u64, signal: i32, orig_ax: i64) -> bool {
+    regs.rip == handler
+        && regs.rdi == signal as u64
+        && regs.rdx == regs.rsp.wrapping_add(8)
+        && regs.rsi == regs.rdx.wrapping_add(KERNEL_UCONTEXT_SIZE)
+        && regs.rsp % 16 == 8
+        && regs.orig_rax as i64 == orig_ax
+}
+
+/// Whether `signal` is one of Linux's synchronous signals
+/// (https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/signal.c?h=v6.12#n196)
+/// with a positive `si_code`. A fault has one, and needs the thread back in
+/// user code, so it is never a chained delivery at the same exit; such a
+/// signal is therefore never taken for one. That loses two genuine chained
+/// deliveries, which then take the registers' answer, always safe and
+/// counted: a SIGSEGV for a frame Linux failed to build after an earlier
+/// one, and a synchronous signal the guest queued with a positive code,
+/// which Linux lets a thread send only to itself (`do_rt_tgsigqueueinfo`,
+/// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/signal.c?h=v6.12#n4112)
+/// or a thread-group leader to its own process (`do_rt_sigqueueinfo`,
+/// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/signal.c?h=v6.12#n4065).
+#[cfg(target_arch = "x86_64")]
+fn synchronous_with_a_kernel_code(
+    signal: i32,
+    info: Option<[u8; reverie::SIGNAL_INFO_SIZE]>,
+) -> bool {
+    let synchronous = [
+        libc::SIGSEGV,
+        libc::SIGBUS,
+        libc::SIGILL,
+        libc::SIGTRAP,
+        libc::SIGFPE,
+        libc::SIGSYS,
+    ];
+    synchronous.contains(&signal)
+        && info.is_some_and(|info| i32::from_ne_bytes(info[8..12].try_into().unwrap()) > 0)
+}
+
+/// What the thread was doing at this delivery stop of `signal`, for the
+/// backend's check of the syscall registers; whether it was taken from the
+/// registers themselves rather than from Detcore's record; and the stop's
+/// `orig_ax` (-1 where no register is read).
 ///
 /// Detcore's record (`ThreadState::delivery_interruption`) is set at each
 /// guest event: the syscall entered, the result Detcore finished it with, a
@@ -941,10 +1012,13 @@ fn sees_syscall(nr: i64) -> bool {
 ///   syscall, so a syscall record with `orig_ax` -1 means the thread returned
 ///   to user code since: no syscall.
 /// - A frame's chained delivery at the same exit stops before any guest
-///   instruction, at the handler's first instruction. Anywhere else, either
-///   the guest ran since, and with `orig_ax` -1 that is no syscall, or the
-///   frame was not built (a frame fault, whose SIGSEGV comes at the same
-///   exit), and the registers' answer is used.
+///   instruction, with the registers Linux set for the frame and the frame's
+///   own stop's `orig_ax` (`at_frame_entry`), and is never a synchronous
+///   signal with a positive `si_code`, as a fault has
+///   (`synchronous_with_a_kernel_code`). Otherwise, either the
+///   guest ran since, and with `orig_ax` -1 that is no syscall, or the frame
+///   was not built (a frame fault, whose SIGSEGV comes at the same exit), and
+///   the registers' answer is used.
 /// - A record naming the syscall `orig_ax` names is sent as it stands, so
 ///   `rax` is compared with the result Detcore finished the call with.
 /// - Where `orig_ax` names a syscall Detcore cannot see (a number outside
@@ -955,7 +1029,10 @@ fn sees_syscall(nr: i64) -> bool {
 /// - With no record (a new thread or image), or where Detcore does not see
 ///   every syscall (`--passthru-opt`), the registers' answer is used, and the
 ///   check of the syscall registers verifies nothing.
-async fn delivery_interruption<G, T>(guest: &mut G) -> (reverie::Interruption, bool)
+async fn delivery_interruption<G, T>(
+    guest: &mut G,
+    signal: i32,
+) -> (reverie::Interruption, bool, i64)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -965,8 +1042,8 @@ where
     // Only x86-64's registers are read here; elsewhere nothing is checked.
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = record;
-        (Interruption::AfterFrame, true)
+        let _ = (record, signal);
+        (Interruption::AfterFrame, true, -1)
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -980,11 +1057,18 @@ where
             Interruption::KernelRun { syscall: orig }
         };
         if guest.config().passthru_opt {
-            return (from_registers, true);
+            return (from_registers, true, orig);
         }
-        match record {
+        let state = guest.thread_state();
+        let (interruption, from_registers) = match record {
             Some(Interruption::AfterFrame)
-                if regs.rip == guest.thread_state().delivery_frame_handler =>
+                if !synchronous_with_a_kernel_code(signal, guest.signal_info())
+                    && at_frame_entry(
+                        &regs,
+                        state.delivery_frame_handler,
+                        state.delivery_frame_signal,
+                        state.delivery_frame_orig_ax,
+                    ) =>
             {
                 (Interruption::AfterFrame, false)
             }
@@ -998,8 +1082,12 @@ where
             // - there is no record (a new thread or image);
             // - the guest ran on since the record (`orig_ax` -1 after a
             //   syscall or a frame);
-            // - still at the syscall's exit away from the handler, the frame
-            //   was not built (a frame fault raises SIGSEGV at the same exit);
+            // - still at the syscall's exit without the frame's registers, the
+            //   frame was not built (a frame fault raises SIGSEGV at the same
+            //   exit);
+            // - a synchronous signal with a positive `si_code`, as a fault has,
+            //   which needs the thread back in user code
+            //   (`synchronous_with_a_kernel_code`);
             // - the thread is in a syscall Detcore cannot see: a number
             //   outside Reverie's table, or a negative one the kernel refuses,
             //   reaches no Tool callback, so the record still names an earlier
@@ -1010,7 +1098,8 @@ where
             // event it subscribes to. Sent as it stands, so the backend reports
             // the contradiction.
             Some(record) => (record, false),
-        }
+        };
+        (interruption, from_registers, orig)
     }
 }
 
@@ -1111,7 +1200,7 @@ where
     // of them stays checked in the other.
     let forced_frame = forced() & frame_mask & !sigbit(signal);
     let forced_current = forced() & current_mask & !sigbit(signal);
-    let (interruption, from_registers) = delivery_interruption(guest).await;
+    let (interruption, from_registers, orig_ax) = delivery_interruption(guest, signal).await;
     let action = reverie::SignalAction {
         handler: action.handler,
         flags: action.flags,
@@ -1151,6 +1240,8 @@ where
         let state = guest.thread_state_mut();
         state.delivery_interruption = Some(reverie::Interruption::AfterFrame);
         state.delivery_frame_handler = action.handler;
+        state.delivery_frame_signal = signal;
+        state.delivery_frame_orig_ax = orig_ax;
     }
     let counters = &mut guest.thread_state_mut().delivery_counters;
     counters.interruption_from_registers += u64::from(from_registers);
@@ -1868,6 +1959,8 @@ mod tests {
         report_path: Option<reverie::SignalReportPath>,
         orig_rax: Option<i64>,
         rip: u64,
+        /// `rdi`, `rsi`, `rdx` and `rsp`, as `regs` shows them.
+        frame_regs: [u64; 4],
         registers_read: usize,
     }
 
@@ -1946,6 +2039,7 @@ mod tests {
             let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
             regs.orig_rax = orig_rax as u64;
             regs.rip = self.delivery.rip;
+            [regs.rdi, regs.rsi, regs.rdx, regs.rsp] = self.delivery.frame_regs;
             regs
         }
         fn signal_report_path(&self) -> Option<reverie::SignalReportPath> {
@@ -3742,11 +3836,18 @@ mod tests {
         }
     }
 
+    /// The registers Linux leaves for a SIGUSR1 frame at 0x7fff_0008, stated
+    /// on their own rather than from `KERNEL_UCONTEXT_SIZE`: `rdi` the signal,
+    /// `rsi` the siginfo 8 + 304 bytes above the frame, `rdx` the ucontext 8
+    /// bytes above it, and `rsp` the frame.
+    const FRAME_REGS: [u64; 4] = [libc::SIGUSR1 as u64, 0x7fff_0140, 0x7fff_0010, 0x7fff_0008];
+
     /// A frame's chained delivery at the same exit stops at the handler's
-    /// first instruction and is `AfterFrame`; once the guest has run on
-    /// (anywhere else, with `orig_ax` -1) it is no syscall; and still at the
-    /// syscall's exit away from the handler, where a frame fault's SIGSEGV
-    /// stops, the registers decide.
+    /// first instruction with the frame's registers and its stop's
+    /// `orig_ax`, and is `AfterFrame`. Each register that differs means the
+    /// guest ran on, and with `orig_ax` -1 that is no syscall. Anywhere else
+    /// it is no syscall too; and still at the syscall's exit away from the
+    /// handler, where a frame fault's SIGSEGV stops, the registers decide.
     #[test]
     fn after_frame_holds_only_at_the_handlers_first_instruction() {
         let kernel = Kernel::default();
@@ -3756,33 +3857,159 @@ mod tests {
         guest.thread.delivery_interruption = Some(reverie::Interruption::NotInSyscall);
         check(&mut guest, libc::SIGUSR1);
         assert_eq!(guest.thread.delivery_frame_handler, 0x4000);
+        assert_eq!(guest.thread.delivery_frame_signal, libc::SIGUSR1);
+        assert_eq!(guest.thread.delivery_frame_orig_ax, -1);
         // The kernel now shows the handler's mask, as at a chained stop.
         let int = sigbit(libc::SIGINT);
         kernel.set(int | USR2 | USR1, 0, USR1);
         guest.delivery.rip = 0x4000;
+        guest.delivery.frame_regs = FRAME_REGS;
         check(&mut guest, libc::SIGUSR1);
         assert_eq!(
             guest.delivery.asked[1].interruption,
             reverie::Interruption::AfterFrame
         );
+        // At the handler's first instruction, but not as Linux leaves a
+        // frame: the guest ran since. Each case differs from FRAME_REGS in
+        // one way only.
+        let [rdi, rsi, rdx, rsp] = FRAME_REGS;
+        for (frame_regs, why) in [
+            ([0, 0, 0, 0], "no frame registers at all"),
+            (
+                [libc::SIGUSR2 as u64, rsi, rdx, rsp],
+                "another signal in rdi",
+            ),
+            (
+                [rdi, rsi, rdx + 8, rsp],
+                "the ucontext not right above the return address",
+            ),
+            (
+                [rdi, rdx + 968, rdx, rsp],
+                "the siginfo after glibc's 968-byte ucontext_t",
+            ),
+            (
+                [rdi, rsi + 8, rdx + 8, rsp + 8],
+                "a frame Linux never aligns so",
+            ),
+        ] {
+            guest.delivery.frame_regs = frame_regs;
+            check(&mut guest, libc::SIGUSR1);
+            assert_eq!(
+                guest.delivery.asked.last().unwrap().interruption,
+                reverie::Interruption::NotInSyscall,
+                "{why}"
+            );
+            // Each delivery went ahead, so the next one follows its frame.
+            assert_eq!(
+                guest.thread.delivery_interruption,
+                Some(reverie::Interruption::AfterFrame)
+            );
+        }
+        guest.delivery.frame_regs = FRAME_REGS;
         guest.delivery.rip = 0x5123;
         check(&mut guest, libc::SIGUSR1);
         assert_eq!(
-            guest.delivery.asked[2].interruption,
+            guest.delivery.asked[7].interruption,
             reverie::Interruption::NotInSyscall
         );
         guest.delivery.orig_rax = Some(libc::SYS_tgkill);
         check(&mut guest, libc::SIGUSR1);
         assert_eq!(
-            guest.delivery.asked[3].interruption,
+            guest.delivery.asked[8].interruption,
             reverie::Interruption::KernelRun {
                 syscall: libc::SYS_tgkill
             }
         );
         assert_eq!(
             guest.thread.delivery_counters.interruption_from_registers,
-            2
+            7
         );
+    }
+
+    /// A frame delivered at a syscall's stop keeps that syscall in `orig_ax`
+    /// until the thread enters the kernel again. At the handler's first
+    /// instruction with every frame register intact but `orig_ax` -1, the
+    /// thread went back to user code and came in again: not `AfterFrame`.
+    #[test]
+    fn after_frame_needs_the_frames_own_orig_ax() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
+        guest.delivery.orig_rax = Some(libc::SYS_tgkill);
+        guest.thread.delivery_interruption = Some(reverie::Interruption::Return {
+            syscall: libc::SYS_tgkill,
+            result: 0,
+        });
+        check(&mut guest, libc::SIGUSR1);
+        assert_eq!(guest.thread.delivery_frame_orig_ax, libc::SYS_tgkill);
+        kernel.set(sigbit(libc::SIGINT) | USR2 | USR1, 0, USR1);
+        guest.delivery.rip = 0x4000;
+        guest.delivery.frame_regs = FRAME_REGS;
+        check(&mut guest, libc::SIGUSR1);
+        assert_eq!(
+            guest.delivery.asked[1].interruption,
+            reverie::Interruption::AfterFrame,
+            "the chained stop keeps the syscall's orig_ax"
+        );
+        guest.delivery.orig_rax = Some(-1);
+        check(&mut guest, libc::SIGUSR1);
+        assert_eq!(
+            guest.delivery.asked[2].interruption,
+            reverie::Interruption::NotInSyscall
+        );
+        assert_eq!(
+            guest.thread.delivery_counters.interruption_from_registers,
+            1
+        );
+    }
+
+    /// A fault needs the thread back in user code: a synchronous signal with
+    /// a positive `si_code` at the handler's first instruction (a `ud2`
+    /// there), with every frame register and `orig_ax` intact, is not
+    /// `AfterFrame`. The same signal sent by `kill` or `tgkill` and pending
+    /// at the same exit is. One the thread queued to itself with a positive
+    /// code is chained too, but cannot be told from a fault, and takes the
+    /// registers' answer as well.
+    #[test]
+    fn after_frame_is_never_a_synchronous_signal_with_a_kernel_code() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let int = sigbit(libc::SIGINT);
+        let ill = sigbit(libc::SIGILL);
+        let interruption = |si_code: i32| {
+            let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
+            let action = KernelSigaction {
+                handler: 0x4100,
+                flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+                restorer: 0x7000,
+                mask: 0,
+            };
+            kernel.set(int, 0, USR1 | ill);
+            record_rt_sigaction(&mut guest, libc::SIGILL, Some(action), None, &Ok(0));
+            guest.delivery.orig_rax = Some(-1);
+            guest.thread.delivery_interruption = Some(reverie::Interruption::NotInSyscall);
+            check(&mut guest, libc::SIGUSR1);
+            kernel.set(int | USR2 | USR1, 0, USR1 | ill);
+            guest.delivery.rip = 0x4000;
+            guest.delivery.frame_regs = FRAME_REGS;
+            let mut info = fault_siginfo(libc::SIGILL);
+            info[8..12].copy_from_slice(&si_code.to_ne_bytes());
+            guest.delivery.signal_info = Some(info);
+            check(&mut guest, libc::SIGILL);
+            assert_eq!(guest.delivery.asked.len(), 2, "both deliveries checked");
+            (
+                guest.delivery.asked[1].interruption,
+                guest.thread.delivery_counters.interruption_from_registers,
+            )
+        };
+        // SI_USER (0) and SI_TKILL (-6): a `kill` or `tgkill` pending at the
+        // same exit.
+        assert_eq!(interruption(0), (reverie::Interruption::AfterFrame, 0));
+        assert_eq!(interruption(-6), (reverie::Interruption::AfterFrame, 0));
+        // ILL_ILLOPN (2): the handler's first instruction faulted, or the
+        // thread queued SIGILL to itself with that code (rt_tgsigqueueinfo),
+        // pending at the same exit. Both take the registers' answer.
+        assert_eq!(interruption(2), (reverie::Interruption::NotInSyscall, 1));
     }
 
     /// A caught force-delivered signal the copy holds blocked reaches its stop

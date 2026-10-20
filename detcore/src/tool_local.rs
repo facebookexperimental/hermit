@@ -4025,6 +4025,18 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) delivery_frame_handler: u64,
 
+    /// With `delivery_interruption` `AfterFrame`, the signal that frame
+    /// delivers, which Linux puts in the handler's first argument register
+    /// (`signal_shadow::at_frame_entry`).
+    #[serde(skip)]
+    pub(crate) delivery_frame_signal: i32,
+
+    /// With `delivery_interruption` `AfterFrame`, `orig_ax` at that frame's
+    /// delivery stop, which Linux keeps until the thread next enters the
+    /// kernel (`signal_shadow::at_frame_entry`).
+    #[serde(skip)]
+    pub(crate) delivery_frame_orig_ax: i64,
+
     /// This thread's counts of checked signal deliveries (A5 step 3.2),
     /// logged when it exits.
     #[serde(skip)]
@@ -4934,6 +4946,8 @@ impl<T> ThreadState<T> {
             signal_shadow_lost: false,
             delivery_interruption: None,
             delivery_frame_handler: 0,
+            delivery_frame_signal: 0,
+            delivery_frame_orig_ax: 0,
             delivery_counters: Default::default(),
             published_mask: Some(None),
             published_dispositions: Arc::default(),

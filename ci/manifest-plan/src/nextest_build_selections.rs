@@ -919,7 +919,9 @@ mod tests {
             // and proc_locks_determinism's copied-child OFD unlock and
             // stale-flock-record tests (+8): 650.
             // Arrived-first epoll_pwait2 and zero-timeout ppoll tests (+2): 652.
-            assert_eq!(population, 652);
+            // A fault at a handler's first instruction (+1): 653.
+            // Two chained deliveries at rt_sigreturn's exit (+2): 655.
+            assert_eq!(population, 655);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

@@ -1551,6 +1551,104 @@ fn ptrace_delivery_check_approves_two_signals_at_one_exit() {
     );
 }
 
+/// A SIGUSR1 handler that comes back to its own first instruction, which
+/// faults there. The SIGSEGV stop shows the SIGUSR1 frame's registers, but
+/// the thread ran user code since that frame, so the SIGSEGV is not a
+/// delivery chained at the same exit: it takes the registers' answer, which
+/// is counted (A5 step 3.2b part 4). Before, the handler's address alone made
+/// it `AfterFrame`, which the backend does not check, with
+/// `interruption_from_registers=0`.
+#[test]
+fn ptrace_delivery_check_does_not_take_a_fault_at_a_handlers_entry_for_a_chained_delivery() {
+    let _guard = hermit_signal_lock();
+    let mode = "reenter-fault";
+    let (counters, approvals, log) =
+        delivery_log_with(mode, &[], "detcore=warn,detcore::signal_delivery=trace");
+    assert_eq!(
+        counters,
+        [
+            "approved=2 held=0 result_checked=1 mismatched=0 interruption_from_registers=1 skipped={} unreported={}"
+        ],
+        "mode {mode}"
+    );
+    assert_eq!(
+        approvals,
+        [
+            "the delivery of signal 10 is approved, interrupting Return { syscall: 234, result: 0 }",
+            "the delivery of signal 11 is approved, interrupting NotInSyscall",
+        ],
+        "mode {mode}"
+    );
+    let noise: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains(" WARN ") || line.contains(" ERROR "))
+        .collect();
+    assert!(noise.is_empty(), "mode {mode}: {noise:#?}");
+}
+
+/// Two synchronous signals the thread sent itself inside a handler that
+/// blocks them, delivered at rt_sigreturn's exit once the handler takes them
+/// out of the frame's saved mask; the second is chained right after the
+/// first one's frame. Queued with positive si_codes, the chained SIGFPE
+/// cannot be told from a fault and conservatively takes the registers'
+/// answer, counted: `NotInSyscall` (A5 step 3.2b part 4). Before, it was
+/// `AfterFrame` with `interruption_from_registers=1`.
+#[test]
+fn ptrace_delivery_check_takes_the_registers_answer_for_a_chained_signal_with_a_kernel_code() {
+    assert_sigreturn_chained(
+        "queued",
+        2,
+        [
+            "the delivery of signal 4 is approved, interrupting NotInSyscall",
+            "the delivery of signal 8 is approved, interrupting NotInSyscall",
+        ],
+    );
+}
+
+/// The same with SIGILL sent by tgkill (SI_TKILL): Linux delivers SIGFPE
+/// first, and the chained SIGILL, with a sender's code, is `AfterFrame`.
+#[test]
+fn ptrace_delivery_check_approves_a_chained_tgkill_signal_after_its_frame() {
+    assert_sigreturn_chained(
+        "tkill",
+        1,
+        [
+            "the delivery of signal 8 is approved, interrupting NotInSyscall",
+            "the delivery of signal 4 is approved, interrupting AfterFrame",
+        ],
+    );
+}
+
+/// Runs the delivery guest's `sigreturn-chained-{how}` mode: SIGUSR1 is
+/// approved at its tgkill's return, then the two signals as `chained`.
+fn assert_sigreturn_chained(how: &str, from_registers: u32, chained: [&str; 2]) {
+    let _guard = hermit_signal_lock();
+    let mode = format!("sigreturn-chained-{how}");
+    let (counters, approvals, log) =
+        delivery_log_with(&mode, &[], "detcore=warn,detcore::signal_delivery=trace");
+    assert_eq!(
+        counters,
+        [format!(
+            "approved=3 held=0 result_checked=1 mismatched=0 interruption_from_registers={from_registers} skipped={{}} unreported={{}}"
+        )],
+        "mode {mode}"
+    );
+    assert_eq!(
+        approvals,
+        [
+            "the delivery of signal 10 is approved, interrupting Return { syscall: 234, result: 0 }",
+            chained[0],
+            chained[1],
+        ],
+        "mode {mode}"
+    );
+    let noise: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains(" WARN ") || line.contains(" ERROR "))
+        .collect();
+    assert!(noise.is_empty(), "mode {mode}: {noise:#?}");
+}
+
 /// A blocked signal does not end a sleep, and is delivered, once, at the
 /// unblock.
 #[test]
