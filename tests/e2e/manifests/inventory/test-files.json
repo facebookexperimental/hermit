@@ -271,6 +271,12 @@
       "why": "tests/c/cpu_virtualization.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/cpuid_host_no_rdrand.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/cpuid_host_no_rdrand.c is owned by hermit-cli/tests/cli.rs: cpu_profile_host_no_rdrand_matches_host_cpuid_and_xsave compares all queried CPUID leaves and subleaves with an independently pinned native oracle, checks the hardware-randomness masks and XSAVE layout, and requires strict repeat parity with both timeslice modes; cpu_profile_host_no_rdrand_oracle_rejects_an_advertised_rdrand requires a visible RDRAND bit to fail the guest assertion. It stays a fixture because these tests assert profile-specific output or the named host-qualification refusal under --cpu-profile host-no-rdrand (https://github.com/rrnewton/hermit/issues/4534)."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/cpuid_probe.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -1775,6 +1781,12 @@
       "path": "tests/c/public_record_mount_stdio.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/public_record_mount_stdio.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and controls mount and standard-stream state to verify public recording behavior across the complete dedicated transaction."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/random_device_host_no_rdrand.cpp",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/random_device_host_no_rdrand.cpp is owned by hermit-cli/tests/cli.rs: cpu_profile_host_no_rdrand_random_device_has_bitwise_parity requires sixteen std::random_device samples and nonempty INFO events to repeat under --cpu-profile host-no-rdrand, or the named host-qualification refusal. It stays a fixture because the CLI test asserts the exact sample format and strict comparison result (https://github.com/rrnewton/hermit/issues/4534)."
     },
     {
       "disposition": "manifest-test",
