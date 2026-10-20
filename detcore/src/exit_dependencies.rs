@@ -48,6 +48,8 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
+use reverie::syscalls::linux_abi::Mmsghdr;
+use reverie::syscalls::linux_abi::Msghdr;
 
 use crate::record_or_replay::RecordOrReplay;
 use crate::syscalls::received_descriptors;
@@ -190,7 +192,7 @@ pub fn held_exit_dependency(
 /// The descriptors a `struct msghdr` at `address` received through
 /// `SCM_RIGHTS`, read after the call: Linux updates `msg_controllen` to what it
 /// wrote.
-fn received_through<G: MemoryAccess>(memory: &G, header: &libc::msghdr) -> Vec<RawFd> {
+fn received_through<G: MemoryAccess>(memory: &G, header: &Msghdr) -> Vec<RawFd> {
     if header.msg_control.is_null() || header.msg_controllen == 0 {
         return Vec::new();
     }
@@ -226,7 +228,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             Syscall::Recvmsg(call) => {
                 let Some(address) = call.msg() else { return };
-                let Ok(header): Result<libc::msghdr, _> = guest.memory().read_value(address) else {
+                let Ok(header): Result<Msghdr, _> = guest.memory().read_value(address) else {
                     return;
                 };
                 (
@@ -239,7 +241,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let count = (ret as usize).min(libc::UIO_MAXIOV as usize);
                 // SAFETY: `mmsghdr` is a plain C record; all-zero values are
                 // valid staging values that `read_values` overwrites.
-                let mut messages: Vec<libc::mmsghdr> =
+                let mut messages: Vec<Mmsghdr> =
                     (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
                 if guest
                     .memory()
@@ -564,11 +566,24 @@ mod tests {
         message.msg_iov = &mut iov;
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = control.len();
+        // This fixture calls the host libc wrapper, whose length is u32 on
+        // musl and usize on GNU; production guest buffers use the kernel ABI.
+        #[cfg(target_env = "musl")]
+        {
+            message.msg_controllen = control.len().try_into().unwrap();
+        }
+        #[cfg(not(target_env = "musl"))]
+        {
+            message.msg_controllen = control.len();
+        }
         let received =
             unsafe { libc::recvmsg(receiver.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
         assert_eq!(received, 1, "recvmsg: {}", std::io::Error::last_os_error());
-        let descriptors = received_descriptors(&control[..message.msg_controllen]);
+        #[cfg(target_env = "musl")]
+        let control_len = usize::try_from(message.msg_controllen).unwrap();
+        #[cfg(not(target_env = "musl"))]
+        let control_len = message.msg_controllen;
+        let descriptors = received_descriptors(&control[..control_len]);
         assert_eq!(descriptors.len(), 1, "{descriptors:?}");
         let listener = unsafe {
             <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(descriptors[0])

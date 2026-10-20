@@ -72,9 +72,9 @@ const fn madvise_action(advice: i32) -> MadviseAction {
         // Successful population and collapse promise synchronous, resource-
         // dependent work. Report the same deterministic error Linux uses when
         // an advice value is unsupported so callers can take their fallback.
-        libc::MADV_POPULATE_READ | libc::MADV_POPULATE_WRITE | libc::MADV_COLLAPSE => {
-            MadviseAction::Reject(Errno::EINVAL)
-        }
+        libc::MADV_POPULATE_READ
+        | libc::MADV_POPULATE_WRITE
+        | reverie::syscalls::linux_abi::MADV_COLLAPSE => MadviseAction::Reject(Errno::EINVAL),
 
         // Never let a guest inject host memory failures, even if the container
         // unexpectedly has enough privilege to make these operations succeed.
@@ -558,7 +558,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .resource_limits
             .lock()
             .unwrap()
-            .get(libc::RLIMIT_DATA)
+            .get(reverie::syscalls::linux_abi::RLIMIT_DATA)
             .map_or(libc::RLIM64_INFINITY, |limit| limit.current);
         let used = (requested - model.start).saturating_add(model.data_span);
         if limit != libc::RLIM64_INFINITY && used > limit {
@@ -810,7 +810,7 @@ VmFlags: rd wr mr mw me gd ac
             libc::MADV_REMOVE,
             libc::MADV_POPULATE_READ,
             libc::MADV_POPULATE_WRITE,
-            libc::MADV_COLLAPSE,
+            reverie::syscalls::linux_abi::MADV_COLLAPSE,
         ] {
             assert_eq!(madvise_action(advice), MadviseAction::Reject(Errno::EINVAL));
         }

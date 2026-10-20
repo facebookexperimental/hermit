@@ -786,7 +786,8 @@ pub(crate) fn is_on_procfs(link: &Path, device: u64, inode: u64) -> Result<bool,
         ));
     }
     // SAFETY: statfs succeeded, so it filled `buf`.
-    Ok(unsafe { buf.assume_init() }.f_type == libc::PROC_SUPER_MAGIC)
+    Ok(unsafe { buf.assume_init() }.f_type as u64
+        == reverie::syscalls::linux_abi::PROC_SUPER_MAGIC as u64)
 }
 
 /// Requires that the magic link `link` lead to inode `inode` on `device`, and
@@ -844,22 +845,26 @@ fn c_path(path: &Path) -> io::Result<CString> {
 /// The identity of the file at `path`, looked up from the directory `dirfd`
 /// with the statx flags `flags`.
 fn identify_at(dirfd: RawFd, path: &CStr, flags: i32) -> io::Result<FileIdentity> {
-    let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
-    let mask = libc::STATX_INO | libc::STATX_MNT_ID;
+    let mut buf = std::mem::MaybeUninit::<reverie::syscalls::linux_abi::Statx>::zeroed();
+    let mask = reverie::syscalls::linux_abi::STATX_INO | reverie::syscalls::linux_abi::STATX_MNT_ID;
     // SAFETY: `path` is NUL-terminated and `buf` is large enough for statx.
-    if unsafe { libc::statx(dirfd, path.as_ptr(), flags, mask, buf.as_mut_ptr()) } != 0 {
+    if unsafe {
+        reverie::syscalls::linux_abi::statx(dirfd, path.as_ptr(), flags, mask, buf.as_mut_ptr())
+    } != 0
+    {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: statx succeeded, so it filled `buf`.
     let found = unsafe { buf.assume_init() };
-    if found.stx_mask & libc::STATX_INO == 0 {
+    if found.stx_mask & reverie::syscalls::linux_abi::STATX_INO == 0 {
         return Err(io::Error::other("statx reported no inode number"));
     }
-    let mount_root = libc::STATX_ATTR_MOUNT_ROOT as u64;
+    let mount_root = reverie::syscalls::linux_abi::STATX_ATTR_MOUNT_ROOT as u64;
     Ok(FileIdentity {
         device: libc::makedev(found.stx_dev_major, found.stx_dev_minor),
         inode: found.stx_ino,
-        mount_id: (found.stx_mask & libc::STATX_MNT_ID != 0).then_some(found.stx_mnt_id),
+        mount_id: (found.stx_mask & reverie::syscalls::linux_abi::STATX_MNT_ID != 0)
+            .then_some(found.stx_mnt_id),
         mount_root: (found.stx_attributes_mask & mount_root != 0)
             .then_some(found.stx_attributes & mount_root != 0),
     })

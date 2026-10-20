@@ -150,12 +150,10 @@ fn copied_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Re
             .as_array()
             .unwrap()
             .len(),
-        // Shared handler extraction adds installed_tool.rs, guest/mod.rs,
-        // guest/host.rs and LiteInst tool_host.rs to the declared source catalog.
-        // Shared reserved-FD policy also binds the syscalls manifest, crate
-        // root and moved module. The in-guest provider forward binds
-        // guest/host_linux.rs: 23 inputs including the checker.
-        23
+        // The reviewed catalog binds 53 runtime/artifact inputs, including the
+        // separate Bootstrap descriptor, role, env/aux and site leaves.
+        // The separately bound qualifier source adds one input.
+        54
     );
     let alias = case.join("cargo-alias");
     let private_home = case.join("cargo-home");

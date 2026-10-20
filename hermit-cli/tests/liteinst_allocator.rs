@@ -2,9 +2,10 @@
 //! Fixture exports never select an allocator. Missing qualification, bootstrap,
 //! reproducible placement or exact Q/W comparisons fail; no cases are skipped.
 
+// Preserve the embedded library's public API, including its re-exports.
 #[allow(dead_code)]
 #[path = "../../reverie/reverie-liteinst-artifact/src/lib.rs"]
-mod artifact;
+pub mod artifact;
 #[allow(dead_code)]
 #[path = "../../reverie/scripts/m1_contract.rs"]
 mod contract;

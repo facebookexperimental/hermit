@@ -1008,23 +1008,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             let thread = match notify {
                 libc::SIGEV_NONE => None,
                 libc::SIGEV_SIGNAL | libc::SIGEV_THREAD => None,
-                libc::SIGEV_THREAD_ID => match posix_timer_thread(guest, named).await {
-                    PosixTimerThread::Thread(thread) => Some(thread),
-                    PosixTimerThread::NotInGroup => return Err(Errno::EINVAL.into()),
-                    PosixTimerThread::NestedNamespace => {
-                        tracing::error!(
-                            "[detcore, dtid {}] timer_create with SIGEV_THREAD_ID is not supported in a nested PID namespace: the thread id is a pid of that namespace, which Detcore does not translate (https://github.com/rrnewton/hermit/issues/4155)",
-                            guest.thread_state().dettid,
-                        );
-                        return self
-                            .refuse_unserviceable_operation(
-                                guest,
-                                Sysno::timer_create,
-                                Errno::ENOSYS,
-                            )
-                            .await;
+                reverie::syscalls::linux_abi::SIGEV_THREAD_ID => {
+                    match posix_timer_thread(guest, named).await {
+                        PosixTimerThread::Thread(thread) => Some(thread),
+                        PosixTimerThread::NotInGroup => return Err(Errno::EINVAL.into()),
+                        PosixTimerThread::NestedNamespace => {
+                            tracing::error!(
+                                "[detcore, dtid {}] timer_create with SIGEV_THREAD_ID is not supported in a nested PID namespace: the thread id is a pid of that namespace, which Detcore does not translate (https://github.com/rrnewton/hermit/issues/4155)",
+                                guest.thread_state().dettid,
+                            );
+                            return self
+                                .refuse_unserviceable_operation(
+                                    guest,
+                                    Sysno::timer_create,
+                                    Errno::ENOSYS,
+                                )
+                                .await;
+                        }
                     }
-                },
+                }
                 _ => return Err(Errno::EINVAL.into()),
             };
             if notify == libc::SIGEV_NONE {

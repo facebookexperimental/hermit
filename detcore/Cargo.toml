@@ -51,6 +51,8 @@ path = "scripts/syscaller.rs"
 [features]
 # Explicit diagnostics only; absent from ordinary artifacts.
 dispatch-observer = []
+# Host-only physical cancellation rendezvous; never a runtime Config switch.
+physical-mm-test-support = []
 
 [dependencies]
 anyhow = "1.0.103"
@@ -74,7 +76,7 @@ raw-cpuid = "10.7.0"
 regex = "1.13.1"
 # Abstract Reverie interface ONLY. Never add a concrete backend here (see the
 # BACKEND-ABSTRACTION COMMANDMENT at the top of this file).
-reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2" }
+reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "214727781526adb7c42f1f303f87264c9a38d6aa" }
 ruzstd = "0.9.0"
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
@@ -90,3 +92,6 @@ tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 # longer waits for the whole library through detcore-testutils, which depends
 # on it, nor links a second copy of it.
 test-case = "3.3.1"
+
+# Unit controls use the same native formatter as the CLI.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

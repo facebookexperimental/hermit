@@ -92,6 +92,9 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::ioctl::Request;
+use reverie::syscalls::linux_abi::Cmsghdr;
+use reverie::syscalls::linux_abi::Mmsghdr;
+use reverie::syscalls::linux_abi::Msghdr;
 
 use super::io::PSELECT6_INTERNAL_MAX_NFDS;
 use super::io::Pselect6SigmaskArg;
@@ -505,7 +508,7 @@ fn names_abstract_unix_address(bytes: &[u8], addrlen: usize, binding: bool) -> b
 /// The descriptors carried by the `SCM_RIGHTS` messages in a sent or
 /// received control buffer.
 pub(crate) fn received_descriptors(control: &[u8]) -> Vec<RawFd> {
-    const HEADER: usize = size_of::<libc::cmsghdr>();
+    const HEADER: usize = size_of::<Cmsghdr>();
     let align = |length: usize| length.next_multiple_of(size_of::<usize>());
     let mut descriptors = Vec::new();
     let mut offset = 0;
@@ -701,12 +704,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             address.is_some_and(|address| guest.memory().read_exact(address, prefix).is_ok())
                 && names_abstract_unix_address(prefix, length, binding)
         };
-        let message_names = |guest: &mut G, header: Option<Addr<'_, libc::msghdr>>| {
+        let message_names = |guest: &mut G, header: Option<Addr<'_, Msghdr>>| {
             let Some(header) = header.and_then(|header| guest.memory().read_value(header).ok())
             else {
                 return false;
             };
-            let header: libc::msghdr = header;
+            let header: Msghdr = header;
             names(
                 guest,
                 Addr::from_raw(header.msg_name as usize),
@@ -733,7 +736,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let Some(vector) = c.msgvec() else {
                     return false;
                 };
-                let vector = vector.cast::<libc::mmsghdr>();
+                let vector = vector.cast::<Mmsghdr>();
                 (0..c.vlen().min(libc::UIO_MAXIOV as u32) as usize).any(|index| {
                     // SAFETY: only read through guest memory access, which
                     // fails on an unmapped address.
@@ -1083,8 +1086,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let offered: Vec<Option<(usize, usize)>> = headers
             .iter()
             .map(|header| {
-                let header = Addr::<libc::msghdr>::from_raw(*header)?;
-                let header: libc::msghdr = guest.memory().read_value(header).ok()?;
+                let header = Addr::<Msghdr>::from_raw(*header)?;
+                let header: Msghdr = guest.memory().read_value(header).ok()?;
                 Some((header.msg_control as usize, header.msg_controllen))
             })
             .collect();
@@ -1103,12 +1106,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             let Some((control, capacity)) = offered else {
                 continue;
             };
-            let delivered = Addr::<libc::msghdr>::from_raw(header)
+            let delivered = Addr::<Msghdr>::from_raw(header)
                 .ok_or(Errno::EFAULT)
                 .and_then(|header| guest.memory().read_value(header))
-                .map(|header: libc::msghdr| {
-                    header.msg_controllen.min(capacity).min(MAX_CONTROL_BYTES)
-                });
+                .map(|header: Msghdr| header.msg_controllen.min(capacity).min(MAX_CONTROL_BYTES));
             let mut bytes = vec![0; *delivered.as_ref().unwrap_or(&0)];
             let readable = delivered.is_ok()
                 && (bytes.is_empty()
@@ -1855,7 +1856,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .resource_limits
             .lock()
             .expect("resource limits mutex poisoned")
-            .get(libc::RLIMIT_NOFILE)
+            .get(reverie::syscalls::linux_abi::RLIMIT_NOFILE)
             .map_or(libc::RLIM64_INFINITY, |limit| limit.current);
         if u64::from(nfds) > open_file_limit {
             return None;
@@ -2621,7 +2622,7 @@ mod tests {
     #[test]
     fn rights_are_found_in_every_control_message() {
         fn message(level: i32, kind: i32, fds: &[RawFd]) -> Vec<u8> {
-            let length = size_of::<libc::cmsghdr>() + size_of_val(fds);
+            let length = size_of::<Cmsghdr>() + size_of_val(fds);
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&length.to_ne_bytes());
             bytes.extend_from_slice(&level.to_ne_bytes());
@@ -2641,6 +2642,21 @@ mod tests {
         zero_length[..8].copy_from_slice(&0usize.to_ne_bytes());
         assert_eq!(received_descriptors(&zero_length), Vec::<RawFd>::new());
         assert_eq!(received_descriptors(&[]), Vec::<RawFd>::new());
+    }
+
+    #[test]
+    fn rights_control_length_is_not_truncated_to_wrapper_width() {
+        let mut control = [0u8; 24];
+        control[..8].copy_from_slice(&((1usize << 32) + 20).to_ne_bytes());
+        control[8..12].copy_from_slice(&libc::SOL_SOCKET.to_ne_bytes());
+        control[12..16].copy_from_slice(&libc::SCM_RIGHTS.to_ne_bytes());
+        control[16..20].copy_from_slice(&42i32.to_ne_bytes());
+        assert!(received_descriptors(&control).is_empty());
+        // The identical low-width valid message must still yield its FD.
+        control[..8].copy_from_slice(&20usize.to_ne_bytes());
+        assert_eq!(received_descriptors(&control), vec![42]);
+        control[..8].copy_from_slice(&usize::MAX.to_ne_bytes());
+        assert!(received_descriptors(&control).is_empty());
     }
 
     #[test]

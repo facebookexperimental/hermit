@@ -231,12 +231,9 @@ impl SharedInputs for SealedFiles {
     }
 }
 
-/// Copy `source` into a new memfd and seal it, returning the memfd, its size
-/// and its sha256. The memfd is close-on-exec until [`inherit`] clears that.
-fn seal_into_memfd(
-    name: &std::ffi::CStr,
-    source: &mut impl Read,
-) -> Result<(OwnedFd, u64, [u8; 32])> {
+/// Create the unsealed owned memfd used by the existing sealed-input producer.
+/// The caller owns filling and immutable sealing before any consumer reads it.
+pub(super) fn new_unsealed_memfd(name: &std::ffi::CStr) -> Result<OwnedFd> {
     // SAFETY: memfd_create takes a valid C string and returns a new descriptor
     // or -1; nothing else owns it.
     let raw =
@@ -245,7 +242,17 @@ fn seal_into_memfd(
         return Err(std::io::Error::last_os_error()).context("memfd_create");
     }
     // SAFETY: `raw` is the new descriptor memfd_create returned.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Copy `source` into a new memfd and seal it, returning the memfd, its size
+/// and its sha256. The memfd is close-on-exec until [`inherit`] clears that.
+fn seal_into_memfd(
+    name: &std::ffi::CStr,
+    source: &mut impl Read,
+) -> Result<(OwnedFd, u64, [u8; 32])> {
+    let fd = new_unsealed_memfd(name)?;
+    let raw = fd.as_raw_fd();
     let mut file = File::from(fd.try_clone()?);
     let size = std::io::copy(source, &mut file)?;
     // SAFETY: fcntl on a descriptor this function owns.

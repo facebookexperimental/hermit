@@ -1494,8 +1494,8 @@ pub struct Scheduler {
     /// `HERMIT_POLICY_REFUSAL_EXIT` instead of the fatal status.
     terminal_is_refusal: bool,
 
-    /// The scheduler turn at which `step2d_handle_empty_queue` last logged
-    /// "zero threads left anywhere, fizzling.", while that empty state lasts.
+    /// The scheduler turn at which the shared logical-empty observation last
+    /// logged "zero threads left anywhere, fizzling.", while that state lasts.
     ///
     /// The line reports a logical transition: every thread is dead or gone and
     /// nothing waits. Once logged, the daemon may pass through the empty-queue
@@ -3007,6 +3007,10 @@ async fn sched_loop_inner(
                     eprintln!("{}", report);
                     std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT);
                 }
+                // The terminal guard above implies the same logical-empty
+                // predicate as step2d. An asynchronous exit can bypass step2d
+                // on its last pass; observing here creates no turn or kick.
+                sched.observe_logically_empty_queue();
                 info!("[scheduler] run queue empty, exiting sched_loop.");
                 if let Some(refusal) = sched.unreplayed_rejoins() {
                     drop(sched);
@@ -6006,6 +6010,31 @@ impl Scheduler {
     /// (`thread_mms`).
     pub(crate) fn record_thread_mm(&mut self, dettid: DetTid, mm: MmId) {
         self.thread_mms.insert(dettid, mm);
+    }
+
+    /// Bind a genuinely fresh initial-current-image root during its existing
+    /// registration, before a turn or any image-specific publication exists.
+    /// The caller holds this scheduler and authenticates the root self-request;
+    /// this method neither prepares exec nor grants a new owner or turn.
+    pub(crate) fn record_initial_current_image_birth(&mut self, tid: DetTid, mm: MmId) -> bool {
+        if mm != MmId::initial(tid).for_exec(tid)
+            || self.backend_failed()
+            || self.thread_was_registered(tid)
+            || self.thread_mms.contains_key(&tid)
+            || self.exec_incarnations.contains_key(&tid)
+            || self.next_turns.contains_key(&tid)
+            || self.thread_tree.thread_to_leader.contains_key(&tid)
+            || self.thread_is_logically_killed(tid)
+            || self.retired_transferred_exec_callers.contains(&tid)
+            || self.physical_thread_pidfds.contains_key(&tid)
+            || self.process_exit_watches.contains_key(&tid)
+            || self.exec_teardowns.contains_key(&tid)
+        {
+            return false;
+        }
+        self.thread_mms.insert(tid, mm);
+        self.exec_incarnations.insert(tid, mm);
+        true
     }
 
     /// The address-space identity recorded for `dettid` (`thread_mms`).
@@ -12310,6 +12339,95 @@ impl Scheduler {
                 && self.child_waits_wait_only_on_stuck_children())
     }
 
+    /// Observe the same logical empty state at step2d or terminal loop exit.
+    /// This commits no turn, performs no kick and releases no physical barrier.
+    /// The legacy event class names the existing empty-state diagnostic.
+    fn observe_logically_empty_queue(&mut self) -> bool {
+        let logically_empty = self.run_queue.is_empty()
+            && self.blocked.no_futex_waiters()
+            && self.blocked.timed_waiters.is_empty()
+            && self.blocked.external_io_blockers.is_empty()
+            && self.blocked.child_waiters.is_empty()
+            && self.blocked.physical_child_waiters.is_empty()
+            && self.blocked.rt_sigsuspend_blockers.is_empty()
+            && self
+                .happens_before
+                .as_ref()
+                .is_none_or(|hb| hb.parked.is_empty());
+        // Report the empty state from logical state alone, once per empty
+        // state. The step2d caller does this before its physical-exit wait;
+        // terminal loop exit covers a pass that never reached step2d.
+        //
+        // Before the physical-exit wait: that wait holds the loop for the
+        // ptrace supervisor's final wait status, which arrives at a
+        // host-chosen moment. When the report sat after the wait, it was
+        // logged only if the status had landed before this step ran, and
+        // otherwise the loop exited without it -- zero or one lines for the
+        // same logical execution
+        // (https://github.com/rrnewton/hermit/issues/3360).
+        //
+        // Once per empty state: the loop can observe this state again before it
+        // exits, while it waits for that status or drains a removal queued
+        // by a dead thread's second, reactive exit hook. How many times it
+        // does is host timing, and neither thing it waits for is a thread,
+        // so the state it reports has not changed
+        // (https://github.com/rrnewton/hermit/issues/3223). See
+        // `empty_queue_kick_turn`.
+        //
+        if !logically_empty {
+            self.empty_queue_kick_turn = None;
+        } else if self.empty_queue_kick_turn != Some(self.turn) {
+            self.empty_queue_kick_turn = Some(self.turn);
+            // `info!`, and that level is load-bearing. Restored from `trace!`
+            // by owner ruling after 08ff51a33e demoted it.
+            //
+            // THE DEMOTION'S ARGUMENT AND WHY IT WAS REJECTED. It ran: how
+            // many times this branch is reached depends on when the host
+            // delivers a child's final wait status, that is an external
+            // real-time event, an INFO line driven by one is a determinism
+            // hazard by construction, so keep the loop sub-INFO. The
+            // measurement offered with it was real -- over 312 concurrent
+            // SaBRe cell-runs, 4 diverged, and in each the whole difference
+            // was this line plus one unrelated WARN.
+            //
+            // The owner's ruling: this fizzle is part of the deterministic
+            // scheduling model, not record/replay external-IO terrain, so it
+            // SHOULD be a deterministic function of detcore scheduling. If it
+            // is not, that is a hermit DEFECT, and demoting the line hid the
+            // defect instead of fixing it. The previous note ended "do not
+            // promote this back without making the host's wait-status
+            // delivery deterministic, which is not possible" -- but making it
+            // deterministic is exactly the work owed, not a reason to stop
+            // reporting it.
+            //
+            // AND THE DEFECT IS REAL AND LARGER THAN THIS LINE. Measured
+            // 2026-08-24 on the CI-staged SaBRe artifact: a guest that forks
+            // and reaps its child with `wait4(WNOHANG)` diverges 36 of 50
+            // under `--verify-strict`, while ptrace is 0 of 50 on the same
+            // guest. The divergence is not confined to logging -- the guest
+            // ITSELF executes different work, 355 syscalls with 4 `wait4`
+            // calls in one run against 354 with 3 in the other. The
+            // scheduler's committed non-poll decisions are byte-identical
+            // (68 in both), so what varies is how many times the parent is
+            // told "not yet". Silencing this line would have left that
+            // unreported.
+            //
+            // If this line is noisy again, the fix is to make a child's exit
+            // become observable to its parent at a deterministic point, not
+            // to lower the level.
+            if enabled!(Level::INFO) {
+                let record_suffix = crate::detlog::record_suffix(
+                    crate::detlog::DetLogEvent::SchedulerEmptyQueueKick,
+                );
+                info!(
+                    "scheduler: zero threads left anywhere, fizzling.{}",
+                    record_suffix
+                );
+            }
+        }
+        logically_empty
+    }
+
     fn step2d_decide_empty_queue(
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
@@ -12336,86 +12454,7 @@ impl Scheduler {
         let futex_empty = self.blocked.no_futex_waiters();
 
         if self.run_queue.is_empty() {
-            let logically_empty = futex_empty
-                && timed_empty
-                && external_waits_empty
-                && rt_sigsuspend_empty
-                && hb_parked_empty;
-            // Report the empty state from logical state alone, BEFORE the
-            // physical-exit wait below and once per empty state. Both halves are
-            // what make the line a function of Detcore scheduling.
-            //
-            // Before the physical-exit wait: that wait holds the loop for the
-            // ptrace supervisor's final wait status, which arrives at a
-            // host-chosen moment. When the report sat after the wait, it was
-            // logged only if the status had landed before this step ran, and
-            // otherwise the loop exited without it -- zero or one lines for the
-            // same logical execution
-            // (https://github.com/rrnewton/hermit/issues/3360).
-            //
-            // Once per empty state: the loop can reach this step again before it
-            // exits, while it waits for that status or drains a removal queued
-            // by a dead thread's second, reactive exit hook. How many times it
-            // does is host timing, and neither thing it waits for is a thread,
-            // so the state it reports has not changed
-            // (https://github.com/rrnewton/hermit/issues/3223). See
-            // `empty_queue_kick_turn`.
-            //
-            // The branch's control flow is unchanged: the wait still gates the
-            // deadlock report and the timer fast-forward, and every path below
-            // still skips this turn. Only where and how often the line is
-            // logged changed; the guest cannot observe either.
-            if !logically_empty {
-                self.empty_queue_kick_turn = None;
-            } else if self.empty_queue_kick_turn != Some(self.turn) {
-                self.empty_queue_kick_turn = Some(self.turn);
-                // `info!`, and that level is load-bearing. Restored from `trace!`
-                // by owner ruling after 08ff51a33e demoted it.
-                //
-                // THE DEMOTION'S ARGUMENT AND WHY IT WAS REJECTED. It ran: how
-                // many times this branch is reached depends on when the host
-                // delivers a child's final wait status, that is an external
-                // real-time event, an INFO line driven by one is a determinism
-                // hazard by construction, so keep the loop sub-INFO. The
-                // measurement offered with it was real -- over 312 concurrent
-                // SaBRe cell-runs, 4 diverged, and in each the whole difference
-                // was this line plus one unrelated WARN.
-                //
-                // The owner's ruling: this fizzle is part of the deterministic
-                // scheduling model, not record/replay external-IO terrain, so it
-                // SHOULD be a deterministic function of detcore scheduling. If it
-                // is not, that is a hermit DEFECT, and demoting the line hid the
-                // defect instead of fixing it. The previous note ended "do not
-                // promote this back without making the host's wait-status
-                // delivery deterministic, which is not possible" -- but making it
-                // deterministic is exactly the work owed, not a reason to stop
-                // reporting it.
-                //
-                // AND THE DEFECT IS REAL AND LARGER THAN THIS LINE. Measured
-                // 2026-08-24 on the CI-staged SaBRe artifact: a guest that forks
-                // and reaps its child with `wait4(WNOHANG)` diverges 36 of 50
-                // under `--verify-strict`, while ptrace is 0 of 50 on the same
-                // guest. The divergence is not confined to logging -- the guest
-                // ITSELF executes different work, 355 syscalls with 4 `wait4`
-                // calls in one run against 354 with 3 in the other. The
-                // scheduler's committed non-poll decisions are byte-identical
-                // (68 in both), so what varies is how many times the parent is
-                // told "not yet". Silencing this line would have left that
-                // unreported.
-                //
-                // If this line is noisy again, the fix is to make a child's exit
-                // become observable to its parent at a deterministic point, not
-                // to lower the level.
-                if enabled!(Level::INFO) {
-                    let record_suffix = crate::detlog::record_suffix(
-                        crate::detlog::DetLogEvent::SchedulerEmptyQueueKick,
-                    );
-                    info!(
-                        "scheduler (step2_process_blocked): zero threads left anywhere, fizzling.{}",
-                        record_suffix
-                    );
-                }
-            }
+            let logically_empty = self.observe_logically_empty_queue();
             if !self.pending_physical_process_exits.is_empty() {
                 // The SaBRe plugin has run the child process's logical exit hook, but the ptrace
                 // supervisor has not received its final wait status. Fast-forwarding the next
@@ -15362,6 +15401,53 @@ mod test {
     use crate::tool_local::RobustListExit;
     use crate::tool_local::RobustListWake;
     use crate::tool_local::ThreadState;
+
+    #[test]
+    fn initial_current_birth_binds_both_identities_without_a_turn() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw(3);
+        let old = MmId::initial(tid);
+        let current = old.for_exec(tid);
+        assert!(scheduler.record_initial_current_image_birth(tid, current));
+        assert_eq!(scheduler.thread_mm(tid), Some(current));
+        assert!(scheduler.rpc_incarnation_matches(tid, current));
+        assert!(!scheduler.rpc_incarnation_matches(tid, old));
+        assert!(!scheduler.thread_was_registered(tid));
+        assert!(!scheduler.next_turns.contains_key(&tid));
+        assert!(scheduler.physical_thread_pidfds.is_empty());
+        assert!(!scheduler.record_initial_current_image_birth(tid, current));
+        assert_eq!(scheduler.thread_mm(tid), Some(current));
+    }
+
+    #[test]
+    fn initial_current_birth_rejects_wrong_or_existing_identities_without_writes() {
+        let tid = DetTid::from_raw(3);
+        let initial = MmId::initial(tid);
+        for mm in [
+            initial,
+            initial.for_exec(tid).for_exec(tid),
+            MmId::initial(DetTid::from_raw(4)).for_exec(DetTid::from_raw(4)),
+        ] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            assert!(!scheduler.record_initial_current_image_birth(tid, mm));
+            assert_eq!(scheduler.thread_mm(tid), None);
+            assert!(!scheduler.exec_incarnations.contains_key(&tid));
+        }
+        for registered in [false, true] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            if registered {
+                scheduler.thread_tree.add_child(tid, tid, true);
+            } else {
+                scheduler.record_thread_mm(tid, initial);
+            }
+            assert!(!scheduler.record_initial_current_image_birth(tid, initial.for_exec(tid)));
+            assert!(!scheduler.exec_incarnations.contains_key(&tid));
+            assert_eq!(
+                scheduler.thread_mm(tid),
+                if registered { None } else { Some(initial) }
+            );
+        }
+    }
 
     #[test]
     fn private_memory_publication_waits_for_the_childs_granted_turn() {
@@ -30383,6 +30469,63 @@ mod test {
             assert!(landed, "the final wait status never landed at {landing:?}");
             runs.push((Some(landing), observation));
         }
+        assert_one_shutdown_log(&runs);
+    }
+
+    /// The real async-exit prefix can drain the last removal and SkipTurn
+    /// before step2d. Completion on the next loop top then takes terminal exit.
+    /// Early completion reaches step2d instead. Both must report the same real
+    /// logical-empty state once, without changing a turn or global time.
+    #[tokio::test]
+    async fn async_last_exit_logs_one_empty_observation_before_or_after_prefix_wait() {
+        if !super::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "async_last_exit_logs_one_empty_observation_before_or_after_prefix_wait",
+        ) {
+            return;
+        }
+        let config = Config::default().with_backend(|backend| {
+            backend.process_exits_complete_asynchronously = true;
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
+        let root = DetTid::from_raw(3);
+        let mut runs = Vec::new();
+        for pass in [1_u64, 2, 3] {
+            let landing = (pass, SchedLoopPoint::LoopTop);
+            let (observation, landed) = run_daemon_to_shutdown(
+                &config,
+                |s| {
+                    s.thread_tree.add_child(root, root, true);
+                    register_known_thread(s, root);
+                    // Existing real grant/barrier and deregistration machinery,
+                    // not a manually assigned pending set or an extra turn.
+                    s.begin_exit_at_grant(root);
+                    s.runqueue_push_back(root);
+                    s.logically_kill_thread(&root, &root, MmId::initial(root));
+                    assert_eq!(s.pending_async_process_exits(), [root]);
+                    assert!(!s.pending_run_queue_removals.is_empty());
+                },
+                Some(landing),
+                move |s| {
+                    if pass == 1 {
+                        assert!(!s.run_queue.is_empty());
+                        assert!(!s.pending_run_queue_removals.is_empty());
+                    } else {
+                        // These witnesses require the real prefix to have
+                        // drained and waited without reaching step2d.
+                        assert!(s.run_queue.is_empty());
+                        assert!(s.pending_run_queue_removals.is_empty());
+                        assert_eq!(s.empty_queue_kick_turn, None);
+                    }
+                    assert!(s.complete_physical_process_exit(root));
+                },
+            )
+            .await;
+            assert!(landed, "completion did not land at {landing:?}");
+            runs.push((Some(landing), observation));
+        }
+        // Exact complete INFO/order, turn and global time equality; exactly one
+        // existing semantic event immediately before actual scheduler shutdown.
         assert_one_shutdown_log(&runs);
     }
 

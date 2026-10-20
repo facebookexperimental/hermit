@@ -88,6 +88,8 @@ mod syscalls;
 #[cfg(test)]
 mod test_pages;
 mod tool_global;
+#[cfg(feature = "physical-mm-test-support")]
+pub use tool_global::initial_mm_probe;
 mod tool_local;
 pub mod util;
 
@@ -2848,7 +2850,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let result = if guest.config().virtualize_time {
             let dettid = guest.thread_state().dettid;
             guest.thread_state_mut().thread_logical_time.add_rdtsc();
-            info!(
+            crate::ordered_info!(
                 "[dtid {}] inbound rdtsc, new logical time: {:?}",
                 dettid,
                 guest.thread_state().thread_logical_time
@@ -3506,6 +3508,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
             }
         }
+    }
+
+    fn on_initial_image_attached(
+        &self,
+        tid: Tid,
+        state: &mut Self::ThreadState,
+    ) -> Result<(), Error> {
+        state.bind_initial_current_image(DetTid::from_raw(tid.as_raw()))?;
+        self.record_or_replay
+            .on_initial_image_attached(tid, state.as_mut())
     }
 
     async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
@@ -6437,9 +6449,9 @@ mod finished_syscall_display_tests {
         stat
     }
 
-    fn sentinel_statx() -> libc::statx {
+    fn sentinel_statx() -> reverie::syscalls::linux_abi::Statx {
         // SAFETY: all-zero is a valid `struct statx`.
-        let mut statx: libc::statx = unsafe { std::mem::zeroed() };
+        let mut statx: reverie::syscalls::linux_abi::Statx = unsafe { std::mem::zeroed() };
         statx.stx_mode = (libc::S_IFREG | 0o644) as u16;
         statx.stx_size = SENTINEL as u64;
         statx
@@ -6455,14 +6467,16 @@ mod finished_syscall_display_tests {
         )
     }
 
-    fn statx(path: &CString, statx: &libc::statx) -> Syscall {
+    fn statx(path: &CString, statx: &reverie::syscalls::linux_abi::Statx) -> Syscall {
         Syscall::Statx(
             Statx::new()
                 .with_dirfd(libc::AT_FDCWD)
                 .with_path(PathPtr::from_ptr(path.as_ptr()))
                 .with_flags(AtFlags::empty())
                 .with_mask(StatxMask::STATX_BASIC_STATS)
-                .with_statx(StatxPtr::from_ptr(statx as *const libc::statx)),
+                .with_statx(StatxPtr::from_ptr(
+                    statx as *const reverie::syscalls::linux_abi::Statx,
+                )),
         )
     }
 
@@ -6516,7 +6530,10 @@ mod finished_syscall_display_tests {
 
         assert_no_struct_rendered(&line);
         assert!(
-            line.contains(&format!("{:p}", &buf as *const libc::statx)),
+            line.contains(&format!(
+                "{:p}",
+                &buf as *const reverie::syscalls::linux_abi::Statx
+            )),
             "statx pointer missing: {line}"
         );
         assert!(line.contains("ENOENT"), "errno missing: {line}");
@@ -6531,7 +6548,7 @@ mod finished_syscall_display_tests {
         assert!(
             line.contains(&format!(
                 "{:p} -> {{st_mode=SFlag(S_IFREG) | 0644, st_size={}, ...}}",
-                &buf as *const libc::statx, SENTINEL
+                &buf as *const reverie::syscalls::linux_abi::Statx, SENTINEL
             )),
             "statx struct missing: {line}"
         );
@@ -6588,7 +6605,7 @@ mod finished_syscall_display_tests {
         assert!(
             line.contains(&format!(
                 "{:p} -> {{st_mode=SFlag(S_IFREG) | 0644, st_size={}, ...}}",
-                &buf as *const libc::statx, SENTINEL
+                &buf as *const reverie::syscalls::linux_abi::Statx, SENTINEL
             )),
             "partial statx copy hidden on EFAULT: {line}"
         );

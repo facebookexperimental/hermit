@@ -58,7 +58,7 @@ const NAME_MAX: usize = 255;
 const MAXSYMLINKS: usize = 40;
 /// The size of `struct msghdr`, whose first two fields are `msg_name` and
 /// `msg_namelen`.
-const MSGHDR_SIZE: usize = std::mem::size_of::<libc::msghdr>();
+const MSGHDR_SIZE: usize = std::mem::size_of::<reverie::syscalls::linux_abi::Msghdr>();
 /// The longest pathname an `AF_UNIX` address holds, with its NUL.
 const SUN_PATH_MAX: usize = 108;
 

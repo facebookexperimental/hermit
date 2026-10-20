@@ -1020,7 +1020,8 @@ fn descriptor_identity(tid: i32, fd: RawFd) -> Option<(PathBuf, bool)> {
         return None;
     }
     // SAFETY: statfs succeeded, so it filled `buf`.
-    let on_procfs = unsafe { buf.assume_init() }.f_type == libc::PROC_SUPER_MAGIC;
+    let on_procfs = unsafe { buf.assume_init() }.f_type as u64
+        == reverie::syscalls::linux_abi::PROC_SUPER_MAGIC as u64;
     Some((link, on_procfs))
 }
 
@@ -1533,7 +1534,8 @@ fn statx_asking_classic_mount_id(call: syscalls::Statx) -> syscalls::Statx {
     let mut args = syscalls::SyscallArgs::from(call);
     let mask = args.arg3 as u32;
     if mask & STATX_MNT_ID_UNIQUE != 0 {
-        args.arg3 = ((mask & !STATX_MNT_ID_UNIQUE) | libc::STATX_MNT_ID) as usize;
+        args.arg3 =
+            ((mask & !STATX_MNT_ID_UNIQUE) | reverie::syscalls::linux_abi::STATX_MNT_ID) as usize;
     }
     syscalls::Statx::from(args)
 }
@@ -1545,12 +1547,13 @@ fn statx_arguments_valid(flags: i32, mask: u32, names_no_path: bool) -> bool {
     let known = libc::AT_SYMLINK_NOFOLLOW
         | libc::AT_EMPTY_PATH
         | libc::AT_NO_AUTOMOUNT
-        | libc::AT_STATX_SYNC_TYPE;
+        | reverie::syscalls::linux_abi::AT_STATX_SYNC_TYPE;
     // A call on the descriptor itself (`AT_EMPTY_PATH` with an empty or
     // NULL path) does not look at the other flags (measured on Linux 7.1).
     mask & 0x8000_0000 == 0
         && (names_no_path || flags & !known == 0)
-        && flags & libc::AT_STATX_SYNC_TYPE != libc::AT_STATX_SYNC_TYPE
+        && flags & reverie::syscalls::linux_abi::AT_STATX_SYNC_TYPE
+            != reverie::syscalls::linux_abi::AT_STATX_SYNC_TYPE
 }
 
 /// Whether `path` spells a descriptor link: `/dev/fd/N`, `/proc/*/fd/N` or
@@ -1846,7 +1849,7 @@ fn stat_family_arguments_valid<M: MemoryAccess>(memory: &M, call: &StatFamily) -
             let known = libc::AT_SYMLINK_NOFOLLOW
                 | libc::AT_NO_AUTOMOUNT
                 | libc::AT_EMPTY_PATH
-                | libc::AT_STATX_SYNC_TYPE;
+                | reverie::syscalls::linux_abi::AT_STATX_SYNC_TYPE;
             names_no_path(memory, call.path(), call.flags()) || call.flags().bits() & !known == 0
         }
         _ => true,
@@ -2971,7 +2974,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         raw_fd: RawFd,
     ) -> Result<libc::stat, Errno> {
-        info!(
+        crate::ordered_info!(
             "Injecting additional fstat to retrieve file metadata on fd {}.",
             raw_fd
         );
@@ -3116,17 +3119,36 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<libc::stat, Errno> {
         let mut stack = guest.stack().await;
         let statptr: StatPtr = StatPtr(stack.reserve());
-        // Keep the guard until the buffer is no longer used. Backends whose
-        // scratch is a Tool-owned arena (DBT, SaBRe) free it when the guard
-        // drops, so dropping it before the injected fstat would let the kernel
-        // write into freed memory.
-        let _stack_guard = stack.commit()?;
-        let copied = Self::inject_stat_into(guest, stat_call(statptr), statptr).await?;
-        // clear stack memory used for fstat allocation
-        guest
-            .memory()
-            .write_exact(statptr.0.cast(), &[0; std::mem::size_of::<libc::stat>()])?;
-        Ok(copied)
+        // Ptrace lends bytes below the guest red zone. Save them before
+        // commit can zero or partially write the reserved buffer, as the
+        // adjacent pre-call lookup path does. Tool-owned scratch is likewise
+        // held by stack/guard throughout every access.
+        let mut saved = [0u8; std::mem::size_of::<libc::stat>()];
+        guest.memory().read_exact(statptr.0.cast(), &mut saved)?;
+        let guard = match stack.commit() {
+            Ok(guard) => guard,
+            Err(errno) => {
+                restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
+                return Err(errno);
+            }
+        };
+        restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
+        // No early `?`: even kernel/readback errors must put back the borrowed
+        // bytes before the guard releases a backend's Tool-owned arena.
+        let copied = Self::inject_stat_into(guest, stat_call(statptr), statptr).await;
+        let restored = guest.memory().write_exact(statptr.0.cast(), &saved);
+        drop(guard);
+        // Preserve the actual injection/readback errno. On success, preserve
+        // the old contract that a failed final scratch write is an error.
+        match copied {
+            Ok(copied) => restored.map(|()| copied),
+            Err(errno) => {
+                if restored.is_err() {
+                    info!("Could not restore the guest bytes under a pre-call lookup buffer.");
+                }
+                Err(errno)
+            }
+        }
     }
 
     /// The fallback of [`Self::inject_fstat`] and [`Self::inject_lstatat`]:
@@ -6105,7 +6127,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         stat: DetStat,
     ) -> Result<i64, Error> {
         let statptr = call.statx().ok_or(Errno::EFAULT)?;
-        let mut statx: libc::statx = stat.into();
+        let mut statx: reverie::syscalls::linux_abi::Statx = stat.into();
         let raw_mount_id = rendered_procfs::guest_procfs_mount_id().ok();
         let unique = statx_requested_mask(call) & STATX_MNT_ID_UNIQUE != 0;
         self.fill_statx_mount_id(guest, &mut statx, raw_mount_id, unique)
@@ -6139,7 +6161,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn fill_statx_mount_id<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        statx: &mut libc::statx,
+        statx: &mut reverie::syscalls::linux_abi::Statx,
         raw_mount_id: Option<u64>,
         unique: bool,
     ) {
@@ -6154,10 +6176,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(id) if unique => id
                 .checked_add(MNT_UNIQUE_ID_OFFSET)
                 .map(|id| (id, STATX_MNT_ID_UNIQUE)),
-            Some(id) => Some((id, libc::STATX_MNT_ID)),
+            Some(id) => Some((id, reverie::syscalls::linux_abi::STATX_MNT_ID)),
             None => None,
         };
-        statx.stx_mask &= !(libc::STATX_MNT_ID | STATX_MNT_ID_UNIQUE);
+        statx.stx_mask &= !(reverie::syscalls::linux_abi::STATX_MNT_ID | STATX_MNT_ID_UNIQUE);
         match reported {
             Some((id, bit)) => {
                 statx.stx_mnt_id = id;
@@ -8796,7 +8818,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(result) => target.unless_overwritten(
                     &guest.memory(),
                     result.0.as_raw(),
-                    std::mem::size_of::<libc::statx>(),
+                    std::mem::size_of::<reverie::syscalls::linux_abi::Statx>(),
                 ),
                 None => target,
             };
@@ -8815,7 +8837,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .descriptor()
                 .and_then(|fd| stdio_inode_override(guest, fd));
             let mut memory = guest.memory();
-            let stat: libc::statx = memory.read_value(statptr.0)?;
+            let stat: reverie::syscalls::linux_abi::Statx = memory.read_value(statptr.0)?;
             // A placeholder another process made, or an earlier image of this
             // one, becomes known by its identity (`determinize_stat`).
             let placeholder = match inode_override {
@@ -8834,12 +8856,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             // placeholder's memfd's.
             let raw_mount_id = match placeholder {
                 Some(_) => rendered_procfs::guest_procfs_mount_id().ok(),
-                None => (stat.stx_mask & libc::STATX_MNT_ID != 0).then_some(stat.stx_mnt_id),
+                None => (stat.stx_mask & reverie::syscalls::linux_abi::STATX_MNT_ID != 0)
+                    .then_some(stat.stx_mnt_id),
             };
             let stat = self
                 .determinize_stat(guest, stat, inode_override, procfs)
                 .await?;
-            let mut statx: libc::statx = stat.into();
+            let mut statx: reverie::syscalls::linux_abi::Statx = stat.into();
             self.fill_statx_mount_id(guest, &mut statx, raw_mount_id, unique)
                 .await;
             memory.write_value(statptr.0, &statx)?;
@@ -15487,6 +15510,8 @@ mod inject_fstat_scratch {
     /// write into freed memory.
     struct ScriptedStack {
         writable: bool,
+        /// Match ptrace reserve/commit's actual zero write in the new controls.
+        zero_on_commit: bool,
         arena: usize,
         capacity: usize,
         guard_live: Arc<AtomicBool>,
@@ -15540,6 +15565,17 @@ mod inject_fstat_scratch {
                 }
                 return Err(Errno::EFAULT);
             }
+            if self.zero_on_commit {
+                // SAFETY: reserve checked the arena capacity and the owned
+                // arena/page is writable for the duration of this stack.
+                unsafe {
+                    std::ptr::write_bytes(
+                        self.arena as *mut u8,
+                        0,
+                        std::mem::size_of::<libc::stat>(),
+                    )
+                };
+            }
             self.guard_live.store(true, Ordering::SeqCst);
             Ok(ScriptedStackGuard {
                 guard_live: self.guard_live,
@@ -15551,6 +15587,7 @@ mod inject_fstat_scratch {
         config: Config,
         thread: ThreadState<()>,
         stack_writable: bool,
+        zero_on_commit: bool,
         mmap_fails: bool,
         arena: Box<[u64; ARENA_WORDS]>,
         guard_live: Arc<AtomicBool>,
@@ -15611,6 +15648,7 @@ mod inject_fstat_scratch {
                 config,
                 thread,
                 stack_writable,
+                zero_on_commit: false,
                 mmap_fails,
                 arena: Box::new([u64::MAX; ARENA_WORDS]),
                 guard_live: Arc::new(AtomicBool::new(false)),
@@ -15735,6 +15773,7 @@ mod inject_fstat_scratch {
         async fn stack(&mut self) -> Self::Stack {
             ScriptedStack {
                 writable: self.stack_writable,
+                zero_on_commit: self.zero_on_commit,
                 arena: self
                     .scratch_page
                     .unwrap_or(self.arena.as_mut_ptr() as usize),
@@ -16365,6 +16404,67 @@ mod inject_fstat_scratch {
         }
     }
 
+    /// Exercise the actual shared helper with nonzero borrowed bytes and
+    /// real kernel fstat success/error. The selectable zero commit matches
+    /// reverie-ptrace GuestStack::commit, rather than duplicating Detcore's
+    /// restoration algorithm in a standalone test helper.
+    #[tokio::test]
+    async fn injected_fstat_restores_nonzero_borrowed_bytes_on_success_and_error() {
+        for success in [true, false] {
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            guest.zero_on_commit = true;
+            for (index, word) in guest.arena.iter_mut().enumerate() {
+                *word = 0xa5a5_a5a5_a5a5_a5a5 ^ index as u64;
+            }
+            let original = *guest.arena;
+            let (fd, inode) = if success { open_file() } else { (-1, 0) };
+            let copied = Detcore::inject_stat_on_stack(&mut guest, |statptr| {
+                Syscall::Fstat(syscalls::Fstat::new().with_fd(fd).with_stat(Some(statptr)))
+            })
+            .await;
+            if success {
+                assert_eq!(unsafe { libc::close(fd) }, 0);
+                assert_eq!(copied.unwrap().st_ino, inode);
+            } else {
+                assert_eq!(copied.err(), Some(Errno::EBADF));
+            }
+            assert_eq!(
+                *guest.arena, original,
+                "success={success}: all borrowed and neighboring bytes"
+            );
+            assert_eq!(guest.injected, [Sysno::fstat]);
+            assert_eq!(guest.fstat_guard_live, [true]);
+            assert!(!guest.guard_live.load(Ordering::SeqCst));
+            assert!(guest.mapped.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_fstat_commit_is_restored_before_the_real_page_fallback() {
+        let (fd, inode) = open_file();
+        let (tool, mut guest) = ScriptedGuest::new(false, false);
+        guest.commit_partial = true;
+        let original = *guest.arena;
+        let result = tool.inject_fstat(&mut guest, fd).await;
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+        assert_eq!(result.unwrap().st_ino, inode);
+        assert_eq!(
+            *guest.arena, original,
+            "the failed commit's partial zero write must be put back"
+        );
+        assert_eq!(guest.injected, [Sysno::mmap, Sysno::fstat, Sysno::munmap]);
+        assert_eq!(
+            guest.fstat_guard_live,
+            [false],
+            "the failed stack guard was never constructed"
+        );
+        assert_eq!(
+            guest.mapped, guest.unmapped,
+            "the actual temporary page was removed"
+        );
+        assert!(!guest.guard_live.load(Ordering::SeqCst));
+    }
+
     #[tokio::test]
     async fn writable_stack_scratch_is_used_while_its_guard_is_live() {
         let (fd, inode) = open_file();
@@ -16388,10 +16488,10 @@ mod inject_fstat_scratch {
             [guest.arena.as_ptr() as usize],
             "fstat must write into the stack scratch"
         );
-        let used_words = std::mem::size_of::<libc::stat>().div_ceil(8);
-        assert!(
-            guest.arena[..used_words].iter().all(|word| *word == 0),
-            "the stat must not be left in the guest's stack scratch"
+        assert_eq!(
+            *guest.arena,
+            [u64::MAX; ARENA_WORDS],
+            "the original borrowed bytes, including neighbors, must remain unchanged"
         );
         assert_eq!(recorded_inode(&guest, fd), Some(inode));
     }
@@ -16950,4 +17050,22 @@ fn report_flock_refusal(message: &str) {
         &mut crate::util::RetryingStderr,
         format_args!("hermit: {message}\n"),
     );
+}
+
+#[cfg(test)]
+mod linux_uapi_statx_tests {
+    use super::statx_arguments_valid;
+
+    #[test]
+    fn statx_sync_modes_keep_linux_positive_and_negative_contract() {
+        for sync in [0, 0x2000, 0x4000] {
+            assert!(statx_arguments_valid(sync, 0, false));
+        }
+        assert!(!statx_arguments_valid(0x6000, 0, false));
+        assert!(!statx_arguments_valid(0x6000, 0, true));
+        assert!(!statx_arguments_valid(0, 0x8000_0000, true));
+        assert!(!statx_arguments_valid(0x4000_0000, 0, false));
+        // Preserve the existing descriptor/no-path rule for other flag bits.
+        assert!(statx_arguments_valid(0x4000_0000, 0, true));
+    }
 }

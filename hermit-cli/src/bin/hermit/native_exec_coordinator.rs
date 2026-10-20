@@ -35,19 +35,24 @@ use detcore::types::DetTid;
 use detcore_model::liteinst_native_exec_runtime as runtime_packet;
 use hermit::in_guest_exits::InGuestExitAdmission;
 use hermit::in_guest_exits::NativeWatchedProcess;
-use hermit::physical_exit_watch;
 use reverie::GlobalTool;
 use reverie_inguest::launcher::native::NativeRootObservation;
 use reverie_inguest::launcher::native::NativeStartAdmission;
 use reverie_rpc_transport::Admitted;
 use reverie_rpc_transport::ConnectionAdmission;
-use reverie_rpc_transport::ExitReporter;
 use reverie_rpc_transport::initial_image::InitialImageAdmission;
 use reverie_rpc_transport::initial_image::config_digest;
 use reverie_rpc_transport::successor::NativeImageConnection;
 use reverie_rpc_transport::successor::SuccessorAdmission;
 use reverie_rpc_transport::successor::SuccessorRequest;
 
+use super::initial_image_admission::InitialRedemption;
+use super::initial_image_admission::NativeReporter;
+use super::initial_image_admission::alive;
+use super::initial_image_admission::consume_initial_redemption;
+use super::initial_image_admission::entropy;
+use super::initial_image_admission::inherited_socket_identity;
+use super::initial_image_admission::require_watched_peer;
 use super::native_exec_artifacts::QualifiedNativeArtifacts;
 use super::native_exec_inputs::GuestPath;
 use super::native_exec_inputs::HeldDynamicInputs;
@@ -65,40 +70,6 @@ fn invalid(message: impl Into<String>) -> io::Error {
 }
 fn error(error: impl std::fmt::Display) -> io::Error {
     invalid(error.to_string())
-}
-fn alive(fd: BorrowedFd<'_>) -> io::Result<()> {
-    let mut poll = libc::pollfd {
-        fd: fd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    if unsafe { libc::poll(&mut poll, 1, 0) } != 0 || poll.revents != 0 {
-        return Err(invalid("native watched birth is no longer live"));
-    }
-    Ok(())
-}
-fn entropy() -> io::Result<[u8; 32]> {
-    let mut bytes = [0; 32];
-    let mut done = 0;
-    while done < bytes.len() {
-        let n =
-            unsafe { libc::getrandom(bytes[done..].as_mut_ptr().cast(), bytes.len() - done, 0) };
-        if n < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if n == 0 {
-            return Err(invalid("native launch nonce source returned EOF"));
-        }
-        done += n as usize;
-    }
-    if bytes == [0; 32] {
-        return Err(invalid("native launch nonce was empty"));
-    }
-    Ok(bytes)
 }
 
 /// Exact raw-kernel masks at the two real native image phases. Initial and
@@ -185,18 +156,7 @@ impl std::fmt::Debug for Proof {
 }
 impl Proof {
     fn peer(&self, peer: &OwnedFd) -> io::Result<()> {
-        use std::os::fd::AsFd;
-        alive(self.watch.retained_pidfd())?;
-        alive(peer.as_fd())?;
-        if self.failed.load(Ordering::Acquire)
-            || !self.watch.watch_is_healthy()
-            || physical_exit_watch::birth_identity(peer) != Some(self.watch.birth_identity())
-        {
-            return Err(invalid(
-                "native peer/watch/source belongs to a different or failed birth",
-            ));
-        }
-        Ok(())
+        require_watched_peer(&self.watch, peer, &self.failed)
     }
     fn selected_original_target(&self, entry: &Entry) -> io::Result<[u8; 32]> {
         self.root.verify()?;
@@ -681,15 +641,19 @@ impl InitialImageAdmission for NativeRunOwner {
             active.proof.peer(&peer)?;
             detcore::native_exec::validate_native_exec_host_configuration(&self.config)
                 .map_err(|e| invalid(format!("native initial host Config: {e:?}")))?;
-            if admitted.process_id != active.proof.watch.process_id()
-                || nonce != self.nonce
-                || digest != self.digest
-                || self.initial_used.swap(true, Ordering::AcqRel)
-            {
-                return Err(invalid(
-                    "native InitialImage owner/nonce/Config/replay refused",
-                ));
-            }
+            consume_initial_redemption(
+                InitialRedemption {
+                    process: active.proof.watch.process_id(),
+                    nonce: &self.nonce,
+                    digest: self.digest,
+                },
+                InitialRedemption {
+                    process: admitted.process_id,
+                    nonce,
+                    digest,
+                },
+                &self.initial_used,
+            )?;
             let image = active.proof.root.image(&peer, self.initial_target)?;
             active.proof.signal_masks.require_bootstrap(&image)?;
             Ok(())
@@ -865,39 +829,7 @@ impl ConnectionAdmission for StatisticsAdmission {
         }
     }
 }
-struct NativeReporter {
-    global: Weak<detcore::GlobalState>,
-}
-impl ExitReporter for NativeReporter {
-    fn process_exited(&self, pid: i32) {
-        if let Some(global) = self.global.upgrade() {
-            if let Some(store) = global.native_exec_registry() {
-                store.lock().unwrap().died();
-            }
-            global.on_backend_process_exited(pid);
-        }
-    }
-    fn pending_process_exits(&self) -> Vec<i32> {
-        self.global
-            .upgrade()
-            .map(|g| g.backend_pending_process_exits())
-            .unwrap_or_default()
-    }
-    fn backend_failed(&self, failure: reverie::BackendFailure) {
-        if let Some(global) = self.global.upgrade() {
-            if let Some(store) = global.native_exec_registry() {
-                store.lock().unwrap().provision_transport_failed();
-            }
-            global.report_backend_failure(failure);
-        }
-    }
-}
-fn inherited_socket_identity(fd: BorrowedFd<'_>, destination: i32) -> io::Result<String> {
-    let encoded = detcore::detlog::tool_output_env_value(fd.as_raw_fd())?;
-    let (_, (device, inode)) = detcore::detlog::parse_tool_output_env_value(&encoded)
-        .ok_or_else(|| invalid("native endpoint identity malformed"))?;
-    Ok(format!("{destination}:{device:016x}:{inode:016x}"))
-}
+
 fn read_original_path(pid: i32, pointer: u64) -> io::Result<Vec<u8>> {
     if pid <= 0 || pointer == 0 || pointer >= 0x0000_8000_0000_0000 {
         return Err(invalid("native original path pointer domain"));

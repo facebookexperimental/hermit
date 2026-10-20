@@ -1,9 +1,10 @@
 //! Required fixed placement of the existing signal/continuation stacks.
 //! These observations do not claim all-entry, TLS or interior write isolation.
 
+// Preserve the embedded library's public API, including its re-exports.
 #[allow(dead_code)]
 #[path = "../../reverie/reverie-liteinst-artifact/src/lib.rs"]
-mod artifact;
+pub mod artifact;
 #[path = "common/cold_bundle.rs"]
 mod cold_bundle;
 #[path = "common/cold_constructor.rs"]

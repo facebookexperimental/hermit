@@ -36,6 +36,10 @@ mod exec_initial;
 mod exec_native;
 #[cfg(feature = "exec-private-init")]
 pub use exec_initial::detcore_liteinst_exec_initialize;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use exec_initial::detcore_liteinst_mapped_entry;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use exec_initial::detcore_liteinst_mapped_initialize;
 // Errors are printed without the C library's errno messages: strerror_r can
 // allocate through the guest's malloc (see describe_io_error).
 use reverie_inguest::guest::support::describe_io_error;
@@ -296,6 +300,14 @@ unsafe fn initialize_detcore(inputs: InitializationInputs) {
                     {
                         fail("InitialImage DETLOG identity or forwarder installed twice");
                     }
+                    if detcore::detlog::set_plain_info_forwarder(forward_plain_info).is_err() {
+                        fail("InitialImage plain INFO forwarder installed twice");
+                    }
+                    if reverie::set_tail_start_forwarder(detcore::detlog::forward_tail_start)
+                        .is_err()
+                    {
+                        fail("InitialImage shared tail-start forwarder installed twice");
+                    }
                 } else {
                     let _ = TOOL_OUTPUT_IDENTITY.set(identity);
                     let _ = detcore::detlog::set_forwarder(forward_detlog, policy);
@@ -514,17 +526,22 @@ impl detcore::OpenFileControlTransport for CoordinatorOpenFiles {
 /// Sends one Detcore record on the reserved socket. Its number can move when the
 /// guest `dup2`s onto it, so it is read for each record.
 fn forward_detlog(target: &str, record_suffix: &str, index: u64, message: std::fmt::Arguments<'_>) {
-    if let Some(socket) = reverie_liteinst::tool_output_fd() {
-        // Never to a descriptor that is not the passed socket; the record is
-        // then counted and missing, so the run is refused.
-        if TOOL_OUTPUT_IDENTITY
-            .get()
-            .is_none_or(|identity| detcore::detlog::socket_identity(socket) != Some(*identity))
-        {
-            return;
-        }
+    if let Some(socket) = authenticated_output_socket() {
         detcore::detlog::send_forwarded_record(socket, target, record_suffix, index, message);
     }
+}
+
+fn authenticated_output_socket() -> Option<libc::c_int> {
+    let socket = reverie_liteinst::tool_output_fd()?;
+    (TOOL_OUTPUT_IDENTITY
+        .get()
+        .is_some_and(|identity| detcore::detlog::socket_identity(socket) == Some(*identity)))
+    .then_some(socket)
+}
+
+#[cfg(feature = "exec-private-init")]
+fn forward_plain_info(target: &str, index: u64, message: std::fmt::Arguments<'_>) {
+    detcore::detlog::send_plain_info_record(authenticated_output_socket(), target, index, message);
 }
 
 /// Blocks ordinary asynchronous signals and returns the previous mask.

@@ -145,9 +145,9 @@ fn validate_resource_limit_mutation(
     }
     // CORE is virtual compatibility state too: changing it cannot enable host
     // core dumps, while Linux sanitizers routinely lower its soft limit.
-    if resource != libc::RLIMIT_STACK
-        && resource != libc::RLIMIT_NOFILE
-        && resource != libc::RLIMIT_CORE
+    if resource != reverie::syscalls::linux_abi::RLIMIT_STACK
+        && resource != reverie::syscalls::linux_abi::RLIMIT_NOFILE
+        && resource != reverie::syscalls::linux_abi::RLIMIT_CORE
     {
         return Err(Errno::EPERM);
     }
@@ -448,7 +448,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let sys_info = self.collect_sysinfo(guest).await?;
         let mut memory = guest.memory();
 
-        memory.write_value(info_addr, &sys_info.into())?;
+        // Typed moves do not guarantee initialized repr(C) padding. Serialize
+        // directly into initialized bytes for every target libc.
+        let bytes = sys_info.to_kernel_bytes();
+        memory.write_exact(info_addr.cast::<u8>(), &bytes)?;
         Ok(0)
     }
 
@@ -654,7 +657,7 @@ mod tests {
         ] {
             let uptime =
                 sysinfo_uptime_seconds(LogicalTime::from_nanos(elapsed_ns), epoch, offset).unwrap();
-            let info: libc::sysinfo = syscalls::SysInfo {
+            let info: reverie::syscalls::linux_abi::Sysinfo = syscalls::SysInfo {
                 uptime,
                 loads_1: 0,
                 loads_5: 0,
@@ -833,7 +836,11 @@ mod tests {
             maximum: 0,
         };
         assert_eq!(
-            validate_resource_limit_mutation(libc::RLIMIT_CPU, limit, limit),
+            validate_resource_limit_mutation(
+                reverie::syscalls::linux_abi::RLIMIT_CPU,
+                limit,
+                limit
+            ),
             Ok(())
         );
     }
@@ -849,7 +856,11 @@ mod tests {
             maximum: 1,
         };
         assert_eq!(
-            validate_resource_limit_mutation(libc::RLIMIT_CORE, previous, requested),
+            validate_resource_limit_mutation(
+                reverie::syscalls::linux_abi::RLIMIT_CORE,
+                previous,
+                requested
+            ),
             Ok(())
         );
     }
@@ -865,7 +876,11 @@ mod tests {
             maximum: 1,
         };
         assert_eq!(
-            validate_resource_limit_mutation(libc::RLIMIT_CPU, previous, requested),
+            validate_resource_limit_mutation(
+                reverie::syscalls::linux_abi::RLIMIT_CPU,
+                previous,
+                requested
+            ),
             Err(Errno::EPERM)
         );
     }
@@ -881,7 +896,11 @@ mod tests {
             maximum: 1,
         };
         assert_eq!(
-            validate_resource_limit_mutation(libc::RLIMIT_CORE, previous, requested),
+            validate_resource_limit_mutation(
+                reverie::syscalls::linux_abi::RLIMIT_CORE,
+                previous,
+                requested
+            ),
             Err(Errno::EINVAL)
         );
     }
@@ -897,7 +916,11 @@ mod tests {
             maximum: 2,
         };
         assert_eq!(
-            validate_resource_limit_mutation(libc::RLIMIT_CORE, previous, requested),
+            validate_resource_limit_mutation(
+                reverie::syscalls::linux_abi::RLIMIT_CORE,
+                previous,
+                requested
+            ),
             Err(Errno::EPERM)
         );
     }

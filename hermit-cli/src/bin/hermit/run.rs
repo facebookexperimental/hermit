@@ -709,6 +709,25 @@ impl SharedLog {
     fn record_sink(&self) -> detcore::detlog::ForwardedRecordSink {
         let log = self.clone();
         Box::new(move |message: &[u8]| {
+            // Binary typed payload is checked before legacy newline handling.
+            // No arbitrary INFO text gets the typed class's acceptance.
+            if message.starts_with(b"HINFO") {
+                match detcore::detlog::decode_plain_info(message) {
+                    Ok((target, text)) => {
+                        let line = format!(
+                            "{NORMALIZED_FORWARDED_DETLOG_TIMESTAMP} INFO {target}: {text}\n"
+                        );
+                        let _ = log.with(|writer| writer.write_all(line.as_bytes()));
+                    }
+                    Err(reason) => {
+                        // No source-lock reentry: the collector may hold it.
+                        detcore::detlog::record_determinism_loss(reason);
+                        let line = format!("{FORWARDING_REFUSED_MARKER} {reason}\n");
+                        let _ = log.with(|writer| writer.write_all(line.as_bytes()));
+                    }
+                }
+                return;
+            }
             let payload = message.strip_suffix(b"\n").unwrap_or(message);
             let mut line = Vec::with_capacity(payload.len() + 40);
             if payload.starts_with(b"INFO detcore") && find_bytes(payload, b" DETLOG ").is_some() {
@@ -1189,6 +1208,11 @@ pub struct RunOpts {
     /// or not virtual time then sampled the host clock for it.
     #[clap(skip)]
     epoch_omitted: bool,
+
+    /// An omitted virtual epoch was left unresolved because this opt-in request
+    /// was refused. Package appearance later cannot admit this invocation.
+    #[clap(skip)]
+    exec_stop_epoch_refused: bool,
 
     /// Whether the epoch was taken from the preemption record being replayed,
     /// replacing an omitted one. See `adopt_replayed_schedule_epoch`.
@@ -2322,6 +2346,119 @@ fn assert_exec_stop_not_ready(error: &Error) {
         error.to_string().contains("exec-stop-runtime-not-ready"),
         "{error:#}"
     );
+}
+
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[test]
+fn exec_stop_admission_reads_the_global_backend_before_launch() {
+    use clap::Parser;
+    for (backend, verify, accepted) in [
+        ("in-guest-trap", false, true),
+        ("ptrace", false, false),
+        ("in-guest-trap", true, false),
+    ] {
+        let backend_arg = format!("--backend={backend}");
+        let mut argv = vec!["hermit", &backend_arg, "run", "--in-guest-exec-stop"];
+        if verify {
+            argv.push("--verify");
+        }
+        argv.extend(["--", "/bin/true"]);
+        let args = crate::Args::try_parse_from(argv).unwrap();
+        let crate::Subcommand::Run(mut run) = args.command else {
+            unreachable!()
+        };
+        assert!(run.backend.is_none(), "backend is a global CLI input");
+        run.set_backend(args.global.backend);
+        // Availability is explicit DATA here: no installed package, mutable
+        // environment, executable image or Ready state is needed by this test.
+        for package_available in [false, true] {
+            assert_eq!(
+                run.exec_stop_direct_domain(package_available),
+                accepted && package_available,
+                "backend={backend} verify={verify} package_available={package_available}"
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[test]
+fn admitted_exec_stop_captures_one_effective_epoch() {
+    let mut run = run_opts_for(&[
+        "hermit",
+        "--backend=in-guest-trap",
+        "run",
+        "--in-guest-exec-stop",
+        "--",
+        "/bin/true",
+    ]);
+    let admitted = run.refuse_unready_exec_stop_with_availability(true).is_ok();
+    assert!(admitted);
+    let calls = std::cell::Cell::new(0);
+    run.capture_default_epoch_with_admission(
+        || {
+            calls.set(calls.get() + 1);
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1)
+        },
+        admitted,
+    );
+    assert_eq!(calls.get(), 1);
+    assert_eq!(
+        run.epoch_capture_for_test(),
+        ("1970-01-01T00:00:01+00:00".to_owned(), true)
+    );
+    assert!(run.epoch_omitted);
+    assert!(!run.exec_stop_epoch_refused);
+    run.refuse_unready_exec_stop_with_availability(true)
+        .unwrap();
+    assert_eq!(
+        run.clone().epoch_capture_for_test(),
+        run.epoch_capture_for_test()
+    );
+    assert_eq!(calls.get(), 1);
+}
+
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[test]
+fn pending_exec_stop_epoch_cannot_be_admitted_by_later_package_appearance() {
+    let mut run = run_opts_for(&[
+        "hermit",
+        "--backend=in-guest-trap",
+        "run",
+        "--in-guest-exec-stop",
+        "--",
+        "/bin/true",
+    ]);
+    let admitted = run
+        .refuse_unready_exec_stop_with_availability(false)
+        .is_ok();
+    assert!(!admitted);
+    run.capture_default_epoch_with_admission(
+        || panic!("a pending opt-in request must not sample the host clock"),
+        admitted,
+    );
+    assert!(run.epoch_omitted);
+    assert!(!run.epoch_captured_from_host);
+    assert!(run.exec_stop_epoch_refused);
+    for mut options in [run.clone(), run] {
+        // The ordinary domain would now accept the available package, but this
+        // invocation never resolved its omitted epoch and remains refused.
+        assert!(options.exec_stop_direct_domain(true));
+        assert_exec_stop_not_ready(
+            &options
+                .refuse_unready_exec_stop_with_availability(true)
+                .unwrap_err(),
+        );
+        let admitted = options
+            .refuse_unready_exec_stop_with_availability(true)
+            .is_ok();
+        options.capture_default_epoch_with_admission(
+            || panic!("retrying a pending request must not sample a later epoch"),
+            admitted,
+        );
+        assert!(options.exec_stop_epoch_refused);
+        assert!(!options.epoch_captured_from_host);
+    }
 }
 
 #[test]
@@ -5752,10 +5889,28 @@ impl RunOpts {
     /// guest launch. Both halves of `--verify` and every backend then receive the
     /// same concrete `DateTime`; Detcore never reads the host clock itself.
     pub(crate) fn capture_default_epoch(&mut self, capture_now: impl FnOnce() -> SystemTime) {
+        let exec_stop_admitted = self.refuse_unready_exec_stop().is_ok();
+        self.capture_default_epoch_with_admission(capture_now, exec_stop_admitted);
+    }
+
+    // The Boolean is only the existing admission decision, not image authority.
+    // Tests supply availability through the same admission predicate below.
+    fn capture_default_epoch_with_admission(
+        &mut self,
+        capture_now: impl FnOnce() -> SystemTime,
+        exec_stop_admitted: bool,
+    ) {
         self.epoch_omitted = true;
-        // The pending exec-stop path is refused after the verdict stamp; it
-        // must not resolve an implicit input for a guest that cannot start.
-        if !self.in_guest_exec_stop && self.uses_virtual_time_determinization() {
+        if self.in_guest_exec_stop
+            && self.uses_virtual_time_determinization()
+            && (self.exec_stop_epoch_refused || !exec_stop_admitted)
+        {
+            self.exec_stop_epoch_refused = true;
+            return;
+        }
+        // The opt-in path executes the genuine Tool and receives the SAME
+        // resolved epoch as every other run; it must not draw a later clock.
+        if self.uses_virtual_time_determinization() {
             self.det_opts
                 .det_config
                 .capture_epoch_from_host_time(capture_now());
@@ -6008,7 +6163,7 @@ impl RunOpts {
     /// receiving end; inside the run's container, the coordinator writes what
     /// arrives on the receiving end into the run's log in order
     /// (`detcore::detlog::set_forwarded_source`).
-    fn open_forwarded_detlog_channel()
+    pub(super) fn open_forwarded_detlog_channel()
     -> Result<Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>, Error> {
         let mut pair = [-1; 2];
         // SAFETY: socketpair writes two descriptors into `pair` on success.
@@ -6454,19 +6609,60 @@ impl RunOpts {
         })?))
     }
 
-    /// A mechanics fixture cannot supply production Detcore readiness. Keep
-    /// this admission independent of host capabilities and backend selection.
+    // Pure option/availability admission. The caller supplies real package
+    // discovery; retained opening still authenticates actual files before spawn.
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    fn exec_stop_direct_domain(&self, package_available: bool) -> bool {
+        self.selected_backend() == Backend::InGuestTrap
+            && package_available
+            && !self.verify
+            && self.verify_run.is_none()
+            && !self.namespace_only
+            && !self.strace_only
+            && self.dap_listen.is_none()
+            && !self.det_opts.det_config.gdbserver
+            && self.det_opts.det_config.network_trace == NetworkTraceConfig::default()
+            && self
+                .guest_command()
+                .is_ok_and(|command| command.find_program().is_ok())
+    }
+
+    /// Admit only the opt-in packaged first-image direct-run domain. Resource
+    /// availability does not replace the retained image and actual startup checks.
     pub(crate) fn refuse_unready_exec_stop(&self) -> Result<(), Error> {
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        let package_available = self.in_guest_exec_stop
+            && !self.exec_stop_epoch_refused
+            && self.selected_backend() == Backend::InGuestTrap
+            && super::mapped_first_admission::packaged_image_declared();
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        let package_available = false;
+        self.refuse_unready_exec_stop_with_availability(package_available)
+    }
+
+    // Availability DATA cannot bypass the sticky epoch refusal or real options.
+    fn refuse_unready_exec_stop_with_availability(
+        &self,
+        package_available: bool,
+    ) -> Result<(), Error> {
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        let _ = package_available;
         if self.in_guest_exec_stop {
+            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            if !self.exec_stop_epoch_refused && self.exec_stop_direct_domain(package_available) {
+                return Ok(());
+            }
             return Err(Error::new(PolicyRefusal).context(
-                "--in-guest-exec-stop: exec-stop-runtime-not-ready: genuine Detcore readiness \
-                 and production ToolRegion image reservation/adoption are not integrated",
+                "--in-guest-exec-stop: exec-stop-runtime-not-ready: requires the packaged private runtime, \
+                 in-guest-trap, and the supported direct-run options",
             ));
         }
         Ok(())
     }
 
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        // Admission must see the actual global backend before any launch.
+        self.set_backend(global.backend);
         self.refuse_unready_exec_stop()?;
         if self.dap_listen.is_some() {
             // Before validation, so every --gdbserver refusal applies.
@@ -6552,7 +6748,7 @@ impl RunOpts {
 
         // The backend is a global option (`hermit --backend X run ...`), the only
         // place it can be given.
-        self.backend = global.backend;
+        self.set_backend(global.backend);
         // Static native-option policy belongs before stdin reservation,
         // availability probes, or backend-specific preprocessing/dispatch.
         #[cfg(feature = "native-exec")]
@@ -6721,11 +6917,22 @@ impl RunOpts {
             // A `--no-namespace` run creates no namespace, so it is not refused
             // where only unshare(CLONE_NEWUSER) is denied
             // (https://github.com/rrnewton/hermit/issues/4515).
-            backend.ensure_available_for(if self.no_namespace {
+            let namespaces = if self.no_namespace {
                 hermit::NamespaceUse::None
             } else {
                 hermit::NamespaceUse::Creates
-            })?;
+            };
+            if self.in_guest_exec_stop {
+                // This launcher needs ptrace, seccomp and the selected namespace
+                // mechanisms, but not an adjacent preload DSO. Its exact-bound
+                // image is opened and retained before container entry in run().
+                self.refuse_unready_exec_stop()?;
+                hermit::validate_tracing_environment(namespaces).map_err(|error| {
+                    Error::new(hermit::BackendUnavailable::new(backend, error.to_string()))
+                })?;
+            } else {
+                backend.ensure_available_for(namespaces)?;
+            }
         }
         // Native exec uses the embedded, producer-qualified catalog rather
         // than the ordinary preload. Its complete Capture::prepare below
@@ -6840,7 +7047,10 @@ impl RunOpts {
                 "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool"
             );
         }
-        if backend == Backend::InGuestTrap && self.uses_in_guest_liteinst() {
+        if backend == Backend::InGuestTrap
+            && self.uses_in_guest_liteinst()
+            && !self.in_guest_exec_stop
+        {
             if self.uses_native_exec() {
                 crate::tracing::diagnostic_eprintln!(
                     "hermit: [in-guest-trap] selected: the embedded native runtime is to host \
@@ -8404,16 +8614,24 @@ impl RunOpts {
         let mut options = self.clone();
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        let mapped_image = if self.in_guest_exec_stop {
+            Some(super::mapped_first_admission::RetainedImage::open()?)
+        } else {
+            None
+        };
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        let mapped_image: Option<()> = None;
         let resources = if network_trace.is_some() {
             "network trace descriptor"
         } else {
             "no descriptors"
         };
-        self.launch_in_container(
-            network_trace,
+        let (value, (_, mapped_image)) = self.launch_in_container(
+            (network_trace, mapped_image),
             resources,
             self.run_timeout(),
-            move |_, identity, native| {
+            move |(_, mapped_image), identity, native| {
                 #[cfg(feature = "native-exec")]
                 if let Some(native) = native {
                     let _ = native;
@@ -8423,10 +8641,27 @@ impl RunOpts {
                 }
                 #[cfg(not(feature = "native-exec"))]
                 let _ = native;
+                #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+                if let Some(image) = mapped_image.as_ref() {
+                    return options.run_mapped_in_container(
+                        &global,
+                        capture_output,
+                        identity,
+                        image,
+                    );
+                }
+                #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+                let _ = mapped_image;
                 options.run_in_container(&global, capture_output, identity)
             },
-        )
-        .map(|(value, _guards)| value)
+        )?;
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        if let Some(image) = mapped_image.as_ref() {
+            image.verify()?;
+        }
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        let _ = mapped_image;
+        Ok(value)
     }
 
     fn warn_no_namespace(&self) {
@@ -10362,6 +10597,74 @@ impl RunOpts {
         )))
     }
 
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    fn run_mapped_in_container(
+        &self,
+        global: &GlobalOpts,
+        capture_output: bool,
+        identity_sources: Option<&IdentityGuard>,
+        image: &super::mapped_first_admission::RetainedImage,
+    ) -> Result<(ExitStatus, Option<Output>), Error> {
+        anyhow::ensure!(
+            !capture_output,
+            "exec-stop direct-run path requires external bounded stdout capture"
+        );
+        let handle = global.log_file_handle.as_ref()
+            .ok_or_else(|| Error::msg("--in-guest-exec-stop requires an actual --log-file for complete INFO/DETLOG evidence"))?;
+        let log = verification_log(
+            handle.try_clone()?,
+            log_max_bytes().map_err(Error::msg)?,
+            global.log_budget(),
+        );
+        let _guard =
+            super::tracing::init_sync_file_tracing(global.log, log.clone(), Backend::InGuestTrap);
+        hermit::proc_mount::warn_if_readonly_proc();
+        let command = self.guest_command()?;
+        let config = complete_container_config(
+            self.effective_det_config(),
+            identity_sources,
+            self.launch_workdir(),
+        )?;
+        let mut config = hermit::prepare_backend_config(config, Backend::InGuestTrap);
+        config.in_guest_site_patching_off = true;
+        // The encoded ForwardPolicy cannot carry span/field-dependent answers.
+        // Refuse those actual RUST_LOG directives before enabling plain INFO.
+        let directives = match std::env::var("RUST_LOG") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => String::new(),
+            Err(error) => return Err(Error::msg(error)),
+        };
+        detcore::detlog::validate_plain_info_directives(&directives).map_err(Error::msg)?;
+        config.in_guest_detlog_forward_policy =
+            Some(hermit::in_guest_detlog_forward_policy_for_native().encode());
+        // SAFETY: explicit bounded intermediate opt-in, internally exact-bound
+        // actual phase4 artifact, same original ptracer and retained lexical
+        // cleanup root. Full landing machine qualification is NOT claimed.
+        let outcome = unsafe {
+            super::mapped_first_admission::run_mapped(
+                command,
+                config,
+                image,
+                log.record_sink(),
+                self.summary,
+                &self.summary_json,
+            )
+        };
+        let flushed = log.with(|writer| writer.flush());
+        let failure = log.failure();
+        let status = outcome?;
+        flushed?;
+        anyhow::ensure!(
+            failure.is_none(),
+            "actual mapped INFO/DETLOG sink failed: {failure:?}"
+        );
+        anyhow::ensure!(
+            detcore::detlog::determinism_loss().is_none(),
+            "actual mapped DETLOG reports determinism loss"
+        );
+        Ok((status, None))
+    }
+
     fn run_in_container(
         &self,
         global: &GlobalOpts,
@@ -10927,6 +11230,73 @@ fn store_network_manifest(
     Ok(())
 }
 
+// The four physical MM controls use the same namespace/root/identity launcher
+// as the real flag; no direct bare-host mapped_run substitute or invented PID.
+#[cfg(all(test, feature = "mm-cancellation-test-support"))]
+pub(crate) fn physical_mm_cancellation_control(
+    point: detcore::initial_mm_probe::Point,
+) -> anyhow::Result<()> {
+    let mut options = RunOpts::try_parse_from([
+        "run",
+        "--strict",
+        "--in-guest-exec-stop",
+        "--no-rcb-time",
+        "--max-timeslice=disabled",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--seed=0",
+        "--sched-seed=0",
+        "--rng-seed=0",
+        "--",
+        "/bin/true",
+    ])?;
+    options.set_backend(Some(Backend::InGuestTrap));
+    options.validate_args()?;
+    anyhow::ensure!(
+        !options.no_namespace,
+        "MM physical control requires real PID namespace"
+    );
+    let image = std::sync::Arc::new(super::mapped_first_admission::RetainedImage::open()?);
+    let held_image = image.clone();
+    let work_options = options.clone();
+    let result = options.launch_in_container(
+        held_image,
+        "same retained runtime image for physical MM cancellation",
+        None,
+        move |image, identity, native| {
+            anyhow::ensure!(
+                native.is_none(),
+                "MM control cannot consume native enrollment"
+            );
+            anyhow::ensure!(
+                identity.is_some(),
+                "MM control requires actual container identity"
+            );
+            let command = work_options.guest_command()?;
+            let config = complete_container_config(
+                work_options.effective_det_config(),
+                identity,
+                work_options.launch_workdir(),
+            )?;
+            let mut config = hermit::prepare_backend_config(config, Backend::InGuestTrap);
+            config.in_guest_site_patching_off = true;
+            config.in_guest_detlog_forward_policy =
+                Some(detcore::detlog::ForwardPolicy::all().encode());
+            super::mapped_first_admission::cancel_mm_in_container(point, command, config, image)
+        },
+    );
+    // Close the SAME outer image even if the real container/control returned
+    // Err; never replace a physical failure with an image verification success.
+    let close = image.verify();
+    match (result, close) {
+        (Ok(((), _)), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(close)) => Err(close.into()),
+        (Err(error), Err(close)) => Err(anyhow::anyhow!(
+            "physical MM={error:#}; image close={close:#}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
@@ -11215,6 +11585,139 @@ mod tests {
         let mut expected = files[2..].to_vec();
         expected.sort();
         assert_eq!(left, expected);
+    }
+
+    #[derive(Clone)]
+    struct PlainInfoWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for PlainInfoWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn typed_plain_info_sink_preserves_native_message_format_and_legacy_detlog() {
+        let native = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let native_writer = native.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || PlainInfoWriter(native_writer.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "detcore::syscalls::files", "Injecting additional fstat to retrieve file metadata on fd {}.", 3);
+        });
+        let native = String::from_utf8(native.lock().unwrap().clone()).unwrap();
+        // Timestamp/level padding belongs to the existing host format. Compare
+        // the whole original target/message portion, with no field rewriting.
+        let native_payload = native.split_once("INFO ").unwrap().1;
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = SharedLog::new(PlainInfoWriter(bytes.clone()));
+        let mut sink = log.record_sink();
+        sink(
+            &detcore::detlog::encode_plain_info(
+                "detcore::syscalls::files",
+                "Injecting additional fstat to retrieve file metadata on fd 3.",
+            )
+            .unwrap(),
+        );
+        let rdtsc = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rdtsc_writer = rdtsc.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || PlainInfoWriter(rdtsc_writer.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "detcore", "[dtid {}] inbound rdtsc, new logical time: {:?}", 3, 17);
+        });
+        let rdtsc = String::from_utf8(rdtsc.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            rdtsc.split_once("INFO ").unwrap().1,
+            "detcore: [dtid 3] inbound rdtsc, new logical time: 17\n"
+        );
+        let rdtsc_typed = detcore::detlog::encode_plain_info(
+            "detcore",
+            "[dtid 3] inbound rdtsc, new logical time: 17",
+        )
+        .unwrap();
+        let (target, message) = detcore::detlog::decode_plain_info(&rdtsc_typed).unwrap();
+        assert_eq!(
+            rdtsc.split_once("INFO ").unwrap().1,
+            format!("{target}: {message}\n")
+        );
+        sink(b"INFO detcore: DETLOG legacy unchanged\n");
+        sink(&detcore::detlog::encode_plain_info("detcore", "DETLOG ordinary text").unwrap());
+        sink(b"INFO detcore: raw plain INFO remains refused\n");
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            output,
+            format!(
+                "{NORMALIZED_FORWARDED_DETLOG_TIMESTAMP} INFO {native_payload}{NORMALIZED_FORWARDED_DETLOG_TIMESTAMP} INFO detcore: DETLOG legacy unchanged\n{NORMALIZED_FORWARDED_DETLOG_TIMESTAMP} INFO detcore: DETLOG ordinary text\n{FORWARDING_REFUSED_MARKER} INFO detcore: raw plain INFO remains refused\n"
+            )
+        );
+        assert!(log.failure().is_none());
+    }
+
+    #[test]
+    fn malformed_typed_plain_info_sink_latches_refusal_without_source_reentry() {
+        const NAME: &str =
+            "run::tests::malformed_typed_plain_info_sink_latches_refusal_without_source_reentry";
+        const CHILD: &str = "HERMIT_PLAIN_INFO_SINK_TEST";
+        if std::env::var(CHILD).ok().as_deref() != Some(NAME) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME])
+                .env(CHILD, NAME)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .any(|line| line == format!("test {NAME} ... ok"))
+                    );
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("typed sink control timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = SharedLog::new(PlainInfoWriter(bytes.clone()));
+        let mut sink = log.record_sink();
+        let mut bad = detcore::detlog::encode_plain_info("detcore", "text").unwrap();
+        bad[9] = 2; // unsupported class, not a textual fallback
+        sink(&bad);
+        sink(b"HINFO");
+        sink(b"HINFO\0\0\0\x01");
+        assert!(detcore::detlog::determinism_loss().is_some());
+        assert!(
+            String::from_utf8(bytes.lock().unwrap().clone())
+                .unwrap()
+                .starts_with(FORWARDING_REFUSED_MARKER)
+        );
+        assert!(
+            log.failure().is_none(),
+            "a semantic refusal is not a fabricated I/O error"
+        );
     }
 
     /// Fails its first write and accepts every later one.

@@ -1134,7 +1134,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and cli_help::test_harness_refuses_parity_inputs_outside_a_verify_probe
     // (pressure-test --parity-all's probe inputs): 1_786.
     // And the detcore-model work-span-report config test: 1_787, listed.
-    ("test.regular_crates", 1_787),
+    // Add the first-image loader controls; retain main's full selection.
+    ("test.regular_crates", 1789),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1707,7 +1708,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run::a_work_span_report_path_with_a_parent_component_is_refused: 1062,
     // listed.
     // Host CPUID profile coverage: https://github.com/rrnewton/hermit/issues/4534.
-    ("test.hermit_unit", 1065),
+    // Add the first-image loader controls; retain main's full selection.
+    ("test.hermit_unit", 1069),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2622,7 +2624,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // only_a_tool_decided_refusal_is_an_internal_failure): 2220.
     // And ten two-phase signal-delivery units (signal_announcement_tests): 2230.
     // Host CPUID profile coverage: https://github.com/rrnewton/hermit/issues/4534.
-    ("test.detcore_unit", 2233),
+    // Add 21 first-image loader controls; retain main's full selection.
+    ("test.detcore_unit", 2254),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4639,7 +4642,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two tool-decided tripwire units of the LinuxEmu D1 pin: 2220.
     // And ten two-phase signal-delivery units (signal_announcement_tests): 2230.
     // Host CPUID profile coverage: https://github.com/rrnewton/hermit/issues/4534.
-    ("test.detcore_unit_on_host", 2233),
+    // Add 21 first-image loader controls; retain main's full selection.
+    ("test.detcore_unit_on_host", 2254),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4963,7 +4967,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same sigreturn-report pin: 1059, listed.
     // And the same three work-span-report units: 1062, listed.
     // Host CPUID profile coverage: https://github.com/rrnewton/hermit/issues/4534.
-    ("test.hermit_unit_on_host", 1065),
+    // Add the first-image loader controls; retain main's full selection.
+    ("test.hermit_unit_on_host", 1069),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5140,7 +5145,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +3, the same parity-probe runner units and harness refusal test as
     // the local node: 1_772.
     // And the same detcore-model work-span-report config test: 1_773.
-    ("test.regular_crates_on_host", 1_773),
+    // Add the first-image loader controls; retain main's full selection.
+    ("test.regular_crates_on_host", 1775),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

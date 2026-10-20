@@ -6,6 +6,7 @@ use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 
 use detcore_model::liteinst_native_exec_catalog as wire;
+use reverie::syscalls::linux_abi;
 use reverie_inguest::guest::native_exec_mappings::ExecutableBacking;
 use reverie_inguest::guest::native_exec_mappings::ExecutableExtent;
 use reverie_inguest::guest::native_exec_mappings::ExecutableObject;
@@ -43,6 +44,7 @@ fn observe(fd: i32) -> Result<Observation, &'static str> {
     const {
         assert!(core::mem::size_of::<libc::statfs64>() == 120);
         assert!(core::mem::align_of::<libc::statfs64>() == 8);
+        assert!(core::mem::offset_of!(libc::statfs64, f_type) == 0);
         assert!(core::mem::offset_of!(libc::statfs64, f_flags) == 80);
     }
     let mut fs: libc::statfs64 = unsafe { core::mem::zeroed() };
@@ -50,22 +52,26 @@ fn observe(fd: i32) -> Result<Observation, &'static str> {
         libc::SYS_fstatfs,
         [fd as u64, (&raw mut fs) as u64, 0, 0, 0, 0],
     )?;
-    let mut identity: libc::statx = unsafe { core::mem::zeroed() };
+    let mut identity: linux_abi::Statx = unsafe { core::mem::zeroed() };
     call(
         libc::SYS_statx,
         [
             fd as u64,
             c"".as_ptr() as u64,
             (libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW) as u64,
-            libc::STATX_MNT_ID as u64,
+            linux_abi::STATX_MNT_ID as u64,
             (&raw mut identity) as u64,
             0,
         ],
     )?;
+    // The kernel words are eight bytes under both libcs; preserve their bits
+    // before comparing the unchanged filesystem and mount-policy masks.
+    let filesystem_type = u64::from_ne_bytes(fs.f_type.to_ne_bytes());
+    let mount_flags = u64::from_ne_bytes(fs.f_flags.to_ne_bytes());
     let required = libc::ST_RDONLY | libc::ST_NOSUID | libc::ST_NODEV;
-    if fs.f_type != libc::TMPFS_MAGIC
-        || fs.f_flags as u64 & required != required
-        || identity.stx_mask & libc::STATX_MNT_ID == 0
+    if filesystem_type != libc::TMPFS_MAGIC as u64
+        || mount_flags & required != required
+        || identity.stx_mask & linux_abi::STATX_MNT_ID == 0
         || identity.stx_mnt_id == 0
     {
         return Err("native backing is not an observed readonly tmpfs mount");
@@ -73,7 +79,7 @@ fn observe(fd: i32) -> Result<Observation, &'static str> {
     Ok(Observation {
         stat,
         mount: identity.stx_mnt_id,
-        flags: fs.f_flags as u64,
+        flags: mount_flags,
     })
 }
 fn same(before: &Observation, after: &Observation) -> bool {

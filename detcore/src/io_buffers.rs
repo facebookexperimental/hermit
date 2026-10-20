@@ -52,6 +52,8 @@ use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::linux_abi::Mmsghdr;
+use reverie::syscalls::linux_abi::Msghdr;
 
 use crate::digest::Digest;
 use crate::dirents::DirentFormat;
@@ -287,8 +289,8 @@ fn msghdr_extents<M: MemoryAccess>(
     if msg_addr == 0 {
         return Ok(Vec::new());
     }
-    let address: AddrMut<'_, libc::msghdr> = AddrMut::from_raw(msg_addr).ok_or(Errno::EFAULT)?;
-    let message: libc::msghdr = memory.read_value(address)?;
+    let address: AddrMut<'_, Msghdr> = AddrMut::from_raw(msg_addr).ok_or(Errno::EFAULT)?;
+    let message: Msghdr = memory.read_value(address)?;
     iovec_extents(memory, message.msg_iov as usize, message.msg_iovlen, moved)
 }
 
@@ -318,11 +320,10 @@ fn mmsghdr_extents<M: MemoryAccess>(
     if mmsg_addr == 0 || count == 0 {
         return Ok(Vec::new());
     }
-    let address: AddrMut<'_, libc::mmsghdr> = AddrMut::from_raw(mmsg_addr).ok_or(Errno::EFAULT)?;
+    let address: AddrMut<'_, Mmsghdr> = AddrMut::from_raw(mmsg_addr).ok_or(Errno::EFAULT)?;
     // SAFETY: `mmsghdr` is a plain C record; an all-zero value is a valid
     // staging value that `read_values` immediately overwrites.
-    let mut headers: Vec<libc::mmsghdr> =
-        (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
+    let mut headers: Vec<Mmsghdr> = (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
     memory.read_values(address.into(), &mut headers)?;
 
     let mut out = Vec::new();
@@ -2587,6 +2588,54 @@ mod tests {
     use reverie::syscalls::LocalMemory;
 
     #[test]
+    fn socket_extents_keep_full_kernel_iovec_count_before_existing_bound() {
+        let first = [0u8; 1];
+        let second = [0u8; 1];
+        let mut iovecs: Vec<libc::iovec> = (0..libc::UIO_MAXIOV)
+            .map(|_| libc::iovec {
+                iov_base: core::ptr::null_mut(),
+                iov_len: 0,
+            })
+            .collect();
+        iovecs[0] = libc::iovec {
+            iov_base: first.as_ptr().cast_mut().cast(),
+            iov_len: 1,
+        };
+        iovecs[1] = libc::iovec {
+            iov_base: second.as_ptr().cast_mut().cast(),
+            iov_len: 1,
+        };
+        // Explicit initialized guest bytes, including dirty header padding.
+        // No padded by-value struct is reinterpreted as bytes.
+        let mut guarded = [0x5au8; 88];
+        guarded[16..72].fill(0);
+        let header = &mut guarded[16..72];
+        header[12..16].fill(0xa5);
+        header[52..56].fill(0xa5);
+        header[16..24].copy_from_slice(&(iovecs.as_ptr() as usize).to_ne_bytes());
+        header[24..32].copy_from_slice(&((1usize << 32) + 1).to_ne_bytes());
+        let before = guarded;
+        let call = Syscall::Recvmsg(
+            syscalls::Recvmsg::new()
+                .with_msg(AddrMut::from_ptr(guarded[16..].as_ptr().cast::<Msghdr>())),
+        );
+        assert_eq!(
+            extents(&LocalMemory::new(), &call, 2).unwrap(),
+            vec![
+                BufferExtent {
+                    addr: first.as_ptr() as u64,
+                    len: 1
+                },
+                BufferExtent {
+                    addr: second.as_ptr() as u64,
+                    len: 1
+                },
+            ],
+        );
+        assert_eq!(guarded, before);
+    }
+
+    #[test]
     fn rng_observation_capacity_failure_is_a_tool_error() {
         let error = rng_observation_vec::<u8>(usize::MAX, "digest payload").unwrap_err();
         let Error::Tool(error) = error else {
@@ -3001,7 +3050,7 @@ mod tests {
 
         // SAFETY: `mmsghdr` is a plain C record and every field consumed by
         // `extents` is initialized below before LocalMemory reads it.
-        let mut headers: [libc::mmsghdr; 2] = unsafe { std::mem::zeroed() };
+        let mut headers: [Mmsghdr; 2] = unsafe { std::mem::zeroed() };
         headers[0].msg_hdr.msg_iov = first_iovecs.as_ptr() as *mut libc::iovec;
         headers[0].msg_hdr.msg_iovlen = first_iovecs.len();
         headers[0].msg_len = 6;
@@ -3011,7 +3060,7 @@ mod tests {
 
         let call = Syscall::Sendmmsg(
             syscalls::Sendmmsg::new()
-                .with_msgvec(Addr::from_ptr(headers.as_ptr().cast::<libc::msghdr>()))
+                .with_msgvec(Addr::from_ptr(headers.as_ptr().cast::<Msghdr>()))
                 .with_vlen(2),
         );
         let memory = LocalMemory::new();

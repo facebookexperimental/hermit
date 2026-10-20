@@ -845,10 +845,10 @@ mod tests {
         // An early stack-limit read, as glibc's startup makes, between two
         // fills: the order survives the handoff.
         let (stack_current, stack_maximum) =
-            crate::initial_resource_limit(libc::RLIMIT_STACK).unwrap();
+            crate::initial_resource_limit(reverie::syscalls::linux_abi::RLIMIT_STACK).unwrap();
         let limit_read = EarlyRequest::LimitRead {
             call: LimitReadCall::Prlimit64 { pid: 0 },
-            resource: libc::RLIMIT_STACK,
+            resource: reverie::syscalls::linux_abi::RLIMIT_STACK,
             current: stack_current,
             maximum: stack_maximum,
         };

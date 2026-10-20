@@ -169,12 +169,12 @@ pub(crate) fn process_holds_signalfd(pid: i32) -> bool {
 /// [`kernel_provenance`] from its kernel facts: the file system type, the
 /// mount's root and mount point, and the resolved path.
 fn provenance_from(
-    fs_type: Option<libc::c_long>,
+    fs_type: Option<u64>,
     mount: Option<(&str, &str)>,
     resolved: Option<&Path>,
 ) -> Phase1Provenance {
-    let sysfs = fs_type == Some(libc::SYSFS_MAGIC);
-    let pseudo_fs = sysfs || fs_type == Some(libc::PROC_SUPER_MAGIC);
+    let sysfs = fs_type == Some(reverie::syscalls::linux_abi::SYSFS_MAGIC as u64);
+    let pseudo_fs = sysfs || fs_type == Some(reverie::syscalls::linux_abi::PROC_SUPER_MAGIC as u64);
     let whole_mount = mount == Some(("/", if sysfs { "/sys" } else { "/proc" }));
     let safe_snapshot = pseudo_fs
         && whole_mount
@@ -211,13 +211,13 @@ fn mount_root_and_point(mountinfo: &str, mount_id: u64) -> Option<(&str, &str)> 
 }
 
 /// `statfs(path).f_type`, if the lookup succeeds.
-fn statfs_type(path: &str) -> Option<libc::c_long> {
+fn statfs_type(path: &str) -> Option<u64> {
     let path = CString::new(path).ok()?;
     let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: a valid C string and a buffer of the right size.
     let rc = unsafe { libc::statfs(path.as_ptr(), buf.as_mut_ptr()) };
     // SAFETY: statfs filled the buffer when it returned 0.
-    (rc == 0).then(|| unsafe { buf.assume_init() }.f_type)
+    (rc == 0).then(|| unsafe { buf.assume_init() }.f_type as u64)
 }
 
 /// A whole disk's statistics file under its canonical sysfs path,
@@ -673,7 +673,21 @@ mod tests {
         );
         assert_eq!(mount_root_and_point(mountinfo, 9), None);
 
-        let proc = Some(libc::PROC_SUPER_MAGIC);
+        let proc = Some(reverie::syscalls::linux_abi::PROC_SUPER_MAGIC as u64);
+        // Preserve the complete kernel word: matching low bits alone cannot
+        // authenticate procfs/sysfs, and a failed statfs remains unknown.
+        for fs_type in [
+            None,
+            Some(u64::MAX),
+            Some((1u64 << 32) | reverie::syscalls::linux_abi::PROC_SUPER_MAGIC as u64),
+        ] {
+            let unknown = provenance_from(
+                fs_type,
+                Some(("/", "/proc")),
+                Some(Path::new("/proc/uptime")),
+            );
+            assert!(!unknown.pseudo_fs && !unknown.safe_snapshot);
+        }
         let uptime = Some(Path::new("/proc/uptime"));
         assert!(provenance_from(proc, Some(("/", "/proc")), uptime).safe_snapshot);
         // A bind of /proc/driver/rtc over /proc/uptime: same file system and
@@ -683,7 +697,7 @@ mod tests {
         // procfs mounted elsewhere, or an unknown mount, is not admitted.
         assert!(!provenance_from(proc, Some(("/", "/mnt/proc")), uptime).safe_snapshot);
         assert!(!provenance_from(proc, None, uptime).safe_snapshot);
-        let sysfs = Some(libc::SYSFS_MAGIC);
+        let sysfs = Some(reverie::syscalls::linux_abi::SYSFS_MAGIC as u64);
         let disk = Some(Path::new(
             "/sys/devices/pci0000:00/0000:00:1f.2/block/sda/stat",
         ));

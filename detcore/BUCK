@@ -37,6 +37,7 @@ rust_library(
                     "development-tools::testing"
                 ]
             },
+            "features": {"physical-mm-test-support": []},
             "dependencies_override": {
                 "dependencies": {
                     "bitflags": {
@@ -52,6 +53,7 @@ rust_library(
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:test-case",
+        "fbsource//third-party/rust:tracing-subscriber",
     ],
     test_env = {
         "ASAN_OPTIONS": "detect_leaks=0",

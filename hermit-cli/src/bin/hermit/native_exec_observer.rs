@@ -193,6 +193,7 @@ impl Stream {
         }
         result
     }
+    #[cfg(any(feature = "native-exec", test))]
     pub fn last(&self) -> io::Result<Entry> {
         self.drain()?;
         let state = self
@@ -208,6 +209,7 @@ impl Stream {
             .cloned()
             .ok_or_else(|| invalid("native observer has no genuine dispatch entry"))
     }
+    #[cfg(any(feature = "native-exec", test))]
     pub fn original_exec_cut(&self) -> io::Result<Entry> {
         let entry = self.last()?;
         let a = entry.arguments;
@@ -295,6 +297,18 @@ impl Observer {
             identity,
         }))
     }
+    /// Failure diagnostics only; does not establish completion or a valid cut.
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    pub(super) fn observed_bytes(&self) -> io::Result<Vec<u8>> {
+        let state = self
+            .stream
+            .state
+            .lock()
+            .map_err(|_| invalid("observer poisoned"))?;
+        Ok(state.bytes.clone())
+    }
+
+    #[cfg(feature = "native-exec")]
     pub(super) fn last(&self) -> io::Result<Entry> {
         if !self.watch.watch_is_healthy() {
             return Err(invalid(
@@ -303,6 +317,7 @@ impl Observer {
         }
         self.stream.last()
     }
+    #[cfg(feature = "native-exec")]
     pub(super) fn original_exec_cut(&self) -> io::Result<Entry> {
         self.last()?;
         self.stream.original_exec_cut()

@@ -437,7 +437,7 @@ impl GuestProcfs {
         if let Some(mount_id) = MOUNT_ID.get() {
             return Ok(*mount_id);
         }
-        let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        let mut statx = std::mem::MaybeUninit::<reverie::syscalls::linux_abi::Statx>::zeroed();
         // SAFETY: the path is NUL-terminated and `statx` is writable.
         let result = unsafe {
             raw_syscall(
@@ -446,7 +446,7 @@ impl GuestProcfs {
                     libc::AT_FDCWD as u64,
                     c"/proc".as_ptr() as u64,
                     0,
-                    u64::from(libc::STATX_MNT_ID),
+                    u64::from(reverie::syscalls::linux_abi::STATX_MNT_ID),
                     statx.as_mut_ptr() as u64,
                     0,
                 ],
@@ -455,7 +455,7 @@ impl GuestProcfs {
         raw_errno(result)?;
         // SAFETY: the call succeeded and initialized the structure.
         let statx = unsafe { statx.assume_init() };
-        if statx.stx_mask & libc::STATX_MNT_ID == 0 {
+        if statx.stx_mask & reverie::syscalls::linux_abi::STATX_MNT_ID == 0 {
             // A kernel too old to report it: the guest's read fails with
             // the errno a missing feature gives, not the run.
             return Err(Errno::EOPNOTSUPP.into());

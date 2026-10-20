@@ -4605,8 +4605,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::SchedGetparam,
     ) -> Result<i64, Error> {
         if let Some(param) = call.param() {
-            let p = libc::sched_param { sched_priority: 0 };
-            guest.memory().write_value(param, &p)?;
+            write_sched_getparam(&mut guest.memory(), param)?;
         }
         Ok(0)
     }
@@ -5394,6 +5393,17 @@ fn read_futex_word<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     Ok(i32::from_ne_bytes(bytes))
 }
 
+/// Write only Linux's sched_param word, never an extended target-libc wrapper.
+fn write_sched_getparam<M: MemoryAccess>(
+    memory: &mut M,
+    param: AddrMut<'_, syscalls::linux_abi::SchedParam>,
+) -> Result<(), Errno> {
+    memory.write_value(
+        param,
+        &syscalls::linux_abi::SchedParam { sched_priority: 0 },
+    )
+}
+
 /// Whether the guest mapping containing `address` is writable, from
 /// `/proc/<pid>/maps`. False if no mapping contains it or the file cannot be
 /// read.
@@ -5581,6 +5591,71 @@ impl FutexWakeOp {
 
 #[cfg(test)]
 mod tests {
+
+    struct SchedParamMemory {
+        bytes: [u8; 16],
+        writable_end: usize,
+        requested: Vec<usize>,
+    }
+    impl MemoryAccess for SchedParamMemory {
+        fn read_vectored(
+            &self,
+            _: &[std::io::IoSlice<'_>],
+            _: &mut [std::io::IoSliceMut<'_>],
+        ) -> Result<usize, Errno> {
+            panic!("sched_getparam must not read guest memory")
+        }
+        fn write_vectored(
+            &mut self,
+            _: &[std::io::IoSlice<'_>],
+            _: &mut [std::io::IoSliceMut<'_>],
+        ) -> Result<usize, Errno> {
+            panic!("the offset-based mock must use write directly")
+        }
+        fn write(&mut self, address: AddrMut<u8>, source: &[u8]) -> Result<usize, Errno> {
+            // The address is an offset into this mock, not a live pointer. Do
+            // not construct a slice from it through the default write method.
+            let start = address.as_raw();
+            let want = source.len();
+            self.requested.push(want);
+            if start
+                .checked_add(want)
+                .is_none_or(|end| end > self.writable_end)
+            {
+                return Err(Errno::EFAULT);
+            }
+            self.bytes[start..start + want].copy_from_slice(source);
+            Ok(want)
+        }
+    }
+
+    #[test]
+    fn sched_getparam_writes_only_kernel_priority_before_guard() {
+        let mut memory = SchedParamMemory {
+            bytes: [0xA5; 16],
+            writable_end: 5,
+            requested: Vec::new(),
+        };
+        let param = AddrMut::<syscalls::linux_abi::SchedParam>::from_raw(1).unwrap();
+        assert_eq!(write_sched_getparam(&mut memory, param), Ok(()));
+        assert_eq!(memory.requested, vec![4]);
+        assert_eq!(&memory.bytes[1..5], &0i32.to_ne_bytes());
+        assert_eq!(memory.bytes[0], 0xA5);
+        assert_eq!(&memory.bytes[5..], &[0xA5; 11]);
+    }
+
+    #[test]
+    fn sched_getparam_short_writable_kernel_word_remains_efault() {
+        let mut memory = SchedParamMemory {
+            bytes: [0xA5; 16],
+            writable_end: 4,
+            requested: Vec::new(),
+        };
+        let param = AddrMut::<syscalls::linux_abi::SchedParam>::from_raw(1).unwrap();
+        assert_eq!(write_sched_getparam(&mut memory, param), Err(Errno::EFAULT));
+        assert_eq!(memory.requested, vec![4]);
+        assert_eq!(memory.bytes, [0xA5; 16]);
+    }
 
     /// A copy the record marks as discarded at send is left out even when the
     /// wake's answer names its signal (`committed`), as for a drain batch's

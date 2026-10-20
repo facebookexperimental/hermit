@@ -343,6 +343,209 @@ pub fn forwarded_line(target: &str, record_suffix: &str, message: fmt::Arguments
     format!("INFO {target}: DETLOG {message}{record_suffix}\n").into_bytes()
 }
 
+/// Dedicated typed payload on the existing counted message socket. This is
+/// not a textual INFO acceptance rule and grants no execution authority.
+pub const PLAIN_INFO_MAGIC: &[u8; 8] = b"HINFO\0\0\0";
+const PLAIN_INFO_HEADER: usize = 20;
+const PLAIN_INFO_MAX: usize = 64 * 1024;
+
+fn plain_info_target(target: &str) -> bool {
+    if target == "detcore" || target == "reverie::guest" {
+        return true;
+    }
+    target.strip_prefix("detcore::").is_some_and(|rest| {
+        rest.split("::").all(|segment| {
+            let mut bytes = segment.bytes();
+            bytes
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+                && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+    })
+}
+
+/// Refuses filters whose meaning cannot be reproduced by the existing
+/// target-only ForwardPolicy. Call before enabling the ordered INFO runtime.
+/// This does not alter the policy or guess answers for span/field directives.
+pub fn validate_plain_info_directives(directives: &str) -> Result<(), &'static str> {
+    for directive in directives
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let level =
+            |text: &str| matches!(text, "off" | "error" | "warn" | "info" | "debug" | "trace");
+        if level(directive) {
+            continue;
+        }
+        let (target, setting) = directive
+            .split_once('=')
+            .map_or((directive, None), |(t, l)| (t, Some(l)));
+        if target.is_empty()
+            || !target
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_:-.".contains(&byte))
+            || setting.is_some_and(|setting| !level(setting))
+        {
+            return Err("ordered plain INFO requires target-only log directives");
+        }
+    }
+    Ok(())
+}
+
+/// Encode only the message-only INFO class. Geometry/UTF-8 are checked again
+/// by the host; no raw INFO line can substitute for this envelope.
+pub fn encode_plain_info(target: &str, message: &str) -> Result<Vec<u8>, &'static str> {
+    if !plain_info_target(target) || target.len() > 4096 {
+        return Err("plain INFO target outside the Detcore module class");
+    }
+    // A line-oriented formatter cannot represent embedded control separators
+    // without additional fidelity work. Refuse, never sanitize or truncate.
+    if message
+        .bytes()
+        .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+    {
+        return Err("plain INFO multiline/control message is unsupported");
+    }
+    let length = PLAIN_INFO_HEADER
+        .checked_add(target.len())
+        .and_then(|n| n.checked_add(message.len()))
+        .filter(|length| *length <= PLAIN_INFO_MAX)
+        .ok_or("plain INFO envelope too large")?;
+    let mut bytes = Vec::with_capacity(length);
+    bytes.extend_from_slice(PLAIN_INFO_MAGIC);
+    bytes.extend_from_slice(&[1, 1, 3, 0]); // version, message class, INFO, reserved
+    bytes.extend_from_slice(&(target.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&(message.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(target.as_bytes());
+    bytes.extend_from_slice(message.as_bytes());
+    Ok(bytes)
+}
+
+/// Decode the complete envelope, rejecting unsupported classes and trailing
+/// bytes. Returned slices borrow the exact counted datagram payload.
+pub fn decode_plain_info(bytes: &[u8]) -> Result<(&str, &str), &'static str> {
+    if bytes.len() < PLAIN_INFO_HEADER
+        || bytes.len() > PLAIN_INFO_MAX
+        || bytes.get(..8) != Some(PLAIN_INFO_MAGIC.as_slice())
+        || bytes.get(8..12) != Some(&[1, 1, 3, 0])
+    {
+        return Err("plain INFO header/class is invalid");
+    }
+    let target_len = u32::from_le_bytes(
+        bytes[12..16]
+            .try_into()
+            .map_err(|_| "plain INFO target length")?,
+    ) as usize;
+    let message_len = u32::from_le_bytes(
+        bytes[16..20]
+            .try_into()
+            .map_err(|_| "plain INFO message length")?,
+    ) as usize;
+    let split = PLAIN_INFO_HEADER
+        .checked_add(target_len)
+        .ok_or("plain INFO target overflow")?;
+    let end = split
+        .checked_add(message_len)
+        .ok_or("plain INFO message overflow")?;
+    if end != bytes.len() || target_len > 4096 {
+        return Err("plain INFO lengths mismatch");
+    }
+    let target = std::str::from_utf8(
+        bytes
+            .get(PLAIN_INFO_HEADER..split)
+            .ok_or("plain INFO target truncated")?,
+    )
+    .map_err(|_| "plain INFO target UTF-8")?;
+    let message = std::str::from_utf8(
+        bytes
+            .get(split..end)
+            .ok_or("plain INFO message truncated")?,
+    )
+    .map_err(|_| "plain INFO message UTF-8")?;
+    if !plain_info_target(target)
+        || message
+            .bytes()
+            .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+    {
+        return Err("plain INFO target/message class is invalid");
+    }
+    Ok((target, message))
+}
+
+/// Explicitly selected only by the genuine InitialImage runtime. Existing
+/// preload/DBT callers never select this delivery mode merely by installing
+/// the historical DETLOG forwarder.
+pub type PlainInfoForwarder = for<'a> fn(&str, u64, fmt::Arguments<'a>);
+static PLAIN_INFO_FORWARDER: OnceLock<PlainInfoForwarder> = OnceLock::new();
+
+/// Select counted delivery for the two shared semantic INFO producers.
+/// Requires the actual existing DETLOG policy/channel to be installed first.
+pub fn set_plain_info_forwarder(forwarder: PlainInfoForwarder) -> Result<(), &'static str> {
+    if FORWARDER.get().is_none() {
+        return Err("plain INFO requires the existing counted forwarder");
+    }
+    PLAIN_INFO_FORWARDER
+        .set(forwarder)
+        .map_err(|_| "plain INFO forwarder installed twice")
+}
+
+/// Whether the explicit InitialImage mode was selected. This is a routing
+/// choice, not an assertion that arbitrary tracing fields/spans are forwarded.
+#[doc(hidden)]
+pub fn plain_info_forwarding() -> bool {
+    PLAIN_INFO_FORWARDER.get().is_some()
+}
+
+/// Called by the two message-only producers after the target policy admits
+/// them. Count before invoking the authenticated transport callback, so a
+/// missing/replaced channel cannot erase a produced record from the cut.
+#[doc(hidden)]
+pub fn emit_plain_info(target: &str, message: fmt::Arguments<'_>) {
+    if !forwards_target(target) {
+        return;
+    }
+    let index = count_forwarded();
+    PLAIN_INFO_FORWARDER
+        .get()
+        .expect("plain INFO forwarder disappeared")(target, index, message);
+}
+
+/// The ordinary tracing arm retains the original tokens, callsite target,
+/// fields and subscriber context. Only explicit InitialImage opt-in selects
+/// the counted message-only arm; this does not capture arbitrary INFO events.
+#[macro_export]
+macro_rules! ordered_info {
+    ($format:literal $(, $argument:expr)* $(,)?) => {{
+        if $crate::detlog::plain_info_forwarding() {
+            if $crate::detlog::forwards_target(module_path!()) {
+                $crate::detlog::emit_plain_info(module_path!(), format_args!($format $(, $argument)*));
+            }
+        } else {
+            tracing::info!($format $(, $argument)*);
+        }
+    }};
+}
+
+/// Send the already counted record on its actual authenticated socket. None
+/// deliberately sends nothing; the produced index remains outstanding and
+/// the existing request/terminal cut must refuse the missing record.
+pub fn send_plain_info_record(
+    socket: Option<libc::c_int>,
+    target: &str,
+    index: u64,
+    message: fmt::Arguments<'_>,
+) {
+    if let Some(socket) = socket {
+        send_forwarded_payload(socket, index, || {
+            match encode_plain_info(target, &message.to_string()) {
+                Ok(bytes) => bytes,
+                Err(reason) => format!("{FORWARDING_LOSS_NOTICE} 0 0 {reason}\n").into_bytes(),
+            }
+        });
+    }
+}
+
 /// Calls `operation` and restores the calling thread's `errno` afterwards. An
 /// in-guest tool runs on the guest's own thread, so a failed forwarding write must
 /// not change what the guest reads there.
@@ -424,6 +627,12 @@ pub fn send_forwarded_record(
     index: u64,
     message: fmt::Arguments<'_>,
 ) {
+    send_forwarded_payload(socket, index, || {
+        forwarded_line(target, record_suffix, message)
+    });
+}
+
+fn send_forwarded_payload(socket: libc::c_int, index: u64, payload: impl FnOnce() -> Vec<u8>) {
     let send = |bytes: &[u8]| loop {
         // SAFETY: `bytes` is a live, initialized byte slice of the given length.
         let sent = unsafe {
@@ -448,11 +657,7 @@ pub fn send_forwarded_record(
         if unreported > 0 && send(notice(0, 0).as_bytes()).is_err() {
             UNREPORTED_LOSSES.fetch_add(unreported, Ordering::AcqRel);
         }
-        let line = tagged_forwarded_message(
-            current_tid(),
-            index,
-            &forwarded_line(target, record_suffix, message),
-        );
+        let line = tagged_forwarded_message(current_tid(), index, &payload());
         if let Err(error) = send(&line) {
             let errno = error.raw_os_error().unwrap_or(0);
             if send(notice(line.len(), errno).as_bytes()).is_err() {
@@ -1976,6 +2181,44 @@ fn release_count_slot(tid: i32) {
     }
 }
 
+/// The root's real ThreadState birth owns these two records. The TID passed
+/// by Tool::init_thread_state is kept explicitly; an ambient backend setup span
+/// does not own this shared semantic event. All other detlog! parents remain.
+pub(crate) fn root_seed_records(tid: i32, user_seed: u64, chaos_seed: u64) {
+    const TARGET: &str = "detcore::tool_local";
+    macro_rules! seed {
+        ($format:literal, $value:expr) => {{
+            if forwards_target(TARGET) {
+                let suffix = record_suffix(DetLogEvent::Other);
+                let index = count_forwarded();
+                FORWARDER.get().expect("forwarder disappeared").0(
+                    TARGET, &suffix, index, format_args!($format, $value, tid));
+            } else {
+                tracing::info!(target: "detcore::tool_local", parent: None,
+                    "DETLOG {}{}", format_args!($format, $value, tid),
+                    record_suffix(DetLogEvent::Other));
+            }
+        }};
+    }
+    seed!(
+        "USER RAND: seeding PRNG for root thread with seed {} (root tid {})",
+        user_seed
+    );
+    seed!(
+        "CHAOSRAND: seeding chaos scheduler with seed {} (root tid {})",
+        chaos_seed
+    );
+}
+
+/// Called only by the explicit InitialImage shared Reverie delivery hook.
+/// The existing policy/count/socket own delivery; this adds no logging owner.
+pub fn forward_tail_start(tid: reverie::Pid, number: reverie::syscalls::Sysno) {
+    emit_plain_info(
+        "reverie::guest",
+        format_args!("[tool] (tid {}) admitted tail syscall: {}", tid, number),
+    );
+}
+
 /// Macro used to encapsulate tracing should-be-deterministic information.
 /// This is currently at the INFO log level.
 #[macro_export]
@@ -2057,6 +2300,340 @@ mod tests {
     use super::ForwardPolicy;
     use super::RECORD_SEPARATOR;
     use super::record_suffix;
+
+    #[test]
+    fn explicit_plain_emitter_preserves_default_tracing_and_shared_socket_counts() {
+        // The real global forwarders are intentionally process-local. Run the
+        // production transition in its own bounded test subprocess.
+        const NAME: &str = "detlog::tests::explicit_plain_emitter_preserves_default_tracing_and_shared_socket_counts";
+        const CHILD: &str = "HERMIT_TWO_SITE_INFO_TEST";
+        if std::env::var(CHILD).ok().as_deref() != Some(NAME) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME])
+                .env(CHILD, NAME)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .any(|line| line == format!("test {NAME} ... ok"))
+                    );
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("plain emitter control timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        use std::os::fd::AsRawFd;
+        use std::os::fd::FromRawFd;
+        use std::os::fd::OwnedFd;
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        use tracing::Event;
+        use tracing::Metadata;
+        use tracing::Subscriber;
+        use tracing::span;
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                assert_eq!(field.name(), "message");
+                self.0 = format!("{value:?}");
+            }
+        }
+        struct Capture(Arc<Mutex<Vec<(String, String)>>>);
+        impl Subscriber for Capture {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((event.metadata().target().to_owned(), message.0));
+            }
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+        }
+        static SOCKET: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+        fn plain(target: &str, index: u64, message: std::fmt::Arguments<'_>) {
+            let fd = SOCKET.load(Ordering::Acquire);
+            super::send_plain_info_record((fd >= 0).then_some(fd), target, index, message);
+        }
+        fn legacy(target: &str, suffix: &str, index: u64, message: std::fmt::Arguments<'_>) {
+            super::send_forwarded_record(
+                SOCKET.load(Ordering::Acquire),
+                target,
+                suffix,
+                index,
+                message,
+            );
+        }
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        assert!(!super::plain_info_forwarding());
+        assert!(
+            super::set_plain_info_forwarder(plain).is_err(),
+            "must not activate without real counted policy"
+        );
+        tracing::subscriber::with_default(Capture(captured.clone()), || {
+            crate::ordered_info!(
+                "Injecting additional fstat to retrieve file metadata on fd {}.",
+                3
+            );
+        });
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![(
+                module_path!().to_owned(),
+                "Injecting additional fstat to retrieve file metadata on fd 3.".to_owned()
+            )]
+        );
+        assert_eq!(super::take_forwarded_since_request(), 0);
+        let mut fds = [-1; 2];
+        // SAFETY: fds is a valid two-element output; a successful socketpair
+        // transfers two fresh descriptors exactly once into OwnedFd.
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let sender = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let receiver = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        SOCKET.store(sender.as_raw_fd(), Ordering::Release);
+        super::set_forwarder(
+            legacy,
+            ForwardPolicy::decode("1,detcore::blocked=0").unwrap(),
+        )
+        .unwrap();
+        // A historical DETLOG forwarder alone must not select plain delivery.
+        assert!(!super::plain_info_forwarding());
+        super::set_plain_info_forwarder(plain).unwrap();
+        assert!(super::set_plain_info_forwarder(plain).is_err());
+        tracing::subscriber::with_default(Capture(captured.clone()), || {
+            crate::ordered_info!("[dtid {}] inbound rdtsc, new logical time: {:?}", 3, 17);
+            super::emit_forwarded("detcore", "", format_args!("middle"));
+            crate::ordered_info!(
+                "Injecting additional fstat to retrieve file metadata on fd {}.",
+                3
+            );
+            super::emit_plain_info("detcore::blocked", format_args!("filtered"));
+        });
+        // Only the legacy DETLOG tracing side-event remains: the new emitter
+        // neither duplicates it nor modifies its existing behavior.
+        assert_eq!(captured.lock().unwrap().len(), 2);
+        fn receive(fd: i32, index: u64) -> Vec<u8> {
+            let mut bytes = [0; 65536];
+            // SAFETY: valid output buffer, actual owned socket, nonblocking.
+            let n = unsafe {
+                libc::recv(
+                    fd,
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            assert!(n > 0);
+            let (tid, got, payload) = super::split_forwarded_message(&bytes[..n as usize]).unwrap();
+            assert_eq!(tid, super::current_tid());
+            assert_eq!(got, index);
+            payload.to_vec()
+        }
+        assert_eq!(
+            super::decode_plain_info(&receive(receiver.as_raw_fd(), 1)).unwrap(),
+            (
+                module_path!(),
+                "[dtid 3] inbound rdtsc, new logical time: 17"
+            )
+        );
+        assert_eq!(
+            receive(receiver.as_raw_fd(), 2),
+            b"INFO detcore: DETLOG middle\n"
+        );
+        assert_eq!(
+            super::decode_plain_info(&receive(receiver.as_raw_fd(), 3)).unwrap(),
+            (
+                module_path!(),
+                "Injecting additional fstat to retrieve file metadata on fd 3."
+            )
+        );
+        assert_eq!(super::take_forwarded_since_request(), 3);
+        // Malformed representation is a counted loss, never truncation.
+        super::emit_plain_info(module_path!(), format_args!("bad\nline"));
+        assert!(
+            receive(receiver.as_raw_fd(), 1).starts_with(super::FORWARDING_LOSS_NOTICE.as_bytes())
+        );
+        assert_eq!(super::take_forwarded_since_request(), 1);
+        super::emit_plain_info(
+            module_path!(),
+            format_args!("{}", "x".repeat(super::PLAIN_INFO_MAX)),
+        );
+        assert!(
+            receive(receiver.as_raw_fd(), 1).starts_with(super::FORWARDING_LOSS_NOTICE.as_bytes())
+        );
+        assert_eq!(super::take_forwarded_since_request(), 1);
+        SOCKET.store(-1, Ordering::Release);
+        super::emit_plain_info(module_path!(), format_args!("identity missing"));
+        assert_eq!(
+            super::take_forwarded_since_request(),
+            1,
+            "missing socket cannot erase the produced index"
+        );
+        let mut byte = 0u8;
+        assert_eq!(
+            unsafe {
+                libc::recv(
+                    receiver.as_raw_fd(),
+                    (&raw mut byte).cast(),
+                    1,
+                    libc::MSG_DONTWAIT,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+    }
+
+    #[test]
+    fn plain_info_codec_preserves_the_original_target_and_message_only() {
+        let bytes = super::encode_plain_info(
+            "detcore::syscalls::files",
+            "Injecting additional fstat on fd 3.",
+        )
+        .unwrap();
+        assert!(bytes.starts_with(b"HINFO\0\0\0\x01\x01\x03\0"));
+        assert_eq!(
+            super::decode_plain_info(&bytes),
+            Ok((
+                "detcore::syscalls::files",
+                "Injecting additional fstat on fd 3."
+            ))
+        );
+        let ordinary =
+            super::encode_plain_info("detcore", "DETLOG is just this ordinary message").unwrap();
+        assert_eq!(
+            super::decode_plain_info(&ordinary).unwrap().1,
+            "DETLOG is just this ordinary message"
+        );
+    }
+
+    #[test]
+    fn plain_info_codec_rejects_classes_lengths_and_utf8_without_fallback() {
+        let valid = super::encode_plain_info("detcore", "message").unwrap();
+        for length in 0..valid.len() {
+            assert!(
+                super::decode_plain_info(&valid[..length]).is_err(),
+                "truncation {length}"
+            );
+        }
+        for offset in [0, 7, 8, 9, 10, 11] {
+            let mut changed = valid.clone();
+            changed[offset] ^= 0x80;
+            assert!(
+                super::decode_plain_info(&changed).is_err(),
+                "header {offset}"
+            );
+        }
+        for field in [12, 16] {
+            let mut changed = valid.clone();
+            changed[field..field + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(super::decode_plain_info(&changed).is_err());
+        }
+        let mut extra = valid.clone();
+        extra.push(0);
+        assert!(super::decode_plain_info(&extra).is_err());
+        let mut utf8 = valid;
+        *utf8.last_mut().unwrap() = 0xff;
+        assert!(super::decode_plain_info(&utf8).is_err());
+        assert!(super::decode_plain_info(b"INFO detcore: arbitrary raw text\n").is_err());
+    }
+
+    #[test]
+    fn plain_info_codec_limits_and_target_contract_are_exact() {
+        let allowed =
+            "x".repeat(super::PLAIN_INFO_MAX - super::PLAIN_INFO_HEADER - "detcore".len());
+        let encoded = super::encode_plain_info("detcore", &allowed).unwrap();
+        assert_eq!(encoded.len(), super::PLAIN_INFO_MAX);
+        assert_eq!(super::decode_plain_info(&encoded).unwrap().1, allowed);
+        assert!(super::encode_plain_info("detcore", &(allowed + "x")).is_err());
+        for target in [
+            "",
+            "other",
+            "detcore_bad",
+            "detcore::",
+            "detcore:::x",
+            "detcore::x::",
+            "detcore::x y",
+        ] {
+            assert!(
+                super::encode_plain_info(target, "text").is_err(),
+                "{target}"
+            );
+        }
+        for message in ["a\nb", "a\rb", "a\0b"] {
+            assert!(super::encode_plain_info("detcore", message).is_err());
+        }
+    }
+
+    #[test]
+    fn plain_info_admission_refuses_span_field_and_invalid_filter_directives() {
+        for directives in [
+            "",
+            "debug",
+            "warn,detcore::syscalls=info",
+            "off,detcore::a=trace",
+            "detcore",
+        ] {
+            assert_eq!(
+                super::validate_plain_info_directives(directives),
+                Ok(()),
+                "{directives}"
+            );
+        }
+        for directives in [
+            "[syscall.intercept]=info",
+            "detcore[{fd}]=info",
+            "detcore[span{fd=3}]=info",
+            "detcore=bogus",
+            "=info",
+            "detcore=info=debug",
+        ] {
+            assert!(
+                super::validate_plain_info_directives(directives).is_err(),
+                "{directives}"
+            );
+        }
+    }
 
     #[test]
     fn native_exec_forwarding_cut_refuses_retained_records_and_loss_state_without_resetting() {
@@ -4002,5 +4579,216 @@ mod tests {
             super::FORWARDED_GENERATION.load(Ordering::SeqCst),
             generation
         );
+    }
+}
+
+#[cfg(test)]
+mod root_lifecycle_record_tests {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::fd::OwnedFd;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Writer {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn root_seed_parent_and_counted_shared_tail_are_real_production_routes() {
+        const TEST: &str = "detlog::root_lifecycle_record_tests::root_seed_parent_and_counted_shared_tail_are_real_production_routes";
+        const CHILD: &str = "HERMIT_ROOT_LIFECYCLE_RECORD_CHILD";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(TEST)) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, TEST)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+            return;
+        }
+        let output = Writer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(output.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        root_seed_records(3, 17, 29);
+        let expected = output.0.lock().unwrap().clone();
+        output.0.lock().unwrap().clear();
+        {
+            let span =
+                tracing::debug_span!(target: "reverie_ptrace::lifecycle", "tracee.attach", pid = 3);
+            let _entered = span.enter();
+            root_seed_records(3, 17, 29);
+        }
+        assert_eq!(*output.0.lock().unwrap(), expected);
+        let text = String::from_utf8(expected.clone()).unwrap();
+        assert!(!text.contains("tracee.attach"));
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.contains("INFO detcore::tool_local: DETLOG USER RAND: seeding PRNG for root thread with seed 17 (root tid 3)"));
+        assert!(text.contains("INFO detcore::tool_local: DETLOG CHAOSRAND: seeding chaos scheduler with seed 29 (root tid 3)"));
+        assert_eq!(text.matches(RECORD_SEPARATOR).count(), 2);
+        // General detlog! still inherits its genuine ambient scope.
+        output.0.lock().unwrap().clear();
+        {
+            let span = tracing::debug_span!("ordinary_parent", real = 7);
+            let _entered = span.enter();
+            crate::detlog!("ordinary event");
+        }
+        assert!(
+            String::from_utf8(output.0.lock().unwrap().clone())
+                .unwrap()
+                .contains("ordinary_parent{real=7}")
+        );
+        output.0.lock().unwrap().clear();
+        {
+            let span = tracing::debug_span!("backend_setup", pid = 3);
+            let _entered = span.enter();
+            reverie::observe_tail_start(
+                reverie::Pid::from_raw(3),
+                reverie::syscalls::Sysno::exit_group,
+            );
+        }
+        let native_tail = output.0.lock().unwrap().clone();
+        assert!(
+            !String::from_utf8(native_tail.clone())
+                .unwrap()
+                .contains("backend_setup")
+        );
+        assert!(
+            String::from_utf8(native_tail.clone())
+                .unwrap()
+                .contains("INFO reverie::guest: [tool] (tid 3) admitted tail syscall: exit_group")
+        );
+        output.0.lock().unwrap().clear();
+
+        static SOCKET: AtomicI32 = AtomicI32::new(-1);
+        fn records(target: &str, suffix: &str, index: u64, message: fmt::Arguments<'_>) {
+            send_forwarded_record(
+                SOCKET.load(Ordering::Acquire),
+                target,
+                suffix,
+                index,
+                message,
+            );
+        }
+        fn plain(target: &str, index: u64, message: fmt::Arguments<'_>) {
+            send_plain_info_record(Some(SOCKET.load(Ordering::Acquire)), target, index, message);
+        }
+        let mut fds = [-1; 2];
+        // SAFETY: two valid output slots; success transfers fresh descriptors.
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        // SAFETY: successful socketpair returned two independently owned FDs.
+        let sender = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let receiver = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        SOCKET.store(sender.as_raw_fd(), Ordering::Release);
+        assert_eq!(take_forwarded_since_request(), 0);
+        set_forwarder(records, ForwardPolicy::decode("1").unwrap()).unwrap();
+        set_plain_info_forwarder(plain).unwrap();
+        reverie::set_tail_start_forwarder(forward_tail_start).unwrap();
+        assert!(reverie::set_tail_start_forwarder(forward_tail_start).is_err());
+        {
+            let span = tracing::debug_span!("backend_setup", pid = 3);
+            let _entered = span.enter();
+            root_seed_records(3, 17, 29);
+            reverie::observe_tail_start(
+                reverie::Pid::from_raw(3),
+                reverie::syscalls::Sysno::exit_group,
+            );
+        }
+        let mut rendered = Vec::new();
+        for index in 1..=3 {
+            let mut bytes = [0_u8; 65536];
+            // SAFETY: owned datagram socket and a valid bounded output buffer.
+            let n = unsafe {
+                libc::recv(
+                    receiver.as_raw_fd(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            assert!(n > 0);
+            let (tid, got, payload) = split_forwarded_message(&bytes[..n as usize]).unwrap();
+            assert_eq!(tid, current_tid());
+            assert_eq!(got, index);
+            if index < 3 {
+                rendered.push(b' ');
+                rendered.extend_from_slice(payload);
+            } else {
+                let (target, message) = decode_plain_info(payload).unwrap();
+                assert_eq!(target, "reverie::guest");
+                let full = format!(" INFO {target}: {message}\n");
+                assert_eq!(full.as_bytes(), native_tail);
+            }
+        }
+        assert_eq!(rendered, expected);
+        assert_eq!(take_forwarded_since_request(), 3);
+        assert!(
+            output.0.lock().unwrap().is_empty(),
+            "forwarded branch must not duplicate tracing"
+        );
+        let mut byte = [0];
+        // SAFETY: same owned socket; verify no duplicate datagram remains.
+        assert_eq!(
+            unsafe {
+                libc::recv(
+                    receiver.as_raw_fd(),
+                    byte.as_mut_ptr().cast(),
+                    1,
+                    libc::MSG_DONTWAIT,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+        // The exact shared target participates in the ordinary target policy;
+        // allowing its closed wire class does not override launch admission.
+        let blocked = ForwardPolicy::decode("1,reverie::guest=0").unwrap();
+        assert!(!blocked.forwards("reverie::guest"));
+        assert!(blocked.forwards("detcore::tool_local"));
+        for target in ["reverie", "reverie::guest::extra", "reverie_ptrace::task"] {
+            assert!(
+                encode_plain_info(target, "not admitted").is_err(),
+                "{target}"
+            );
+        }
     }
 }

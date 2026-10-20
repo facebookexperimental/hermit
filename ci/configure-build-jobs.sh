@@ -2427,10 +2427,18 @@ fi
 # REBASE TO 90329dd5be334d5e486891656e2652a8af3934b2 (2026-10-20): the incoming change adds three
 # Tool hooks for a two-phase signal delivery and SignalAnnouncement in
 # reverie-core (tool.rs, guest.rs and signal.rs only). No DBT, SDK or native
-# input changes; calibrated budgets, jobs, limits and inventory989 are
+# input changes; calibrated budgets, jobs, limits and inventory997 are
 # unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 3488565473fd87ad492ecfa1990193b99a2a1ad2 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 3488565473fd87ad492ecfa1990193b99a2a1ad2 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 214727781526adb7c42f1f303f87264c9a38d6aa (2026-10-20): from
+# 3488565473fd87ad492ecfa1990193b99a2a1ad2. The first-image loader and shared
+# Rust support change; Cargo.lock gains the shared PMU dependency. The complete
+# reverie-dbt tree, third-party SDK inputs, root Cargo.toml and rust-toolchain.toml
+# are byte-identical. Inventory 997, SDK recipe and calibrated limits carry.
+# This carries only SDK/build-resource calibration, not runtime/package identity.
+# The opted-in loader union requires a fresh link and INFO, memory, RCB and
+# cancellation qualification after landing under the approved soft-green rule.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 214727781526adb7c42f1f303f87264c9a38d6aa ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 214727781526adb7c42f1f303f87264c9a38d6aa (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

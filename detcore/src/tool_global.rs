@@ -10,6 +10,8 @@
 //! the Detcore tool.
 
 mod exec_identity;
+#[cfg(feature = "physical-mm-test-support")]
+pub mod initial_mm_probe;
 pub mod native_exec;
 mod parked;
 use std::cmp::Ordering;
@@ -1129,6 +1131,8 @@ impl DevicePool {
 #[derive(Debug)]
 pub struct GlobalState {
     sched: Arc<Mutex<Scheduler>>,
+    #[cfg(feature = "physical-mm-test-support")]
+    initial_mm_probe: Mutex<Option<Arc<initial_mm_probe::Probe>>>,
 
     inodes: Arc<Mutex<InodePool>>,
 
@@ -1678,6 +1682,8 @@ impl GlobalState {
 
         Self {
             sched,
+            #[cfg(feature = "physical-mm-test-support")]
+            initial_mm_probe: Mutex::new(None),
             next_port: AtomicU16::new(range[0]),
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
@@ -2423,7 +2429,8 @@ impl GlobalState {
         let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
         // SAFETY: root is live and filesystem has space for the complete result.
         if unsafe { libc::fstatfs(root.as_raw_fd(), filesystem.as_mut_ptr()) } != 0
-            || unsafe { filesystem.assume_init() }.f_type != libc::PROC_SUPER_MAGIC
+            || unsafe { filesystem.assume_init() }.f_type as u64
+                != reverie::syscalls::linux_abi::PROC_SUPER_MAGIC as u64
         {
             return None;
         }
@@ -3380,7 +3387,7 @@ impl GlobalState {
                     );
                     R::CreateChildThread(Some(post_exec_mm))
                 } else {
-                    match self
+                    let registration = self
                         .recv_create_child_thread(
                             from,
                             request_mm,
@@ -3396,8 +3403,10 @@ impl GlobalState {
                                 parent_is_kernel_blocked: false,
                             },
                         )
-                        .await
-                    {
+                        .await;
+                    #[cfg(feature = "physical-mm-test-support")]
+                    self.initial_mm_registration_result(dettid, &registration);
+                    match registration {
                         SchedulerRpcResult::Continue(()) => R::CreateChildThread(None),
                         SchedulerRpcResult::ThreadExited => R::ThreadExited,
                     }
@@ -4218,6 +4227,15 @@ impl GlobalState {
             }
         };
 
+        #[cfg(feature = "physical-mm-test-support")]
+        if matches!(&resp, R::MarkPastFirstExecve(_)) {
+            // Mark's state/input updates are complete and every match-arm
+            // mutex guard is out of scope. The ordinary terminal recheck below
+            // still follows this checkpoint before any reply can be returned.
+            self.initial_mm_checkpoint(initial_mm_probe::Point::PostExec, dtid, request_mm)
+                .await;
+        }
+
         // Awaited scheduler operations may have raced logical teardown. Never return their
         // operation-specific response after the sender acquired a permanent tombstone.
         // A SIGKILL committed meanwhile leaves the request unanswered, whatever
@@ -4487,6 +4505,15 @@ impl GlobalState {
             maybe_priority,
             parent_is_kernel_blocked,
         } = registration;
+        #[cfg(feature = "physical-mm-test-support")]
+        if flags.is_none() && rpc_sender.as_raw() == child_dettid.as_raw() {
+            self.initial_mm_checkpoint(
+                initial_mm_probe::Point::BeforeRegistration,
+                child_dettid,
+                request_mm,
+            )
+            .await;
+        }
         let initial_priority = if let Some(pr) = &self.preemptions_to_replay {
             assert!(maybe_priority.is_none());
             let prio = pr
@@ -4549,17 +4576,62 @@ impl GlobalState {
                 return SchedulerRpcResult::ThreadExited;
             }
 
+            // A parent-authored child registration carries the parent's MM,
+            // which naturally differs from the child's initial MM (including
+            // when the parent has execed). It must retain the ordinary clone
+            // transaction. Only an already registered, matching parent may
+            // take that path; a malformed root self-request still reaches the
+            // complete first-image checks below.
+            let registered_parent_creation = sender == parent_dettid
+                && parent_dettid != child_dettid
+                && sched.thread_was_registered(sender);
+            let initial_current_root = flags.is_none()
+                && request_mm != MmId::initial(child_dettid)
+                && !registered_parent_creation;
+            if initial_current_root
+                && (sender != child_dettid
+                    || parent_dettid != child_dettid
+                    || parent_detpid != child_dettid
+                    || ctid != 0
+                    || parent_is_kernel_blocked
+                    || request_mm != MmId::initial(child_dettid).for_exec(child_dettid)
+                    || self.root_dettid.get().is_some()
+                    || self.initial_descriptor_image_complete.load(SeqCst)
+                    || self.root_image_marked.load(SeqCst)
+                    || self
+                        .pending_exec_states
+                        .lock()
+                        .unwrap()
+                        .contains_key(&child_dettid))
+            {
+                return SchedulerRpcResult::ThreadExited;
+            }
+            // The local Tool selected this MM synchronously under the genuine
+            // initial-image lifecycle before this request began. Record both
+            // identities at birth, not in a later Mark response/ack interval.
+            if initial_current_root
+                && !sched.record_initial_current_image_birth(child_dettid, request_mm)
+            {
+                return SchedulerRpcResult::ThreadExited;
+            }
+
             if parent_is_kernel_blocked && self.cfg.sequentialize_threads {
                 sched.complete_vfork_registration(parent_dettid, child_dettid);
             }
 
-            let child_mm = MmId::for_clone(
-                request_mm,
-                child_dettid,
-                flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_VM)),
-            );
-            sched.register_reused_transferred_exec_tid(child_dettid, child_mm);
-            sched.record_thread_mm(child_dettid, child_mm);
+            let child_mm = if initial_current_root {
+                request_mm
+            } else {
+                MmId::for_clone(
+                    request_mm,
+                    child_dettid,
+                    flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_VM)),
+                )
+            };
+            if !initial_current_root {
+                sched.register_reused_transferred_exec_tid(child_dettid, child_mm);
+                sched.record_thread_mm(child_dettid, child_mm);
+            }
             // The guest's procfs paths name a task by its thread ID in the
             // guest's PID namespace, which is the raw value of its DetTid.
             self.inodes
@@ -4774,6 +4846,17 @@ impl GlobalState {
             );
             sched.started_up.try_put(());
         }
+        #[cfg(feature = "physical-mm-test-support")]
+        if flags.is_none() && rpc_sender.as_raw() == child_dettid.as_raw() {
+            // No scheduler mutex lives across the test rendezvous. The real
+            // ParentContinue call below is unchanged and has not been issued.
+            self.initial_mm_checkpoint(
+                initial_mm_probe::Point::RegisteredBeforeGrant,
+                child_dettid,
+                request_mm,
+            )
+            .await;
+        }
         // The child queue position above determines which equal-priority side
         // gets the first turn when the parent requests ParentContinue.
         // A vfork parent is already blocked by the kernel and is not in the run
@@ -4817,6 +4900,9 @@ impl GlobalState {
         physical_ids: Option<(i32, i32)>,
         signal_identity: Option<reverie::SignalTaskIdentity>,
     ) -> SchedulerRpcResult<Option<ThreadHistory>> {
+        #[cfg(feature = "physical-mm-test-support")]
+        self.initial_mm_checkpoint(initial_mm_probe::Point::ThreadStartup, dettid, request_mm)
+            .await;
         let mut tries: u64 = 0;
         // TODO: eliminate this loop. Could instead signal with an ivar.
         let response_ivar = loop {
@@ -11000,6 +11086,200 @@ mod tests {
             replay.provenance().unwrap().unwrap().assignment_order,
             provenance.assignment_order
         );
+    }
+
+    #[tokio::test]
+    async fn initial_current_root_registration_is_consistent_and_single_use() {
+        let config = Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        }
+        .with_backend(|backend| backend.tool_shares_guest_descriptor_table = true);
+        let mut state = GlobalState::initialize(&config, false);
+        let pipe = reverie::InheritedInput::pipe(0).unwrap();
+        state.install_inherited_input(pipe.lease().unwrap());
+        let root = DetTid::from_raw(3);
+        let initial = MmId::initial(root);
+        let current = initial.for_exec(root);
+        let registration = || super::ChildRegistration {
+            parent_dettid: root,
+            parent_detpid: root,
+            child_dettid: root,
+            child_tid_addr: 0,
+            flags: None,
+            exit_signal: libc::SIGCHLD,
+            physical_ids: None,
+            maybe_priority: Some(DEFAULT_PRIORITY),
+            parent_is_kernel_blocked: false,
+        };
+        assert!(matches!(
+            state
+                .recv_create_child_thread(Tid::from_raw(root.as_raw()), current, registration())
+                .await,
+            SchedulerRpcResult::Continue(())
+        ));
+        assert_eq!(state.root_dettid.get(), Some(&root));
+        assert_eq!(
+            state.inherited_input.lock().unwrap().as_ref().unwrap().root,
+            Some((root, current))
+        );
+        // Completion consumes the launch input at its birth identity; there is
+        // no intermediate old-MM registration and no changed Mark response.
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(root.as_raw()),
+                (
+                    DetTime::new(&config),
+                    initial,
+                    GlobalRequest::MarkPastFirstExecve(root, None, None, None),
+                ),
+            )
+            .await
+            .1;
+        assert_eq!(response, GlobalResponse::ThreadExited);
+        assert!(state.inherited_input.lock().unwrap().is_some());
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(root.as_raw()),
+                (
+                    DetTime::new(&config),
+                    current,
+                    GlobalRequest::MarkPastFirstExecve(root, None, None, None),
+                ),
+            )
+            .await
+            .1;
+        let GlobalResponse::MarkPastFirstExecve(completion) = response else {
+            panic!("{response:?}")
+        };
+        assert_eq!(completion.initial_input.as_ref(), Some(pipe.identity()));
+        assert!(state.inherited_input.lock().unwrap().is_none());
+        {
+            let sched = state.sched.lock().unwrap();
+            assert_eq!(sched.thread_mm(root), Some(current));
+            assert!(sched.rpc_incarnation_matches(root, current));
+            assert!(!sched.rpc_incarnation_matches(root, initial));
+            assert!(sched.thread_was_registered(root));
+        }
+        assert!(matches!(
+            state
+                .recv_create_child_thread(Tid::from_raw(root.as_raw()), current, registration())
+                .await,
+            SchedulerRpcResult::ThreadExited
+        ));
+        assert_eq!(state.sched.lock().unwrap().thread_mm(root), Some(current));
+    }
+
+    #[tokio::test]
+    async fn initial_current_root_rejects_stale_nonroot_and_wrong_incarnations() {
+        let root = DetTid::from_raw(3);
+        let other = DetTid::from_raw(4);
+        let current = MmId::initial(root).for_exec(root);
+        for case in 0..8 {
+            let config = Config {
+                sequentialize_threads: false,
+                ..Config::default()
+            };
+            let state = GlobalState::initialize(&config, false);
+            let mut registration = super::ChildRegistration {
+                parent_dettid: root,
+                parent_detpid: root,
+                child_dettid: root,
+                child_tid_addr: 0,
+                flags: None,
+                exit_signal: libc::SIGCHLD,
+                physical_ids: None,
+                maybe_priority: Some(DEFAULT_PRIORITY),
+                parent_is_kernel_blocked: false,
+            };
+            let mut sender = root;
+            let mut mm = current;
+            match case {
+                0 => sender = other,
+                1 => registration.parent_dettid = other,
+                2 => registration.parent_detpid = other,
+                3 => registration.child_tid_addr = 8,
+                4 => registration.parent_is_kernel_blocked = true,
+                5 => mm = current.for_exec(root),
+                6 => mm = MmId::initial(other).for_exec(other),
+                7 => {
+                    // A registered but unrelated sender cannot make a
+                    // root-shaped request ordinary parent creation.
+                    sender = other;
+                    state
+                        .sched
+                        .lock()
+                        .unwrap()
+                        .thread_tree
+                        .add_child(other, other, true);
+                }
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                state
+                    .recv_create_child_thread(Tid::from_raw(sender.as_raw()), mm, registration)
+                    .await,
+                SchedulerRpcResult::ThreadExited
+            ));
+            assert!(state.root_dettid.get().is_none());
+            assert_eq!(state.sched.lock().unwrap().thread_mm(root), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_parent_creation_preserves_the_child_mm_after_initial_image_birth() {
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(4);
+        for parent_mm in [
+            MmId::initial(parent),
+            MmId::initial(parent).for_exec(parent),
+        ] {
+            for flags in [None, Some(CloneFlags::empty())] {
+                let config = Config {
+                    sequentialize_threads: false,
+                    ..Config::default()
+                };
+                let state = GlobalState::initialize(&config, false);
+                let registration = |child_dettid, flags| super::ChildRegistration {
+                    parent_dettid: parent,
+                    parent_detpid: parent,
+                    child_dettid,
+                    child_tid_addr: 0,
+                    flags,
+                    exit_signal: libc::SIGCHLD,
+                    physical_ids: None,
+                    maybe_priority: Some(DEFAULT_PRIORITY),
+                    parent_is_kernel_blocked: false,
+                };
+                assert!(matches!(
+                    state
+                        .recv_create_child_thread(
+                            Tid::from_raw(parent.as_raw()),
+                            parent_mm,
+                            registration(parent, None),
+                        )
+                        .await,
+                    SchedulerRpcResult::Continue(())
+                ));
+                assert!(matches!(
+                    state
+                        .recv_create_child_thread(
+                            Tid::from_raw(parent.as_raw()),
+                            parent_mm,
+                            registration(child, flags),
+                        )
+                        .await,
+                    SchedulerRpcResult::Continue(())
+                ));
+                let sched = state.sched.lock().unwrap();
+                assert_eq!(sched.thread_mm(parent), Some(parent_mm));
+                assert_eq!(sched.thread_mm(child), Some(MmId::initial(child)));
+                assert!(sched.thread_was_registered(parent));
+                assert!(sched.thread_was_registered(child));
+                assert!(sched.rpc_incarnation_matches(parent, parent_mm));
+                assert_eq!(state.root_dettid.get(), Some(&parent));
+            }
+        }
     }
 
     /// The global tool's `/proc/<pid>/auxv` rows, driven through its RPC

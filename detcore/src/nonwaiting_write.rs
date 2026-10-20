@@ -255,19 +255,20 @@ pub fn write_without_waiting_for_a_reader(fd: RawFd, bytes: &[u8]) -> io::Result
 fn file_type(fd: RawFd) -> Result<libc::mode_t, i32> {
     // SAFETY: statx writes only into the zeroed struct it is given; an empty
     // path with AT_EMPTY_PATH names `fd` itself.
-    let mut stat: libc::statx = unsafe { mem::zeroed() };
+    let mut stat: reverie::syscalls::linux_abi::Statx = unsafe { mem::zeroed() };
     let inspected = unsafe {
-        libc::statx(
+        reverie::syscalls::linux_abi::statx(
             fd,
             c"".as_ptr(),
-            libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
-            libc::STATX_TYPE,
+            libc::AT_EMPTY_PATH | reverie::syscalls::linux_abi::AT_STATX_DONT_SYNC,
+            reverie::syscalls::linux_abi::STATX_TYPE,
             &mut stat,
         )
     } == 0;
     let statx_errno = if inspected { libc::EIO } else { last_errno() };
     let file_type = libc::mode_t::from(stat.stx_mode) & libc::S_IFMT;
-    if inspected && stat.stx_mask & libc::STATX_TYPE != 0 && file_type != 0 {
+    if inspected && stat.stx_mask & reverie::syscalls::linux_abi::STATX_TYPE != 0 && file_type != 0
+    {
         return Ok(file_type);
     }
     // SAFETY: F_GETPIPE_SZ only reads the pipe behind `fd`.

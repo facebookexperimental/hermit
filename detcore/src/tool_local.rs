@@ -559,12 +559,12 @@ impl Default for ResourceLimits {
             current: libc::RLIM64_INFINITY,
             maximum: libc::RLIM64_INFINITY,
         };
-        let mut limits = vec![unlimited; libc::RLIMIT_RTTIME as usize + 1];
-        limits[libc::RLIMIT_STACK as usize] = ResourceLimit {
+        let mut limits = vec![unlimited; reverie::syscalls::linux_abi::RLIMIT_RTTIME as usize + 1];
+        limits[reverie::syscalls::linux_abi::RLIMIT_STACK as usize] = ResourceLimit {
             current: 8 * 1024 * 1024,
             maximum: libc::RLIM64_INFINITY,
         };
-        limits[libc::RLIMIT_NOFILE as usize] = ResourceLimit {
+        limits[reverie::syscalls::linux_abi::RLIMIT_NOFILE as usize] = ResourceLimit {
             current: 1_048_576,
             maximum: 1_048_576,
         };
@@ -1804,27 +1804,30 @@ mod resource_limits_tests {
     fn defaults_are_fixed_and_cover_linux_resources() {
         let limits = ResourceLimits::default();
         assert_eq!(
-            limits.get(libc::RLIMIT_STACK),
+            limits.get(reverie::syscalls::linux_abi::RLIMIT_STACK),
             Some(ResourceLimit {
                 current: 8 * 1024 * 1024,
                 maximum: libc::RLIM64_INFINITY,
             })
         );
         assert_eq!(
-            limits.get(libc::RLIMIT_NOFILE),
+            limits.get(reverie::syscalls::linux_abi::RLIMIT_NOFILE),
             Some(ResourceLimit {
                 current: 1_048_576,
                 maximum: 1_048_576,
             })
         );
         assert_eq!(
-            limits.get(libc::RLIMIT_CORE),
+            limits.get(reverie::syscalls::linux_abi::RLIMIT_CORE),
             Some(ResourceLimit {
                 current: libc::RLIM64_INFINITY,
                 maximum: libc::RLIM64_INFINITY,
             })
         );
-        assert_eq!(limits.get(libc::RLIMIT_RTTIME + 1), None);
+        assert_eq!(
+            limits.get(reverie::syscalls::linux_abi::RLIMIT_RTTIME + 1),
+            None
+        );
     }
 
     #[test]
@@ -1835,11 +1838,14 @@ mod resource_limits_tests {
             current: 1024,
             maximum: 1_048_576,
         };
-        child.set(libc::RLIMIT_NOFILE, lowered);
+        child.set(reverie::syscalls::linux_abi::RLIMIT_NOFILE, lowered);
 
-        assert_eq!(child.get(libc::RLIMIT_NOFILE), Some(lowered));
         assert_eq!(
-            parent.get(libc::RLIMIT_NOFILE),
+            child.get(reverie::syscalls::linux_abi::RLIMIT_NOFILE),
+            Some(lowered)
+        );
+        assert_eq!(
+            parent.get(reverie::syscalls::linux_abi::RLIMIT_NOFILE),
             Some(ResourceLimit {
                 current: 1_048_576,
                 maximum: 1_048_576,
@@ -4937,14 +4943,7 @@ impl<T> ThreadState<T> {
     /// Create a fresh new thread state from nothing.  In practice this is only used for the thread
     /// state of the root thread of the container.
     pub fn new(pid: DetPid, cfg: &Config, record_or_replay: T) -> Self {
-        detlog!(
-            "USER RAND: seeding PRNG for root thread with seed {}",
-            cfg.rng_seed()
-        );
-        detlog!(
-            "CHAOSRAND: seeding chaos scheduler with seed {}",
-            cfg.sched_seed()
-        );
+        crate::detlog::root_seed_records(pid.as_raw(), cfg.rng_seed(), cfg.sched_seed());
         let thread_logical_time = DetTime::new(cfg);
         let last_accounted_user_time = thread_logical_time.user_cpu_time();
         let last_accounted_system_time = thread_logical_time.system_cpu_time();
@@ -5046,6 +5045,25 @@ impl<T> ThreadState<T> {
             robust_list_head: None,
             robust_list_process: Arc::new(Mutex::new(RobustListProcessState::default())),
         }
+    }
+
+    /// Select the current image before its first registration, only from the
+    /// authenticated initial-image Tool hook. No registered identity is rekeyed.
+    pub(crate) fn bind_initial_current_image(&mut self, tid: DetTid) -> Result<(), Errno> {
+        if tid != self.dettid
+            || self.detpid.is_some()
+            || self.thread_start_entered
+            || self.past_global_first_execve
+            || self.mm_id != MmId::initial(tid)
+            || self.clone_flags.is_some()
+            || self.pending_vfork.is_some()
+            || self.pedigree.raw() != Pedigree::new().raw()
+            || self.published_runtime_private_memory.is_some()
+        {
+            return Err(Errno::EPROTO);
+        }
+        self.mm_id = self.mm_id.for_exec(tid);
+        Ok(())
     }
 
     /// Apply a required, authenticated initial-image random handoff to the
@@ -6755,6 +6773,47 @@ mod timeslice_tests {
                 .observe(epoch + Duration::from_secs(9)),
             epoch + Duration::from_secs(9)
         );
+    }
+
+    #[test]
+    fn initial_current_image_is_selected_once_before_registration() {
+        let tid = DetTid::from_raw(3);
+        let mut state = ThreadState::new(tid, &Config::default(), ());
+        assert_eq!(state.mm_id, MmId::initial(tid)); // No fact: old default.
+        state.physical_tid = Some(tid.as_raw());
+        let physical_tid = state.physical_tid;
+        state.bind_initial_current_image(tid).unwrap();
+        let current = MmId::initial(tid).for_exec(tid);
+        assert_eq!(state.mm_id, current);
+        assert_eq!(state.physical_tid, physical_tid);
+        assert!(!state.thread_start_entered);
+        assert!(state.detpid.is_none());
+        assert_eq!(state.bind_initial_current_image(tid), Err(Errno::EPROTO));
+        assert_eq!(state.mm_id, current);
+    }
+
+    #[test]
+    fn initial_current_image_rejects_nonfresh_or_other_thread_state() {
+        let tid = DetTid::from_raw(3);
+        for case in 0..7 {
+            let mut state = ThreadState::new(tid, &Config::default(), ());
+            let requested = if case == 0 { DetTid::from_raw(4) } else { tid };
+            match case {
+                1 => state.detpid = Some(tid),
+                2 => state.thread_start_entered = true,
+                3 => state.past_global_first_execve = true,
+                4 => state.mm_id = state.mm_id.for_exec(tid),
+                5 => state.clone_flags = Some(CloneFlags::empty()),
+                6 => state.mm_id = MmId::initial(DetTid::from_raw(4)),
+                _ => {}
+            }
+            let before = state.mm_id;
+            assert_eq!(
+                state.bind_initial_current_image(requested),
+                Err(Errno::EPROTO)
+            );
+            assert_eq!(state.mm_id, before);
+        }
     }
 
     #[test]

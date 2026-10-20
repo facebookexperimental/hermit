@@ -153,6 +153,79 @@ pub fn encode(packet: Packet<'_>) -> Result<Vec<u8>, PacketError> {
     Ok(bytes)
 }
 
+/// Explicit observer-bearing ordinary packet version. Legacy version one is
+/// unchanged; an observer is never smuggled through the DETLOG policy/identity.
+pub const OBSERVER_VERSION: u16 = 2;
+/// Decode either the unchanged legacy packet or its explicit observer extension.
+/// The legacy decoder itself continues to reject version two.
+pub fn decode_with_observer(bytes: &[u8]) -> Result<(Packet<'_>, Option<&str>), PacketError> {
+    if bytes.len() < 10 || u16::from_be_bytes([bytes[8], bytes[9]]) != OBSERVER_VERSION {
+        return decode(bytes).map(|packet| (packet, None));
+    }
+    if !(HEADER_LEN + 2..=MAX_PACKET_LEN).contains(&bytes.len()) {
+        return Err(PacketError::Size);
+    }
+    if bytes[..8] != MAGIC {
+        return Err(PacketError::Magic);
+    }
+    if usize::from(u16::from_be_bytes([bytes[10], bytes[11]])) != bytes.len() {
+        return Err(PacketError::Size);
+    }
+    let lengths =
+        [92, 94, 96, 98].map(|i| usize::from(u16::from_be_bytes([bytes[i], bytes[i + 1]])));
+    let mut end = HEADER_LEN + 2;
+    let mut fields: [&[u8]; 4] = [&[]; 4];
+    for (field, length) in fields.iter_mut().zip(lengths) {
+        let next = end.checked_add(length).ok_or(PacketError::Length)?;
+        *field = bytes.get(end..next).ok_or(PacketError::Length)?;
+        check_text(field)?;
+        end = next;
+    }
+    if end != bytes.len() {
+        return Err(PacketError::Length);
+    }
+    let packet = Packet {
+        nonce: bytes[12..44].try_into().map_err(|_| PacketError::Length)?,
+        config_digest: bytes[44..76].try_into().map_err(|_| PacketError::Length)?,
+        schema_fingerprint: bytes[76..92]
+            .try_into()
+            .map_err(|_| PacketError::Fingerprint)?,
+        coordinator: fields[0],
+        detlog_identity: std::str::from_utf8(fields[1]).map_err(|_| PacketError::Utf8)?,
+        forward_policy: std::str::from_utf8(fields[2]).map_err(|_| PacketError::Utf8)?,
+    };
+    check_fingerprint(packet.schema_fingerprint)?;
+    let observer = std::str::from_utf8(fields[3]).map_err(|_| PacketError::Utf8)?;
+    if observer == packet.detlog_identity {
+        return Err(PacketError::Length);
+    }
+    Ok((packet, Some(observer)))
+}
+
+/// Encode a distinct observer identity without changing legacy packet bytes.
+pub fn encode_with_observer(packet: Packet<'_>, observer: &str) -> Result<Vec<u8>, PacketError> {
+    check_text(observer.as_bytes())?;
+    if observer == packet.detlog_identity {
+        return Err(PacketError::Length);
+    }
+    let original = encode(packet)?;
+    let total = original
+        .len()
+        .checked_add(2)
+        .and_then(|n| n.checked_add(observer.len()))
+        .filter(|n| *n <= MAX_PACKET_LEN)
+        .ok_or(PacketError::Size)?;
+    let mut bytes = Vec::with_capacity(total);
+    bytes.extend_from_slice(&original[..HEADER_LEN]);
+    bytes[8..10].copy_from_slice(&OBSERVER_VERSION.to_be_bytes());
+    bytes[10..12].copy_from_slice(&(total as u16).to_be_bytes());
+    bytes.extend_from_slice(&(observer.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(&original[HEADER_LEN..]);
+    bytes.extend_from_slice(observer.as_bytes());
+    decode_with_observer(&bytes)?;
+    Ok(bytes)
+}
+
 fn check_text(bytes: &[u8]) -> Result<(), PacketError> {
     if bytes.is_empty() {
         return Err(PacketError::Empty);
@@ -373,5 +446,55 @@ mod tests {
                 before
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+    fn packet() -> Packet<'static> {
+        Packet {
+            nonce: &[1; 32],
+            config_digest: &[2; 32],
+            schema_fingerprint: b"0123456789abcdef",
+            coordinator: b"/rpc",
+            detlog_identity: "10:0000000000000001:0000000000000002",
+            forward_policy: "INFO",
+        }
+    }
+    #[test]
+    fn legacy_bytes_and_decoder_stay_separate() {
+        let old = encode(packet()).unwrap();
+        assert_eq!(decode_with_observer(&old), Ok((packet(), None)));
+        let new = encode_with_observer(packet(), "11:0000000000000001:0000000000000003").unwrap();
+        assert_eq!(decode(&new), Err(PacketError::Version));
+        assert_eq!(
+            decode_with_observer(&new),
+            Ok((packet(), Some("11:0000000000000001:0000000000000003")))
+        );
+    }
+    #[test]
+    fn observer_missing_malformed_and_trailing_refuse() {
+        assert_eq!(encode_with_observer(packet(), ""), Err(PacketError::Empty));
+        assert_eq!(
+            encode_with_observer(packet(), packet().detlog_identity),
+            Err(PacketError::Length)
+        );
+        let bytes = encode_with_observer(packet(), "11:1:3").unwrap();
+        let mut missing = bytes.clone();
+        missing[98..100].copy_from_slice(&0u16.to_be_bytes());
+        assert_eq!(decode_with_observer(&missing), Err(PacketError::Empty));
+        let mut extra = bytes.clone();
+        extra.push(1);
+        let n = extra.len() as u16;
+        extra[10..12].copy_from_slice(&n.to_be_bytes());
+        assert_eq!(decode_with_observer(&extra), Err(PacketError::Length));
+        assert_eq!(
+            decode_with_observer(&bytes[..bytes.len() - 1]),
+            Err(PacketError::Size)
+        );
+        let mut nul = bytes;
+        *nul.last_mut().unwrap() = 0;
+        assert_eq!(decode_with_observer(&nul), Err(PacketError::Nul));
     }
 }

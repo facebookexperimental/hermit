@@ -90,7 +90,7 @@ impl DetStat {
 
 impl Default for DetStat {
     fn default() -> Self {
-        let statx: libc::statx = unsafe { std::mem::zeroed() };
+        let statx: reverie::syscalls::linux_abi::Statx = unsafe { std::mem::zeroed() };
         let mut stat: Self = statx.into();
         stat.mask = StatxMask::STATX_BASIC_STATS;
         stat.nlink = 1;
@@ -190,8 +190,8 @@ impl From<DetStat> for libc::stat {
     }
 }
 
-impl From<&libc::statx> for DetStat {
-    fn from(st: &libc::statx) -> Self {
+impl From<&reverie::syscalls::linux_abi::Statx> for DetStat {
+    fn from(st: &reverie::syscalls::linux_abi::Statx) -> Self {
         DetStat {
             mask: StatxMask::from_bits_truncate(st.stx_mask),
             mode: st.stx_mode as _,
@@ -214,16 +214,16 @@ impl From<&libc::statx> for DetStat {
     }
 }
 
-impl From<libc::statx> for DetStat {
-    fn from(st: libc::statx) -> Self {
+impl From<reverie::syscalls::linux_abi::Statx> for DetStat {
+    fn from(st: reverie::syscalls::linux_abi::Statx) -> Self {
         (&st).into()
     }
 }
 
-impl From<&DetStat> for libc::statx {
+impl From<&DetStat> for reverie::syscalls::linux_abi::Statx {
     fn from(st: &DetStat) -> Self {
-        // libc::statx doesn't provide `impl Default`
-        let mut statx: libc::statx = unsafe { std::mem::zeroed() };
+        // reverie::syscalls::linux_abi::Statx doesn't provide `impl Default`
+        let mut statx: reverie::syscalls::linux_abi::Statx = unsafe { std::mem::zeroed() };
         statx.stx_mask = st.mask.bits();
         statx.stx_blksize = st.blksize as u32;
         statx.stx_attributes = st.attributes.bits();
@@ -247,7 +247,7 @@ impl From<&DetStat> for libc::statx {
     }
 }
 
-impl From<DetStat> for libc::statx {
+impl From<DetStat> for reverie::syscalls::linux_abi::Statx {
     fn from(st: DetStat) -> Self {
         (&st).into()
     }
@@ -264,7 +264,7 @@ mod tests {
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         stat.st_dev = dev;
         stat.st_rdev = rdev;
-        let mut statx: libc::statx = unsafe { std::mem::zeroed() };
+        let mut statx: reverie::syscalls::linux_abi::Statx = unsafe { std::mem::zeroed() };
         statx.stx_dev_major = 259;
         statx.stx_dev_minor = 5;
         statx.stx_rdev_major = 8;
@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(from_stat.dev, from_statx.dev);
         assert_eq!(from_stat.rdev, from_statx.rdev);
 
-        let round_trip = libc::statx::from(&from_statx);
+        let round_trip = reverie::syscalls::linux_abi::Statx::from(&from_statx);
         assert_eq!(
             (round_trip.stx_dev_major, round_trip.stx_dev_minor),
             (259, 5)

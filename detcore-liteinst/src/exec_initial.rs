@@ -17,6 +17,11 @@ use reverie_inguest::guest::exec_private::NativeControl;
 use reverie_inguest::guest::rpc::GuestRpcStream;
 use reverie_rpc_transport::BlockingRpcClient;
 
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+mod mapped_entry;
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub use mapped_entry::detcore_liteinst_mapped_entry;
+
 static INITIAL_IMAGE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static NATIVE_CONTROL: AtomicPtr<NativeControl> = AtomicPtr::new(core::ptr::null_mut());
 // Bounded startup diagnostics only; never authority or a readiness witness.
@@ -287,10 +292,10 @@ impl InstalledImage {
     }
 }
 
-#[cfg(feature = "exec-native-injection")]
+#[cfg(any(feature = "exec-native-injection", feature = "loader-private-runtime"))]
 static NATIVE_OBSERVER_IDENTITY: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
 
-#[cfg(feature = "exec-native-injection")]
+#[cfg(any(feature = "exec-native-injection", feature = "loader-private-runtime"))]
 pub(crate) fn retain_native_observer_identity(identity: (u64, u64)) -> Result<(), &'static str> {
     NATIVE_OBSERVER_IDENTITY
         .set(identity)
@@ -311,7 +316,7 @@ fn observe_dispatch(entry: detcore::dispatch_observer::Entry) {
     if !active() || entry.pid != tid || entry.tid != tid || entry.dettid <= 0 {
         fail();
     }
-    #[cfg(feature = "exec-native-injection")]
+    #[cfg(any(feature = "exec-native-injection", feature = "loader-private-runtime"))]
     let selected_native = NATIVE_OBSERVER_IDENTITY.get().map(|identity| {
         (
             reverie_inguest::guest::native_exec_fds::socket_fd(
@@ -321,7 +326,7 @@ fn observe_dispatch(entry: detcore::dispatch_observer::Entry) {
             *identity,
         )
     });
-    #[cfg(not(feature = "exec-native-injection"))]
+    #[cfg(not(any(feature = "exec-native-injection", feature = "loader-private-runtime")))]
     let selected_native: Option<(i32, (u64, u64))> = None;
     let (socket, identity) = selected_native.unwrap_or_else(|| {
         (
@@ -513,7 +518,37 @@ pub unsafe extern "C" fn detcore_liteinst_exec_initialize(native: *mut NativeCon
         }
         return 0;
     }
-    let packet = liteinst_initial_image::decode(bytes).unwrap_or_else(|_| fail());
+    let (packet, socket, client) = ordinary_initial_client(bytes, InitialImageTid::Native(native));
+    INITIAL_STEP.store(9, Ordering::Relaxed);
+    let prepared =
+        unsafe { reverie_liteinst::prepare_tool_initial_image::<detcore::Detcore>(client, native) }
+            .unwrap_or_else(|_| fail());
+    // Preserve GNU's allocation order: these owned fields follow preparation.
+    let fields = OrdinaryInitialFields::from_packet(packet, socket);
+    unsafe { fields.initialize(prepared) }
+}
+
+// A physical TID source, never watched-birth or mapping authorization. Mapped
+// callers can supply this variant only inside the unsafe affine entry below.
+enum InitialImageTid {
+    Native(*mut NativeControl),
+    #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+    Mapped(i32),
+}
+
+// Both physical origins use exactly the ordinary HLNI domain, real schema,
+// socket redemption, digest, Config and DETLOG policy comparisons. In GNU the
+// NativeControl TID read still occurs after the schema comparison.
+fn ordinary_initial_client(
+    bytes: &[u8],
+    identity: InitialImageTid,
+) -> (
+    liteinst_initial_image::Packet<'_>,
+    OsString,
+    reverie_rpc_transport::InitialImageClient<detcore::GlobalState, GuestRpcStream>,
+) {
+    let (packet, observer) =
+        liteinst_initial_image::decode_with_observer(bytes).unwrap_or_else(|_| fail());
     // Mandatory real schema comparison precedes the socket and all guest Config
     // deserialization. This fingerprint includes the actual Config/RPC sources.
     INITIAL_STEP.store(5, Ordering::Relaxed);
@@ -521,10 +556,14 @@ pub unsafe extern "C" fn detcore_liteinst_exec_initialize(native: *mut NativeCon
         fail();
     }
     INITIAL_STEP.store(6, Ordering::Relaxed);
-    let tid = reverie::Pid::from_raw(
-        unsafe { reverie_inguest::guest::exec_private::native_tid(native) }
-            .unwrap_or_else(|_| fail()),
-    );
+    let tid = reverie::Pid::from_raw(match identity {
+        InitialImageTid::Native(native) => {
+            unsafe { reverie_inguest::guest::exec_private::native_tid(native) }
+                .unwrap_or_else(|_| fail())
+        }
+        #[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+        InitialImageTid::Mapped(tid) => tid,
+    });
     let socket = OsString::from_vec(packet.coordinator.to_vec());
     INITIAL_STEP.store(7, Ordering::Relaxed);
     // The compatibility InitialImage route keeps its ordinary socket behavior;
@@ -533,6 +572,11 @@ pub unsafe extern "C" fn detcore_liteinst_exec_initialize(native: *mut NativeCon
         report_rpc_failure(&reverie_rpc_transport::RpcError::Io(error));
         fail()
     });
+    let stream = reverie_inguest::guest::rpc::move_ordinary_coordinator_stream(stream)
+        .unwrap_or_else(|error| {
+            report_rpc_failure(&reverie_rpc_transport::RpcError::Io(error));
+            fail()
+        });
     let client = BlockingRpcClient::<detcore::GlobalState, GuestRpcStream>::initial_image_from_connected_stream(
         GuestRpcStream::from(stream),
         tid,
@@ -549,25 +593,153 @@ pub unsafe extern "C" fn detcore_liteinst_exec_initialize(native: *mut NativeCon
     {
         fail();
     }
-    INITIAL_STEP.store(9, Ordering::Relaxed);
-    let prepared =
-        unsafe { reverie_liteinst::prepare_tool_initial_image::<detcore::Detcore>(client, native) }
-            .unwrap_or_else(|_| fail());
-    let inputs = super::InitializationInputs {
-        coordinator_socket: socket,
-        forward_request: Some(OsString::from(packet.detlog_identity)),
-        forward_policy: Some(OsString::from(packet.forward_policy)),
-        coordinator_fingerprint: Some(OsString::from(
-            std::str::from_utf8(packet.schema_fingerprint).unwrap_or_else(|_| fail()),
-        )),
-        initial_image: Some(InitialImageInputs::Initial { prepared }),
-    };
-    // SAFETY: no Guest ran; owned dispatch/allocator and Tool FS remain live.
-    INITIAL_STEP.store(10, Ordering::Relaxed);
-    unsafe {
-        super::initialize_detcore(inputs);
+    if let Some(observer) = observer {
+        install_ordinary_observer(observer, packet.detlog_identity).unwrap_or_else(|error| {
+            report_initialization_error(error);
+            fail()
+        });
     }
-    0
+    (packet, socket, client)
+}
+
+// This changes no syscall policy: it binds the existing independent diagnostic
+// endpoint before the installed callback can publish or enter the guest.
+fn install_ordinary_observer(observer: &str, detlog: &str) -> Result<(), &'static str> {
+    #[cfg(any(feature = "exec-native-injection", feature = "loader-private-runtime"))]
+    {
+        let (fd, identity) = detcore::detlog::parse_tool_output_env_value(observer)
+            .ok_or("ordinary observer identity is unreadable")?;
+        let (detlog_fd, detlog_identity) = detcore::detlog::parse_tool_output_env_value(detlog)
+            .ok_or("ordinary DETLOG identity is unreadable")?;
+        if fd == detlog_fd
+            || identity == detlog_identity
+            || detcore::detlog::socket_identity(fd) != Some(identity)
+            || detcore::detlog::socket_identity(detlog_fd) != Some(detlog_identity)
+        {
+            return Err("ordinary observer and DETLOG socket roles differ");
+        }
+        let mut kind = 0i32;
+        let mut length = core::mem::size_of_val(&kind) as libc::socklen_t;
+        // SAFETY: scalar getsockopt of the actual authenticated inherited socket.
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                (&raw mut kind).cast(),
+                &mut length,
+            )
+        } != 0
+            || length as usize != core::mem::size_of_val(&kind)
+            || kind != libc::SOCK_SEQPACKET
+        {
+            return Err("ordinary observer requires actual sequenced packets");
+        }
+        // SAFETY: exclusive authenticated initializer owns this inherited role;
+        // the host retains only its separate-process descriptor and peer.
+        unsafe {
+            reverie_inguest::guest::native_exec_fds::reserve_socket(
+                reverie_inguest::guest::native_exec_fds::NativeSocket::Observer,
+                fd,
+            )
+        }
+        .map_err(|error| error.0)?;
+        retain_native_observer_identity(identity)
+    }
+    #[cfg(not(any(feature = "exec-native-injection", feature = "loader-private-runtime")))]
+    {
+        let _ = (observer, detlog);
+        Err("ordinary observer ownership feature unavailable")
+    }
+}
+
+// Own packet-derived values before the mapped affine prelude is consumed.
+// GNU constructs this at its original point after native preparation instead.
+struct OrdinaryInitialFields {
+    socket: OsString,
+    forward_request: OsString,
+    forward_policy: OsString,
+    fingerprint: OsString,
+}
+
+impl OrdinaryInitialFields {
+    fn from_packet(packet: liteinst_initial_image::Packet<'_>, socket: OsString) -> Self {
+        Self {
+            socket,
+            forward_request: OsString::from(packet.detlog_identity),
+            forward_policy: OsString::from(packet.forward_policy),
+            fingerprint: OsString::from(
+                std::str::from_utf8(packet.schema_fingerprint).unwrap_or_else(|_| fail()),
+            ),
+        }
+    }
+
+    // SAFETY: caller retains the genuine private FS/stack, dispatch scope,
+    // prepared fatal owner and all existing initialize_detcore obligations.
+    unsafe fn initialize(
+        self,
+        prepared: reverie_liteinst::PreparedInitialImage<detcore::Detcore>,
+    ) -> i64 {
+        let inputs = super::InitializationInputs {
+            coordinator_socket: self.socket,
+            forward_request: Some(self.forward_request),
+            forward_policy: Some(self.forward_policy),
+            coordinator_fingerprint: Some(self.fingerprint),
+            initial_image: Some(InitialImageInputs::Initial { prepared }),
+        };
+        INITIAL_STEP.store(10, Ordering::Relaxed);
+        unsafe { super::initialize_detcore(inputs) };
+        0
+    }
+}
+
+/// Initialize genuine Detcore from the authenticated mapped physical prelude.
+///
+/// This Rust-only entry is not a foreign packet ABI or a startup producer. It
+/// consumes the same ordinary HLNI client, installer, lifecycle and finish path
+/// as the GNU first image. Successful return does not transfer to Guest.
+///
+/// # Safety
+/// The trusted Rust producer must retain the exact host reservation/image and
+/// terminal owner, and satisfy every capture/adoption and private-libc contract
+/// that produced `mapped`. Actual private libc/TLS, its real environ and C
+/// allocator, and the secure-input FD transaction (including owned-open
+/// restoration) must be complete; Tool FS and the owned stack remain active.
+/// This is a foreign-library Rust entry, not std::rt::lang_start. It neither
+/// claims std::rt::init nor supplies std argv; every selected library operation
+/// must satisfy its actual documented libc/TLS/foreign-entry requirements.
+/// No Guest or competing initializer may have run. The actual coordinator must
+/// redeem the one-use watched birth on this exact input/socket; scalar fields
+/// and packet bytes do not establish physical provenance. On return the same
+/// owner must perform the production registration/physical handover, preserving
+/// real Detcore writes (including AT_RANDOM), not probe byte-equal restoration.
+#[cfg(all(feature = "loader-private-runtime", target_env = "musl"))]
+pub unsafe fn detcore_liteinst_mapped_initialize(
+    mapped: reverie_inguest::guest::exec_private::mapped_initial::MappedToolPrelude,
+) -> i64 {
+    INITIAL_STEP.store(1, Ordering::Relaxed);
+    NATIVE_CONTROL.store(mapped.control().as_ptr(), Ordering::Release);
+    if INITIAL_IMAGE_ACTIVE.swap(true, Ordering::AcqRel) {
+        fail();
+    }
+    // The real prelude already adopted the sole ToolRegion and established the
+    // private FS/stack. Do not ordinary-reserve, recapture, or synthesize GNU data.
+    let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
+    INITIAL_STEP.store(3, Ordering::Relaxed);
+    let bytes = mapped.packet();
+    INITIAL_STEP.store(4, Ordering::Relaxed);
+    // Ordinary decode rejects HLNEXEC1; this is not the native successor branch.
+    let (packet, socket, client) =
+        ordinary_initial_client(bytes, InitialImageTid::Mapped(mapped.native_tid()));
+    let fields = OrdinaryInitialFields::from_packet(packet, socket);
+    INITIAL_STEP.store(9, Ordering::Relaxed);
+    // SAFETY: same accepted client and affine physical owner; preparation arms
+    // the existing fatal guard before publication or any fallible client drop.
+    let prepared = unsafe {
+        reverie_liteinst::prepare_tool_mapped_initial_image::<detcore::Detcore>(client, mapped)
+    }
+    .unwrap_or_else(|_| fail());
+    unsafe { fields.initialize(prepared) }
 }
 
 core::arch::global_asm!(".protected detcore_liteinst_exec_initialize");

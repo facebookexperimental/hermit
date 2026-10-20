@@ -15,7 +15,7 @@ hermit_build_env = {
     "CARGO_PKG_VERSION": "0.5.1",
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "3488565473fd87ad492ecfa1990193b99a2a1ad2",
+    "HERMIT_REVERIE_PIN": "214727781526adb7c42f1f303f87264c9a38d6aa",
 }
 
 # The shadow release entrypoint supplies these values from Git/Cargo metadata
@@ -98,8 +98,9 @@ rust_library(
                 },
             },
             "features": {
-                "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop"],
+                "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop", "reverie-inguest/loader-private-runtime"],
                 "default": [],
+                "loader-rcb-observation": ["exec-stop-launcher", "reverie-ptrace/rcb-observation"],
                 "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
                 "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],
                 "e9patch": [],
@@ -107,6 +108,7 @@ rust_library(
                 "native-exec": ["liteinst", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"],
                 "third-party-backends": ["dbt", "sabre", "e9patch", "liteinst"],
                 "kvm-native-test-support": ["reverie-kvm/native-test-support"],
+                "mm-cancellation-test-support": ["exec-stop-launcher", "liteinst", "detcore/physical-mm-test-support"],
                 "kvm-execution-tests": [],
             },
         },
@@ -201,8 +203,9 @@ rust_binary(
                 },
             },
             "features": {
-                "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop"],
+                "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop", "reverie-inguest/loader-private-runtime"],
                 "default": [],
+                "loader-rcb-observation": ["exec-stop-launcher", "reverie-ptrace/rcb-observation"],
                 "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
                 "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],
                 "e9patch": [],
@@ -210,6 +213,7 @@ rust_binary(
                 "native-exec": ["liteinst", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"],
                 "third-party-backends": ["dbt", "sabre", "e9patch", "liteinst"],
                 "kvm-native-test-support": ["reverie-kvm/native-test-support"],
+                "mm-cancellation-test-support": ["exec-stop-launcher", "liteinst", "detcore/physical-mm-test-support"],
                 "kvm-execution-tests": [],
             },
         },

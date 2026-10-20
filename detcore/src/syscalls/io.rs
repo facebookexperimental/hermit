@@ -30,6 +30,9 @@ use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
+use reverie::syscalls::linux_abi::Cmsghdr;
+use reverie::syscalls::linux_abi::Mmsghdr;
+use reverie::syscalls::linux_abi::Msghdr;
 use tracing::debug;
 use tracing::trace;
 
@@ -763,12 +766,12 @@ fn write_control_prefix<T: Copy>(bytes: &mut [u8], value: T) -> usize {
 }
 
 fn socket_timestamp_messages(control: &[u8]) -> Vec<SocketTimestampMessage> {
-    let header_len = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
+    let header_len = cmsg_align(std::mem::size_of::<Cmsghdr>());
     let mut messages = Vec::new();
     let mut offset = 0usize;
 
     while let Some(header_bytes) = control.get(offset..) {
-        let Some(header) = read_control_value::<libc::cmsghdr>(header_bytes) else {
+        let Some(header) = read_control_value::<Cmsghdr>(header_bytes) else {
             break;
         };
         if header.cmsg_len < header_len {
@@ -3417,10 +3420,10 @@ where
     for header in headers {
         // A null header or control buffer fails the call with EFAULT
         // before Linux reads any descriptor.
-        let Some(header) = Addr::<libc::msghdr>::from_raw(*header) else {
+        let Some(header) = Addr::<Msghdr>::from_raw(*header) else {
             continue;
         };
-        let Ok(header) = guest.memory().read_value::<_, libc::msghdr>(header) else {
+        let Ok(header) = guest.memory().read_value::<_, Msghdr>(header) else {
             unread = true;
             continue;
         };
@@ -3465,7 +3468,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // the larger size.
             let headers: Vec<usize> = call.msgvec().map_or_else(Vec::new, |vector| {
                 (0..call.vlen().min(libc::UIO_MAXIOV as u32) as usize)
-                    .map(|index| vector.as_raw() + index * std::mem::size_of::<libc::mmsghdr>())
+                    .map(|index| vector.as_raw() + index * std::mem::size_of::<Mmsghdr>())
                     .collect()
             });
             self.mark_exported_listeners(guest, &headers);
@@ -3473,7 +3476,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // As for `sendmsg`: every entry Linux could send.
         let headers: Vec<usize> = call.msgvec().map_or_else(Vec::new, |vector| {
             (0..call.vlen().min(libc::UIO_MAXIOV as u32) as usize)
-                .map(|index| vector.as_raw() + index * std::mem::size_of::<libc::mmsghdr>())
+                .map(|index| vector.as_raw() + index * std::mem::size_of::<Mmsghdr>())
                 .collect()
         });
         self.refuse_sending_virtual_timerfds(guest, &headers);
@@ -3543,7 +3546,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Snapshot every input field before the receive. Linux permits the
         // control buffer to overlap this header, so rereading it afterward can
         // turn a successful consuming receive into an artificial EFAULT.
-        let message: libc::msghdr = guest.memory().read_value(message_address)?;
+        let message: Msghdr = guest.memory().read_value(message_address)?;
         if message.msg_control.is_null() || message.msg_controllen == 0 {
             return self
                 .handle_socket_receive(guest, call, call.sockfd(), true)
@@ -3746,7 +3749,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // array). Scoped so the `msghdr`'s raw pointers are dropped before the
         // await below: holding one would make this future non-`Send`.
         let segments = {
-            let message: libc::msghdr = guest.memory().read_value(message_address)?;
+            let message: Msghdr = guest.memory().read_value(message_address)?;
             Self::read_iov_segments(guest, message.msg_iov as usize, message.msg_iovlen)?
         };
 
@@ -3800,7 +3803,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let geometry: Vec<Vec<(usize, usize)>> = {
             // SAFETY: `mmsghdr` is a plain C record; an all-zero value is a
             // valid staging value immediately overwritten by `read_values`.
-            let mut headers: Vec<libc::mmsghdr> = (0..vlen as usize)
+            let mut headers: Vec<Mmsghdr> = (0..vlen as usize)
                 .map(|_| unsafe { std::mem::zeroed() })
                 .collect();
             guest
@@ -3827,10 +3830,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // wrote. Also scoped: nothing awaits past this point, but keeping the
         // raw pointers contained keeps the rule visible.
         let counts: Vec<usize> = {
-            let address: AddrMut<'_, libc::mmsghdr> =
-                AddrMut::from_raw(base).ok_or(Errno::EFAULT)?;
+            let address: AddrMut<'_, Mmsghdr> = AddrMut::from_raw(base).ok_or(Errno::EFAULT)?;
             // SAFETY: as above.
-            let mut headers: Vec<libc::mmsghdr> = (0..vlen as usize)
+            let mut headers: Vec<Mmsghdr> = (0..vlen as usize)
                 .map(|_| unsafe { std::mem::zeroed() })
                 .collect();
             guest.memory().read_values(address.into(), &mut headers)?;
@@ -3882,7 +3884,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let controls = {
             // SAFETY: `mmsghdr` is a plain C record and an all-zero value is a valid
             // initialized staging value that is immediately overwritten by `read_values`.
-            let mut messages: Vec<libc::mmsghdr> = (0..call.vlen())
+            let mut messages: Vec<Mmsghdr> = (0..call.vlen())
                 .map(|_| unsafe { std::mem::zeroed() })
                 .collect();
             guest
@@ -4088,7 +4090,7 @@ mod tests {
 
     #[test]
     fn socket_timestamp_control_messages_use_logical_time() {
-        let header_len = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
+        let header_len = cmsg_align(std::mem::size_of::<Cmsghdr>());
         let timeval_len = std::mem::size_of::<libc::timeval>();
         let timespec_len = std::mem::size_of::<libc::timespec>();
         let first_len = header_len + timeval_len;
@@ -4100,7 +4102,7 @@ mod tests {
 
         assert!(write_control_value(
             &mut control,
-            libc::cmsghdr {
+            Cmsghdr {
                 cmsg_len: first_len,
                 cmsg_level: libc::SOL_SOCKET,
                 cmsg_type: SCM_TIMESTAMP_OLD,
@@ -4115,7 +4117,7 @@ mod tests {
         ));
         assert!(write_control_value(
             &mut control[second_offset..],
-            libc::cmsghdr {
+            Cmsghdr {
                 cmsg_len: second_len,
                 cmsg_level: libc::SOL_SOCKET,
                 cmsg_type: SCM_TIMESTAMPNS_OLD,
@@ -4130,7 +4132,7 @@ mod tests {
         ));
         assert!(write_control_value(
             &mut control[third_offset..],
-            libc::cmsghdr {
+            Cmsghdr {
                 cmsg_len: third_len,
                 cmsg_level: libc::SOL_SOCKET,
                 cmsg_type: libc::SCM_RIGHTS,
@@ -4158,12 +4160,12 @@ mod tests {
 
     #[test]
     fn truncated_timestamp_payload_prefix_is_rewritten() {
-        let header_len = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
+        let header_len = cmsg_align(std::mem::size_of::<Cmsghdr>());
         let full_len = header_len + std::mem::size_of::<libc::timeval>();
         let mut control = vec![0xaa; header_len + std::mem::size_of::<i32>()];
         assert!(write_control_value(
             &mut control,
-            libc::cmsghdr {
+            Cmsghdr {
                 cmsg_len: full_len,
                 cmsg_level: libc::SOL_SOCKET,
                 cmsg_type: SCM_TIMESTAMP_OLD,
@@ -4183,13 +4185,13 @@ mod tests {
 
     #[test]
     fn timestamping_preserves_populated_source_slots() {
-        let header_len = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
+        let header_len = cmsg_align(std::mem::size_of::<Cmsghdr>());
         let timespec_len = std::mem::size_of::<libc::timespec>();
         let message_len = header_len + 3 * timespec_len;
         let mut control = vec![0; cmsg_align(message_len)];
         assert!(write_control_value(
             &mut control,
-            libc::cmsghdr {
+            Cmsghdr {
                 cmsg_len: message_len,
                 cmsg_level: libc::SOL_SOCKET,
                 cmsg_type: SCM_TIMESTAMPING_OLD,

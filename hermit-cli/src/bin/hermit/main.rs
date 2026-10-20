@@ -29,11 +29,18 @@ mod global_opts;
 mod host_capabilities;
 mod host_seccomp;
 mod image;
+#[cfg(any(
+    feature = "native-exec",
+    all(feature = "exec-stop-launcher", feature = "liteinst")
+))]
+mod initial_image_admission;
 mod instruction_map;
 mod inventory;
 mod list;
 mod logdiff;
 mod manifest;
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+mod mapped_first_admission;
 #[cfg(feature = "native-exec")]
 mod native_exec_artifacts;
 #[cfg(feature = "native-exec")]
@@ -44,7 +51,10 @@ mod native_exec_coordinator;
 mod native_exec_inputs;
 #[cfg(feature = "native-exec")]
 mod native_exec_maps;
-#[cfg(feature = "native-exec")]
+#[cfg(any(
+    feature = "native-exec",
+    all(feature = "exec-stop-launcher", feature = "liteinst")
+))]
 mod native_exec_observer;
 #[cfg(feature = "native-exec")]
 mod native_exec_provider;
@@ -241,6 +251,10 @@ fn args_from_matches_with_clock(
                 backend.as_str()
             ),
         ));
+    }
+    // Epoch admission must use the same global backend as the eventual launch.
+    if let Subcommand::Run(run) = &mut args.command {
+        run.set_backend(args.global.backend);
     }
     if run_epoch_source == Some(ValueSource::DefaultValue) {
         match &mut args.command {
@@ -626,7 +640,10 @@ impl Subcommand {
             write_pending_verification_json(path)?;
         }
         match self {
-            Subcommand::Run(run) => run.refuse_unready_exec_stop()?,
+            Subcommand::Run(run) => {
+                run.set_backend(global.backend);
+                run.refuse_unready_exec_stop()?;
+            }
             Subcommand::Oci(oci) => oci.refuse_unready_exec_stop()?,
             _ => (),
         }
@@ -2973,3 +2990,9 @@ mod tests {
         assert!(matches!(args.command, Subcommand::InstructionMap(_)));
     }
 }
+
+// Numeric foreign-entry bounds only; these never invoke a runtime entry,
+// initialize private libc or claim ownership/readiness.
+#[cfg(test)]
+#[path = "../../../../detcore-liteinst/src/exec_initial/mapped_entry/bounds.rs"]
+mod mapped_entry_bounds_tests;

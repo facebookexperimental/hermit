@@ -767,7 +767,9 @@ pub enum NamespaceUse {
     None,
 }
 
-fn validate_tracing_environment(namespaces: NamespaceUse) -> Result<(), Error> {
+/// Check the host mechanisms needed by a retained exec-stop launcher or a
+/// ptrace run, without assuming which runtime artifact the launcher uses.
+pub fn validate_tracing_environment(namespaces: NamespaceUse) -> Result<(), Error> {
     check_tracing_environment(namespaces, run_capability_probe)
 }
 
@@ -1311,7 +1313,10 @@ fn refuse_in_guest_trap_patching(backend: Backend, evidence: Option<String>) -> 
 
 /// Use the existing actual subscriber-derived forwarding policy for the
 /// shared native path. Call inside the same verification tracing scope.
-#[cfg(feature = "native-exec")]
+#[cfg(any(
+    feature = "native-exec",
+    all(feature = "exec-stop-launcher", feature = "liteinst")
+))]
 #[doc(hidden)]
 pub fn in_guest_detlog_forward_policy_for_native() -> detcore::detlog::ForwardPolicy {
     in_guest_detlog_forward_policy()
