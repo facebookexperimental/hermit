@@ -177,3 +177,94 @@ fn pselect6_sleeps_under_its_temporary_mask() {
         }
     }
 }
+
+// This is a Linux-semantics control, not a repeat-parity claim. Native and
+// ptrace are the reference; the feature-gated DBT leg requires its real runtime.
+#[test]
+fn pselect6_wrapper_validation_preserves_pending_signals() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("pselect-validation-pending-{}", std::process::id()));
+    fs::create_dir_all(&build_root).unwrap();
+    let guest = build_root.join("pselect6_wrapper_validation");
+    let mut compile = Command::new("cc");
+    compile
+        .args([
+            "-O0", "-g", "-pthread", "-std=c11", "-Wall", "-Wextra", "-Werror",
+        ])
+        .arg(repository.join("tests/c/pselect6_wrapper_validation.c"))
+        .arg("-o")
+        .arg(&guest);
+    command_output(compile, "pselect validation guest compilation");
+    #[cfg(not(feature = "dbt"))]
+    let backends = ["native", "ptrace"];
+    #[cfg(feature = "dbt")]
+    let backends = ["native", "ptrace", "dbt"];
+    for backend in backends {
+        for mode in ["validation-empty", "validation-pending"] {
+            let mut command = if backend == "native" {
+                Command::new(&guest)
+            } else {
+                let mut command = Command::new(hermit_test::hermit_binary());
+                command
+                    .arg(format!("--backend={backend}"))
+                    .args([
+                        "--log=info",
+                        "run",
+                        "--strict",
+                        "--epoch=2026-01-01T00:00:00Z",
+                        "--base-env=minimal",
+                        "--",
+                    ])
+                    .arg(&guest);
+                command
+            };
+            command.arg(mode);
+            if backend != "native" {
+                hermit_test::configure_guest_execution(&mut command);
+            }
+            let output = command_output(command, &format!("wrapper-validation {backend} {mode}"));
+            let queued = i32::from(mode == "validation-pending");
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!(
+                    "mode={} result=-1 errno=22 pending={queued} blocked=1 handled=0 timeout=0,1000000000\n",
+                    if queued == 1 { "pending" } else { "empty" }
+                ),
+                "wrapper-validation {backend} {mode}"
+            );
+        }
+        for mode in [
+            "argument-validation-order",
+            "wrapper-protected-tail",
+            "wrapper-unmapped-tail",
+        ] {
+            let mut command = if backend == "native" {
+                Command::new(&guest)
+            } else {
+                let mut command = Command::new(hermit_test::hermit_binary());
+                command
+                    .arg(format!("--backend={backend}"))
+                    .args([
+                        "--log=info",
+                        "run",
+                        "--strict",
+                        "--epoch=2026-01-01T00:00:00Z",
+                        "--base-env=minimal",
+                        "--",
+                    ])
+                    .arg(&guest);
+                command
+            };
+            command.arg(mode);
+            if backend != "native" {
+                hermit_test::configure_guest_execution(&mut command);
+            }
+            let output = command_output(command, &format!("wrapper-validation {backend} {mode}"));
+            assert_eq!(
+                output.stdout, b"pselect6-simulation-ok\n",
+                "wrapper-validation {backend} {mode}"
+            );
+        }
+    }
+}

@@ -2281,7 +2281,28 @@ fi
 # rust-toolchain.toml, so the inventory (989), SDK and native inputs,
 # calibrated budget, job width and limits are unchanged from the 229e1fad
 # carry.
-expected_pin=a778f36cec8ba4b9f6ba4a811496a37d01dff8d4
+# CARRY TO 9b015a747751c4ba83ca79745f21177ca0df9217 (2026-10-20): from
+# 5041073ee5204c976aa3fdba76b16035bbf7ef76. The scoped pselect wrapper-validation
+# purpose advances the callback ABI to 13; the table remains 80 bytes. Native
+# client and three DynamoRIO inputs change; this is not an SDK byte-equality
+# carry. No DBT path is added or removed (inventory 989), and root manifests,
+# lockfile and build recipe are unchanged. One source-build sample for SDK
+# fcc3a4ab3c7b2df4bb57c564dae8ce734ca1334338dd828030d63a3472d1b381
+# took 26.44 seconds at 7 effective jobs (185.07 job-seconds, NUM_JOBS=8),
+# below the existing 572 job-second default ratchet. Preserve the calibrated
+# budgets, job width and resource limits; this sample does not recalibrate them
+# or establish runtime-package identity. Fresh paired runtime evidence is required.
+# REBASE TO 34386566313e8a71913435c60054d348afb6b5bb (2026-10-20): replay the unchanged
+# API13 change on the documentation-only 229e1fad base above. The original
+# measured build and its limits remain historical evidence, not a new result.
+# Native/SDK afterimages match the original API13 change; fresh runtime evidence
+# is required for the newly composed Hermit source.
+# REBASE TO edb27ebed0310674972a7d7e63f24ad180441b76 (2026-10-20): replay the same scoped
+# API13 change on published a778f36c, retaining its artifact-runner correction.
+# Native and SDK inputs match the reviewed R72 afterimages; inventory stays989.
+# The historical calibration is unchanged, not a new source-build measurement.
+# This budget carry does not substitute for current source/runtime validation.
+expected_pin=edb27ebed0310674972a7d7e63f24ad180441b76
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

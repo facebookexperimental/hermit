@@ -91,8 +91,10 @@ const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | l
 /// controller-capture callback at offset 56 and appends private-memory facts
 /// at offset 64. The incompatible historical version-10 tables are refused.
 /// Version 12 appends optional internal branch facts at offset72.
+/// Version 13 adds the syscall invoker's fourth injection-purpose argument;
+/// the callback table remains 80 bytes, but version 12 is incompatible.
 /// Installing the callback does not enable instrumentation or shared time.
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 12;
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 13;
 const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 80;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3620,7 +3622,7 @@ mod tests {
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 12);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 13);
         assert_eq!(IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE, 80);
         assert_eq!(
             std::mem::offset_of!(reverie_dbt::DbtRuntimeCallbacks, branch_fact),
@@ -5395,7 +5397,9 @@ mod tests {
             _context: usize,
             _sysnum: i64,
             _args: *const u64,
+            purpose: u32,
         ) -> i64 {
+            assert_eq!(purpose, reverie::InjectionPurpose::Application as u32);
             0
         }
         unsafe extern "C" fn read_registers(

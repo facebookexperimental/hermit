@@ -56,6 +56,12 @@ deterministic I/O, RCB time, and serialized scheduling. Options beginning with
 | `--max-timeslice requires user-space perf counters ... continuing with timer preemption disabled` | Configuration | `perf_event_open` was blocked by `perf_event_paranoid`, seccomp, or missing VM PMU exposure. | Enable user PMU access, or pass `--max-timeslice=disabled`. Disabling it can let CPU-bound threads run until another event. |
 | `Hardware perf counters are not supported on this machine. Records/Replays may randomly fail` | Configuration | Record/replay metadata setup could not use the PMU and disabled preemption. | Enable user PMU access before recording and replay on equivalent hardware, or expect weaker schedule fidelity. |
 
+## Injection Mechanisms
+
+| Message | Class | Trigger | Fix |
+| --- | --- | --- | --- |
+| pselect6-wrapper-validation-unsupported: ... | Unsupported | A Guest implementation does not provide the closed Tool validation-injection contract. This is a mechanism failure, not a guest errno. | Implement and validate the purpose on that Guest; do not substitute EINVAL or ordinary injection silently. |
+
 ## Option Warnings
 
 | Message | Class | Trigger | Fix |

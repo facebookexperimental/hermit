@@ -900,6 +900,52 @@ fn ppoll_uses_kernel_wait(sequentialize_threads: bool, recordreplay_modes: bool)
     !sequentialize_threads || recordreplay_modes
 }
 
+// Linux copies the outer wrapper before rejecting this private malformed
+// timeout. Keep the operation and its closed purpose together: using this
+// disposition with a valid timeout would bypass runtime mask interposition.
+async fn validate_pselect6_wrapper<G, T>(
+    guest: &mut G,
+    argument: Addr<'_, libc::sigset_t>,
+) -> Result<(), Error>
+where
+    T: reverie::Tool,
+    G: Guest<T>,
+{
+    let mut stack = guest.stack().await;
+    let validation_timeout = stack.reserve::<Timespec>();
+    let _guard = stack.commit()?;
+    guest.memory().write_value(
+        validation_timeout,
+        &Timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000_000,
+        },
+    )?;
+    let validation = syscalls::Pselect6::new()
+        .with_nfds(0)
+        .with_readfds(None)
+        .with_writefds(None)
+        .with_exceptfds(None)
+        .with_timeout(Some(validation_timeout))
+        .with_sigmask(Some(argument));
+    match guest
+        .inject_with_purpose(
+            validation,
+            reverie::InjectionPurpose::Pselect6WrapperValidation,
+        )
+        .await
+    {
+        Err(error) => match error.into_errno()? {
+            Errno::EINVAL => Ok(()),
+            // This is the call's first injection. A mechanism failure must not
+            // be converted to a guest errno or a successful validation.
+            errno => crate::syscalls::signal::restart_if_first_probe_not_run(Err(errno.into())),
+        },
+        // Success would mean the backend did not validate the probe.
+        Ok(_) => Err(Errno::EIO.into()),
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// poll syscall (MAYHANG)
     // TODO-HUMAN-REVIEW(PR-1023): Review zero-timeout poll scheduling across backends.
@@ -1176,35 +1222,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // page. Have Linux validate both wrapper words first. It copies
                 // this wrapper before rejecting a malformed timeout, without
                 // reading the inner mask, changing it, waiting, or writing output.
-                let mut stack = guest.stack().await;
-                let validation_timeout = stack.reserve::<Timespec>();
-                let _guard = stack.commit()?;
-                guest.memory().write_value(
-                    validation_timeout,
-                    &Timespec {
-                        tv_sec: 0,
-                        tv_nsec: 1_000_000_000,
-                    },
-                )?;
-                let validation = syscalls::Pselect6::new()
-                    .with_nfds(0)
-                    .with_readfds(None)
-                    .with_writefds(None)
-                    .with_exceptfds(None)
-                    .with_timeout(Some(validation_timeout))
-                    .with_sigmask(Some(argument));
-                match guest.inject(validation).await {
-                    Err(Errno::EINVAL) => {}
-                    // The call's first injection
-                    // (`restart_if_first_probe_not_run`).
-                    Err(errno) => {
-                        return crate::syscalls::signal::restart_if_first_probe_not_run(Err(
-                            errno.into()
-                        ));
-                    }
-                    // Success would mean the backend did not validate the probe.
-                    Ok(_) => return Err(Errno::EIO.into()),
-                }
+                validate_pselect6_wrapper::<_, Self>(guest, argument).await?;
                 Some(argument)
             }
             None => None,
