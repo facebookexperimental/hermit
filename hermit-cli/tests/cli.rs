@@ -630,8 +630,9 @@ fn liteinst_runtime_cache_requires_the_current_revision() {
     ));
 }
 
-/// A regular build embeds no source revision; only `HERMIT_STAMP_GIT_SHA=1`
-/// stamps one. Both `--version` and `version --json` must say which.
+/// A regular Cargo/OSS build embeds no source revision; only
+/// `HERMIT_STAMP_GIT_SHA=1` stamps one. Both `--version` and `version --json`
+/// must agree on the provenance of the Cargo/OSS or fbcode build.
 #[test]
 fn version_names_a_revision_only_when_the_build_was_stamped() {
     let text = hermit(&["--version"]);
@@ -645,7 +646,21 @@ fn version_names_a_revision_only_when_the_build_was_stamped() {
     let info: detcore_model::build_info::BuildInfo =
         serde_json::from_slice(&json.stdout).expect("version --json is not BuildInfo");
 
-    if option_env!("HERMIT_STAMP_GIT_SHA") == Some("1") {
+    if cfg!(fbcode_build) {
+        let revision = info.git_sha.as_str();
+        assert!(
+            revision == "unknown"
+                || (revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())),
+            "an fbcode build must embed the fbsource revision or none, got {revision:?}"
+        );
+        assert!(
+            text.trim_end().ends_with(&format!(
+                "(fbsource: {}, fbpkg: hermit:{})",
+                revision, info.version
+            )),
+            "--version must name the fbcode build's provenance: {text:?}"
+        );
+    } else if option_env!("HERMIT_STAMP_GIT_SHA") == Some("1") {
         let sha = info.git_sha.strip_suffix("-dirty").unwrap_or(&info.git_sha);
         assert!(
             sha.len() == 12 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()),

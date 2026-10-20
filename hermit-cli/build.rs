@@ -27,6 +27,8 @@ use build_support::build_date;
 use build_support::emit_git_revision;
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(fbcode_build)");
+
     let date = build_date();
 
     emit_git_revision();
