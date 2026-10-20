@@ -476,11 +476,35 @@ class IngestTest(unittest.TestCase):
                 self.assertNotIn(claim(X), summary.get("host_inapplicable_cells") or [])
                 self.assertEqual(printed["final_outcomes"], {outcome: 1, "PASS": 1} if outcome == "FAIL"
                                  else {"PASS": 2})
-        # A claim before a row is still skipped, and the cell is not listed.
+        # A claim before a failed row is still skipped, and since Tpx spent its
+        # retry on the claim, the failed attempt is listed for its local retry
+        # (2d279d95: c-programs/sigreturn-preemption, a skid overshoot after a
+        # withheld execution, was refused with no attempt 2).
+        failed_on_re = execution(X, 200, "FAIL", "rx2")
+        failed_on_re["result"]["route"] = "re"
         printed, rows, summary = self.accepted(
-            {"RUN": [withheld_on("re", X, 100, "rx1"), execution(X, 200, "FAIL", "rx2"), Y_PASSES]}
+            {"RUN": [withheld_on("re", X, 100, "rx1"), failed_on_re, Y_PASSES]},
+            withheld_retries=[X_SLUG],
         )
         self.assertEqual(rows, [(X, 1, "FAIL", "rx2"), (Y, 1, "PASS", "ry1")])
+        self.assertEqual(printed["withheld_retries_on_re"], 1)
+        # Its local retry is attempt 2.
+        printed, rows, _ = self.accepted(
+            {
+                "RUN": [withheld_on("re", X, 100, "rx1"), failed_on_re, Y_PASSES],
+                "RERUN": [execution(X, 300, "PASS", "rx3")],
+            }
+        )
+        self.assertEqual(rows, [(X, 1, "FAIL", "rx2"), (X, 2, "PASS", "rx3"), (Y, 1, "PASS", "ry1")])
+        self.assertEqual(printed["withheld_retries_on_re"], 0)
+        # A local rerun's failed attempt after claims made on RE had its own Tpx
+        # retry, so it is not listed again.
+        printed, _, _ = self.accepted(
+            {"RUN": [withheld_on("re", X, 100, "rx1"), execution(X, 200, "FAIL", "rx2"), Y_PASSES]}
+        )
+        self.assertEqual(printed["withheld_retries_on_re"], 0)
+        # A claim before a passing row needs no retry.
+        printed, _, _ = self.accepted({"RUN": [withheld_on("re", X, 100, "rx1"), execution(X, 200, "PASS", "rx2"), Y_PASSES]})
         self.assertEqual(printed["withheld_retries_on_re"], 0)
 
     def test_a_cell_withheld_on_re_by_every_execution_is_listed_for_a_local_rerun(self):

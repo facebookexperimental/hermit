@@ -676,6 +676,11 @@ def main():
 
     def withheld_on_re(cell, rows, summary, route):
         return not rows and route == "re" and claims_host_inapplicable(cell, summary)
+
+    def failed_attempt(cell, rows, summary, route):
+        if rows:
+            return rows[-1].get("outcome") != "PASS"
+        return not claims_host_inapplicable(cell, summary)
     missing = sorted(c for c in want if not covered(c))
     extra = sorted(set(per_cell) - set(want))
     if missing or extra:
@@ -707,6 +712,15 @@ def main():
         if not ran:
             rerun_locally.append(cell_slug(want[cell]))
         elif withheld_on_re(cell, *runs[-1]):
+            retry_locally.append(cell_slug(want[cell]))
+        elif len(ran) == 1 and len(runs) > 1 and ran[0][2] == "re" and failed_attempt(cell, *ran[0]):
+            # Tpx's one retry went to an execution withheld on RE before the
+            # cell's only attempt, which failed on RE: that attempt never got
+            # the retry an executed run gives it. (A local rerun's attempt has
+            # its own Tpx retry.) In the full validation of
+            # 2d279d95, c-programs/sigreturn-preemption was withheld on one RE
+            # worker, then failed attempt 1 with a skid overshoot on another,
+            # and import mode refused it with no attempt 2 to judge.
             retry_locally.append(cell_slug(want[cell]))
         attempt = 0
         for (rows, summary, route), end in zip(runs, per_cell_ends[cell]):
