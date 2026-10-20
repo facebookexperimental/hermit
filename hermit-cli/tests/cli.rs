@@ -37662,42 +37662,65 @@ fn cpu_profile_host_no_rdrand_matches_host_cpuid_and_xsave() {
             _ => {}
         }
     }
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let (status, log) = run_with_deadline(
-        hermit_command(&[
+    // Default placement may choose different topology domains; without a
+    // timeslice ordinary runs are not pinned at all. Both modes must use the
+    // original allowed set's lowest CPU for every native CPUID answer.
+    for extra in [&[][..], &["--max-timeslice=disabled"][..]] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let mut args = vec![
+            "--log=info",
             "run",
             "--strict",
             "--cpu-profile=host-no-rdrand",
             "--timeout=60",
-            "--",
-            guest.to_str().unwrap(),
-        ]),
-        directory.path(),
-        Duration::from_secs(180),
-        false,
-    );
-    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout")).unwrap();
-    if !host_no_rdrand_succeeded_or_refused(status.and_then(|s| s.code()), &stdout, &log, 0) {
-        return;
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict.to_str().unwrap(),
+        ];
+        args.extend(extra);
+        args.extend(["--", guest.to_str().unwrap()]);
+        let (status, log) = run_with_deadline(
+            hermit_command(&args),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout")).unwrap();
+        if !host_no_rdrand_succeeded_or_refused(status.and_then(|s| s.code()), &stdout, &log, 0) {
+            return;
+        }
+        assert_eq!(host_cpuid_rows(&stdout), expected, "{stdout}\n{log}");
+        let xcomp = |text: &str| {
+            text.lines()
+                .filter(|line| line.starts_with("xcomp "))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(xcomp(&stdout), xcomp(&native), "XCOMP must match native");
+        assert_eq!(xcomp(&stdout).len(), 3, "missing XCOMP queries");
+        assert!(stdout.contains("check rdrand hidden: ok\n"), "{stdout}");
+        assert!(stdout.contains("check rdseed hidden: ok\n"), "{stdout}");
+        assert!(
+            stdout
+                .lines()
+                .filter(|line| line.starts_with("check "))
+                .all(|line| line.ends_with(": ok")),
+            "{stdout}"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).unwrap()).unwrap();
+        assert_eq!(report["bitwise_parity"], true, "{report}\n{log}");
+        for side in ["left", "right"] {
+            assert!(
+                report["compared_log_messages"][side]
+                    .as_u64()
+                    .is_some_and(|count| count > 0),
+                "{report}"
+            );
+        }
     }
-    assert_eq!(host_cpuid_rows(&stdout), expected, "{stdout}\n{log}");
-    let xcomp = |text: &str| {
-        text.lines()
-            .filter(|line| line.starts_with("xcomp "))
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(xcomp(&stdout), xcomp(&native), "XCOMP must match native");
-    assert_eq!(xcomp(&stdout).len(), 3, "missing XCOMP queries");
-    assert!(stdout.contains("check rdrand hidden: ok\n"), "{stdout}");
-    assert!(stdout.contains("check rdseed hidden: ok\n"), "{stdout}");
-    assert!(
-        stdout
-            .lines()
-            .filter(|line| line.starts_with("check "))
-            .all(|line| line.ends_with(": ok")),
-        "{stdout}"
-    );
 }
 
 /// libstdc++'s ordinary random_device selects its source using CPUID. Two
@@ -37908,6 +37931,144 @@ fn cpu_profile_host_no_rdrand_refuses_bypass_modes_and_recording() {
         output.stdout.is_empty(),
         "the refused guest ran: {output:?}"
     );
+
+    // Network recordings had a separate writer and an early replay dispatch
+    // that bypassed the syscall-recording refusal. They must refuse before
+    // the guest or either artifact writer runs, even for old/forged manifests
+    // that already carry this profile (https://github.com/rrnewton/hermit/pull/4535).
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let data = directory.path().join("data");
+    let marker = directory.path().join("guest-ran");
+    let trace = directory.path().join("network.trace");
+    let manifest_path = directory.path().join("network.trace.manifest.json");
+    let script = "printf ran > \"$1\"; printf 'guest must not run\\n'";
+    let run = |args: &[&str]| {
+        let mut command = hermit_command(args);
+        command
+            .env("HERMIT_DATA_DIR", &data)
+            .env("XDG_CONFIG_HOME", directory.path().join("config"))
+            .env_remove("HERMIT_MANIFEST");
+        hermit_test::hermit_output("host profile recording refusal", &mut command)
+    };
+    let assert_refused = |output: &Output| {
+        assert_hermit_refusal_contains(
+            output,
+            Refusal::Policy,
+            &[
+                "--cpu-profile host-no-rdrand refused:",
+                "record/replay is not supported",
+                "does not bind the host CPUID state",
+            ],
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "the refused guest ran: {output:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "the refused guest created {}",
+            marker.display()
+        );
+        assert!(
+            !data.exists() || fs::read_dir(&data).unwrap().next().is_none(),
+            "a refused recording created a data-store artifact"
+        );
+    };
+    let output = run(&[
+        "run",
+        "--cpu-profile=host-no-rdrand",
+        "--record-networking",
+        trace.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        script,
+        "host-profile-recording",
+        marker.to_str().unwrap(),
+    ]);
+    assert_refused(&output);
+    assert!(
+        !trace.exists(),
+        "a refused recording created its network trace"
+    );
+    assert!(
+        !manifest_path.exists(),
+        "a refused recording created its manifest"
+    );
+
+    // This valid, empty trace is deliberately generated independently of
+    // Hermit. A malformed or missing fixture could fail before the CPU-profile
+    // guard and would not establish that a replayable trace is refused.
+    let epoch = detcore_model::config::CANONICAL_TEST_EPOCH.parse().unwrap();
+    detcore_model::network_engine::NetworkEngine::new_record(epoch)
+        .finish()
+        .unwrap()
+        .write_framed(fs::File::create(&trace).unwrap())
+        .unwrap();
+    let trace_bytes = fs::read(&trace).unwrap();
+    let output = run(&[
+        "run",
+        "--cpu-profile=host-no-rdrand",
+        "--replay-networking",
+        trace.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        script,
+        "host-profile-replay",
+        marker.to_str().unwrap(),
+    ]);
+    assert_refused(&output);
+    assert!(
+        !manifest_path.exists(),
+        "a refused replay created a manifest"
+    );
+
+    let mut manifest = serde_json::json!({
+        "schema": "hermit-recording-manifest/v1",
+        "hermit": {"version": "0.4.1"},
+        "id": "0123456789abcdef0123456789abcdef",
+        "kind": "network",
+        "created": detcore_model::config::CANONICAL_TEST_EPOCH,
+        "command": {
+            "program": "/bin/sh",
+            "args": ["-c", script, "host-profile-manifest", marker.to_str().unwrap()]
+        },
+        "inputs": {
+            "run": {
+                "cpu-profile": "host-no-rdrand",
+                "epoch": detcore_model::config::CANONICAL_TEST_EPOCH
+            }
+        },
+        "artifacts": {
+            "network_trace": {
+                "path": "network.trace",
+                "format": "hermit-net-trace",
+                "version": 2,
+                "sha256": detcore::Digest::digest_path(&trace).unwrap().to_string(),
+                "bytes": trace_bytes.len()
+            }
+        }
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    fs::write(&manifest_path, &manifest_bytes).unwrap();
+    let output = run(&["run", "--from", manifest_path.to_str().unwrap()]);
+    assert_refused(&output);
+    assert_eq!(fs::read(&manifest_path).unwrap(), manifest_bytes);
+
+    for kind in ["network", "history", "inputs-only", "full-syscall"] {
+        manifest["kind"] = serde_json::json!(kind);
+        let original = serde_json::to_vec(&manifest).unwrap();
+        fs::write(&manifest_path, &original).unwrap();
+        let output = run(&["--log=warn", "replay", manifest_path.to_str().unwrap()]);
+        assert_refused(&output);
+        assert!(
+            !stderr(&output).contains("replays by rerunning its program"),
+            "{kind} was dispatched before the profile was refused: {output:?}"
+        );
+        assert_eq!(fs::read(&manifest_path).unwrap(), original, "{kind}");
+        assert_eq!(fs::read(&trace).unwrap(), trace_bytes, "{kind}");
+    }
 }
 
 /// The x86-64-v3 CPU profile refuses by name every run it cannot qualify,

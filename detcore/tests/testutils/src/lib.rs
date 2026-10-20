@@ -101,6 +101,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         virtualize_cpuid: false,
         cpu_profile: Default::default(),
         cpu_profile_host: None,
+        cpu_profile_source: None,
         // These test configs run detcore under the ptrace backend.
         backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
         guest_may_inherit_a_terminal: false,
@@ -203,6 +204,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         virtualize_cpuid: true,
         cpu_profile: Default::default(),
         cpu_profile_host: None,
+        cpu_profile_source: None,
         // These test configs run detcore under the ptrace backend.
         backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
         guest_may_inherit_a_terminal: false,
@@ -305,6 +307,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         virtualize_cpuid: true,
         cpu_profile: Default::default(),
         cpu_profile_host: None,
+        cpu_profile_source: None,
         // These test configs run detcore under the ptrace backend.
         backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
         guest_may_inherit_a_terminal: false,

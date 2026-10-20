@@ -206,6 +206,14 @@ pub struct Config {
     #[serde(default)]
     pub cpu_profile_host: Option<crate::cpu_profile::HostXstate>,
 
+    /// Native CPUID source for host-no-rdrand, selected during admission from
+    /// the caller's original allowed CPU set, before container placement.
+    /// The ptrace launch pins its actual tracer to this CPU. Never restored
+    /// from recording metadata: host-profile recording/replay is refused.
+    #[clap(skip)]
+    #[serde(default)]
+    pub cpu_profile_source: Option<usize>,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review in-process backend descriptor discovery.
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2509,7 +2517,7 @@ mod legacy_backend_json {
     /// `work_span_report` came after it as well: the report is written by the
     /// scheduler, not the in-guest runtime, so it is never written and reads
     /// as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 19] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 20] = [
         "backend",
         "record_host_inputs",
         "guest_may_inherit_a_terminal",
@@ -2524,6 +2532,7 @@ mod legacy_backend_json {
         "inherited_seccomp",
         "cpu_profile",
         "cpu_profile_host",
+        "cpu_profile_source",
         "signal_state_copy",
         "container_mount_table",
         "mountinfo_mount_namespace",
@@ -2688,7 +2697,7 @@ mod legacy_backend_json {
                         .map(Some)
                         .map_err(<A::Error as de::Error>::custom)
                 }
-                Some("cpu_profile_host") => seed
+                Some("cpu_profile_host" | "cpu_profile_source") => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
                     .map_err(<A::Error as de::Error>::custom),
@@ -2952,6 +2961,7 @@ mod legacy_backend_json {
                 | "inherited_seccomp"
                 | "cpu_profile"
                 | "cpu_profile_host"
+                | "cpu_profile_source"
                 | "signal_state_copy"
                 | "container_mount_table"
                 | "mountinfo_mount_namespace"
@@ -3605,6 +3615,7 @@ mod tests {
                 | "inherited_seccomp"
                 | "cpu_profile"
                 | "cpu_profile_host"
+                | "cpu_profile_source"
                 | "signal_state_copy"
                 | "container_mount_table"
                 | "mountinfo_mount_namespace"
@@ -3624,13 +3635,13 @@ mod tests {
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
         // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
         // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
-        // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`,
+        // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`, `cpu_profile_source`,
         // `signal_state_copy`, `container_mount_table`,
         // `mountinfo_mount_namespace`, `signal_delivery_check_fatal` and
-        // `work_span_report` none: fourteen more keys, and eighteen fewer, so
-        // four keys fewer than fields.
+        // `work_span_report` none: fourteen more keys, and nineteen fewer, so
+        // five keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 4);
+        assert_eq!(fields.len(), keys.len() + 5);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -3875,6 +3886,7 @@ mod tests {
         };
         let v3 = Config {
             cpu_profile: crate::cpu_profile::CpuProfile::X86_64V3,
+            cpu_profile_source: Some(17),
             ..v2.clone()
         };
         let json = to_legacy_backend_json(&v3).unwrap();
@@ -3884,7 +3896,11 @@ mod tests {
             from_legacy_backend_json(&json).unwrap().cpu_profile,
             crate::cpu_profile::CpuProfile::X86_64V2
         );
-        // The bincode form the tool reads carries both fields.
+        assert_eq!(
+            from_legacy_backend_json(&json).unwrap().cpu_profile_source,
+            None
+        );
+        // The bincode form the tool reads carries all profile fields.
         let wire = bincode::serde::encode_to_vec(&v3, bincode::config::legacy()).unwrap();
         let (decoded, _): (Config, usize) =
             bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
@@ -3892,6 +3908,7 @@ mod tests {
             decoded.cpu_profile,
             crate::cpu_profile::CpuProfile::X86_64V3
         );
+        assert_eq!(decoded.cpu_profile_source, Some(17));
     }
 
     #[test]

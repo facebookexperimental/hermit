@@ -750,6 +750,12 @@ MONITOR/MWAIT, MONITORX/MWAITX, RDPRU, AMD lightweight profiling, architectural
 performance monitoring, VIA XSTORE randomness, and hypervisor-specific clock
 interfaces are also hidden. CPU identity fields
 (APIC, core and node IDs) are zeroed so tracer migration does not change them.
+Before container placement, admission chooses the lowest CPU in the caller's
+allowed affinity set and qualifies it. Every launch pins the actual tracer and
+guest to that source CPU, including when the timeslice is disabled and when a
+library reuses a tracer worker. All native leaves and subleaves therefore come
+from one repeatable source: cache sharing and topology can differ between cores
+even on a homogeneous CPU model. Failure to pin that source refuses the launch.
 Other host features remain visible, including every XSAVE leaf 0xD subleaf;
 Linux's XCOMP queries and permission requests operate on the guest's real
 kernel state. RDTSC and RDTSCP still trap and return virtual time, with RDTSCP's
@@ -757,7 +763,8 @@ CPU ID zero. Leaf 0x15 reports the virtual TSC's one-billion cycles per logical
 second; leaf 0x16 retains the host's static frequency metadata.
 
 Results are **host CPU model specific**: cross-host builds need the same CPU
-model, topology and compatible kernel/XSTATE settings. Intel hybrid and AMD
+model, topology and compatible kernel/XSTATE settings, and repeat runs need the
+same allowed CPU set so they select the same source. Intel hybrid and AMD
 heterogeneous CPUs are refused because different core types can report different
 features. This mode skips v3's XSTATE_BV
 qualification; host save/restore activity can still affect XSAVE output and
@@ -772,7 +779,11 @@ retain interception; the mode never falls back to native CPUID. It requires
 the ptrace backend and virtual time, and conflicts with
 `--no-virtualize-cpuid`, `--no-virtualize-time`, and execution modes that bypass
 Detcore. Record/replay currently refuses this profile because recordings do
-not bind its complete host CPU state. Use a virtual profile for recordings.
+not bind its complete host CPU state. This includes `--record-networking`,
+`--replay-networking`, and network manifests loaded with `run --from`; `replay`
+refuses any manifest carrying this profile before dispatch. Use a virtual
+profile for recordings. Plain history `run --from` is argument reuse, subject
+to the same host requirements as a new run.
 
 ### File System, Environment, And Network
 

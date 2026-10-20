@@ -6127,10 +6127,24 @@ impl RunOpts {
             namespace_only: self.namespace_only,
         };
         if config.cpu_profile == detcore_model::cpu_profile::CpuProfile::HostNoRdrand {
-            hermit::cpu_profile_admission::admit_host_no_rdrand(&request).map_err(|refusal| {
-                Error::new(PolicyRefusal)
-                    .context(format!("--cpu-profile host-no-rdrand refused: {refusal}"))
-            })?;
+            // Network traces, like syscall recordings, do not bind this
+            // profile's host CPUID state. Refuse before host admission,
+            // manifest creation or opening/truncating the trace. A network
+            // manifest restored by `run --from` also sets replay_networking.
+            if self.record_networking.is_some()
+                || self.replay_networking.is_some()
+                || config.network_trace.mode != NetworkTraceMode::Off
+            {
+                hermit::cpu_profile_admission::check_record_or_replay(config.cpu_profile)
+                    .map_err(|refusal| Error::new(PolicyRefusal).context(refusal.to_string()))?;
+            }
+            let source = hermit::cpu_profile_admission::admit_host_no_rdrand(&request).map_err(
+                |refusal| {
+                    Error::new(PolicyRefusal)
+                        .context(format!("--cpu-profile host-no-rdrand refused: {refusal}"))
+                },
+            )?;
+            self.det_opts.det_config.cpu_profile_source = Some(source);
             tracing::info!("--cpu-profile host-no-rdrand admitted: CPUID faulting verified");
             eprintln!("{}", detcore_model::cpu_profile::HOST_NO_RDRAND_RESIDUAL);
             return Ok(());

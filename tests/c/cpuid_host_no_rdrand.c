@@ -11,8 +11,10 @@
 // Guest mode also checks the hardware-randomness bits, RDTSCP's virtual AUX,
 // and the native XSAVE layout used by the dynamic loader.
 
+#define _GNU_SOURCE
 #include <cpuid.h>
 #include <errno.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +23,29 @@
 #include <unistd.h>
 
 static int failures;
+
+// Admission chooses this CPU before container placement. Keep the native
+// oracle on that same independent source, even on asymmetric cache/topology
+// domains of a homogeneous CPU model.
+static void pin_native_source(void) {
+  cpu_set_t allowed, selected;
+  if (sched_getaffinity(0, sizeof(allowed), &allowed)) {
+    perror("native source affinity");
+    exit(2);
+  }
+  for (unsigned cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    if (CPU_ISSET(cpu, &allowed)) {
+      CPU_ZERO(&selected);
+      CPU_SET(cpu, &selected);
+      if (sched_setaffinity(0, sizeof(selected), &selected)) {
+        perror("pin native source");
+        exit(2);
+      }
+      return;
+    }
+  }
+  exit(2);
+}
 
 // A native-only availability oracle, independent of Hermit's admission code.
 // EINVAL is the old-kernel unknown-command answer; ENODEV means the hardware
@@ -75,9 +100,26 @@ static void row(unsigned leaf, unsigned subleaf) {
 
 static void rows(unsigned first, unsigned last) {
   for (unsigned leaf = first; leaf <= last; ++leaf) {
-    unsigned subleaves = leaf == 0xd ? 64 : (first == 0 ? 3 : 1);
+    unsigned subleaves = 1;
+    switch (leaf) {
+    case 0xd:
+      subleaves = 64; // Every possible XSAVE component.
+      break;
+    case 4: case 7: case 0xb: case 0xf: case 0x10: case 0x12:
+    case 0x14: case 0x17: case 0x18: case 0x1b: case 0x1d:
+    case 0x1e: case 0x1f: case 0x20: case 0x23: case 0x24:
+    case 0x8000001du: case 0x80000020u: case 0x80000026u:
+      subleaves = 256;
+      break;
+    }
     for (unsigned subleaf = 0; subleaf < subleaves; ++subleaf) {
       row(leaf, subleaf);
+    }
+    if (subleaves > 1) {
+      // Invalid topology subleaves can retain the ECX input's low byte.
+      // Catch snapshots or lookup tables that clamp or wrap these requests.
+      row(leaf, 256);
+      row(leaf, UINT32_MAX);
     }
   }
 }
@@ -136,6 +178,9 @@ int main(int argc, char** argv) {
   int inject_rdrand = argc == 2 && strcmp(argv[1], "--inject-rdrand") == 0;
   if (argc != 1 && !native && !inject_rdrand) {
     return 2;
+  }
+  if (native) {
+    pin_native_source();
   }
   unsigned a, b, c, d, max_basic, max_extended;
   __cpuid_count(0, 0, max_basic, b, c, d);

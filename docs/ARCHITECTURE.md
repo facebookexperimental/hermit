@@ -465,7 +465,12 @@ it only helps programs that *ask* before they act. A program that executes
 instruction itself requires the KVM/SVM backend.
 
 The opt-in `--cpu-profile=host-no-rdrand` also traps every CPUID, but derives
-its answers from native host CPUID. Detcore clears hardware randomness and
+its answers from native host CPUID on a fixed source CPU. Admission chooses the
+lowest originally allowed CPU before container placement; both library launch
+paths pin their actual tracer to that source before constructing the guest.
+The configuration carries the source across container forks and cached tracer
+workers, so per-core topology/cache differences cannot follow random placement.
+Detcore clears hardware randomness and
 unvirtualized timing/profiling features, normalizes CPU identity fields, and
 reports leaf 0x15 consistently with its virtual TSC. It preserves the host's
 complete XSAVE leaf 0xD; the guest's XGETBV/XSAVE and XCOMP controls operate on

@@ -14,6 +14,10 @@
 
 use detcore_model::cpu_profile::CpuProfile;
 use detcore_model::cpu_profile::HostXstate;
+use nix::sched::CpuSet;
+use nix::sched::sched_getaffinity;
+use nix::sched::sched_setaffinity;
+use nix::unistd::Pid;
 
 use crate::xstate_probe;
 
@@ -261,22 +265,73 @@ pub fn qualify_host_no_rdrand() -> Result<(), AdmissionRefusal> {
     ))
 }
 
-static HOST_NO_RDRAND_ADMITTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+// Each bit records a source CPU whose faulting and host-profile checks passed.
+// Atomics survive the CLI's fork without a possibly held mutex. A Config also
+// carries its chosen CPU, so concurrent library admissions cannot overwrite
+// another run's source or authorize an unpinned tracer.
+static HOST_NO_RDRAND_CPUS: [std::sync::atomic::AtomicBool; libc::CPU_SETSIZE as usize] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; libc::CPU_SETSIZE as usize];
 
-/// Admit host CPUID only after the required interception has been proved.
-pub fn admit_host_no_rdrand(request: &AdmissionRequest<'_>) -> Result<(), AdmissionRefusal> {
+fn affinity_cpus(affinity: &CpuSet) -> Vec<usize> {
+    (0..CpuSet::count())
+        .filter(|cpu| affinity.is_set(*cpu).unwrap_or(false))
+        .collect()
+}
+
+fn host_profile_affinity() -> Result<CpuSet, AdmissionRefusal> {
+    sched_getaffinity(Pid::from_raw(0))
+        .map_err(|error| format!("cannot read the CPUID source thread's CPU affinity: {error}"))
+}
+
+/// The actual tracer is pinned before it constructs the guest, including a
+/// library's cached tracer worker. Guest/worker threads inherit this singleton.
+/// Every leaf and arbitrarily high subleaf therefore has one native source.
+fn pin_host_cpuid_source(cpu: usize) -> Result<(), AdmissionRefusal> {
+    let mut selected = CpuSet::new();
+    selected.set(cpu).map_err(|error| error.to_string())?;
+    sched_setaffinity(Pid::from_raw(0), &selected)
+        .map_err(|error| format!("cannot pin the CPUID source thread to CPU {cpu}: {error}"))?;
+    check_host_cpuid_source(cpu)
+}
+
+fn check_host_cpuid_source(cpu: usize) -> Result<(), AdmissionRefusal> {
+    if affinity_cpus(&host_profile_affinity()?) != [cpu] {
+        return Err(format!(
+            "the tracer's CPU affinity changed after host CPUID admission; \
+             keep the tracer pinned to its admitted CPUID source CPU {cpu}"
+        ));
+    }
+    Ok(())
+}
+
+/// Select the lowest allowed CPU before the CLI's container can randomly
+/// narrow affinity. Probe that CPU, restore the caller's mask, and return the
+/// source to carry in Config::cpu_profile_source. The launch guard pins the
+/// actual tracer thread; this also works with a pre-existing library worker.
+/// Repeat runs require the same allowed CPU set and host configuration.
+pub fn admit_host_no_rdrand(request: &AdmissionRequest<'_>) -> Result<usize, AdmissionRefusal> {
     admit_host_no_rdrand_with(request, qualify_host_no_rdrand)
 }
 
 fn admit_host_no_rdrand_with(
     request: &AdmissionRequest<'_>,
     probe: impl FnOnce() -> Result<(), AdmissionRefusal>,
-) -> Result<(), AdmissionRefusal> {
+) -> Result<usize, AdmissionRefusal> {
     check_host_no_rdrand_request(request)?;
-    probe()?;
-    HOST_NO_RDRAND_ADMITTED.store(true, std::sync::atomic::Ordering::Release);
-    Ok(())
+    let original = host_profile_affinity()?;
+    let cpu = affinity_cpus(&original)
+        .first()
+        .copied()
+        .ok_or("the CPUID source thread has no allowed CPU")?;
+    let admission = pin_host_cpuid_source(cpu).and_then(|()| probe());
+    // Restore on success as well as refusal: a library caller's other work
+    // must not inherit a placement constraint intended for its tracer.
+    sched_setaffinity(Pid::from_raw(0), &original).map_err(|error| {
+        format!("cannot restore the caller's CPU affinity after CPUID admission: {error}; probe result: {admission:?}")
+    })?;
+    admission?;
+    HOST_NO_RDRAND_CPUS[cpu].store(true, std::sync::atomic::Ordering::Release);
+    Ok(cpu)
 }
 
 /// A recording currently binds only the v3 host facts, not a complete native
@@ -573,6 +628,11 @@ pub fn refuse_unadmitted_launch(
     }
     let refuse = |why: &str| Err(CpuProfileRefusal::new(config.cpu_profile, why));
     if config.cpu_profile == CpuProfile::HostNoRdrand {
+        // Library callers can configure the network engine directly, without
+        // passing through RunOpts or its early artifact-creation guard.
+        if config.network_trace.mode != detcore_model::network_trace::NetworkTraceMode::Off {
+            check_record_or_replay(config.cpu_profile)?;
+        }
         let request = AdmissionRequest {
             backend: if ptrace { "ptrace" } else { "non-ptrace" },
             ptrace,
@@ -584,13 +644,19 @@ pub fn refuse_unadmitted_launch(
         };
         check_host_no_rdrand_request(&request)
             .map_err(|why| CpuProfileRefusal::new(config.cpu_profile, why))?;
-        if !HOST_NO_RDRAND_ADMITTED.load(std::sync::atomic::Ordering::Acquire) {
+        let cpu = config.cpu_profile_source.filter(|cpu| {
+            HOST_NO_RDRAND_CPUS
+                .get(*cpu)
+                .is_some_and(|admitted| admitted.load(std::sync::atomic::Ordering::Acquire))
+        });
+        let Some(cpu) = cpu else {
             return refuse(
-                "this process did not verify CPUID faulting; call admit_host_no_rdrand \
-                 before launching the guest",
+                "this process did not verify CPUID faulting on the configuration's source CPU; \
+                 call admit_host_no_rdrand and retain its source in cpu_profile_source",
             );
-        }
-        return Ok(());
+        };
+        return pin_host_cpuid_source(cpu)
+            .map_err(|reason| CpuProfileRefusal::new(config.cpu_profile, reason));
     }
     if !ptrace {
         return refuse("only the ptrace backend is qualified");
@@ -799,6 +865,7 @@ mod tests {
 
     #[test]
     fn host_profile_refuses_absent_faulting_and_requires_admission_to_launch() {
+        let original = host_profile_affinity().unwrap();
         let mut config = detcore::Config {
             cpu_profile: CpuProfile::HostNoRdrand,
             ..Default::default()
@@ -809,18 +876,54 @@ mod tests {
         let refusal =
             admit_host_no_rdrand_with(&request("ptrace"), || Err(simulated.into())).unwrap_err();
         assert_eq!(refusal, simulated);
+        assert_eq!(
+            affinity_cpus(&host_profile_affinity().unwrap()),
+            affinity_cpus(&original)
+        );
         assert!(refuse_unadmitted_launch(&config, true).is_err());
 
-        // A successful CPUID probe admits without v3 host facts or XSTATE
-        // calibration. The launch still rechecks interception requirements.
-        admit_host_no_rdrand_with(&request("ptrace"), || Ok(())).unwrap();
+        // The source is chosen from the original mask, before a container or
+        // cached worker has narrowed it. Admission restores the caller's mask.
+        let source = admit_host_no_rdrand_with(&request("ptrace"), || Ok(())).unwrap();
+        assert_eq!(source, affinity_cpus(&original)[0]);
+        assert_eq!(
+            affinity_cpus(&host_profile_affinity().unwrap()),
+            affinity_cpus(&original)
+        );
+        assert!(refuse_unadmitted_launch(&config, true).is_err());
+        config.cpu_profile_source = Some(source);
+        for mode in [
+            detcore_model::network_trace::NetworkTraceMode::Record,
+            detcore_model::network_trace::NetworkTraceMode::Replay,
+        ] {
+            config.network_trace.mode = mode;
+            let refusal = refuse_unadmitted_launch(&config, true).unwrap_err();
+            assert!(refusal.reason.contains("record/replay is not supported"));
+        }
+        config.network_trace.mode = detcore_model::network_trace::NetworkTraceMode::Off;
+        let other_config = config.clone();
+        let original_cpus = affinity_cpus(&original);
+        std::thread::spawn(move || {
+            // A previously created library worker can have a wider or different
+            // mask than admission's caller. The actual launch pins that worker.
+            let other_cpu = *original_cpus.last().unwrap();
+            let mut other = CpuSet::new();
+            other.set(other_cpu).unwrap();
+            sched_setaffinity(Pid::from_raw(0), &other).unwrap();
+            assert_eq!(refuse_unadmitted_launch(&other_config, true), Ok(()));
+            assert_eq!(affinity_cpus(&host_profile_affinity().unwrap()), [source]);
+        })
+        .join()
+        .unwrap();
         assert_eq!(refuse_unadmitted_launch(&config, true), Ok(()));
+        assert_eq!(affinity_cpus(&host_profile_affinity().unwrap()), [source]);
         assert!(refuse_unadmitted_launch(&config, false).is_err());
         config.virtualize_cpuid = false;
         assert!(refuse_unadmitted_launch(&config, true).is_err());
         config.virtualize_cpuid = true;
         config.virtualize_time = false;
         assert!(refuse_unadmitted_launch(&config, true).is_err());
+        sched_setaffinity(Pid::from_raw(0), &original).unwrap();
     }
 
     #[test]

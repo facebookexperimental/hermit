@@ -103,6 +103,22 @@ impl ReplayOpts {
             Target::Recording { data_dir, id } => (HermitData::with_dir(data_dir), id),
             Target::Manifest(path) => {
                 let manifest = crate::manifest::read(&path)?;
+                // Check the saved profile before dispatching any manifest
+                // kind: network/history reruns otherwise bypass the syscall
+                // metadata check below and use this host's unbound CPUID.
+                let profile = manifest
+                    .inputs
+                    .run
+                    .get("cpu-profile")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default();
+                hermit::cpu_profile_admission::check_record_or_replay(profile).map_err(
+                    |refusal| {
+                        Error::new(super::container::PolicyRefusal).context(refusal.to_string())
+                    },
+                )?;
                 if manifest.kind != Kind::FullSyscall {
                     return Err(self.rerun(global, &path, &manifest, store.data_dir()));
                 }
@@ -114,14 +130,13 @@ impl ReplayOpts {
                 (HermitData::with_dir(data_dir), id)
             }
         };
-        if let Some(address) = &self.dap_listen {
-            return Err(self.exec_dap_adapter(&hermit, id, address));
-        }
-
         let metadata = hermit.recording_metadata(id)?;
         hermit::cpu_profile_admission::check_record_or_replay(metadata.cpu_profile).map_err(
             |refusal| Error::new(super::container::PolicyRefusal).context(refusal.to_string()),
         )?;
+        if let Some(address) = &self.dap_listen {
+            return Err(self.exec_dap_adapter(&hermit, id, address));
+        }
         if metadata.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
             // A v3 recording replays only on a qualifying host; qualify before
             // the container, as `record start` does. The replayer compares the

@@ -538,6 +538,9 @@ pub fn cpu_profile_admission_refusal(cfg: &Config) -> Option<&'static str> {
         CpuProfile::HostNoRdrand if !cfg.virtualize_time => {
             Some("virtual time is required for RDTSC/RDTSCP; remove --no-virtualize-time")
         }
+        CpuProfile::HostNoRdrand if cfg.cpu_profile_source.is_none() => {
+            Some("the configuration carries no admitted host CPUID source CPU")
+        }
         _ => None,
     }
 }

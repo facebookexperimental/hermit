@@ -135,7 +135,9 @@ macro_rules! host_no_rdrand_residual {
         "With --cpu-profile host-no-rdrand, CPUID remains intercepted, but its answers \
          come from the host CPU with hardware-randomness and unvirtualized timing \
          features hidden. Results are host-CPU-model specific: cross-host builds need \
-         the same CPU model and compatible kernel/XSTATE settings and CPU topology. Host XSAVE behavior \
+         the same CPU model and compatible kernel/XSTATE settings and CPU topology. \
+         The tracer and guest are pinned to the lowest originally allowed CPU, even \
+         with the timeslice disabled; repeat runs require the same allowed CPU set. Host XSAVE behavior \
          is retained without the x86-64-v3 XSTATE qualification, so programs inspecting \
          XSAVE or signal-register metadata have no determinism guarantee. Programs must honor \
          the advertised feature bits; unconditional RDRAND or RDSEED is not trapped \

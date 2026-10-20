@@ -122,6 +122,10 @@ impl InterceptedCpuid {
 
     pub fn cpuid(&self, leaf: u32, subleaf: u32) -> Option<CpuIdResult> {
         if self.profile == CpuProfile::HostNoRdrand {
+            // Launch admission binds the tracer to the lowest originally
+            // allowed CPU, including after container placement or worker reuse.
+            // All topology/cache subleaves and other per-core fields therefore
+            // have one native source, even when host topology is asymmetric.
             // Invalid native leaves can alias the highest basic leaf. Do not
             // let aliases evade the sanitization associated with that leaf.
             // Hypervisor leaves include vendor-specific clocks that are not
@@ -908,9 +912,17 @@ mod tests {
     fn host_profile_requires_interception_and_virtual_time_but_not_v3_facts() {
         let mut config = crate::Config {
             cpu_profile: CpuProfile::HostNoRdrand,
+            cpu_profile_source: Some(0),
             ..Default::default()
         };
         assert_eq!(crate::cpu_profile_admission_refusal(&config), None);
+        config.cpu_profile_source = None;
+        assert!(
+            crate::cpu_profile_admission_refusal(&config)
+                .unwrap()
+                .contains("source CPU")
+        );
+        config.cpu_profile_source = Some(0);
         config.virtualize_cpuid = false;
         assert!(
             crate::cpu_profile_admission_refusal(&config)
