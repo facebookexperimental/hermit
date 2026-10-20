@@ -140,7 +140,29 @@ fn compile_c_without_libc(source: &Path, output: &Path) {
     command_output(command, "C workload compilation without libc");
 }
 
+/// Repository-relative Rust guest source -> prebuilt binary, for builds that
+/// supply Rust guests instead of a host `rustc` (fbsource's Buck build).
+fn prepared_rust_guest(source: &Path) -> Option<PathBuf> {
+    let raw = std::env::var("HERMIT_PREPARED_RUST_GUESTS").ok()?;
+    let guests: std::collections::BTreeMap<String, PathBuf> =
+        serde_json::from_str(&raw).expect("prepared Rust guest paths must be a JSON object");
+    let (_, path) = guests
+        .into_iter()
+        .find(|(relative, _)| source.ends_with(relative))
+        .unwrap_or_else(|| panic!("no prepared Rust guest for {}", source.display()));
+    Some(path)
+}
+
 fn compile_rust(source: &Path, output: &Path) {
+    if let Some(prepared) = prepared_rust_guest(source) {
+        fs::copy(&prepared, output).unwrap_or_else(|error| {
+            panic!(
+                "failed to copy prepared Rust guest {}: {error}",
+                prepared.display()
+            )
+        });
+        return;
+    }
     let mut command = Command::new("rustc");
     command
         .args(["--edition=2024", "-C", "debuginfo=1"])
