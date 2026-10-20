@@ -736,6 +736,16 @@ fn parity_references(
         .iter()
         .map(|cell| ((cell.test_id.clone(), cell.backend), cell.applicable))
         .collect();
+    parity_references_in(&applicable, sampled, tracked_by_id)
+}
+
+/// [`parity_references`] over the snapshot's applicability of each parity
+/// cell, keyed by (test, backend).
+fn parity_references_in(
+    applicable: &BTreeMap<(String, parity::ParityBackend), bool>,
+    sampled: &[TrackedCell],
+    tracked_by_id: &BTreeMap<CellId, TrackedCell>,
+) -> Result<(Vec<TrackedCell>, Vec<String>), String> {
     let sampled_ids: BTreeSet<&CellId> = sampled.iter().map(|cell| &cell.id).collect();
     let mut references = BTreeMap::new();
     let mut pairs = BTreeSet::new();
@@ -14142,11 +14152,6 @@ fn parity_reference_sample_self_test(root: &Path, scratch: &Path) -> Result<(), 
             && parity::ParityBackend::parse(&cell.backend).is_ok()
             && pairs.contains(&(cell.test.clone(), cell.backend.clone()))
     };
-    let unpaired_candidate = |cell: &CellId| {
-        cell.mode == parity::PARITY_MODE
-            && parity::ParityBackend::parse(&cell.backend).is_ok()
-            && !pairs.contains(&(cell.test.clone(), cell.backend.clone()))
-    };
     let population: Vec<CellId> = pressure_cells(root, &CellSelection::default())?
         .selected
         .into_iter()
@@ -14165,23 +14170,24 @@ fn parity_reference_sample_self_test(root: &Path, scratch: &Path) -> Result<(), 
             .map(|(_, cell)| cell.clone())
             .collect()
     };
-    // The first seed whose sample adds a reference, already holds another
-    // candidate's reference, holds a candidate without an applicable pair,
-    // and holds a cell that is not in verify mode.
+    // The first seed whose sample adds a reference and holds a cell that is
+    // not in verify mode. A sample that also holds a candidate's own reference,
+    // or a candidate without an applicable pair, needs particular red cells,
+    // so those branches are proved on planted cells instead
+    // (`parity_references_cover_each_branch_on_planted_cells`,
+    // https://github.com/rrnewton/hermit/issues/4538); the checks below hold
+    // for whatever the chosen sample contains.
     let (seed, sampled) = (0..1_000_000u64)
         .map(|seed| (seed, sample_of(seed)))
         .find(|(_, sampled)| {
-            let references: BTreeSet<CellId> = sampled
+            sampled
                 .iter()
                 .filter(|cell| candidate(cell))
                 .map(reference_of)
-                .collect();
-            references.iter().any(|cell| !sampled.contains(cell))
-                && references.iter().any(|cell| sampled.contains(cell))
-                && sampled.iter().any(&unpaired_candidate)
+                .any(|cell| !sampled.contains(&cell))
                 && sampled.iter().any(|cell| cell.mode != parity::PARITY_MODE)
         })
-        .ok_or("no seed below 1000000 samples every parity-reference case")?;
+        .ok_or("no seed below 1000000 samples a parity reference and a non-verify cell")?;
     let candidates: Vec<&CellId> = sampled.iter().filter(|cell| candidate(cell)).collect();
     let expected_references: BTreeSet<CellId> = candidates
         .iter()
@@ -16051,20 +16057,17 @@ fn self_test(root: &Path) -> Result<(), String> {
     {
         return Err("explicit disabled-cell probing lost its exact requested cell".into());
     }
-    let red_kvm = tracked
+    // Any red applicable verify cell is refused as a probe, so this needs no
+    // particular backend (https://github.com/rrnewton/hermit/issues/4538).
+    let red_applicable = tracked
         .cells
         .iter()
-        .find(|cell| {
-            cell.is_applicable()
-                && cell.status == "red"
-                && cell.id.mode == "verify"
-                && cell.id.backend == "kvm"
-        })
-        .ok_or("self-test needs at least one red KVM verify cell")?;
+        .find(|cell| cell.is_applicable() && cell.status == "red" && cell.id.mode == "verify")
+        .ok_or("self-test needs at least one red applicable verify cell")?;
     let red_as_disabled = CellSelection {
-        test: Some(red_kvm.id.test.clone()),
-        mode: Some(red_kvm.id.mode.clone()),
-        backend: Some(red_kvm.id.backend.clone()),
+        test: Some(red_applicable.id.test.clone()),
+        mode: Some(red_applicable.id.mode.clone()),
+        backend: Some(red_applicable.id.backend.clone()),
         probe_disabled: true,
         run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
         ..CellSelection::default()
@@ -16077,18 +16080,24 @@ fn self_test(root: &Path) -> Result<(), String> {
             "not-applicable-cell probe reported the wrong error: {red_as_disabled_error}"
         ));
     }
+    // The capability check reads only the backend, so a green KVM cell does.
+    let selected_kvm = tracked
+        .cells
+        .iter()
+        .find(|cell| cell.is_applicable() && cell.id.mode == "verify" && cell.id.backend == "kvm")
+        .ok_or("self-test needs at least one applicable KVM verify cell")?;
     let absent_kvm = CapabilityVerdict {
         present: false,
         evidence: "planted unavailable /dev/kvm".into(),
     };
-    if require_selected_kvm_capability(std::slice::from_ref(red_kvm), &absent_kvm).is_ok() {
+    if require_selected_kvm_capability(std::slice::from_ref(selected_kvm), &absent_kvm).is_ok() {
         return Err("selected KVM cell was accepted with an unavailable host capability".into());
     }
     let present_kvm = CapabilityVerdict {
         present: true,
         evidence: "planted openable /dev/kvm".into(),
     };
-    require_selected_kvm_capability(std::slice::from_ref(red_kvm), &present_kvm)
+    require_selected_kvm_capability(std::slice::from_ref(selected_kvm), &present_kvm)
         .map_err(|error| format!("selected KVM cell was refused despite capability: {error}"))?;
     let disabled_batch_selection = CellSelection {
         mode: Some("verify".into()),
@@ -16342,6 +16351,19 @@ fn self_test(root: &Path) -> Result<(), String> {
         .find(|cell| cell.mode == "verify" && cell.backend != "kvm")
         .cloned()
         .ok_or("self-test needs one executable non-KVM red verify cell for --cells-file")?;
+    // The mixed --cells-file plan below checks the kvm_guest resource and cap,
+    // and a cells-file names only red cells, so it still needs a red KVM
+    // verify cell (https://github.com/rrnewton/hermit/issues/4538).
+    let red_kvm = tracked
+        .cells
+        .iter()
+        .find(|cell| {
+            cell.is_applicable()
+                && cell.status == "red"
+                && cell.id.mode == "verify"
+                && cell.id.backend == "kvm"
+        })
+        .ok_or("self-test needs at least one red KVM verify cell for its --cells-file plan")?;
     let mut cells_file_ids = vec![red_kvm.id.clone(), non_kvm_cells_file_id];
     cells_file_ids.sort();
     let cells_file_path = scratch.join("selected-cells.jsonl");
@@ -25492,11 +25514,24 @@ mod pressure_sample_tests {
             .map(|cell| cell.test_id)
             .collect();
         let available = pressure_cells(&root, &CellSelection::default()).unwrap();
+        let budgets = load_budgets(&root).unwrap();
         let (selected, failed_cell) = available
             .selected
             .iter()
             .filter(|cell| cell.id.mode == "verify" && cell.id.backend == "ptrace")
             .filter(|cell| !committed_tests.contains(&cell.id.test))
+            // Ten repetitions of a heavy row (600 s, such as compat/java) do
+            // not fit the run's wall bound, so the planner would refuse them
+            // (https://github.com/rrnewton/hermit/issues/4538).
+            .filter(|cell| {
+                budgets
+                    .get(&(
+                        cell.id.test.clone(),
+                        cell.id.mode.clone(),
+                        cell.id.backend.clone(),
+                    ))
+                    .is_some_and(|budget| budget.timeout_seconds <= 60)
+            })
             .find_map(|cell| {
                 parity::ParityBackend::ALL
                     .into_iter()
@@ -27004,6 +27039,85 @@ mod pressure_sample_tests {
                 wanted(sampled).then(|| (seed, sampled.clone()))
             })
             .expect("a seed samples the wanted cell")
+    }
+
+    /// Every branch of a sample's parity references, on planted cells rather
+    /// than the tracked scorecard, so no flip of a real cell can take a branch
+    /// away (https://github.com/rrnewton/hermit/issues/4538): a candidate whose
+    /// reference is not sampled adds that reference once, however many of the
+    /// test's candidates are sampled; a candidate whose reference is sampled
+    /// adds none; a candidate without an applicable pair adds no pair and no
+    /// reference; a non-verify cell and a ptrace cell are no candidates; a
+    /// candidate absent from the snapshot, or whose reference is untracked, is
+    /// refused by name.
+    #[test]
+    fn parity_references_cover_each_branch_on_planted_cells() {
+        let id = |test: &str, mode: &str, backend: &str| CellId {
+            lane: "portable".into(),
+            category: "fixture".into(),
+            test: format!("fixture/{test}"),
+            mode: mode.into(),
+            backend: backend.into(),
+        };
+        let tracked = |cell: CellId| TrackedCell {
+            id: cell,
+            status: "red".into(),
+            not_applicable_reason: None,
+        };
+        let pair = |test: &str, backend: parity::ParityBackend, applicable: bool| {
+            ((format!("fixture/{test}"), backend), applicable)
+        };
+        let applicable = BTreeMap::from([
+            pair("added", parity::ParityBackend::Sabre, true),
+            pair("added", parity::ParityBackend::Kvm, true),
+            pair("held", parity::ParityBackend::Dbt, true),
+            pair("unpaired", parity::ParityBackend::Kvm, false),
+        ]);
+        let all = [
+            id("added", "verify", "ptrace"),
+            id("held", "verify", "ptrace"),
+            id("unpaired", "verify", "ptrace"),
+        ];
+        let tracked_by_id: BTreeMap<CellId, TrackedCell> = all
+            .iter()
+            .cloned()
+            .map(|cell| (cell.clone(), tracked(cell)))
+            .collect();
+        let sampled = [
+            id("added", "verify", "sabre"),
+            id("added", "verify", "kvm"),
+            id("held", "verify", "dbt"),
+            id("held", "verify", "ptrace"),
+            id("unpaired", "verify", "kvm"),
+            id("added", "chaos", "ptrace"),
+        ]
+        .map(tracked);
+        let (references, pairs) =
+            parity_references_in(&applicable, &sampled, &tracked_by_id).unwrap();
+        assert_eq!(
+            references
+                .iter()
+                .map(|cell| cell.id.clone())
+                .collect::<Vec<_>>(),
+            [id("added", "verify", "ptrace")]
+        );
+        assert_eq!(
+            pairs,
+            [
+                "fixture/added@kvm",
+                "fixture/added@sabre",
+                "fixture/held@dbt",
+            ]
+        );
+        let absent = [tracked(id("absent", "verify", "sabre"))];
+        let error = parity_references_in(&applicable, &absent, &tracked_by_id).unwrap_err();
+        assert!(
+            error.contains("has no parity cell fixture/absent@sabre"),
+            "{error}"
+        );
+        let untracked = BTreeMap::new();
+        let error = parity_references_in(&applicable, &sampled[..1], &untracked).unwrap_err();
+        assert!(error.contains("has no tracked reference cell"), "{error}");
     }
 
     /// A sampled dbt verify candidate with a pair runs its ptrace reference
