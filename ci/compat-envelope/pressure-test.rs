@@ -284,6 +284,7 @@ Commands:
       [--cells-file PATH]
       [--green --backend BACKEND --repetitions COUNT] [--no-retry] [--jobs COUNT]
       [--probe-disabled --backend BACKEND]
+      [--parity-all --repetitions COUNT]
       Run bounded probes for the selected red cells. An exact-cell run uses the
       current working tree for fast fix/test iteration; a dirty result is
       labelled exploratory and cannot promote the scorecard. Batch runs require
@@ -386,6 +387,17 @@ Selection and bounded-batch options (run and plan):
                            path after the shared builds (fixture node, test
                            preparation, cell, summary) cannot fit it; an
                            exact or cells-file request for one is refused.
+  --parity-all             With --repetitions, select every verify cell of every
+                           test in the parity population (every test whose ptrace
+                           verify cell full validation selects), on ptrace and on
+                           every candidate backend, whatever its status. A
+                           candidate the manifest disables runs as a parity probe
+                           (test-harness run --probe-disabled --parity-inputs: on
+                           ptrace's guest arguments, and with
+                           --max-timeslice=disabled on liteinst and in-guest-trap),
+                           so the parity post-pass measures every population cell
+                           beside its ptrace reference in this one series. Not
+                           combinable with any other population filter.
   --green                  With --repetitions, select cells selected by full instead
                            of red cells. Exact --test/--mode/--backend, --mode,
                            and --sample filters are retained in run.json. A sample
@@ -954,6 +966,14 @@ struct CellSelection {
     green: bool,
     #[serde(default)]
     probe_disabled: bool,
+    /// `--parity-all`: every verify cell of every test in the parity
+    /// population, on ptrace and on every candidate backend whatever its
+    /// status. A candidate the manifest disables runs as a parity probe
+    /// (`test-harness run --probe-disabled --parity-inputs`, on ptrace's
+    /// inputs), so the series' parity post-pass measures every population cell
+    /// beside its ptrace reference. Requires `--repetitions`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    parity_all: bool,
     /// `--no-retry`: every repetition is exactly one harness attempt, so the
     /// repeated sample is N first-attempt observations (`test-harness run
     /// --no-retry`). Requires `--repetitions`.
@@ -1185,8 +1205,10 @@ fn dbt_namespace_prefix(backend: &str) -> String {
     }
 }
 
-fn population_label(green: bool, probe_disabled: bool) -> &'static str {
-    if green {
+fn population_label(green: bool, probe_disabled: bool, parity_all: bool) -> &'static str {
+    if parity_all {
+        "parity-all"
+    } else if green {
         "green"
     } else if probe_disabled {
         "disabled"
@@ -1196,6 +1218,27 @@ fn population_label(green: bool, probe_disabled: bool) -> &'static str {
 }
 
 fn validate_repetition_selection(selection: &CellSelection) -> Result<(), String> {
+    if selection.parity_all {
+        if selection.repetitions.is_none() {
+            return Err("--parity-all requires --repetitions".into());
+        }
+        if selection.test.is_some()
+            || selection.mode.is_some()
+            || selection.backend.is_some()
+            || selection.sample.is_some()
+            || selection.seed.is_some()
+            || selection.green
+            || selection.probe_disabled
+            || selection.cells_file.is_some()
+            || selection.retained_cells_file_cells.is_some()
+            || selection.run_id_prefix.is_some()
+        {
+            return Err(
+                "--parity-all selects its own population; it cannot be combined with --test, --mode, --backend, --sample, --seed, --green, --probe-disabled, --cells-file or --run-id-prefix"
+                    .into(),
+            );
+        }
+    }
     let Some(repetitions) = selection.repetitions else {
         if selection.run_id_prefix.is_some() {
             return Err("--run-id-prefix requires --repetitions".into());
@@ -1957,6 +2000,9 @@ struct RunMetadata {
     green: bool,
     #[serde(default)]
     probe_disabled: bool,
+    /// `--parity-all` (see [`CellSelection::parity_all`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    parity_all: bool,
     /// Whether every harness invocation ran with `--no-retry`.
     #[serde(default)]
     no_retry: bool,
@@ -3356,7 +3402,8 @@ fn print_manifest_guest_memory(metadata: &RunMetadata) {
 
 fn print_unavailable(metadata: &RunMetadata) {
     if metadata.unavailable_cells > 0 {
-        let population = population_label(metadata.green, metadata.probe_disabled);
+        let population =
+            population_label(metadata.green, metadata.probe_disabled, metadata.parity_all);
         println!(
             "Unavailable {population} cells omitted: {} (their manifests declare no executable attempts)",
             metadata.unavailable_cells
@@ -3546,6 +3593,12 @@ fn result_options(
                     return Err("--probe-disabled may be specified only once".into());
                 }
                 selection.probe_disabled = true;
+            }
+            "--parity-all" if allow_selection => {
+                if selection.parity_all {
+                    return Err("--parity-all may be specified only once".into());
+                }
+                selection.parity_all = true;
             }
             "--no-retry" if allow_selection => {
                 if selection.no_retry {
@@ -3913,6 +3966,34 @@ fn emit_series_to(
         )
         .map_err(|e| format!("invalid {}: {e}", metadata_path.display()))?;
 
+        if metadata.parity_all {
+            // A parity-all series exists for its parity rows, which go out
+            // under their own producer. Its cells are not cell evidence: a
+            // disabled candidate ran as a probe on ptrace's inputs, not as its
+            // manifest describes, so no cell row reaches the series.
+            let script = parent.join("ci-hub/series/series.py");
+            if !script.is_file() {
+                return Err(format!(
+                    "{} does not exist; DEV_HERMIT_PARENT does not look like a dev-hermit checkout",
+                    script.display()
+                ));
+            }
+            let run_id = series_run_id(&metadata, results)?;
+            parity_line = Some(append_series_parity(
+                &script,
+                parent,
+                results,
+                &run_id,
+                &metadata.hermit_sha,
+                metadata.source_tree_dirty,
+                parity::ParityProducer::ParityAll,
+                bounds,
+            ));
+            return Ok(format!(
+                "emitted no cell result from parity-all run {run_id}: its disabled candidates ran as \
+                 probes on ptrace's inputs, which are not cell evidence"
+            ));
+        }
         // Deliberately NOT the checkout-HEAD guard `summarize` applies. That guard is
         // right for reading a campaign you are standing in; emitting a RETAINED
         // campaign from a checkout that has since moved is the normal case, and the
@@ -3924,16 +4005,7 @@ fn emit_series_to(
                 results.display()
             ));
         }
-        let run_id = if metadata.run_id.is_empty() {
-            results
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| !name.is_empty() && *name != "." && *name != "..")
-                .ok_or_else(|| format!("{} has no usable run id", results.display()))?
-                .to_string()
-        } else {
-            metadata.run_id.clone()
-        };
+        let run_id = series_run_id(&metadata, results)?;
         let mut payload = String::new();
         for (_, row) in &collected {
             payload.push_str(
@@ -3981,6 +4053,7 @@ fn emit_series_to(
             &run_id,
             &metadata.hermit_sha,
             metadata.source_tree_dirty,
+            parity::ParityProducer::PressureTest,
             bounds,
         ));
         let Some(status) = status? else {
@@ -4013,7 +4086,8 @@ fn emit_series_to(
 /// Send one series' parity rows -- [`parity::node_ledger_sources`] over the
 /// `parity.status.json` and `parity.jsonl` its post-pass left in `results`,
 /// filed under the pressure-test lane and node -- to `series.py
-/// append-parity` with `--producer pressure-test`, through the same
+/// append-parity` with `--producer pressure-test` (`parity-all` for a
+/// `--parity-all` series), through the same
 /// [`parity::append_ledger_rows`] validate uses. The outcome is one line and
 /// never an error: a refused output, a writer that predates `append-parity`,
 /// one that refuses the rows or one killed at its bound is named, with the
@@ -4033,6 +4107,21 @@ fn emit_series_to(
 /// error, never the benign line for a series with no post-pass output at
 /// all.
 /// <https://github.com/rrnewton/hermit/issues/3301>
+/// The run id a series' rows carry: the campaign's own, else its result
+/// directory's name.
+fn series_run_id(metadata: &RunMetadata, results: &Path) -> Result<String, String> {
+    if !metadata.run_id.is_empty() {
+        return Ok(metadata.run_id.clone());
+    }
+    results
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .map(str::to_string)
+        .ok_or_else(|| format!("{} has no usable run id", results.display()))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn append_series_parity(
     script: &Path,
     parent: &Path,
@@ -4040,6 +4129,7 @@ fn append_series_parity(
     run_id: &str,
     tree: &str,
     source_tree_dirty: bool,
+    producer: parity::ParityProducer,
     bounds: parity::AppendBounds,
 ) -> String {
     let rows = match parity::node_ledger_sources(
@@ -4070,7 +4160,7 @@ fn append_series_parity(
         &parity::LedgerAppend {
             series: script,
             parent,
-            producer: parity::ParityProducer::PressureTest,
+            producer,
             run_id,
             tree,
             source_tree_dirty,
@@ -4205,6 +4295,28 @@ fn check_scorecard(root: &Path) -> Result<CheckedScorecard<'_>, String> {
     }
 }
 
+/// Whether a `--parity-all` series runs `backend`: the reference
+/// ([`parity::PARITY_REFERENCE_BACKEND`]) and every candidate
+/// ([`parity::ParityBackend::ALL`]).
+fn parity_all_runs_backend(backend: &str) -> bool {
+    backend == parity::PARITY_REFERENCE_BACKEND
+        || parity::ParityBackend::ALL
+            .iter()
+            .any(|candidate| candidate.as_str() == backend)
+}
+
+/// The tests of the parity population: every test whose ptrace verify cell
+/// full validation selects ([`parity::ParityMatrix::population`]).
+fn parity_population_tests(root: &Path) -> Result<BTreeSet<String>, String> {
+    let manifests = ManifestSet::load(root)?;
+    let population = parity::population(&manifests)?;
+    let tests: BTreeSet<String> = population.iter().map(|cell| cell.test_id.clone()).collect();
+    if tests.is_empty() {
+        return Err("--parity-all: the parity population is empty".into());
+    }
+    Ok(tests)
+}
+
 fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCells, String> {
     validate_selection_shape(selection)?;
     validate_repetition_selection(selection)?;
@@ -4252,6 +4364,10 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         .iter()
         .map(|cell| (cell.id.clone(), cell.clone()))
         .collect();
+    let parity_all_tests = selection
+        .parity_all
+        .then(|| parity_population_tests(root))
+        .transpose()?;
     for cell in tracked.cells {
         if !seen.insert(cell.id.clone()) {
             return Err("tracked cells contain a duplicate identity".into());
@@ -4260,6 +4376,33 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
             applicable_by_test
                 .entry(cell.id.test.clone())
                 .or_insert_with(|| cell.id.clone());
+        }
+        if let Some(tests) = &parity_all_tests {
+            // --parity-all: the verify cells of the population's tests on
+            // ptrace and every candidate, whatever their status.
+            if cell.id.mode == "verify"
+                && parity_all_runs_backend(&cell.id.backend)
+                && tests.contains(&cell.id.test)
+            {
+                let budget = budgets
+                    .get(&(
+                        cell.id.test.clone(),
+                        cell.id.mode.clone(),
+                        cell.id.backend.clone(),
+                    ))
+                    .ok_or_else(|| {
+                        format!(
+                            "no manifest execution budget for {}/{}/{}",
+                            cell.id.test, cell.id.mode, cell.id.backend
+                        )
+                    })?;
+                if budget.attempts.is_some() {
+                    selected_cells.push(cell);
+                } else {
+                    unavailable.push(cell);
+                }
+            }
+            continue;
         }
         let selected = if let Some(requested) = &requested_ids {
             let selected = requested.contains(&cell.id);
@@ -4426,7 +4569,11 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     }
     selected_cells.sort_by(|left, right| left.id.cmp(&right.id));
     if selected_cells.is_empty() {
-        let population = population_label(selection.green, selection.probe_disabled);
+        let population = population_label(
+            selection.green,
+            selection.probe_disabled,
+            selection.parity_all,
+        );
         if !unavailable.is_empty() {
             return Err(format!(
                 "the selected {population} population has no executable commands; {} cell(s) are unavailable because their manifests declare no executable attempts",
@@ -4548,7 +4695,11 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     selected_cells.len()
                 )
             } else {
-                let population = population_label(selection.green, selection.probe_disabled);
+                let population = population_label(
+                    selection.green,
+                    selection.probe_disabled,
+                    selection.parity_all,
+                );
                 format!(
                     "--sample {count} exceeds the {} {population} cells with executable commands in the selected population; {} selected {population} cell(s) are unavailable because their manifests declare no executable attempts",
                     selected_cells.len(),
@@ -6149,6 +6300,13 @@ fn write_plan_after_scorecard_check(
                     format!(" --backend {}", shell_quote(&cell.backend))
                 };
                 ("--include-manual", backend)
+            } else if selection.parity_all && cell.mode == "verify" {
+                // A disabled candidate in a parity series runs on ptrace's
+                // inputs, so its log is comparable with the reference's.
+                (
+                    "--probe-disabled --parity-inputs",
+                    format!(" --backend {}", shell_quote(&cell.backend)),
+                )
             } else {
                 (
                     "--probe-disabled",
@@ -6266,7 +6424,11 @@ fn write_plan_after_scorecard_check(
                 group: "cell".into(),
                 job: slug,
                 desc: if let Some(number) = repetition {
-                    let population = population_label(selection.green, selection.probe_disabled);
+                    let population = population_label(
+                        selection.green,
+                        selection.probe_disabled,
+                        selection.parity_all,
+                    );
                     format!(
                         "Repeat {population} cell {}/{}/{}@{} ({number}/{})",
                         cell.test,
@@ -6276,7 +6438,11 @@ fn write_plan_after_scorecard_check(
                         selection.run_count()
                     )
                 } else {
-                    let population = population_label(selection.green, selection.probe_disabled);
+                    let population = population_label(
+                        selection.green,
+                        selection.probe_disabled,
+                        selection.parity_all,
+                    );
                     format!(
                         "Attempt {population} cell {}/{}/{}@{}",
                         cell.test, cell.mode, cell.backend, cell.lane
@@ -6333,12 +6499,20 @@ fn write_plan_after_scorecard_check(
         desc: if selection.repeats_cells() {
             format!(
                 "Wait for every repeated {}-cell check before reading retained runner evidence",
-                population_label(selection.green, selection.probe_disabled)
+                population_label(
+                    selection.green,
+                    selection.probe_disabled,
+                    selection.parity_all
+                )
             )
         } else {
             format!(
                 "Wait for every {}-cell attempt before reading retained runner evidence",
-                population_label(selection.green, selection.probe_disabled)
+                population_label(
+                    selection.green,
+                    selection.probe_disabled,
+                    selection.parity_all
+                )
             )
         },
         description: String::new(),
@@ -6456,6 +6630,7 @@ fn write_plan_after_scorecard_check(
         run_id_prefix: selection.run_id_prefix.clone(),
         green: selection.green,
         probe_disabled: selection.probe_disabled,
+        parity_all: selection.parity_all,
         no_retry: selection.no_retry,
         jobs: selection.scheduler_jobs(),
         manifest_guest_cap: selection.manifest_guest_cap(),
@@ -6729,6 +6904,7 @@ fn validate_run_contract(
         run_id_prefix: metadata.run_id_prefix.clone(),
         green: metadata.green,
         probe_disabled: metadata.probe_disabled,
+        parity_all: metadata.parity_all,
         no_retry: metadata.no_retry,
         jobs: Some(metadata.jobs),
         manifest_guest_cap: metadata
@@ -6777,7 +6953,8 @@ fn validate_run_contract(
         }
     }
     if metadata.unavailable_cells != pressure_cells.unavailable.len() {
-        let population = population_label(metadata.green, metadata.probe_disabled);
+        let population =
+            population_label(metadata.green, metadata.probe_disabled, metadata.parity_all);
         return Err(format!(
             "run metadata records {} unavailable {population} cell(s), current manifest selection has {}",
             metadata.unavailable_cells,
@@ -6869,7 +7046,7 @@ fn validate_run_contract(
         if expected.insert(tracked.id, applicable).is_some() {
             return Err(format!(
                 "tracked scorecard contains a duplicate {}-cell identity",
-                population_label(metadata.green, metadata.probe_disabled)
+                population_label(metadata.green, metadata.probe_disabled, metadata.parity_all)
             ));
         }
     }
@@ -9189,9 +9366,12 @@ fn verify_repetition_summary_json(
 }
 
 fn summary_heading(metadata: &RunMetadata) -> &'static str {
-    let population = population_label(metadata.green, metadata.probe_disabled);
+    let population = population_label(metadata.green, metadata.probe_disabled, metadata.parity_all);
     if metadata.repetitions.is_some() {
         match population {
+            "parity-all" => {
+                "# Parity-all results (every population verify cell, disabled candidates probed)"
+            }
             "green" => "# Repeated green-cell results",
             "disabled" => "# Repeated disabled-cell results",
             _ => "# Repeated red-cell results",
@@ -9252,7 +9432,8 @@ fn repeated_summary_line(
             )
         }
     } else {
-        let population = population_label(metadata.green, metadata.probe_disabled);
+        let population =
+            population_label(metadata.green, metadata.probe_disabled, metadata.parity_all);
         format!(
             "Repeated {population}-cell batch: {terminal_passes}/{total} terminally passed; {clean_passes}/{total} passed cleanly; {result}."
         )
@@ -10505,7 +10686,8 @@ fn summarize(
         );
         Some(result)
     } else {
-        let population = population_label(metadata.green, metadata.probe_disabled);
+        let population =
+            population_label(metadata.green, metadata.probe_disabled, metadata.parity_all);
         println!(
             "{} {population} cell(s) passed once; they are candidates for repeated confirmation, not automatic promotion.",
             passing.len(),
@@ -10541,7 +10723,7 @@ fn summarize(
         }
         println!();
     }
-    let summary = json!({
+    let mut summary = json!({
         "schema": SUMMARY_SCHEMA,
         "hermit_sha": metadata.hermit_sha,
         "detcore_tree": metadata.detcore_tree,
@@ -10581,6 +10763,12 @@ fn summarize(
             }))
             .collect::<Vec<_>>(),
     });
+    if metadata.parity_all {
+        // Present only for a --parity-all run, so every other summary keeps
+        // its bytes. Its readers (sweep_report) take no verdict from it.
+        summary["parity_all"] = json!(true);
+        summary["parity_all_disclosure"] = json!(parity::PARITY_ALL_DISCLOSURE);
+    }
     verify_repetition_summary_json(&summary, attempted, retried_repetitions)?;
     let mut text = serde_json::to_string_pretty(&summary)
         .map_err(|e| format!("cannot serialize summary: {e}"))?;
@@ -10862,7 +11050,12 @@ fn series_parity_scope(
     // candidate full validation runs but this series did not plan is outside
     // the series' population, counted apart, never scored 0.
     let mut scope = parity::resolve_scope(&manifests, Some(&explicit), &planned)?;
-    scope.mark_unsampled_candidates(&planned);
+    // A --parity-all series plans every population cell and is no sample
+    // (producer parity-all is not a sampled producer), so nothing in it is
+    // "not sampled": a cell it failed to plan stays a candidate-missing 0.
+    if !metadata.parity_all {
+        scope.mark_unsampled_candidates(&planned);
+    }
     Ok(scope)
 }
 
@@ -12198,7 +12391,8 @@ fn with_executor_invocation(mut row: CellResult) -> CellResult {
     if row.expected_guest_exit.is_some() {
         comparison.push("--verify-allow=failure".into());
     }
-    comparison.extend(["/fixture/verify-runs/1/run1", "/fixture/verify-runs/1/run2"].map(String::from));
+    comparison
+        .extend(["/fixture/verify-runs/1/run1", "/fixture/verify-runs/1/run2"].map(String::from));
     for attempt in &mut row.attempts {
         let mut run = vec!["hermit".to_owned()];
         run.extend(options.iter().cloned());
@@ -13260,8 +13454,7 @@ fn named_cells(cells: &[NamedCell]) -> Vec<(&str, &str, &str)> {
 /// of a labelled test this list also held, compat/strict-du's, went with the
 /// compat/strict-<row> tests (<https://github.com/rrnewton/hermit/issues/4276>);
 /// no labelled test has a disabled SaBRe cell now.
-const FOCUSED_DISABLED_SABRE_CELLS: [(&str, &str, &str); 1] =
-    [("compat/comm", "replay", "sabre")];
+const FOCUSED_DISABLED_SABRE_CELLS: [(&str, &str, &str); 1] = [("compat/comm", "replay", "sabre")];
 
 /// The `test-harness` subcommand of a generated command and the selection it
 /// applies, parsed as `test-harness` parses them: `--include-manual` selects
@@ -14914,6 +15107,110 @@ fn self_test(root: &Path) -> Result<(), String> {
     prefix_without_repetition.repetitions = None;
     if validate_repetition_selection(&prefix_without_repetition).is_ok() {
         return Err("run-id prefix was accepted without repeated-cell evidence".into());
+    }
+    // --parity-all selects its own population: it needs --repetitions and
+    // takes no other population filter.
+    let parity_all = CellSelection {
+        parity_all: true,
+        repetitions: Some(1),
+        ..CellSelection::default()
+    };
+    validate_repetition_selection(&parity_all)
+        .map_err(|e| format!("a valid --parity-all selection was refused: {e}"))?;
+    for (what, invalid) in [
+        (
+            "without --repetitions",
+            CellSelection {
+                repetitions: None,
+                ..parity_all.clone()
+            },
+        ),
+        (
+            "with --green",
+            CellSelection {
+                green: true,
+                ..parity_all.clone()
+            },
+        ),
+        (
+            "with --probe-disabled",
+            CellSelection {
+                probe_disabled: true,
+                ..parity_all.clone()
+            },
+        ),
+        (
+            "with --mode",
+            CellSelection {
+                mode: Some("verify".into()),
+                ..parity_all.clone()
+            },
+        ),
+        (
+            "with --sample",
+            CellSelection {
+                sample: Some(3),
+                ..parity_all.clone()
+            },
+        ),
+        (
+            "with --test",
+            CellSelection {
+                test: Some("fixture/test".into()),
+                ..parity_all.clone()
+            },
+        ),
+        (
+            "with --backend",
+            CellSelection {
+                backend: Some("kvm".into()),
+                ..parity_all.clone()
+            },
+        ),
+        (
+            "with --seed",
+            CellSelection {
+                seed: Some(7),
+                ..parity_all.clone()
+            },
+        ),
+        (
+            "with --cells-file",
+            CellSelection {
+                cells_file: Some(PathBuf::from("cells.jsonl")),
+                ..parity_all.clone()
+            },
+        ),
+        (
+            "with --run-id-prefix",
+            CellSelection {
+                run_id_prefix: Some("prefix".into()),
+                ..parity_all.clone()
+            },
+        ),
+    ] {
+        match validate_repetition_selection(&invalid) {
+            Ok(()) => return Err(format!("--parity-all was accepted {what}")),
+            Err(error)
+                if what == "without --repetitions"
+                    || error.starts_with("--parity-all selects its own population") => {}
+            Err(error) => {
+                return Err(format!(
+                    "--parity-all {what} was refused for another reason: {error}"
+                ));
+            }
+        }
+    }
+    if !parity_all_runs_backend("ptrace")
+        || parity::ParityBackend::ALL
+            .iter()
+            .any(|candidate| !parity_all_runs_backend(candidate.as_str()))
+        || parity_all_runs_backend("native")
+    {
+        return Err("--parity-all does not run exactly ptrace and every candidate".into());
+    }
+    if population_label(false, false, true) != "parity-all" {
+        return Err("a --parity-all run is not labelled as one".into());
     }
     let mut two_repetitions = repeated_selection_contract.clone();
     two_repetitions.repetitions = Some(2);
@@ -18008,6 +18305,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         run_id_prefix: None,
         green: false,
         probe_disabled: false,
+        parity_all: false,
         no_retry: false,
         jobs: default_jobs(),
         manifest_guest_cap: DEFAULT_MANIFEST_GUEST_CAP,
@@ -28115,6 +28413,7 @@ sys.exit(2)
                 RUN,
                 TREE,
                 false,
+                parity::ParityProducer::PressureTest,
                 parity::AppendBounds::default(),
             )
         }

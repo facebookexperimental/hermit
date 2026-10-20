@@ -1127,7 +1127,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And four CPUID subscription/host-admission/plan-routing regressions: 1782.
     // And +1 from d1870efe (runner.rs: a Buck skid-overshoot retry unit), which did
     // not move this pin: 1_783.
-    ("test.regular_crates", 1_783),
+    // And runner::tests::a_parity_probe_runs_a_disabled_verify_cell_on_ptraces_inputs,
+    // runner::tests::a_parity_probe_does_not_borrow_another_backends_shared_flag_reason
+    // and cli_help::test_harness_refuses_parity_inputs_outside_a_verify_probe
+    // (pressure-test --parity-all's probe inputs): 1_786.
+    ("test.regular_crates", 1_786),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5101,7 +5105,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same detcore-model fatal-delivery-check test: 1764.
     // And the same four CPUID requirement regressions: 1768.
     // And +1, the same d1870efe runner unit as the local node: 1_769.
-    ("test.regular_crates_on_host", 1_769),
+    // And +3, the same parity-probe runner units and harness refusal test as
+    // the local node: 1_772.
+    ("test.regular_crates_on_host", 1_772),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

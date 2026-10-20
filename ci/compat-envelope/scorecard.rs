@@ -7793,10 +7793,17 @@ Credit pools clean credit (inputs equalized) with unequalized credit only under 
             _ => String::new(),
         };
         out.push_str(&format!(
-            "\n### {} run `{}` {sha}{partial}\n\n`{}`\n\n\
+            "\n### {} run `{}` {sha}{partial}\n\n{}`{}`\n\n\
 | Candidate backend | Selected | Population | Population mean | Full | Partial | Zero | Excluded (reference) | Not compared | Measured | Matched | Mean credit (measured) | Credit inputs |\n\
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
-            run.producer, run.run_id, run.line
+            run.producer,
+            run.run_id,
+            if run.producer == ParityProducer::ParityAll {
+                format!("{}\n\n", hermit_manifest_plan::parity::PARITY_ALL_DISCLOSURE)
+            } else {
+                String::new()
+            },
+            run.line
         ));
         // A backend the run reported, or one its commit's selection owes
         // cells although the run reported none of them.

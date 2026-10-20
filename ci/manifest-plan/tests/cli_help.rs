@@ -715,6 +715,52 @@ fn test_harness_refuses_a_broad_probe_disabled_selection() {
     std::fs::remove_dir_all(&directory).expect("remove non-repository working directory");
 }
 
+/// `--parity-inputs` gives a probed disabled verify cell ptrace's inputs, so it
+/// is refused anywhere else: without `--probe-disabled`, and on a mode other
+/// than verify.
+#[test]
+fn test_harness_refuses_parity_inputs_outside_a_verify_probe() {
+    let harness = env!("CARGO_BIN_EXE_test-harness");
+    let directory = non_repository_dir("parity-inputs-outside-probe");
+    const REFUSED: &str =
+        "test-harness: --parity-inputs requires --probe-disabled on a verify cell\n";
+    for arguments in [
+        vec!["run", "--parity-inputs"],
+        vec![
+            "run",
+            "--include-manual",
+            "--test",
+            "fixture/probe",
+            "--mode",
+            "verify",
+            "--backend",
+            "kvm",
+            "--parity-inputs",
+        ],
+        vec![
+            "run",
+            "--probe-disabled",
+            "--test",
+            "fixture/probe",
+            "--mode",
+            "replay",
+            "--backend",
+            "kvm",
+            "--parity-inputs",
+        ],
+    ] {
+        let output = run_from(harness, &arguments, Some(&directory));
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            REFUSED,
+            "{arguments:?}"
+        );
+    }
+    std::fs::remove_dir_all(&directory).expect("remove non-repository working directory");
+}
+
 /// `--check --write` used to write the snapshot while `--write --check` was
 /// refused. Both orders, and a repeated mode flag, are now refused before the
 /// repository is located, so nothing is read or written. The run happens at

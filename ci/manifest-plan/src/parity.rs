@@ -4663,6 +4663,12 @@ pub struct ParityLedgerSource {
 pub enum ParityProducer {
     Validate,
     PressureTest,
+    /// A `pressure-test.rs run --parity-all` series: every verify cell of every
+    /// population test on ptrace and every candidate, a candidate the
+    /// manifests disable as a parity probe on ptrace's inputs
+    /// ([`PARITY_ALL_DISCLOSURE`]). Its rows are kept apart from the pressure
+    /// test's own so that a probe's credit is never read as a manifest cell's.
+    ParityAll,
 }
 
 impl ParityProducer {
@@ -4670,9 +4676,19 @@ impl ParityProducer {
         match self {
             Self::Validate => "validate",
             Self::PressureTest => "pressure-test",
+            Self::ParityAll => "parity-all",
         }
     }
 }
+
+/// What every report of a [`ParityProducer::ParityAll`] run says beside its
+/// numbers.
+pub const PARITY_ALL_DISCLOSURE: &str = "This is a parity-all run: every verify cell of every \
+     test in the parity population, on ptrace and on every candidate backend, whatever the \
+     manifests enable. A candidate the manifests disable ran as a parity probe on ptrace's guest \
+     arguments (with --max-timeslice=disabled on liteinst and in-guest-trap), not as its \
+     manifest describes it, so its credit says how far its log follows ptrace's on the same \
+     inputs; it is not evidence that the cell can be enabled.";
 
 impl fmt::Display for ParityProducer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

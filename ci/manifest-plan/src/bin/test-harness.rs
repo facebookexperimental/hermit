@@ -372,6 +372,9 @@ fn print_command_help(command: &str) -> bool {
              --include-occasional             Include occasional cells\n  \
              --include-manual                 Include manual cells; requires exact test and mode\n  \
              --probe-disabled                 Run one disabled cell; requires exact test/mode/backend\n  \
+             --parity-inputs                  With --probe-disabled on a verify cell: run it on ptrace's guest\n  \
+                                              arguments (and --max-timeslice=disabled on liteinst and\n  \
+                                              in-guest-trap), so parity can compare it\n  \
              --prebuilt                       Reuse prepared test programs\n  \
              --allow-empty                    Permit an empty CI selection; requires --ci-only and category\n  \
              --results <PATH>                 Write JSONL cell results to PATH\n  \
@@ -551,6 +554,7 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
                 args.probe_disabled = true;
                 args.selection.population = Some(Population::Disabled);
             }
+            "--parity-inputs" => args.selection.parity_inputs = true,
             "--parity-reference" => fail(REMOVED_PARITY_REFERENCE),
             "--prebuilt" => args.prebuilt = true,
             "--diagnostic-results" => args.diagnostic_results = true,
@@ -970,6 +974,11 @@ fn validate_args(command: &str, args: &Args) {
                 "--probe-disabled names one exact backend; --exclude-backend has no meaning there",
             );
         }
+    }
+    if args.selection.parity_inputs
+        && (!args.probe_disabled || args.selection.mode.as_deref() != Some("verify"))
+    {
+        fail("--parity-inputs requires --probe-disabled on a verify cell");
     }
     if args.allow_empty {
         if !args.ci_only {
