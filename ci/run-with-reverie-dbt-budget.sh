@@ -2353,7 +2353,7 @@ fi
 # reverie-core (tool.rs, guest.rs and signal.rs only). No DBT, SDK or native
 # input changes; calibrated budgets, jobs, limits and inventory989 are
 # unchanged.
-expected_pin=90329dd5be334d5e486891656e2652a8af3934b2
+expected_pin=3488565473fd87ad492ecfa1990193b99a2a1ad2
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

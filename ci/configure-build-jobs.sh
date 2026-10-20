@@ -2429,8 +2429,8 @@ fi
 # reverie-core (tool.rs, guest.rs and signal.rs only). No DBT, SDK or native
 # input changes; calibrated budgets, jobs, limits and inventory989 are
 # unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 90329dd5be334d5e486891656e2652a8af3934b2 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 90329dd5be334d5e486891656e2652a8af3934b2 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 3488565473fd87ad492ecfa1990193b99a2a1ad2 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 3488565473fd87ad492ecfa1990193b99a2a1ad2 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

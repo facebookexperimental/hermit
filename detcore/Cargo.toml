@@ -26,7 +26,7 @@
 [package]
 name = "hermit-detcore"
 description = "Detcore: the deterministic scheduler and syscall determinization core of the Hermit execution engine."
-version = "0.4.1"
+version = "0.5.1"
 edition = "2024"
 readme = "README.md"
 homepage = "https://hermetic-infra.org"
@@ -59,7 +59,7 @@ bincode = { version = "2", features = ["serde"] }
 bitflags = { version = "2.13.1", features = ["serde"], default-features = false }
 chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
-detcore-model = { version = "0.4.1", path = "../detcore-model" }
+detcore-model = { version = "0.5.1", path = "../detcore-model" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 hex = { version = "0.4.3", features = ["alloc"] }
 libc = "0.2.186"
@@ -74,7 +74,7 @@ raw-cpuid = "10.7.0"
 regex = "1.13.1"
 # Abstract Reverie interface ONLY. Never add a concrete backend here (see the
 # BACKEND-ABSTRACTION COMMANDMENT at the top of this file).
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2" }
+reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2" }
 ruzstd = "0.9.0"
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }

@@ -3,7 +3,7 @@
 [package]
 name = "hermit"
 description = "Hermit: a deterministic Linux execution engine for reproducible runs, record and replay, and concurrency-race search."
-version = "0.4.1"
+version = "0.5.1"
 edition = "2024"
 readme = "README.md"
 homepage = "https://hermetic-infra.org"
@@ -50,20 +50,20 @@ bincode = { version = "2", features = ["serde"] }
 addr2line = "0.26.1"
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 colored = "2.1.0"
-detcore = { package = "hermit-detcore", version = "0.4.1", path = "../detcore" }
-detcore-dbt = { version = "0.4.0", path = "../detcore-dbt", optional = true }
-detcore-model = { version = "0.4.1", path = "../detcore-model" }
+detcore = { package = "hermit-detcore", version = "0.5.1", path = "../detcore" }
+detcore-dbt = { version = "0.5.1", path = "../detcore-dbt", optional = true }
+detcore-model = { version = "0.5.1", path = "../detcore-model" }
 diff = "0.1.13"
 dirs = "6.0"
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
-hermit-record = { version = "0.4.1", path = "../hermit-record" }
-hermit-record-format = { version = "0.4.1", path = "../hermit-record-format" }
-hermit-replay = { version = "0.4.1", path = "../hermit-replay" }
-hermit-run-kvm = { version = "0.4.1", path = "../hermit-run-kvm" }
-hermit-run-ptrace = { version = "0.4.1", path = "../hermit-run-ptrace" }
-hermit-resources = { version = "0.4.1", path = "../hermit-resources" }
-hermit-test-workdir = { version = "0.4.1", path = "../common/test-workdir", optional = true }
+hermit-record = { version = "0.5.1", path = "../hermit-record" }
+hermit-record-format = { version = "0.5.1", path = "../hermit-record-format" }
+hermit-replay = { version = "0.5.1", path = "../hermit-replay" }
+hermit-run-kvm = { version = "0.5.1", path = "../hermit-run-kvm" }
+hermit-run-ptrace = { version = "0.5.1", path = "../hermit-run-ptrace" }
+hermit-resources = { version = "0.5.1", path = "../hermit-resources" }
+hermit-test-workdir = { version = "0.5.1", path = "../common/test-workdir", optional = true }
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
@@ -75,15 +75,15 @@ rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
 # Reverie is pinned to a specific commit for reproducibility. Keep this rev in
 # sync across all crates and bump it via docs/updating-reverie.md.
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2" }
-reverie-dbt = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2", default-features = false, optional = true }
-reverie-kvm = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2" }
-reverie-ptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2" }
-reverie-liteinst = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2", default-features = false, optional = true }
-reverie-inguest = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2", default-features = false, optional = true }
-reverie-rpc-transport = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2", optional = true }
-reverie-sabre-stats = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2", optional = true }
-safeptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2" }
+reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2" }
+reverie-dbt = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2", default-features = false, optional = true }
+reverie-kvm = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2" }
+reverie-ptrace = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2" }
+reverie-liteinst = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2", default-features = false, optional = true }
+reverie-inguest = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2", default-features = false, optional = true }
+reverie-rpc-transport = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2", optional = true }
+reverie-sabre-stats = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2", optional = true }
+safeptrace = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 serde_yaml = "0.9.34"
@@ -99,7 +99,7 @@ uuid = { version = "1.24.0", features = ["rng-getrandom", "serde", "v4", "v5", "
 
 [dev-dependencies]
 # Keep the shared physical-launcher regression in the ordinary unit gate.
-reverie-inguest = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2", default-features = false, features = ["exec-stop"] }
+reverie-inguest = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2", default-features = false, features = ["exec-stop"] }
 # Exact token locations and digests bind the complete source inventory.
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 quote = "1.0.47"

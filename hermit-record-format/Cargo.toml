@@ -1,7 +1,7 @@
 [package]
 name = "hermit-record-format"
 description = "Record/replay event format and support shared by Hermit's record and replay paths."
-version = "0.4.1"
+version = "0.5.1"
 edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
@@ -9,10 +9,10 @@ publish = false
 
 [dependencies]
 bincode = { version = "2", features = ["serde"] }
-detcore = { package = "hermit-detcore", version = "0.4.1", path = "../detcore" }
+detcore = { package = "hermit-detcore", version = "0.5.1", path = "../detcore" }
 goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
 libc = "0.2.186"
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2" }
+reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 tempfile = "3.27.0"

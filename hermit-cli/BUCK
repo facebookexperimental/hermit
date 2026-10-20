@@ -12,10 +12,10 @@ load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 oncall("hermit")
 
 hermit_build_env = {
-    "CARGO_PKG_VERSION": "0.4.1",
+    "CARGO_PKG_VERSION": "0.5.1",
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "90329dd5be334d5e486891656e2652a8af3934b2",
+    "HERMIT_REVERIE_PIN": "3488565473fd87ad492ecfa1990193b99a2a1ad2",
 }
 
 # The shadow release entrypoint supplies these values from Git/Cargo metadata
@@ -70,7 +70,7 @@ rust_library(
         "cargo_toml_dir": ".",
         "cargo_toml_config": {
             "package": {
-                "version": "0.4.1",
+                "version": "0.5.1",
                 "readme": "README.md",
                 "homepage": "https://hermetic-infra.org",
                 "documentation": "https://docs.rs/hermit-run",
@@ -173,7 +173,7 @@ rust_binary(
         "cargo_toml_dir": ".",
         "cargo_toml_config": {
             "package": {
-                "version": "0.4.1",
+                "version": "0.5.1",
                 "readme": "README.md",
                 "homepage": "https://hermetic-infra.org",
                 "documentation": "https://docs.rs/hermit-run",

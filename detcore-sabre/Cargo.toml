@@ -1,7 +1,7 @@
 [package]
 name = "detcore-sabre"
 description = "SaBRe backend glue for Detcore, the Hermit deterministic execution engine."
-version = "0.4.0"
+version = "0.5.1"
 edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
@@ -11,11 +11,11 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-detcore = { package = "hermit-detcore", version = "0.4.0", path = "../detcore" }
+detcore = { package = "hermit-detcore", version = "0.5.1", path = "../detcore" }
 libc = "0.2.186"
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2" }
-reverie-memory = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2" }
-reverie-rpc-transport = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2" }
-reverie-sabre = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2" }
-reverie-syscalls = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "90329dd5be334d5e486891656e2652a8af3934b2" }
+reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2" }
+reverie-memory = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2" }
+reverie-rpc-transport = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2" }
+reverie-sabre = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2" }
+reverie-syscalls = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "3488565473fd87ad492ecfa1990193b99a2a1ad2" }
 syscalls = { version = "0.6.7", features = ["serde"] }
