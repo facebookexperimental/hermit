@@ -23821,7 +23821,7 @@
       "group": "test",
       "job": "liteinst_allocator",
       "desc": "Require scope-free Rust allocation ownership in both actual preload leaves",
-      "description": "Eight Nextest identities: two genuine leaf matrices, five shared artifact qualifier controls and the real Gitless source-copy factory regression. Each completed leaf matrix requires fixed-input quiet/work pairs S,Z,G,O,R,E,A, actual constructor/launcher bootstrap, six allocation-route positive controls, zero scope depths, private membership and unchanged literal guest/next addresses, breaks and bytes. Only stdin differs. Missing producer/exports/placement or a failed pair fails; raw captures retain actual execution separately from selection. The standalone uses Reverie's public configure_command Strace API; Detcore uses the one prepared Hermit with in-guest-trap, strict settings, fixed epoch and disabled timeslice. libc internals, stacks/TLS/protection and RV's caller/guard controls are separate nonclaims. Existing per-test backstop remains unchanged.",
+      "description": "Four Nextest identities: two genuine leaf matrices and two source-copy factory controls. Shared artifact qualifier unit tests run through the allocator fixture script harness, not this consumer. Each completed leaf matrix requires fixed-input quiet/work pairs S,Z,G,O,R,E,A, actual constructor/launcher bootstrap, six allocation-route positive controls, zero scope depths, private membership and unchanged literal guest/next addresses, breaks and bytes. Only stdin differs. Missing producer/exports/placement or a failed pair fails; raw captures retain actual execution separately from selection. The standalone uses Reverie's public configure_command Strace API; Detcore uses the one prepared Hermit with in-guest-trap, strict settings, fixed epoch and disabled timeslice. libc internals, stacks/TLS/protection and RV's caller/guard controls are separate nonclaims. Existing per-test backstop remains unchanged.",
       "labels": [
         "full",
         "portable"
@@ -23849,7 +23849,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "189",
+        "NEXTEST_EXPECTED_EXECUTED": "4",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"liteinst_allocator\"]"
       },
       "networkonly": false,
@@ -23874,7 +23874,7 @@
       "group": "test",
       "job": "liteinst_stacks",
       "desc": "Require literal fixed placement of actual LiteInst signal and callback stacks",
-      "description": "Fourteen required identities: the original four genuine leaf rows, five artifact qualifier controls and two shared stack-observation controls, plus one actual Detcore constructor-placement row and two constructor-oracle refusal controls. Standalone native Strace SITE1 ALT1 must report the real fixed guarded altstack and absent continuation; ALT0 gets no stack credit; inert loading must reserve nothing. Genuine Detcore trap/site0 ALT1 must reach one actual callback at the exact marker IP/TID/RSP, with one completion and fixed guarded 8-MiB capacity. The additional constructor fixture executes the unchanged M2 workload and requires real bootstrap samples disjoint from both later stack extents including guards. Separate source-bound receipts, unchanged M1/M2 comparators, current constructor-bearing leaf qualification and independent clean H/RV source guards are mandatory. No consumer compilation, warm artifact search, caller-byte equality, full-entry/TLS or interior-write-protection claim. Raw observations remain separate from selection. The scheduler hint est_duration_s is 125 s, the median of the 12 passing full validations of 2026-10-15/16 (112-146 s); at 60 s, dispatch by longest estimate kept it waiting behind shorter nodes once its dependencies were done: in the full validation of 947ad92b it started at +429 s, 40 s after its last dependency ended at +389 s, while all 16 slots ran other nodes, and it set the end of the graph to within 11 s.",
+      "description": "Nine required identities: four genuine leaf rows, two shared stack-observation controls, one actual Detcore constructor-placement row and two constructor-oracle refusal controls. Shared artifact qualifier unit tests run through the allocator fixture script harness, not this consumer. Standalone native Strace SITE1 ALT1 must report the real fixed guarded altstack and absent continuation; ALT0 gets no stack credit; inert loading must reserve nothing. Genuine Detcore trap/site0 ALT1 must reach one actual callback at the exact marker IP/TID/RSP, with one completion and fixed guarded 8-MiB capacity. The additional constructor fixture executes the unchanged M2 workload and requires real bootstrap samples disjoint from both later stack extents including guards. Separate source-bound receipts, unchanged M1/M2 comparators, current constructor-bearing leaf qualification and independent clean H/RV source guards are mandatory. No consumer compilation, warm artifact search, caller-byte equality, full-entry/TLS or interior-write-protection claim. Raw observations remain separate from selection. The scheduler hint est_duration_s is 125 s, the median of the 12 passing full validations of 2026-10-15/16 (112-146 s); at 60 s, dispatch by longest estimate kept it waiting behind shorter nodes once its dependencies were done: in the full validation of 947ad92b it started at +429 s, 40 s after its last dependency ended at +389 s, while all 16 slots ran other nodes, and it set the end of the graph to within 11 s.",
       "labels": [
         "full",
         "portable"
@@ -23902,7 +23902,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "194",
+        "NEXTEST_EXPECTED_EXECUTED": "9",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"liteinst_stacks\"]"
       },
       "networkonly": false,

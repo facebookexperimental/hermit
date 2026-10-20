@@ -2,10 +2,8 @@
 //! Fixture exports never select an allocator. Missing qualification, bootstrap,
 //! reproducible placement or exact Q/W comparisons fail; no cases are skipped.
 
-// Preserve the embedded library's public API, including its re-exports.
-#[allow(dead_code)]
-#[path = "../../reverie/reverie-liteinst-artifact/src/lib.rs"]
-pub mod artifact;
+// Import the library without registering its unit tests in this integration binary.
+pub use reverie_liteinst_artifact as artifact;
 #[allow(dead_code)]
 #[path = "../../reverie/scripts/m1_contract.rs"]
 mod contract;

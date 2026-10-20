@@ -15,6 +15,13 @@
 
 #[path = "../hermit-cli/tests/common/cold_bundle.rs"]
 mod cold_bundle;
+// The script producer discovers test harnesses from an explicit cfg(test) item.
+// Compile the same qualifier in both modes; its real unit tests run through
+// scripts/run-script-tests.sh rather than either fixture integration binary.
+#[cfg(not(test))]
+#[path = "../reverie/reverie-liteinst-artifact/src/lib.rs"]
+pub mod m1_artifact;
+#[cfg(test)]
 #[path = "../reverie/reverie-liteinst-artifact/src/lib.rs"]
 pub mod m1_artifact;
 #[path = "../hermit-cli/tests/common/m1_bundle.rs"]

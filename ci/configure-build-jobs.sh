@@ -2442,8 +2442,13 @@ fi
 # exact allocator return contract and declared source digest change. DBT tree, SDK inputs, root manifests
 # and toolchain are identical; inventory997 and resource budgets carry unchanged.
 # This carries no runtime evidence or artifact identity.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 364e5ea289b6e9d5d019615ff5b2a4ca576f5256 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 364e5ea289b6e9d5d019615ff5b2a4ca576f5256 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 9b1ba3cfbea21152a11b190112757c2274d9bca3 (2026-10-20): from
+# 364e5ea289b6e9d5d019615ff5b2a4ca576f5256. Restore ordinary coordinator socket placement.
+# reverie-dbt, third-party, root Cargo.toml, Cargo.lock and rust-toolchain.toml
+# are unchanged. Inventory 997 and existing resource limits carry unchanged.
+
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 9b1ba3cfbea21152a11b190112757c2274d9bca3 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 9b1ba3cfbea21152a11b190112757c2274d9bca3 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

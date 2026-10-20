@@ -2366,7 +2366,12 @@ fi
 # exact allocator return contract and declared source digest change. DBT tree, SDK inputs, root manifests
 # and toolchain are identical; inventory997 and resource budgets carry unchanged.
 # This carries no runtime evidence or artifact identity.
-expected_pin=364e5ea289b6e9d5d019615ff5b2a4ca576f5256
+# CARRY TO 9b1ba3cfbea21152a11b190112757c2274d9bca3 (2026-10-20): from
+# 364e5ea289b6e9d5d019615ff5b2a4ca576f5256. Restore ordinary coordinator socket placement.
+# reverie-dbt, third-party, root Cargo.toml, Cargo.lock and rust-toolchain.toml
+# are unchanged. Inventory 997 and existing resource limits carry unchanged.
+
+expected_pin=9b1ba3cfbea21152a11b190112757c2274d9bca3
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

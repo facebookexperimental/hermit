@@ -288,22 +288,12 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 /// an empty or narrowed run refuse. Update these only after enumerating the
 /// corresponding shipped command and accounting for changed test identities.
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
-    // Two actual-leaf matrices, five shared qualifier controls and the real
-    // Gitless source-copy factory regression; confirm with the prepared listing.
-    // The measured native-exec 0xe8 TLS whole-recipe control adds one identity.
-    // And +1 from a3a9c83a: 9.
-    // The private-source transaction checks both Result paths: +1.
-    // The shared qualifier's two child-stream reader controls: +2 = 12.
-    // And 177 more unit tests of reverie-liteinst-artifact, which this binary
-    // #[path]-includes (13 -> 190 #[test]s at Reverie 21472778, pinned by
-    // 059e069b; 185 of them selected here): 189, listed.
-    ("test.liteinst_allocator", 189),
-    // Eleven unchanged M2 cases plus one constructor row and two refusal controls.
-    // The same measured native-exec TLS recipe control adds one identity.
-    // And +1 from a3a9c83a: 15.
-    // The shared qualifier's two child-stream reader controls: +2 = 17.
-    // And the same 177 reverie-liteinst-artifact unit tests: 194, listed.
-    ("test.liteinst_stacks", 194),
+    // Measured 189 - 185 embedded qualifier tests = four allocator/source-copy
+    // cases. The same 185 qualifier identities now run once through the existing
+    // allocator producer's script-test harness, with none dropped or ignored.
+    ("test.liteinst_allocator", 4),
+    // Measured 194 - the same 185 qualifier tests = nine stack/constructor cases.
+    ("test.liteinst_stacks", 9),
     // run_dbt_binds_in_a_user_namespace_of_its_own retains both prior
     // identities: 2 + 1 = 3.
     ("test.isolated_dbt_workdir", 3),
@@ -8112,7 +8102,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"liteinst_allocator"########,
         desc: r########"Require scope-free Rust allocation ownership in both actual preload leaves"########,
-        description: r########"Eight Nextest identities: two genuine leaf matrices, five shared artifact qualifier controls and the real Gitless source-copy factory regression. Each completed leaf matrix requires fixed-input quiet/work pairs S,Z,G,O,R,E,A, actual constructor/launcher bootstrap, six allocation-route positive controls, zero scope depths, private membership and unchanged literal guest/next addresses, breaks and bytes. Only stdin differs. Missing producer/exports/placement or a failed pair fails; raw captures retain actual execution separately from selection. The standalone uses Reverie's public configure_command Strace API; Detcore uses the one prepared Hermit with in-guest-trap, strict settings, fixed epoch and disabled timeslice. libc internals, stacks/TLS/protection and RV's caller/guard controls are separate nonclaims. Existing per-test backstop remains unchanged."########,
+        description: r########"Four Nextest identities: two genuine leaf matrices and two source-copy factory controls. Shared artifact qualifier unit tests run through the allocator fixture script harness, not this consumer. Each completed leaf matrix requires fixed-input quiet/work pairs S,Z,G,O,R,E,A, actual constructor/launcher bootstrap, six allocation-route positive controls, zero scope depths, private membership and unchanged literal guest/next addresses, breaks and bytes. Only stdin differs. Missing producer/exports/placement or a failed pair fails; raw captures retain actual execution separately from selection. The standalone uses Reverie's public configure_command Strace API; Detcore uses the one prepared Hermit with in-guest-trap, strict settings, fixed epoch and disabled timeslice. libc internals, stacks/TLS/protection and RV's caller/guard controls are separate nonclaims. Existing per-test backstop remains unchanged."########,
         labels: &[r########"full"########, r########"portable"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_M1_ALLOCATOR_FIXTURE_BUNDLE="$PWD/target/ci/m1-allocator-fixtures.path"; REVERIE_LITEINST_PRELOAD=$(./ci/build-liteinst-allocator-fixtures.rs --print-standalone) && export REVERIE_LITEINST_PRELOAD && ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_allocator -j 1"########,
         cmdtype: CmdType::Unknown,
@@ -8149,7 +8139,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"liteinst_stacks"########,
         desc: r########"Require literal fixed placement of actual LiteInst signal and callback stacks"########,
-        description: r########"Fourteen required identities: the original four genuine leaf rows, five artifact qualifier controls and two shared stack-observation controls, plus one actual Detcore constructor-placement row and two constructor-oracle refusal controls. Standalone native Strace SITE1 ALT1 must report the real fixed guarded altstack and absent continuation; ALT0 gets no stack credit; inert loading must reserve nothing. Genuine Detcore trap/site0 ALT1 must reach one actual callback at the exact marker IP/TID/RSP, with one completion and fixed guarded 8-MiB capacity. The additional constructor fixture executes the unchanged M2 workload and requires real bootstrap samples disjoint from both later stack extents including guards. Separate source-bound receipts, unchanged M1/M2 comparators, current constructor-bearing leaf qualification and independent clean H/RV source guards are mandatory. No consumer compilation, warm artifact search, caller-byte equality, full-entry/TLS or interior-write-protection claim. Raw observations remain separate from selection. The scheduler hint est_duration_s is 125 s, the median of the 12 passing full validations of 2026-10-15/16 (112-146 s); at 60 s, dispatch by longest estimate kept it waiting behind shorter nodes once its dependencies were done: in the full validation of 947ad92b it started at +429 s, 40 s after its last dependency ended at +389 s, while all 16 slots ran other nodes, and it set the end of the graph to within 11 s."########,
+        description: r########"Nine required identities: four genuine leaf rows, two shared stack-observation controls, one actual Detcore constructor-placement row and two constructor-oracle refusal controls. Shared artifact qualifier unit tests run through the allocator fixture script harness, not this consumer. Standalone native Strace SITE1 ALT1 must report the real fixed guarded altstack and absent continuation; ALT0 gets no stack credit; inert loading must reserve nothing. Genuine Detcore trap/site0 ALT1 must reach one actual callback at the exact marker IP/TID/RSP, with one completion and fixed guarded 8-MiB capacity. The additional constructor fixture executes the unchanged M2 workload and requires real bootstrap samples disjoint from both later stack extents including guards. Separate source-bound receipts, unchanged M1/M2 comparators, current constructor-bearing leaf qualification and independent clean H/RV source guards are mandatory. No consumer compilation, warm artifact search, caller-byte equality, full-entry/TLS or interior-write-protection claim. Raw observations remain separate from selection. The scheduler hint est_duration_s is 125 s, the median of the 12 passing full validations of 2026-10-15/16 (112-146 s); at 60 s, dispatch by longest estimate kept it waiting behind shorter nodes once its dependencies were done: in the full validation of 947ad92b it started at +429 s, 40 s after its last dependency ended at +389 s, while all 16 slots ran other nodes, and it set the end of the graph to within 11 s."########,
         labels: &[r########"full"########, r########"portable"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_M2_STACK_FIXTURE_BUNDLE="$PWD/target/ci/m2-stack-fixtures.path"; export HERMIT_COLD_STACK_FIXTURE_BUNDLE="$PWD/target/ci/cold-stack-fixtures.path"; REVERIE_LITEINST_PRELOAD=$(./ci/build-liteinst-allocator-fixtures.rs --print-stack-standalone) && export REVERIE_LITEINST_PRELOAD && ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_stacks"########,
         cmdtype: CmdType::Unknown,

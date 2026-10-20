@@ -4198,11 +4198,11 @@ fn assert_m1_allocator_gate(cfg: &DagConfig) -> Result<(), String> {
         .env
         .get("NEXTEST_EXPECTED_EXECUTED")
         .map(String::as_str)
-        != Some("189")
+        != Some("4")
         || consumer.integration_test_binaries.as_deref()
             != Some(&["liteinst_allocator".to_owned()][..])
     {
-        return Err("M1 consumer lost its 189-test target population".into());
+        return Err("M1 consumer lost its four-test target population".into());
     }
     crate::nextest_build_selections::assert_command_selection(consumer)?;
     let command = crate::nextest_build_selections::execution_command(consumer)?;
@@ -4260,11 +4260,11 @@ fn assert_m2_stack_gate(cfg: &DagConfig) -> Result<(), String> {
         .env
         .get("NEXTEST_EXPECTED_EXECUTED")
         .map(String::as_str)
-        != Some("194")
+        != Some("9")
         || consumer.integration_test_binaries.as_deref()
             != Some(&["liteinst_stacks".to_owned()][..])
     {
-        return Err("stack consumer lost its 194-test target population".into());
+        return Err("stack consumer lost its nine-test target population".into());
     }
     crate::nextest_build_selections::assert_command_selection(consumer)?;
     let command = crate::nextest_build_selections::execution_command(consumer)?;
@@ -5592,6 +5592,8 @@ sys.exit(37)
             "label",
             "dependency",
             "count",
+            "old-count",
+            "embedded-qualifier-count",
             "selection",
             "fixture",
         ] {
@@ -5614,6 +5616,14 @@ sys.exit(37)
                     "count" => {
                         step.env
                             .insert("NEXTEST_EXPECTED_EXECUTED".into(), "0".into());
+                    }
+                    "old-count" => {
+                        step.env
+                            .insert("NEXTEST_EXPECTED_EXECUTED".into(), "12".into());
+                    }
+                    "embedded-qualifier-count" => {
+                        step.env
+                            .insert("NEXTEST_EXPECTED_EXECUTED".into(), "189".into());
                     }
                     "selection" => {
                         step.env.remove(crate::nextest_binaries::SELECTION_ENV);
@@ -5642,6 +5652,8 @@ sys.exit(37)
             "label",
             "dependency",
             "count",
+            "old-count",
+            "embedded-qualifier-count",
             "selection",
             "fixture",
             "cold-fixture",
@@ -5665,6 +5677,14 @@ sys.exit(37)
                     "count" => {
                         step.env
                             .insert("NEXTEST_EXPECTED_EXECUTED".into(), "0".into());
+                    }
+                    "old-count" => {
+                        step.env
+                            .insert("NEXTEST_EXPECTED_EXECUTED".into(), "17".into());
+                    }
+                    "embedded-qualifier-count" => {
+                        step.env
+                            .insert("NEXTEST_EXPECTED_EXECUTED".into(), "194".into());
                     }
                     "selection" => {
                         step.env.remove(crate::nextest_binaries::SELECTION_ENV);
