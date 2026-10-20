@@ -4198,11 +4198,11 @@ fn assert_m1_allocator_gate(cfg: &DagConfig) -> Result<(), String> {
         .env
         .get("NEXTEST_EXPECTED_EXECUTED")
         .map(String::as_str)
-        != Some("10")
+        != Some("12")
         || consumer.integration_test_binaries.as_deref()
             != Some(&["liteinst_allocator".to_owned()][..])
     {
-        return Err("M1 consumer lost its ten-test target population".into());
+        return Err("M1 consumer lost its twelve-test target population".into());
     }
     crate::nextest_build_selections::assert_command_selection(consumer)?;
     let command = crate::nextest_build_selections::execution_command(consumer)?;
@@ -4260,11 +4260,11 @@ fn assert_m2_stack_gate(cfg: &DagConfig) -> Result<(), String> {
         .env
         .get("NEXTEST_EXPECTED_EXECUTED")
         .map(String::as_str)
-        != Some("15")
+        != Some("17")
         || consumer.integration_test_binaries.as_deref()
             != Some(&["liteinst_stacks".to_owned()][..])
     {
-        return Err("stack consumer lost its fifteen-test target population".into());
+        return Err("stack consumer lost its seventeen-test target population".into());
     }
     crate::nextest_build_selections::assert_command_selection(consumer)?;
     let command = crate::nextest_build_selections::execution_command(consumer)?;
