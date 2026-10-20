@@ -31,6 +31,9 @@ Hermit currently supports x86-64 Linux. Building and running it requires:
 - User-space performance counters for precise scheduler preemption. Hermit can
   run without them, but CPU-bound workloads receive fewer preemption points.
 
+For container requirements, preflight checks, and measured commands, see
+[Running Hermit in Podman or Docker](docs/running-in-containers.md).
+
 On Debian or Ubuntu:
 
 ```bash
