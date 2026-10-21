@@ -2697,7 +2697,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And resources::tests::the_kernel_run_blocking_calls_are_the_three_outside_the_schedule
     // and scheduler::test::every_kernel_run_blocking_resource_is_granted_outside_the_schedule
     // (A5 step 3c slice 0f, the published kernel-run call list): 2300, listed.
-    ("test.detcore_unit", 2300),
+    // And fourteen retained coherent NUMA controls: 2314.
+    ("test.detcore_unit", 2314),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3058,7 +3059,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the opened-target private-Smaps control: 312, listed.
     // Less under_passthru_opt_an_unobserved_rebinding_names_no_host_input_change,
     // ignored as a known failure by https://github.com/rrnewton/hermit/pull/4559: 311.
-    ("test.hermit_integration_3", 311),
+    // And 28 retained coherent mapping-capture controls: 339.
+    ("test.hermit_integration_3", 339),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4779,7 +4781,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same six slice 0a reserved-send units: 2289, listed.
     // And the same nine host-timed producer units (slice 0b): 2298, listed.
     // And the same two slice 0f kernel-run call-list units: 2300, listed.
-    ("test.detcore_unit_on_host", 2300),
+    // And the same fourteen retained coherent NUMA controls: 2314.
+    ("test.detcore_unit_on_host", 2314),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4888,7 +4891,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the opened-target private-Smaps control: 658, listed.
     // Less under_passthru_opt_an_unobserved_rebinding_names_no_host_input_change
     // (https://github.com/rrnewton/hermit/pull/4559): 657.
-    ("test.hermit_integration_on_host", 657),
+    // And the same 28 retained coherent mapping-capture controls: 685.
+    ("test.hermit_integration_on_host", 685),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

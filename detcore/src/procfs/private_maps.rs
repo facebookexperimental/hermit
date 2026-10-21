@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Projection of authoritative runtime intervals from complete Maps/Smaps snapshots.
+//! Projection of authoritative runtime intervals from complete procfs snapshots.
 //! This is shared policy; providers supply ownership facts, never procfs text.
 
 use reverie::RuntimePrivateMemoryRegion;
@@ -15,6 +15,7 @@ use reverie::RuntimePrivateMemoryRegion;
 pub(crate) enum Format {
     Maps,
     Smaps,
+    NumaMaps,
 }
 
 impl Format {
@@ -22,6 +23,7 @@ impl Format {
         match self {
             Self::Maps => "maps",
             Self::Smaps => "smaps",
+            Self::NumaMaps => "numa_maps",
         }
     }
 
@@ -33,6 +35,7 @@ impl Format {
         match self {
             Self::Maps => project(contents, regions),
             Self::Smaps => project_smaps(contents, regions),
+            Self::NumaMaps => Err("coherent companion Maps capture is required"),
         }
     }
 }
@@ -133,19 +136,9 @@ pub(crate) fn project(
             return Err("overlapping or unordered maps rows");
         }
         previous_end = row.end;
-        let mut cursor = row.start;
-        for region in regions {
-            if region.end <= cursor || region.start >= row.end {
-                continue;
-            }
-            if cursor < region.start {
-                append_fragment(&mut output, body, &row, cursor, region.start.min(row.end))?;
-            }
-            cursor = cursor.max(region.end).min(row.end);
-        }
-        if cursor < row.end {
-            append_fragment(&mut output, body, &row, cursor, row.end)?;
-        }
+        for_guest_fragments(&row, regions, |start, end| {
+            append_fragment(&mut output, body, &row, start, end)
+        })?;
     }
     Ok(output)
 }
@@ -157,6 +150,158 @@ fn validate_regions(regions: &[RuntimePrivateMemoryRegion]) -> Result<(), &'stat
             return Err("invalid runtime-private interval union");
         }
         previous_end = region.end;
+    }
+    Ok(())
+}
+
+fn for_guest_fragments(
+    row: &Header,
+    regions: &[RuntimePrivateMemoryRegion],
+    mut visit: impl FnMut(u64, u64) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let mut cursor = row.start;
+    for region in regions {
+        if region.end <= cursor || region.start >= row.end {
+            continue;
+        }
+        if cursor < region.start {
+            visit(cursor, region.start.min(row.end))?;
+        }
+        cursor = cursor.max(region.end).min(row.end);
+    }
+    if cursor < row.end {
+        visit(cursor, row.end)?;
+    }
+    Ok(())
+}
+
+/// Project raw NUMA rows using the full extents of a contemporaneous Maps capture.
+/// The caller must establish that capture's coherence; matching row starts alone
+/// cannot prove it. Apply the existing NUMA sanitizer once, after this succeeds.
+pub(crate) fn project_numa(
+    maps: &[u8],
+    numa: &[u8],
+    regions: &[RuntimePrivateMemoryRegion],
+) -> Result<Vec<u8>, &'static str> {
+    validate_regions(regions)?;
+    if !maps.is_empty() && !maps.ends_with(b"\n") {
+        return Err("truncated maps snapshot");
+    }
+    if !numa.is_empty() && !numa.ends_with(b"\n") {
+        return Err("truncated numa snapshot");
+    }
+    let mut mappings = Vec::new();
+    let mut previous_end = 0;
+    for line in maps.split_inclusive(|byte| *byte == b'\n') {
+        let row = header(&line[..line.len() - 1])?;
+        if row.start < previous_end {
+            return Err("overlapping or unordered maps rows");
+        }
+        previous_end = row.end;
+        mappings.push(row);
+    }
+
+    let mut output = Vec::with_capacity(numa.len());
+    let mut previous_start = None;
+    for line in numa.split_inclusive(|byte| *byte == b'\n') {
+        let body = &line[..line.len() - 1];
+        let mut fields = body
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty());
+        let start = number(fields.next().ok_or("missing numa start address")?, 16)
+            .map_err(|_| "invalid numa start address")?;
+        // Policy and other fields remain opaque on whole guest VMAs, including
+        // inputs for which the existing sanitizer deliberately preserves bytes.
+        fields.next().ok_or("missing numa policy")?;
+        if previous_start.is_some_and(|previous| start <= previous) {
+            return Err("duplicate or unordered numa rows");
+        }
+        previous_start = Some(start);
+        let index = mappings
+            .binary_search_by_key(&start, |row| row.start)
+            .map_err(|_| "numa start has no exact maps match")?;
+        let row = &mappings[index];
+        let mut guest_end = None;
+        for_guest_fragments(row, regions, |start, end| {
+            // A suffix or a second fragment would require a different policy
+            // lookup address, including a different shmem file offset.
+            if start != row.start {
+                return Err("mixed numa mapping changes policy lookup start");
+            }
+            guest_end = Some(end);
+            Ok(())
+        })?;
+        if let Some(end) = guest_end {
+            if end != row.end {
+                validate_numa_guest_prefix(body)?;
+            }
+            output.extend_from_slice(line);
+        } else {
+            // Dropping this row must not erase a whole-view sanitizer fallback
+            // and thereby strip accounting from the remaining guest rows.
+            numa_without_fallback(body)?;
+        }
+    }
+    Ok(output)
+}
+
+fn numa_without_fallback(body: &[u8]) -> Result<&str, &'static str> {
+    let text = std::str::from_utf8(body).map_err(|_| "non-UTF8 numa sanitizer fallback")?;
+    for field in text.split_whitespace() {
+        if super::numa_page_accounting_value(field)
+            .is_some_and(|value| value.parse::<u64>().is_err())
+        {
+            return Err("malformed numa accounting fallback");
+        }
+    }
+    Ok(text)
+}
+
+fn validate_numa_guest_prefix(body: &[u8]) -> Result<(), &'static str> {
+    let text = numa_without_fallback(body)?;
+    let mut fields = text.split_whitespace().skip(1).peekable();
+    let policy = fields.next().ok_or("missing numa policy")?;
+    // Linux mpol_to_str emits these two multiword policy names. Their flags
+    // and node lists stay opaque, just as for a single-word policy: no policy
+    // is reconstructed or evaluated at a new address.
+    let is_policy_tail = |field: &str, name: &str| {
+        field
+            .strip_prefix(name)
+            .is_some_and(|tail| tail.is_empty() || tail.starts_with('=') || tail.starts_with(':'))
+    };
+    if policy == "weighted" {
+        if !fields
+            .next()
+            .is_some_and(|field| is_policy_tail(field, "interleave"))
+        {
+            return Err("mixed numa mapping has unknown policy");
+        }
+    } else if policy == "prefer"
+        && fields
+            .peek()
+            .is_some_and(|field| is_policy_tail(field, "(many)"))
+    {
+        fields.next();
+    }
+    let mut has_file = false;
+    for field in fields {
+        if matches!(field, "heap" | "stack" | "huge") {
+            return Err("mixed numa mapping has region tags");
+        }
+        if let Some(path) = field.strip_prefix("file=") {
+            if path.is_empty() || has_file {
+                return Err("mixed numa mapping has unsupported file fields");
+            }
+            has_file = true;
+            continue;
+        }
+        if super::numa_page_accounting_value(field).is_some() {
+            return Err("mixed numa mapping has residency fields");
+        }
+        if field.starts_with("kernelpagesize_kB=") {
+            return Err("mixed numa mapping has page-size presence");
+        }
+        return Err("mixed numa mapping has unknown fields");
     }
     Ok(())
 }
@@ -521,20 +666,35 @@ mod tests {
     }
 
     #[test]
-    fn private_projection_only_binds_maps_and_smaps_leaves() {
+    fn private_projection_binds_exact_maps_smaps_and_coherent_numa_leaves() {
         use crate::procfs::ProcfsFile;
-        for (leaf, format) in [("maps", Format::Maps), ("smaps", Format::Smaps)] {
+        for (leaf, format) in [
+            ("maps", Format::Maps),
+            ("smaps", Format::Smaps),
+            ("numa_maps", Format::NumaMaps),
+        ] {
             let path = format!("/proc/self/{leaf}");
             let file = ProcfsFile::from_path(std::path::Path::new(&path)).unwrap();
             assert_eq!(file.private_mapping_format(), Some(format));
         }
-        for leaf in ["smaps_rollup", "numa_maps"] {
-            let path = format!("/proc/self/{leaf}");
-            let path = std::path::Path::new(&path);
+        {
+            let path = std::path::Path::new("/proc/self/smaps_rollup");
             let file = ProcfsFile::from_path(path).unwrap();
             assert_eq!(file.private_mapping_format(), None);
             assert_eq!(crate::procfs::maps_task_at(path, 11, 12), None);
         }
+        for leaf in ["numa_map", "numa_maps/extra", "numa_maps_backup"] {
+            let path = format!("/proc/self/{leaf}");
+            assert_eq!(
+                crate::procfs::maps_task_at(std::path::Path::new(&path), 11, 12),
+                None
+            );
+        }
+        assert_eq!(
+            Format::NumaMaps.project(b"", &[]),
+            Err("coherent companion Maps capture is required"),
+            "NUMA cannot use an unpaired Maps/Smaps snapshot"
+        );
     }
     struct KernelSmapsFixture {
         base: *mut libc::c_void,
@@ -810,6 +970,255 @@ mod tests {
         assert_eq!(kernel_smaps_headers(&changed_smaps), expected_guest);
         assert_ne!(guest_maps, sanitize_maps(&changed_maps, &identities));
         assert_ne!(guest_smaps, sanitize_smaps(&changed_smaps, &identities));
+    }
+
+    #[test]
+    fn numa_private_splits_are_hidden_and_guest_splits_remain_visible() {
+        let before_maps = b"1000-2000 r-xp 0 08:01 7 /guest\n3000-6000 ---p 0 00:00 0\n7000-8000 rw-p 0 08:01 9 /data\n";
+        let after_maps = b"1000-2000 r-xp 0 08:01 7 /guest\n3000-4000 rw-p 0 00:00 0\n4000-5000 ---p 0 08:02 999 /private\n5000-6000 rw-p 0 00:00 0\n7000-8000 rw-p 0 08:01 9 /data\n";
+        let before_numa = b"1000 default file=/guest mapped=1 N0=1\n3000 default\n7000 prefer:0 file=/data dirty=1 N0=1\n";
+        let after_numa = b"1000 default file=/guest mapped=1 N0=1\n3000 default anon=1 N1=1\n4000 default future=value anon=0\n5000 default anon=1 N1=1\n7000 prefer:0 file=/data dirty=1 N0=1\n";
+        let private = [RuntimePrivateMemoryRegion {
+            start: 0x3000,
+            end: 0x6000,
+        }];
+        let expected =
+            b"1000 default file=/guest mapped=1 N0=1\n7000 prefer:0 file=/data dirty=1 N0=1\n";
+        assert_eq!(
+            project_numa(before_maps, before_numa, &private).unwrap(),
+            expected
+        );
+        assert_eq!(
+            project_numa(after_maps, after_numa, &private).unwrap(),
+            expected
+        );
+
+        let guest_split_maps = b"1000-1800 r-xp 0 08:01 7 /guest\n1800-2000 r--p 800 08:01 7 /guest\n3000-6000 ---p 0 00:00 0\n7000-8000 rw-p 0 08:01 9 /data\n";
+        let guest_split_numa = b"1000 default file=/guest\n1800 default file=/guest mapped=1 N0=1\n3000 default\n7000 prefer:0 file=/data dirty=1 N0=1\n";
+        let changed = project_numa(guest_split_maps, guest_split_numa, &private).unwrap();
+        assert_eq!(changed, b"1000 default file=/guest\n1800 default file=/guest mapped=1 N0=1\n7000 prefer:0 file=/data dirty=1 N0=1\n");
+        assert_ne!(changed, expected);
+    }
+
+    #[test]
+    fn numa_whole_guest_rows_preserve_raw_fields_and_sanitizer_fallback() {
+        use super::super::sanitize_numa_maps;
+        let maps = b"1000-2000 rw-p 0 08:01 7 /guest\n3000-4000 ---p 0 00:00 0\n";
+        let private = [RuntimePrivateMemoryRegion {
+            start: 0x3000,
+            end: 0x4000,
+        }];
+        for guest in [
+            &b"1000\tdefault  file=/guest future=value heap kernelpagesize_kB=4 anon=2 N0=2\n"[..],
+            &b"1000 default anon=bad N0=2\n"[..],
+            &b"1000 default file=/guest-\xff anon=2\n"[..],
+        ] {
+            let mut raw = guest.to_vec();
+            raw.extend_from_slice(b"3000 default anon=1 future=value\n");
+            let projected = project_numa(maps, &raw, &private).unwrap();
+            assert_eq!(
+                projected, guest,
+                "projection must not sanitize whole guest rows"
+            );
+            assert_eq!(sanitize_numa_maps(&projected), sanitize_numa_maps(guest));
+        }
+        // Maps may contain entries absent from NUMA. A missing exact match for
+        // a NUMA row is an error; a missing NUMA row is not an inferred extent.
+        assert_eq!(
+            project_numa(maps, b"1000 default\n", &[]).unwrap(),
+            b"1000 default\n"
+        );
+    }
+
+    #[test]
+    fn numa_mixed_prefix_preserves_start_policy_and_file_bytes() {
+        let maps = b"1000-5000 rw-s 2000 00:01 7 /dev/shm/data\n7000-8000 rw-p 0 00:00 0\n";
+        let private = [
+            RuntimePrivateMemoryRegion {
+                start: 0x3000,
+                end: 0x4000,
+            },
+            RuntimePrivateMemoryRegion {
+                start: 0x4000,
+                end: 0x5000,
+            },
+        ];
+        for prefix in [
+            &b"1000 default\n"[..],
+            &b"1000\tbind:0-1  file=/dev/shm/data\\040name\n"[..],
+            &b"1000 prefer (many)=static|balancing:0-1 file=/dev/shm/data\n"[..],
+            &b"1000 weighted interleave=relative:0-2\n"[..],
+        ] {
+            // An unrelated whole guest row can invoke the sanitizer's fallback;
+            // it does not authorize weakening the mixed row's field restriction.
+            let mut raw = prefix.to_vec();
+            raw.extend_from_slice(b"7000 default file=/guest-\xff anon=bad\n");
+            assert_eq!(project_numa(maps, &raw, &private).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn numa_changed_start_or_multiple_fragments_refuse_even_without_counters() {
+        let maps = b"1000-5000 rw-s 2000 00:01 7 /dev/shm/data\n";
+        let numa = b"1000 bind:0 file=/dev/shm/data\n";
+        for private in [
+            RuntimePrivateMemoryRegion {
+                start: 0x1000,
+                end: 0x2000,
+            },
+            RuntimePrivateMemoryRegion {
+                start: 0x2000,
+                end: 0x3000,
+            },
+        ] {
+            assert_eq!(
+                project_numa(maps, numa, &[private]),
+                Err("mixed numa mapping changes policy lookup start"),
+                "a start inside a private interval cannot hide a guest suffix"
+            );
+        }
+    }
+
+    #[test]
+    fn numa_mixed_fields_have_specific_refusal_reasons() {
+        let maps = b"1000-5000 rw-p 0 00:00 0\n";
+        let private = [RuntimePrivateMemoryRegion {
+            start: 0x3000,
+            end: 0x5000,
+        }];
+        for (field, reason) in [
+            ("heap", "mixed numa mapping has region tags"),
+            ("stack", "mixed numa mapping has region tags"),
+            ("huge", "mixed numa mapping has region tags"),
+            (
+                "kernelpagesize_kB=4",
+                "mixed numa mapping has page-size presence",
+            ),
+            ("future=1", "mixed numa mapping has unknown fields"),
+            ("N=1", "mixed numa mapping has unknown fields"),
+            ("Nother=1", "mixed numa mapping has unknown fields"),
+            ("file=", "mixed numa mapping has unsupported file fields"),
+            (
+                "file=/a file=/b",
+                "mixed numa mapping has unsupported file fields",
+            ),
+        ] {
+            let numa = format!("1000 default {field}\n");
+            assert_eq!(project_numa(maps, numa.as_bytes(), &private), Err(reason));
+        }
+        for name in [
+            "active",
+            "anon",
+            "dirty",
+            "mapped",
+            "mapmax",
+            "swapcache",
+            "writeback",
+            "N0",
+            "N12",
+        ] {
+            for value in ["0", "1", "18446744073709551615"] {
+                let numa = format!("1000 default {name}={value}\n");
+                assert_eq!(
+                    project_numa(maps, numa.as_bytes(), &private),
+                    Err("mixed numa mapping has residency fields")
+                );
+            }
+            for value in ["", "bad", "-1", "18446744073709551616"] {
+                let numa = format!("1000 default {name}={value}\n");
+                assert_eq!(
+                    project_numa(maps, numa.as_bytes(), &private),
+                    Err("malformed numa accounting fallback")
+                );
+            }
+        }
+        assert_eq!(
+            project_numa(maps, b"1000 default file=/a-\xff\n", &private),
+            Err("non-UTF8 numa sanitizer fallback")
+        );
+        for policy in ["weighted", "weighted unknown", "default unexpected"] {
+            let numa = format!("1000 {policy}\n");
+            assert!(project_numa(maps, numa.as_bytes(), &private).is_err());
+        }
+    }
+
+    #[test]
+    fn numa_validates_row_and_maps_framing_before_private_filtering() {
+        let maps = b"1000-2000 rw-p 0 00:00 0\n3000-4000 rw-p 0 00:00 0\n";
+        let private = [RuntimePrivateMemoryRegion {
+            start: 0x1000,
+            end: 0x5000,
+        }];
+        for (numa, reason) in [
+            (&b"1000 default"[..], "truncated numa snapshot"),
+            (&b"\n"[..], "missing numa start address"),
+            (&b"x default\n"[..], "invalid numa start address"),
+            (
+                &b"10000000000000000 default\n"[..],
+                "invalid numa start address",
+            ),
+            (&b"1000\n"[..], "missing numa policy"),
+            (
+                &b"1000 default\n1000 default\n"[..],
+                "duplicate or unordered numa rows",
+            ),
+            (
+                &b"3000 default\n1000 default\n"[..],
+                "duplicate or unordered numa rows",
+            ),
+            (&b"1800 default\n"[..], "numa start has no exact maps match"),
+            (&b"2000 default\n"[..], "numa start has no exact maps match"),
+            (&b"5000 default\n"[..], "numa start has no exact maps match"),
+            (
+                &b"1000 default anon=bad\n"[..],
+                "malformed numa accounting fallback",
+            ),
+            (
+                &b"1000 default N0=18446744073709551616\n"[..],
+                "malformed numa accounting fallback",
+            ),
+            (
+                &b"1000 default file=/private-\xff\n"[..],
+                "non-UTF8 numa sanitizer fallback",
+            ),
+        ] {
+            assert_eq!(project_numa(maps, numa, &private), Err(reason));
+        }
+        for bad_maps in [
+            &b"1000-2000 rw-p 0 00:00 0"[..],
+            &b"2000-1000 rw-p 0 00:00 0\n"[..],
+            &b"1000-2000 rw-p 0 00:00 nope\n"[..],
+            &b"1000-2000 rw-p 10000000000000000 00:00 0\n"[..],
+            &b"1000-3000 rw-p 0 00:00 0\n2000-4000 rw-p 0 00:00 0\n"[..],
+            &b"3000-4000 rw-p 0 00:00 0\n1000-2000 rw-p 0 00:00 0\n"[..],
+        ] {
+            assert!(project_numa(bad_maps, b"1000 default\n", &private).is_err());
+        }
+        for regions in [
+            vec![RuntimePrivateMemoryRegion { start: 2, end: 1 }],
+            vec![
+                RuntimePrivateMemoryRegion { start: 1, end: 3 },
+                RuntimePrivateMemoryRegion { start: 2, end: 4 },
+            ],
+        ] {
+            assert_eq!(
+                project_numa(maps, b"1000 default\n", &regions),
+                Err("invalid runtime-private interval union")
+            );
+        }
+        // Otherwise dropping the second row would suppress the sanitizer's
+        // whole-view fallback and strip counters from the first guest row.
+        assert_eq!(
+            project_numa(
+                maps,
+                b"1000 default anon=1 N0=1\n3000 default dirty=invalid\n",
+                &[RuntimePrivateMemoryRegion {
+                    start: 0x3000,
+                    end: 0x4000,
+                }],
+            ),
+            Err("malformed numa accounting fallback")
+        );
     }
 
     #[test]

@@ -1592,11 +1592,12 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // 0x182 private DBT runtime images stay out of application mapping space,
     // 0x183 authenticates bootstrap LOAD ownership in the guest maps view,
     // 0x184 projects those private intervals from complete Smaps sections,
-    // and 0x185 random devices are classified by device number),
+    // 0x185 random devices are classified by device number,
+    // and 0x186 projects coherent NUMA rows with authenticated private ownership),
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x185,
+        metadata["version"], 0x186,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);

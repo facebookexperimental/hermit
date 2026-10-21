@@ -664,7 +664,8 @@ pub(crate) fn maps_task_at(path: &Path, pid: i32, tid: i32) -> Option<BoundTask>
     let normalized = normalize_observed_path(path)?;
     let path = normalized.to_str()?;
     ProcfsTask::parse(path, "maps")
-        .or_else(|| ProcfsTask::parse(path, "smaps"))?
+        .or_else(|| ProcfsTask::parse(path, "smaps"))
+        .or_else(|| ProcfsTask::parse(path, "numa_maps"))?
         .bound_to(pid, tid)
         .bound()
 }
@@ -1739,6 +1740,8 @@ impl ProcfsFile {
             Some(private_maps::Format::Maps)
         } else if self.kind == ProcfsKind::Smaps {
             Some(private_maps::Format::Smaps)
+        } else if self.kind == ProcfsKind::NumaMaps {
+            Some(private_maps::Format::NumaMaps)
         } else {
             None
         }
@@ -4025,21 +4028,21 @@ fn sanitize_fdinfo(contents: &[u8], identity: Option<(u64, i32, u64, u64)>) -> V
     normalized
 }
 
+fn numa_page_accounting_value(field: &str) -> Option<&str> {
+    let (name, value) = field.split_once('=')?;
+    let fixed_counter = matches!(
+        name,
+        "active" | "anon" | "dirty" | "mapped" | "mapmax" | "swapcache" | "writeback"
+    );
+    let node_counter = name
+        .strip_prefix('N')
+        .is_some_and(|node| !node.is_empty() && node.bytes().all(|byte| byte.is_ascii_digit()));
+    (fixed_counter || node_counter).then_some(value)
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-934): Review the /proc/self/numa_maps field policy.
 fn sanitize_numa_maps(contents: &[u8]) -> Vec<u8> {
-    fn page_accounting_value(field: &str) -> Option<&str> {
-        let (name, value) = field.split_once('=')?;
-        let fixed_counter = matches!(
-            name,
-            "active" | "anon" | "dirty" | "mapped" | "mapmax" | "swapcache" | "writeback"
-        );
-        let node_counter = name
-            .strip_prefix('N')
-            .is_some_and(|node| !node.is_empty() && node.bytes().all(|byte| byte.is_ascii_digit()));
-        (fixed_counter || node_counter).then_some(value)
-    }
-
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
     };
@@ -4056,7 +4059,7 @@ fn sanitize_numa_maps(contents: &[u8]) -> Vec<u8> {
 
         let mut kept = Vec::with_capacity(fields.len());
         for field in fields {
-            if let Some(value) = page_accounting_value(field) {
+            if let Some(value) = numa_page_accounting_value(field) {
                 if value.parse::<u64>().is_err() {
                     return contents.to_vec();
                 }

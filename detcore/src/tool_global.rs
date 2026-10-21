@@ -12,6 +12,7 @@
 mod exec_identity;
 #[cfg(feature = "physical-mm-test-support")]
 pub mod initial_mm_probe;
+pub(crate) mod mapping_capture;
 pub mod native_exec;
 mod parked;
 use std::cmp::Ordering;
@@ -1197,6 +1198,9 @@ pub struct GlobalState {
     /// Actual controller input, held only until the registered root image
     /// consumes it. The lease keeps its raw identity live, not guest-visible.
     inherited_input: Mutex<Option<PendingInheritedInput>>,
+    // Installed only on the external controller by a contained launcher.
+    mapping_capture_run: Option<reverie::MappingCaptureRun>,
+    mapping_capture_pending: Mutex<Option<mapping_capture::Pending>>,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
@@ -1700,6 +1704,8 @@ impl GlobalState {
             past_first_execve: AtomicBool::new(false),
             initial_descriptor_image_complete: AtomicBool::new(false),
             inherited_input: Mutex::new(None),
+            mapping_capture_run: None,
+            mapping_capture_pending: Mutex::new(None),
             pending_exec_states: process_exit_cleanup.pending_exec_states,
             completed_exec_transfers: process_exit_cleanup.completed_exec_transfers,
             post_exec_fd_blocking: process_exit_cleanup.post_exec_fd_blocking,
@@ -2205,6 +2211,10 @@ impl GlobalTool for GlobalState {
         });
     }
 
+    fn install_mapping_capture_run(&mut self, run: reverie::MappingCaptureRun) {
+        self.mapping_capture_run = Some(run);
+    }
+
     fn install_backend_signal_control(
         &self,
         control: Option<reverie::BackendSignalControl>,
@@ -2398,6 +2408,12 @@ impl GlobalTool for GlobalState {
     }
 
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
+        if let GlobalRequest::MappingCapture(request) = &gr.2 {
+            return (
+                None,
+                GlobalResponse::MappingCapture(self.mapping_capture_request(from, gr.1, request)),
+            );
+        }
         if let GlobalRequest::CheckBrkMappings(check, fact) = &gr.2 {
             return (
                 None,
@@ -2557,6 +2573,12 @@ impl GlobalState {
     ) -> <Self as GlobalTool>::Response {
         // This read stays inside the caller's existing grant. In particular,
         // it neither drains logs nor updates clocks or deadline ownership.
+        if let GlobalRequest::MappingCapture(request) = &gr.2 {
+            return (
+                None,
+                GlobalResponse::MappingCapture(self.mapping_capture_request(from, gr.1, request)),
+            );
+        }
         if let GlobalRequest::CheckBrkMappings(check, fact) = &gr.2 {
             return (
                 None,
@@ -3023,6 +3045,9 @@ impl GlobalState {
                 unreachable!(
                     "refused signal controls are answered before the forwarded-record drain"
                 )
+            }
+            GlobalRequest::MappingCapture(_) => {
+                unreachable!("coherent mapping capture precedes clock accounting")
             }
             GlobalRequest::CheckBrkMappings(..) => {
                 unreachable!("mapping capture is answered before clock accounting")
@@ -6511,6 +6536,8 @@ pub enum GlobalRequest {
     /// may know under another identity, whose fdinfo could not be read for
     /// this reason (`procfs::locks::LockLedger::refuse`). Appended last.
     LockLedgerRefused(String),
+    /// Contained mapping capture; answered without changing the serial grant.
+    MappingCapture(mapping_capture::Request),
 }
 
 /// Responses from the global object
@@ -6743,6 +6770,8 @@ pub enum GlobalResponse {
     HostTimedAndPrivateSigchld(u64, u64),
     /// Appended last.
     LockLedgerRefused(()),
+    /// Appended mapping capture response.
+    MappingCapture(mapping_capture::Reply),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external

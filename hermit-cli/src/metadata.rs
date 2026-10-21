@@ -827,7 +827,12 @@ impl RecordVersion {
 // the seeded stream and expects the `fstat`; replaying it would print other
 // bytes and fall out of step, so it is refused here
 // (https://github.com/rrnewton/hermit/issues/4544).
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x185);
+// 0x185 -> 0x186 (reserved dh-8abwk / dh-gxmvo-c4f85c08835; coordinator
+// confirms landing order): coherent runtime-private NUMA projection changes
+// guest procfs bytes and refuses unsupported observation domains. ABI15 and
+// private capture storage can also shift runtime layout. Older recordings must
+// not replay with different values.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x186);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -852,7 +857,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x185);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x185;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x186;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

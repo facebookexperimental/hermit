@@ -5800,7 +5800,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 table
             }
-            None => self.snapshot_procfs(guest, call).await?,
+            None => {
+                if let Some((crate::procfs::private_maps::Format::NumaMaps, target)) = &maps_target
+                {
+                    if !can_read(
+                        guest
+                            .thread_state()
+                            .with_detfd(call.fd(), |fd| fd.status_flags())?,
+                    ) {
+                        return Err(Errno::EBADF.into());
+                    }
+                    crate::tool_global::mapping_capture::capture(guest, target)?
+                } else {
+                    self.snapshot_procfs(guest, call).await?
+                }
+            }
         };
         let raw_contents = if let Some((format, target)) = maps_target {
             let name = format.name();
@@ -5809,13 +5823,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                     "runtime-private {name} view unavailable: target ownership changed during capture"
                 )));
             }
-            format
-                .project(&raw_contents, &target.private.regions)
-                .map_err(|reason| {
-                    Error::Tool(anyhow::anyhow!(
-                        "runtime-private {name} view unavailable: {reason}"
-                    ))
-                })?
+            if format == crate::procfs::private_maps::Format::NumaMaps {
+                // The synchronous capture already projected its coherent pair
+                // with this exact ownership fact. The existing initializer
+                // below applies the unchanged NUMA sanitizer exactly once.
+                raw_contents
+            } else {
+                format
+                    .project(&raw_contents, &target.private.regions)
+                    .map_err(|reason| {
+                        Error::Tool(anyhow::anyhow!(
+                            "runtime-private {name} view unavailable: {reason}"
+                        ))
+                    })?
+            }
         } else {
             raw_contents
         };

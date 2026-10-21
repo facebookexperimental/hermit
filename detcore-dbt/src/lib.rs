@@ -96,8 +96,9 @@ const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | l
 /// Version 14 grows the private-memory snapshot pointee from 96 to 176 bytes
 /// for authenticated bootstrap LOAD pages; the callback table remains 80 bytes.
 /// Installing the callback does not enable instrumentation or shared time.
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 14;
-const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 80;
+// Version 15 appends the cooperative mapping-capture callback at offset 80.
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 15;
+const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 88;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the inherited DBT report descriptor.
@@ -132,7 +133,16 @@ fn upgrade_runtime_callbacks_v1(
         controller_capture_control: unsupported_controller_capture,
         runtime_private_memory: unavailable_private_memory,
         branch_fact: unavailable_branch_fact,
+        mapping_capture: unavailable_mapping_capture,
     }
+}
+
+unsafe extern "C" fn unavailable_mapping_capture(
+    _context: usize,
+    _operation: u32,
+    _arguments: *mut reverie_dbt::NativeMappingCapture,
+) -> i32 {
+    0
 }
 
 unsafe extern "C" fn unsupported_controller_capture(
@@ -1304,6 +1314,7 @@ unsafe fn runtime_background_init(
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
     reverie_dbt::install_runtime_private_memory(callbacks.runtime_private_memory);
     reverie_dbt::install_branch_fact_query(callbacks.branch_fact);
+    reverie_dbt::install_mapping_capture(callbacks.mapping_capture);
     let (emit_diagnostic, emit_evidence, protected_level) = runtime_callback_channels(callbacks);
     let _ = DBT_DIAGNOSTIC_EMITTER.set(emit_diagnostic);
     DBT_EVIDENCE_LOG_LEVEL.store(protected_level, Ordering::Release);
@@ -3624,8 +3635,8 @@ mod tests {
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 14);
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE, 80);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 15);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE, 88);
         assert_eq!(
             std::mem::offset_of!(reverie_dbt::DbtRuntimeCallbacks, branch_fact),
             72
@@ -3747,6 +3758,7 @@ mod tests {
             controller_capture_control: unsupported_controller_capture,
             runtime_private_memory: unavailable_private_memory,
             branch_fact: unavailable_branch_fact,
+            mapping_capture: unavailable_mapping_capture,
         };
         let (diagnostic, evidence, level) = runtime_callback_channels(&callbacks);
 

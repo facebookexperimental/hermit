@@ -931,6 +931,7 @@ mod event_tests {
     use crate::Config;
     use crate::Detcore;
     use crate::GlobalState;
+    use crate::Sysno;
     use crate::ThreadState;
     use crate::fd::DetFd;
     use crate::fd::FdType;
@@ -1153,6 +1154,10 @@ mod event_tests {
         memory: EventMemory,
         injected_iovecs: Vec<(usize, usize)>,
         injected_zero_reads: usize,
+        // Enabled only by the io_uring refusal control. Count the actual Guest
+        // injection boundary while returning the same ENOSYS as the handler:
+        // errno alone must not hide a forwarding regression.
+        io_uring_injections: Option<usize>,
         polls: Mutex<Vec<u32>>,
         /// `Resources::backend_runtime_bootstrap` of each resource request,
         /// in the order the requests arrive.
@@ -1353,6 +1358,19 @@ mod event_tests {
 
         async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
             let (number, args) = syscall.into_parts();
+            if matches!(
+                number,
+                Sysno::io_uring_setup | Sysno::io_uring_enter | Sysno::io_uring_register
+            ) {
+                let calls = self
+                    .io_uring_injections
+                    .as_mut()
+                    .expect("unexpected io_uring injection outside its refusal control");
+                *calls += 1;
+                // No host syscall: this fake backend records the invocation
+                // boundary even when the reported errno remains unchanged.
+                return Err(Errno::ENOSYS);
+            }
             if let Syscall::Read(call) = Syscall::from_raw(number, args) {
                 assert_eq!(call.len(), 0);
                 self.injected_zero_reads += 1;
@@ -1476,6 +1494,7 @@ mod event_tests {
             memory: EventMemory::new(),
             injected_iovecs: Vec::new(),
             injected_zero_reads: 0,
+            io_uring_injections: None,
             polls: Mutex::new(Vec::new()),
             request_marks: Mutex::new(Vec::new()),
             releases: Mutex::new(0),
@@ -1487,6 +1506,41 @@ mod event_tests {
             report_memory_regions: false,
         };
         (tool, guest)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn io_uring_refusal_never_reaches_guest_injection() {
+        for passthru_opt in [false, true] {
+            for call in [
+                Syscall::from(reverie::syscalls::IoUringSetup::new()),
+                Syscall::from(reverie::syscalls::IoUringEnter::new()),
+                Syscall::from(reverie::syscalls::IoUringRegister::new()),
+            ] {
+                let (_tool, mut guest) = event_guest(FdType::Regular, None);
+                guest.config.passthru_opt = passthru_opt;
+                guest.io_uring_injections = Some(0);
+                let tool = <Detcore as Tool>::new(guest.pid(), &guest.config);
+                let number = call.number();
+                assert!(
+                    <Detcore as Tool>::subscriptions(&guest.config)
+                        .iter_syscalls()
+                        .any(|subscribed| subscribed == number),
+                    "{number}: passthru_opt={passthru_opt} bypassed the handler"
+                );
+                let result = tool.handle_syscall_event(&mut guest, call).await;
+                assert_eq!(
+                    guest.io_uring_injections,
+                    Some(0),
+                    "{number}: passthru_opt={passthru_opt} reached injection"
+                );
+                assert!(
+                    matches!(result, Err(Error::Errno(Errno::ENOSYS))),
+                    "{number}: passthru_opt={passthru_opt}: {result:?}"
+                );
+                // EventGuest::tail_inject already panics unconditionally, so
+                // forwarding through that other kernel boundary also fails.
+            }
+        }
     }
 
     /// A happens-before program with one posthook anchor, `p`, on the

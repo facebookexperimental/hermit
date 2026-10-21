@@ -12,6 +12,10 @@ mod hermit_test;
 #[path = "common/readonly_proc.rs"]
 mod readonly_proc;
 
+#[cfg(feature = "dbt")]
+#[path = "common/mapping_capture_live.rs"]
+mod mapping_capture_live;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;

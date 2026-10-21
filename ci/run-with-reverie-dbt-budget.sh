@@ -2458,7 +2458,24 @@ fi
 # third-party/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so inventory 999, SDK and native inputs, calibrated
 # budget, job width and limits carry unchanged from the 7d2bee96 entry.
-expected_pin=71aa5842d2f2a7ab94b05c06f418c11d9945088d
+# CARRY TO 22133ff8adc2f1bc6a32133dd7c6d92e4ba30c00 (2026-10-21): coherent mapping capture prerequisite.
+# SDK/native sources changed; no source-equality or old-runtime carry is claimed.
+# The normal producer in scope14b built SDK a0f4981c from current sources:
+# 30.57s wall, jobs7, 214.00 job-seconds under the existing eight-core admission.
+# Preserve the existing budgets/limits and all calibration history. Fresh SDK
+# key authentication, normal package qualification and final gates remain required.
+# CARRY TO 4949692f882cc373ec077770ec9bc157007014af (2026-10-21): restack on Reverie main39f2.
+# The capture SDK/native inputs equal the reviewed 22133ff prerequisite; the
+# new base changes ptrace task/tracer code, and this commit also repairs two
+# rustdoc comments plus their existing artifact catalog tuples. No fresh
+# calibration or prior runtime/package identity is claimed. Preserve budgets,
+# limits and all histories; authenticate current inputs for each producer.
+# CARRY TO e069a76deaf8bd0768bc94a11b64ca2207a5aab1 (2026-10-22): mechanical restack on main71aa.
+# The capture SDK/native inputs equal the reviewed 4949692 prerequisite.
+# Upstream KVM/LiteInst changes and a Tool documentation edit are retained.
+# Keep calibrated budgets/limits unchanged; no new runtime, package or fresh
+# calibration result is claimed by this source-only carry.
+expected_pin=e069a76deaf8bd0768bc94a11b64ca2207a5aab1
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

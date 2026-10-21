@@ -2422,6 +2422,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     type GlobalState = GlobalState;
     type ThreadState = ThreadState<T::ThreadState>;
 
+    fn native_mm_ownership(config: &Config) -> reverie::NativeMmOwnership {
+        // Guest-local initialization and callback polling use the backend's
+        // managed runtime. Scheduler/controller workers execute in another MM;
+        // the native fatal-core worker is called only by the ptrace tracer.
+        // io_uring remains intercepted and refused, including passthru_opt.
+        // This guarantee must also be supplied by the inner Tool: recording,
+        // replay, and arbitrary extensions do not inherit it implicitly.
+        T::native_mm_ownership(config)
+    }
+
     /// Only a sequentialized run on a backend with process signal control
     /// can install that control. Whether this run observes dequeues is
     /// decided after installation by [`GlobalState`]'s
