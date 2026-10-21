@@ -417,8 +417,11 @@ pub(crate) fn readlink_size(buffer_len: usize) -> Result<usize, Errno> {
 /// caller's namespace links name their canonical constants; and the caller's
 /// own descriptor link spelled through its thread is its `fd/N`. A trailing
 /// slash or `.` follows the link, so such a spelling of a decided target is
-/// [`DecidedLink::Followed`]. `None` for any other path, for a spelling with
-/// `..`, and for a followed descriptor link, which the kernel resolves.
+/// [`DecidedLink::Followed`]. The caller's own process directory by number,
+/// its `task` directory and its own thread's directory are no links, so
+/// EINVAL by any of these spellings. `None` for any other path, for a
+/// spelling with `..`, and for a followed descriptor link, which the kernel
+/// resolves.
 fn decided_procfs_link(path: &[u8], pid: i32, tid: i32) -> Option<DecidedLink> {
     let rest = path.strip_prefix(b"/proc/")?;
     let mut parts = Vec::new();
@@ -444,7 +447,9 @@ fn decided_procfs_link(path: &[u8], pid: i32, tid: i32) -> Option<DecidedLink> {
                     Errno::ENOTDIR
                 },
             )),
-            _ => None,
+            // A directory is one followed or not.
+            followed @ DecidedLink::Followed(_) => Some(followed),
+            DecidedLink::SelfFd(_) => None,
         };
     }
     decided_procfs_link_parts(&parts, pid, tid)
@@ -480,6 +485,16 @@ fn decided_procfs_link_parts(parts: &[&[u8]], pid: i32, tid: i32) -> Option<Deci
         }
         [process, b"task", thread, b"fd", fd] if own_process(process) && own_thread(thread) => {
             decimal_fd(OsStr::from_bytes(fd)).map(DecidedLink::SelfFd)
+        }
+        // The caller's own process directory by number, its `task`
+        // directory, and its own thread's directory: directories, not links,
+        // so `readlink` fails with EINVAL, as on Linux. Decided here so that
+        // no backend's `/proc` answers for them: the KVM executor's is the
+        // supervisor's, where the number names another task or none.
+        [process] if *process == pid_name.as_bytes() => Some(DecidedLink::Followed(Errno::EINVAL)),
+        [process, b"task"] if own_process(process) => Some(DecidedLink::Followed(Errno::EINVAL)),
+        [process, b"task", thread] if own_process(process) && own_thread(thread) => {
+            Some(DecidedLink::Followed(Errno::EINVAL))
         }
         _ => None,
     }
@@ -2327,6 +2342,18 @@ mod tests {
         ] {
             assert_eq!(decided(path), followed(Errno::EINVAL), "{path}");
         }
+        // The caller's own directories are no links: EINVAL, followed or not.
+        for path in [
+            "/proc/3",
+            "/proc/3/",
+            "/proc/3/.",
+            "/proc/3/task",
+            "/proc/self/task",
+            "/proc/3/task/5",
+            "/proc/self/task/5/",
+        ] {
+            assert_eq!(decided(path), followed(Errno::EINVAL), "{path}");
+        }
         for path in [
             "/proc/mounts/",
             "/proc/mounts/.",
@@ -2347,6 +2374,9 @@ mod tests {
             "/proc/4/ns/pid",
             "/proc/self/task/6/ns/pid",
             "/proc/self/task/6/fd/7",
+            "/proc/4/task",
+            "/proc/3/task/6",
+            "/proc/5",
             "/proc/self/ns/unknown",
             "/proc/self/fd/7",
             "/proc/self/exe",

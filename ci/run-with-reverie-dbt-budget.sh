@@ -2385,8 +2385,16 @@ fi
 # third-party/ and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml,
 # so inventory 997, SDK and native inputs, calibrated budget, job width and
 # limits carry unchanged from the 0788cb09 entry.
+# CARRY TO 9c993c8528f1b05a5c0241eaff98f73817853d02 (2026-10-20): from
+# ae4467b31549288aa56268c401dbdbcab7043bb5. One commit (kvm lane, LinuxEmu
+# shrink D4a: the executor's loginuid, cpufreq and /proc/self link answers
+# and their virtual-file carrier are deleted). It changes reverie-kvm/src
+# only; git diff is empty under reverie-dbt/ and third-party/ and for the
+# root Cargo.toml, Cargo.lock and rust-toolchain.toml, so inventory 997, SDK
+# and native inputs, calibrated budget, job width and limits carry unchanged
+# from the ae4467b3 entry.
 
-expected_pin=ae4467b31549288aa56268c401dbdbcab7043bb5
+expected_pin=9c993c8528f1b05a5c0241eaff98f73817853d02
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

@@ -2636,7 +2636,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (review of https://github.com/rrnewton/hermit/pull/4532): 2255, listed.
     // And the statfs canonicalization unit of the LinuxEmu D2 pin
     // (canonicalize_statfs_buf_caps_free_counts_and_zeroes_the_fsid): 2256.
-    ("test.detcore_unit", 2256),
+    // And the cpufreq boost constant unit of the LinuxEmu D4a pin
+    // (cpufreq_boost_is_off_on_every_policy): 2257.
+    ("test.detcore_unit", 2257),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4664,7 +4666,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Add 21 first-image loader controls; retain main's full selection.
     // And the same --signal-at boundary test: 2255, listed.
     // And the same statfs canonicalization unit of the LinuxEmu D2 pin: 2256.
-    ("test.detcore_unit_on_host", 2256),
+    // And the same cpufreq boost constant unit of the LinuxEmu D4a pin: 2257.
+    ("test.detcore_unit_on_host", 2257),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

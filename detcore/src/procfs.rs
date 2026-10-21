@@ -2326,30 +2326,29 @@ fn parse_fdinfo_target(path: &str) -> Option<i32> {
 
 const VIRTUAL_CPU_FREQUENCY_KHZ: u64 = 1_000_000;
 
-fn is_cpufreq_policy_value_path(path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix("/sys/devices/system/cpu") else {
-        return false;
-    };
+/// The attribute a path names in a cpufreq policy directory, by either of
+/// Linux's spellings: `cpu/cpuN/cpufreq/<attribute>` or
+/// `cpu/cpufreq/policyN/<attribute>`.
+fn cpufreq_policy_attribute(path: &Path) -> Option<&str> {
+    let relative = path.strip_prefix("/sys/devices/system/cpu").ok()?;
     let components = relative
         .iter()
-        .filter_map(|component| component.to_str())
-        .collect::<Vec<_>>();
-    let attribute = match components.as_slice() {
-        [cpu, "cpufreq", attribute]
-            if cpu.strip_prefix("cpu").is_some_and(|id| {
-                !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
-            }) =>
-        {
-            *attribute
-        }
-        ["cpufreq", policy, attribute]
-            if policy.strip_prefix("policy").is_some_and(|id| {
-                !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
-            }) =>
-        {
-            *attribute
-        }
-        _ => return false,
+        .map(|component| component.to_str())
+        .collect::<Option<Vec<_>>>()?;
+    let numbered = |name: &str, prefix: &str| {
+        name.strip_prefix(prefix)
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+    };
+    match components.as_slice() {
+        [cpu, "cpufreq", attribute] if numbered(cpu, "cpu") => Some(*attribute),
+        ["cpufreq", policy, attribute] if numbered(policy, "policy") => Some(*attribute),
+        _ => None,
+    }
+}
+
+fn is_cpufreq_policy_value_path(path: &Path) -> bool {
+    let Some(attribute) = cpufreq_policy_attribute(path) else {
+        return false;
     };
     matches!(
         attribute,
@@ -2480,6 +2479,13 @@ enum SingleCpuFile {
     /// `node0/distance`: one distance per node, so only node 0's to itself,
     /// which Linux reports as 10.
     Node0Distance,
+    /// cpufreq's `boost`, the global switch and each policy's: 0, off. The
+    /// virtual CPU cannot boost: its CPUID shows neither Intel's turbo
+    /// (`ida`) nor AMD's core performance boost (`cpb`), and its cpufreq
+    /// policy reports one frequency, [`VIRTUAL_CPU_FREQUENCY_KHZ`], as its
+    /// minimum, maximum and current. Linux shows no `boost` for such a CPU;
+    /// like the other cpufreq files, it is kept where the host has it.
+    CpufreqBoost,
 }
 
 impl SingleCpuFile {
@@ -2490,6 +2496,8 @@ impl SingleCpuFile {
             "/sys/devices/system/cpu/smt/control" => Self::SmtControl,
             "/sys/devices/system/node/has_generic_initiator" => Self::GenericInitiators,
             "/sys/devices/system/node/node0/distance" => Self::Node0Distance,
+            "/sys/devices/system/cpu/cpufreq/boost" => Self::CpufreqBoost,
+            _ if cpufreq_policy_attribute(Path::new(path)) == Some("boost") => Self::CpufreqBoost,
             _ => match path.strip_prefix("/sys/devices/system/cpu/cpu0/topology/")? {
                 "cluster_id" | "core_id" | "die_id" | "physical_package_id" => Self::TopologyId,
                 _ => return None,
@@ -2500,7 +2508,7 @@ impl SingleCpuFile {
     fn contents(self) -> Vec<u8> {
         match self {
             Self::KernelMax => format!("{}\n", VIRTUAL_CPUSET_BYTES * 8 - 1).into_bytes(),
-            Self::SmtActive | Self::TopologyId => b"0\n".to_vec(),
+            Self::SmtActive | Self::TopologyId | Self::CpufreqBoost => b"0\n".to_vec(),
             Self::SmtControl => b"notsupported\n".to_vec(),
             Self::GenericInitiators => b"\n".to_vec(),
             Self::Node0Distance => b"10\n".to_vec(),
@@ -7041,6 +7049,37 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
         }
         assert_eq!(sanitize_cpu_list(b"0-1\n"), b"0\n");
         assert_eq!(sanitize_cpu_list(b"\n"), b"\n");
+    }
+
+    /// Every spelling of cpufreq's boost switch reads 0 on every backend,
+    /// whatever the host's value; other files of a policy keep their kinds.
+    #[test]
+    fn cpufreq_boost_is_off_on_every_policy() {
+        let kind = |path: &str| ProcfsFile::from_path(Path::new(path)).map(|file| file.kind);
+        for path in [
+            "/sys/devices/system/cpu/cpufreq/boost",
+            "/sys/devices/system/cpu/cpufreq/policy0/boost",
+            "/sys/devices/system/cpu/cpufreq/policy17/boost",
+            "/sys/devices/system/cpu/cpu0/cpufreq/boost",
+            "/sys/devices/system/cpu/cpu5/cpufreq/boost",
+        ] {
+            let Some(ProcfsKind::SingleCpuConstant(file)) = kind(path) else {
+                panic!("{path} is {:?}, not a constant", kind(path));
+            };
+            assert_eq!(file.contents(), b"0\n", "{path}");
+        }
+        assert_eq!(
+            kind("/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq"),
+            Some(ProcfsKind::ScalingCurFreq)
+        );
+        for path in [
+            "/sys/devices/system/cpu/cpufreq/policyX/boost",
+            "/sys/devices/system/cpu/cpufreq/policy0/boost/x",
+            "/sys/devices/system/cpu/cpu0/boost",
+            "/sys/devices/system/cpu/intel_pstate/no_turbo",
+        ] {
+            assert_eq!(kind(path), None, "{path}");
+        }
     }
 
     #[test]

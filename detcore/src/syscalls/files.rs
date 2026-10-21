@@ -4284,8 +4284,34 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if procfs.is_none() || self.cfg.recordreplay_modes {
                     let resolved = if self.cfg.recordreplay_modes {
                         self.recorded_open_path(guest, fd).await?
-                    } else {
+                    } else if crate::procfs_inode::tool_can_name_guest_descriptors(
+                        &self.cfg.backend,
+                    ) {
                         resolved_open_path(&self.cfg.backend, guest.pid().as_raw(), fd)
+                    } else if call.dirfd() != libc::AT_FDCWD && !path.is_absolute() {
+                        // Where the tool cannot read the guest's descriptor
+                        // links itself, it asks the kernel beneath the backend
+                        // for the same link (`descriptor_kernel_link`, one
+                        // injected `readlinkat`), but only for a lookup
+                        // relative to a directory descriptor: its prefix is
+                        // that directory's recorded spelling, which need not
+                        // name the directory (a symbolic link, a `..`, a `.`
+                        // after `chdir`, a descriptor received over a
+                        // socket), so `openat(dirfd, "cpu0/cpufreq/boost")`
+                        // must classify by the object as it does where the
+                        // tool reads the link. Absolute and AT_FDCWD-relative
+                        // spellings stay lexical there, so that an
+                        // unclassified open costs no injected call. Without
+                        // sequentialized threads, a sibling's dup2 over the
+                        // descriptor before the install below can misattach
+                        // the class, as for a spelling-classified open on
+                        // every backend
+                        // (https://github.com/rrnewton/hermit/issues/4543).
+                        Self::descriptor_kernel_link(guest, fd)
+                            .await
+                            .filter(|link| link.is_absolute())
+                    } else {
+                        None
                     };
                     // Under record and replay, a `/proc` name outside the
                     // run's level that a spelling the lookup check does not

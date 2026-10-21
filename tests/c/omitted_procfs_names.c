@@ -101,6 +101,7 @@ static const char* const omitted[] = {
     "/proc/self/limits",
     "/proc/self/attr",
     "/proc/self/oom_score_adj",
+    "/proc/self/loginuid",
     "/proc/thread-self/wchan",
 };
 
