@@ -1716,7 +1716,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Add the first-image loader controls; retain main's full selection.
     // And run::signal_at_is_refused_where_it_would_not_reach_the_guest
     // (review of https://github.com/rrnewton/hermit/pull/4532): 1070, listed.
-    ("test.hermit_unit", 1070),
+    // And run::skid_margin_override_accepts_margins_above_the_table_largest,
+    // run::skid_margin_override_keeps_the_keep_margin_up_to_the_table_largest and
+    // run::run_installs_its_skid_margin: 1073, listed.
+    ("test.hermit_unit", 1073),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4995,7 +4998,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Host CPUID profile coverage: https://github.com/rrnewton/hermit/issues/4534.
     // Add the first-image loader controls; retain main's full selection.
     // And the same --signal-at refusal test: 1070, listed.
-    ("test.hermit_unit_on_host", 1070),
+    // And the same three --skid-margin tests: 1073, listed.
+    ("test.hermit_unit_on_host", 1073),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

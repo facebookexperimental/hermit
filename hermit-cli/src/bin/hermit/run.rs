@@ -1290,8 +1290,23 @@ pub struct RunOpts {
     #[clap(long)]
     pin_threads: bool,
 
-    /// Override the processor-specific PMU skid margin, in retired conditional branches. Larger
-    /// values schedule the overflow interrupt earlier and can increase single-stepping overhead.
+    /// Override the processor-specific PMU skid margin, in retired conditional branches.
+    ///
+    /// A precise timer event is programmed to interrupt the guest this many branches before its
+    /// target, and the guest is then single-stepped onto the target. A larger margin makes it
+    /// less likely that a late interrupt lands past the target (an overshoot, which refuses the
+    /// run), and costs more single steps per delivered event. Any override also turns off the
+    /// two-stage arming Reverie otherwise uses for long events, which changes the cost but not
+    /// where an event is delivered.
+    ///
+    /// Up to 10000, the largest margin in Reverie's processor table, the margin changes only how
+    /// a target is reached: never the target, and never whether a stop keeps or cancels an event,
+    /// which is decided by a keep margin of 10005 on every processor, with or without the
+    /// override. Such a run's schedule and output are those of a run without it. A larger margin
+    /// moves the keep margin to the margin plus 5: the run is still deterministic and the same
+    /// on every processor, but its schedule can differ from a run without the override, so
+    /// compare runs that pass the same value. (`REVERIE_SKID_MARGIN_OVERRIDE`, a fault-injection
+    /// variable, sets the margin too; this flag wins when both are set.)
     // TODO-HUMAN-REVIEW(PR-991): Review the ptrace PMU skid-margin CLI override.
     #[clap(long, value_name = "RCBS")]
     skid_margin: Option<u64>,
@@ -3989,6 +4004,83 @@ fn skid_margin_override_parses_and_round_trips() {
         format!("{opts}"),
         " --skid-margin=500 --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
     );
+}
+
+/// `--skid-margin` accepts any margin, including the 20000 and more that
+/// the calibrated `hermit analyze` super-validation node passes through
+/// `--run-arg`. A margin above the table's largest moves the keep margin
+/// (see `skid_margin_override_keeps_the_keep_margin_up_to_the_table_largest`),
+/// which is deterministic, so it is documented rather than refused.
+#[test]
+fn skid_margin_override_accepts_margins_above_the_table_largest() {
+    let largest = reverie::pmu_config::LARGEST_TABLE_SKID_MARGIN;
+    assert_eq!(largest, 10_000);
+    for accepted in [0, 1, 2_000, largest, largest + 1, 20_000, 100_000] {
+        let margin = format!("--skid-margin={accepted}");
+        let mut opts = RunOpts::try_parse_from(["fakehermit", margin.as_str(), "fakeprog"])
+            .unwrap_or_else(|error| panic!("{margin} refused: {error}"));
+        opts.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(opts.skid_margin, Some(accepted));
+    }
+}
+
+/// On every processor in the table, a margin up to the table's largest leaves
+/// the keep margin, which decides whether a stop keeps or cancels a precise
+/// event, exactly where the processor's own margin leaves it, so the override
+/// changes only how a target is reached. A larger margin moves it to the
+/// margin plus 5, the same on every processor.
+#[test]
+fn skid_margin_override_keeps_the_keep_margin_up_to_the_table_largest() {
+    use reverie::pmu_config::PmuConfig;
+    let largest = reverie::pmu_config::LARGEST_TABLE_SKID_MARGIN;
+    // Intel Sapphire Rapids, AMD family 19h model A0h, EPYC 9D85, another Zen.
+    for (family, model) in [(0x06, 0x8F), (0x19, 0xA0), (0x1A, 0x11), (0x19, 0x11)] {
+        let config = PmuConfig::for_family_model(family, model).unwrap();
+        let keep = config.keep_margin();
+        for margin in [0, 1, config.skid_margin(), 5_000, largest] {
+            let overridden = config.clone().with_skid_margin_override(margin);
+            assert_eq!(overridden.skid_margin(), margin);
+            assert_eq!(
+                overridden.keep_margin(),
+                keep,
+                "family {family:#x} model {model:#x} margin {margin}"
+            );
+        }
+        for margin in [largest + 1, 20_000] {
+            assert_eq!(
+                config
+                    .clone()
+                    .with_skid_margin_override(margin)
+                    .keep_margin(),
+                margin + reverie::pmu_config::SINGLESTEP_TIMEOUT_RCBS,
+                "family {family:#x} model {model:#x} margin {margin}"
+            );
+        }
+    }
+}
+
+/// `hermit run` records `--skid-margin` as the skid margin of Reverie's
+/// per-process PMU configuration, so a later margin is refused; where this
+/// host has a PMU profile, the configuration built from it carries the margin
+/// and the processor's own keep margin. This relies on nextest running each
+/// test in a process of its own, as the validation DAG does.
+#[test]
+fn run_installs_its_skid_margin() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--skid-margin=7777", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    opts.install_pmu_config().unwrap();
+    assert!(
+        reverie_ptrace::set_skid_margin_override(1).is_err(),
+        "run did not install --skid-margin"
+    );
+    if let Some(config) = reverie::pmu_config::try_get_pmu_config() {
+        assert_eq!(config.skid_margin(), 7777);
+        assert_eq!(
+            config.keep_margin(),
+            reverie::pmu_config::LARGEST_TABLE_SKID_MARGIN
+                + reverie::pmu_config::SINGLESTEP_TIMEOUT_RCBS
+        );
+    }
 }
 
 #[test]
