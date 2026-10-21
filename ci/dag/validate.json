@@ -23974,6 +23974,13 @@
           "lane": "portable",
           "category": "determinism-stress",
           "test": "determinism-stress/order-violation",
+          "mode": "chaos",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/order-violation",
           "mode": "verify",
           "backend": "kvm"
         },
@@ -42675,6 +42682,13 @@
           "category": "determinism-stress",
           "test": "determinism-stress/example-race",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/order-violation",
+          "mode": "chaos",
           "backend": "ptrace"
         },
         {
@@ -68017,6 +68031,13 @@
           "category": "determinism-stress",
           "test": "determinism-stress/example-race",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/order-violation",
+          "mode": "chaos",
           "backend": "ptrace"
         },
         {

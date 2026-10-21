@@ -27,7 +27,6 @@ data-handling/sqlite-query-determinism naked -
 determinism-stress-c/producer-consumer naked -
 determinism-stress-c/thread-stress verify sabre
 determinism-stress/example-race verify sabre
-determinism-stress/order-violation chaos ptrace
 determinism-stress/thread-contention naked -
 language-runtimes/bash-random naked -
 language-runtimes/cpp-stl-determinism naked -
