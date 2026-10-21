@@ -133,10 +133,10 @@ hermit oci run --entrypoint /bin/bash ubuntu -lc 'id; uname -a'
 hermit oci run -it ubuntu
 
 # Determinism verification from two fresh writable snapshots.
-hermit oci run --strict --verify ubuntu /bin/sh -lc 'date; id'
+hermit oci run --strict --epoch=2026-01-01T00:00:00Z --verify ubuntu /bin/sh -lc 'date; id'
 
 # Existing backend selection remains global.
-hermit --backend=ptrace oci run --strict ubuntu /bin/true
+hermit --backend=ptrace oci run --strict --epoch=2026-01-01T00:00:00Z ubuntu /bin/true
 ```
 
 `ubuntu` normalizes to `docker.io/library/ubuntu:latest`. A tag is resolved

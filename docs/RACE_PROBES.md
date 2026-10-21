@@ -15,7 +15,7 @@ perturbation points compiled into every build, and they are **off unless
 
 ```console
 HERMIT_RACE_PROBE=bg_harvest_skip=0@0.5 HERMIT_RACE_PROBE_SEED=7 \
-  hermit run --strict -- ./guest
+  hermit run --strict --epoch=2026-01-01T00:00:00Z -- ./guest
 ```
 
 `HERMIT_RACE_PROBE` is a comma-separated list of `point=LO[-HI][@P]` items:

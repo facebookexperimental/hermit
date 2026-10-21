@@ -192,7 +192,7 @@ Each approval is also logged at TRACE under the same target, with the
 interruption it was checked against. To see them:
 
 ```bash
-RUST_LOG=detcore::signal_delivery=trace hermit --log-file run.log run --strict -- ./program
+RUST_LOG=detcore::signal_delivery=trace hermit --log-file run.log run --strict --epoch=2026-01-01T00:00:00Z -- ./program
 ```
 
 Reverie can now keep a guest's SIGTRAP state across its own single-steps,

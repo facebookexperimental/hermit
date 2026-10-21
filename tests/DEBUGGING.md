@@ -249,7 +249,7 @@ source bytes.
     "$dev_hermit/bin/safehermit" --sh-deadline 120 \
     --sh-report "$run/safehermit.report" \
     "$hermit_bin" --log info --backend ptrace run --base-env=minimal \
-    --strict --verify-strict --verify --verify-json "$run/verify.json" \
+    --strict --epoch=2026-01-01T00:00:00Z --verify-strict --verify --verify-json "$run/verify.json" \
     --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C \
     --env TZ=UTC --env HOME="$run/home" \
     --env XDG_CONFIG_HOME="$run/xdg-config" --env E2E_TMPDIR=/test \

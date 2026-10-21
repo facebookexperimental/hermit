@@ -23,7 +23,7 @@ Apply it directly. The verify report names the record, and the retained logs let
 you see what actually differs there:
 
 ```bash
-hermit run --strict --verify --verify-strict --verify-json report.json -- <prog>
+hermit run --strict --epoch=2026-01-01T00:00:00Z --verify --verify-strict --verify-json report.json -- <prog>
 # the report names the location; the run prints the two retained log paths
 diff <(sed 's/^[0-9T:.-]*Z*//' PATH_PRINTED_FOR_RUN_1) \
      <(sed 's/^[0-9T:.-]*Z*//' PATH_PRINTED_FOR_RUN_2) > d.txt
