@@ -151,7 +151,7 @@ const EXACT_CELL_HERMIT_BIN: &str = "HERMIT_BIN=\"$PWD/target/ci/hermit\"";
 /// Exact ptrace/KVM cells need neither the third-party backends nor the E2E
 /// bundle, so their `build.e2e_artifact` builds and installs only Hermit. The
 /// Hermit binary is the only product of `build.workspace` this replaces.
-const DIRECT_EXACT_HERMIT_BUILD: &str = "CARGO_BUILD_JOBS=8 cargo build --locked --profile validate -p hermit --bin hermit && mkdir -p target/ci && install -m 755 target/validate/hermit target/ci/hermit";
+const DIRECT_EXACT_HERMIT_BUILD: &str = "CARGO_BUILD_JOBS=8 cargo build --locked --profile validate -p hermit-run --bin hermit && mkdir -p target/ci && install -m 755 target/validate/hermit target/ci/hermit";
 const DIRECT_BUILD_REPLACED_PREREQUISITE: &str = "build.workspace";
 /// Written before a cell starts. If the cell's cgroup is killed before the
 /// harness can report, this remains a conservative non-pass attempt marker.
@@ -17056,7 +17056,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             .contains("cargo build -p hermit-manifest-plan --bins")
         || manifest_plan_steps[0]
             .cmd
-            .contains("cargo build --locked --profile validate -p hermit --bin hermit")
+            .contains("cargo build --locked --profile validate -p hermit-run --bin hermit")
         || repeated_dag.resource_caps.get("manifest_guest") != Some(&4)
         || repeated_dag.resource_caps.contains_key("kvm")
     {

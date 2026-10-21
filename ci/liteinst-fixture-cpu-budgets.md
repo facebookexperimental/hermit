@@ -35,7 +35,7 @@ measurements at one test at a time.
 
 ## Complete stacks node, October 16 evening
 
-All 15 `hermit::liteinst_stacks` tests now have an independent CPU allowance
+All 15 `hermit-run::liteinst_stacks` tests now have an independent CPU allowance
 and a wall backstop of three times that allowance. The wall policy accommodates
 waiting under host load; it is an authorized tolerance increase, not a claim
 that a test needs three CPU seconds for each wall second. Termination grace
@@ -106,8 +106,8 @@ The full validation at `876ec26de98849ba789ba8612ebdfbb0d6134268` stopped
 seconds against a 22-second cap (27.983 seconds wall). This is a censored
 failure: its completion cost under that load is unknown.
 
-The table audits every test in `hermit::liteinst_stacks` (15) and
-`hermit::liteinst_allocator` (9), using the cgroup CPU receipts from five full
+The table audits every test in `hermit-run::liteinst_stacks` (15) and
+`hermit-run::liteinst_allocator` (9), using the cgroup CPU receipts from five full
 validations. Each ran all 24 identities once, without retries or skips:
 119 completed successfully and one hit its CPU cap. These are measurements at
 different source/artifact cohorts, not repeated qualification of one head.

@@ -13,7 +13,7 @@ status, output, and Stripped execution logs. That comparison removes selected
 numeric, address, path, and time fields; it is not an L2 comparison.
 
 ```bash
-cargo build --release -p hermit --bin hermit
+cargo build --release -p hermit-run --bin hermit
 with-proxy ./tests/reproducible-builds/run.sh
 ```
 

@@ -17,7 +17,8 @@ Conditional Compilation Audit are still those of the audited revision.
 
 ## Hermit Features
 
-All Hermit-local features belong to the `hermit` package and are declared in
+All Hermit-local features belong to the `hermit-run` package (whose library
+and executable are both named `hermit`) and are declared in
 [`hermit-cli/Cargo.toml`](https://github.com/rrnewton/hermit/blob/065980ea661f9d5e84b4fbaa0c69f4a4f69a81a9/hermit-cli/Cargo.toml).
 
 | Feature | Default | What it gates |
@@ -64,7 +65,7 @@ the repeated name is intentional rather than a shared feature.
 The intended split is a core Cargo release containing ptrace and KVM, and a
 developer build that explicitly enables and stages all third-party
 backends. Plain `make` is that all-backend developer build
-(`-p hermit --features third-party-backends`), and `make release-core` stays
+(`-p hermit-run --features third-party-backends`), and `make release-core` stays
 feature-free.
 
 This matches the release plan only if "single static core binary" means one

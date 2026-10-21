@@ -160,7 +160,7 @@ it refuses `--backend=liteinst`. Build the in-guest runtime beside the Hermit
 executable, or name it with `HERMIT_LITEINST_TOOL_RUNTIME`:
 
 ```bash
-cargo build --locked -p hermit --features liteinst --bin hermit
+cargo build --locked -p hermit-run --features liteinst --bin hermit
 cargo build --locked -p detcore-liteinst
 ./target/debug/hermit --backend=liteinst run --max-timeslice=disabled -- /bin/echo hello
 ```
@@ -201,7 +201,7 @@ The `dbt`, `sabre`, and `e9patch` selections require optional CLI features as
 well as runtime resources. Build both with:
 
 ```bash
-cargo build --release --workspace --features hermit/third-party-backends
+cargo build --release --workspace --features hermit-run/third-party-backends
 ./target/install_pkg/hermit --backend=dbt run -- /bin/echo hello
 ```
 
@@ -286,7 +286,7 @@ Debug Adapter Protocol clients such as editors and
 adapter supports reverse execution (`stepBack` and `reverseContinue`):
 
 ```bash
-cargo build -p hermit --bin hermit --bin hermit-dap
+cargo build -p hermit-run --bin hermit --bin hermit-dap
 target/debug/hermit record start -- ./program
 target/debug/hermit replay --dap-listen=4711  # a DAP client attaches to 127.0.0.1:4711
 ```
@@ -302,11 +302,11 @@ thread has published it. Build Hermit and the guest, then run the default
 deterministic schedule twice. The first command rebuilds `target/release/hermit`,
 which `target/install_pkg/hermit` links to, with default features; if you built
 the `dbt`, `sabre`, and `e9patch` backends above, use
-`cargo build --release --workspace --features hermit/third-party-backends`
+`cargo build --release --workspace --features hermit-run/third-party-backends`
 instead so the rebuild keeps them:
 
 ```bash
-cargo build --release -p hermit --bin hermit
+cargo build --release -p hermit-run --bin hermit
 mkdir -p target/chaos-demo
 cc -std=c11 -O2 -pthread tests/chaos/order_violation.c \
   -o target/chaos-demo/order-violation

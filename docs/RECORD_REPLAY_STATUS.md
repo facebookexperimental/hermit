@@ -186,10 +186,10 @@ syscall/event mismatch rather than treated as only an address-placement issue.
 The repository's existing target also passes:
 
 ```text
-cargo test -p hermit --test record_replay
+cargo test -p hermit-run --test record_replay
 17 passed; 0 failed; finished in 120.16s
 
-cargo test -p hermit --test record_replay -- --test-threads=1
+cargo test -p hermit-run --test record_replay -- --test-threads=1
 17 passed; 0 failed; finished in 95.90s
 ```
 

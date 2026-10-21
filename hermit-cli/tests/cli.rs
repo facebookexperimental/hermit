@@ -23148,7 +23148,7 @@ fn hermit_dap_listen_without_an_adapter_names_the_build_command() {
         assert!(
             !output.status.success()
                 && stderr.contains("--dap-listen needs hermit-dap beside hermit")
-                && stderr.contains("cargo build -p hermit --bin hermit --bin hermit-dap"),
+                && stderr.contains("cargo build -p hermit-run --bin hermit --bin hermit-dap"),
             "{args:?}: {}\nstderr:\n{stderr}",
             output.status
         );

@@ -617,7 +617,7 @@ jobs:
       # also built `-p detcore-dbt`, which the workspace build then recompiled)
       # and then hashes
       # target/validate/deps/libdetcore_dbt.{so,rlib} into the prepared-Nextest
-      # record as runtime files of every -p hermit and --workspace selection.
+      # record as runtime files of every -p hermit-run and --workspace selection.
       # A step here used to re-run
       # `cargo build -p detcore-dbt` to "stage" the DBT runtime. That build
       # resolves different dependency features from the workspace build (for

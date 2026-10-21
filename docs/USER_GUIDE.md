@@ -225,7 +225,7 @@ which `third-party-backends` includes; a build without it refuses
 `--backend=liteinst`:
 
 ```bash
-cargo build --locked -p hermit --features liteinst --bin hermit
+cargo build --locked -p hermit-run --features liteinst --bin hermit
 cargo build --locked -p detcore-liteinst
 ./target/debug/hermit --backend=liteinst run --max-timeslice=disabled -- /bin/echo hello
 ```
@@ -327,7 +327,7 @@ The `dbt`, `sabre`, and `e9patch` selections require optional CLI features as
 well as their runtime resources. Build and stage both with:
 
 ```bash
-cargo build --release --workspace --features hermit/third-party-backends
+cargo build --release --workspace --features hermit-run/third-party-backends
 ./target/install_pkg/hermit --backend=dbt run -- /bin/echo hello
 ```
 

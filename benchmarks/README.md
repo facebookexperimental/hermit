@@ -135,7 +135,7 @@ Build Hermit and the in-guest LiteInst runtime beside it first (the top-level
 `README.md` describes the runtime), then run from the repository root:
 
 ```sh
-cargo build --locked --release -p hermit --features liteinst --bin hermit
+cargo build --locked --release -p hermit-run --features liteinst --bin hermit
 cargo build --locked --release -p detcore-liteinst
 ./benchmarks/getpid_cost.rs
 ./benchmarks/getpid_cost.rs --backends ptrace --counts 50000,100000 --iterations 3

@@ -26,9 +26,9 @@ preemption schedule, and requires a precise replay of that failure.
 Run the tiers with:
 
 ```bash
-cargo test -p hermit --test stress_suite fast_chaos_matrix -- --ignored --exact
-cargo test -p hermit --test stress_suite slow_race_matrix -- --ignored --exact
-cargo test -p hermit --test stress_suite slow_cas_search_and_replay -- --ignored --exact
+cargo test -p hermit-run --test stress_suite fast_chaos_matrix -- --ignored --exact
+cargo test -p hermit-run --test stress_suite slow_race_matrix -- --ignored --exact
+cargo test -p hermit-run --test stress_suite slow_cas_search_and_replay -- --ignored --exact
 ```
 
 ## Default scheduling fairness
@@ -40,7 +40,7 @@ while a writer is waiting on an `RwLock`. The integration test runs each fixed
 workload five times and requires identical metrics:
 
 ```bash
-cargo test -p hermit --test thread_scheduling_fairness -- --test-threads=1
+cargo test -p hermit-run --test thread_scheduling_fairness -- --test-threads=1
 ```
 
 The current default-scheduler baseline is:

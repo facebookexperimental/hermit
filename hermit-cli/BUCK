@@ -70,6 +70,7 @@ rust_library(
         "cargo_toml_dir": ".",
         "cargo_toml_config": {
             "package": {
+                "name": "hermit-run",
                 "version": "0.5.1",
                 "readme": "README.md",
                 "homepage": "https://hermetic-infra.org",
@@ -175,6 +176,7 @@ rust_binary(
         "cargo_toml_dir": ".",
         "cargo_toml_config": {
             "package": {
+                "name": "hermit-run",
                 "version": "0.5.1",
                 "readme": "README.md",
                 "homepage": "https://hermetic-infra.org",

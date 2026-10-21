@@ -8,7 +8,7 @@ runs a strict oracle pass so it can assert the canonical guest-visible value;
 Build a release binary and run the ptrace suite:
 
 ```shell
-cargo build --release -p hermit
+cargo build --release -p hermit-run
 tests/e2e/lib/system-utils/run.sh target/release/hermit ptrace
 ```
 

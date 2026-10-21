@@ -17,13 +17,13 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--exclude",
             "hermit-detcore-tests",
             "--exclude",
-            "hermit",
+            "hermit-run",
             "--exclude",
             "hermetic_infra_hermit_flaky-tests",
         ]),
         "test.hermit_unit" | "privileged-test.pmu_ptrace_completion_cases" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends,kvm-native-test-support",
             "--lib",
@@ -32,7 +32,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         "test.detcore_unit" => Some(&["-p", "hermit-detcore", "--lib", "--bins"]),
         "test.inherited_terminal_read" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -59,7 +59,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         }
         "test.hermit_integration" | "test.pmu_integration_cases" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -327,7 +327,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "test.arbitrary_binaries" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -335,7 +335,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "test.liteinst_allocator" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -343,7 +343,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "test.liteinst_stacks" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -360,7 +360,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         | "super.dbt_strict_blocked_stdin_teardown_diagnostic"
         | "super.dbt_guest_stderr_isolation_diagnostic" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -370,7 +370,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         | "privileged-only-test.cli_kvm"
         | "privileged-only-test.cli_kvm_on_host" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends,kvm-execution-tests",
             "--lib",
@@ -379,7 +379,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "test.sabre_examples" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -394,7 +394,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         | "privileged-only-test.pmu_buck_chaos_cases"
         | "privileged-only-test.pmu_buck_chaos_cases_on_host" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -402,7 +402,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "test.app_strict_verify" | "super.managed_jvm_strict_verify_diagnostics" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -410,7 +410,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "test.command_strict_verify" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -418,7 +418,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "test.ignored_syscall_regressions" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -428,7 +428,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "test.rr_suite_contract" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -437,7 +437,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         "quick.detcore_unit" => Some(&["-p", "hermit-detcore", "--lib"]),
         "super.relaxed_hermit_flag_matrix" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -445,7 +445,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "super.pselect_signal_interruption_diagnostic" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -453,7 +453,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "test.record_replay" | "super.record_replay_matrix_diagnostic" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -461,7 +461,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "super.ipc_determinism_diagnostic" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -469,7 +469,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "super.random_source_determinism_diagnostic" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -477,7 +477,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "super.threaded_integration_matrix_diagnostic" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -486,7 +486,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         "super.weekly_portable_chaos_cases" | "super.weekly_ignored_portable_chaos_cases" => {
             Some(&[
                 "-p",
-                "hermit",
+                "hermit-run",
                 "--features",
                 "third-party-backends",
                 "--test",
@@ -495,7 +495,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         }
         "super.pmu_analyze_hello_race_stress_calibrated_skid" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -503,7 +503,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "super.full_leveldb_strict_determinism" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -511,7 +511,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "super.sqlite_veryquick_strict_determinism" => Some(&[
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -685,7 +685,7 @@ fn preparation_profile<'a>(tag: &str, command: &'a str) -> Result<Option<&'a str
 
 /// A producer of a unifying profile (`nextest_binaries::unifies`) must end
 /// with that profile's unified workspace build followed by `prepare`. Any other
-/// build -- different features, or a second `-p hermit --bin hermit` link --
+/// build -- different features, or a second `-p hermit-run --bin hermit` link --
 /// makes preparation re-resolve features, recompile, and relink the unhashed
 /// executable the tests run. That build also links the Hermit the E2E cells
 /// run, so its features must keep every third-party backend. The pinned-root
@@ -717,9 +717,9 @@ pub(super) fn assert_producers_build_the_unified_selection(
                 step.tag()
             ));
         }
-        if !expected.contains("hermit/third-party-backends") {
+        if !expected.contains("hermit-run/third-party-backends") {
             return Err(format!(
-                "{} links the E2E Hermit without hermit/third-party-backends: `{expected}`",
+                "{} links the E2E Hermit without hermit-run/third-party-backends: `{expected}`",
                 step.tag()
             ));
         }
@@ -1077,7 +1077,7 @@ mod tests {
         let relinked = mutated(&|cmd| {
             cmd.replacen(
                 "cargo build --locked --profile validate --workspace",
-                "cargo build --locked --profile validate -p hermit --bin hermit && cargo build --locked --profile validate --workspace",
+                "cargo build --locked --profile validate -p hermit-run --bin hermit && cargo build --locked --profile validate --workspace",
                 1,
             )
         });
@@ -1099,7 +1099,7 @@ mod tests {
             "{doubled}"
         );
         // A workspace build whose features are not the union.
-        let narrowed = mutated(&|cmd| cmd.replace("hermit/kvm-execution-tests,", ""));
+        let narrowed = mutated(&|cmd| cmd.replace("hermit-run/kvm-execution-tests,", ""));
         assert!(
             narrowed.contains("must end with its unified workspace build"),
             "{narrowed}"
@@ -1155,7 +1155,7 @@ mod tests {
         }
         let error = assert_producers_build_the_unified_selection(&stripped).unwrap_err();
         assert!(
-            error.contains("without hermit/third-party-backends"),
+            error.contains("without hermit-run/third-party-backends"),
             "{error}"
         );
     }
@@ -1256,7 +1256,7 @@ mod tests {
             terminal_selection,
             [
                 "-p",
-                "hermit",
+                "hermit-run",
                 "--features",
                 "third-party-backends",
                 "--test",
@@ -1401,12 +1401,12 @@ mod tests {
 
     #[test]
     fn build_selection_parser_keeps_quoted_filter_punctuation_literal() {
-        let args = command_arguments("./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --test cli -E 'test(/a; b/)' -- --ignored; exit $?", "run-nextest-counted.sh").unwrap();
+        let args = command_arguments("./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --test cli -E 'test(/a; b/)' -- --ignored; exit $?", "run-nextest-counted.sh").unwrap();
         assert_eq!(
             args,
             [
                 "-p",
-                "hermit",
+                "hermit-run",
                 "--test",
                 "cli",
                 "-E",

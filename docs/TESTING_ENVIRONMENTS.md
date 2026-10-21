@@ -77,7 +77,7 @@ Run the matrix directly with:
 
 ```sh
 HERMIT_FLAG_MATRIX_REPORT=target/relaxed-flag-matrix/results.tsv \
-  cargo test -p hermit --test relaxed_flag_matrix \
+  cargo test -p hermit-run --test relaxed_flag_matrix \
   meaningful_flag_combinations_run_without_crashing -- \
   --exact --ignored --test-threads=1 --nocapture
 ```
@@ -167,7 +167,7 @@ Runs after a push to `integration` or by `workflow_dispatch`. It asks
 - `cargo build --workspace`
 - `cargo nextest run --profile ci --workspace` **excluding** `hermit-detcore`,
   `hermit`, and `hermetic_infra_hermit_flaky-tests`
-- `cargo test -p hermit --lib --bins` (no namespace-dependent integration tests)
+- `cargo test -p hermit-run --lib --bins` (no namespace-dependent integration tests)
 - `cargo test -p hermit-detcore --lib --bins`
 - doc tests (`cargo test --workspace --doc`), `cargo doc`, Clippy, rustfmt
 

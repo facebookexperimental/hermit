@@ -21,7 +21,7 @@ the explicit `Determinism verified` marker.
 Build Hermit once, then run a category or the complete matrix:
 
 ```bash
-cargo build --release -p hermit --bin hermit
+cargo build --release -p hermit-run --bin hermit
 tests/e2e/lib/determinism-stress/random.sh
 tests/e2e/lib/determinism-stress/run.sh
 ```

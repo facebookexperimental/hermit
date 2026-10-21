@@ -473,13 +473,13 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
                 .map_err(|error| format!("release-artifact bracket: {tag}: {error}"))?;
         }
         // The unified workspace build links the one Hermit binary; a second
-        // `-p hermit --bin hermit` build would relink it with other features.
+        // `-p hermit-run --bin hermit` build would relink it with other features.
         let unified =
             hermit_manifest_plan::nextest_binaries::unified_prebuild_command(cfg, profile)
                 .map_err(|error| format!("release-artifact bracket: {tag}: {error}"))?;
         if !source.ends_with(&unified)
             || !unified.contains("--profile validate --workspace --all-targets")
-            || !unified.contains("hermit/third-party-backends")
+            || !unified.contains("hermit-run/third-party-backends")
             || source.contains("--bin hermit")
             || !source.contains("./ci/clean-stale-reverie-dbt.sh validate")
             || !source.contains("HERMIT_INSTALL_FORCE_RESTAGE=")
@@ -5308,7 +5308,7 @@ cleared-caps refusal names {} starved step(s)",
         // selections, full 16, privileged 3; portable omits exactly one
         // privileged selection and full omits none. The one it omits is
         // privileged-only-test.cli_kvm's
-        // ["-p","hermit","--features","third-party-backends,kvm-execution-tests","--lib","--test","cli"],
+        // ["-p","hermit-run","--features","third-party-backends,kvm-execution-tests","--lib","--test","cli"],
         // which the same commit created when it gave that node the
         // kvm-execution-tests feature. The requirement is unchanged -- every
         // privileged selection must already be prepared -- only the set it is
@@ -6809,7 +6809,7 @@ mod e2e_runner_tests {
         assert_eq!(cargo["path"], "target/validate/hermit");
         let stage = std::fs::read_to_string(test_source_root().join("ci/buck-e2e/stage")).unwrap();
         assert!(stage.contains("target_dir=$root/target\n"));
-        assert!(stage.contains("--profile validate -p hermit --bin hermit"));
+        assert!(stage.contains("--profile validate -p hermit-run --bin hermit"));
         assert!(stage.contains("install -m 755 \"$target_dir/validate/hermit\""));
         let node =
             std::fs::read_to_string(test_source_root().join("ci/buck-e2e/validate-node")).unwrap();
@@ -12980,7 +12980,7 @@ fn first_dependency_cycle(steps: &[Step]) -> Option<Vec<String>> {
 fn build_release_hermit_node(gate: &str, bin: &str) -> dagrun::model::Step {
     let default = bin.ends_with("target/release/hermit");
     let cmd = if default {
-        "cargo build --release -p hermit --features third-party-backends".to_string()
+        "cargo build --release -p hermit-run --features third-party-backends".to_string()
     } else {
         // A caller-supplied binary is reused rather than rebuilt, but it must
         // exist: silently proceeding with a missing binary would fail every row
@@ -31543,7 +31543,7 @@ printf finalized >target/finalized
             selection,
             [
                 "-p",
-                "hermit",
+                "hermit-run",
                 "--features",
                 "third-party-backends",
                 "--test",

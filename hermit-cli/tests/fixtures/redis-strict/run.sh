@@ -24,7 +24,7 @@ for command in cmp curl grep make nproc sha256sum tar timeout with-proxy; do
 done
 
 if [[ ! -x $hermit_bin ]]; then
-  cargo build -p hermit
+  cargo build -p hermit-run
 fi
 
 mkdir -p "$(dirname "$archive")" "$(dirname "$source_root")"

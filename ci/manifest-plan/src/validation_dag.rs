@@ -1119,7 +1119,7 @@ pub const PORTABLE_FOCUSED_HERMIT_BIN: &str = "ignored/hermetic/split/target/rel
 const PORTABLE_FOCUSED_COMPAT_TAG: &str = "portablecompat.manifest_compat";
 
 /// Backends whose cells the `PORTABLE_FOCUSED_COMPAT_TAG` step omits with
-/// `--exclude-backend`. Its release build, `cargo build --release -p hermit
+/// `--exclude-backend`. Its release build, `cargo build --release -p hermit-run
 /// --features third-party-backends`, does not build the in-guest Detcore
 /// runtime (libdetcore_liteinst.so, the separate detcore-liteinst package)
 /// that the `liteinst` and `in-guest-trap` backends load, so each of their
@@ -4570,7 +4570,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // rr-compat-only on 2026-10-02: those run types' buckets run the
     // validation's one build, the e2e artifact.
     let expected_focused_labels = ["e9patch-compat-only"];
-    if focused_release.cmd != "cargo build --release -p hermit --features third-party-backends"
+    if focused_release.cmd != "cargo build --release -p hermit-run --features third-party-backends"
         || focused_release.deps != ["gate.manifest"]
         || focused_release.labels
             != expected_focused_labels

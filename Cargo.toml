@@ -33,7 +33,7 @@ exclude = ["agent-utils"]
 # are deliberately excluded so the default developer build produces the
 # `hermit` binary (ptrace/kvm) with no DynamoRIO/e9patch/SaBRe third-party
 # dependencies; LiteInst is likewise behind hermit-cli's `liteinst` feature. CI opts them back in with `--workspace` plus
-# `cargo ... -p hermit --features third-party-backends`. `detcore-liteinst` (the
+# `cargo ... -p hermit-run --features third-party-backends`. `detcore-liteinst` (the
 # in-guest LiteInst Detcore preload, which pulls `reverie-liteinst`) is excluded
 # for the same reason; build it with `cargo build -p detcore-liteinst`.
 default-members = [

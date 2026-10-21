@@ -2132,7 +2132,7 @@ fn dbt_run_error(drrun: &Path, error: std::io::Error) -> Error {
 // `#[cfg(feature = "dbt")]` alone this function and any test of it compile only in
 // a build validation does not perform. Measured on main before this change:
 //
-//     $ cargo test -p hermit --bin hermit dbt_status
+//     $ cargo test -p hermit-run --bin hermit dbt_status
 //     running 0 tests
 //
 // Zero -- so the only check that a signalled death is not reported as a normal exit

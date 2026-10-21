@@ -151,7 +151,7 @@ def require_tool(name: str) -> str:
 
 def build_hermit(hermit: Path, skip_build: bool) -> None:
     if not skip_build:
-        run_setup(["cargo", "build", "--release", "-p", "hermit", "--bin", "hermit"])
+        run_setup(["cargo", "build", "--release", "-p", "hermit-run", "--bin", "hermit"])
     if not hermit.is_file() or not os.access(hermit, os.X_OK):
         raise BenchmarkError(f"Hermit executable is not executable: {hermit}")
 

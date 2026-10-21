@@ -79,7 +79,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-test-workdir`; reverse-dependent closure: detcore-testutils, hermit, hermit-cdylib, hermit-detcore-tests, hermit-test-workdir.",
+      "_why": "@generated: Cargo package `hermit-test-workdir`; reverse-dependent closure: detcore-testutils, hermit-cdylib, hermit-detcore-tests, hermit-run, hermit-test-workdir.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -123,7 +123,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-cdylib, hermit-detcore, hermit-detcore-tests, hermit-record, hermit-record-format, hermit-replay, hermit-run-kvm, hermit-run-ptrace, hermit-verify.",
+      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit-cdylib, hermit-detcore, hermit-detcore-tests, hermit-record, hermit-record-format, hermit-replay, hermit-run, hermit-run-kvm, hermit-run-ptrace, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -169,7 +169,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-dbt`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, hermit, hermit-cdylib.",
+      "_why": "@generated: Cargo package `detcore-dbt`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, hermit-cdylib, hermit-run.",
       "e2e_backends": [
         "dbt"
       ],
@@ -241,7 +241,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-cdylib, hermit-detcore, hermit-detcore-tests, hermit-manifest-plan, hermit-record, hermit-record-format, hermit-replay, hermit-run-kvm, hermit-run-ptrace, hermit-verify.",
+      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit-cdylib, hermit-detcore, hermit-detcore-tests, hermit-manifest-plan, hermit-record, hermit-record-format, hermit-replay, hermit-run, hermit-run-kvm, hermit-run-ptrace, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -423,7 +423,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit`; reverse-dependent closure: hermit, hermit-cdylib.",
+      "_why": "@generated: Cargo package `hermit-run`; reverse-dependent closure: hermit-cdylib, hermit-run.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -507,7 +507,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-record`; reverse-dependent closure: hermit, hermit-cdylib, hermit-record.",
+      "_why": "@generated: Cargo package `hermit-record`; reverse-dependent closure: hermit-cdylib, hermit-record, hermit-run.",
       "nodes": [
         "build.workspace_on_host",
         "doc.doctests_on_host",
@@ -532,7 +532,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-record-format`; reverse-dependent closure: hermit, hermit-cdylib, hermit-record, hermit-record-format, hermit-replay.",
+      "_why": "@generated: Cargo package `hermit-record-format`; reverse-dependent closure: hermit-cdylib, hermit-record, hermit-record-format, hermit-replay, hermit-run.",
       "nodes": [
         "build.workspace_on_host",
         "doc.doctests_on_host",
@@ -557,7 +557,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-replay`; reverse-dependent closure: hermit, hermit-cdylib, hermit-replay.",
+      "_why": "@generated: Cargo package `hermit-replay`; reverse-dependent closure: hermit-cdylib, hermit-replay, hermit-run.",
       "nodes": [
         "build.workspace_on_host",
         "doc.doctests_on_host",
@@ -582,7 +582,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-resources`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, hermit, hermit-cdylib, hermit-resources.",
+      "_why": "@generated: Cargo package `hermit-resources`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, hermit-cdylib, hermit-resources, hermit-run.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -623,7 +623,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-run-kvm`; reverse-dependent closure: hermit, hermit-cdylib, hermit-run-kvm.",
+      "_why": "@generated: Cargo package `hermit-run-kvm`; reverse-dependent closure: hermit-cdylib, hermit-run, hermit-run-kvm.",
       "nodes": [
         "build.workspace_on_host",
         "doc.doctests_on_host",
@@ -648,7 +648,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-run-ptrace`; reverse-dependent closure: hermit, hermit-cdylib, hermit-run-ptrace.",
+      "_why": "@generated: Cargo package `hermit-run-ptrace`; reverse-dependent closure: hermit-cdylib, hermit-run, hermit-run-ptrace.",
       "nodes": [
         "build.workspace_on_host",
         "doc.doctests_on_host",

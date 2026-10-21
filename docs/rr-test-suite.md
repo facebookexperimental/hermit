@@ -39,9 +39,9 @@ are ptrace-heavy and need PMU branch counters plus working user and mount
 namespaces, so run them on such a host:
 
 ```sh
-cargo test -p hermit --test rr_suite              # every enabled case
-cargo test -p hermit --test rr_suite rr_hello     # one
-cargo test -p hermit --test rr_suite -- --ignored # only the known failures
+cargo test -p hermit-run --test rr_suite              # every enabled case
+cargo test -p hermit-run --test rr_suite rr_hello     # one
+cargo test -p hermit-run --test rr_suite -- --ignored # only the known failures
 ```
 
 ## Coverage

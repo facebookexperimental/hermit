@@ -198,7 +198,7 @@ echo "-- record_replay suite"
 rm -f -- "$RECORD_RESULTS"
 REC_EXIT=0
 DAGRUN_TEST_COUNTS_PATH="$RECORD_RESULTS" \
-  ./ci/run-nextest-counted.sh -p hermit --test record_replay >"$RECORD_LOG" 2>&1 \
+  ./ci/run-nextest-counted.sh -p hermit-run --test record_replay >"$RECORD_LOG" 2>&1 \
   || REC_EXIT=$?
 RECORD_STATUS=$(test_result_counts "$RECORD_RESULTS" "$REC_EXIT")
 
@@ -215,7 +215,7 @@ for t in sqlite_veryquick redis_strict python_stdlib language_runtime_determinis
   echo "########## TARGET: $t ##########" >>"$APPS_LOG"
   app_exit=0
   DAGRUN_TEST_COUNTS_PATH="$result_file" \
-    ./ci/run-nextest-counted.sh -p hermit --test "$t" >>"$APPS_LOG" 2>&1 \
+    ./ci/run-nextest-counted.sh -p hermit-run --test "$t" >>"$APPS_LOG" 2>&1 \
     || app_exit=$?
   APP_STATUS[$t]=$(test_result_counts "$result_file" "$app_exit")
 done
@@ -256,9 +256,9 @@ PRS=$(git log --oneline -40 | grep -iE 'Merge pull request' | head -12 \
   echo "| --- | --- | --- |"
   echo "| Strict / fail-closed | scripts/test-fail-closed.sh | $STRICT_STATUS |"
   echo "| Working-envelope L1-L4+rr | scripts/validate.rs --envelope-only | $ENV_JSON |"
-  echo "| Record/replay | ci/run-nextest-counted.sh -p hermit --test record_replay | $RECORD_STATUS |"
+  echo "| Record/replay | ci/run-nextest-counted.sh -p hermit-run --test record_replay | $RECORD_STATUS |"
   for t in sqlite_veryquick redis_strict python_stdlib language_runtime_determinism; do
-    echo "| App: $t | ci/run-nextest-counted.sh -p hermit --test $t | ${APP_STATUS[$t]} |"
+    echo "| App: $t | ci/run-nextest-counted.sh -p hermit-run --test $t | ${APP_STATUS[$t]} |"
   done
   echo
   echo "## rr suite"

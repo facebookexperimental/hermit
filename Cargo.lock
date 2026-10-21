@@ -974,67 +974,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hermit"
-version = "0.5.1"
-dependencies = [
- "addr2line",
- "anyhow",
- "bincode 2.0.1",
- "clap",
- "colored",
- "detcore-dbt",
- "detcore-model",
- "diff",
- "dirs",
- "fbinit",
- "goblin",
- "hermit-detcore",
- "hermit-record",
- "hermit-record-format",
- "hermit-replay",
- "hermit-resources",
- "hermit-run-kvm",
- "hermit-run-ptrace",
- "hermit-test-workdir",
- "iced-x86",
- "libc",
- "nix 0.30.1",
- "num_cpus",
- "object 0.40.0",
- "pretty_assertions",
- "proc-macro2",
- "quote",
- "rand",
- "rand_pcg",
- "regex",
- "reverie-core",
- "reverie-dbt",
- "reverie-inguest",
- "reverie-kvm",
- "reverie-liteinst",
- "reverie-liteinst-artifact",
- "reverie-loader",
- "reverie-ptrace",
- "reverie-rpc-transport",
- "reverie-sabre-stats",
- "ruzstd 0.9.0",
- "safeptrace",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "shell-words",
- "syn 2.0.119",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-appender",
- "tracing-log",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1044,7 +983,7 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 name = "hermit-cdylib"
 version = "0.5.1"
 dependencies = [
- "hermit",
+ "hermit-run",
 ]
 
 [[package]]
@@ -1190,6 +1129,67 @@ dependencies = [
 [[package]]
 name = "hermit-resources"
 version = "0.5.1"
+
+[[package]]
+name = "hermit-run"
+version = "0.5.1"
+dependencies = [
+ "addr2line",
+ "anyhow",
+ "bincode 2.0.1",
+ "clap",
+ "colored",
+ "detcore-dbt",
+ "detcore-model",
+ "diff",
+ "dirs",
+ "fbinit",
+ "goblin",
+ "hermit-detcore",
+ "hermit-record",
+ "hermit-record-format",
+ "hermit-replay",
+ "hermit-resources",
+ "hermit-run-kvm",
+ "hermit-run-ptrace",
+ "hermit-test-workdir",
+ "iced-x86",
+ "libc",
+ "nix 0.30.1",
+ "num_cpus",
+ "object 0.40.0",
+ "pretty_assertions",
+ "proc-macro2",
+ "quote",
+ "rand",
+ "rand_pcg",
+ "regex",
+ "reverie-core",
+ "reverie-dbt",
+ "reverie-inguest",
+ "reverie-kvm",
+ "reverie-liteinst",
+ "reverie-liteinst-artifact",
+ "reverie-loader",
+ "reverie-ptrace",
+ "reverie-rpc-transport",
+ "reverie-sabre-stats",
+ "ruzstd 0.9.0",
+ "safeptrace",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "shell-words",
+ "syn 2.0.119",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-log",
+ "tracing-subscriber",
+ "uuid",
+]
 
 [[package]]
 name = "hermit-run-kvm"

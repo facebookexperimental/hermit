@@ -573,7 +573,7 @@
     {
       "disposition": "cargo-integration-test-fixture",
       "path": "tests/c/flock_exclusion.c",
-      "runner": "cargo test -p hermit --test flock_exclusion",
+      "runner": "cargo test -p hermit-run --test flock_exclusion",
       "why": "tests/c/flock_exclusion.c is compiled and exercised by hermit-cli/tests/flock_exclusion.rs: it proves flock exclusion between distinct open file descriptions in one process and across processes, release and reacquire, safe refusal for blocking upgrades of known and SCM_RIGHTS-received lock state, safe cross-process inherited-lock state, replayed lock side effects for materialized files, and fail-closed replay for non-materialized files; hermit-cli/tests/cli.rs's run_kvm_flock_is_a_named_refusal_where_ptrace_excludes runs its exclusion scenario at bitwise parity on ptrace and requires the named flock refusal on KVM"
     },
     {
@@ -2097,7 +2097,7 @@
     {
       "disposition": "cargo-integration-test-fixture",
       "path": "tests/c/replay_epoch_probe.c",
-      "runner": "cargo test -p hermit --test clock_determinism and --test cli",
+      "runner": "cargo test -p hermit-run --test clock_determinism and --test cli",
       "why": "tests/c/replay_epoch_probe.c is compiled and exercised by hermit-cli/tests/clock_determinism.rs and hermit-cli/tests/cli.rs: two spinning threads plus eight absolute CLOCK_REALTIME samples prove that a preemption or schedule replay started without --epoch reuses the recording's virtual-time epoch and reproduces the recorded samples, that a contradicting explicit epoch is refused before the guest runs, and (PMU hosts, privileged-test.pmu_cli_cases) that a --chaos recording's absolute preemption points replay without the \"Cannot set end of timeslice\" panic (https://github.com/rrnewton/hermit/issues/3411, https://github.com/rrnewton/hermit/issues/3413)"
     },
     {

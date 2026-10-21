@@ -131,9 +131,9 @@ if [[ ${DETERMINISM_STRESS_EVIDENCE_SELF_TEST:-0} == 1 ]]; then
 fi
 
 [[ -x $hermit_bin ]] || fail \
-  "Hermit release binary not found: $hermit_bin (run: cargo build --release -p hermit --bin hermit)"
+  "Hermit release binary not found: $hermit_bin (run: cargo build --release -p hermit-run --bin hermit)"
 [[ -x $VERIFICATION_REPORT_BIN ]] || fail \
-  "typed verification-report reader not found: $VERIFICATION_REPORT_BIN (run: cargo build -p hermit --bin verification-report)"
+  "typed verification-report reader not found: $VERIFICATION_REPORT_BIN (run: cargo build -p hermit-run --bin verification-report)"
 command -v "$cc_bin" >/dev/null 2>&1 || fail "C compiler not found: $cc_bin"
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
 command -v timeout >/dev/null 2>&1 || fail "timeout is required"

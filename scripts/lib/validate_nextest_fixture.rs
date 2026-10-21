@@ -585,17 +585,18 @@ fn actual_nextest_results_and_publication_failures() {
     let fixture = tree.crate_dir();
     fs::create_dir_all(fixture.join("src")).unwrap();
     fs::write(fixture.join("Cargo.toml"), concat!(
-        "[package]\nname = \"hermit\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n",
+        "[package]\nname = \"hermit-run\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n",
         "[lib]\nname = \"hermit_structured_results_fixture\"\n[workspace]\n",
     )).unwrap();
     fs::write(fixture.join("src/lib.rs"), concat!(
         "#[test]\nfn passes() { assert_eq!(2 + 2, 4); }\n",
         "#[test]\nfn fails() { assert_eq!(2 + 2, 5, \"intentional structured-result fixture assertion\"); }\n",
     )).unwrap();
-    // The canonical .config/nextest.toml names the `cli` test binary, and
-    // nextest refuses a config whose binary() matcher names no binary in the
-    // workspace. An empty `cli` target keeps the copied config loadable; it has
-    // no tests, so nothing it adds is selected or counted.
+    // The canonical .config/nextest.toml names the `cli` test binary of
+    // package `hermit-run`, and nextest refuses a config whose package() or
+    // binary() matcher names nothing in the workspace. So the fixture package is
+    // `hermit-run`, and an empty `cli` target keeps the copied config loadable;
+    // it has no tests, so nothing it adds is selected or counted.
     fs::create_dir_all(fixture.join("tests")).unwrap();
     fs::write(fixture.join("tests/cli.rs"), b"").unwrap();
     let target = tree.target_dir();
@@ -787,7 +788,7 @@ fn actual_nextest_results_and_publication_failures() {
         assert_eq!(outcome.returncode, Some(wrapper_status));
         let actual: BTreeMap<String, bool> = names
             .iter()
-            .map(|name| (format!("hermit${name}"), name == "passes"))
+            .map(|name| (format!("hermit-run${name}"), name == "passes"))
             .collect();
         assert_eq!(
             node_classification(outcome, &result.attempts),
@@ -924,7 +925,7 @@ fn actual_nextest_results_and_publication_failures() {
         if name == "publish-after-failure" {
             let summary = test_id_summary(observations, &result.attempts, &fixture_node);
             assert_eq!(summary.failed.len(), 1);
-            assert_eq!(summary.failed[0].id, "hermit$fails");
+            assert_eq!(summary.failed[0].id, "hermit-run$fails");
             assert!(summary.failed_nodes_without_test_ids.is_empty());
         }
         if let Some(retained) = retained {

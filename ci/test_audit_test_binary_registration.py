@@ -54,7 +54,7 @@ class RegistrationAuditTest(unittest.TestCase):
         )
         (self.root / "ci/dag/validate.json").write_text(
             '{"steps":[{"group":"test","job":"registered",'
-            '"cmd":"cargo test -p hermit --test registered",'
+            '"cmd":"cargo test -p hermit-run --test registered",'
             '"integration_test_binaries":["registered"]}]}\n'
         )
         (self.root / "ci/undeclared-test-binaries.tsv").write_text(
@@ -155,7 +155,7 @@ class RegistrationAuditTest(unittest.TestCase):
                         {
                             "group": "test",
                             "job": "registered",
-                            "cmd": "cargo test -p hermit --test registered",
+                            "cmd": "cargo test -p hermit-run --test registered",
                             "integration_test_binaries": ["registered"],
                         },
                         probe_step,
@@ -169,14 +169,14 @@ class RegistrationAuditTest(unittest.TestCase):
 
     def test_echoed_invocation_does_not_register_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(
-            "echo cargo test -p hermit --test zz_probe", declared=["zz_probe"]
+            "echo cargo test -p hermit-run --test zz_probe", declared=["zz_probe"]
         )
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("integration_test_binaries", result.stderr)
 
     def test_no_run_invocation_does_not_register_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(
-            "cargo test -p hermit --test zz_probe --no-run", declared=["zz_probe"]
+            "cargo test -p hermit-run --test zz_probe --no-run", declared=["zz_probe"]
         )
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("integration_test_binaries", result.stderr)
@@ -184,7 +184,7 @@ class RegistrationAuditTest(unittest.TestCase):
     def test_nextest_run_registers_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(
             "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh "
-            "./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --test zz_probe -j 1",
+            "./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --test zz_probe -j 1",
             declared=["zz_probe"],
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -192,7 +192,7 @@ class RegistrationAuditTest(unittest.TestCase):
 
     def test_nextest_no_run_does_not_register_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(
-            "cargo nextest run -p hermit --test zz_probe --no-run",
+            "cargo nextest run -p hermit-run --test zz_probe --no-run",
             declared=["zz_probe"],
         )
         self.assertEqual(result.returncode, 2, result.stdout)
@@ -203,9 +203,9 @@ class RegistrationAuditTest(unittest.TestCase):
         probe.write_text("#[test]\nfn probe() {}\n")
         (self.root / "ci/dag/validate.json").write_text(
             '{"steps":[{"group":"test","job":"registered",'
-            '"cmd":"cargo test -p hermit --test registered",'
+            '"cmd":"cargo test -p hermit-run --test registered",'
             '"integration_test_binaries":["registered"],'
-            '"desc":"unlike cargo test -p hermit --test zz_probe, which we skip"}]}\n'
+            '"desc":"unlike cargo test -p hermit-run --test zz_probe, which we skip"}]}\n'
         )
         subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
 
@@ -218,7 +218,7 @@ class RegistrationAuditTest(unittest.TestCase):
         """The positive leg: the tightening must not reject Hermit's real shapes."""
         result = self._plant_probe_with_dag_command(
             "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh "
-            "cargo test -p hermit --features third-party-backends --test zz_probe",
+            "cargo test -p hermit-run --features third-party-backends --test zz_probe",
             declared=["zz_probe"],
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -229,7 +229,7 @@ class RegistrationAuditTest(unittest.TestCase):
             'test "${HERMIT_E2E_EMPTY_WORKDIR:-}" = /test && '
             "prlimit --fsize=67108864:67108864 -- "
             "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh "
-            "${CI:+--profile ci} -p hermit --features third-party-backends "
+            "${CI:+--profile ci} -p hermit-run --features third-party-backends "
             "--test zz_probe -E 'test(=positive) | test(=negative)' -- --include-ignored",
             declared=["zz_probe"],
         )
@@ -237,7 +237,7 @@ class RegistrationAuditTest(unittest.TestCase):
         self.assertIn("ci-registered=2", result.stdout)
 
     def test_prlimit_does_not_register_nonexecuting_or_malformed_commands(self) -> None:
-        invocation = "./ci/run-nextest-counted.sh -p hermit --test zz_probe"
+        invocation = "./ci/run-nextest-counted.sh -p hermit-run --test zz_probe"
         for command in (
             f"echo prlimit --fsize=67108864:67108864 -- {invocation}",
             f"unrelated prlimit --fsize=67108864:67108864 -- {invocation}",
@@ -263,7 +263,7 @@ class RegistrationAuditTest(unittest.TestCase):
                 self.assertIn("integration_test_binaries", result.stderr)
 
     def test_prlimit_assignments_require_shell_position_or_explicit_env(self) -> None:
-        invocation = "./ci/run-nextest-counted.sh -p hermit --test zz_probe"
+        invocation = "./ci/run-nextest-counted.sh -p hermit-run --test zz_probe"
         for command in (
             f"CARGO_BUILD_JOBS=1 prlimit --fsize=67108864:67108864 -- {invocation}",
             f"prlimit --fsize=67108864:67108864 -- env CARGO_BUILD_JOBS=1 {invocation}",
@@ -276,7 +276,7 @@ class RegistrationAuditTest(unittest.TestCase):
                 self.assertIn("ci-registered=2", result.stdout)
 
     def test_prlimit_refuses_unsupported_nested_runner_forms(self) -> None:
-        invocation = "./ci/run-nextest-counted.sh -p hermit --test zz_probe"
+        invocation = "./ci/run-nextest-counted.sh -p hermit-run --test zz_probe"
         for prefix in ("timeout 300 FOO=1", "nice FOO=1", "timeout 300", "nice"):
             with self.subTest(prefix=prefix):
                 # The first two never execute the test command. The latter two
@@ -290,7 +290,7 @@ class RegistrationAuditTest(unittest.TestCase):
                 self.assertIn("integration_test_binaries", result.stderr)
 
     def test_prlimit_cannot_execute_a_shell_exec_builtin(self) -> None:
-        invocation = "./ci/run-nextest-counted.sh -p hermit --test zz_probe"
+        invocation = "./ci/run-nextest-counted.sh -p hermit-run --test zz_probe"
         prlimit = shutil.which("prlimit")
         env_command = shutil.which("env")
         self.assertIsNotNone(prlimit)
@@ -322,7 +322,7 @@ class RegistrationAuditTest(unittest.TestCase):
     def test_shell_exec_before_prlimit_still_executes_the_test_command(self) -> None:
         result = self._plant_probe_with_dag_command(
             "exec prlimit --fsize=67108864:67108864 -- "
-            "./ci/run-nextest-counted.sh -p hermit --test zz_probe",
+            "./ci/run-nextest-counted.sh -p hermit-run --test zz_probe",
             declared=["zz_probe"],
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -345,7 +345,7 @@ class RegistrationAuditTest(unittest.TestCase):
         result = self._plant_probe_with_dag_command(
             "prlimit --fsize=67108864:67108864 -- "
             "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh "
-            "${CI:+--profile ci} -p hermit --features third-party-backends --test zz_probe",
+            "${CI:+--profile ci} -p hermit-run --features third-party-backends --test zz_probe",
             declared=["zz_probe"],
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -355,7 +355,7 @@ class RegistrationAuditTest(unittest.TestCase):
         result = self._plant_probe_with_dag_command(
             "prlimit --fsize=67108864:67108864 -- "
             "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh "
-            "-p hermit --test zz_probe --no-run",
+            "-p hermit-run --test zz_probe --no-run",
             declared=["zz_probe"],
         )
         self.assertEqual(result.returncode, 2, result.stdout)
@@ -372,7 +372,7 @@ class RegistrationAuditTest(unittest.TestCase):
             with self.subTest(options=options):
                 result = self._plant_probe_with_dag_command(
                     f"prlimit {options} -- ./ci/run-nextest-counted.sh "
-                    "-p hermit --test zz_probe",
+                    "-p hermit-run --test zz_probe",
                     declared=["zz_probe"],
                 )
                 self.assertEqual(result.returncode, 2, result.stdout)
@@ -382,7 +382,7 @@ class RegistrationAuditTest(unittest.TestCase):
         result = self._plant_probe_with_dag_command(
             "prlimit --fsize=67108864:67108864 -- "
             "./ci/run-with-reverie-dbt-budget.sh echo "
-            "cargo test -p hermit --test zz_probe",
+            "cargo test -p hermit-run --test zz_probe",
             declared=["zz_probe"],
         )
         self.assertEqual(result.returncode, 2, result.stdout)
@@ -390,7 +390,7 @@ class RegistrationAuditTest(unittest.TestCase):
 
     def test_executed_target_without_typed_declaration_is_refused_by_name(self) -> None:
         result = self._plant_probe_with_dag_command(
-            "cargo test -p hermit --test zz_probe"
+            "cargo test -p hermit-run --test zz_probe"
         )
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("step test.probe", result.stderr)
@@ -398,7 +398,7 @@ class RegistrationAuditTest(unittest.TestCase):
 
     def test_command_and_typed_declaration_must_name_the_same_targets(self) -> None:
         result = self._plant_probe_with_dag_command(
-            "cargo test -p hermit --test zz_probe", declared=["registered"]
+            "cargo test -p hermit-run --test zz_probe", declared=["registered"]
         )
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("step test.probe integration_test_binaries", result.stderr)

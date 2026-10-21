@@ -42,7 +42,7 @@
   "package_paths": {
     "hermit-detcore": ["detcore/**"],
     "hermetic_infra_hermit_flaky-tests": ["flaky-tests/**"],
-    "hermit": ["hermit-cli/**"],
+    "hermit-run": ["hermit-cli/**"],
     "hermit-install": ["hermit-install/**"]
   },
   "package_rules": [
@@ -52,7 +52,7 @@
         "hermit-detcore",
         "detcore-model",
         "detcore-testutils",
-        "hermit",
+        "hermit-run",
         "hermit-cdylib",
         "hermit-test-workdir",
         "hermit-resources",

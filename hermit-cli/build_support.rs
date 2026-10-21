@@ -178,6 +178,25 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 
 include!("reverie_pin.rs");
 
+/// Whether a Cargo manifest declares a `dbt` feature. Main's hermit-cli does;
+/// the crates.io projection of `hermit-run` does not, and build.rs turns that
+/// absence into `cfg(hermit_registry_build)`.
+pub fn declares_dbt_feature(manifest: &str) -> bool {
+    let mut in_features = false;
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_features = line == "[features]";
+        } else if in_features
+            && line
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "dbt")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// The Reverie revision this tree pins, read from the canonical manifest.
 ///
 /// `detcore/Cargo.toml` is the source of truth the pin checker uses; every other

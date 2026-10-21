@@ -61,7 +61,7 @@ bzip2recover_bin=$(command -v bzip2recover)
 gzip_bin=$(command -v gzip)
 
 if [[ ! -x $hermit_bin ]]; then
-  cargo build --manifest-path "$repo_root/Cargo.toml" --release -p hermit --bin hermit
+  cargo build --manifest-path "$repo_root/Cargo.toml" --release -p hermit-run --bin hermit
 fi
 [[ -x $hermit_bin ]] || fail "Hermit binary is not executable: $hermit_bin"
 

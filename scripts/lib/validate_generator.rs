@@ -301,7 +301,7 @@ pub(crate) fn generated_focused_compat_partition(
             &format!("{namespace}prep"),
             "release_resources",
             "Stage the release backend resources for the host e9patch cells",
-            "./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbt -p detcore-dbt-cdylib -p detcore-sabre -p hermit-install && target/release/stage-detcore-liteinst --git target && test -x target/install_pkg/rsrcs/e9patch && test -x target/install_pkg/rsrcs/e9tool".into(),
+            "./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p hermit-run --features third-party-backends -p detcore-dbt -p detcore-dbt-cdylib -p detcore-sabre -p hermit-install && target/release/stage-detcore-liteinst --git target && test -x target/install_pkg/rsrcs/e9patch && test -x target/install_pkg/rsrcs/e9tool".into(),
             vec!["compatprep.hermit_release".into()],
             1200,
             7200,

@@ -20,7 +20,7 @@
 //! explicitly by `scripts/validate.rs`. Run them with:
 //!
 //! ```text
-//! cargo test -p hermit --test analyze -- --ignored
+//! cargo test -p hermit-run --test analyze -- --ignored
 //! ```
 
 #[path = "common/hermit_binary.rs"]

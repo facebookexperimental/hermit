@@ -45,7 +45,7 @@ pub fn hermit_dap_beside_hermit() -> Result<PathBuf, Error> {
     if !adapter.is_file() {
         anyhow::bail!(
             "--dap-listen needs hermit-dap beside hermit, and {} does not exist; \
-             build it with `cargo build -p hermit --bin hermit --bin hermit-dap`",
+             build it with `cargo build -p hermit-run --bin hermit --bin hermit-dap`",
             adapter.display()
         );
     }

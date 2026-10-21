@@ -9,7 +9,7 @@ artifact_dir="$fixture/target/reproducible-builds"
 
 if [[ ! -x "$hermit_bin" ]]; then
     printf 'Hermit binary not found: %s\n' "$hermit_bin" >&2
-    printf 'Build it with: cargo build --release -p hermit --bin hermit\n' >&2
+    printf 'Build it with: cargo build --release -p hermit-run --bin hermit\n' >&2
     exit 1
 fi
 

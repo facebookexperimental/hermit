@@ -49,7 +49,7 @@ build: prune-stale-release install-deps ## Build the development Hermit binary w
 	@echo 'make: building the hermit binary (dev profile, third-party-backends) -- expect ~45s warm, longer cold'
 	@echo "make: cargo jobs=$(THIRD_PARTY_BUILD_JOBS) (host has $$(nproc) logical cores)"
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --locked \
-		-p hermit --features third-party-backends
+		-p hermit-run --features third-party-backends
 	@bin=target/debug/hermit; \
 		if [ -x "$$bin" ]; then \
 			echo "make: BUILD OK -- $$bin (dev profile, third-party-backends)"; \
@@ -84,7 +84,7 @@ install-hooks: ## Install this checkout's git pre-commit hooks (Reverie pin poli
 # A release build stamps the source revision into `hermit --version`; regular
 # builds do not (see hermit-cli/build_support.rs, `HERMIT_STAMP_GIT_SHA`).
 release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm)
-	HERMIT_STAMP_GIT_SHA=1 $(CARGO) build --release --locked -p hermit
+	HERMIT_STAMP_GIT_SHA=1 $(CARGO) build --release --locked -p hermit-run
 
 # `make build` produces target/debug/hermit but never rebuilds an existing
 # target/release/hermit. A release binary left over from an earlier
@@ -533,12 +533,12 @@ check-submodules: checkout-all ## Initialize if needed, then verify (build path)
 
 validate-kvm: check-submodules ## Run ONLY the KVM cells of the E2E manifests (needs /dev/kvm)
 	@test -r /dev/kvm && test -w /dev/kvm || { echo 'validate-kvm: /dev/kvm is not readable and writable, so no KVM cell can run here' >&2; exit 1; }
-	cargo build -p hermit
+	cargo build -p hermit-run
 	cargo build -p hermit-manifest-plan --bin test-harness
 	HERMIT_BIN=$(abspath $(HERMIT_DEBUG_BIN)) target/debug/test-harness run --backend kvm
 
 validate-dbt: check-submodules ## Run ONLY the DBT cells of the E2E manifests (third-party-backends feature)
-	cargo build -p hermit --features third-party-backends
+	cargo build -p hermit-run --features third-party-backends
 	cargo build -p hermit-manifest-plan --bin test-harness
 	HERMIT_BIN=$(abspath $(HERMIT_DEBUG_BIN)) target/debug/test-harness run --backend dbt
 

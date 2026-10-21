@@ -190,8 +190,8 @@ retry=$root/ci/retry-on-compiler-crash.sh
 setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --release -p hermit-manifest-plan --bins \
     --target-dir "$target_dir" >"$tmp/release-build.log" 2>&1 &
 release_build=$!
-setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit --bin hermit \
-    --features hermit/third-party-backends --target-dir "$hermit_target_dir" >"$tmp/hermit-build.log" 2>&1 &
+setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-run --bin hermit \
+    --features hermit-run/third-party-backends --target-dir "$hermit_target_dir" >"$tmp/hermit-build.log" 2>&1 &
 hermit_build=$!
 # The ordinary in-guest Detcore runtime in the liteinst-runtime profile: the Cargo
 # command the packaging finalizer below runs, started here so it compiles beside the

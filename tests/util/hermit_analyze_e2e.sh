@@ -34,7 +34,7 @@ fi
 readonly ANALYZE_SKID_OPT
 
 echo ":: [schedule_search] Building Hermit and analyzer fixtures"
-cargo build -p hermit --bin hermit
+cargo build -p hermit-run --bin hermit
 cargo build -p hermetic_infra_hermit_flaky-tests --bin hello_race
 mkdir -p "$TARGET_DIR/debug"
 "${CC:-cc}" -g -nostdlib \

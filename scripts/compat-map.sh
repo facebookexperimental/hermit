@@ -194,7 +194,7 @@ log() { [[ $emit_json -eq 1 ]] || printf '%s\n' "$*" >&2; }
 if [[ ! -x $HERMIT_BIN ]]; then
     printf 'error: hermit binary not found or not executable: %s\n' "$HERMIT_BIN" >&2
     # shellcheck disable=SC2016  # backticks are a literal hint, not a command substitution
-    printf 'hint: build it first with `cargo build -p hermit --bin hermit`, or set HERMIT_BIN.\n' >&2
+    printf 'hint: build it first with `cargo build -p hermit-run --bin hermit`, or set HERMIT_BIN.\n' >&2
     exit 1
 fi
 
@@ -376,7 +376,7 @@ if [[ $run_rr -eq 1 && $rr_count -gt 0 ]]; then
     rm -f -- "$rr_results"
     rr_exit=0
     ( cd "$repo_root" && DAGRUN_TEST_COUNTS_PATH="$rr_results" \
-        timeout 1800 ./ci/run-nextest-counted.sh -p hermit --test rr_suite ) \
+        timeout 1800 ./ci/run-nextest-counted.sh -p hermit-run --test rr_suite ) \
         >"$rr_log" 2>&1 || rr_exit=$?
     load_rr_results "$rr_results" "$rr_exit" || true
     if [[ $rr_status == unknown ]]; then
@@ -506,7 +506,7 @@ echo "Other buckets"
 printf '  rr tests   %s\n' "$(rr_result_summary "$rr_count")"
 if [[ $rr_status == inventory-only ]]; then
     # shellcheck disable=SC2016  # backticks are a literal hint, not a command substitution
-    printf '             `./ci/run-nextest-counted.sh -p hermit --test rr_suite`)\n'
+    printf '             `./ci/run-nextest-counted.sh -p hermit-run --test rr_suite`)\n'
 fi
 printf '  oss apps   %d catalogued (inventory-only): %s\n' "$oss_count" "${oss_apps[*]:-none}"
 hr

@@ -56,7 +56,7 @@ requires the Cargo binary to name the 12-character `HEAD` revision, and only a
 stamped build embeds one:
 
 ```sh
-HERMIT_STAMP_GIT_SHA=1 cargo build --release --workspace --features hermit/third-party-backends
+HERMIT_STAMP_GIT_SHA=1 cargo build --release --workspace --features hermit-run/third-party-backends
 target/release/stage-detcore-liteinst --git target
 ```
 

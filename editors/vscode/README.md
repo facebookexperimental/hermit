@@ -73,7 +73,7 @@ adapter-created breakpoints to its own breakpoint list; the test records
 that rather than requiring it.
 
 ```bash
-cargo build -p hermit --bin hermit --bin hermit-dap
+cargo build -p hermit-run --bin hermit --bin hermit-dap
 # VS Code for Linux, unpacked from the .tar.gz at https://code.visualstudio.com/download
 editors/vscode/test/run.sh --code /path/to/VSCode-linux-x64/code
 ```

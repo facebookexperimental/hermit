@@ -123,7 +123,7 @@ def run_setup(command: Sequence[str]) -> None:
 
 def build_hermit(hermit: Path, skip_build: bool) -> None:
     if not skip_build:
-        run_setup(["cargo", "build", "--release", "-p", "hermit", "--bin", "hermit"])
+        run_setup(["cargo", "build", "--release", "-p", "hermit-run", "--bin", "hermit"])
     if not hermit.is_file() or not os.access(hermit, os.X_OK):
         raise BenchmarkError(
             f"Hermit executable is missing or not executable: {hermit}"

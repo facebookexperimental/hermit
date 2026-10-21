@@ -35,7 +35,7 @@ programs only. Multithreaded guests are not yet covered by the tests.
   runs the `hermit` beside itself:
 
   ```bash
-  cargo build -p hermit --bin hermit --bin hermit-dap
+  cargo build -p hermit-run --bin hermit --bin hermit-dap
   ```
 
   This rebuilds `target/debug/hermit` with default features. If you built it
@@ -438,7 +438,7 @@ through a real GDB, with no editor: `initialize`, `attach`,
 
 ```bash
 HERMIT_REQUIRE_DAP=1 HERMIT_REQUIRE_DAP_GDB=1 \
-  cargo nextest run -p hermit --test cli dap
+  cargo nextest run -p hermit-run --test cli dap
 ```
 
 Without `HERMIT_REQUIRE_DAP_GDB`, the end-to-end tests skip, loudly, when no

@@ -85,7 +85,7 @@ During iteration, prefer the narrowest relevant target, for example:
 ```bash
 cargo test -p hermit-detcore
 cargo test -p hermit-detcore-tests --test tests_time
-cargo test -p hermit
+cargo test -p hermit-run
 ```
 
 The `tests` and `flaky-tests` workspace members mostly contain guest binaries

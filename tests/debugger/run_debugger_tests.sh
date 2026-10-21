@@ -32,8 +32,8 @@ if [ -z "${HERMIT_BIN:-}" ]; then
   elif [ -x "$ROOT/target/release/hermit" ]; then
     HERMIT_BIN="$ROOT/target/release/hermit"
   else
-    echo ":: building hermit (cargo build -p hermit --bin hermit) ..."
-    cargo build -p hermit --bin hermit || exit 1
+    echo ":: building hermit (cargo build -p hermit-run --bin hermit) ..."
+    cargo build -p hermit-run --bin hermit || exit 1
     HERMIT_BIN="$ROOT/target/debug/hermit"
   fi
 fi

@@ -37,10 +37,10 @@ trap publish_test_counts EXIT
 # and both tests retain long-lived server processes while a client exits. Run
 # them explicitly with:
 #
-# cargo test -p hermit --test frontier_app_benchmarks \
+# cargo test -p hermit-run --test frontier_app_benchmarks \
 #   redis_deep_session_is_nondeterministic_natively_and_l2_under_hermit -- \
 #   --ignored --exact --nocapture
-# cargo test -p hermit --test frontier_app_benchmarks \
+# cargo test -p hermit-run --test frontier_app_benchmarks \
 #   http_server_session_is_nondeterministic_natively_and_l2_under_hermit -- \
 #   --ignored --exact --nocapture
 for test_script in sqlite_on_disk.sh sqlite_deep.sh build_tools.sh; do

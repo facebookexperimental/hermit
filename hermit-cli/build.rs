@@ -28,6 +28,19 @@ use build_support::emit_git_revision;
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(fbcode_build)");
+    println!("cargo:rustc-check-cfg=cfg(hermit_registry_build)");
+
+    // A manifest without a `dbt` feature is the crates.io projection, whose
+    // DBT diagnostic points at a source build (see
+    // `dbt_disabled_build_reason`). An unreadable manifest counts as a source
+    // build.
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    let registry_build = std::env::var_os("CARGO_MANIFEST_DIR")
+        .and_then(|dir| std::fs::read_to_string(std::path::Path::new(&dir).join("Cargo.toml")).ok())
+        .is_some_and(|manifest| !build_support::declares_dbt_feature(&manifest));
+    if registry_build {
+        println!("cargo:rustc-cfg=hermit_registry_build");
+    }
 
     let date = build_date();
 

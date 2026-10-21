@@ -128,7 +128,7 @@ fn hermit_binary() -> PathBuf {
     let sibling = Path::new(env!("CARGO_BIN_EXE_hermit-verify")).with_file_name("hermit");
     assert!(
         sibling.is_file(),
-        "no Hermit binary: set HERMIT_BIN, or build hermit beside {} (cargo build -p hermit)",
+        "no Hermit binary: set HERMIT_BIN, or build hermit beside {} (cargo build -p hermit-run)",
         env!("CARGO_BIN_EXE_hermit-verify")
     );
     sibling

@@ -32,7 +32,7 @@
 //! in the pinned root (test.rr_suite_contract):
 //!
 //! ```text
-//! cargo test -p hermit --test rr_suite
+//! cargo test -p hermit-run --test rr_suite
 //! ```
 //!
 //! An `#[ignore]` names why its program cannot pass under Hermit today: a

@@ -70,7 +70,7 @@ const STANDALONE_ALLOCATOR_CPU_SECONDS: u64 = 33;
 // Earlier CPU22 timeouts stay censored, not successful completion samples.
 const DETCORE_STACK_CPU_SECONDS: u64 = 51;
 const RENDERED_PROCFS_WRAPPER_NAME: &str = "hermit-rendered-procfs-cpu";
-// hermit::cli detcore_renders_its_procfs_files_on_every_backend runs a
+// hermit-run::cli detcore_renders_its_procfs_files_on_every_backend runs a
 // --verify of one guest on every backend this build has, DBT's among them, plus
 // a DBT chroot run. Completed cgroup CPU seconds in the 13 full validations of
 // 2026-10-15/16 that ran it: 4.5 to 14.9 (12.8, 12.9 and 14.6 at 2f640c23,
@@ -82,7 +82,7 @@ const RENDERED_PROCFS_WRAPPER_NAME: &str = "hermit-rendered-procfs-cpu";
 // second, 36 CPU seconds take 50 s, inside the unchanged 57-second wall.
 const RENDERED_PROCFS_CPU_SECONDS: u64 = 36;
 const CPU_PROFILE_V3_LOADER_WRAPPER_NAME: &str = "hermit-cpu-profile-v3-loader-cpu";
-// hermit::cli cpu_profile_v3_host_loader_sees_exactly_x86_64_v3 runs the host
+// hermit-run::cli cpu_profile_v3_host_loader_sees_exactly_x86_64_v3 runs the host
 // glibc loader under `--cpu-profile x86-64-v3` several times
 // (--list-diagnostics, --help and more). Recorded cgroup attempts under
 // ignored/validate on 2026-10-15/17: 110 completed at 3.01 to 17.22 CPU
@@ -110,7 +110,7 @@ impl MeasuredCpuAllowance {
     const fn stack(wrapper_name: &'static str, test: &'static str, cpu_seconds: u64) -> Self {
         Self {
             wrapper_name,
-            binary: "hermit::liteinst_stacks",
+            binary: "hermit-run::liteinst_stacks",
             test,
             cpu_seconds,
             wall_seconds: Some(3 * cpu_seconds),
@@ -119,7 +119,7 @@ impl MeasuredCpuAllowance {
 
     fn identity(self) -> nextest_cpu::AttemptIdentity {
         nextest_cpu::AttemptIdentity {
-            package: "hermit".into(),
+            package: "hermit-run".into(),
             binary: self.binary.into(),
             test: self.test.into(),
             attempt: 1,
@@ -130,35 +130,35 @@ impl MeasuredCpuAllowance {
 const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 19] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
-        binary: "hermit::liteinst_allocator",
+        binary: "hermit-run::liteinst_allocator",
         test: "genuine_detcore_leaf_keeps_scope_free_work_private",
         cpu_seconds: DETCORE_ALLOCATOR_CPU_SECONDS,
         wall_seconds: None,
     },
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_CONSTRUCTOR_WRAPPER_NAME,
-        binary: "hermit::liteinst_stacks",
+        binary: "hermit-run::liteinst_stacks",
         test: "cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack",
         cpu_seconds: DETCORE_CONSTRUCTOR_CPU_SECONDS,
         wall_seconds: Some(DETCORE_CONSTRUCTOR_WALL_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: STANDALONE_ALLOCATOR_WRAPPER_NAME,
-        binary: "hermit::liteinst_allocator",
+        binary: "hermit-run::liteinst_allocator",
         test: "genuine_standalone_leaf_keeps_scope_free_work_private",
         cpu_seconds: STANDALONE_ALLOCATOR_CPU_SECONDS,
         wall_seconds: None,
     },
     MeasuredCpuAllowance {
         wrapper_name: RENDERED_PROCFS_WRAPPER_NAME,
-        binary: "hermit::cli",
+        binary: "hermit-run::cli",
         test: "detcore_renders_its_procfs_files_on_every_backend",
         cpu_seconds: RENDERED_PROCFS_CPU_SECONDS,
         wall_seconds: None,
     },
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_STACK_WRAPPER_NAME,
-        binary: "hermit::liteinst_stacks",
+        binary: "hermit-run::liteinst_stacks",
         test: "genuine_detcore_reaches_fixed_guarded_callback_and_altstack",
         cpu_seconds: DETCORE_STACK_CPU_SECONDS,
         wall_seconds: Some(3 * DETCORE_STACK_CPU_SECONDS),
@@ -230,7 +230,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 19] = [
     ),
     MeasuredCpuAllowance {
         wrapper_name: CPU_PROFILE_V3_LOADER_WRAPPER_NAME,
-        binary: "hermit::cli",
+        binary: "hermit-run::cli",
         test: "cpu_profile_v3_host_loader_sees_exactly_x86_64_v3",
         cpu_seconds: CPU_PROFILE_V3_LOADER_CPU_SECONDS,
         wall_seconds: Some(3 * CPU_PROFILE_V3_LOADER_CPU_SECONDS),
@@ -722,7 +722,7 @@ fn prepared_selected_cpu_allowances(
 /// The only overrides a regular configuration may carry, as (filter,
 /// test-group) pairs. Each group only lowers how many of its tests run at once.
 const REGULAR_GROUP_OVERRIDES: [(&str, &str); 1] = [(
-    "package(=hermit) & binary(=cli) & (test(=record_classifies_a_gdbserver_replay_stage_container_child_failure) | test(=every_record_container_site_classifies_a_child_fault_by_name))",
+    "package(=hermit-run) & binary(=cli) & (test(=record_classifies_a_gdbserver_replay_stage_container_child_failure) | test(=every_record_container_site_classifies_a_child_fault_by_name))",
     "cli-gdbserver-port",
 )];
 
@@ -854,7 +854,7 @@ fn resolve_budgets(
     // run in the serialized group or, for the cli binary, at the DAG's width.
     if identities
         .iter()
-        .any(|identity| identity.package == "hermit")
+        .any(|identity| identity.package == "hermit-run")
     {
         return Err("regular calibration cannot cover the hermit package".into());
     }
@@ -1790,26 +1790,26 @@ mod tests {
     fn new_measured_cells_require_exact_prepared_selected_identities() {
         for (binary, test, name, budget) in [
             (
-                "hermit::liteinst_stacks",
+                "hermit-run::liteinst_stacks",
                 "cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack",
                 DETCORE_CONSTRUCTOR_WRAPPER_NAME,
                 "55000000",
             ),
             (
-                "hermit::liteinst_allocator",
+                "hermit-run::liteinst_allocator",
                 "genuine_standalone_leaf_keeps_scope_free_work_private",
                 STANDALONE_ALLOCATOR_WRAPPER_NAME,
                 "33000000",
             ),
             (
-                "hermit::liteinst_stacks",
+                "hermit-run::liteinst_stacks",
                 "genuine_detcore_reaches_fixed_guarded_callback_and_altstack",
                 DETCORE_STACK_WRAPPER_NAME,
                 "51000000",
             ),
         ] {
             let target = nextest_cpu::AttemptIdentity {
-                package: "hermit".into(),
+                package: "hermit-run".into(),
                 binary: binary.into(),
                 test: test.into(),
                 attempt: 1,
@@ -1866,8 +1866,8 @@ mod tests {
                     Some((name, budget))
                 } else if identity == detcore_allocator_identity() {
                     Some((DETCORE_ALLOCATOR_WRAPPER_NAME, "32000000"))
-                } else if identity.package == "hermit"
-                    && identity.binary == "hermit::liteinst_stacks"
+                } else if identity.package == "hermit-run"
+                    && identity.binary == "hermit-run::liteinst_stacks"
                 {
                     match identity.test.as_str() {
                         "genuine_detcore_reaches_fixed_guarded_callback_and_altstack" => {
@@ -1920,7 +1920,7 @@ mod tests {
                     .filter(|entry| entry.contains_key("slow-timeout"))
                     .collect::<Vec<_>>();
                 let expected_wall = expected
-                    .filter(|_| identity.binary == "hermit::liteinst_stacks")
+                    .filter(|_| identity.binary == "hermit-run::liteinst_stacks")
                     .map(|(_, cpu)| format!("{}s", cpu.parse::<u64>().unwrap() / 1_000_000 * 3));
                 assert_eq!(wall_overrides.len(), usize::from(expected_wall.is_some()));
                 if let Some(entry) = wall_overrides.first() {
@@ -1980,8 +1980,8 @@ mod tests {
     #[test]
     fn cpu_profile_v3_loader_has_its_measured_cap_and_wall_backstop() {
         let identity = nextest_cpu::AttemptIdentity {
-            package: "hermit".into(),
-            binary: "hermit::cli".into(),
+            package: "hermit-run".into(),
+            binary: "hermit-run::cli".into(),
             test: "cpu_profile_v3_host_loader_sees_exactly_x86_64_v3".into(),
             attempt: 1,
         };
@@ -2043,11 +2043,11 @@ mod tests {
             DETCORE_STACK_WRAPPER_NAME,
         ];
         let filters = [
-            "package(=hermit) & binary_id(=hermit::liteinst_allocator) & test(=genuine_detcore_leaf_keeps_scope_free_work_private)",
-            "package(=hermit) & binary_id(=hermit::liteinst_stacks) & test(=cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack)",
-            "package(=hermit) & binary_id(=hermit::liteinst_allocator) & test(=genuine_standalone_leaf_keeps_scope_free_work_private)",
-            "package(=hermit) & binary_id(=hermit::cli) & test(=detcore_renders_its_procfs_files_on_every_backend)",
-            "package(=hermit) & binary_id(=hermit::liteinst_stacks) & test(=genuine_detcore_reaches_fixed_guarded_callback_and_altstack)",
+            "package(=hermit-run) & binary_id(=hermit-run::liteinst_allocator) & test(=genuine_detcore_leaf_keeps_scope_free_work_private)",
+            "package(=hermit-run) & binary_id(=hermit-run::liteinst_stacks) & test(=cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack)",
+            "package(=hermit-run) & binary_id(=hermit-run::liteinst_allocator) & test(=genuine_standalone_leaf_keeps_scope_free_work_private)",
+            "package(=hermit-run) & binary_id(=hermit-run::cli) & test(=detcore_renders_its_procfs_files_on_every_backend)",
+            "package(=hermit-run) & binary_id(=hermit-run::liteinst_stacks) & test(=genuine_detcore_reaches_fixed_guarded_callback_and_altstack)",
         ];
         for mask in 0..(1 << names.len()) {
             let identities = MEASURED_CPU_ALLOWANCES
@@ -2269,8 +2269,8 @@ mod tests {
         let identities = expected
             .iter()
             .map(|(test, _, _)| nextest_cpu::AttemptIdentity {
-                package: "hermit".into(),
-                binary: "hermit::liteinst_stacks".into(),
+                package: "hermit-run".into(),
+                binary: "hermit-run::liteinst_stacks".into(),
                 test: (*test).into(),
                 attempt: 1,
             })
@@ -2412,7 +2412,7 @@ mod tests {
             assert_eq!(
                 entries.get(0).unwrap()["filter"].as_str(),
                 Some(
-                    "package(=hermit) & binary_id(=hermit::liteinst_stacks) & test(=cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack)"
+                    "package(=hermit-run) & binary_id(=hermit-run::liteinst_stacks) & test(=cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack)"
                 )
             );
             assert_eq!(
@@ -2609,8 +2609,8 @@ mod tests {
         for (field, replacement) in [
             (0, "other"),
             (1, "other::liteinst_allocator"),
-            (1, "hermit::liteinst_allocator_extra"),
-            (1, "prefixhermit::liteinst_allocator"),
+            (1, "hermit-run::liteinst_allocator_extra"),
+            (1, "prefixhermit-run::liteinst_allocator"),
             (2, "genuine_standalone_leaf_keeps_scope_free_work_private"),
             (
                 2,
@@ -2780,7 +2780,7 @@ mod tests {
     #[test]
     fn admitted_wrappers_are_an_exact_complement_with_one_executable_and_independent_scaling() {
         let source = include_str!("../.config/nextest.toml");
-        let exact = "package(=hermit) & binary_id(=hermit::liteinst_allocator) & test(=genuine_detcore_leaf_keeps_scope_free_work_private)";
+        let exact = "package(=hermit-run) & binary_id(=hermit-run::liteinst_allocator) & test(=genuine_detcore_leaf_keeps_scope_free_work_private)";
         let path = "/tmp/a path/it's-$(literal)-wrapper";
         for (multiplier, ordinary, detcore) in [
             (1.0, "22000000", "32000000"),

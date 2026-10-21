@@ -583,7 +583,7 @@ pub fn budget_context(
         "--exclude",
         "hermit-detcore-tests",
         "--exclude",
-        "hermit",
+        "hermit-run",
         "--exclude",
         "hermetic_infra_hermit_flaky-tests",
     ];
@@ -1469,7 +1469,7 @@ pub fn cargo_profile_for(graph_profile: &str) -> Option<&'static str> {
 ///
 /// Only the validate-profile graph profiles do: their producers build the whole
 /// workspace with the unified features first, so the listing compiles nothing.
-/// The other profiles' producers build far less (a dev `-p hermit --bin hermit`
+/// The other profiles' producers build far less (a dev `-p hermit-run --bin hermit`
 /// in the privileged lane, under a 120-second cap), and a whole-workspace
 /// listing there would compile every test target of every member; they keep
 /// one listing per selection.
@@ -2329,15 +2329,15 @@ mod tests {
     #[test]
     fn several_selections_unify_to_the_workspace_with_qualified_features() {
         let several = selections(&[
-            "-p hermit --features third-party-backends,kvm-native-test-support --lib --bins",
+            "-p hermit-run --features third-party-backends,kvm-native-test-support --lib --bins",
             "-p hermit-detcore-tests --test tests_misc",
-            "-p hermit --features third-party-backends,kvm-execution-tests --lib --test cli",
-            "--workspace --exclude hermit",
+            "-p hermit-run --features third-party-backends,kvm-execution-tests --lib --test cli",
+            "--workspace --exclude hermit-run",
         ]);
         assert_eq!(
             unified_selection(&several).unwrap(),
             args(
-                "--workspace --all-targets --features hermit/kvm-execution-tests,hermit/kvm-native-test-support,hermit/third-party-backends"
+                "--workspace --all-targets --features hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/third-party-backends"
             )
         );
         let unfeatured = selections(&["-p a --lib", "-p b --test t"]);
@@ -2351,7 +2351,7 @@ mod tests {
     fn only_validate_profile_profiles_unify_their_listing() {
         let several = selections(&[
             "-p hermit-detcore-tests --test tests_misc",
-            "-p hermit --features third-party-backends --test hermit_modes",
+            "-p hermit-run --features third-party-backends --test hermit_modes",
         ]);
         for profile in ["full", "hosted-portable"] {
             let plan = listings(profile, &several).unwrap();
@@ -2647,7 +2647,7 @@ mod tests {
     fn record_fixture(fixture: &Fixture) -> (PreparedRecord, Value) {
         let (mut record, _) = fixture.selection();
         record.selections.values_mut().next().unwrap().build_args =
-            argv(&["-p", "hermit", "--test", "record_replay"]);
+            argv(&["-p", "hermit-run", "--test", "record_replay"]);
         let directory = fixture.root.join("record-workloads");
         fs::create_dir(&directory).unwrap();
         let mut targets = Vec::new();
@@ -2855,7 +2855,7 @@ mod tests {
             "--profile",
             "ci",
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -2874,7 +2874,7 @@ mod tests {
             parsed.build,
             argv(&[
                 "-p",
-                "hermit",
+                "hermit-run",
                 "--features",
                 "third-party-backends",
                 "--test",

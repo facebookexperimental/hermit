@@ -1962,14 +1962,17 @@ fn dbt_unavailable_reason() -> Option<String> {
 #[cfg(not(feature = "dbt"))]
 // TODO-HUMAN-REVIEW(PR-1150): Review the default-on DBT compile-time feature boundary.
 fn dbt_unavailable_reason() -> Option<String> {
-    Some(dbt_disabled_build_reason(
-        option_env!("CARGO_PKG_NAME").unwrap_or("hermit"),
-    ))
+    Some(dbt_disabled_build_reason(cfg!(hermit_registry_build)))
 }
 
+/// `registry_build`: this crate was built from a manifest that declares no
+/// `dbt` feature, as the crates.io projection of `hermit-run` does
+/// (`cfg(hermit_registry_build)`, set by build.rs). A source build of main
+/// declares one, and only needs to enable it. The package name cannot tell
+/// them apart: both are `hermit-run`.
 #[cfg(not(feature = "dbt"))]
-fn dbt_disabled_build_reason(package_name: &str) -> String {
-    if package_name == "hermit-run" {
+fn dbt_disabled_build_reason(registry_build: bool) -> String {
+    if registry_build {
         "the dbt backend is not included in this registry release; use a source build from https://github.com/rrnewton/hermit with `--features dbt`. The registry's `third-party-backends` feature does not include DBT. DynamoRIO availability on this machine has not been checked".to_owned()
     } else {
         "the `dbt` feature is not enabled in this source build; rebuild with `--features dbt` (or `--features third-party-backends`). DynamoRIO availability on this machine has not been checked".to_owned()
@@ -7345,15 +7348,18 @@ mod tests {
     #[cfg(not(feature = "dbt"))]
     #[test]
     fn dbt_registry_diagnostic_redirects_to_a_source_build() {
-        let reason = super::dbt_disabled_build_reason("hermit-run");
+        let reason = super::dbt_disabled_build_reason(true);
         assert!(reason.contains("not included in this registry release"));
         assert!(reason.contains("source build from https://github.com/rrnewton/hermit"));
         assert!(reason.contains("`third-party-backends` feature does not include DBT"));
         assert!(reason.contains("has not been checked"));
 
-        let source_reason = super::dbt_disabled_build_reason("hermit");
+        let source_reason = super::dbt_disabled_build_reason(false);
         assert!(source_reason.contains("rebuild with `--features dbt`"));
         assert!(!source_reason.contains("not included in this registry release"));
+        // This tree's manifest declares `dbt`, so build.rs must have judged it
+        // a source build, whatever the package is called.
+        const { assert!(!cfg!(hermit_registry_build)) };
     }
 
     #[cfg(not(feature = "sabre"))]
