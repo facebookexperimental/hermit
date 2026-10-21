@@ -973,5 +973,22 @@ class InGuestRouteTest(unittest.TestCase):
                 self.assertEqual(remote, [], (routing, backend))
 
 
+class HostLevelRouteTest(unittest.TestCase):
+    """A ptrace or e9patch verify cell runs at its host's strictness level: strict only
+    where the host has CPUID faulting and an exact retired-branch counter. RE workers
+    guarantee neither, and in 8fc35521's validation 5 of the 17 ptrace verify cells that
+    ran on RE ran relaxed (--no-virtualize-cpuid --max-timeslice=disabled), so _route
+    keeps every such cell on the validation host."""
+
+    def test_every_host_level_verify_cell_runs_locally_under_every_config(self) -> None:
+        for routing in ParityRouteTest.CONFIGS:
+            targets = evaluate_cells(*routing)
+            cells = [t for t in targets.values()
+                     if t["args"][1] == "verify" and t["args"][2] in ("ptrace", "e9patch")]
+            self.assertGreater(len(cells), 500, routing)
+            remote = sorted(t["name"] for t in cells if t["route"] != "local")
+            self.assertEqual(remote, [], routing)
+
+
 if __name__ == "__main__":
     unittest.main()

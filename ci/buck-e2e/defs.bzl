@@ -11,7 +11,9 @@ Routing (per cell, first match wins; see _route):
          kvm, and every liteinst and in-guest-trap cell names cpuid-faulting, which the
          in-guest LiteInst runtime needs and RE workers may lack), a `requires` tool RE
          workers lack, the LOCAL_TESTS deny-list, a test measured to fail only on RE
-         (re_exclusions.json), a PMU-armed cell under -c hermit_e2e.pmu_on_re=false, or
+         (re_exclusions.json), a verify cell on a backend whose strictness follows its
+         host (HOST_LEVEL_BACKENDS: RE workers would run it relaxed), a PMU-armed cell
+         under -c hermit_e2e.pmu_on_re=false, or
          the ptrace verify cell of a test whose kvm, liteinst or in-guest-trap verify cell
          runs locally (its parity reference).
          A sabre or dbt verify cell also runs locally whenever its test's ptrace verify
@@ -62,6 +64,18 @@ PMU_FREE_CELLS = [
     "system-utils/clock-determinism/custom@ptrace",
 ]
 
+# Backends whose verify cell runs at its host's strictness level
+# (ci/manifest-plan/src/runner.rs pmu_clock_backend and host_strictness): strict, with
+# CPUID virtualization and the preemption timer, only where the host has CPUID faulting
+# and an exact retired-branch counter; relaxed (--no-virtualize-cpuid
+# --max-timeslice=disabled) elsewhere. RE workers guarantee neither: of nine sampled on
+# 2026-10-21 seven lacked CPUID faulting and the rest had multiplexed or undercounting
+# PMU counters (dev-hermit ai_docs/2026-10-21-hermit-on-ondemand-and-devvm-cpuid.md), and
+# in 8fc35521's validation 5 of the 17 ptrace verify cells on RE ran relaxed. On RE such
+# a cell's pass would prove the relaxed level wherever the validation host proves the
+# strict one, depending on which worker it drew, so it runs on the validation host.
+HOST_LEVEL_BACKENDS = ["ptrace", "e9patch"]
+
 # Parity candidate backends whose verify cell is routed on its own; when it runs locally,
 # its test's ptrace verify cell (the parity reference) follows it there. sabre and dbt
 # verify cells instead follow their reference (hermit_e2e_cells).
@@ -95,6 +109,8 @@ def _route(cell, pmu_on_re, re_exclusions, local_candidates):
         return ("local", LOCAL_TESTS[cell["test"]])
     if cell["test"] in re_exclusions:
         return ("local", "measured: " + re_exclusions[cell["test"]]["reason"])
+    if cell["mode"] == "verify" and cell["backend"] in HOST_LEVEL_BACKENDS:
+        return ("local", "runs at its host's strictness level; RE workers lack CPUID faulting or an exact branch counter, so it would run relaxed there")
     if pmu_armed(cell) and not pmu_on_re:
         return ("local", "arms the PMU and -c hermit_e2e.pmu_on_re=false")
     if cell["backend"] == "ptrace" and cell["mode"] == "verify" and cell["test"] in local_candidates:
