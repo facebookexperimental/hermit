@@ -829,6 +829,21 @@ prints `-` as the source and that ancestor's mountpoint. This keeps unrelated
 host mount activity out of the guest's view, at the cost of a less complete
 table than Linux shows.
 
+When a runtime supplies authenticated private-memory intervals, the guest's
+`maps` and `smaps` views exclude those intervals using the opened target's
+ownership, including inherited and duplicated descriptors. `smaps` removes
+complete private VMA sections before assigning mapping identities. A VMA that
+mixes private and guest memory refuses with `runtime-private smaps view
+unavailable: mixed ownership has unsupported per-VMA accounting`: its aggregate
+accounting cannot faithfully describe separate guest fragments. `maps` retains
+its existing fragment support. Guest sections keep the existing Smaps sanitizer
+policy; its fallback for unknown fields or malformed values can retain raw
+device, inode and accounting fields in the projected guest view. Ambiguous
+section framing refuses instead of hiding a possible guest section.
+
+This projection does not cover `smaps_rollup`, `numa_maps` or `map_files`, or
+runtime mappings absent from the supplied ownership facts.
+
 Network modes are:
 
 - `--network=local` (default): isolated loopback networking.

@@ -12,7 +12,44 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static char snapshot[65536];
+// Smaps includes a body for every VMA. Still refuse a full buffer or a read
+// without EOF; a larger bound must not turn truncation into success.
+static char snapshot[1024 * 1024];
+static char maps_snapshot[65536];
+
+static int same_mapping_headers(const char *smaps_path, size_t smaps_size) {
+  char path[128];
+  size_t length = strlen(smaps_path);
+  if (length < 5 || length >= sizeof(path) ||
+      strcmp(smaps_path + length - 5, "smaps") != 0)
+    return 1;
+  memcpy(path, smaps_path, length - 5);
+  strcpy(path + length - 5, "maps");
+  FILE *file = fopen(path, "r");
+  if (file == NULL)
+    return 2;
+  size_t size = fread(maps_snapshot, 1, sizeof(maps_snapshot) - 1, file);
+  int failed = ferror(file) || !feof(file);
+  failed |= fclose(file) != 0;
+  if (failed)
+    return 3;
+  size_t cursor = 0;
+  for (size_t at = 0; at < smaps_size;) {
+    char *end = memchr(snapshot + at, '\n', smaps_size - at);
+    if (end == NULL)
+      return 4;
+    size_t count = (size_t)(end - snapshot) + 1 - at;
+    unsigned long start, limit;
+    if (sscanf(snapshot + at, "%lx-%lx", &start, &limit) == 2) {
+      if (cursor + count > size ||
+          memcmp(snapshot + at, maps_snapshot + cursor, count) != 0)
+        return 5;
+      cursor += count;
+    }
+    at += count;
+  }
+  return cursor == size ? 0 : 6;
+}
 
 static int check_map(const char *path, void *address, const char *wanted,
                      const char *unwanted) {
@@ -25,6 +62,10 @@ static int check_map(const char *path, void *address, const char *wanted,
   snapshot[size] = 0;
   if (failed || strstr(snapshot, unwanted) != NULL)
     return 2;
+  size_t path_length = strlen(path);
+  if (path_length >= 5 && strcmp(path + path_length - 5, "smaps") == 0 &&
+      same_mapping_headers(path, size) != 0)
+    return 4;
   for (char *line = snapshot; line != NULL && *line != 0;) {
     char *next = strchr(line, '\n');
     if (next != NULL)
@@ -40,6 +81,9 @@ static int check_map(const char *path, void *address, const char *wanted,
 }
 
 int main(int argc, char **argv) {
+  int smaps = argc == 2 &&
+      (strcmp(argv[1], "smaps") == 0 || strcmp(argv[1], "old-exec-smaps") == 0);
+  const char *leaf = smaps ? "smaps" : "maps";
   if (argc == 3 && strcmp(argv[1], "after-exec") == 0) {
     char byte;
     if (read(atoi(argv[2]), &byte, 1) != 0)
@@ -47,8 +91,9 @@ int main(int argc, char **argv) {
     puts("old maps descriptor has no replacement image");
     return 0;
   }
-  if (argc == 2 && strcmp(argv[1], "old-exec") == 0) {
-    int old = open("/proc/self/maps", O_RDONLY);
+  if (argc == 2 && (strcmp(argv[1], "old-exec") == 0 ||
+                    strcmp(argv[1], "old-exec-smaps") == 0)) {
+    int old = open(smaps ? "/proc/self/smaps" : "/proc/self/maps", O_RDONLY);
     if (old < 0)
       return 23;
     char number[32];
@@ -65,7 +110,7 @@ int main(int argc, char **argv) {
                        parent_file, 0);
   if (address == MAP_FAILED)
     return 11;
-  int inherited = open("/proc/self/maps", O_RDONLY);
+  int inherited = open(smaps ? "/proc/self/smaps" : "/proc/self/maps", O_RDONLY);
   if (inherited < 0)
     return 18;
   int ready[2], release[2];
@@ -114,11 +159,12 @@ int main(int argc, char **argv) {
   close(inherited);
   close(ready[0]);
   char own[64], foreign[64], task[96];
-  snprintf(own, sizeof(own), "/proc/%d/maps", getpid());
-  snprintf(foreign, sizeof(foreign), "/proc/%d/maps", child);
-  snprintf(task, sizeof(task), "/proc/%d/task/%d/maps", child, child);
+  snprintf(own, sizeof(own), "/proc/%d/%s", getpid(), leaf);
+  snprintf(foreign, sizeof(foreign), "/proc/%d/%s", child, leaf);
+  snprintf(task, sizeof(task), "/proc/%d/task/%d/%s", child, child, leaf);
   if (!failed) {
-    const char *paths[] = {"/proc/self/maps", "/proc/thread-self/maps", own,
+    const char *paths[] = {smaps ? "/proc/self/smaps" : "/proc/self/maps",
+                           smaps ? "/proc/thread-self/smaps" : "/proc/thread-self/maps", own,
                            foreign, task};
     for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
       int remote = i >= 3;
@@ -136,6 +182,7 @@ int main(int argc, char **argv) {
   failed |= !WIFEXITED(status) || WEXITSTATUS(status) != 0;
   if (failed)
     return 17;
-  puts("maps aliases retain the target's guest mapping");
+  puts(smaps ? "smaps aliases retain the target's guest mapping" :
+               "maps aliases retain the target's guest mapping");
   return 0;
 }

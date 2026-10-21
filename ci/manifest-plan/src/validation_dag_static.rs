@@ -2642,7 +2642,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the cpufreq boost constant unit of the LinuxEmu D4a pin
     // (cpufreq_boost_is_off_on_every_policy): 2257.
     // And a two-phase check-time grant unit: 2258.
-    ("test.detcore_unit", 2258),
+    // And five shared private-Smaps projection controls: 2263, listed.
+    ("test.detcore_unit", 2263),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3000,7 +3001,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And two chained deliveries at rt_sigreturn's exit: 309.
     // And a wait mask differing only in forced signals: 310.
     // And the dedicated pselect6 wrapper-validation fixture: 311.
-    ("test.hermit_integration_3", 311),
+    // And the opened-target private-Smaps control: 312, listed.
+    ("test.hermit_integration_3", 312),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4672,7 +4674,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same statfs canonicalization unit of the LinuxEmu D2 pin: 2256.
     // And the same cpufreq boost constant unit of the LinuxEmu D4a pin: 2257.
     // And a two-phase check-time grant unit: 2258.
-    ("test.detcore_unit_on_host", 2258),
+    // And the same five shared private-Smaps projection controls: 2263, listed.
+    ("test.detcore_unit_on_host", 2263),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4778,7 +4781,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +3 from c5eb858a: 655.
     // And +1 for a wait mask differing only in forced signals: 656.
     // And +1 from 14a1715c: 657.
-    ("test.hermit_integration_on_host", 657),
+    // And the opened-target private-Smaps control: 658, listed.
+    ("test.hermit_integration_on_host", 658),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

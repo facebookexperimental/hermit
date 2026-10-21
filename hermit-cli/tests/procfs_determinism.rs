@@ -2809,17 +2809,35 @@ fn sysfs_hwmon_input_is_deterministic_when_available() {
 #[cfg(feature = "dbt")]
 #[test]
 fn runtime_private_maps_keep_the_opened_targets_guest_mapping() {
+    runtime_private_mapping_target_check(false);
+}
+
+#[cfg(feature = "dbt")]
+#[test]
+fn runtime_private_smaps_keep_the_opened_targets_guest_mapping() {
+    runtime_private_mapping_target_check(true);
+}
+
+#[cfg(feature = "dbt")]
+fn runtime_private_mapping_target_check(smaps: bool) {
     let _run_lock = hermit_run_lock();
+    let leaf = if smaps { "smaps" } else { "maps" };
     let build = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("runtime-private-maps")
-        .join(std::process::id().to_string());
+        .join(std::process::id().to_string())
+        .join(leaf);
     fs::create_dir_all(&build).unwrap();
     let source =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runtime_private_maps.c");
     let program = build.join("runtime_private_maps");
     compile_c(&source, &program);
-    let expected = b"maps aliases retain the target's guest mapping\n";
-    let native = Command::new(&program).output().unwrap();
+    let expected = format!("{leaf} aliases retain the target's guest mapping\n");
+    let expected = expected.as_bytes();
+    let mut native = Command::new(&program);
+    if smaps {
+        native.arg("smaps");
+    }
+    let native = native.output().unwrap();
     assert!(native.status.success(), "native target control: {native:?}");
     assert_eq!(native.stdout, expected);
     let mut observations = Vec::new();
@@ -2845,9 +2863,12 @@ fn runtime_private_maps_keep_the_opened_targets_guest_mapping() {
             .arg(build.join(format!("{backend}-logs")))
             .arg("--")
             .arg(&program);
+        if smaps {
+            command.arg("smaps");
+        }
         hermit_test::configure_guest_execution(&mut command);
         let output = hermit_test::hermit_output_attempts(
-            &format!("runtime-private maps target binding ({backend})"),
+            &format!("runtime-private {leaf} target binding ({backend})"),
             1,
             &mut command,
         );
@@ -2875,7 +2896,8 @@ fn runtime_private_maps_keep_the_opened_targets_guest_mapping() {
         }
     }
     let old_expected = b"old maps descriptor has no replacement image\n";
-    let native_old = Command::new(&program).arg("old-exec").output().unwrap();
+    let old_exec = if smaps { "old-exec-smaps" } else { "old-exec" };
+    let native_old = Command::new(&program).arg(old_exec).output().unwrap();
     assert!(
         native_old.status.success(),
         "native old-mm control: {native_old:?}"
@@ -2896,10 +2918,10 @@ fn runtime_private_maps_keep_the_opened_targets_guest_mapping() {
                 "--",
             ])
             .arg(&program)
-            .arg("old-exec");
+            .arg(old_exec);
         hermit_test::configure_guest_execution(&mut command);
         let output = hermit_test::hermit_output_attempts(
-            &format!("runtime-private maps old image ({backend})"),
+            &format!("runtime-private {leaf} old image ({backend})"),
             1,
             &mut command,
         );
@@ -2918,8 +2940,9 @@ fn runtime_private_maps_keep_the_opened_targets_guest_mapping() {
             assert!(output.status.code().is_some(), "{output:?}");
             assert!(output.stdout.is_empty(), "{output:?}");
             assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("runtime-private maps view unavailable: target ownership retired"),
+                String::from_utf8_lossy(&output.stderr).contains(&format!(
+                    "runtime-private {leaf} view unavailable: target ownership retired"
+                )),
                 "{output:?}"
             );
         }

@@ -6,10 +6,36 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Projection of authoritative runtime intervals from complete maps snapshots.
+//! Projection of authoritative runtime intervals from complete Maps/Smaps snapshots.
 //! This is shared policy; providers supply ownership facts, never procfs text.
 
 use reverie::RuntimePrivateMemoryRegion;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Format {
+    Maps,
+    Smaps,
+}
+
+impl Format {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Maps => "maps",
+            Self::Smaps => "smaps",
+        }
+    }
+
+    pub(crate) fn project(
+        self,
+        contents: &[u8],
+        regions: &[RuntimePrivateMemoryRegion],
+    ) -> Result<Vec<u8>, &'static str> {
+        match self {
+            Self::Maps => project(contents, regions),
+            Self::Smaps => project_smaps(contents, regions),
+        }
+    }
+}
 
 struct Header {
     fields: [std::ops::Range<usize>; 5],
@@ -94,13 +120,7 @@ pub(crate) fn project(
     contents: &[u8],
     regions: &[RuntimePrivateMemoryRegion],
 ) -> Result<Vec<u8>, &'static str> {
-    let mut previous_end = 0;
-    for region in regions {
-        if region.start >= region.end || region.start < previous_end {
-            return Err("invalid runtime-private interval union");
-        }
-        previous_end = region.end;
-    }
+    validate_regions(regions)?;
     if !contents.is_empty() && !contents.ends_with(b"\n") {
         return Err("truncated maps snapshot");
     }
@@ -128,6 +148,103 @@ pub(crate) fn project(
         }
     }
     Ok(output)
+}
+
+fn validate_regions(regions: &[RuntimePrivateMemoryRegion]) -> Result<(), &'static str> {
+    let mut previous_end = 0;
+    for region in regions {
+        if region.start >= region.end || region.start < previous_end {
+            return Err("invalid runtime-private interval union");
+        }
+        previous_end = region.end;
+    }
+    Ok(())
+}
+
+/// Smaps accounting describes a whole VMA. Remove complete private sections,
+/// but never invent accounting for the guest fragments of a mixed VMA.
+/// Field values stay opaque: the existing sanitizer sees the projected view.
+fn project_smaps(
+    contents: &[u8],
+    regions: &[RuntimePrivateMemoryRegion],
+) -> Result<Vec<u8>, &'static str> {
+    validate_regions(regions)?;
+    if !contents.is_empty() && !contents.ends_with(b"\n") {
+        return Err("truncated smaps snapshot");
+    }
+    let mut output = Vec::with_capacity(contents.len());
+    let mut previous_end = 0;
+    let mut section: Option<(Header, usize, bool)> = None;
+    let mut offset = 0;
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let body = &line[..line.len() - 1];
+        if smaps_field(body) {
+            match section.as_mut() {
+                Some((_, _, has_body)) => *has_body = true,
+                None => return Err("smaps field before first mapping header"),
+            }
+        } else {
+            // Any non-field must be a complete header, even in a section
+            // that will be hidden. Malformed headers cannot become body.
+            let row = header(body)?;
+            if row.start < previous_end {
+                return Err("overlapping or unordered smaps rows");
+            }
+            previous_end = row.end;
+            if let Some((old, start, has_body)) = section.take() {
+                append_smaps_section(
+                    &mut output,
+                    &contents[start..offset],
+                    &old,
+                    has_body,
+                    regions,
+                )?;
+            }
+            section = Some((row, offset, false));
+        }
+        offset += line.len();
+    }
+    if let Some((row, start, has_body)) = section {
+        append_smaps_section(&mut output, &contents[start..], &row, has_body, regions)?;
+    }
+    Ok(output)
+}
+
+fn smaps_field(line: &[u8]) -> bool {
+    let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    let label = &line[..colon];
+    label.first().is_some_and(u8::is_ascii_alphabetic)
+        && label
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+
+fn append_smaps_section(
+    output: &mut Vec<u8>,
+    bytes: &[u8],
+    row: &Header,
+    has_body: bool,
+    regions: &[RuntimePrivateMemoryRegion],
+) -> Result<(), &'static str> {
+    if !has_body {
+        return Err("smaps mapping header has no body");
+    }
+    let private_bytes = regions
+        .iter()
+        .map(|region| {
+            row.end
+                .min(region.end)
+                .saturating_sub(row.start.max(region.start))
+        })
+        .sum::<u64>();
+    if private_bytes == 0 {
+        output.extend_from_slice(bytes);
+    } else if private_bytes != row.end - row.start {
+        return Err("mixed ownership has unsupported per-VMA accounting");
+    }
+    Ok(())
 }
 
 fn append_fragment(
@@ -261,6 +378,438 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn smaps_opened_target_keeps_the_same_owner_fact() {
+        use crate::procfs::BoundTask;
+        use crate::procfs::MapsTarget;
+        use crate::procfs::ProcfsFile;
+
+        let answer = target_answer(11, 0x3000);
+        for (path, thread) in [
+            ("/proc/self/smaps", None),
+            ("/proc/thread-self/smaps", Some(12)),
+            ("/proc/11/smaps", None),
+            ("/proc/11/task/12/smaps", Some(12)),
+        ] {
+            let task = BoundTask {
+                process: 11,
+                thread,
+            };
+            let binding = MapsTarget::from_open(task, &answer, &answer).unwrap();
+            let mut opened = ProcfsFile::from_path(std::path::Path::new(path)).unwrap();
+            opened.bind_maps_target(binding.clone());
+            let alias: ProcfsFile =
+                serde_json::from_slice(&serde_json::to_vec(&opened.clone()).unwrap()).unwrap();
+            assert_eq!(alias.maps_target(), Some(binding));
+            assert_eq!(
+                crate::procfs::maps_task_at(std::path::Path::new(path), 11, 12),
+                Some(task)
+            );
+        }
+    }
+
+    #[test]
+    fn smaps_projection_preserves_guest_sections_and_fallback() {
+        let private = [RuntimePrivateMemoryRegion {
+            start: 0x3000,
+            end: 0x6000,
+        }];
+        let guest =
+            b"1000-2000 r--p 00000000 08:01 7 /guest\nSize: 4 kB\nRss: 3 kB\nVmFlags: rd mr\n";
+        let hidden = b"3000-6000 ---p 00000000 08:02 999 /private\nUnknownPrivate: invalid value\n";
+        let raw = [guest.as_slice(), hidden.as_slice()].concat();
+        let projected = project_smaps(&raw, &private).unwrap();
+        assert_eq!(projected, guest);
+        let table = std::collections::BTreeMap::from([((libc::makedev(8, 1), 7), (0, 10))]);
+        let sanitized = crate::procfs::sanitize_smaps(&projected, &table);
+        assert_eq!(sanitized, crate::procfs::sanitize_smaps(guest, &table));
+        assert!(
+            sanitized
+                .windows(b"Rss:\t0 kB".len())
+                .any(|w| w == b"Rss:\t0 kB")
+        );
+        assert!(
+            !sanitized
+                .windows(b"/private".len())
+                .any(|w| w == b"/private")
+        );
+        let identities: Vec<_> = std::str::from_utf8(&projected)
+            .unwrap()
+            .lines()
+            .filter_map(crate::procfs::mapping_header_identity)
+            .collect();
+        assert_eq!(identities, vec![(libc::makedev(8, 1), 7)]);
+
+        for guest in [
+            b"1000-2000 r--p 0 08:01 7 /guest\nUnknownGuest: preserved\n".as_slice(),
+            b"1000-2000 r--p 0 08:01 7 /guest\nRss: invalid\n".as_slice(),
+            b"1000-2000 r--p 0 08:01 7 /guest-\xff\nRss: 7 kB\n".as_slice(),
+        ] {
+            let raw = [guest, hidden.as_slice()].concat();
+            let projected = project_smaps(&raw, &private).unwrap();
+            assert_eq!(projected, guest);
+            // Fallback is on the whole guest view, never the original input.
+            assert_eq!(crate::procfs::sanitize_smaps(&projected, &table), guest);
+        }
+    }
+
+    #[test]
+    fn smaps_framing_and_mixed_accounting_refuse_before_identity_requests() {
+        let private = [RuntimePrivateMemoryRegion {
+            start: 0x3000,
+            end: 0x4000,
+        }];
+        for raw in [
+            b"Rss: 0 kB\n".as_slice(),
+            b"3000-4000 ---p 0 00:00 0\n".as_slice(),
+            b"3000-4000 ---p 0 00:00 0\nRss: 0 kB".as_slice(),
+            b"3000-4000 ---p 0 00:00 0\nRss: 0 kB\n71000000-71001000: r-xp 0 00:00 9\n".as_slice(),
+            b"3000-4000 ---p 0 00:00 0\nRss: 0 kB\nno colon\n".as_slice(),
+            b"3000-4000 ---p 0 00:00 0\nRss: 0 kB\n1000-2000 r--p 0 00:00 0\nSize: 4 kB\n"
+                .as_slice(),
+            b"ffffffffffffffff-10000000000000000 r--p 0 00:00 0\nSize: 4 kB\n".as_slice(),
+        ] {
+            assert!(project_smaps(raw, &private).is_err(), "{raw:?}");
+        }
+        let mixed = b"2000-5000 r--p 0 08:01 7 /mixed\nSize: 12 kB\nRss: 4 kB\n";
+        let mut requested = false;
+        let result = project_smaps(mixed, &private).inspect(|_| {
+            requested = true;
+        });
+        assert_eq!(
+            result.unwrap_err(),
+            "mixed ownership has unsupported per-VMA accounting"
+        );
+        assert!(!requested);
+        assert!(
+            project(
+                mixed.split_inclusive(|b| *b == b'\n').next().unwrap(),
+                &private
+            )
+            .is_ok(),
+            "Maps retains its original mixed-row support"
+        );
+        let touching = [
+            RuntimePrivateMemoryRegion {
+                start: 0x2000,
+                end: 0x3000,
+            },
+            RuntimePrivateMemoryRegion {
+                start: 0x3000,
+                end: 0x5000,
+            },
+        ];
+        assert!(project_smaps(mixed, &touching).unwrap().is_empty());
+        let adjacent = [RuntimePrivateMemoryRegion {
+            start: 0x5000,
+            end: 0x6000,
+        }];
+        assert_eq!(project_smaps(mixed, &adjacent).unwrap(), mixed);
+        let overlapping = [
+            RuntimePrivateMemoryRegion {
+                start: 0x2000,
+                end: 0x4000,
+            },
+            RuntimePrivateMemoryRegion {
+                start: 0x3000,
+                end: 0x5000,
+            },
+        ];
+        assert!(project_smaps(mixed, &overlapping).is_err());
+    }
+
+    #[test]
+    fn private_projection_only_binds_maps_and_smaps_leaves() {
+        use crate::procfs::ProcfsFile;
+        for (leaf, format) in [("maps", Format::Maps), ("smaps", Format::Smaps)] {
+            let path = format!("/proc/self/{leaf}");
+            let file = ProcfsFile::from_path(std::path::Path::new(&path)).unwrap();
+            assert_eq!(file.private_mapping_format(), Some(format));
+        }
+        for leaf in ["smaps_rollup", "numa_maps"] {
+            let path = format!("/proc/self/{leaf}");
+            let path = std::path::Path::new(&path);
+            let file = ProcfsFile::from_path(path).unwrap();
+            assert_eq!(file.private_mapping_format(), None);
+            assert_eq!(crate::procfs::maps_task_at(path, 11, 12), None);
+        }
+    }
+    struct KernelSmapsFixture {
+        base: *mut libc::c_void,
+        page: usize,
+        len: usize,
+        backing: std::fs::File,
+    }
+
+    impl KernelSmapsFixture {
+        fn new() -> Self {
+            use std::os::fd::AsRawFd;
+            use std::os::fd::FromRawFd;
+            let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+                .expect("positive kernel page size");
+            assert!(page.is_power_of_two());
+            let len = page.checked_mul(7).expect("seven-page extent fits");
+            let fd = unsafe {
+                libc::memfd_create(c"private-smaps-kernel-control".as_ptr(), libc::MFD_CLOEXEC)
+            };
+            assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+            // A new memfd inode prevents this extent merging with unrelated VMAs.
+            let backing = unsafe { std::fs::File::from_raw_fd(fd) };
+            assert_eq!(
+                unsafe { libc::ftruncate(backing.as_raw_fd(), len.try_into().unwrap()) },
+                0,
+                "ftruncate: {}",
+                std::io::Error::last_os_error()
+            );
+            let base = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE,
+                    backing.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(
+                base,
+                libc::MAP_FAILED,
+                "mmap: {}",
+                std::io::Error::last_os_error()
+            );
+            Self {
+                base,
+                page,
+                len,
+                backing,
+            }
+        }
+
+        fn boundary(&self, page: usize) -> u64 {
+            assert!(page <= 7);
+            (self.base as usize)
+                .checked_add(self.page.checked_mul(page).unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap()
+        }
+
+        fn protect(&self, first: usize, pages: usize, prot: libc::c_int) {
+            assert!(pages > 0 && first.checked_add(pages).is_some_and(|end| end <= 7));
+            assert_eq!(
+                unsafe {
+                    libc::mprotect(
+                        self.boundary(first) as usize as *mut libc::c_void,
+                        pages * self.page,
+                        prot,
+                    )
+                },
+                0,
+                "mprotect: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        fn capture(&self, smaps: bool) -> Vec<u8> {
+            use std::os::unix::fs::MetadataExt;
+            let raw = std::fs::read(if smaps {
+                "/proc/self/smaps"
+            } else {
+                "/proc/self/maps"
+            })
+            .expect("read actual kernel snapshot");
+            assert!(
+                raw.ends_with(b"\n"),
+                "complete newline-terminated kernel snapshot"
+            );
+            // Split at real headers; retain every byte of each selected section.
+            // Never crop or rewrite a kernel row to fit the independently known extent.
+            let mut starts = Vec::new();
+            let mut offset = 0;
+            for line in raw.split_inclusive(|byte| *byte == b'\n') {
+                let body = &line[..line.len() - 1];
+                if header(body).is_ok() {
+                    starts.push(offset);
+                } else {
+                    assert!(
+                        smaps && !starts.is_empty() && body.contains(&b':'),
+                        "unexpected kernel mapping/field line: {body:?}"
+                    );
+                }
+                offset += line.len();
+            }
+            starts.push(raw.len());
+            let inode = self.backing.metadata().expect("memfd metadata").ino();
+            let mut selected = Vec::new();
+            let mut next = self.boundary(0);
+            for pair in starts.windows(2) {
+                let section = &raw[pair[0]..pair[1]];
+                let line_end = section.iter().position(|byte| *byte == b'\n').unwrap();
+                let row = header(&section[..line_end]).expect("kernel mapping header");
+                if row.end <= self.boundary(0) || row.start >= self.boundary(7) {
+                    continue;
+                }
+                assert!(
+                    row.start >= self.boundary(0) && row.end <= self.boundary(7),
+                    "a kernel VMA straddled the independently allocated extent"
+                );
+                assert_eq!(row.start, next, "exact ordered, gap-free extent coverage");
+                assert_eq!(
+                    row.inode, inode,
+                    "the selected row belongs to our unique memfd"
+                );
+                assert_eq!(
+                    row.offset,
+                    row.start - self.boundary(0),
+                    "real backing offset"
+                );
+                next = row.end;
+                selected.extend_from_slice(section);
+            }
+            assert_eq!(next, self.boundary(7), "complete seven-page kernel extent");
+            selected
+        }
+    }
+
+    impl Drop for KernelSmapsFixture {
+        fn drop(&mut self) {
+            let result = unsafe { libc::munmap(self.base, self.len) };
+            assert_eq!(result, 0, "release complete test extent");
+        }
+    }
+
+    fn kernel_smaps_headers(bytes: &[u8]) -> Vec<(u64, u64, Vec<u8>)> {
+        bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .filter_map(|line| {
+                let body = line.strip_suffix(b"\n").unwrap();
+                let row = header(body).ok()?;
+                Some((row.start, row.end, body[row.fields[1].clone()].to_vec()))
+            })
+            .collect()
+    }
+
+    fn kernel_smaps_inode_requests(bytes: &[u8]) -> Vec<(u64, u64)> {
+        std::str::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .filter_map(super::super::mapping_header_identity)
+            .collect()
+    }
+
+    #[test]
+    fn real_private_commit_keeps_maps_and_smaps_guest_sections_and_inode_requests() {
+        use super::super::BoundTask;
+        use super::super::MapsTarget;
+        use super::super::sanitize_maps;
+        use super::super::sanitize_smaps;
+        let fixture = KernelSmapsFixture::new();
+        let task = BoundTask {
+            process: 11,
+            thread: None,
+        };
+        let mut answer = target_answer(task.process, fixture.boundary(2));
+        let Some(reverie::RuntimePrivateMemory::Ready(private)) =
+            answer.runtime_private_memory.as_mut()
+        else {
+            panic!("existing fixture provides ready ownership");
+        };
+        private.regions[0].end = fixture.boundary(5);
+        let target = MapsTarget::from_open(task, &answer, &answer).unwrap();
+        let regions = &target.private.regions;
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start, fixture.boundary(2));
+        assert_eq!(regions[0].end, fixture.boundary(5));
+
+        // Real initial VMA spans both guest and private portions: Smaps must not
+        // fabricate per-fragment accounting, while existing Maps splitting survives.
+        let mixed_maps = fixture.capture(false);
+        let mixed_smaps = fixture.capture(true);
+        let all_none = vec![(fixture.boundary(0), fixture.boundary(7), b"---p".to_vec())];
+        assert_eq!(kernel_smaps_headers(&mixed_maps), all_none);
+        assert_eq!(kernel_smaps_headers(&mixed_smaps), all_none);
+        assert_eq!(
+            project_smaps(&mixed_smaps, regions),
+            Err("mixed ownership has unsupported per-VMA accounting"),
+            "real mixed VMA must refuse for the declared accounting contract"
+        );
+        assert_eq!(
+            kernel_smaps_headers(&project(&mixed_maps, regions).unwrap()).len(),
+            2,
+            "do not narrow existing Maps fragment support"
+        );
+
+        fixture.protect(0, 2, libc::PROT_READ);
+        fixture.protect(5, 2, libc::PROT_READ);
+        let before_maps = fixture.capture(false);
+        let before_smaps = fixture.capture(true);
+        let before_headers = vec![
+            (fixture.boundary(0), fixture.boundary(2), b"r--p".to_vec()),
+            (fixture.boundary(2), fixture.boundary(5), b"---p".to_vec()),
+            (fixture.boundary(5), fixture.boundary(7), b"r--p".to_vec()),
+        ];
+        assert_eq!(kernel_smaps_headers(&before_maps), before_headers);
+        assert_eq!(kernel_smaps_headers(&before_smaps), before_headers);
+
+        // Commit the ENTIRE authoritative private interval, keeping exact private
+        // boundaries distinct from the two read-only guest ranges.
+        fixture.protect(2, 3, libc::PROT_READ | libc::PROT_WRITE);
+        for page in 2..5 {
+            unsafe { std::ptr::write_volatile(fixture.boundary(page) as usize as *mut u8, 1) };
+        }
+        let after_maps = fixture.capture(false);
+        let after_smaps = fixture.capture(true);
+        let mut after_headers = before_headers.clone();
+        after_headers[1].2 = b"rw-p".to_vec();
+        assert_eq!(kernel_smaps_headers(&after_maps), after_headers);
+        assert_eq!(kernel_smaps_headers(&after_smaps), after_headers);
+        assert_ne!(
+            before_maps, after_maps,
+            "actual kernel commitment is observable"
+        );
+        assert_ne!(
+            before_smaps, after_smaps,
+            "actual kernel Smaps input changed"
+        );
+
+        let projected_maps = project(&before_maps, regions).unwrap();
+        let projected_smaps = project_smaps(&before_smaps, regions).unwrap();
+        let requests = kernel_smaps_inode_requests(&projected_maps);
+        assert_eq!(
+            requests.len(),
+            2,
+            "one request per retained guest header, including duplicates"
+        );
+        assert_eq!(requests, kernel_smaps_inode_requests(&projected_smaps));
+        let identities: std::collections::BTreeMap<_, _> = requests
+            .iter()
+            .copied()
+            .map(|raw| (raw, (libc::makedev(0, 1), 77)))
+            .collect();
+        let guest_maps = sanitize_maps(&projected_maps, &identities);
+        let guest_smaps = sanitize_smaps(&projected_smaps, &identities);
+        let after_maps = project(&after_maps, regions).unwrap();
+        let after_smaps = project_smaps(&after_smaps, regions).unwrap();
+        assert_eq!(requests, kernel_smaps_inode_requests(&after_maps));
+        assert_eq!(requests, kernel_smaps_inode_requests(&after_smaps));
+        assert_eq!(guest_maps, sanitize_maps(&after_maps, &identities));
+        assert_eq!(guest_smaps, sanitize_smaps(&after_smaps, &identities));
+
+        // A real guest change must remain visible. READ -> NONE avoids merging a
+        // guest row into the now-RW private VMA and testing a different contract.
+        fixture.protect(0, 2, libc::PROT_NONE);
+        let changed_maps = project(&fixture.capture(false), regions).unwrap();
+        let changed_smaps = project_smaps(&fixture.capture(true), regions).unwrap();
+        let expected_guest = vec![
+            (fixture.boundary(0), fixture.boundary(2), b"---p".to_vec()),
+            (fixture.boundary(5), fixture.boundary(7), b"r--p".to_vec()),
+        ];
+        assert_eq!(kernel_smaps_headers(&changed_maps), expected_guest);
+        assert_eq!(kernel_smaps_headers(&changed_smaps), expected_guest);
+        assert_ne!(guest_maps, sanitize_maps(&changed_maps, &identities));
+        assert_ne!(guest_smaps, sanitize_smaps(&changed_smaps, &identities));
     }
 
     #[test]

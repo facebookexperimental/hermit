@@ -662,7 +662,9 @@ impl MapsTarget {
 
 pub(crate) fn maps_task_at(path: &Path, pid: i32, tid: i32) -> Option<BoundTask> {
     let normalized = normalize_observed_path(path)?;
-    ProcfsTask::parse(normalized.to_str()?, "maps")?
+    let path = normalized.to_str()?;
+    ProcfsTask::parse(path, "maps")
+        .or_else(|| ProcfsTask::parse(path, "smaps"))?
         .bound_to(pid, tid)
         .bound()
 }
@@ -1732,8 +1734,18 @@ impl ProcfsFile {
         self.kind == ProcfsKind::Maps
     }
 
+    pub(crate) fn private_mapping_format(&self) -> Option<private_maps::Format> {
+        if self.is_maps() {
+            Some(private_maps::Format::Maps)
+        } else if self.kind == ProcfsKind::Smaps {
+            Some(private_maps::Format::Smaps)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn bind_maps_target(&mut self, target: MapsTarget) {
-        assert!(self.is_maps());
+        assert!(self.private_mapping_format().is_some());
         self.maps_target = Some(target);
     }
 

@@ -61,6 +61,8 @@ deterministic I/O, RCB time, and serialized scheduling. Options beginning with
 | Message | Class | Trigger | Fix |
 | --- | --- | --- | --- |
 | pselect6-wrapper-validation-unsupported: ... | Unsupported | A Guest implementation does not provide the closed Tool validation-injection contract. This is a mechanism failure, not a guest errno. | Implement and validate the purpose on that Guest; do not substitute EINVAL or ordinary injection silently. |
+| `runtime-private smaps view unavailable: mixed ownership has unsupported per-VMA accounting` | Unsupported | One kernel VMA contains both guest and authenticated runtime-private bytes. Smaps reports aggregate VMA accounting, so the shared projector cannot faithfully assign it to guest fragments. No partial snapshot or guest errno is substituted. | Use Maps if mapping extents alone suffice; split Smaps accounting is unsupported. |
+| `runtime-private smaps view unavailable: ...` | Unsupported | Opened-target ownership is unbound, retired or changed, capture is not sequentialized, or snapshot framing cannot be validated. | Preserve the named reason when reporting the failure. Hermit refuses to project using guessed ownership or ambiguous sections. |
 
 ## Option Warnings
 

@@ -814,7 +814,10 @@ impl RecordVersion {
 // PT_LOAD pages are runtime-private in the guest's maps view. The ownership
 // snapshot/task-state layout grows, which can also shift later mappings.
 // Replaying older recordings could produce different bytes or addresses.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x183);
+// 0x183 -> 0x184 (provisional dh-ldymk reservation in dh-gxmvo; coordinator
+// rederives at landing): project existing runtime-private ownership from whole
+// smaps sections and refuse unsupported mixed-VMA accounting.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x184);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -839,7 +842,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x183);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x183;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x184;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

@@ -4369,7 +4369,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .filter(ProcfsFile::may_be_named_by_provenance);
                 }
                 if guest.runtime_private_memory_regions().is_some()
-                    && procfs.as_ref().is_some_and(ProcfsFile::is_maps)
+                    && procfs
+                        .as_ref()
+                        .and_then(ProcfsFile::private_mapping_format)
+                        .is_some()
                     && let Some(stat) = host_stat
                 {
                     match self
@@ -5445,14 +5448,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Read,
     ) -> Result<(), Error> {
-        let maps_target = if guest.runtime_private_memory_regions().is_some()
-            && guest
-                .thread_state()
-                .with_detfd(call.fd(), |fd| fd.procfs_is_maps())?
+        let format = guest
+            .thread_state()
+            .with_detfd(call.fd(), |fd| fd.procfs_private_mapping_format())?;
+        let maps_target = if let Some(format) = format
+            && guest.runtime_private_memory_regions().is_some()
         {
+            let name = format.name();
             if !guest.config().sequentialize_threads {
                 return Err(Error::Tool(anyhow::anyhow!(
-                    "runtime-private maps view unavailable: capture is not sequentialized"
+                    "runtime-private {name} view unavailable: capture is not sequentialized"
                 )));
             }
             let target = guest
@@ -5460,15 +5465,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_detfd(call.fd(), |fd| fd.procfs_maps_target())?
                 .ok_or_else(|| {
                     Error::Tool(anyhow::anyhow!(
-                        "runtime-private maps view unavailable: opened target image is unbound"
+                        "runtime-private {name} view unavailable: opened target image is unbound"
                     ))
                 })?;
             if !guest.runtime_private_memory_is_current(&target.private) {
                 return Err(Error::Tool(anyhow::anyhow!(
-                    "runtime-private maps view unavailable: target ownership retired"
+                    "runtime-private {name} view unavailable: target ownership retired"
                 )));
             }
-            Some(target)
+            Some((format, target))
         } else {
             None
         };
@@ -5525,19 +5530,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             None => self.snapshot_procfs(guest, call).await?,
         };
-        let raw_contents = if let Some(target) = maps_target {
+        let raw_contents = if let Some((format, target)) = maps_target {
+            let name = format.name();
             if !guest.runtime_private_memory_is_current(&target.private) {
                 return Err(Error::Tool(anyhow::anyhow!(
-                    "runtime-private maps view unavailable: target ownership changed during capture"
+                    "runtime-private {name} view unavailable: target ownership changed during capture"
                 )));
             }
-            crate::procfs::private_maps::project(&raw_contents, &target.private.regions).map_err(
-                |reason| {
+            format
+                .project(&raw_contents, &target.private.regions)
+                .map_err(|reason| {
                     Error::Tool(anyhow::anyhow!(
-                        "runtime-private maps view unavailable: {reason}"
+                        "runtime-private {name} view unavailable: {reason}"
                     ))
-                },
-            )?
+                })?
         } else {
             raw_contents
         };
@@ -8284,7 +8290,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         procfs_inode::preserving_errno(Self::name_procfs_entry(guest, stat, target)).await
     }
 
-    /// Maps ownership needs the actual opened object even where scheduler
+    /// Maps/Smaps ownership needs the actual opened object even where scheduler
     /// IDs are virtual. Use the existing same-view task directory capability;
     /// never pass a virtual TID to the host-only procfs naming path.
     async fn maps_descriptor_entry<G: Guest<Self>>(
