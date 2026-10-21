@@ -347,6 +347,36 @@ pub struct Config {
     #[clap(skip)]
     pub in_guest_reserved_signals: u64,
 
+    /// Whether Detcore refuses the guest calls that would let the kernel send
+    /// a guest process a signal at a moment host timing decides (A5 step 3c,
+    /// slice 0b; design sections 16.30, D28 and D28a,
+    /// <https://github.com/rrnewton/hermit/issues/4485>).
+    ///
+    /// While the in-guest runtime runs its own code, ordinary signals are
+    /// blocked, and Linux keeps a blocked signal pending even under
+    /// `SIG_IGN`, so such a signal could become pending at a host-timed
+    /// moment whatever the guest's action. So where this is set, Detcore
+    /// answers with `EPERM` and a WARN the operation that completes such a
+    /// producer: an owner for a socket or for a descriptor with `O_ASYNC`
+    /// (`F_SETOWN`, `F_SETOWN_EX`, `FIOSETOWN`, `SIOCSPGRP`), `O_ASYNC` for a
+    /// descriptor with an owner (`F_SETFL`, `FIOASYNC`), a lease
+    /// (`F_SETLEASE`) and a directory notification (`F_NOTIFY`). It holds a
+    /// parent-death signal it can send itself, as it does on ptrace, and
+    /// refuses the run by name (`pdeathsig-would-fire`) if one would fire; it
+    /// refuses with `EPERM` one it cannot hold. A SIGKILL parent-death signal
+    /// keeps the kernel's path. False, the default, changes nothing.
+    ///
+    /// The host sets it, not a flag, when it prepares an in-guest run on the
+    /// default route, where it also clears the physical `RLIMIT_CPU` soft
+    /// limit and refuses an inherited descriptor that is already such a
+    /// producer (D25). Every other backend, and the in-guest loader route,
+    /// leave it false. Every Tool image receives it in the configuration
+    /// handshake, which guest code cannot change. Like
+    /// `in_guest_site_patching_off`, it has no legacy key.
+    #[serde(default)]
+    #[clap(skip)]
+    pub in_guest_refuses_host_timed_producers: bool,
+
     /// The guest's first image, as its `/proc/self/exe` link names it, and
     /// the image the kernel exec'd in its place where a launcher loads the
     /// guest ([`LaunchImage`]). Detcore answers that link from it until the
@@ -2192,7 +2222,9 @@ impl Default for Config {
 /// only by `hermit replay`, which runs only on the ptrace backend. So is
 /// [`Config::inherited_seccomp`], added after this form froze, which reads
 /// back as unknown. So is [`Config::in_guest_reserved_signals`], empty for
-/// DBT (it is set only for in-guest runs), which reads back as empty. Every
+/// DBT (it is set only for in-guest runs), which reads back as empty, and
+/// [`Config::in_guest_refuses_host_timed_producers`], false for DBT, which
+/// reads back as false. Every
 /// other field is serialized exactly as `serde_json::to_string(config)`
 /// serializes it.
 ///
@@ -2647,6 +2679,8 @@ mod legacy_backend_json {
     /// in-guest LiteInst), so it is never written and reads as false.
     /// `in_guest_reserved_signals` is empty for DBT (it is set only for
     /// in-guest runs), so it is never written and reads as empty.
+    /// `in_guest_refuses_host_timed_producers` is false for DBT (it is set
+    /// only for in-guest runs), so it is never written and reads as false.
     /// `launch_image` came after the legacy form froze: it is never written
     /// and reads as unset. DBT's runtime takes it from the coordinator's
     /// configuration instead, which declares DynamoRIO's library as the
@@ -2671,13 +2705,14 @@ mod legacy_backend_json {
     /// as unset.
     /// `signal_at` came after the form froze; the scheduler acts on it, not
     /// the runtime, so it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 22] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 23] = [
         "backend",
         "record_host_inputs",
         "guest_may_inherit_a_terminal",
         "in_guest_detlog_forward_policy",
         "in_guest_site_patching_off",
         "in_guest_reserved_signals",
+        "in_guest_refuses_host_timed_producers",
         "launch_image",
         "target_timeslice_syscalls_only",
         "futex_wake_yields",
@@ -2786,7 +2821,8 @@ mod legacy_backend_json {
     /// [`Config::guest_may_inherit_a_terminal`],
     /// [`Config::in_guest_detlog_forward_policy`],
     /// [`Config::in_guest_site_patching_off`],
-    /// [`Config::in_guest_reserved_signals`], [`Config::launch_image`],
+    /// [`Config::in_guest_reserved_signals`],
+    /// [`Config::in_guest_refuses_host_timed_producers`], [`Config::launch_image`],
     /// [`Config::target_timeslice_syscalls_only`],
     /// [`Config::futex_wake_yields`], [`Config::replaying`],
     /// [`Config::scheduler_turn_cost`] or [`Config::inherited_seccomp`] takes
@@ -2824,6 +2860,7 @@ mod legacy_backend_json {
                     "record_host_inputs"
                     | "guest_may_inherit_a_terminal"
                     | "in_guest_site_patching_off"
+                    | "in_guest_refuses_host_timed_producers"
                     | "target_timeslice_syscalls_only"
                     | "futex_wake_yields"
                     | "replaying"
@@ -3115,6 +3152,7 @@ mod legacy_backend_json {
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
                 | "in_guest_reserved_signals"
+                | "in_guest_refuses_host_timed_producers"
                 | "launch_image"
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
@@ -3266,6 +3304,7 @@ mod tests {
         assert!(!config.in_guest_site_patching_off);
         assert_eq!(config.in_guest_reserved_signals, 0);
         assert!(!config.reserves_in_guest_signal(libc::SIGSYS.into()));
+        assert!(!config.in_guest_refuses_host_timed_producers);
         assert!(config.launch_image.is_none());
     }
 
@@ -3813,7 +3852,7 @@ mod tests {
     /// with the fifteen legacy keys where `backend` stands and no
     /// `record_host_inputs`, `guest_may_inherit_a_terminal`,
     /// `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
-    /// `in_guest_reserved_signals`,
+    /// `in_guest_reserved_signals`, `in_guest_refuses_host_timed_producers`,
     /// `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
     /// `replaying`,
     /// `scheduler_turn_cost` or
@@ -3838,6 +3877,7 @@ mod tests {
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
                 | "in_guest_reserved_signals"
+                | "in_guest_refuses_host_timed_producers"
                 | "launch_image"
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
@@ -3866,16 +3906,16 @@ mod tests {
         // `backend` becomes fifteen keys; `record_host_inputs`,
         // `guest_may_inherit_a_terminal`,
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
-        // `in_guest_reserved_signals`,
+        // `in_guest_reserved_signals`, `in_guest_refuses_host_timed_producers`,
         // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
         // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
         // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`, `cpu_profile_source`,
         // `signal_state_copy`, `container_mount_table`,
         // `mountinfo_mount_namespace`, `signal_delivery_check_fatal`,
         // `work_span_report` and `signal_at` none: fourteen more keys, and
-        // twenty-one fewer, so seven keys fewer than fields.
+        // twenty-two fewer, so eight keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 7);
+        assert_eq!(fields.len(), keys.len() + 8);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -4620,6 +4660,71 @@ mod tests {
         assert!(top.reserves_in_guest_signal(64));
         assert!(!top.reserves_in_guest_signal(65));
         assert!(!top.reserves_in_guest_signal(0));
+    }
+
+    /// `in_guest_refuses_host_timed_producers` is false for DBT, so the legacy
+    /// form never carries it, and it reads back as false from both the object
+    /// and the array form.
+    #[test]
+    fn in_guest_refuses_host_timed_producers_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            in_guest_refuses_host_timed_producers: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(
+            !json.contains("in_guest_refuses_host_timed_producers"),
+            "{json}"
+        );
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .in_guest_refuses_host_timed_producers
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .in_guest_refuses_host_timed_producers
+        );
+    }
+
+    /// The setting reaches every Tool image through Reverie's bincode
+    /// handshake unchanged, on or off, and a JSON configuration without the
+    /// key reads as off (its serde default).
+    #[test]
+    fn in_guest_refuses_host_timed_producers_round_trips_and_defaults_to_off() {
+        for refuses in [false, true] {
+            let config = Config {
+                in_guest_refuses_host_timed_producers: refuses,
+                ..Config::default()
+            };
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(decoded.in_guest_refuses_host_timed_producers, refuses);
+            let json: Config =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            assert_eq!(json.in_guest_refuses_host_timed_producers, refuses);
+        }
+        let mut encoded = serde_json::to_value(Config::default()).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("in_guest_refuses_host_timed_producers")
+            .expect("the field is serialized");
+        let decoded: Config = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.in_guest_refuses_host_timed_producers);
     }
 
     /// `--signal-at` takes `turn=N:SIGNAL` with SIGNAL a name or a number.

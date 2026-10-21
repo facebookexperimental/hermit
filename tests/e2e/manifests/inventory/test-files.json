@@ -895,6 +895,12 @@
       "why": "tests/c/host_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify mode; ci=true on ptrace and dbi): Host-identity contract guest emitting the OBSERVED virtualized uname/gethostname/sysinfo/CPU values so cross-backend parity is checkable and a backend leaking the real host identity is caught; runs in blocking CI on the two backends that execute it"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/host_timed_producer_probe.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/host_timed_producer_probe.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this probe of signal producers whose signal Linux sends at a moment host timing decides (A5 step 3c slice 0b, https://github.com/rrnewton/hermit/issues/4485), runs it natively for Linux's answers, requires both in-guest LiteInst backends to refuse with EPERM and a named WARN exactly the F_SETOWN-family operations that complete a producer and the parent-death signals Detcore cannot hold while verifying bitwise, to end a run whose held parent-death signal would fire with the named refusal pdeathsig-would-fire, to warn on refused RLIMIT_CPU changes, and to clear or refuse inherited producer state at launch, and requires ptrace to print Linux's output unchanged; it remains a guest fixture because a generic manifest cannot express those per-backend verdicts or the launcher state the launch cases set up."
+    },
+    {
       "disposition": "support-data",
       "path": "tests/c/inherited_stdin.c",
       "runner": "hermit-cli/tests/cli.rs::run_dbt_preserves_inherited_stdin_descriptor_types",

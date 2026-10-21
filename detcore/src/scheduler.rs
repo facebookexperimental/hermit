@@ -1517,6 +1517,10 @@ pub struct Scheduler {
 
     /// How the backend runs the guest. See [`Config::backend`].
     backend: BackendCapabilities,
+    /// Whether a parent-death signal Detcore holds but cannot send ends the
+    /// run when it would fire (`parent_death_firing_refusal`): an in-guest
+    /// run's default route (`Config::in_guest_refuses_host_timed_producers`).
+    refuses_parent_death_firing: bool,
     /// When the release barrier (`step2_release_signaled_background`) began
     /// waiting for the threads in `blocked.signaled_background` to post their
     /// continuations; `None` while the set is empty.
@@ -3013,6 +3017,7 @@ async fn sched_loop_inner(
                     .as_ref()
                     .and_then(HbRuntime::unfired_occurrence_report)
                 {
+                    crate::host_timed_producers::emit_run_end_log();
                     eprintln!("{}", report);
                     std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT);
                 }
@@ -3076,6 +3081,7 @@ async fn sched_loop_inner(
                 .map(|report| (report, is_refusal))
         };
         if let Some((report, is_refusal)) = terminal {
+            crate::host_timed_producers::emit_run_end_log();
             eprintln!("{}", report);
             if is_refusal {
                 // A happens-before spec the guest cannot satisfy: a policy
@@ -3286,6 +3292,50 @@ impl std::fmt::Display for VforkBarrierRefusal {
 
 impl std::error::Error for VforkBarrierRefusal {}
 
+/// A parent-death signal that would fire on an in-guest run's default route,
+/// where Detcore holds it but cannot send it yet
+/// (`Scheduler::parent_death_firing_refusal`): the run ends with this named
+/// stopping refusal, `pdeathsig-would-fire`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParentDeathFiringRefusal {
+    /// The thread whose leaving fires the signal.
+    exited: DetTid,
+    /// The process that armed it.
+    child: DetPid,
+    /// The signal.
+    signal: i32,
+    /// Whether `exited` left at a committed point (an `Exit` grant), rather
+    /// than in an unscheduled death, which the backend reports at a moment host
+    /// timing decides and Detcore already records as a determinism loss that
+    /// refuses verification. The refusal fires in both cases whenever an armed
+    /// child is still alive when the parent's death is reported, failing
+    /// closed; at an unscheduled death that moment is host-timed.
+    committed: bool,
+}
+
+impl std::fmt::Display for ParentDeathFiringRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let when = if self.committed {
+            "at its Exit grant"
+        } else {
+            "at an unscheduled death (no Exit grant, already a named determinism loss)"
+        };
+        let name = Signal::try_from(self.signal).map_or("?", |signal| signal.as_str());
+        write!(
+            f,
+            "hermit refused to continue the run (pdeathsig-would-fire): thread {} left {when}, \
+             which fires the parent-death signal {} ({name}) that process {} armed, and Detcore \
+             holds that signal on this backend but cannot send it yet (A5 step 3c, D28a, \
+             https://github.com/rrnewton/hermit/issues/4485)",
+            self.exited.as_raw(),
+            self.signal,
+            self.child.as_raw(),
+        )
+    }
+}
+
+impl std::error::Error for ParentDeathFiringRefusal {}
+
 /// End the run on a scheduler refusal: write it to stderr and exit with
 /// `HERMIT_POLICY_REFUSAL_EXIT`, the status for "hermit examined the run and
 /// refused it", as the network replay refusal does. Only the ptrace backend
@@ -3304,6 +3354,7 @@ impl std::error::Error for VforkBarrierRefusal {}
 /// (`GlobalState::init_for_external_scheduler`), and the DynamoRIO guest is a
 /// plain child of hermit that no PID namespace binds.
 pub(crate) fn exit_on_scheduler_refusal(refusal: &dyn std::fmt::Display) -> ! {
+    crate::host_timed_producers::emit_run_end_log();
     {
         use std::io::Write;
         let _ = writeln!(crate::util::RetryingStderr, "{refusal}");
@@ -3976,6 +4027,7 @@ impl Scheduler {
             backend_failure_sender: Some(backend_failure_sender),
             backend_failure_wake: backend_failure_wake.shared(),
             backend: cfg.backend,
+            refuses_parent_death_firing: cfg.in_guest_refuses_host_timed_producers,
             signaled_background_since: None,
             signaled_background_refusal: None,
             vfork_barrier_wait_since: None,
@@ -5164,35 +5216,17 @@ impl Scheduler {
     /// wait ends for them (https://github.com/rrnewton/hermit/issues/3146);
     /// that is a determinism loss, named here.
     fn deliver_parent_death_signals(&mut self, exited: DetTid, process: DetPid) {
-        let children: Vec<DetPid> = self
-            .thread_tree
-            .parent_death_parents
-            .iter()
-            .filter(|(_, parent)| **parent == exited)
-            .map(|(child, _)| *child)
-            .collect();
+        if let Some(refusal) = self.parent_death_firing_refusal(exited, process) {
+            exit_on_scheduler_refusal(&refusal);
+        }
+        let children = self.parent_death_children(exited);
         if children.is_empty() {
             return;
         }
         let heir = self.parent_death_heir(exited, process);
         for child in children {
-            let mut tasks: Vec<DetTid> = self
-                .thread_tree
-                .my_thread_group(&DetTid::from_raw(child.as_raw()))
-                .into_iter()
-                .filter(|tid| self.next_turns.contains_key(tid))
-                .collect();
-            tasks.sort_by_key(|tid| (tid.as_raw() != child.as_raw(), *tid));
-            let signals: Vec<i32> = tasks
-                .iter()
-                .filter_map(|tid| self.thread_tree.parent_death_signals.get(tid).copied())
-                .collect();
-            let committed = self.committed_exits.contains(&exited)
-                || self.thread_tree.granted_exits.contains(&process)
-                || self
-                    .parent_death_exec_survivor
-                    .map(|(survivor_process, _)| survivor_process)
-                    == Some(process);
+            let signals = self.held_parent_death_signals(child);
+            let committed = self.parent_death_exit_is_committed(exited, process);
             for signal in signals {
                 let Ok(signal) = Signal::try_from(signal) else {
                     warn!(
@@ -5238,6 +5272,83 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    /// The children whose parent-death parent is `exited`, in pid order.
+    fn parent_death_children(&self, exited: DetTid) -> Vec<DetPid> {
+        self.thread_tree
+            .parent_death_parents
+            .iter()
+            .filter(|(_, parent)| **parent == exited)
+            .map(|(child, _)| *child)
+            .collect()
+    }
+
+    /// The parent-death signals Detcore holds for `child`'s live tasks, leader
+    /// first, then by tid.
+    fn held_parent_death_signals(&self, child: DetPid) -> Vec<i32> {
+        let mut tasks: Vec<DetTid> = self
+            .thread_tree
+            .my_thread_group(&DetTid::from_raw(child.as_raw()))
+            .into_iter()
+            .filter(|tid| self.next_turns.contains_key(tid))
+            .collect();
+        tasks.sort_by_key(|tid| (tid.as_raw() != child.as_raw(), *tid));
+        tasks
+            .iter()
+            .filter_map(|tid| self.thread_tree.parent_death_signals.get(tid).copied())
+            .collect()
+    }
+
+    /// Whether `exited`, a thread of `process`, left at a committed point:
+    /// its exit, its process's `exit_group`, or an exec's edge was granted.
+    fn parent_death_exit_is_committed(&self, exited: DetTid, process: DetPid) -> bool {
+        self.committed_exits.contains(&exited)
+            || self.thread_tree.granted_exits.contains(&process)
+            || self
+                .parent_death_exec_survivor
+                .map(|(survivor_process, _)| survivor_process)
+                == Some(process)
+    }
+
+    /// On an in-guest run's default route (`refuses_parent_death_firing`),
+    /// the refusal for the first parent-death signal that would fire as
+    /// `exited`, a thread of `process`, leaves: one Detcore holds for a live
+    /// task of a child whose parent-death parent `exited` is, in the order
+    /// `deliver_parent_death_signals` would send them. Detcore holds such a
+    /// signal there, with the kernel armed with 0, but cannot send it yet, so
+    /// the run ends by name rather than lose the signal (D28a of A5 step 3c,
+    /// https://github.com/rrnewton/hermit/issues/4485). `None` anywhere else,
+    /// and where nothing would fire. A SIGKILL parent-death signal is never
+    /// held (the kernel keeps it), so never refused here.
+    ///
+    /// At a committed exit (an `Exit` grant) the refusal is decided at that
+    /// grant, in the schedule's order. At an unscheduled death of the parent
+    /// (one the backend reports without a grant, such as a process killed by
+    /// another's SIGKILL on the in-guest backends) the removal comes at a
+    /// moment host timing decides; that death is already a named determinism
+    /// loss which refuses verification. The refusal fires there whenever an
+    /// armed child is still alive at that moment, which is host-timed too:
+    /// a child that has ended by then holds nothing to fire.
+    fn parent_death_firing_refusal(
+        &self,
+        exited: DetTid,
+        process: DetPid,
+    ) -> Option<ParentDeathFiringRefusal> {
+        if !self.refuses_parent_death_firing {
+            return None;
+        }
+        self.parent_death_children(exited)
+            .into_iter()
+            .find_map(|child| {
+                let signal = *self.held_parent_death_signals(child).first()?;
+                Some(ParentDeathFiringRefusal {
+                    exited,
+                    child,
+                    signal,
+                    committed: self.parent_death_exit_is_committed(exited, process),
+                })
+            })
     }
 
     /// Send the parent-death signals decided since the last drain
@@ -31814,6 +31925,80 @@ mod test {
         scheduler.set_parent_death_signal(child, libc::SIGUSR1);
         scheduler.thread_tree.add_child(worker, child, true);
         assert_eq!(scheduler.parent_death_signal(child), 0);
+    }
+
+    /// D28a: on an in-guest run's default route a held parent-death signal
+    /// for a live child ends the run by name (`pdeathsig-would-fire`) when its
+    /// parent thread leaves, naming the thread, the signal, the child and
+    /// whether the exit was granted. Nothing is refused for a child with no
+    /// signal, for a thread that is not the child's parent, for a child with
+    /// no live task, or anywhere the configuration does not ask for it.
+    #[test]
+    fn a_held_parent_death_signal_that_would_fire_in_guest_is_refused_by_name() {
+        let (parent, child) = (DetTid::from_raw(3), DetTid::from_raw(5));
+        let process = DetPid::from_raw(3);
+        let build = |refuses: bool| {
+            let mut scheduler = Scheduler::new(&Config {
+                in_guest_refuses_host_timed_producers: refuses,
+                ..Config::default()
+            });
+            scheduler.thread_tree.add_child(parent, parent, true);
+            scheduler.thread_tree.add_child(parent, child, true);
+            for tid in [parent, child] {
+                register_known_thread(&mut scheduler, tid);
+            }
+            scheduler
+        };
+        let mut scheduler = build(true);
+        assert_eq!(scheduler.parent_death_firing_refusal(parent, process), None);
+        scheduler.set_parent_death_signal(child, libc::SIGUSR1);
+        let refusal = scheduler
+            .parent_death_firing_refusal(parent, process)
+            .expect("a held signal for a live child fires");
+        assert_eq!(
+            refusal,
+            ParentDeathFiringRefusal {
+                exited: parent,
+                child: DetPid::from_raw(5),
+                signal: libc::SIGUSR1,
+                committed: false,
+            }
+        );
+        let text = refusal.to_string();
+        assert!(
+            text.starts_with(
+                "hermit refused to continue the run (pdeathsig-would-fire): thread 3 left at an \
+                 unscheduled death (no Exit grant, already a named determinism loss)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("parent-death signal 10 (SIGUSR1) that process 5 armed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("https://github.com/rrnewton/hermit/issues/4485"),
+            "{text}"
+        );
+        // Granted: the exit is committed.
+        scheduler.thread_tree.granted_exits.insert(process);
+        let refusal = scheduler
+            .parent_death_firing_refusal(parent, process)
+            .unwrap();
+        assert!(refusal.committed);
+        assert!(refusal.to_string().contains("left at its Exit grant"));
+        // Only the child's own parent thread fires it.
+        assert_eq!(
+            scheduler.parent_death_firing_refusal(DetTid::from_raw(4), process),
+            None
+        );
+        // A child with no live task holds nothing that could fire.
+        scheduler.next_turns.remove(&child);
+        assert_eq!(scheduler.parent_death_firing_refusal(parent, process), None);
+        // Off the in-guest default route the run is never refused here.
+        let mut scheduler = build(false);
+        scheduler.set_parent_death_signal(child, libc::SIGUSR1);
+        assert_eq!(scheduler.parent_death_firing_refusal(parent, process), None);
     }
 
     /// A chain of child waits down to a held child is stuck: the root waits

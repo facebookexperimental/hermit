@@ -157,6 +157,34 @@ fn validate_resource_limit_mutation(
     Ok(())
 }
 
+/// On an in-guest run's default route
+/// (`Config::in_guest_refuses_host_timed_producers`), a WARN for a change to
+/// `RLIMIT_CPU` refused with `errno` EPERM (as it is on every backend: the
+/// limit is virtual, [`validate_resource_limit_mutation`]): a physical CPU-time
+/// limit would send SIGXCPU at a moment host CPU time decides, a host-timed
+/// producer A5 step 3c refuses there by name. Nothing on any other backend,
+/// for another resource, or for another errno (EINVAL, for a soft limit above
+/// the hard one, comes first and arms nothing).
+fn warn_refused_cpu_limit<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &G,
+    call: &str,
+    resource: u32,
+    errno: Errno,
+) {
+    if resource == reverie::syscalls::linux_abi::RLIMIT_CPU
+        && errno == Errno::EPERM
+        && guest.config().in_guest_refuses_host_timed_producers
+    {
+        tracing::warn!(
+            "{}",
+            crate::host_timed_producers::rlimit_cpu_refused_warning(
+                call,
+                guest.thread_state().dettid.as_raw(),
+            )
+        );
+    }
+}
+
 /// The record of a resource-limit read that a loader served before post-exec
 /// ([`crate::random::EarlyRequest::LimitRead`]), emitted by post-exec. It is
 /// the record [`Detcore::handle_prlimit64`] emits for the same read, from the
@@ -220,7 +248,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             .lock()
             .expect("resource limits mutex poisoned");
         let previous = limits.get(resource).ok_or(Errno::EINVAL)?;
-        validate_resource_limit_mutation(resource, previous, requested)?;
+        validate_resource_limit_mutation(resource, previous, requested)
+            .inspect_err(|errno| warn_refused_cpu_limit(guest, "setrlimit", resource, *errno))?;
         if requested != previous {
             limits.set(resource, requested);
         }
@@ -302,7 +331,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .expect("resource validity changed while handling prlimit64");
 
             if let Some(requested) = requested {
-                validate_resource_limit_mutation(resource, previous, requested)?;
+                validate_resource_limit_mutation(resource, previous, requested).inspect_err(
+                    |errno| warn_refused_cpu_limit(guest, "prlimit64", resource, *errno),
+                )?;
                 if requested != previous {
                     limits.set(resource, requested);
                 }

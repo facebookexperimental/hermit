@@ -90,8 +90,57 @@ fn seccomp_result(op: u32, flags: u32, has_args: bool) -> Result<i64, Errno> {
 /// (https://github.com/rrnewton/hermit/issues/4440): only where a thread's
 /// exit reaches the scheduler in order (sequentialized threads) and the
 /// guest's tasks are host tasks it can signal (ptrace).
-fn emulates_parent_death_signal(config: &crate::config::Config) -> bool {
+fn delivers_parent_death_signal(config: &crate::config::Config) -> bool {
     config.sequentialize_threads && config.backend.host_task_reads_reach_guest_threads
+}
+
+/// Whether Detcore holds parent-death signals itself, arming the kernel with
+/// 0 and answering `PR_GET_PDEATHSIG` from its own record: wherever it sends
+/// them ([`delivers_parent_death_signal`]), and on an in-guest run's default
+/// route (`Config::in_guest_refuses_host_timed_producers`), where it cannot
+/// send them yet and refuses the run when one would fire
+/// (`Scheduler::deliver_parent_death_signals`; D28a of A5 step 3c,
+/// https://github.com/rrnewton/hermit/issues/4485).
+fn holds_parent_death_signal(config: &crate::config::Config) -> bool {
+    delivers_parent_death_signal(config) || config.in_guest_refuses_host_timed_producers
+}
+
+/// Where `prctl(PR_SET_PDEATHSIG, signal)` goes ([`parent_death_signal_route`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParentDeathSignalRoute {
+    /// Detcore keeps the value (0 disarms) and arms the kernel with 0.
+    Hold,
+    /// The kernel takes the call, as on Linux.
+    Kernel,
+    /// EPERM and a WARN: a signal Detcore cannot hold, which the kernel would
+    /// send at a host-timed moment.
+    Refuse,
+}
+
+/// Where `prctl(PR_SET_PDEATHSIG, signal)` goes, where Detcore holds
+/// parent-death signals (`holds`) and refuses the ones it cannot hold
+/// (`refuses_unheld`, an in-guest run's default route). Detcore holds 0 and
+/// every signal it sends itself ([`detcore_sends_parent_death_signal`]).
+/// SIGKILL keeps the kernel's path everywhere: it cannot be blocked or left
+/// pending, so the in-guest runtime's mask does not make it host-timed in the
+/// way the refusal is about (design section 16.32). Any other signal (SIGSTOP,
+/// SIGALRM, a realtime signal) is refused where unheld signals are; a value
+/// above 64 always goes to the kernel, which refuses it with EINVAL.
+fn parent_death_signal_route(
+    signal: libc::c_ulong,
+    holds: bool,
+    refuses_unheld: bool,
+) -> ParentDeathSignalRoute {
+    if holds && (signal == 0 || detcore_sends_parent_death_signal(signal)) {
+        ParentDeathSignalRoute::Hold
+    } else if refuses_unheld
+        && (1..=64).contains(&signal)
+        && signal != libc::SIGKILL as libc::c_ulong
+    {
+        ParentDeathSignalRoute::Refuse
+    } else {
+        ParentDeathSignalRoute::Kernel
+    }
 }
 
 /// Whether parent-death signal `signal` is one Detcore sends itself: a
@@ -516,7 +565,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // the kernel and arms nothing.
             // A parent-death signal Detcore sends itself is held by Detcore,
             // not the kernel (armed with 0); any other comes from the kernel.
-            libc::PR_GET_PDEATHSIG if emulates_parent_death_signal(guest.config()) => {
+            libc::PR_GET_PDEATHSIG if holds_parent_death_signal(guest.config()) => {
                 let held = crate::tool_global::parent_death_signal(guest, None).await;
                 if held == 0 {
                     return self.passthrough(guest, call.into()).await;
@@ -544,14 +593,32 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 // A signal Detcore sends itself when the parent thread leaves
                 // (`Scheduler::deliver_parent_death_signals`,
-                // https://github.com/rrnewton/hermit/issues/4440): the kernel
-                // is armed with 0, so it never posts a copy of its own at a
-                // host-timed moment, and Detcore keeps the value. Any other
-                // value takes the kernel's path below, and disarms Detcore's
-                // only once the kernel has accepted it (an invalid one, which
-                // the kernel refuses with EINVAL, changes nothing).
-                let emulated = emulates_parent_death_signal(guest.config());
-                if emulated && (signal == 0 || detcore_sends_parent_death_signal(signal)) {
+                // https://github.com/rrnewton/hermit/issues/4440), or, on an
+                // in-guest run's default route, one it holds and refuses the
+                // run over if it would fire (D28a): the kernel is armed with
+                // 0, so it never posts a copy of its own at a host-timed
+                // moment, and Detcore keeps the value. There, a signal Detcore
+                // cannot hold is refused. Any other value takes the kernel's
+                // path below, and disarms Detcore's only once the kernel has
+                // accepted it (an invalid one, which the kernel refuses with
+                // EINVAL, changes nothing).
+                let held = holds_parent_death_signal(guest.config());
+                let route = parent_death_signal_route(
+                    signal,
+                    held,
+                    guest.config().in_guest_refuses_host_timed_producers,
+                );
+                if route == ParentDeathSignalRoute::Refuse {
+                    tracing::warn!(
+                        "{}",
+                        crate::host_timed_producers::parent_death_signal_refused_warning(
+                            signal as i32,
+                            guest.thread_state().dettid.as_raw(),
+                        )
+                    );
+                    return Err(Errno::EPERM.into());
+                }
+                if route == ParentDeathSignalRoute::Hold {
                     // The call is Detcore's, not recorded: replay decides it
                     // the same way. The kernel may hold a value an earlier
                     // kernel-path call armed, which this one replaces, so it
@@ -583,7 +650,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .await;
                 }
                 let result = self.passthrough(guest, call.into()).await?;
-                if emulated {
+                if held {
                     crate::tool_global::parent_death_signal(guest, Some(0)).await;
                 }
                 Ok(result)
@@ -1206,6 +1273,84 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D28a: on an in-guest run's default route Detcore holds 0 and every
+    /// signal it sends itself, as on ptrace; SIGKILL keeps the kernel's path;
+    /// SIGSTOP, SIGALRM and the realtime signals are refused; a value above 64
+    /// is the kernel's EINVAL. Where Detcore delivers them (ptrace), nothing
+    /// is refused. Where it does neither (every other backend), everything is
+    /// the kernel's.
+    #[test]
+    fn parent_death_signals_are_held_refused_or_the_kernels() {
+        use ParentDeathSignalRoute::*;
+        for signal in 0..=66_u64 {
+            let held = signal == 0 || detcore_sends_parent_death_signal(signal);
+            let in_guest = parent_death_signal_route(signal, true, true);
+            let ptrace = parent_death_signal_route(signal, true, false);
+            let other = parent_death_signal_route(signal, false, false);
+            assert_eq!(other, Kernel, "{signal}");
+            assert_eq!(ptrace, if held { Hold } else { Kernel }, "{signal}");
+            let expected = if held {
+                Hold
+            } else if signal == libc::SIGKILL as u64 || signal > 64 {
+                Kernel
+            } else {
+                Refuse
+            };
+            assert_eq!(in_guest, expected, "{signal}");
+        }
+        // The values the brief names.
+        for (signal, route) in [
+            (libc::SIGUSR1, Hold),
+            (libc::SIGUSR2, Hold),
+            (0, Hold),
+            (libc::SIGKILL, Kernel),
+            (libc::SIGSTOP, Refuse),
+            (libc::SIGALRM, Refuse),
+            (32, Refuse),
+            (64, Refuse),
+            (65, Kernel),
+        ] {
+            assert_eq!(
+                parent_death_signal_route(signal as u64, true, true),
+                route,
+                "{signal}"
+            );
+        }
+    }
+
+    /// Detcore holds parent-death signals where it delivers them (ptrace,
+    /// sequentialized) and on an in-guest run's default route, and only
+    /// delivers them on ptrace.
+    #[test]
+    fn holding_a_parent_death_signal_is_split_from_delivering_it() {
+        let ptrace = crate::config::Config {
+            sequentialize_threads: true,
+            backend: BackendCapabilities::PTRACE,
+            ..Default::default()
+        };
+        assert!(delivers_parent_death_signal(&ptrace));
+        assert!(holds_parent_death_signal(&ptrace));
+        let unsequentialized = crate::config::Config {
+            sequentialize_threads: false,
+            ..ptrace.clone()
+        };
+        assert!(!delivers_parent_death_signal(&unsequentialized));
+        assert!(!holds_parent_death_signal(&unsequentialized));
+        let in_guest = crate::config::Config {
+            sequentialize_threads: true,
+            backend: BackendCapabilities::LITEINST_IN_GUEST,
+            in_guest_refuses_host_timed_producers: true,
+            ..Default::default()
+        };
+        assert!(!delivers_parent_death_signal(&in_guest));
+        assert!(holds_parent_death_signal(&in_guest));
+        let off = crate::config::Config {
+            in_guest_refuses_host_timed_producers: false,
+            ..in_guest
+        };
+        assert!(!holds_parent_death_signal(&off));
+    }
 
     mod group_mirror {
         use std::sync::Mutex;

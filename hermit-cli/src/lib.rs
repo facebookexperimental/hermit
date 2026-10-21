@@ -1203,6 +1203,509 @@ pub fn in_guest_reserved_signals(config: &DetConfig, backend: Backend) -> u64 {
     reserved
 }
 
+/// Whether Detcore refuses host-timed signal producers in a run of `backend`
+/// (`detcore::Config::in_guest_refuses_host_timed_producers`, A5 step 3c
+/// slice 0b): on Hermit's default in-guest route, for both in-guest backends,
+/// and never on another backend. The in-guest loader route never calls this,
+/// so the setting stays off there: today's behaviour (D13(a), D26).
+pub const fn in_guest_refuses_host_timed_producers(backend: Backend) -> bool {
+    backend.is_in_guest_liteinst()
+}
+
+/// `RLIMIT_CPU`'s value as Hermit's log and refusal print it: `unlimited`, or
+/// a number of seconds.
+#[cfg(feature = "liteinst")]
+fn rlimit_seconds(value: libc::rlim_t) -> String {
+    if value == libc::RLIM_INFINITY {
+        "unlimited".to_owned()
+    } else {
+        format!("{value}s")
+    }
+}
+
+/// The INFO line for the physical `RLIMIT_CPU` the guest's own check found,
+/// `old`, just before its program started, and set to unlimited, the value
+/// Detcore reports (`syscalls/sysinfo.rs`): D25 of A5 step 3c.
+#[cfg(feature = "liteinst")]
+fn rlimit_cpu_report_line(old: libc::rlimit) -> String {
+    if old.rlim_cur == libc::RLIM_INFINITY && old.rlim_max == libc::RLIM_INFINITY {
+        format!(
+            "HERMIT_IN_GUEST_RLIMIT_CPU: the guest's physical RLIMIT_CPU was soft {} hard {}, the \
+             value Detcore reports; the guest starts with it unchanged (A5 step 3c, D25)",
+            rlimit_seconds(old.rlim_cur),
+            rlimit_seconds(old.rlim_max),
+        )
+    } else {
+        format!(
+            "HERMIT_IN_GUEST_RLIMIT_CPU: the guest's physical RLIMIT_CPU was soft {} hard {}; \
+             Hermit sets it to soft unlimited hard unlimited as the guest starts, the value \
+             Detcore reports, so the kernel never sends SIGXCPU at a moment host CPU time decides \
+             (A5 step 3c, D25)",
+            rlimit_seconds(old.rlim_cur),
+            rlimit_seconds(old.rlim_max),
+        )
+    }
+}
+
+/// Why the guest cannot start with the finite physical `RLIMIT_CPU` its own
+/// check found, `old`, which it could not raise to unlimited (`errno`; raising
+/// a hard limit needs `CAP_SYS_RESOURCE` in the initial user namespace,
+/// `do_prlimit`, which Hermit's container never has). A finite limit would
+/// make the kernel send SIGXCPU at the soft limit and SIGKILL at the hard
+/// one, at moments host CPU time decides.
+#[cfg(feature = "liteinst")]
+fn rlimit_cpu_refusal(old: libc::rlimit, errno: nix::errno::Errno) -> String {
+    format!(
+        "the guest would inherit a finite physical RLIMIT_CPU (soft {}, hard {}), and Hermit \
+         cannot raise it ({errno}), so the kernel would send SIGXCPU or SIGKILL at a moment host \
+         CPU time decides; run Hermit with an unlimited hard CPU-time limit \
+         (A5 step 3c, D25, https://github.com/rrnewton/hermit/issues/4485)",
+        rlimit_seconds(old.rlim_cur),
+        rlimit_seconds(old.rlim_max),
+    )
+}
+
+/// Why descriptor `fd`, which the guest would inherit, cannot be inherited by
+/// an in-guest guest: it is already a complete host-timed signal producer
+/// (`state`, D25 of A5 step 3c), holds a lease (`lease`), or has an owner
+/// without `O_ASYNC` on a file that is not a socket. A directory
+/// notification (`F_NOTIFY`) sets such an owner and signals it for its
+/// events, and cannot be read back (there is no `F_GETNOTIFY`, and fdinfo
+/// does not show dnotify), so any owner fails closed. `None` when it has
+/// none of these.
+#[cfg(feature = "liteinst")]
+fn inherited_producer_refusal(
+    fd: std::os::fd::RawFd,
+    state: detcore::host_timed_producers::ProducerState,
+    lease: bool,
+) -> Option<String> {
+    let what = if lease {
+        "it holds a lease, whose owner Linux sends SIGIO when another process opens the file"
+    } else if state.is_complete() && state.o_async {
+        "it has O_ASYNC and an owner, which Linux sends SIGIO when it becomes ready"
+    } else if state.is_complete() {
+        "it is a socket with an owner, which Linux sends SIGURG when out-of-band data arrives"
+    } else if state.owner {
+        "it has an owner, which a directory notification (F_NOTIFY) on it would make Linux send \
+         SIGIO for the directory's changes, and Hermit cannot tell whether one is set"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "the guest would inherit descriptor {fd}, which is already a signal producer: {what}, at \
+         a moment host timing decides; close it, or clear its owner and O_ASYNC, before running \
+         Hermit (A5 step 3c, D25, https://github.com/rrnewton/hermit/issues/4485)"
+    ))
+}
+
+/// Why descriptor `fd`, which the guest would inherit and whose state cannot
+/// be read (`errno`), is not inherited unchecked.
+#[cfg(feature = "liteinst")]
+fn unreadable_descriptor_refusal(fd: std::os::fd::RawFd, errno: nix::errno::Errno) -> String {
+    format!(
+        "the guest would inherit descriptor {fd}, whose signal owner and flags cannot be read \
+         ({errno}), so Hermit cannot tell whether it is a signal producer \
+         (A5 step 3c, D25, https://github.com/rrnewton/hermit/issues/4485)"
+    )
+}
+
+/// Why the guest's descriptor table could not be listed (`errno`), so is not
+/// inherited unchecked.
+#[cfg(feature = "liteinst")]
+fn unlisted_descriptors_refusal(errno: nix::errno::Errno) -> String {
+    format!(
+        "the guest's descriptor table could not be listed from /proc/self/fd ({errno}), so \
+         Hermit cannot tell whether a descriptor it would inherit is a signal producer \
+         (A5 step 3c, D25, https://github.com/rrnewton/hermit/issues/4485)"
+    )
+}
+
+/// The guest's own check, in its process just before its program starts
+/// (D25 of A5 step 3c): a `pre_exec` callback Hermit installs after every
+/// other one that can change what it checks, so after
+/// the spawner has put the command's configured standard streams in place
+/// (whatever descriptor each came from, close-on-exec or not) and after every
+/// callback the caller installed (one of which could clear close-on-exec on a
+/// descriptor of its own, or change a limit). Hermit's own process cannot see
+/// that state. The callback
+/// - lists the whole descriptor table from `/proc/self/fd`, and fails the
+///   launch, by name, when it cannot ([`audit_inherited_descriptors`]);
+/// - reads each descriptor without close-on-exec, and fails the launch for a
+///   complete producer, a lease or any owner, or one it cannot read
+///   ([`check_inherited_descriptor`]);
+/// - reads `RLIMIT_CPU` and sets it to unlimited, and fails the launch when it
+///   cannot.
+///
+/// Every outcome is written to a pipe this process reads ([`LaunchReport`]):
+/// a failure's reason, from which the caller makes the named refusal, or the
+/// limit the check found, which is logged at INFO at the end of the run, on
+/// every exit path (`detcore::host_timed_producers::defer_run_end_log`).
+#[cfg(feature = "liteinst")]
+struct LaunchAudit {
+    pipe: std::sync::Arc<LaunchPipe>,
+}
+
+/// The pipe the guest's check reports through, and its report once read.
+#[cfg(feature = "liteinst")]
+struct LaunchPipe {
+    read: std::os::fd::OwnedFd,
+    _write: std::os::fd::OwnedFd,
+    report: std::sync::OnceLock<Option<LaunchReport>>,
+}
+
+#[cfg(feature = "liteinst")]
+impl LaunchPipe {
+    /// The next report in the pipe, if the check wrote one.
+    fn read_report(&self) -> Option<LaunchReport> {
+        let mut bytes = [0u8; LaunchReport::SIZE];
+        let read = nix::unistd::read(&self.read, &mut bytes).ok()?;
+        (read == bytes.len()).then(|| LaunchReport::decode(bytes))
+    }
+
+    /// The launch's report, read once.
+    fn report(&self) -> Option<LaunchReport> {
+        *self.report.get_or_init(|| self.read_report())
+    }
+
+    /// Logs at INFO the `RLIMIT_CPU` a check that passed found and set to
+    /// unlimited (D25); nothing for a check that failed or never ran.
+    fn log_rlimit(&self) {
+        match self.report() {
+            Some(report) if report.kind == audit_bits::PASSED => {
+                tracing::info!("{}", rlimit_cpu_report_line(report.limit()));
+            }
+            // A refusal is reported where the launch fails, not here.
+            Some(_) => {}
+            None => tracing::warn!(
+                "HERMIT_IN_GUEST_RLIMIT_CPU: the guest's launch check reported nothing \
+                 (A5 step 3c, D25)"
+            ),
+        }
+    }
+}
+
+/// The report's kinds and state bits.
+#[cfg(feature = "liteinst")]
+mod audit_bits {
+    /// The check passed; the report carries the limit it found.
+    pub const PASSED: u8 = 0;
+    /// A descriptor is a complete producer; the bits say what it holds.
+    pub const PRODUCER: u8 = 1;
+    /// A descriptor's state cannot be read; the errno says why.
+    pub const UNREADABLE: u8 = 2;
+    /// The descriptor table cannot be listed; the errno says why.
+    pub const UNLISTED: u8 = 3;
+    /// `RLIMIT_CPU` cannot be raised; the report carries the limit and errno.
+    pub const RLIMIT_CPU: u8 = 4;
+
+    pub const O_ASYNC: u8 = 1;
+    pub const OWNER: u8 = 2;
+    pub const SOCKET: u8 = 4;
+    pub const LEASE: u8 = 8;
+}
+
+/// What the guest's check reports ([`LaunchAudit`]): its kind
+/// ([`audit_bits`]), state bits, errno, descriptor, and the `RLIMIT_CPU` it
+/// found, in 24 native-endian bytes.
+#[cfg(feature = "liteinst")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LaunchReport {
+    kind: u8,
+    bits: u8,
+    errno: u8,
+    fd: libc::c_int,
+    rlimit: (libc::rlim_t, libc::rlim_t),
+}
+
+#[cfg(feature = "liteinst")]
+impl LaunchReport {
+    const SIZE: usize = 24;
+
+    fn encode(self) -> [u8; Self::SIZE] {
+        let mut bytes = [0u8; Self::SIZE];
+        bytes[0] = self.kind;
+        bytes[1] = self.bits;
+        bytes[2] = self.errno;
+        bytes[4..8].copy_from_slice(&self.fd.to_ne_bytes());
+        bytes[8..16].copy_from_slice(&self.rlimit.0.to_ne_bytes());
+        bytes[16..24].copy_from_slice(&self.rlimit.1.to_ne_bytes());
+        bytes
+    }
+
+    fn decode(bytes: [u8; Self::SIZE]) -> Self {
+        let word = |range: std::ops::Range<usize>| {
+            libc::rlim_t::from_ne_bytes(bytes[range].try_into().expect("eight bytes"))
+        };
+        Self {
+            kind: bytes[0],
+            bits: bytes[1],
+            errno: bytes[2],
+            fd: libc::c_int::from_ne_bytes(bytes[4..8].try_into().expect("four bytes")),
+            rlimit: (word(8..16), word(16..24)),
+        }
+    }
+
+    fn errno(self) -> nix::errno::Errno {
+        nix::errno::Errno::from_raw(self.errno.into())
+    }
+
+    fn limit(self) -> libc::rlimit {
+        libc::rlimit {
+            rlim_cur: self.rlimit.0,
+            rlim_max: self.rlimit.1,
+        }
+    }
+
+    /// The refusal this report names, `None` for a check that passed.
+    fn refusal(self) -> Option<String> {
+        match self.kind {
+            audit_bits::PRODUCER => {
+                let state = detcore::host_timed_producers::ProducerState {
+                    o_async: self.bits & audit_bits::O_ASYNC != 0,
+                    owner: self.bits & audit_bits::OWNER != 0,
+                    socket: self.bits & audit_bits::SOCKET != 0,
+                };
+                inherited_producer_refusal(self.fd, state, self.bits & audit_bits::LEASE != 0)
+            }
+            audit_bits::UNREADABLE => Some(unreadable_descriptor_refusal(self.fd, self.errno())),
+            audit_bits::UNLISTED => Some(unlisted_descriptors_refusal(self.errno())),
+            audit_bits::RLIMIT_CPU => Some(rlimit_cpu_refusal(self.limit(), self.errno())),
+            _ => None,
+        }
+    }
+}
+
+/// The report for descriptor `fd` of the calling process if the guest must
+/// not inherit it, `None` if it may: one with close-on-exec, which it does
+/// not inherit, or `report`, the audit's own pipe, are skipped.
+/// Async-signal-safe: fcntl and fstat only, no allocation.
+#[cfg(feature = "liteinst")]
+fn check_inherited_descriptor(fd: libc::c_int, report: libc::c_int) -> Option<LaunchReport> {
+    // SAFETY: F_GETFD reads a descriptor flag and writes no memory.
+    let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if fd == report || fd_flags < 0 || fd_flags & libc::FD_CLOEXEC != 0 {
+        return None;
+    }
+    let (kind, bits, errno) = match detcore::host_timed_producers::host_descriptor_state(fd) {
+        Ok((state, lease)) if lease || state.owner || state.is_complete() => (
+            audit_bits::PRODUCER,
+            (if state.o_async {
+                audit_bits::O_ASYNC
+            } else {
+                0
+            }) | (if state.owner { audit_bits::OWNER } else { 0 })
+                | (if state.socket { audit_bits::SOCKET } else { 0 })
+                | (if lease { audit_bits::LEASE } else { 0 }),
+            0,
+        ),
+        Ok(_) | Err(nix::errno::Errno::EBADF) => return None,
+        Err(errno) => (audit_bits::UNREADABLE, 0, errno as i32 as u8),
+    };
+    Some(LaunchReport {
+        kind,
+        bits,
+        errno,
+        fd,
+        rlimit: (0, 0),
+    })
+}
+
+/// The first report [`check_inherited_descriptor`] makes for the calling
+/// process's descriptors, every one `/proc/self/fd` lists, read with
+/// `getdents64` into a stack buffer. Where that directory cannot be listed
+/// (its open or a read fails, for example with EMFILE after a caller lowered
+/// `RLIMIT_NOFILE` below its open descriptors), the report says so
+/// (`UNLISTED`, with the errno): no number-range scan stands in for it, since
+/// no bound below the largest open descriptor is sure. Async-signal-safe:
+/// open, getdents64, close, fcntl and fstat only, no allocation.
+#[cfg(feature = "liteinst")]
+fn audit_inherited_descriptors(report: libc::c_int) -> Option<LaunchReport> {
+    let unlisted = || LaunchReport {
+        kind: audit_bits::UNLISTED,
+        bits: 0,
+        errno: nix::errno::Errno::last_raw() as u8,
+        fd: -1,
+        rlimit: (0, 0),
+    };
+    // SAFETY: plain system calls on this process's descriptor table, writing
+    // only into the local buffer.
+    unsafe {
+        let directory = libc::open(
+            c"/proc/self/fd".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        );
+        if directory < 0 {
+            return Some(unlisted());
+        }
+        let mut buffer = [0u8; 4096];
+        loop {
+            let read = libc::syscall(
+                libc::SYS_getdents64,
+                directory,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+            );
+            if read < 0 {
+                let failed = unlisted();
+                libc::close(directory);
+                return Some(failed);
+            }
+            if read == 0 {
+                break;
+            }
+            let mut offset = 0;
+            while offset + 19 < read as usize {
+                // struct linux_dirent64: d_ino (8), d_off (8), d_reclen (2),
+                // d_type (1), d_name.
+                let length =
+                    u16::from_ne_bytes([buffer[offset + 16], buffer[offset + 17]]) as usize;
+                if length == 0 {
+                    break;
+                }
+                let mut fd: libc::c_int = 0;
+                let mut digits = 0;
+                for &byte in &buffer[offset + 19..offset + length] {
+                    if !byte.is_ascii_digit() {
+                        break;
+                    }
+                    fd = fd
+                        .saturating_mul(10)
+                        .saturating_add((byte - b'0') as libc::c_int);
+                    digits += 1;
+                }
+                if digits > 0
+                    && fd != directory
+                    && let Some(found) = check_inherited_descriptor(fd, report)
+                {
+                    libc::close(directory);
+                    return Some(found);
+                }
+                offset += length;
+            }
+        }
+        libc::close(directory);
+        None
+    }
+}
+
+/// The guest's whole check ([`LaunchAudit`]), in its process: the descriptor
+/// table, then `RLIMIT_CPU`, which it sets to unlimited. Every outcome is a
+/// report; a failing one fails the launch. Async-signal-safe.
+#[cfg(feature = "liteinst")]
+fn launch_check(report: libc::c_int) -> LaunchReport {
+    if let Some(failed) = audit_inherited_descriptors(report) {
+        return failed;
+    }
+    // SAFETY: getrlimit and setrlimit read and write only the local limits.
+    unsafe {
+        let mut old: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_CPU, &mut old) != 0 {
+            return LaunchReport {
+                kind: audit_bits::RLIMIT_CPU,
+                bits: 0,
+                errno: nix::errno::Errno::last_raw() as u8,
+                fd: -1,
+                rlimit: (0, 0),
+            };
+        }
+        let mut found = LaunchReport {
+            kind: audit_bits::PASSED,
+            bits: 0,
+            errno: 0,
+            fd: -1,
+            rlimit: (old.rlim_cur, old.rlim_max),
+        };
+        if old.rlim_cur != libc::RLIM_INFINITY || old.rlim_max != libc::RLIM_INFINITY {
+            let unlimited = libc::rlimit {
+                rlim_cur: libc::RLIM_INFINITY,
+                rlim_max: libc::RLIM_INFINITY,
+            };
+            if libc::setrlimit(libc::RLIMIT_CPU, &unlimited) != 0 {
+                found.kind = audit_bits::RLIMIT_CPU;
+                found.errno = nix::errno::Errno::last_raw() as u8;
+            }
+        }
+        found
+    }
+}
+
+#[cfg(feature = "liteinst")]
+impl LaunchAudit {
+    /// Installs the check on `command`, after every `pre_exec` callback
+    /// already installed on it, so a library caller's own run first. It is
+    /// the last callback that can change what it checks: Reverie's in-guest
+    /// launcher then adds two of its own (reverie-inguest
+    /// `src/launcher/mod.rs` at a214eb85): `personality(ADDR_NO_RANDOMIZE)`
+    /// (`:619`, called at `:1048` and `:1092`), and clearing close-on-exec on
+    /// its own sealed bootstrap memfd (`:1061-1068`, `bootstrap.rs`). Neither
+    /// touches `RLIMIT_CPU` or creates a signal producer.
+    /// Also keeps the INFO line of the limit it finds to log at the end of
+    /// the run, on every exit path (`detcore::host_timed_producers`).
+    fn install(command: &mut Command) -> Result<Self, Error> {
+        use std::os::fd::AsRawFd;
+        let (read, write) =
+            nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC | nix::fcntl::OFlag::O_NONBLOCK)?;
+        let report = write.as_raw_fd();
+        // SAFETY: the callback is async-signal-safe (see `launch_check`) and
+        // allocates nothing.
+        unsafe {
+            command.pre_exec(move || {
+                let found = launch_check(report);
+                let bytes = found.encode();
+                libc::write(report, bytes.as_ptr().cast(), bytes.len());
+                if found.kind == audit_bits::PASSED {
+                    Ok(())
+                } else {
+                    Err(reverie::Errno::EPERM)
+                }
+            });
+        }
+        let pipe = std::sync::Arc::new(LaunchPipe {
+            read,
+            _write: write,
+            report: std::sync::OnceLock::new(),
+        });
+        let logged = pipe.clone();
+        detcore::host_timed_producers::defer_run_end_log(move || logged.log_rlimit());
+        Ok(Self { pipe })
+    }
+
+    /// `error`, the launch's, or the named refusal the guest's check reported
+    /// for `backend`, which is why the launch failed. A check that passed
+    /// before the backend failed has its limit logged first, as on every
+    /// other exit path.
+    fn launch_error(&self, backend: Backend, error: reverie::Error) -> Error {
+        match self.pipe.report().and_then(LaunchReport::refusal) {
+            Some(reason) => Error::new(LiteinstInGuestRefusal::for_backend(backend, reason)),
+            None => {
+                detcore::host_timed_producers::emit_run_end_log();
+                Error::from(error)
+            }
+        }
+    }
+}
+
+/// Before an in-guest launch on the default route, installs the guest's own
+/// check of what it inherits (D25 of A5 step 3c, design section 16.32,
+/// [`LaunchAudit`]): it refuses the launch by name for an inherited
+/// descriptor that is already a host-timed signal producer, a descriptor
+/// table it cannot list, or a finite `RLIMIT_CPU` it cannot raise, and
+/// otherwise sets the guest's physical `RLIMIT_CPU` to unlimited as the guest
+/// starts. The caller turns a failed launch's report into the refusal; a
+/// passed one's limit is logged at INFO at the end of the run, on every exit
+/// path. `None` for a backend
+/// that does not refuse host-timed producers.
+#[cfg(feature = "liteinst")]
+fn neutralize_inherited_signal_producers(
+    command: &mut Command,
+    backend: Backend,
+) -> Result<Option<LaunchAudit>, Error> {
+    if !in_guest_refuses_host_timed_producers(backend) {
+        return Ok(None);
+    }
+    Ok(Some(LaunchAudit::install(command)?))
+}
+
 /// Why an `in-guest-trap` run cannot start with the guest environment of
 /// `command`: the environment (explicit or inherited) sets
 /// `REVERIE_LITEINST_SITE_PATCHING` to a value other than the one Hermit
@@ -4232,6 +4735,9 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // so whatever a caller's configuration carried, every backend and every
     // other route starts from the empty set (A5 step 3c, D13(a)).
     config.in_guest_reserved_signals = 0;
+    // So is the refusal of host-timed signal producers
+    // (`in_guest_refuses_host_timed_producers`, A5 step 3c slice 0b).
+    config.in_guest_refuses_host_timed_producers = false;
     config
 }
 
@@ -4535,6 +5041,9 @@ async fn dispatch_backend(
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
             let (launch, _detlog_descriptor) =
                 in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
+            // After Hermit's other callbacks, so the guest's own check is the
+            // last one that can change what it checks (`LaunchAudit::install`).
+            let audit = neutralize_inherited_signal_producers(&mut command, backend)?;
             let tool_data = launch.encode();
             // Every Tool image must forward on that socket, by that policy;
             // see detcore::Config::in_guest_detlog_forward_policy.
@@ -4543,6 +5052,8 @@ async fn dispatch_backend(
                 .is_some()
                 .then(|| in_guest_detlog_forward_policy().encode());
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
+            config.in_guest_refuses_host_timed_producers =
+                in_guest_refuses_host_timed_producers(backend);
             // Last, from the configuration every Tool image receives.
             config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
             let preload = liteinst_tool_runtime_library_path()?;
@@ -4577,7 +5088,13 @@ async fn dispatch_backend(
                     },
                 )
                 .await
-                .inspect_err(|error| exits.fail_launch(error))?;
+                .inspect_err(|error| exits.fail_launch(error))
+                // A standard descriptor the guest's own check refused
+                // (D25) fails the launch; name it.
+                .map_err(|error| match &audit {
+                    Some(audit) => audit.launch_error(backend, error),
+                    None => Error::from(error),
+                })?;
             let patched =
                 in_guest_trap_patching_evidence(backend, dispatch_stats.as_ref(), process_reports);
             let settled = settle_in_guest_exits(&exits, &global_state).await;
@@ -4593,6 +5110,10 @@ async fn dispatch_backend(
                     dispatch_stats,
                 )
                 .await;
+            // After the scheduler has shut down, so the line's place among
+            // the run's INFO lines is fixed (D25); a stopping refusal logs it
+            // just before it exits instead.
+            detcore::host_timed_producers::emit_run_end_log();
             refuse_in_guest_policy(backend, policy_refusal)?;
             settled?;
             refuse_in_guest_trap_patching(backend, patched)?;
@@ -4850,6 +5371,9 @@ async fn dispatch_output_backend(
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
             let (launch, _detlog_descriptor) =
                 in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
+            // After Hermit's other callbacks, so the guest's own check is the
+            // last one that can change what it checks (`LaunchAudit::install`).
+            let audit = neutralize_inherited_signal_producers(&mut command, backend)?;
             let tool_data = launch.encode();
             // Every Tool image must forward on that socket, by that policy;
             // see detcore::Config::in_guest_detlog_forward_policy.
@@ -4858,6 +5382,8 @@ async fn dispatch_output_backend(
                 .is_some()
                 .then(|| in_guest_detlog_forward_policy().encode());
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
+            config.in_guest_refuses_host_timed_producers =
+                in_guest_refuses_host_timed_producers(backend);
             // Last, from the configuration every Tool image receives.
             config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
             let preload = liteinst_tool_runtime_library_path()?;
@@ -4883,7 +5409,13 @@ async fn dispatch_output_backend(
                     }
                 })
                 .await
-                .inspect_err(|error| exits.fail_launch(error))?;
+                .inspect_err(|error| exits.fail_launch(error))
+                // A standard descriptor the guest's own check refused
+                // (D25) fails the launch; name it.
+                .map_err(|error| match &audit {
+                    Some(audit) => audit.launch_error(backend, error),
+                    None => Error::from(error),
+                })?;
             let patched =
                 in_guest_trap_patching_evidence(backend, dispatch_stats.as_ref(), process_reports);
             let settled = settle_in_guest_exits(&exits, &global_state).await;
@@ -4905,6 +5437,10 @@ async fn dispatch_output_backend(
                     dispatch_stats,
                 )
                 .await;
+            // After the scheduler has shut down, so the line's place among
+            // the run's INFO lines is fixed (D25); a stopping refusal logs it
+            // just before it exits instead.
+            detcore::host_timed_producers::emit_run_end_log();
             refuse_in_guest_policy(backend, policy_refusal)?;
             settled?;
             refuse_in_guest_trap_patching(backend, patched)?;
@@ -6918,6 +7454,241 @@ mod tests {
         assert_eq!(loader.in_guest_reserved_signals, 0);
         assert!(loader.in_guest_site_patching_off);
         assert_eq!(loader.backend, backend_capabilities(Backend::InGuestTrap));
+    }
+
+    /// A configuration that already asks for the refusal of host-timed signal
+    /// producers (a public, serialized field) never keeps it through Hermit's
+    /// preparation: every backend's preparation and the loader route's (the
+    /// exec-stop, native-exec and mapped-first-admission launchers, and the
+    /// native-exec verify route) turn it off. Only the default in-guest route
+    /// turns it on afterwards, from the backend alone: both in-guest backends
+    /// and no other (A5 step 3c slice 0b).
+    #[test]
+    fn a_poisoned_producer_refusal_never_survives_preparation() {
+        let poisoned = DetConfig {
+            in_guest_refuses_host_timed_producers: true,
+            ..DetConfig::default()
+        };
+        for backend in Backend::ALL {
+            let prepared = prepare_backend_config(poisoned.clone(), backend);
+            assert!(
+                !prepared.in_guest_refuses_host_timed_producers,
+                "{backend:?}"
+            );
+            assert_eq!(
+                in_guest_refuses_host_timed_producers(backend),
+                matches!(backend, Backend::Liteinst | Backend::InGuestTrap),
+                "{backend:?}"
+            );
+        }
+        let loader = prepare_in_guest_loader_route_config(poisoned);
+        assert!(!loader.in_guest_refuses_host_timed_producers);
+        assert!(loader.in_guest_site_patching_off);
+    }
+
+    /// D25: the guest's check logs the limit it found, unchanged when
+    /// already unlimited and raised otherwise, and a limit it could not raise
+    /// refuses the run, naming both values and the errno.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn an_in_guest_launch_logs_the_cpu_limit_it_found_and_refuses_one_it_cannot_raise() {
+        let limit = |rlim_cur, rlim_max| libc::rlimit { rlim_cur, rlim_max };
+        let unchanged = rlimit_cpu_report_line(limit(libc::RLIM_INFINITY, libc::RLIM_INFINITY));
+        assert!(
+            unchanged.contains(
+                "was soft unlimited hard unlimited, the value Detcore reports; the guest starts \
+                 with it unchanged"
+            ),
+            "{unchanged}"
+        );
+        let raised = rlimit_cpu_report_line(limit(1, libc::RLIM_INFINITY));
+        assert!(
+            raised.contains(
+                "was soft 1s hard unlimited; Hermit sets it to soft unlimited hard unlimited"
+            ),
+            "{raised}"
+        );
+        let refused = rlimit_cpu_refusal(limit(3600, 7200), nix::errno::Errno::EPERM);
+        assert!(
+            refused.starts_with(
+                "the guest would inherit a finite physical RLIMIT_CPU (soft 3600s, hard 7200s), \
+                 and Hermit cannot raise it (EPERM: "
+            ),
+            "{refused}"
+        );
+        assert!(refused.contains("D25"), "{refused}");
+    }
+
+    /// D25: what the guest's own check reports through its pipe becomes the
+    /// refusal naming the descriptor and why (an unreadable one, or a table
+    /// that cannot be listed, with its errno; an unraisable `RLIMIT_CPU` with
+    /// its values), or, for a check that passed, the limit to log; an empty
+    /// pipe (the check never ran) names nothing.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn the_launch_audit_reports_what_the_guest_check_found() {
+        use std::os::fd::AsRawFd;
+        let mut command = Command::new("/bin/true");
+        let audit = LaunchAudit::install(&mut command).unwrap();
+        let pipe = &audit.pipe;
+        assert_eq!(pipe.read_report(), None);
+        let write = |report: LaunchReport| {
+            let bytes = report.encode();
+            // SAFETY: a write of a local array.
+            let written =
+                unsafe { libc::write(pipe._write.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+            assert_eq!(written, bytes.len() as isize);
+        };
+        let report = |kind, bits, errno: i32, fd, rlimit| LaunchReport {
+            kind,
+            bits,
+            errno: errno as u8,
+            fd,
+            rlimit,
+        };
+        for (sent, what) in [
+            (
+                report(
+                    audit_bits::PRODUCER,
+                    audit_bits::O_ASYNC | audit_bits::OWNER,
+                    0,
+                    0,
+                    (0, 0),
+                ),
+                "the guest would inherit descriptor 0, which is already a signal producer: it has \
+                 O_ASYNC and an owner",
+            ),
+            (
+                report(
+                    audit_bits::PRODUCER,
+                    audit_bits::SOCKET | audit_bits::OWNER,
+                    0,
+                    1,
+                    (0, 0),
+                ),
+                "descriptor 1, which is already a signal producer: it is a socket with an owner",
+            ),
+            (
+                report(audit_bits::PRODUCER, audit_bits::LEASE, 0, 300, (0, 0)),
+                "descriptor 300, which is already a signal producer: it holds a lease",
+            ),
+            (
+                report(audit_bits::UNREADABLE, 0, libc::EACCES, 7, (0, 0)),
+                "descriptor 7, whose signal owner and flags cannot be read (EACCES",
+            ),
+            (
+                report(audit_bits::UNLISTED, 0, libc::EMFILE, -1, (0, 0)),
+                "descriptor table could not be listed from /proc/self/fd (EMFILE",
+            ),
+            (
+                report(audit_bits::RLIMIT_CPU, 0, libc::EPERM, -1, (3600, 3600)),
+                "finite physical RLIMIT_CPU (soft 3600s, hard 3600s), and Hermit cannot raise it \
+                 (EPERM",
+            ),
+        ] {
+            write(sent);
+            let received = pipe.read_report().unwrap();
+            assert_eq!(received, sent);
+            let reason = received.refusal().unwrap();
+            assert!(reason.contains(what), "{reason}");
+        }
+        let passed = report(audit_bits::PASSED, 0, 0, -1, (1, libc::RLIM_INFINITY));
+        write(passed);
+        let received = pipe.read_report().unwrap();
+        assert_eq!(received.refusal(), None);
+        assert_eq!(
+            rlimit_cpu_report_line(received.limit()),
+            rlimit_cpu_report_line(libc::rlimit {
+                rlim_cur: 1,
+                rlim_max: libc::RLIM_INFINITY
+            })
+        );
+        assert_eq!(pipe.read_report(), None);
+    }
+
+    /// D25: the guest's check reads its whole descriptor table and skips
+    /// close-on-exec descriptors and its own pipe: in this process, a pipe
+    /// with O_ASYNC and an owner is reported only once its close-on-exec is
+    /// cleared, by number and state, and the table scan reports exactly it.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn the_inherited_descriptor_scan_finds_a_producer_without_close_on_exec() {
+        use std::os::fd::AsRawFd;
+        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
+        drop(write);
+        let fd = read.as_raw_fd();
+        // SAFETY: plain fcntl calls on a descriptor this test owns; no SIGIO
+        // can be sent for a pipe with no writer.
+        unsafe {
+            assert_eq!(libc::fcntl(fd, libc::F_SETOWN, libc::getpid()), 0);
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            assert_eq!(libc::fcntl(fd, libc::F_SETFL, flags | libc::O_ASYNC), 0);
+        }
+        assert_eq!(check_inherited_descriptor(fd, -1), None);
+        // SAFETY: as above.
+        unsafe { assert_eq!(libc::fcntl(fd, libc::F_SETFD, 0), 0) };
+        let expected = LaunchReport {
+            kind: audit_bits::PRODUCER,
+            bits: audit_bits::O_ASYNC | audit_bits::OWNER,
+            errno: 0,
+            fd,
+            rlimit: (0, 0),
+        };
+        assert_eq!(check_inherited_descriptor(fd, -1), Some(expected));
+        assert_eq!(
+            check_inherited_descriptor(fd, fd),
+            None,
+            "the audit's own pipe"
+        );
+        // No other descriptor of this test process is a producer, so the
+        // table scan reports exactly this one.
+        assert_eq!(audit_inherited_descriptors(-1), Some(expected));
+        // SAFETY: as above.
+        unsafe { assert_eq!(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC), 0) };
+    }
+
+    /// D25: an inherited descriptor that is already a producer (O_ASYNC with
+    /// an owner, a socket with an owner, a lease) refuses the run, naming the
+    /// descriptor, and so does one with only an owner (a directory
+    /// notification, which cannot be read back, would signal it); one with
+    /// only O_ASYNC, or an unowned socket, does not.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn an_inherited_signal_producer_is_refused_by_descriptor() {
+        use detcore::host_timed_producers::ProducerState;
+        let state = |o_async, owner, socket| ProducerState {
+            o_async,
+            owner,
+            socket,
+        };
+        for (producer, lease, what) in [
+            (state(true, true, false), false, "O_ASYNC and an owner"),
+            (state(false, true, true), false, "a socket with an owner"),
+            (state(false, false, false), true, "holds a lease"),
+            (
+                state(false, true, false),
+                false,
+                "it has an owner, which a directory",
+            ),
+        ] {
+            let reason = inherited_producer_refusal(7, producer, lease).unwrap();
+            assert!(
+                reason.starts_with("the guest would inherit descriptor 7, "),
+                "{reason}"
+            );
+            assert!(reason.contains(what), "{reason}");
+        }
+        for state in [
+            state(true, false, false),
+            state(false, false, true),
+            state(true, false, true),
+        ] {
+            assert_eq!(
+                inherited_producer_refusal(7, state, false),
+                None,
+                "{state:?}"
+            );
+        }
     }
 
     /// Hermit's default in-guest route reserves SIGSYS always, SIGSEGV while

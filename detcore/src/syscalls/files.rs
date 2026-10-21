@@ -9283,6 +9283,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 signal.into(),
             )?;
         }
+        // On an in-guest run's default route, the one operation that would
+        // complete a host-timed signal producer (D28), before the call reaches
+        // the kernel. It comes before the owner screen below, so that its own
+        // reads of the descriptor's state finish before the screen takes its
+        // copy of an `F_SETOWN_EX` owner on the scratch stack: one scratch
+        // frame at a time. It reads that owner from guest memory itself; the
+        // screen's later copy is the same value, since only a thread of the
+        // caller's process could change it in between, and the in-guest
+        // backends, the only ones that refuse producers, run no second thread
+        // (they refuse thread creation).
+        if let Some((arming, owner)) = self.fcntl_producer_arming(guest, call) {
+            self.refuse_host_timed_producer(guest, fd, arming, owner)
+                .await?;
+        }
         // Before anything else, so a refused call has no other effect.
         let (call, _owner_copy) = self.screen_fcntl_owner(guest, call).await?;
         // The owner of an asynchronous-I/O descriptor may be any process or
@@ -9928,6 +9942,294 @@ impl<T: RecordOrReplay> Detcore<T> {
         Err(Errno::EPERM.into())
     }
 
+    /// The operation `call`, an `fcntl` as the kernel will receive it, would
+    /// perform that can complete a host-timed signal producer
+    /// ([`crate::host_timed_producers`]), where the run refuses them
+    /// (`Config::in_guest_refuses_host_timed_producers`); `None` for every
+    /// other call, for every disarm (an owner of 0, `F_SETLEASE` with
+    /// `F_UNLCK`, `F_NOTIFY` with no event bit, `F_SETFL` without `O_ASYNC`), for
+    /// arguments the kernel refuses before it arms anything (`F_SETOWN` of
+    /// `INT_MIN`, an unknown `F_SETOWN_EX` type or lease type), and always
+    /// where the run does not refuse them. `F_SETSIG` alone completes nothing:
+    /// it changes which signal an owner gets. With an owner-setting command
+    /// comes the pid number the kernel looks up for the owner (`find_vpid`):
+    /// `F_SETOWN`'s owner, negated for a process group, and `F_SETOWN_EX`'s
+    /// pid as given.
+    fn fcntl_producer_arming<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Fcntl,
+    ) -> Option<(
+        crate::host_timed_producers::ProducerArming,
+        Option<crate::host_timed_producers::OwnerLookup>,
+    )> {
+        use crate::host_timed_producers::F_OWNER_PGRP;
+        use crate::host_timed_producers::F_OWNER_PID;
+        use crate::host_timed_producers::F_OWNER_TID;
+        use crate::host_timed_producers::ProducerArming;
+        // dnotify's event bits, `DN_ACCESS` through `DN_ATTRIB`: the only ones
+        // `convert_arg` turns into events (`fs/notify/dnotify/dnotify.c:201-221`);
+        // every other bit (`DN_MULTISHOT`, an unknown one) makes none.
+        const DN_EVENTS: libc::c_int = 0x3f;
+        if !guest.config().in_guest_refuses_host_timed_producers {
+            return None;
+        }
+        match call.cmd() {
+            F_SETOWN => {
+                let owner = call.into_parts().1.arg2 as libc::c_int;
+                (owner != 0 && owner != libc::c_int::MIN).then_some((
+                    ProducerArming::SetOwner("fcntl(F_SETOWN)"),
+                    Some(crate::host_timed_producers::OwnerLookup::of_setown(owner)),
+                ))
+            }
+            F_SETOWN_EX(Some(owner)) => {
+                let owner: Addr<[libc::c_int; 2]> = owner.cast();
+                let [kind, pid] = guest.memory().read_value(owner).ok()?;
+                ([F_OWNER_TID, F_OWNER_PID, F_OWNER_PGRP].contains(&kind) && pid != 0).then_some((
+                    ProducerArming::SetOwner("fcntl(F_SETOWN_EX)"),
+                    Some(crate::host_timed_producers::OwnerLookup {
+                        who: pid,
+                        group: kind == F_OWNER_PGRP,
+                    }),
+                ))
+            }
+            F_SETFL(flags) => (flags & libc::O_ASYNC != 0)
+                .then_some((ProducerArming::SetAsync("fcntl(F_SETFL)"), None)),
+            F_SETLEASE(lease) => [libc::F_RDLCK, libc::F_WRLCK]
+                .contains(&lease)
+                .then_some((ProducerArming::Lease, None)),
+            F_NOTIFY(mask) => (mask & DN_EVENTS != 0).then_some((ProducerArming::Notify, None)),
+            _ => None,
+        }
+    }
+
+    /// As [`Self::fcntl_producer_arming`], for an `ioctl` as the kernel will
+    /// receive it: `FIOSETOWN` or `SIOCSPGRP` with a nonzero owner, with the
+    /// pid number the kernel looks up for it (`f_setown`), and `FIOASYNC`
+    /// turning `O_ASYNC` on. An unreadable argument is left to the kernel,
+    /// which answers EBADF or EFAULT and arms nothing.
+    fn ioctl_producer_arming<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Ioctl,
+    ) -> Option<(
+        crate::host_timed_producers::ProducerArming,
+        Option<crate::host_timed_producers::OwnerLookup>,
+    )> {
+        use crate::host_timed_producers::ProducerArming;
+        if !guest.config().in_guest_refuses_host_timed_producers {
+            return None;
+        }
+        let (call_name, owner) = match call.request() {
+            syscalls::ioctl::Request::FIOASYNC(on) => {
+                let on: libc::c_int = guest.memory().read_value(on?).ok()?;
+                return (on != 0).then_some((ProducerArming::SetAsync("ioctl(FIOASYNC)"), None));
+            }
+            syscalls::ioctl::Request::FIOSETOWN(owner) => ("ioctl(FIOSETOWN)", owner),
+            syscalls::ioctl::Request::SIOCSPGRP(owner) => ("ioctl(SIOCSPGRP)", owner),
+            _ => return None,
+        };
+        let owner: libc::c_int = guest.memory().read_value(owner?).ok()?;
+        (owner != 0 && owner != libc::c_int::MIN).then_some((
+            ProducerArming::SetSocketOwner(call_name),
+            Some(crate::host_timed_producers::OwnerLookup::of_setown(owner)),
+        ))
+    }
+
+    /// Refuses with EPERM and a WARN `arming` on descriptor `fd` if it would
+    /// complete a host-timed signal producer
+    /// ([`crate::host_timed_producers::ProducerArming::completes`]), reading
+    /// the descriptor's state in the caller's turn
+    /// ([`Self::descriptor_producer_state`]). Linux's answers that come
+    /// before any arming come first: EBADF for a descriptor the caller does
+    /// not hold or an `O_PATH` one, ENOTDIR for `F_NOTIFY` on a file that is
+    /// not a directory (`fcntl_dirnotify`, `fs/notify/dnotify/dnotify.c:288-292`)
+    /// and EINVAL for a lease on a file that is not regular (`vfs_setlease`,
+    /// `fs/locks.c:2021-2022`). An owner-setting operation naming an owner
+    /// no signal can reach (`owner`, [`Self::owner_can_be_signalled`])
+    /// completes nothing, and is left to the kernel, which answers ESRCH for
+    /// one that does not exist, as `f_setown` and `f_setown_ex` do, and sets
+    /// one that exists but can never be signalled. Called only where the run
+    /// refuses producers.
+    async fn refuse_host_timed_producer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        arming: crate::host_timed_producers::ProducerArming,
+        owner: Option<crate::host_timed_producers::OwnerLookup>,
+    ) -> Result<(), Error> {
+        use crate::host_timed_producers::ProducerArming;
+        let (state, file_type) = self.descriptor_producer_state(guest, fd).await?;
+        match arming {
+            ProducerArming::Notify if file_type != libc::S_IFDIR => {
+                return Err(Errno::ENOTDIR.into());
+            }
+            ProducerArming::Lease if file_type != libc::S_IFREG => {
+                return Err(Errno::EINVAL.into());
+            }
+            _ => {}
+        }
+        if !arming.completes(state) {
+            return Ok(());
+        }
+        if let Some(owner) = owner
+            && !self.owner_can_be_signalled(guest, owner).await?
+        {
+            return Ok(());
+        }
+        tracing::warn!(
+            "{}",
+            crate::host_timed_producers::producer_refused_warning(
+                arming,
+                state,
+                fd,
+                guest.thread_state().dettid.as_raw(),
+            )
+        );
+        Err(Errno::EPERM.into())
+    }
+
+    /// Whether a signal for `owner`, the owner an owner-setting call names,
+    /// can reach a guest process, now or after a later call of the guest's,
+    /// so that setting it would complete a producer. Two questions are kept
+    /// apart. The kernel sets any owner whose pid number a task, process
+    /// group or session still holds (`find_vpid`; ESRCH otherwise: `f_setown`,
+    /// `fs/fcntl.c:177-181`, and `f_setown_ex`, `:251-253`). Whether a signal
+    /// can then reach anyone depends on the owner's type (`send_sigio`,
+    /// `fs/fcntl.c:917-928`):
+    /// - a process or thread owner (`F_OWNER_PID`, `F_OWNER_TID`, a positive
+    ///   `F_SETOWN`) reaches the task with that pid, asked by `kill(who, 0)`.
+    ///   A number that only a group or session holds names no task, and none
+    ///   can take it while the owner holds it, so it can never be signalled.
+    /// - a process-group owner reaches the members of that group
+    ///   (`fs/fcntl.c:923-928`). It can be signalled when the group exists,
+    ///   asked by `kill(-who, 0)`, and also when only a live task with that
+    ///   pid exists, asked by `kill(who, 0)` and Detcore's exit model: that
+    ///   task can still form the group, by `setpgid(0, 0)` or `setsid()`
+    ///   (whose new group is the task's own pid, `kernel/sys.c:1128`), which
+    ///   Detcore admits on every backend, and Linux would then signal it, so
+    ///   arming it now completes a producer that a later call activates. A
+    ///   number no task holds as its pid or group (one a session alone still
+    ///   holds), or one only an exited task holds (a zombie), can never be
+    ///   signalled.
+    ///   `kill(-1, 0)` names every process, not group 1, so group 1 is asked
+    ///   by `getpgid(1)`: pid 1 is Hermit's container init on the in-guest
+    ///   backends, which never forms a group of its own later, so group 1
+    ///   exists exactly when its leader is pid 1 (a group outside the PID
+    ///   namespace reads as 0).
+    ///
+    /// Each probe sends nothing and runs in the caller's turn through
+    /// `record_or_replay`. A probe answered (0, or EPERM for a task the
+    /// caller may not signal) means it exists; ESRCH means it does not; any
+    /// other errno (a security module's refusal, say) fails closed: the owner
+    /// counts as reachable, so the call is refused by name rather than armed
+    /// unchecked.
+    async fn owner_can_be_signalled<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        owner: crate::host_timed_producers::OwnerLookup,
+    ) -> Result<bool, Error> {
+        let who = owner.who;
+        if who <= 0 {
+            return Ok(false);
+        }
+        let mut probe = async |sysno: Sysno, target: libc::c_int| {
+            let call = Syscall::from_raw(
+                sysno,
+                procfs_levels::raw_args([target as isize as usize, 0, 0, 0, 0, 0]),
+            );
+            self.record_or_replay(&mut *guest, call).await
+        };
+        let answered = |result: Result<i64, Errno>| !matches!(result, Err(Errno::ESRCH));
+        if owner.group && who == 1 {
+            return Ok(match probe(Sysno::getpgid, 1).await {
+                Ok(leader) => leader == 1,
+                Err(Errno::ESRCH) => false,
+                Err(_) => true,
+            });
+        }
+        if owner.group && answered(probe(Sysno::kill, -who).await) {
+            return Ok(true);
+        }
+        if !answered(probe(Sysno::kill, who).await) {
+            return Ok(false);
+        }
+        if !owner.group {
+            return Ok(true);
+        }
+        // A task holds the number as its pid, but leads no group: it can form
+        // the group later only while it lives. One Detcore saw exit (a zombie
+        // its parent has not reaped, or one already gone) never will, so its
+        // number as a group owner can never be signalled. A task Detcore does
+        // not model (none of the guest's) counts as able to.
+        let (targets, exited) =
+            crate::tool_global::resolve_kill_targets_and_exit(guest, DetPid::from_raw(who)).await;
+        Ok(!targets.is_empty() || exited.is_none())
+    }
+
+    /// What descriptor `fd` already arms toward a host-timed signal producer,
+    /// and its file type (`st_mode & S_IFMT`), read in the caller's turn by
+    /// `F_GETFL`, `F_GETOWN_EX` and `fstat`, each through `record_or_replay`,
+    /// so a replay reads the recorded answers. The guest's own calls set a
+    /// descriptor's owner and status flags in their turns (an inherited
+    /// producer is refused at launch), and the reads run in the caller's
+    /// turn, so the answers are the same in every run. The exception is an
+    /// open file description the guest shares with a process outside the
+    /// container (an inherited descriptor whose other holder is still
+    /// running), which that process can change at a moment host timing
+    /// decides: outside input of the same class as an external kill, which
+    /// Hermit does not make deterministic. A descriptor the caller does not
+    /// hold is EBADF from the first read, and an `O_PATH` one is EBADF, as
+    /// Linux answers every arming command on one (`check_fcntl_cmd`,
+    /// `fs/fcntl.c:556-568` and `:571-591`).
+    async fn descriptor_producer_state<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<(crate::host_timed_producers::ProducerState, libc::mode_t), Error> {
+        let fcntl = |command: libc::c_int, address: usize| {
+            Syscall::from_raw(
+                Sysno::fcntl,
+                procfs_levels::raw_args([fd as usize, command as usize, address, 0, 0, 0]),
+            )
+        };
+        let flags = self
+            .record_or_replay(guest, fcntl(libc::F_GETFL, 0))
+            .await? as libc::c_int;
+        if flags & libc::O_PATH != 0 {
+            return Err(Errno::EBADF.into());
+        }
+        let mut stack = guest.stack().await;
+        let owner = stack.reserve::<[libc::c_int; 2]>();
+        let stat = stack.reserve::<libc::stat>();
+        let guard = stack.commit()?;
+        self.record_or_replay(
+            guest,
+            fcntl(crate::host_timed_producers::F_GETOWN_EX, owner.as_raw()),
+        )
+        .await?;
+        self.record_or_replay(
+            guest,
+            Syscall::from_raw(
+                Sysno::fstat,
+                procfs_levels::raw_args([fd as usize, stat.as_raw(), 0, 0, 0, 0]),
+            ),
+        )
+        .await?;
+        let [kind, pid] = guest.memory().read_value(Addr::from(owner))?;
+        let stat: libc::stat = guest.memory().read_value(Addr::from(stat))?;
+        drop(guard);
+        let file_type = stat.st_mode & libc::S_IFMT;
+        Ok((
+            crate::host_timed_producers::ProducerState {
+                o_async: flags & libc::O_ASYNC != 0,
+                owner: crate::host_timed_producers::names_an_owner(kind, pid),
+                socket: file_type == libc::S_IFSOCK,
+            },
+            file_type,
+        ))
+    }
+
     /// `call`, unless it is an `fcntl` that sets a descriptor's signal owner
     /// to one of Hermit's tasks ([`Self::refuse_hermit_owner`]): `F_SETOWN`
     /// with a positive pid, or `F_SETOWN_EX` naming a thread (`F_OWNER_TID`)
@@ -10023,6 +10325,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             crate::syscalls::timerfd::refuse(format_args!(
                 "ioctl(TFD_IOC_SET_TICKS) on timerfd {fd} would set the host's tick count"
             ));
+        }
+        // As in `handle_fcntl`: the one request that would complete a
+        // host-timed signal producer, on an in-guest run's default route,
+        // before the owner screen takes its copy on the scratch stack.
+        if let Some((arming, owner)) = self.ioctl_producer_arming(guest, call) {
+            self.refuse_host_timed_producer(guest, fd, arming, owner)
+                .await?;
         }
         // Before anything else, so a refused call has no other effect.
         let (call, _owner_copy) = self.screen_ioctl_owner(guest, call).await?;

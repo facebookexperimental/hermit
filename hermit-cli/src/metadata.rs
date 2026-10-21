@@ -1154,6 +1154,7 @@ fn record_or_replay_config_with_timer_support(
         in_guest_detlog_forward_policy: None,
         in_guest_site_patching_off: false,
         in_guest_reserved_signals: 0,
+        in_guest_refuses_host_timed_producers: false,
         // The first image's link stays the kernel's in record and replay.
         launch_image: None,
         // Not measured for record and replay.

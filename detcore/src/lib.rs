@@ -53,6 +53,7 @@ mod fd;
 mod fifo_peer;
 pub mod guest_log;
 mod host_inputs;
+pub mod host_timed_producers;
 pub mod in_guest_launch;
 pub mod in_guest_site_patching;
 mod io_buffers;
