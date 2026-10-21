@@ -10815,8 +10815,7 @@ impl RunOpts {
             identity_sources,
             self.launch_workdir(),
         )?;
-        let mut config = hermit::prepare_backend_config(config, Backend::InGuestTrap);
-        config.in_guest_site_patching_off = true;
+        let mut config = hermit::prepare_in_guest_loader_route_config(config);
         // The encoded ForwardPolicy cannot carry span/field-dependent answers.
         // Refuse those actual RUST_LOG directives before enabling plain INFO.
         let directives = match std::env::var("RUST_LOG") {
@@ -10978,8 +10977,7 @@ impl RunOpts {
             })?;
             detcore::detlog::set_forwarded_source(receiver, log.record_sink());
             let policy = hermit::in_guest_detlog_forward_policy_for_native();
-            let mut config = hermit::prepare_backend_config(config, Backend::InGuestTrap);
-            config.in_guest_site_patching_off = true;
+            let mut config = hermit::prepare_in_guest_loader_route_config(config);
             config.in_guest_detlog_forward_policy = Some(policy.encode());
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -11467,8 +11465,7 @@ pub(crate) fn physical_mm_cancellation_control(
                 identity,
                 work_options.launch_workdir(),
             )?;
-            let mut config = hermit::prepare_backend_config(config, Backend::InGuestTrap);
-            config.in_guest_site_patching_off = true;
+            let mut config = hermit::prepare_in_guest_loader_route_config(config);
             config.in_guest_detlog_forward_policy =
                 Some(detcore::detlog::ForwardPolicy::all().encode());
             super::mapped_first_admission::cancel_mm_in_container(point, command, config, image)

@@ -66,6 +66,7 @@ static CONSTRUCTOR_MUTATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static EXIT_REAPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static UNSCHEDULED_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SELF_SIGNAL_DEATH_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static RESERVED_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DUP_ALIAS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOSE_RANGE_PORT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static IOV_OVERWRITTEN_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3297,6 +3298,522 @@ fn liteinst_in_guest_runtime_owned_self_signals_refuse_verification() {
             );
             assert!(
                 !stderr.contains("Determinism verified"),
+                "{backend} {mode}: {stderr}"
+            );
+        }
+    }
+}
+
+/// The send calls `reserved_signal_send_probe` (`tests/c`) makes, in its
+/// order, and the three signals the in-guest runtime keeps for itself with
+/// their numbers.
+const RESERVED_SEND_CALLS: [&str; 6] = [
+    "kill",
+    "tkill",
+    "tgkill",
+    "rt_sigqueueinfo",
+    "rt_tgsigqueueinfo",
+    "pidfd_send_signal",
+];
+const RESERVED_SIGNALS: [(&str, i32); 3] = [
+    ("SIGSYS", libc::SIGSYS),
+    ("SIGSEGV", libc::SIGSEGV),
+    ("SIGTRAP", libc::SIGTRAP),
+];
+/// The arming calls `reserved_signal_send_probe armings` makes for each
+/// reserved signal, in its order, with the call each one's WARN names.
+const RESERVED_ARMINGS: [(&str, &str); 5] = [
+    ("fcntl(F_SETSIG)", "fcntl(F_SETSIG)"),
+    ("timer_create(SIGEV_SIGNAL)", "timer_create"),
+    ("timer_create(SIGEV_THREAD)", "timer_create"),
+    ("timer_create(SIGEV_THREAD_ID)", "timer_create"),
+    ("prctl(PR_SET_PDEATHSIG)", "prctl(PR_SET_PDEATHSIG)"),
+];
+
+/// What `reserved_signal_send_probe sends` prints. On Linux each send
+/// succeeds and kills the child with its signal. Refused, each returns EPERM
+/// and the child exits 0. Under ptrace (`ptrace_drops_sigtrap`) each send
+/// succeeds and kills the child, except that a SIGTRAP from another process
+/// never reaches the child, which exits 0: a known ptrace-backend deviation
+/// from Linux, https://github.com/rrnewton/hermit/issues/4555, measured at
+/// Hermit 1538d448 before the reserved set existed and unrelated to it
+/// (ptrace's set is empty), pinned here at its current value so that this
+/// test shows the reserved-signal rule leaves ptrace unchanged.
+fn reserved_sends_expected(refused: bool, ptrace_drops_sigtrap: bool) -> String {
+    let mut expected = String::new();
+    for call in RESERVED_SEND_CALLS {
+        for (name, number) in RESERVED_SIGNALS {
+            expected.push_str(&if refused {
+                format!("{call} {name}: rc=-1 errno=EPERM child=exit 0\n")
+            } else if ptrace_drops_sigtrap && number == libc::SIGTRAP {
+                format!("{call} {name}: rc=0 errno=0 child=exit 0\n")
+            } else {
+                format!("{call} {name}: rc=0 errno=0 child=signal {number}\n")
+            });
+        }
+    }
+    expected
+}
+
+/// What `reserved_signal_send_probe exited` prints, on Linux and on every
+/// backend: a zombie child still takes each signal (0) and a reaped one is
+/// gone (ESRCH), whatever the call. A target with no live thread is never a
+/// reserved-signal refusal.
+fn reserved_exited_expected() -> String {
+    let mut expected = String::new();
+    for (state, answer) in [("zombie", "rc=0 errno=0"), ("reaped", "rc=-1 errno=ESRCH")] {
+        let mut sends = String::new();
+        for call in RESERVED_SEND_CALLS {
+            for (name, _) in RESERVED_SIGNALS {
+                sends.push_str(&format!("{state} {call} {name}: {answer}\n"));
+            }
+        }
+        // The zombie is reaped after its sends, the other child before.
+        if state == "zombie" {
+            expected.push_str(&sends);
+            expected.push_str("zombie child=exit 7\n");
+        } else {
+            expected.push_str("reaped child=exit 7\n");
+            expected.push_str(&sends);
+        }
+    }
+    expected
+}
+
+/// What `reserved_signal_send_probe siginfo` prints, on Linux and on every
+/// backend: each reserved signal sent with a siginfo Linux refuses before any
+/// permission check gets that answer, never a reserved-signal refusal: EFAULT
+/// for an unmapped siginfo, E2BIG for an unknown layout with a nonzero
+/// expansion byte, and, for pidfd_send_signal, EINVAL when si_signo is not
+/// the call's signal. The child is sent nothing and exits 0.
+fn reserved_siginfo_expected() -> String {
+    let mut expected = String::new();
+    for (name, _) in RESERVED_SIGNALS {
+        for (case, calls, answer) in [
+            (
+                "unmapped",
+                &["rt_sigqueueinfo", "rt_tgsigqueueinfo", "pidfd_send_signal"][..],
+                "EFAULT",
+            ),
+            (
+                "expansion",
+                &["rt_sigqueueinfo", "rt_tgsigqueueinfo", "pidfd_send_signal"][..],
+                "E2BIG",
+            ),
+            ("mismatched", &["pidfd_send_signal"][..], "EINVAL"),
+        ] {
+            for call in calls {
+                expected.push_str(&format!(
+                    "siginfo {case} {call} {name}: rc=-1 errno={answer}\n"
+                ));
+            }
+        }
+    }
+    expected.push_str("siginfo child=exit 0\n");
+    expected
+}
+
+/// What `reserved_signal_send_probe tail` prints. A siginfo 8 bytes below
+/// the top of the address space, and one of a layout Linux does not know
+/// whose expansion lies on an unmapped page, are EFAULT everywhere: their
+/// copy fails before any permission check. One of a layout Linux knows
+/// (SI_QUEUE) with the same placement copies, since Linux never reads that
+/// expansion: natively the send kills the child, and `refused` (the in-guest
+/// backends) it is the reserved-signal EPERM and the child exits 0.
+fn reserved_tail_expected(refused: bool) -> String {
+    let mut expected = String::new();
+    for case in ["top", "known", "unknown"] {
+        for call in ["rt_sigqueueinfo", "rt_tgsigqueueinfo", "pidfd_send_signal"] {
+            for (name, number) in RESERVED_SIGNALS {
+                let answer = match case {
+                    "known" if refused => "rc=-1 errno=EPERM child=exit 0".to_string(),
+                    "known" => format!("rc=0 errno=0 child=signal {number}"),
+                    _ => "rc=-1 errno=EFAULT child=exit 0".to_string(),
+                };
+                expected.push_str(&format!("tail {case} {call} {name}: {answer}\n"));
+            }
+        }
+    }
+    expected
+}
+
+/// What `reserved_signal_send_probe armings` prints. Each arming succeeds on
+/// Linux and ptrace and returns EPERM refused; the two disarms succeed
+/// everywhere and leave no parent-death signal armed. Then the answers Linux
+/// gives before it looks at the signal, which a refusal never comes before:
+/// EBADF for F_SETSIG on a closed and on an O_PATH descriptor, EINVAL for
+/// timer_create on an id with no clock and EOPNOTSUPP on a clock without
+/// timers, that answer coming before the notification's, so it stands with
+/// an invalid notification or a SIGEV_THREAD_ID thread outside the process
+/// too. Under ptrace (`ptrace_ignores_timer_clocks`) the two plain
+/// timer_create calls succeed instead and the two combined ones are the
+/// notification's EINVAL: Detcore's virtual timers do not check the clock on
+/// any backend (https://github.com/rrnewton/hermit/issues/4556), a deviation
+/// measured at Hermit 1538d448 and unrelated to the reserved set, which
+/// ptrace does not have; pinned here at its current value.
+fn reserved_armings_expected(refused: bool, ptrace_ignores_timer_clocks: bool) -> String {
+    let answer = if refused {
+        "rc=-1 errno=EPERM"
+    } else {
+        "rc=0 errno=0"
+    };
+    let mut expected = String::new();
+    for (name, _) in RESERVED_SIGNALS {
+        for (call, _) in RESERVED_ARMINGS {
+            expected.push_str(&format!("{call} {name}: {answer}\n"));
+        }
+    }
+    expected.push_str(
+        "fcntl(F_SETSIG) 0: rc=0 errno=0\n\
+         prctl(PR_SET_PDEATHSIG) 0: rc=0 errno=0\n\
+         prctl(PR_GET_PDEATHSIG): rc=0 armed=0\n\
+         fcntl(closed fd, F_SETSIG) SIGSEGV: rc=-1 errno=EBADF\n\
+         fcntl(O_PATH fd, F_SETSIG) SIGSEGV: rc=-1 errno=EBADF\n",
+    );
+    if ptrace_ignores_timer_clocks {
+        expected.push_str(
+            "timer_create(clock 10, SIGEV_SIGNAL) SIGSEGV: rc=0 errno=0\n\
+             timer_create(CLOCK_MONOTONIC_RAW, SIGEV_SIGNAL) SIGSEGV: rc=0 errno=0\n\
+             timer_create(CLOCK_MONOTONIC_RAW, notify 99) SIGSEGV: rc=-1 errno=EINVAL\n\
+             timer_create(CLOCK_MONOTONIC_RAW, SIGEV_THREAD_ID tid 1) SIGSEGV: rc=-1 errno=EINVAL\n",
+        );
+    } else {
+        expected.push_str(
+            "timer_create(clock 10, SIGEV_SIGNAL) SIGSEGV: rc=-1 errno=EINVAL\n\
+             timer_create(CLOCK_MONOTONIC_RAW, SIGEV_SIGNAL) SIGSEGV: rc=-1 errno=EOPNOTSUPP\n\
+             timer_create(CLOCK_MONOTONIC_RAW, notify 99) SIGSEGV: rc=-1 errno=EOPNOTSUPP\n\
+             timer_create(CLOCK_MONOTONIC_RAW, SIGEV_THREAD_ID tid 1) SIGSEGV: rc=-1 errno=EOPNOTSUPP\n",
+        );
+    }
+    expected
+}
+
+/// One run of `reserved_signal_send_probe` (`tests/c`) under `backend`, at log
+/// level `info`, with `extra` run options.
+fn run_reserved_signal_probe(backend: &str, extra: &[&str], mode: &str) -> Output {
+    let guest = c_guest(&RESERVED_SIGNAL_GUEST, "reserved_signal_send_probe");
+    super::hermit_test::hermit_output(
+        "hermit run",
+        Command::new(hermit_binary())
+            .args(["--log=info", "--backend", backend, "run"])
+            .args([
+                "--max-timeslice=disabled",
+                "--strict",
+                "--base-env=minimal",
+                "--mount=type=tmpfs,target=/test",
+                "--workdir=/test",
+            ])
+            .args(extra)
+            .arg("--")
+            .arg(guest)
+            .arg(mode)
+            .stdin(Stdio::null()),
+    )
+}
+
+/// Runs `mode` of `reserved_signal_send_probe` under `backend` twice: plainly,
+/// which prints Detcore's WARNs on stderr (a --verify run keeps each run's log
+/// for its comparison instead), and under `--verify --verify-strict`. Both
+/// must print `expected` with no recorded determinism loss, and the verify run
+/// must establish bitwise parity. Returns the plain run's stderr.
+fn assert_reserved_probe_runs(backend: &str, mode: &str, expected: &str) -> String {
+    let output = run_reserved_signal_probe(backend, &[], mode);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "{backend} {mode}: status={:?}\nstdout={stdout}\nstderr={stderr}",
+        output.status
+    );
+    assert_eq!(stdout, expected, "{backend} {mode}: {stderr}");
+    assert!(
+        !stderr.contains("determinism loss"),
+        "{backend} {mode}: {stderr}"
+    );
+
+    let verified = run_reserved_signal_probe(backend, &["--verify", "--verify-strict"], mode);
+    let verified_stdout = String::from_utf8_lossy(&verified.stdout);
+    let verified_stderr = String::from_utf8_lossy(&verified.stderr);
+    assert!(
+        verified.status.success(),
+        "{backend} {mode} --verify: status={:?}\nstdout={verified_stdout}\nstderr={verified_stderr}",
+        verified.status
+    );
+    assert_eq!(
+        verified_stdout, expected,
+        "{backend} {mode} --verify: {verified_stderr}"
+    );
+    assert!(
+        verified_stderr.contains("Determinism verified")
+            && verified_stderr.contains("bitwise parity established"),
+        "{backend} {mode} --verify: {verified_stderr}"
+    );
+    assert!(
+        !verified_stderr.contains("determinism loss"),
+        "{backend} {mode} --verify: {verified_stderr}"
+    );
+    stderr
+}
+
+/// A5 step 3c slice 0a (design section 16.30,
+/// <https://github.com/rrnewton/hermit/issues/4485>): the in-guest runtime keeps
+/// SIGSYS, SIGSEGV (while it traps instructions, which a default run does)
+/// and SIGTRAP (while LiteInst's guard router is installed, which today is
+/// every in-guest image) for itself. A send of one to another live process
+/// would run that process's runtime handler outside the schedule, so on both
+/// in-guest backends Detcore refuses each with EPERM and a WARN naming the
+/// call, the signal and the target, by every send call, and the child lives
+/// on to its own exit. Arming one as a notification signal (`F_SETSIG`;
+/// `timer_create` with `SIGEV_SIGNAL`, `SIGEV_THREAD` or `SIGEV_THREAD_ID`;
+/// `PR_SET_PDEATHSIG`) is refused the same way, with a WARN per arming; a
+/// disarm is not, and Linux's earlier answers (EBADF for the descriptor,
+/// EINVAL or EOPNOTSUPP for the clock) come first. Both runs verify
+/// bitwise. The same guest under ptrace, whose reserved set is empty, prints
+/// what it printed before the set existed (see `reserved_sends_expected` and
+/// `reserved_armings_expected` for its two named deviations from Linux) and
+/// Hermit warns of nothing.
+/// The loader route cannot run here (it needs a private musl runtime that no
+/// validation node builds); its set is empty whatever its input, pinned by
+/// `a_poisoned_reserved_signal_set_never_survives_preparation`.
+#[test]
+fn liteinst_in_guest_reserved_signal_sends_and_armings_are_refused() {
+    let _guard = hermit_run_guard();
+    for (backend, refused) in [
+        ("liteinst", true),
+        ("in-guest-trap", true),
+        ("ptrace", false),
+    ] {
+        let ptrace = backend == "ptrace";
+        let stderr =
+            assert_reserved_probe_runs(backend, "sends", &reserved_sends_expected(refused, ptrace));
+        if refused {
+            assert_eq!(
+                stderr
+                    .matches("HERMIT_RESERVED_SIGNAL_SEND_REFUSED ")
+                    .count(),
+                RESERVED_SEND_CALLS.len() * RESERVED_SIGNALS.len(),
+                "{backend}: {stderr}"
+            );
+            for (name, number) in RESERVED_SIGNALS {
+                for call in RESERVED_SEND_CALLS {
+                    let warning = format!(
+                        "HERMIT_RESERVED_SIGNAL_SEND_REFUSED signum={number} ({name}) \
+                         call={call} sender="
+                    );
+                    assert_eq!(
+                        stderr.matches(&warning).count(),
+                        1,
+                        "{backend}: {warning}\n{stderr}"
+                    );
+                }
+            }
+        } else {
+            assert!(
+                !stderr.contains("HERMIT_RESERVED_SIGNAL"),
+                "{backend}: {stderr}"
+            );
+        }
+
+        let stderr = assert_reserved_probe_runs(
+            backend,
+            "armings",
+            &reserved_armings_expected(refused, ptrace),
+        );
+        if refused {
+            // One WARN per refused arming, none for a disarm or for a call
+            // Linux answers first.
+            assert_eq!(
+                stderr
+                    .matches("HERMIT_RESERVED_SIGNAL_ARMING_REFUSED ")
+                    .count(),
+                RESERVED_ARMINGS.len() * RESERVED_SIGNALS.len(),
+                "{backend}: {stderr}"
+            );
+            for (name, number) in RESERVED_SIGNALS {
+                for warned in ["fcntl(F_SETSIG)", "timer_create", "prctl(PR_SET_PDEATHSIG)"] {
+                    let warning = format!(
+                        "HERMIT_RESERVED_SIGNAL_ARMING_REFUSED signum={number} ({name}) \
+                         call={warned} caller="
+                    );
+                    let times = RESERVED_ARMINGS
+                        .iter()
+                        .filter(|(_, call)| *call == warned)
+                        .count();
+                    assert_eq!(
+                        stderr.matches(&warning).count(),
+                        times,
+                        "{backend}: {warning}\n{stderr}"
+                    );
+                }
+            }
+        } else {
+            assert!(
+                !stderr.contains("HERMIT_RESERVED_SIGNAL"),
+                "{backend}: {stderr}"
+            );
+        }
+    }
+}
+
+/// A reserved signal sent to a process with no live thread is never refused:
+/// to a zombie child every send call succeeds (0) and to a reaped child each
+/// is ESRCH, as on Linux (`check_kill_permission` runs only once a task is
+/// found, and a zombie still has one), on both in-guest backends and on
+/// ptrace. The same guest runs natively first, so the expectation is
+/// Linux's own answer on this host, not a constant only Hermit agrees with.
+#[test]
+fn liteinst_in_guest_reserved_sends_to_exited_targets_keep_linuxs_answers() {
+    let _guard = hermit_run_guard();
+    let expected = reserved_exited_expected();
+    let guest = c_guest(&RESERVED_SIGNAL_GUEST, "reserved_signal_send_probe");
+    let native = Command::new(guest)
+        .arg("exited")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "{native:?}");
+    assert_eq!(String::from_utf8_lossy(&native.stdout), expected, "native");
+    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+        let stderr = assert_reserved_probe_runs(backend, "exited", &expected);
+        assert!(
+            !stderr.contains("HERMIT_RESERVED_SIGNAL"),
+            "{backend}: {stderr}"
+        );
+    }
+}
+
+/// A reserved signal sent with a siginfo that Linux refuses before any
+/// permission check keeps Linux's answer, without a reserved-signal WARN, on
+/// both in-guest backends and on ptrace: the copy of the siginfo from the
+/// caller's memory (EFAULT for an unmapped one, E2BIG for an unknown layout
+/// with a nonzero expansion byte) for `rt_sigqueueinfo`,
+/// `rt_tgsigqueueinfo` and `pidfd_send_signal`, and pidfd's check that
+/// si_signo is the call's signal (EINVAL). The copy follows Linux's order and
+/// bounds (`tail`): a siginfo 8 bytes below the top of the address space is
+/// EFAULT, and so is an unknown layout whose expansion is unmapped, while a
+/// known layout with an unmapped expansion copies and reaches the
+/// reserved-signal refusal on the in-guest backends (Linux's send
+/// natively). Under ptrace, whose reserved set is empty, the top-of-space
+/// sends are EFAULT (Detcore's siginfo read never runs past the end of the
+/// address space; it panicked there before), and the first known-layout send
+/// with an unmapped expansion stops the run by name, as it did before this
+/// slice: ptrace's `rt_sigqueueinfo` decides from all 128 bytes, which it
+/// cannot read (https://github.com/rrnewton/hermit/issues/4034). The guest
+/// runs natively first, so the expectations are Linux's own answers on this
+/// host.
+#[test]
+fn liteinst_in_guest_reserved_sends_keep_linuxs_siginfo_answers() {
+    let _guard = hermit_run_guard();
+    let expected = reserved_siginfo_expected();
+    let guest = c_guest(&RESERVED_SIGNAL_GUEST, "reserved_signal_send_probe");
+    let native = Command::new(guest)
+        .arg("siginfo")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "{native:?}");
+    assert_eq!(String::from_utf8_lossy(&native.stdout), expected, "native");
+    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+        let stderr = assert_reserved_probe_runs(backend, "siginfo", &expected);
+        assert!(
+            !stderr.contains("HERMIT_RESERVED_SIGNAL"),
+            "{backend}: {stderr}"
+        );
+    }
+
+    let native = Command::new(guest)
+        .arg("tail")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "{native:?}");
+    let native_tail = reserved_tail_expected(false);
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        native_tail,
+        "native"
+    );
+    for backend in ["liteinst", "in-guest-trap"] {
+        let stderr = assert_reserved_probe_runs(backend, "tail", &reserved_tail_expected(true));
+        // A WARN for each known-layout send it refuses, and none for a copy
+        // that fails first.
+        assert_eq!(
+            stderr
+                .matches("HERMIT_RESERVED_SIGNAL_SEND_REFUSED ")
+                .count(),
+            3 * RESERVED_SIGNALS.len(),
+            "{backend}: {stderr}"
+        );
+    }
+    let output = run_reserved_signal_probe("ptrace", &[], "tail");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let top: String = native_tail
+        .lines()
+        .take_while(|line| line.starts_with("tail top "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_eq!(top.lines().count(), 3 * RESERVED_SIGNALS.len());
+    assert_eq!(
+        output.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "ptrace tail: status={:?}\nstdout={stdout}\nstderr={stderr}",
+        output.status
+    );
+    assert_eq!(stdout, top, "ptrace tail: {stderr}");
+    assert!(
+        stderr.contains("rt_sigqueueinfo with a siginfo_t at ")
+            && stderr.contains("Hermit cannot read all 128 bytes of it to decide the call"),
+        "ptrace tail: {stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "ptrace tail: {stderr}");
+    assert!(
+        !stderr.contains("HERMIT_RESERVED_SIGNAL"),
+        "ptrace tail: {stderr}"
+    );
+}
+
+/// A reserved signal sent to a process group, by `kill(0)`, `kill(-pgrp)`,
+/// `kill(-1)` or `pidfd_send_signal` with `PIDFD_SIGNAL_PROCESS_GROUP`, stays
+/// refused by name exactly as before A5 step 3c slice 0a, on both in-guest
+/// backends and on ptrace: Detcore does not model process-group membership
+/// (<https://github.com/rrnewton/hermit/issues/4046>,
+/// <https://github.com/rrnewton/hermit/issues/4108>), so a fail-closed run stops
+/// with the policy-refusal status at the call. The reserved-signal EPERM is
+/// not put in front of that stopping refusal, which would weaken it. These
+/// modes run only under Hermit, never natively.
+#[test]
+fn liteinst_in_guest_reserved_group_sends_stay_refused_by_name() {
+    let _guard = hermit_run_guard();
+    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+        for (mode, refusal) in [
+            (
+                "group-kill0",
+                "signal 31 to its own process group by kill is not supported",
+            ),
+            ("group-killpgid", "signal 31 to process group "),
+            (
+                "group-killall",
+                "signal 31 to every process it may signal by kill is not supported",
+            ),
+            (
+                "group-pidfd",
+                "signal 31 by pidfd_send_signal with PIDFD_SIGNAL_PROCESS_GROUP is not supported",
+            ),
+        ] {
+            let output = run_reserved_signal_probe(backend, &[], mode);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+                "{backend} {mode}: status={:?}\nstdout={stdout}\nstderr={stderr}",
+                output.status
+            );
+            assert_eq!(stdout, "own group: yes\n", "{backend} {mode}: {stderr}");
+            assert!(stderr.contains(refusal), "{backend} {mode}: {stderr}");
+            assert!(
+                !stderr.contains("HERMIT_RESERVED_SIGNAL"),
                 "{backend} {mode}: {stderr}"
             );
         }

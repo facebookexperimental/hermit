@@ -531,6 +531,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             libc::PR_SET_PDEATHSIG => {
                 let signal = call.arg2();
+                // A reserved in-guest signal as the parent-death signal; 0
+                // disarms and is never reserved, nor is a value the kernel
+                // refuses with EINVAL (above 64).
+                Self::refuse_reserved_signal_arming(
+                    guest,
+                    crate::refused_signal_controls::ReservedArming::PrctlPdeathsig,
+                    i64::try_from(signal).unwrap_or(-1),
+                )?;
                 if signal == libc::SIGALRM as libc::c_ulong {
                     refuse_sigalrm(guest, SigalrmControl::ArmProducer).await?;
                 }

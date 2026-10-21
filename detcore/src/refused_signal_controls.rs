@@ -31,6 +31,11 @@
 //! kernel ends a process on SIGBUS, SIGFPE or SIGILL), because neither path
 //! reaches Detcore; a thread's exit hook does not run on those deaths either,
 //! so it is not used.
+//!
+//! The texts of Detcore's own refusals of the in-guest runtime's reserved
+//! signals (`Config::in_guest_reserved_signals`: a send to another process,
+//! or an arming) live here too. Detcore decides those itself, at the call,
+//! and prints each through its guest WARN path (`crate::guest_log`).
 
 use std::sync::OnceLock;
 
@@ -98,6 +103,85 @@ pub(crate) fn alternate_stack_refused_warning() -> String {
         .to_string()
 }
 
+/// The WARN for a send of a reserved in-guest signal
+/// (`Config::in_guest_reserved_signals`) from the caller's process to
+/// another, which Detcore refused with EPERM: `call` is the system call,
+/// `sender` the calling thread and `target` the process it named. Printed for
+/// every refused send, through Detcore's guest WARN path
+/// (`crate::guest_log`), not once per run: each names its own target.
+pub(crate) fn reserved_signal_send_refused_warning(
+    call: &str,
+    signum: i32,
+    sender: i32,
+    target: i32,
+) -> String {
+    let name = signal_name(signum);
+    format!(
+        "HERMIT_RESERVED_SIGNAL_SEND_REFUSED signum={signum} ({name}) call={call} sender={sender} \
+         target=process {target}: received EPERM and nothing was sent. The in-guest runtime keeps \
+         {name} for itself, and a {name} from another process would run the runtime's handler in \
+         process {target} outside the schedule. A named refusal, not Linux's behaviour \
+         (A5 step 3c, https://github.com/rrnewton/hermit/issues/4485)."
+    )
+}
+
+/// A call that arms a notification signal, as the reserved-signal refusal
+/// names it (`Detcore::refuse_reserved_signal_arming`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReservedArming {
+    /// `fcntl(F_SETSIG)`: the descriptor's I/O signal.
+    FcntlSetsig,
+    /// `timer_create` with a signal notification.
+    TimerCreate,
+    /// `prctl(PR_SET_PDEATHSIG)`: the parent-death signal.
+    PrctlPdeathsig,
+}
+
+impl ReservedArming {
+    /// The call and operation, as the WARN names them.
+    pub(crate) fn call(self) -> &'static str {
+        match self {
+            Self::FcntlSetsig => "fcntl(F_SETSIG)",
+            Self::TimerCreate => "timer_create",
+            Self::PrctlPdeathsig => "prctl(PR_SET_PDEATHSIG)",
+        }
+    }
+
+    /// Who would send the signal, and when.
+    fn sender(self) -> &'static str {
+        match self {
+            Self::FcntlSetsig => {
+                "the kernel would send it for the descriptor's I/O events, at moments host timing \
+                 decides"
+            }
+            Self::TimerCreate => "Detcore's virtual timer would deliver it at each expiry",
+            Self::PrctlPdeathsig => {
+                "the kernel would send it when the parent thread exits, at a moment host timing \
+                 decides"
+            }
+        }
+    }
+}
+
+/// The WARN for an arming of a reserved in-guest signal as a notification
+/// signal by `arming`, which Detcore refused with EPERM.
+pub(crate) fn reserved_signal_arming_refused_warning(
+    arming: ReservedArming,
+    signum: i32,
+    caller: i32,
+) -> String {
+    let name = signal_name(signum);
+    let call = arming.call();
+    let sender = arming.sender();
+    format!(
+        "HERMIT_RESERVED_SIGNAL_ARMING_REFUSED signum={signum} ({name}) call={call} \
+         caller={caller}: received EPERM and nothing was armed. The in-guest runtime keeps {name} \
+         for itself: {sender}, and the runtime's handler, not the guest's action, would take it. \
+         A named refusal, not Linux's behaviour \
+         (A5 step 3c, https://github.com/rrnewton/hermit/issues/4485)."
+    )
+}
+
 /// `signum`'s name: `SIGUSR1`, or, for a realtime signal, its kernel number
 /// (C libraries reserve different numbers of them, so `SIGRTMIN+n` would
 /// depend on the guest's).
@@ -127,6 +211,64 @@ mod tests {
             );
         }
         assert!(handler_refused_warning(36).contains("(realtime signal 36)"));
+
+        let send = reserved_signal_send_refused_warning("tgkill", libc::SIGSYS, 4, 5);
+        assert!(
+            send.starts_with(
+                "HERMIT_RESERVED_SIGNAL_SEND_REFUSED signum=31 (SIGSYS) call=tgkill sender=4 \
+                 target=process 5: received EPERM"
+            ),
+            "{send}"
+        );
+        let arming =
+            reserved_signal_arming_refused_warning(ReservedArming::FcntlSetsig, libc::SIGSEGV, 4);
+        assert!(
+            arming.starts_with(
+                "HERMIT_RESERVED_SIGNAL_ARMING_REFUSED signum=11 (SIGSEGV) \
+                 call=fcntl(F_SETSIG) caller=4: received EPERM"
+            ),
+            "{arming}"
+        );
+        // Each arming names who would send the signal: host timing for the
+        // kernel's I/O and parent-death signals, never for Detcore's timers.
+        assert!(
+            arming.contains("at moments host timing decides"),
+            "{arming}"
+        );
+        let timer =
+            reserved_signal_arming_refused_warning(ReservedArming::TimerCreate, libc::SIGSYS, 4);
+        assert!(timer.contains("call=timer_create caller=4"), "{timer}");
+        assert!(
+            timer.contains("Detcore's virtual timer would deliver it"),
+            "{timer}"
+        );
+        assert!(!timer.contains("host timing"), "{timer}");
+        let pdeathsig = reserved_signal_arming_refused_warning(
+            ReservedArming::PrctlPdeathsig,
+            libc::SIGTRAP,
+            4,
+        );
+        assert!(
+            pdeathsig.contains("call=prctl(PR_SET_PDEATHSIG) caller=4"),
+            "{pdeathsig}"
+        );
+        assert!(
+            pdeathsig.contains("when the parent thread exits"),
+            "{pdeathsig}"
+        );
+        for text in [&send, &arming, &timer, &pdeathsig] {
+            assert!(
+                text.contains("A named refusal, not Linux's behaviour"),
+                "{text}"
+            );
+            assert!(
+                text.contains("https://github.com/rrnewton/hermit/issues/4485"),
+                "{text}"
+            );
+            for backend in ["liteinst", "LiteInst", "in-guest-trap", "sabre", "SaBRe"] {
+                assert!(!text.contains(backend), "{text}");
+            }
+        }
         // No backend is named: the text is the same wherever it is printed.
         for text in [usr1, stack] {
             for backend in ["liteinst", "LiteInst", "in-guest-trap", "sabre", "SaBRe"] {

@@ -624,6 +624,10 @@ where
     ))
 }
 
+/// The 128 bytes of the guest's `siginfo_t` at `info`, `None` when they
+/// cannot be read. A range that would pass the end of the address space is
+/// unreadable, as it is to Linux's copy (EFAULT), and is never handed to the
+/// guest-memory reader, whose page walk would overflow on it.
 fn read_siginfo<T, G: Guest<Detcore<T>>>(
     guest: &mut G,
     info: AddrMut<libc::siginfo_t>,
@@ -631,6 +635,7 @@ fn read_siginfo<T, G: Guest<Detcore<T>>>(
 where
     T: RecordOrReplay,
 {
+    info.as_raw().checked_add(128)?;
     if let Ok(bytes) = guest.memory().read_value(info.cast::<[u8; 128]>()) {
         return Some(bytes);
     }
@@ -2084,6 +2089,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Kill,
     ) -> Result<i64, Error> {
+        // A group send (pid 0 or below) is not a target here: the paths below
+        // refuse it (`refuse_group_signal`) unless it is a SIGKILL.
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::kill,
+                call.sig(),
+                ReservedSendTarget::Process(call.pid()),
+                ReservedSendSiginfo::None,
+            )
+            .await
+        {
+            return refused;
+        }
         self.record_orphaned_group_signals(guest, call.sig()).await;
         // A thread below the container's PID namespace names pids of its own
         // namespace, where none of Hermit's tasks is visible
@@ -2864,6 +2883,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tgkill,
     ) -> Result<i64, Error> {
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::tgkill,
+                call.sig(),
+                ReservedSendTarget::Thread {
+                    tgid: Some(call.tgid()),
+                    tid: call.tid(),
+                },
+                ReservedSendSiginfo::None,
+            )
+            .await
+        {
+            return refused;
+        }
         self.record_orphaned_group_signals(guest, call.sig()).await;
         // A nested caller names its own namespace's ids; Detcore's model uses
         // the tasks they name, and the forwarded call keeps them
@@ -2974,6 +3008,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tkill,
     ) -> Result<i64, Error> {
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::tkill,
+                call.sig(),
+                ReservedSendTarget::Thread {
+                    tgid: None,
+                    tid: call.tid(),
+                },
+                ReservedSendSiginfo::None,
+            )
+            .await
+        {
+            return refused;
+        }
         self.record_orphaned_group_signals(guest, call.sig()).await;
         // A nested caller names its own namespace's tid
         // (https://github.com/rrnewton/hermit/issues/4155).
@@ -3229,6 +3278,207 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Refuse, with EPERM and a WARN, a send of one of the in-guest runtime's
+    /// reserved signals (`Config::in_guest_reserved_signals`) to a process
+    /// other than the caller's own. `None` leaves the call to its handler's
+    /// ordinary path, unchanged. A5 step 3c, design section 16.30: such a
+    /// signal would run the target's runtime handler on a thread that does not
+    /// hold the scheduler's turn.
+    ///
+    /// Each send handler calls this beside its other opening checks (pidfd's
+    /// once its descriptor names a target), so every later path (record and
+    /// replay, a nested caller's own-init forward) is covered. It decides from
+    /// the configured set, the signal number and Detcore's model of processes
+    /// and their live threads alone:
+    /// - a signal outside the set takes the ordinary path before any request
+    ///   is made, so with the set empty (every backend but the in-guest ones'
+    ///   default route) nothing at all changes; signal 0 is never in it;
+    /// - a target in the caller's own process takes the ordinary path. A
+    ///   caller in the container's PID namespace that names its own thread or
+    ///   process makes no request for it; a caller in a nested namespace first
+    ///   has each id translated (one `GuestPid` request per id);
+    /// - only a target with a live thread in Detcore's model is refused. A
+    ///   target with none takes the ordinary path, which keeps Linux's answer:
+    ///   a zombie (exited, not yet reaped) still takes a signal (0), and a
+    ///   reaped process, an id no task has, or a thread that has exited is
+    ///   ESRCH. So are an id Detcore cannot translate, a non-positive id, and a
+    ///   thread outside the group `tgkill` names;
+    /// - group sends (`kill(0)`, `kill(-pgid)`, `kill(-1)`, and
+    ///   `pidfd_send_signal`'s process-group scope) are not passed here: their
+    ///   handlers refuse every non-SIGKILL group send first
+    ///   (`refuse_group_signal`), a stopping refusal or ENOSYS by policy, and
+    ///   SIGKILL is never reserved.
+    ///
+    /// A send it would refuse first gets the answers Linux gives before any
+    /// permission check, without the WARN: a `tgkill` or `rt_tgsigqueueinfo`
+    /// whose tgid is not the named thread's own process is ESRCH
+    /// (`do_send_specific`), and an unreadable or malformed `siginfo`
+    /// (`siginfo`) is EFAULT, E2BIG or, for `pidfd_send_signal`, EINVAL
+    /// (`reserved_send_siginfo_errno`). Nothing is delivered either way.
+    pub(crate) async fn refuse_reserved_signal_send<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        signal: i32,
+        target: ReservedSendTarget,
+        siginfo: ReservedSendSiginfo,
+    ) -> Option<Result<i64, Error>> {
+        if !guest.config().reserves_in_guest_signal(signal.into()) {
+            return None;
+        }
+        let own = self.detpid;
+        let caller = guest.thread_state().dettid;
+        // `query`, the id whose process's live threads decide, `thread`, the
+        // thread a thread-directed send must reach, and `group`, the thread
+        // group a `tgkill` or `rt_tgsigqueueinfo` names.
+        let (query, thread, group) = match target {
+            ReservedSendTarget::Process(pid) => {
+                if pid <= 0 {
+                    return None;
+                }
+                let named = self.reserved_send_task(guest, pid).await?;
+                if reserved_send_names_own(own, caller, named, None) {
+                    return None;
+                }
+                (named, None, None)
+            }
+            ReservedSendTarget::Thread { tgid, tid } => {
+                if tid <= 0 || tgid.is_some_and(|tgid| tgid <= 0) {
+                    return None;
+                }
+                let thread = self.reserved_send_task(guest, tid).await?;
+                let group = match tgid {
+                    Some(tgid) => Some(self.reserved_send_task(guest, tgid).await?),
+                    None => None,
+                };
+                if reserved_send_names_own(own, caller, thread, group) {
+                    return None;
+                }
+                (group.unwrap_or(thread), Some(thread), group)
+            }
+            ReservedSendTarget::Pidfd { named, thread } => {
+                let named = named?;
+                if reserved_send_names_own(own, caller, named, None) {
+                    return None;
+                }
+                (named, thread.then_some(named), None)
+            }
+        };
+        let (targets, _) = resolve_kill_targets_and_exit(guest, query).await;
+        if !reserved_send_refuses(caller, thread, &targets) {
+            return None;
+        }
+        let leader = registered_process_of(guest, targets[0]).await;
+        if !reserved_send_names_its_group(group, leader) {
+            return None;
+        }
+        if let Some(errno) = self.reserved_send_siginfo_errno(guest, signal, siginfo) {
+            return Some(Err(errno.into()));
+        }
+        let process = leader.unwrap_or(query);
+        tracing::warn!(
+            "{}",
+            crate::refused_signal_controls::reserved_signal_send_refused_warning(
+                sysno.name(),
+                signal,
+                caller.as_raw(),
+                process.as_raw(),
+            )
+        );
+        Some(Err(Errno::EPERM.into()))
+    }
+
+    /// Linux's answer for the `siginfo` of a send that would otherwise be
+    /// refused (`refuse_reserved_signal_send`), which it gives before any
+    /// permission check: the copy from the caller's memory, read here in the
+    /// caller's own turn and in Linux's order (`siginfo_copy_errno`): the
+    /// head, then the expansion only for a layout Linux does not know. A
+    /// range that would pass the end of the address space is EFAULT, never
+    /// computed. `None` when the copy succeeds or the call carries none.
+    ///
+    /// The bytes are read through `Guest::memory()`. On the in-guest backends
+    /// that is `process_vm_readv` (reverie-inguest `read_guest`,
+    /// src/guest/host.rs:2463-2476 at a214eb85), which refuses some memory
+    /// x86's `copy_from_user` can read, such as a write-only mapping: such a
+    /// siginfo is EFAULT here where Linux would copy it. Detcore's ptrace-side
+    /// readers (`read_siginfo`, `read_mapped_prefix`,
+    /// `rt_sigqueueinfo_precheck`) fall back to `/proc/<tid>/mem` for that,
+    /// which cannot be reused in-guest, where guest thread ids are not host
+    /// thread ids.
+    fn reserved_send_siginfo_errno<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: i32,
+        siginfo: ReservedSendSiginfo,
+    ) -> Option<Errno> {
+        let (address, pidfd) = match siginfo {
+            ReservedSendSiginfo::None => return None,
+            ReservedSendSiginfo::Queued(address) => (address, false),
+            ReservedSendSiginfo::Pidfd(None) => return None,
+            ReservedSendSiginfo::Pidfd(Some(address)) => (address, true),
+        };
+        // Each range must end inside the address space: a pointer within a
+        // siginfo's length of its top cannot be copied (EFAULT).
+        let head = address
+            .checked_add(KERNEL_SIGINFO_SIZE)
+            .and_then(|_| AddrMut::<[u8; KERNEL_SIGINFO_SIZE]>::from_raw(address))
+            .and_then(|head| guest.memory().read_value(head).ok());
+        let read_expansion = || {
+            let start = address.checked_add(KERNEL_SIGINFO_SIZE)?;
+            start.checked_add(SI_EXPANSION_SIZE)?;
+            let expansion = AddrMut::<[u8; SI_EXPANSION_SIZE]>::from_raw(start)?;
+            guest.memory().read_value(expansion).ok()
+        };
+        siginfo_copy_errno(signal, pidfd, head, read_expansion)
+    }
+
+    /// The task a reserved send's `id` names (`refuse_reserved_signal_send`):
+    /// the id itself for a caller in the container's PID namespace, and for a
+    /// caller in a nested one the task its namespace's `id` is. `None` when
+    /// Detcore cannot name one, which leaves the call to its ordinary path.
+    async fn reserved_send_task<G: Guest<Self>>(&self, guest: &mut G, id: i32) -> Option<DetTid> {
+        if !guest.thread_state().nested_pid_namespace {
+            return Some(DetTid::from_raw(id));
+        }
+        if guest
+            .config()
+            .backend
+            .requires_thread_directed_process_signals
+        {
+            return None;
+        }
+        match crate::tool_global::guest_pid(guest, id).await {
+            GuestPidAnswer::Task { task, .. } => Some(task),
+            GuestPidAnswer::NoSuchPid | GuestPidAnswer::Untranslatable(_) => None,
+        }
+    }
+
+    /// Refuse, with EPERM and a WARN, an arming of one of the in-guest
+    /// runtime's reserved signals (`Config::in_guest_reserved_signals`) as a
+    /// notification signal by `arming`, whatever the target: its deliveries
+    /// would reach the runtime's handler for the signal rather than the
+    /// guest's action (A5 step 3c, design section 16.30). The caller makes
+    /// Linux's earlier checks of the call first. A disarm (signal 0) is never
+    /// reserved, and with the set empty nothing changes.
+    pub(crate) fn refuse_reserved_signal_arming<G: Guest<Self>>(
+        guest: &mut G,
+        arming: crate::refused_signal_controls::ReservedArming,
+        signal: i64,
+    ) -> Result<(), Error> {
+        if !guest.config().reserves_in_guest_signal(signal) {
+            return Ok(());
+        }
+        tracing::warn!(
+            "{}",
+            crate::refused_signal_controls::reserved_signal_arming_refused_warning(
+                arming,
+                signal as i32,
+                guest.thread_state().dettid.as_raw(),
+            )
+        );
+        Err(Errno::EPERM.into())
+    }
+
     /// Refuse by name a guest's `SIGCHLD` that carries the scheduler's own-copy
     /// mark (`SI_QUEUE` with `OWN_SIGCHLD_MARK`), which a receiver in a nested
     /// PID namespace would take for the scheduler's copy
@@ -3280,6 +3530,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Sysno::rt_tgsigqueueinfo,
                 call.sig(),
                 call.siginfo().map(AddrMut::cast),
+            )
+            .await
+        {
+            return refused;
+        }
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::rt_tgsigqueueinfo,
+                call.sig(),
+                ReservedSendTarget::Thread {
+                    tgid: Some(call.tgid()),
+                    tid: call.tid(),
+                },
+                ReservedSendSiginfo::Queued(call.siginfo().map_or(0, |info| info.as_raw())),
             )
             .await
         {
@@ -3418,6 +3683,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Sysno::rt_sigqueueinfo,
                 call.sig(),
                 call.siginfo().map(AddrMut::cast),
+            )
+            .await
+        {
+            return refused;
+        }
+        // Linux names no group here: a non-positive pid is ESRCH.
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::rt_sigqueueinfo,
+                call.sig(),
+                ReservedSendTarget::Process(call.tgid()),
+                ReservedSendSiginfo::Queued(call.siginfo().map_or(0, |info| info.as_raw())),
             )
             .await
         {
@@ -4690,6 +4968,148 @@ pub(crate) fn own_process_signal_refusal(
     None
 }
 
+/// What a send names, as `Detcore::refuse_reserved_signal_send` reads it.
+pub(crate) enum ReservedSendTarget {
+    /// The process a positive pid names (`kill`, `rt_sigqueueinfo`): any of
+    /// its live threads' ids names it, as in Linux's `kill_pid_info`. Not a
+    /// group: a non-positive pid takes the ordinary path.
+    Process(libc::pid_t),
+    /// A thread (`tkill`), and for `tgkill` and `rt_tgsigqueueinfo` the
+    /// thread group the call says it is in.
+    Thread {
+        tgid: Option<libc::pid_t>,
+        tid: libc::pid_t,
+    },
+    /// What a `pidfd_send_signal` descriptor names, already Detcore's id
+    /// (`None` for a descriptor with no recorded target), and whether the
+    /// call is thread-scoped (`PIDFD_SIGNAL_THREAD`).
+    Pidfd { named: Option<DetPid>, thread: bool },
+}
+
+/// The `siginfo` a send carries, as `Detcore::refuse_reserved_signal_send`
+/// checks it before a refusal: none (`kill`, `tkill`, `tgkill`); the
+/// address `rt_sigqueueinfo` and `rt_tgsigqueueinfo` copy (0 for a null
+/// pointer, which Linux's copy refuses too); or `pidfd_send_signal`'s,
+/// which may be absent.
+pub(crate) enum ReservedSendSiginfo {
+    None,
+    Queued(usize),
+    Pidfd(Option<usize>),
+}
+
+/// The size of Linux's `struct kernel_siginfo` on x86-64, the part of a
+/// `siginfo_t` every copy from user memory reads, and of the expansion after
+/// it (`SI_EXPANSION_SIZE`: `SI_MAX_SIZE`, 128, less that).
+const KERNEL_SIGINFO_SIZE: usize = 48;
+const SI_EXPANSION_SIZE: usize = 128 - KERNEL_SIGINFO_SIZE;
+
+/// Whether Linux knows the layout of a siginfo with signal `signo` and code
+/// `code`, so that it need not check the expansion bytes
+/// (`known_siginfo_layout`, kernel/signal.c:3320-3337 at v6.12, with
+/// `sig_sicodes` at :3304-3318 and the limits of
+/// include/uapi/asm-generic/siginfo.h).
+fn known_siginfo_layout(signo: i32, code: i32) -> bool {
+    const SI_KERNEL: i32 = 0x80;
+    const SI_DETHREAD: i32 = -7;
+    const SI_ASYNCNL: i32 = -60;
+    const NSIGPOLL: i32 = 6;
+    // `sig_specific_sicodes`: a signal below SIGRTMIN with its own codes.
+    let specific_limit = match signo {
+        libc::SIGILL => Some(11),
+        libc::SIGFPE => Some(15),
+        libc::SIGSEGV => Some(10),
+        libc::SIGBUS => Some(5),
+        libc::SIGTRAP => Some(6),
+        libc::SIGCHLD => Some(6),
+        libc::SIGPOLL => Some(NSIGPOLL),
+        libc::SIGSYS => Some(2),
+        _ => None,
+    };
+    if code == SI_KERNEL {
+        true
+    } else if code > 0 {
+        code <= specific_limit.unwrap_or(NSIGPOLL)
+    } else {
+        code >= SI_DETHREAD || code == SI_ASYNCNL
+    }
+}
+
+/// Linux's answer to the copy of a send's `siginfo` from user memory, which
+/// comes before any permission check (v6.12 kernel/signal.c): `head`, the
+/// first `KERNEL_SIGINFO_SIZE` bytes, `None` when the caller cannot read
+/// them, and `read_expansion`, which reads the rest (`None` when it cannot)
+/// and is called only when Linux reads it too. The head must be readable
+/// (EFAULT, `copy_siginfo_from_user`); only for a layout Linux does not know
+/// is the expansion read at all, and then it must be readable (EFAULT) and
+/// every byte of it 0 (E2BIG, `post_copy_siginfo_from_user`, :3394-3415), so
+/// a known layout whose expansion is unmapped copies. `rt_sigqueueinfo` and
+/// `rt_tgsigqueueinfo` judge the layout by the call's `signal`
+/// (`__copy_siginfo_from_user`, :3417-3424); `pidfd_send_signal` (`pidfd`)
+/// by the siginfo's own `si_signo`, which must then equal `signal` (EINVAL,
+/// :3959-3966).
+fn siginfo_copy_errno(
+    signal: i32,
+    pidfd: bool,
+    head: Option<[u8; KERNEL_SIGINFO_SIZE]>,
+    read_expansion: impl FnOnce() -> Option<[u8; SI_EXPANSION_SIZE]>,
+) -> Option<Errno> {
+    let Some(head) = head else {
+        return Some(Errno::EFAULT);
+    };
+    let field = |offset: usize| {
+        i32::from_ne_bytes(head[offset..offset + 4].try_into().expect("four bytes"))
+    };
+    let (si_signo, si_code) = (field(0), field(8));
+    let layout_signo = if pidfd { si_signo } else { signal };
+    if !known_siginfo_layout(layout_signo, si_code) {
+        match read_expansion() {
+            None => return Some(Errno::EFAULT),
+            Some(bytes) if bytes.iter().any(|byte| *byte != 0) => return Some(Errno::E2BIG),
+            Some(_) => {}
+        }
+    }
+    (pidfd && si_signo != signal).then_some(Errno::EINVAL)
+}
+
+/// Whether the thread group a `tgkill` or `rt_tgsigqueueinfo` names
+/// (`group`) is the named thread's own process (`leader`), as Linux requires
+/// (`task_tgid_vnr(p) == tgid` in `do_send_specific`, kernel/signal.c:3994 at
+/// v6.12); a tgid naming another thread of that process, or another process,
+/// is ESRCH there. Always true for a call that names no group.
+fn reserved_send_names_its_group(group: Option<DetPid>, leader: Option<DetPid>) -> bool {
+    group.is_none_or(|group| leader == Some(group))
+}
+
+/// Whether a reserved send (`Detcore::refuse_reserved_signal_send`) names the
+/// caller's own process by its ids alone, before any lookup: `named` is the
+/// caller's thread or its process's id, or `group`, the thread group a
+/// `tgkill` or `rt_tgsigqueueinfo` names, is the caller's process. Such a send
+/// keeps its ordinary path; a `group` that does not hold `named` is the
+/// kernel's ESRCH there.
+fn reserved_send_names_own(
+    own: DetPid,
+    caller: DetTid,
+    named: DetTid,
+    group: Option<DetPid>,
+) -> bool {
+    named == caller || named == own || group == Some(own)
+}
+
+/// Whether a reserved send is refused, given `targets`, the live threads of
+/// the process the send names in Detcore's model (`process_signal_targets`),
+/// and `thread`, the thread a thread-directed send names: only a process
+/// with a live thread, which is not the caller's own (the caller is a live
+/// thread of its own process), and for a thread-directed send only when the
+/// named thread is one of those live threads. Anything else keeps Linux's
+/// answer on the ordinary path: a zombie or a reaped process has no live
+/// thread (0 or ESRCH), and an exited thread, or one outside the group a
+/// `tgkill` names, is ESRCH.
+fn reserved_send_refuses(caller: DetTid, thread: Option<DetTid>, targets: &[DetTid]) -> bool {
+    !targets.is_empty()
+        && !targets.contains(&caller)
+        && thread.is_none_or(|thread| targets.contains(&thread))
+}
+
 /// How a process-directed signal the calling thread sends goes on
 /// (`Detcore::own_process_signal`).
 /// What a positive pid the calling thread names refers to
@@ -4883,6 +5303,162 @@ mod tests {
             );
         }
         assert!(matches!(restart(Ok(7)), Ok(7)));
+    }
+
+    /// A reserved send names the caller's own process by its ids when it names
+    /// the calling thread, the process's id, or the process as the thread
+    /// group; any other id needs a lookup (A5 step 3c slice 0a).
+    #[test]
+    fn a_reserved_send_to_the_callers_own_process_is_decided_by_its_ids() {
+        let own = DetPid::from_raw(3);
+        let caller = DetTid::from_raw(4);
+        let other = DetPid::from_raw(5);
+        assert!(reserved_send_names_own(own, caller, caller, None));
+        assert!(reserved_send_names_own(own, caller, own, None));
+        // tgkill(own, other): the group is the caller's; the kernel answers.
+        assert!(reserved_send_names_own(own, caller, other, Some(own)));
+        assert!(!reserved_send_names_own(own, caller, other, None));
+        assert!(!reserved_send_names_own(own, caller, other, Some(other)));
+    }
+
+    /// A `tgkill` or `rt_tgsigqueueinfo` is refused only when the tgid it
+    /// names is the thread's own process: a tgid naming another thread of
+    /// that process, or another process, is Linux's ESRCH
+    /// (`do_send_specific`), and a call that names no group always matches.
+    #[test]
+    fn a_reserved_thread_send_must_name_the_threads_own_group() {
+        let leader = DetPid::from_raw(5);
+        let sibling = DetPid::from_raw(6);
+        assert!(reserved_send_names_its_group(None, Some(leader)));
+        assert!(reserved_send_names_its_group(Some(leader), Some(leader)));
+        assert!(!reserved_send_names_its_group(Some(sibling), Some(leader)));
+        assert!(!reserved_send_names_its_group(Some(leader), None));
+    }
+
+    /// Linux's siginfo copy, which comes before any permission check: an
+    /// unreadable head is EFAULT; an unknown layout needs a readable, all-zero
+    /// expansion (EFAULT, E2BIG); `rt_*sigqueueinfo` judge the layout by the
+    /// call's signal and `pidfd_send_signal` by the siginfo's own, which must
+    /// equal the call's (EINVAL).
+    #[test]
+    fn a_reserved_send_checks_its_siginfo_as_linux_copies_it() {
+        let head = |signo: i32, code: i32| {
+            let mut bytes = [0u8; KERNEL_SIGINFO_SIZE];
+            bytes[0..4].copy_from_slice(&signo.to_ne_bytes());
+            bytes[8..12].copy_from_slice(&code.to_ne_bytes());
+            Some(bytes)
+        };
+        let zero = || Some([0u8; SI_EXPANSION_SIZE]);
+        let dirty = || {
+            let mut bytes = [0u8; SI_EXPANSION_SIZE];
+            bytes[SI_EXPANSION_SIZE - 1] = 1;
+            Some(bytes)
+        };
+        let unreadable = || None;
+        // A known layout never reads its expansion, as Linux does not.
+        let never = || -> Option<[u8; SI_EXPANSION_SIZE]> {
+            panic!("the expansion of a known layout must not be read")
+        };
+        let sys = libc::SIGSYS;
+        for pidfd in [false, true] {
+            assert_eq!(
+                siginfo_copy_errno(sys, pidfd, None, never),
+                Some(Errno::EFAULT)
+            );
+            // SI_QUEUE is a known layout: the expansion is not read, so an
+            // unreadable one copies.
+            assert_eq!(siginfo_copy_errno(sys, pidfd, head(sys, -1), never), None);
+            // -8 is below SI_DETHREAD and not SI_ASYNCNL: unknown.
+            assert_eq!(siginfo_copy_errno(sys, pidfd, head(sys, -8), zero), None);
+            assert_eq!(
+                siginfo_copy_errno(sys, pidfd, head(sys, -8), dirty),
+                Some(Errno::E2BIG)
+            );
+            assert_eq!(
+                siginfo_copy_errno(sys, pidfd, head(sys, -8), unreadable),
+                Some(Errno::EFAULT)
+            );
+        }
+        // A mismatched si_signo is EINVAL for pidfd_send_signal only.
+        let usr1 = head(libc::SIGUSR1, -1);
+        assert_eq!(
+            siginfo_copy_errno(sys, true, usr1, never),
+            Some(Errno::EINVAL)
+        );
+        assert_eq!(siginfo_copy_errno(sys, false, usr1, never), None);
+        // rt_*sigqueueinfo judge the layout by the call's signal: SIGSYS's
+        // code 2 (SYS_USER_DISPATCH) is known; code 3 is not.
+        assert_eq!(siginfo_copy_errno(sys, false, head(0, 2), never), None);
+        assert_eq!(
+            siginfo_copy_errno(sys, false, head(0, 3), dirty),
+            Some(Errno::E2BIG)
+        );
+    }
+
+    /// `known_siginfo_layout`'s table: SI_KERNEL, the codes down to
+    /// SI_DETHREAD and SI_ASYNCNL are known for every signal; a positive code
+    /// up to the signal's own limit, or NSIGPOLL for a signal without one.
+    #[test]
+    fn known_siginfo_layout_matches_linuxs_table() {
+        for signo in [
+            libc::SIGSYS,
+            libc::SIGSEGV,
+            libc::SIGTRAP,
+            libc::SIGUSR1,
+            40,
+        ] {
+            for code in [0x80, 0, -1, -6, -7, -60] {
+                assert!(known_siginfo_layout(signo, code), "{signo} {code}");
+            }
+            for code in [-8, -59, -61, 0x81] {
+                assert!(!known_siginfo_layout(signo, code), "{signo} {code}");
+            }
+        }
+        for (signo, limit) in [
+            (libc::SIGILL, 11),
+            (libc::SIGFPE, 15),
+            (libc::SIGSEGV, 10),
+            (libc::SIGBUS, 5),
+            (libc::SIGTRAP, 6),
+            (libc::SIGCHLD, 6),
+            (libc::SIGPOLL, 6),
+            (libc::SIGSYS, 2),
+            (libc::SIGUSR1, 6),
+        ] {
+            assert!(known_siginfo_layout(signo, limit), "{signo}");
+            assert!(!known_siginfo_layout(signo, limit + 1), "{signo}");
+        }
+    }
+
+    /// Only a send to a process with a live thread, other than the caller's
+    /// own, is refused, and a thread-directed one only when the named thread
+    /// is live in it: a zombie or reaped process (no live thread), an exited
+    /// thread and a thread outside the named group keep Linux's answer.
+    #[test]
+    fn a_reserved_send_is_refused_only_to_another_live_process() {
+        let caller = DetTid::from_raw(3);
+        let other = DetTid::from_raw(5);
+        let other_sibling = DetTid::from_raw(6);
+        let live_other = [other, other_sibling];
+        // kill(other): a live process that is not the caller's.
+        assert!(reserved_send_refuses(caller, None, &live_other));
+        // tkill/tgkill of a live thread of it.
+        assert!(reserved_send_refuses(
+            caller,
+            Some(other_sibling),
+            &live_other
+        ));
+        // The caller's own process.
+        assert!(!reserved_send_refuses(caller, None, &[caller, other]));
+        // A zombie or a reaped process: no live thread.
+        assert!(!reserved_send_refuses(caller, None, &[]));
+        assert!(!reserved_send_refuses(caller, Some(other), &[]));
+        // An exited thread, or one outside the group tgkill names.
+        assert!(!reserved_send_refuses(
+            caller,
+            Some(DetTid::from_raw(7)),
+            &live_other
+        ));
     }
 
     use super::*;

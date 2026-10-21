@@ -1160,6 +1160,49 @@ pub fn forced_site_patching_value(backend: Backend) -> Option<&'static str> {
     }
 }
 
+/// Whether LiteInst's SIGTRAP guard router is installed in every in-guest Tool
+/// image. At the pinned Reverie it is: the runtime's instrumentation
+/// preparation (`prepare_instrumentation`, reverie-liteinst
+/// `src/runtime.rs:1114-1124`) installs it through
+/// `prepare_live_patching_with_signal_runtime` whatever the site-patching
+/// setting, on both the Tool-host path (`PatchHost::prepare_patcher`,
+/// `src/runtime.rs:730-733`, which reverie-inguest's `activate_runtime` calls
+/// for patching on and off, `src/guest/tool_install.rs:277`) and the direct
+/// install (`install_runtime`, `src/runtime.rs:804`). A guest whose SIGTRAP
+/// action is a handler of its own at that point makes the installation fail
+/// (EPERM), so no guest runs without it. A later step stops installing it with
+/// site patching off (A5 3c.0 slice 0c); this answer changes with it.
+pub const fn in_guest_guard_router_installed(backend: Backend) -> bool {
+    backend.is_in_guest_liteinst()
+}
+
+/// The signals the in-guest runtime keeps for itself in a run of `backend`
+/// configured by `config` (`detcore::Config::in_guest_reserved_signals`), bit
+/// `n - 1` for signal `n`, for Hermit's default in-guest route: SIGSYS, its
+/// syscall trap, always; SIGSEGV while it subscribes instructions, when it
+/// installs its instruction-fault handler for SIGSEGV; and SIGTRAP while
+/// LiteInst's guard router is installed ([`in_guest_guard_router_installed`]).
+/// The subscription is Detcore's own decision from the same configuration
+/// (`Tool::subscriptions`), which each in-guest Tool image reads to choose
+/// its instruction subscriptions (reverie-inguest `tool_install.rs:191-195`).
+/// Empty (0) for every other backend. The in-guest loader route never calls
+/// this, so its set stays empty: today's behaviour there (D13(a)).
+pub fn in_guest_reserved_signals(config: &DetConfig, backend: Backend) -> u64 {
+    if !backend.is_in_guest_liteinst() {
+        return 0;
+    }
+    let bit = |signal: libc::c_int| 1_u64 << (signal - 1);
+    let subscription = <Detcore as reverie::Tool>::subscriptions(config);
+    let mut reserved = bit(libc::SIGSYS);
+    if subscription.has_rdtsc() || subscription.has_cpuid() {
+        reserved |= bit(libc::SIGSEGV);
+    }
+    if in_guest_guard_router_installed(backend) {
+        reserved |= bit(libc::SIGTRAP);
+    }
+    reserved
+}
+
 /// Why an `in-guest-trap` run cannot start with the guest environment of
 /// `command`: the environment (explicit or inherited) sets
 /// `REVERIE_LITEINST_SITE_PATCHING` to a value other than the one Hermit
@@ -4184,6 +4227,24 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // asked only for them.
     config.guest_may_inherit_a_terminal =
         config.backend.host_timed_signals_are_physical && launcher_may_pass_a_terminal();
+    // The in-guest runtime's reserved signals are set only for the default
+    // in-guest route, after this preparation (`in_guest_reserved_signals`),
+    // so whatever a caller's configuration carried, every backend and every
+    // other route starts from the empty set (A5 step 3c, D13(a)).
+    config.in_guest_reserved_signals = 0;
+    config
+}
+
+/// The configuration of an in-guest run on the loader route (the exec-stop,
+/// native-exec and mapped-first-admission launchers of `hermit run`): the
+/// `in-guest-trap` backend's preparation with site patching off. It keeps
+/// today's behaviour on that route (D13(a), and D26 of the A5 step 3c design:
+/// the route's own comparison gates any change), so the in-guest runtime's
+/// reserved-signal set stays empty here whatever `config` carried; only the
+/// default route sets it (`in_guest_reserved_signals`).
+pub fn prepare_in_guest_loader_route_config(config: DetConfig) -> DetConfig {
+    let mut config = prepare_backend_config(config, Backend::InGuestTrap);
+    config.in_guest_site_patching_off = true;
     config
 }
 
@@ -4482,6 +4543,8 @@ async fn dispatch_backend(
                 .is_some()
                 .then(|| in_guest_detlog_forward_policy().encode());
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
+            // Last, from the configuration every Tool image receives.
+            config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
             let (exit_status, mut global_state, dispatch_stats, process_reports) =
@@ -4795,6 +4858,8 @@ async fn dispatch_output_backend(
                 .is_some()
                 .then(|| in_guest_detlog_forward_policy().encode());
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
+            // Last, from the configuration every Tool image receives.
+            config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
             let (output, mut global_state, dispatch_stats, process_reports) =
@@ -6816,6 +6881,101 @@ mod tests {
             }
         }
         assert!(!in_guest_stats_request(Backend::Liteinst, &None).is_enabled());
+    }
+
+    /// A configuration that already carries a reserved-signal set (it is a
+    /// public, serialized field) never keeps it through Hermit's preparation:
+    /// every backend's preparation, the loader route's
+    /// (`prepare_in_guest_loader_route_config`, which `hermit run`'s
+    /// exec-stop, native-exec and mapped-first-admission launchers use) and
+    /// the native-exec verify route's leave it empty. Only the default
+    /// in-guest route sets it afterwards, from the backend and the
+    /// subscription alone, never from the input.
+    #[test]
+    fn a_poisoned_reserved_signal_set_never_survives_preparation() {
+        let poisoned = DetConfig {
+            in_guest_reserved_signals: u64::MAX,
+            ..DetConfig::default()
+        };
+        for backend in Backend::ALL {
+            let prepared = prepare_backend_config(poisoned.clone(), backend);
+            assert_eq!(prepared.in_guest_reserved_signals, 0, "{backend:?}");
+            let expected = if backend.is_in_guest_liteinst() {
+                in_guest_reserved_signals(
+                    &prepare_backend_config(DetConfig::default(), backend),
+                    backend,
+                )
+            } else {
+                0
+            };
+            assert_eq!(
+                in_guest_reserved_signals(&prepared, backend),
+                expected,
+                "{backend:?}"
+            );
+        }
+        let loader = prepare_in_guest_loader_route_config(poisoned);
+        assert_eq!(loader.in_guest_reserved_signals, 0);
+        assert!(loader.in_guest_site_patching_off);
+        assert_eq!(loader.backend, backend_capabilities(Backend::InGuestTrap));
+    }
+
+    /// Hermit's default in-guest route reserves SIGSYS always, SIGSEGV while
+    /// Detcore's subscription traps an instruction, and SIGTRAP while the
+    /// guard router is installed, which today is every in-guest image. Every
+    /// other backend gets an empty set, and so does the in-guest loader route,
+    /// whose configuration is `prepare_backend_config`'s with no reserved set
+    /// (A5 step 3c, design section 16.30).
+    #[test]
+    fn in_guest_reserved_signals_follow_the_backend_and_the_subscription() {
+        let bit = |signal: libc::c_int| 1_u64 << (signal - 1);
+        let all = bit(libc::SIGSYS) | bit(libc::SIGSEGV) | bit(libc::SIGTRAP);
+        for backend in Backend::ALL {
+            let config = prepare_backend_config(DetConfig::default(), backend);
+            assert_eq!(config.in_guest_reserved_signals, 0, "{backend:?}");
+            let reserved = in_guest_reserved_signals(&config, backend);
+            // This restates `in_guest_guard_router_installed`'s definition
+            // today and so tests nothing about the router. Slice 0c, which
+            // stops installing the router with site patching off, must
+            // replace it with a test of the route and patching setting that
+            // decide the installation.
+            assert_eq!(
+                in_guest_guard_router_installed(backend),
+                backend.is_in_guest_liteinst(),
+                "{backend:?}"
+            );
+            if !backend.is_in_guest_liteinst() {
+                assert_eq!(reserved, 0, "{backend:?}");
+                continue;
+            }
+            // Without --passthru-opt Detcore always subscribes RDTSC.
+            assert!(<Detcore as reverie::Tool>::subscriptions(&config).has_rdtsc());
+            assert_eq!(reserved, all, "{backend:?}");
+
+            // --passthru-opt with time and CPUID virtualization off traps no
+            // instruction, so the runtime installs no SIGSEGV handler.
+            let mut unsubscribed = config.clone();
+            unsubscribed.passthru_opt = true;
+            unsubscribed.virtualize_time = false;
+            unsubscribed.virtualize_cpuid = false;
+            let subscription = <Detcore as reverie::Tool>::subscriptions(&unsubscribed);
+            assert!(!subscription.has_rdtsc() && !subscription.has_cpuid());
+            assert_eq!(
+                in_guest_reserved_signals(&unsubscribed, backend),
+                bit(libc::SIGSYS) | bit(libc::SIGTRAP),
+                "{backend:?}"
+            );
+            for (time, cpuid) in [(true, false), (false, true)] {
+                let mut subscribed = unsubscribed.clone();
+                subscribed.virtualize_time = time;
+                subscribed.virtualize_cpuid = cpuid;
+                assert_eq!(
+                    in_guest_reserved_signals(&subscribed, backend),
+                    all,
+                    "{backend:?} time={time} cpuid={cpuid}"
+                );
+            }
+        }
     }
 
     #[test]

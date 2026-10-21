@@ -62,6 +62,48 @@ fn clock_id_is_known(clockid: ClockId) -> bool {
     }
 }
 
+/// Linux's answer to `timer_create` for `clockid` alone, which it gives
+/// before it reads the notification (`do_timer_create`,
+/// kernel/time/posix-timers.c:448-455 at v6.12): EINVAL for an id with no
+/// clock (`clockid_to_kclock` and the `posix_clocks` table at :1529-1556: 10,
+/// and 12 up), EOPNOTSUPP for a clock with no timers (CLOCK_MONOTONIC_RAW,
+/// CLOCK_REALTIME_COARSE, CLOCK_MONOTONIC_COARSE, and a clock descriptor: a
+/// negative id with `(id & CLOCKFD_MASK) == CLOCKFD`, which names
+/// `clock_posix_dynamic`, kernel/time/posix-clock.c:334-339, whatever
+/// descriptor it encodes; include/linux/posix-timers_types.h:24-32), and
+/// EINVAL for a negative id whose clock bits name no CPU clock (`(id & 7) ==
+/// 7`: per-thread with CPUCLOCK_WHICH 3, which is CPUCLOCK_MAX, so
+/// `pid_for_clock` refuses it from the bits alone,
+/// kernel/time/posix-cpu-timers.c:63-64, and `posix_cpu_timer_create`
+/// answers EINVAL, :392-395). `None` for the clocks with timers, for the
+/// alarm clocks (whose answer depends on the host) and for the other
+/// negative ids, CPU clocks, whose answer depends on the process or thread
+/// the id names: a CPU-clock id naming a task that does not exist therefore
+/// gets the reserved-signal EPERM where Linux answers EINVAL. Only a
+/// `timer_create` whose sigevent names a reserved signal reads it, right
+/// after the copy and before the notification is checked, as Linux orders
+/// them, so that neither the refusal nor Detcore's notification checks come
+/// before Linux's clock answer. Detcore's virtual timers do not otherwise
+/// check the clock, which https://github.com/rrnewton/hermit/issues/4556
+/// tracks together with the CPU-clock case above.
+fn timer_create_clock_refusal(clockid: ClockId) -> Option<Errno> {
+    use reverie::syscalls::FromToRaw;
+    const CLOCKFD: i32 = 3;
+    const CLOCKFD_MASK: i32 = 4 | 3;
+    if !clock_id_is_known(clockid) {
+        return Some(Errno::EINVAL);
+    }
+    match clockid.into_raw() as i32 {
+        libc::CLOCK_MONOTONIC_RAW | libc::CLOCK_REALTIME_COARSE | libc::CLOCK_MONOTONIC_COARSE => {
+            Some(Errno::EOPNOTSUPP)
+        }
+        id if id < 0 && id & CLOCKFD_MASK == CLOCKFD => Some(Errno::EOPNOTSUPP),
+        // CPUCLOCK_PERTHREAD_MASK | CPUCLOCK_MAX: no CPU clock.
+        id if id < 0 && id & CLOCKFD_MASK == CLOCKFD_MASK => Some(Errno::EINVAL),
+        _ => None,
+    }
+}
+
 fn time_from_resources(rsrcs: &Resources) -> Option<LogicalTime> {
     if rsrcs.resources.len() > 1 {
         panic!(
@@ -1005,6 +1047,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     event.sigev_value.sival_ptr as usize as u64,
                 )
             };
+            // A reserved in-guest signal: Linux answers for the clock right
+            // after copying the sigevent, before it looks at the notification
+            // (`do_timer_create`), so an unsupported clock is that answer even
+            // when the notification is invalid too
+            // (`timer_create_clock_refusal`).
+            if guest.config().reserves_in_guest_signal(signo.into())
+                && let Some(errno) = timer_create_clock_refusal(clockid)
+            {
+                return Err(errno.into());
+            }
             let thread = match notify {
                 libc::SIGEV_NONE => None,
                 libc::SIGEV_SIGNAL | libc::SIGEV_THREAD => None,
@@ -1039,6 +1091,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             (Some(libc::SIGALRM), None, None)
         };
+        // A reserved in-guest signal as the timer's notification signal, for
+        // each notification that delivers one (`SIGEV_SIGNAL`, `SIGEV_THREAD`,
+        // `SIGEV_THREAD_ID`), after Linux's answers for the clock and the
+        // sigevent above. With no `sigevent` the signal is SIGALRM, which is
+        // never reserved.
+        if let Some(signo) = signo
+            && guest.config().reserves_in_guest_signal(signo.into())
+        {
+            Self::refuse_reserved_signal_arming(
+                guest,
+                crate::refused_signal_controls::ReservedArming::TimerCreate,
+                signo.into(),
+            )?;
+        }
         // `None` for a real-time signal (32 to 64): see `handle_timer_settime`.
         let signal = signo.and_then(|signo| Signal::try_from(signo).ok());
         if signal == Some(Signal::SIGALRM) {
@@ -1299,6 +1365,50 @@ async fn posix_timer_readout<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Linux's clock answer to `timer_create`, which a reserved-signal refusal
+    /// must not come before: EINVAL for an id with no clock, EOPNOTSUPP for a
+    /// clock without timers, nothing for the clocks with timers and for the
+    /// ids whose answer depends on the host or the process they name.
+    #[test]
+    fn timer_create_clock_refusal_matches_linuxs_clock_table() {
+        use reverie::syscalls::FromToRaw;
+        let refusal = |id: i32| timer_create_clock_refusal(ClockId::from_raw(id as _));
+        for id in [
+            libc::CLOCK_REALTIME,
+            libc::CLOCK_MONOTONIC,
+            libc::CLOCK_PROCESS_CPUTIME_ID,
+            libc::CLOCK_THREAD_CPUTIME_ID,
+            libc::CLOCK_BOOTTIME,
+            libc::CLOCK_REALTIME_ALARM,
+            libc::CLOCK_BOOTTIME_ALARM,
+            libc::CLOCK_TAI,
+            -2,
+        ] {
+            assert_eq!(refusal(id), None, "{id}");
+        }
+        // FD_TO_CLOCKID(fd), ((~fd) << 3) | CLOCKFD, for descriptors 3 and 0:
+        // clock descriptors, which have no timers.
+        let clock_descriptor = |fd: i32| (!fd << 3) | 3;
+        for id in [
+            libc::CLOCK_MONOTONIC_RAW,
+            libc::CLOCK_REALTIME_COARSE,
+            libc::CLOCK_MONOTONIC_COARSE,
+            clock_descriptor(3),
+            clock_descriptor(0),
+        ] {
+            assert_eq!(refusal(id), Some(Errno::EOPNOTSUPP), "{id}");
+        }
+        // CPU clocks of a process (pid 1, CPUCLOCK_SCHED) and of a thread
+        // (perthread bit) keep `None`: their answer depends on the task.
+        for id in [(!1 << 3) | 2, (!1 << 3) | 4 | 2] {
+            assert_eq!(refusal(id), None, "{id}");
+        }
+        // Per-thread CPU-clock bits with CPUCLOCK_WHICH 3: no such clock.
+        for id in [10, 12, 99, (!1 << 3) | 7, (!0 << 3) | 7] {
+            assert_eq!(refusal(id), Some(Errno::EINVAL), "{id}");
+        }
+    }
 
     #[test]
     fn timex_policy_distinguishes_queries_from_mutations() {

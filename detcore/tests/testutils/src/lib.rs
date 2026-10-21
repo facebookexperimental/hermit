@@ -107,6 +107,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         guest_may_inherit_a_terminal: false,
         in_guest_detlog_forward_policy: None,
         in_guest_site_patching_off: false,
+        in_guest_reserved_signals: 0,
         launch_image: None,
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
         virtualize_time: false,
@@ -211,6 +212,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         guest_may_inherit_a_terminal: false,
         in_guest_detlog_forward_policy: None,
         in_guest_site_patching_off: false,
+        in_guest_reserved_signals: 0,
         launch_image: None,
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
         virtualize_time: true, // stat* could depends on this
@@ -315,6 +317,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         guest_may_inherit_a_terminal: false,
         in_guest_detlog_forward_policy: None,
         in_guest_site_patching_off: false,
+        in_guest_reserved_signals: 0,
         launch_image: None,
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
         virtualize_time: true,

@@ -321,6 +321,32 @@ pub struct Config {
     #[clap(skip)]
     pub in_guest_site_patching_off: bool,
 
+    /// The signals an in-guest runtime keeps for itself, which a guest may
+    /// not send to another process or arm as a notification signal: bit
+    /// `n - 1` for signal `n`, as Detcore's other signal sets are kept.
+    ///
+    /// Such a signal sent from one process to another would run the target's
+    /// runtime handler on a thread that does not hold the scheduler's turn
+    /// (A5 step 3c, design section 16.30,
+    /// <https://github.com/rrnewton/hermit/issues/4485>). So Detcore answers a
+    /// send of one of these signals to a process other than the caller's own
+    /// (`kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`,
+    /// `pidfd_send_signal`), and any arming of one (`fcntl(F_SETSIG)`,
+    /// `timer_create`, `prctl(PR_SET_PDEATHSIG)`), with `EPERM` and a WARN
+    /// ([`Config::reserves_in_guest_signal`]). A send to the caller's own
+    /// process is unchanged. Empty (0), the default, changes nothing.
+    ///
+    /// The host sets it, not a flag, when it prepares an in-guest run on the
+    /// default route: SIGSYS, SIGSEGV while the runtime subscribes
+    /// instructions, and SIGTRAP while LiteInst's guard router is installed.
+    /// Every other backend, and the in-guest loader route, leave it empty.
+    /// Every Tool image receives it in the configuration handshake, which
+    /// guest code cannot change. Like `in_guest_site_patching_off`, it has no
+    /// legacy key.
+    #[serde(default)]
+    #[clap(skip)]
+    pub in_guest_reserved_signals: u64,
+
     /// The guest's first image, as its `/proc/self/exe` link names it, and
     /// the image the kernel exec'd in its place where a launcher loads the
     /// guest ([`LaunchImage`]). Detcore answers that link from it until the
@@ -1155,6 +1181,15 @@ impl Config {
     /// (`BackendCapabilities::kernel_signal_targets_are_predictable`).
     pub fn models_signal_targets(&self) -> bool {
         self.sequentialize_threads && self.backend.kernel_signal_targets_are_predictable
+    }
+
+    /// Whether `signal` is one of [`Config::in_guest_reserved_signals`]. Never
+    /// signal 0 (an existence check sends nothing), nor a number outside 1 to
+    /// 64, which Linux refuses with EINVAL before any target is named. Always
+    /// false while the set is empty, which it is on every backend but the
+    /// in-guest ones' default route.
+    pub fn reserves_in_guest_signal(&self, signal: i64) -> bool {
+        (1..=64).contains(&signal) && self.in_guest_reserved_signals & (1_u64 << (signal - 1)) != 0
     }
 
     /// This configuration with `change` applied to its backend capabilities.
@@ -2156,8 +2191,10 @@ impl Default for Config {
 /// `hermit run` refuses with the DBT backend, and [`Config::replaying`], set
 /// only by `hermit replay`, which runs only on the ptrace backend. So is
 /// [`Config::inherited_seccomp`], added after this form froze, which reads
-/// back as unknown. Every other field is serialized exactly as
-/// `serde_json::to_string(config)` serializes it.
+/// back as unknown. So is [`Config::in_guest_reserved_signals`], empty for
+/// DBT (it is set only for in-guest runs), which reads back as empty. Every
+/// other field is serialized exactly as `serde_json::to_string(config)`
+/// serializes it.
 ///
 /// Use this wherever the JSON is visible to the guest. `hermit run
 /// --backend=dbt` passes the configuration to the in-guest DBT runtime in the
@@ -2576,6 +2613,7 @@ mod legacy_backend_json {
     use serde::de::value::MapDeserializer;
     use serde::de::value::SeqAccessDeserializer;
     use serde::de::value::StringDeserializer;
+    use serde::de::value::U64Deserializer;
     use serde::ser::Error as _;
     use serde::ser::Impossible;
     use serde::ser::SerializeStruct;
@@ -2607,6 +2645,8 @@ mod legacy_backend_json {
     /// replay runs only on the ptrace backend.
     /// `in_guest_site_patching_off` is false for DBT (it is set only for
     /// in-guest LiteInst), so it is never written and reads as false.
+    /// `in_guest_reserved_signals` is empty for DBT (it is set only for
+    /// in-guest runs), so it is never written and reads as empty.
     /// `launch_image` came after the legacy form froze: it is never written
     /// and reads as unset. DBT's runtime takes it from the coordinator's
     /// configuration instead, which declares DynamoRIO's library as the
@@ -2631,12 +2671,13 @@ mod legacy_backend_json {
     /// as unset.
     /// `signal_at` came after the form froze; the scheduler acts on it, not
     /// the runtime, so it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 21] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 22] = [
         "backend",
         "record_host_inputs",
         "guest_may_inherit_a_terminal",
         "in_guest_detlog_forward_policy",
         "in_guest_site_patching_off",
+        "in_guest_reserved_signals",
         "launch_image",
         "target_timeslice_syscalls_only",
         "futex_wake_yields",
@@ -2744,7 +2785,8 @@ mod legacy_backend_json {
     /// there nor [`Config::record_host_inputs`],
     /// [`Config::guest_may_inherit_a_terminal`],
     /// [`Config::in_guest_detlog_forward_policy`],
-    /// [`Config::in_guest_site_patching_off`], [`Config::launch_image`],
+    /// [`Config::in_guest_site_patching_off`],
+    /// [`Config::in_guest_reserved_signals`], [`Config::launch_image`],
     /// [`Config::target_timeslice_syscalls_only`],
     /// [`Config::futex_wake_yields`], [`Config::replaying`],
     /// [`Config::scheduler_turn_cost`] or [`Config::inherited_seccomp`] takes
@@ -2787,6 +2829,10 @@ mod legacy_backend_json {
                     | "replaying"
                     | "signal_delivery_check_fatal",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
+                // Empty, as its serde default is.
+                Some("in_guest_reserved_signals") => {
+                    seed.deserialize(U64Deserializer::new(0)).map(Some)
+                }
                 // On, as its serde default is.
                 Some("signal_state_copy") => {
                     seed.deserialize(BoolDeserializer::new(true)).map(Some)
@@ -3068,6 +3114,7 @@ mod legacy_backend_json {
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
+                | "in_guest_reserved_signals"
                 | "launch_image"
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
@@ -3217,6 +3264,8 @@ mod tests {
         assert!(!config.guest_may_inherit_a_terminal);
         assert!(config.in_guest_detlog_forward_policy.is_none());
         assert!(!config.in_guest_site_patching_off);
+        assert_eq!(config.in_guest_reserved_signals, 0);
+        assert!(!config.reserves_in_guest_signal(libc::SIGSYS.into()));
         assert!(config.launch_image.is_none());
     }
 
@@ -3764,6 +3813,7 @@ mod tests {
     /// with the fifteen legacy keys where `backend` stands and no
     /// `record_host_inputs`, `guest_may_inherit_a_terminal`,
     /// `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
+    /// `in_guest_reserved_signals`,
     /// `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
     /// `replaying`,
     /// `scheduler_turn_cost` or
@@ -3787,6 +3837,7 @@ mod tests {
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
+                | "in_guest_reserved_signals"
                 | "launch_image"
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
@@ -3815,15 +3866,16 @@ mod tests {
         // `backend` becomes fifteen keys; `record_host_inputs`,
         // `guest_may_inherit_a_terminal`,
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
+        // `in_guest_reserved_signals`,
         // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
         // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
         // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`, `cpu_profile_source`,
         // `signal_state_copy`, `container_mount_table`,
         // `mountinfo_mount_namespace`, `signal_delivery_check_fatal`,
         // `work_span_report` and `signal_at` none: fourteen more keys, and
-        // twenty fewer, so six keys fewer than fields.
+        // twenty-one fewer, so seven keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 6);
+        assert_eq!(fields.len(), keys.len() + 7);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -4465,6 +4517,109 @@ mod tests {
             assert_eq!(read, wire.len());
             assert_eq!(decoded.signal_at, signal_at);
         }
+    }
+
+    /// The in-guest reserved-signal set as an in-guest default-route run
+    /// carries it: SIGSYS, SIGSEGV and SIGTRAP.
+    fn in_guest_reserved_set() -> u64 {
+        [libc::SIGSYS, libc::SIGSEGV, libc::SIGTRAP]
+            .into_iter()
+            .fold(0, |set, signal| set | (1_u64 << (signal - 1)))
+    }
+
+    /// `in_guest_reserved_signals` is empty for DBT, so the legacy form never
+    /// carries it, and it reads back as empty from both the object and the
+    /// array form.
+    #[test]
+    fn in_guest_reserved_signals_never_enters_the_legacy_form() {
+        let empty = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let reserved = Config {
+            in_guest_reserved_signals: in_guest_reserved_set(),
+            ..empty.clone()
+        };
+        let json = to_legacy_backend_json(&reserved).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&empty).unwrap());
+        assert!(!json.contains("in_guest_reserved_signals"), "{json}");
+        assert_eq!(
+            from_legacy_backend_json(&json)
+                .unwrap()
+                .in_guest_reserved_signals,
+            0
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert_eq!(
+            from_legacy_backend_json(&array)
+                .unwrap()
+                .in_guest_reserved_signals,
+            0
+        );
+    }
+
+    /// The set reaches every Tool image through Reverie's bincode handshake
+    /// unchanged, empty or not, and a JSON configuration without the key reads
+    /// as empty (its serde default).
+    #[test]
+    fn in_guest_reserved_signals_round_trips_and_defaults_to_empty() {
+        for set in [0, in_guest_reserved_set()] {
+            let config = Config {
+                in_guest_reserved_signals: set,
+                ..Config::default()
+            };
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(decoded.in_guest_reserved_signals, set);
+            let json: Config =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            assert_eq!(json.in_guest_reserved_signals, set);
+        }
+        let mut encoded = serde_json::to_value(Config::default()).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("in_guest_reserved_signals")
+            .expect("the field is serialized");
+        let decoded: Config = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.in_guest_reserved_signals, 0);
+    }
+
+    /// `reserves_in_guest_signal` answers from the set alone: each reserved
+    /// signal and no other, never signal 0 or a number outside 1 to 64, and
+    /// nothing at all while the set is empty.
+    #[test]
+    fn reserves_in_guest_signal_reads_only_the_set() {
+        let empty = Config::default();
+        let reserved = Config {
+            in_guest_reserved_signals: in_guest_reserved_set(),
+            ..Config::default()
+        };
+        for signal in -1..=66 {
+            assert!(!empty.reserves_in_guest_signal(signal), "{signal}");
+            let expected = [libc::SIGSYS, libc::SIGSEGV, libc::SIGTRAP]
+                .into_iter()
+                .any(|reserved| i64::from(reserved) == signal);
+            assert_eq!(
+                reserved.reserves_in_guest_signal(signal),
+                expected,
+                "{signal}"
+            );
+        }
+        // The top bit is signal 64, the last one Linux accepts.
+        let top = Config {
+            in_guest_reserved_signals: 1 << 63,
+            ..Config::default()
+        };
+        assert!(top.reserves_in_guest_signal(64));
+        assert!(!top.reserves_in_guest_signal(65));
+        assert!(!top.reserves_in_guest_signal(0));
     }
 
     /// `--signal-at` takes `turn=N:SIGNAL` with SIGNAL a name or a number.

@@ -9262,6 +9262,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Fcntl,
     ) -> Result<i64, Error> {
         let fd = call.fd();
+        // A reserved in-guest signal as the descriptor's I/O signal; 0, the
+        // default SIGIO, is never reserved. Like the owner screen below, it
+        // comes first, so a refused call has no other effect. Linux's fdget
+        // comes before it: a descriptor the guest does not hold, or an O_PATH
+        // one (which `check_fcntl_cmd` admits only for F_DUPFD*, F_GETFD,
+        // F_SETFD and F_GETFL), is EBADF.
+        if let F_SETSIG(signal) = call.cmd()
+            && guest.config().reserves_in_guest_signal(signal.into())
+        {
+            let o_path = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.status_flags() & libc::O_PATH != 0)?;
+            if o_path {
+                return Err(Errno::EBADF.into());
+            }
+            Self::refuse_reserved_signal_arming(
+                guest,
+                crate::refused_signal_controls::ReservedArming::FcntlSetsig,
+                signal.into(),
+            )?;
+        }
         // Before anything else, so a refused call has no other effect.
         let (call, _owner_copy) = self.screen_fcntl_owner(guest, call).await?;
         // The owner of an asynchronous-I/O descriptor may be any process or
@@ -11836,6 +11857,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self
                 .refuse_unserviceable_operation(guest, Sysno::pidfd_send_signal, Errno::ENOSYS)
                 .await;
+        }
+        // A reserved in-guest signal to another live process is refused here,
+        // after the group scope's refusal above and before any path below
+        // forwards the call; a target with no live thread (a zombie, or gone)
+        // keeps its answer below.
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::pidfd_send_signal,
+                signal,
+                crate::syscalls::signal::ReservedSendTarget::Pidfd {
+                    named,
+                    thread: scope == PidfdSignalScope::Thread,
+                },
+                crate::syscalls::signal::ReservedSendSiginfo::Pidfd(info.map(|info| info.as_raw())),
+            )
+            .await
+        {
+            return refused;
         }
         let process = match named {
             Some(named) => Some(signal_target_process(guest, named).await.unwrap_or(named)),
