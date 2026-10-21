@@ -229,6 +229,33 @@ fn parse_eventfd_count(fdinfo: &str) -> Option<u64> {
     u64::from_str_radix(count.trim(), 16).ok()
 }
 
+/// How many times a replayed `close` is injected while a signal stops it
+/// before it runs.
+const PHYSICAL_CLOSE_RESTART_ATTEMPTS: u32 = 16;
+
+/// Injects the physical `close` a replayed close needs for its descriptor
+/// namespace effect. A signal can stop the injection before the syscall
+/// instruction runs, which a backend reports as ERESTARTSYS and Linux's close
+/// never returns, so only that is retried: a completed close that reported
+/// EINTR or EIO has released the descriptor, and repeating it could close a
+/// descriptor a later call reused. A close stopped that way on every attempt
+/// ends the replay, because the recorded result says the descriptor is
+/// released while its physical placeholder would stay open.
+async fn inject_physical_close<T: Tool, G: Guest<T>>(
+    guest: &mut G,
+    syscall: Syscall,
+) -> Result<i64, Errno> {
+    for _ in 0..PHYSICAL_CLOSE_RESTART_ATTEMPTS {
+        match guest.inject(syscall).await {
+            Err(Errno::ERESTARTSYS) => continue,
+            result => return result,
+        }
+    }
+    panic!(
+        "replayed {syscall:?} was stopped before it ran on {PHYSICAL_CLOSE_RESTART_ATTEMPTS} attempts"
+    );
+}
+
 /// Whether `fd` in the table of thread `tid` holds a placeholder installed
 /// for an accepted connection. `/proc/<tid>` shows that thread's own table,
 /// which is not the leader's for a thread cloned without `CLONE_FILES`.
@@ -2344,7 +2371,7 @@ impl Replayer {
         // ENOSPC, or EDQUOT. EBADF leaves the namespace unchanged, while
         // ERESTARTSYS means Reverie must restart the injection first.
         if !matches!(recorded, Err(Errno::EBADF | Errno::ERESTARTSYS))
-            && let Err(error) = guest.inject(syscall).await
+            && let Err(error) = inject_physical_close(guest, syscall).await
         {
             if error == Errno::EBADF {
                 // Some replayed descriptor sources, notably SCM_RIGHTS,
