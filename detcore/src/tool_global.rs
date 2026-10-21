@@ -2221,6 +2221,70 @@ impl GlobalTool for GlobalState {
         mode == reverie::BackendSignalControlMode::ToolControlled
     }
 
+    /// Detcore lets the backend skip an empty user-return boundary. Only
+    /// reverie-kvm reads this answer, and only once Detcore's
+    /// `install_signal_control` returned `ToolControlled`, which needs the
+    /// backend's process signal control and `--sequentialize-threads`. The
+    /// ptrace, DBT, SaBRe and LiteInst backends never ask, so the constant is
+    /// fixed for the run on every backend, as the contract requires.
+    ///
+    /// An empty boundary is one where the thread holds no permit and the
+    /// backend shows no pending signal its mask leaves unblocked, no parked
+    /// ledger, no signalfd in the process, no dequeue-journal entry of the
+    /// thread, and no stored dequeue failure. There the full round trip is
+    /// `authorize_signal_boundary`, a selection of nothing, and a `NoHandler`
+    /// receipt to `consume_signal_boundary`. Skipping it is unobservable:
+    ///
+    /// - Authorization publishes nothing. Detcore's own signals (real-timer
+    ///   and POSIX-timer expiry, child-exit SIGCHLD) are published under the
+    ///   scheduler lock at scheduler time into the backend's pending sets or
+    ///   dequeue journal, which make a boundary non-empty, so none is lost.
+    /// - Authorization succeeds only for `parked.running`. The only skippable
+    ///   boundaries follow a completed Tool callback or a backend-owned
+    ///   `rt_sigreturn` (thread entry checks only when a signal is eligible).
+    ///   Every request is awaited, and every background release
+    ///   (`BlockingExternalIO`, `BlockingRtSigsuspend`, a vfork parent) awaits
+    ///   its `BlockedExternalContinue` grant before the callback returns, so
+    ///   such a boundary is always inside the thread's own serial grant
+    ///   (`holds_serial_grant`). No grant, alarm selection or step2 drain runs
+    ///   then: they wait for quiescence, and `are_all_quiesced` waits on the
+    ///   running thread's empty request. The control-intent drain
+    ///   (`drain_control_intents`) does run on every pass of the turn loop,
+    ///   but its intents only finish or resume an observed parked wait. A
+    ///   finish runs while that wait's observation permit exists, and in the
+    ///   boundary thread's own process that permit makes authorization
+    ///   refuse; a resume reads no permit. So no other decision can see the
+    ///   short-lived permit, and its release admits no exit: exits wait only
+    ///   behind another permit of the process.
+    /// - The receipt's cleanup is redundant there. Every grant settles the
+    ///   parked request it answers (`settle_parked_grant`), and every request
+    ///   the scheduler substitutes for a filed one retires the replaced
+    ///   request's ownership (`retire_replaced_parked_request`), so no
+    ///   ownership outlives its request. An observed wait's request and
+    ///   `Observation` owner, and a `ReturningCaught` owner, always come with
+    ///   a permit, which makes the boundary non-empty.
+    /// - The rest is bookkeeping no decision reads: `parked.nonce` stays
+    ///   monotonic, only smaller, and is never logged; `parked.completed`
+    ///   only recognises an exact duplicate receipt.
+    ///
+    /// The cost is that Detcore's identity checks at authorization (ESRCH,
+    /// EINVAL) now run only at non-empty boundaries.
+    ///
+    /// Held once before, while a backgrounded KVM `rt_sigsuspend` race was
+    /// open (<https://github.com/rrnewton/hermit/issues/4360>). That race is
+    /// fixed: a KVM `rt_sigsuspend` now runs in its caller's turn, and a
+    /// sibling may exit while a thread holds a permit
+    /// (<https://github.com/rrnewton/hermit/issues/4367>). Before those fixes
+    /// the race fired about as often with this opt-in as without it.
+    ///
+    /// Re-prove or drop this if Detcore ever holds pending signals, or its
+    /// own mask copy, that the backend cannot see and delivers them through
+    /// authorization, or if the backend's KVM signal policy moves into
+    /// Detcore: the skip trusts the backend's pending sets and mask.
+    fn skip_empty_signal_boundaries(&self) -> bool {
+        true
+    }
+
     fn authorize_backend_signal_boundary(
         &self,
         task: reverie::SignalTaskIdentity,
@@ -10964,6 +11028,26 @@ mod tests {
         assert!(sched.process_physically_gone(DetPid::from_raw(57)));
         assert!(!sched.thread_tree.contains(&DetTid::from_raw(57)));
         assert!(!sched.next_turns.contains_key(&DetTid::from_raw(57)));
+    }
+
+    /// Detcore lets reverie-kvm skip empty signal boundaries. The answer is
+    /// one constant for every configuration, as the Reverie contract requires
+    /// that it never change during a run; only reverie-kvm reads it.
+    #[test]
+    fn detcore_lets_the_backend_skip_empty_signal_boundaries() {
+        for (signal_control, sequentialize_threads) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let config = Config {
+                sequentialize_threads,
+                ..Config::default()
+            }
+            .with_backend(|backend| {
+                backend.provides_process_signal_control = signal_control;
+            });
+            let state = GlobalState::initialize(&config, false);
+            assert!(state.skip_empty_signal_boundaries());
+        }
     }
 
     /// Two backends call `GlobalTool::on_backend_process_exited`, for two

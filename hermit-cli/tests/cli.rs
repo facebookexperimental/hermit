@@ -246,6 +246,8 @@ static PARENT_DEATH_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_PIDFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHILD_WAIT_DEADLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_THEN_SIBLING_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PARKED_WAIT_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PARKED_READ_SIGNAL_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_SPINNER_AND_NEW_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
@@ -2810,6 +2812,58 @@ fn signal_then_sibling_exit_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "signal-then-sibling-exit guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn parked_wait_then_exec_guest() -> &'static Path {
+    PARKED_WAIT_THEN_EXEC_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("parked-wait-then-exec");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the parked-wait-then-exec guest directory");
+        let guest = build_root.join("parked_wait_then_exec");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/parked_wait_then_exec.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the parked-wait-then-exec guest");
+        assert!(
+            output.status.success(),
+            "parked-wait-then-exec guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn parked_read_signal_then_exec_guest() -> &'static Path {
+    PARKED_READ_SIGNAL_THEN_EXEC_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("parked-read-signal-then-exec");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the parked-read-signal-then-exec guest directory");
+        let guest = build_root.join("parked_read_signal_then_exec");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/parked_read_signal_then_exec.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the parked-read-signal-then-exec guest");
+        assert!(
+            output.status.success(),
+            "parked-read-signal-then-exec guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -14937,6 +14991,177 @@ fn run_kvm_a_sibling_may_exit_while_its_signal_is_taken() {
             );
         }
     }
+}
+
+/// tests/c/parked_wait_then_exec.c on KVM: a parked wait that a real-timer
+/// SIGALRM interrupts (`caught`, `pause`) or that sleeps its full time with
+/// SIGALRM ignored (`ignored`), then execve, then another parked wait in the
+/// new image. Detcore lets reverie-kvm skip the signal boundary at a
+/// system-call return that can deliver nothing
+/// (`GlobalTool::skip_empty_signal_boundaries`), and with it the receipt that
+/// clears a thread's parked requests. If a parked request outlived its wait,
+/// the exec would be refused (`complete_signal_exec`, "KVM parked signal
+/// protocol failed ... Identity"). Every run must print Linux's two lines and
+/// reach bitwise parity with INFO messages compared.
+#[test]
+fn run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM parked-wait-then-exec case: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = parked_wait_then_exec_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let cases = [
+        (
+            "caught",
+            "caught: rc=-1 eintr=1 handler=1\nafter caught: rc=0\n",
+        ),
+        (
+            "ignored",
+            "ignored: rc=0 eintr=0 handler=0\nafter ignored: rc=0\n",
+        ),
+        (
+            "pause",
+            "pause: rc=-1 eintr=1 handler=1\nafter pause: rc=0\n",
+        ),
+    ];
+    for (mode, expected) in cases {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report_arg = report.to_str().expect("report path should be UTF-8");
+        let args = [
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{mode}");
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(verdict["bitwise_parity"], true, "{mode}: {verdict}");
+        for side in ["left", "right"] {
+            assert!(
+                verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+                "{mode}: no INFO messages compared: {verdict}"
+            );
+        }
+    }
+}
+
+/// tests/c/parked_read_signal_then_exec.c on KVM: a parked pipe read that an
+/// ignored real-timer SIGALRM is observed in and resumes, then a sibling's
+/// SIGUSR2, which the reader blocks, wakes before the read's next turn; the
+/// read restarts, completes when the sibling writes, and the reader execs.
+/// The signal wake replaced the read's request, and the parked ownership of
+/// the replaced request outlived it. Once Detcore let reverie-kvm skip the
+/// empty signal boundary after the restart, nothing removed that ownership,
+/// and the exec was refused ("KVM parked signal protocol failed ...
+/// Identity"): the run printed only the first line, and the image after exec
+/// never ran. The scheduler now retires that ownership when it replaces the
+/// request (`retire_replaced_parked_request`). The run must print Linux's two
+/// lines and reach bitwise parity with INFO messages compared.
+#[test]
+fn run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM parked-read-signal-then-exec case: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = parked_read_signal_then_exec_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("verify.json");
+    let report_arg = report.to_str().expect("report path should be UTF-8");
+    let args = [
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report_arg,
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "read: n=1 byte=x\nafter: usr2 pending=1 blocked=1\n"
+    );
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("strict verification wrote no verdict"))
+            .expect("strict verification verdict is valid JSON");
+    assert_eq!(verdict["bitwise_parity"], true, "{verdict}");
+    for side in ["left", "right"] {
+        assert!(
+            verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+            "no INFO messages compared: {verdict}"
+        );
+    }
+
+    // The run took the path under test, read from its INFO log: while the
+    // reader's first one-byte `read` is still in flight, the alarm is handled
+    // (only a parked observation reaches a thread inside a call), then the
+    // SIGUSR2 wake replaces the read's request (its `WaitidSignals` grant),
+    // and the read returns ERESTARTSYS to be restarted. A schedule that
+    // avoided the observation or the replacement would no longer cover it.
+    let args = [
+        "--log=info",
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let log = stderr(&output);
+    let lines: Vec<&str> = log.lines().collect();
+    let is_read = |line: &str| line.contains("read(3, ") && line.contains(", 1) = ");
+    let start = lines
+        .iter()
+        .position(|line| line.contains("inbound syscall: read(3, ") && is_read(line))
+        .expect("the reader's one-byte read is in the INFO log");
+    let finish = start
+        + lines[start..]
+            .iter()
+            .position(|line| line.contains("finish syscall") && is_read(line))
+            .expect("the reader's first read finishes in the INFO log");
+    assert!(
+        lines[finish].contains("Err(Errno(ERESTARTSYS))"),
+        "the first read was not restarted: {}",
+        lines[finish]
+    );
+    let observed = lines[start..finish]
+        .iter()
+        .position(|line| line.contains("handling inbound signal (#0) SIGALRM"))
+        .expect("the alarm was not observed inside the read");
+    assert!(
+        lines[start + observed..finish]
+            .iter()
+            .any(|line| line.contains("WaitidSignals([SigWrapper(12)])")),
+        "the SIGUSR2 wake did not replace the read's request after the observation"
+    );
 }
 
 /// Runs tests/c/chaos_spinner_and_new_thread.c under `--chaos --sched-seed=7`

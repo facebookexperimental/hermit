@@ -619,6 +619,586 @@ fn return_permit_requires_real_grant_and_receipt_is_exactly_once() {
     assert!(s.next_turns.contains_key(&peer));
 }
 
+/// Every input a later scheduling decision reads from the signal protocol,
+/// with permit and continuation numbering left out: the run queue, each
+/// thread's turn owner and transports, which threads own a parked request,
+/// the permits by holder and task, exits waiting for a permit, exit fences,
+/// pending admissions, timed waits, and failure.
+fn scheduling_inputs(s: &Scheduler) -> String {
+    let owners: Vec<_> = s
+        .next_turns
+        .iter()
+        .map(|(tid, turn)| {
+            let owner = match turn.protocol.owner {
+                NextTurnOwner::Ordinary => "ordinary",
+                NextTurnOwner::Observation { .. } => "observation",
+                NextTurnOwner::ReturningCaught { .. } => "returning-caught",
+            };
+            (
+                *tid,
+                owner,
+                turn.req.is_full(),
+                turn.resp.is_full(),
+                s.blocked.timed_waiters.thread_deadline(*tid),
+            )
+        })
+        .collect();
+    let requests: Vec<_> = s.parked.requests.keys().map(|id| id.dettid).collect();
+    let permits: Vec<_> = s
+        .parked
+        .permits
+        .iter()
+        .map(|(tid, permit)| (*tid, permit.task, permit.site))
+        .collect();
+    format!(
+        "{:?}",
+        (
+            s.run_queue.tids().collect::<Vec<_>>(),
+            owners,
+            requests,
+            permits,
+            &s.parked.exits_awaiting_permit,
+            s.parked.exit_fences.keys().collect::<Vec<_>>(),
+            &s.pending_run_queue_admissions,
+            s.parked.failure,
+            s.backend_failed(),
+        )
+    )
+}
+
+/// The round trip reverie-kvm leaves out at an empty user-return boundary,
+/// because Detcore opts in to `skip_empty_signal_boundaries`: an
+/// authorization inside the holder's own serial grant and a `NoHandler`
+/// receipt. Run in one of two identical schedulers and skipped in the other,
+/// it publishes nothing and leaves every scheduling input the same. Only the
+/// permit counter and the stored receipt differ, and the next alarm selection
+/// and a sibling's exit admission decide the same way in both.
+#[test]
+fn an_empty_boundary_round_trip_changes_only_the_nonce_and_the_receipt() {
+    let world = || {
+        let (mut s, b) = fixture();
+        let (holder, _, _) = add(&mut s, 100, 100);
+        let (sleeper, mm, site) = add(&mut s, 100, 101);
+        let (exiting, _, _) = add(&mut s, 100, 102);
+        add(&mut s, 200, 200);
+        let response = sleep(&mut s, sleeper, mm, site, 100);
+        b.recipients.lock().unwrap().push(SignalRecipient {
+            task: task(100, 101),
+        });
+        // The holder was granted its turn and has not filed its next request.
+        s.runqueue_push_back(holder);
+        s.parked.running = Some(holder);
+        assert!(s.holds_serial_grant(holder));
+        (s, b, response, holder, exiting)
+    };
+    let (mut asked, asked_backend, asked_response, holder, exiting) = world();
+    let (mut skipped, skipped_backend, skipped_response, ..) = world();
+    assert_eq!(scheduling_inputs(&asked), scheduling_inputs(&skipped));
+
+    let nonce = asked.parked.nonce;
+    let permit = asked
+        .authorize_signal_boundary(task(100, 100))
+        .unwrap()
+        .expect("the thread holding the serial grant is authorized");
+    assert!(
+        asked_backend.publications.lock().unwrap().is_empty()
+            && asked_backend.timer_publications.lock().unwrap().is_empty()
+            && asked_backend.child_publications.lock().unwrap().is_empty(),
+        "authorization publishes nothing"
+    );
+    let receipt = SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::NoHandler,
+    };
+    asked.consume_signal_boundary(receipt).unwrap();
+    // The backend releases its reservation after the receipt, as reverie-kvm's
+    // `finish_signal_boundary` does.
+    asked_backend.release_delivery(permit).unwrap();
+
+    assert_eq!(asked.parked.nonce, nonce + 1);
+    assert_eq!(skipped.parked.nonce, nonce);
+    assert_eq!(asked.parked.completed.get(&holder), Some(&receipt));
+    assert!(skipped.parked.completed.is_empty());
+    assert_eq!(scheduling_inputs(&asked), scheduling_inputs(&skipped));
+    assert!(asked_backend.permits.lock().unwrap().is_empty());
+    assert!(skipped_backend.permits.lock().unwrap().is_empty());
+    for s in [&asked, &skipped] {
+        assert!(!s.exit_awaits_sibling_permit(exiting, DetPid::from_raw(100)));
+        assert!(s.holds_serial_grant(holder));
+    }
+
+    // The next maintenance pass picks the same alarm recipient in both; only
+    // the numbering of its permit and continuation differs, still increasing.
+    for s in [&mut asked, &mut skipped] {
+        s.committed_time = at(10);
+        s.select_parked_alarm().unwrap();
+    }
+    let (a, k) = (selected(&asked_response), selected(&skipped_response));
+    assert_eq!(a.permit.task, k.permit.task);
+    assert_eq!(a.permit.site, k.permit.site);
+    assert_eq!(a.continuation.dettid, k.continuation.dettid);
+    assert_eq!(a.permit.sequence, k.permit.sequence + 1);
+    assert_eq!(scheduling_inputs(&asked), scheduling_inputs(&skipped));
+    for s in [&asked, &skipped] {
+        assert!(s.exit_awaits_sibling_permit(exiting, DetPid::from_raw(100)));
+    }
+}
+
+/// Why the receipt's cleanup (`parked.requests` and the turn owner) has
+/// nothing to do at a boundary reverie-kvm skips. While a parked wait is
+/// observed, its request and `Observation` owner come with a permit; when it
+/// returns into a caught handler, its `ReturningCaught` owner keeps that
+/// permit. With a permit held, the backend does not skip the boundary. Once the wait resumes, the grant that answers it settles the
+/// request, so the empty boundary after that grant has no request or owner
+/// left to clean. A leaked request would make `complete_signal_exec` refuse
+/// the thread's next exec.
+#[test]
+fn a_parked_wait_leaves_nothing_for_an_empty_boundary_to_clean() {
+    let observe = || {
+        let (mut s, b) = fixture();
+        let (tid, mm, site) = add(&mut s, 100, 100);
+        let response = sleep(&mut s, tid, mm, site, 100);
+        b.recipients.lock().unwrap().push(SignalRecipient {
+            task: task(100, 100),
+        });
+        s.committed_time = at(10);
+        s.select_parked_alarm().unwrap();
+        let c = selected(&response);
+        assert!(s.parked.requests.keys().any(|id| id.dettid == tid));
+        assert!(matches!(
+            s.next_turns[&tid].protocol.owner,
+            NextTurnOwner::Observation { .. }
+        ));
+        assert_eq!(s.parked.permits.get(&tid), Some(&c.permit));
+        assert_eq!(b.permits.lock().unwrap().as_slice(), &[c.permit]);
+        (s, b, tid, mm, site, c)
+    };
+
+    // Interrupted for a caught handler: the permit stays until the receipt.
+    let (mut s, b, tid, mm, site, c) = observe();
+    let ack = Ivar::new();
+    s.post_control(
+        tid,
+        mm,
+        ControlIntent::Finish {
+            wait: c.continuation,
+            lease: c.lease,
+            site,
+            finish: ObservationFinish::InterruptForCaught {
+                selection: reverie::PreparedSignalToken {
+                    site,
+                    selection_nonce: 1,
+                },
+            },
+            ack: ack.clone(),
+        },
+    )
+    .unwrap();
+    s.drain_control_intents();
+    assert_eq!(ack.try_read(), Some(Ok(FinishAck::Interrupted)));
+    assert!(matches!(
+        s.next_turns[&tid].protocol.owner,
+        NextTurnOwner::ReturningCaught { .. }
+    ));
+    assert!(!s.parked.requests.keys().any(|id| id.dettid == tid));
+    assert_eq!(s.parked.permits.get(&tid), Some(&c.permit));
+    assert_eq!(b.permits.lock().unwrap().as_slice(), &[c.permit]);
+
+    // No handler: the same wait resumes, without a permit, and its grant
+    // settles the request.
+    let (mut s, b, tid, mm, site, c) = observe();
+    let ack = Ivar::new();
+    s.post_control(
+        tid,
+        mm,
+        ControlIntent::Finish {
+            wait: c.continuation,
+            lease: c.lease,
+            site,
+            finish: ObservationFinish::ResumeSameWait,
+            ack: ack.clone(),
+        },
+    )
+    .unwrap();
+    s.drain_control_intents();
+    let ticket = match ack.try_read().unwrap().unwrap() {
+        FinishAck::AwaitResume(t) => t,
+        other => panic!("{other:?}"),
+    };
+    let resumed = Ivar::new();
+    s.post_control(
+        tid,
+        mm,
+        ControlIntent::Resume {
+            ticket,
+            site,
+            response: resumed.clone(),
+        },
+    )
+    .unwrap();
+    s.drain_control_intents();
+    assert!(s.parked.permits.is_empty());
+    assert!(b.permits.lock().unwrap().is_empty());
+    assert_eq!(s.next_turns[&tid].protocol.owner, NextTurnOwner::Ordinary);
+    assert!(
+        s.parked.requests.keys().any(|id| id.dettid == tid),
+        "the resumed wait is owned until its grant"
+    );
+    s.unblock_guest(tid, &resumed).unwrap();
+    assert!(resumed.try_read().is_some());
+    assert!(s.holds_serial_grant(tid));
+    assert!(
+        !s.parked.requests.keys().any(|id| id.dettid == tid),
+        "the grant settled the resumed wait"
+    );
+    assert_eq!(s.next_turns[&tid].protocol.owner, NextTurnOwner::Ordinary);
+
+    // So the empty boundary after the grant cleans nothing up.
+    let before = scheduling_inputs(&s);
+    let permit = s
+        .authorize_signal_boundary(task(100, 100))
+        .unwrap()
+        .unwrap();
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::NoHandler,
+    })
+    .unwrap();
+    b.release_delivery(permit).unwrap();
+    assert_eq!(scheduling_inputs(&s), before);
+    assert!(b.permits.lock().unwrap().is_empty());
+}
+
+/// A restartable polled read (`InternalIOPolling`, ERESTARTSYS) whose parked
+/// wait an ignored alarm observed and resumed: the scheduler owns its request
+/// again, in the Waiting phase, without a permit. Returns the resumed
+/// response transport.
+fn resumed_restartable_polled_read(
+    s: &mut Scheduler,
+    b: &Backend,
+    tid: DetTid,
+    mm: MmId,
+    site: reverie::CallbackSignalSite,
+) -> Ivar<SchedResponse> {
+    assert!(s.backend.supports_parked_write_signal_interruption);
+    let mut r = Resources::new(tid);
+    r.insert(ResourceID::InternalIOPolling, Permission::W);
+    r.poll_attempt = 1;
+    r.set_signal_interrupt_errno(reverie::Errno::ERESTARTSYS);
+    s.install_resource_origin(
+        tid,
+        ResourceOrigin {
+            rpc: RpcOrigin::DirectRequestResources,
+            mm,
+            control: ControlCapability::PolledRead { site },
+        },
+    )
+    .unwrap();
+    let response = {
+        let turn = &s.next_turns[&tid];
+        turn.req.put(Ok(r));
+        turn.resp.clone()
+    };
+    s.run_queue.push_poller(tid, DEFAULT_PRIORITY, 1);
+    b.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 100),
+    });
+    s.select_parked_alarm().unwrap();
+    let c = selected(&response);
+    let ack = Ivar::new();
+    s.post_control(
+        tid,
+        mm,
+        ControlIntent::Finish {
+            wait: c.continuation,
+            lease: c.lease,
+            site,
+            finish: ObservationFinish::ResumeSameWait,
+            ack: ack.clone(),
+        },
+    )
+    .unwrap();
+    s.drain_control_intents();
+    let ticket = match ack.try_read().unwrap().unwrap() {
+        FinishAck::AwaitResume(ticket) => ticket,
+        other => panic!("{other:?}"),
+    };
+    let resumed = Ivar::new();
+    s.post_control(
+        tid,
+        mm,
+        ControlIntent::Resume {
+            ticket,
+            site,
+            response: resumed.clone(),
+        },
+    )
+    .unwrap();
+    s.drain_control_intents();
+    b.recipients.lock().unwrap().clear();
+    assert!(!s.backend_failed());
+    assert!(s.parked.permits.is_empty());
+    assert_eq!(s.next_turns[&tid].protocol.owner, NextTurnOwner::Ordinary);
+    assert!(s.parked.requests.keys().any(|id| id.dettid == tid));
+    resumed
+}
+
+/// Whether `tid` still owns any parked request, which makes
+/// `complete_signal_exec` refuse its next exec.
+fn owns_parked_request(s: &Scheduler, tid: DetTid) -> bool {
+    s.parked.requests.keys().any(|id| id.dettid == tid)
+}
+
+/// A signal drain that replaces a resumed parked read's request
+/// (`force_unblock_thread_at`) retires that request's parked ownership, so
+/// the grant of the replacement leaves none behind. Before, the grant settled
+/// only ownership of the current request transport, and the old entry
+/// survived until a signal-boundary receipt, which reverie-kvm skips at an
+/// empty boundary; the thread's next exec was then refused
+/// (`complete_signal_exec`, ProtocolFailure::Identity).
+#[test]
+fn a_signal_replacing_a_resumed_parked_read_leaves_no_ownership_after_its_grant() {
+    let (mut s, b) = fixture();
+    let (tid, mm, site) = add(&mut s, 100, 100);
+    let resumed = resumed_restartable_polled_read(&mut s, &b, tid, mm, site);
+    // A sibling's signal, which the read's own mask may block: the drain
+    // replaces the request with the signal wake.
+    s.notify_signal_pending(tid, SigWrapper::from(Signal::SIGUSR2));
+    s.drain_pending_cross_task_signals();
+    assert!(!s.backend_failed());
+    let replaced = s.next_turns[&tid].req.try_read().unwrap().unwrap();
+    assert!(
+        replaced
+            .resources
+            .keys()
+            .any(|id| matches!(id, ResourceID::WaitidSignals(_)))
+    );
+    assert!(
+        !owns_parked_request(&s, tid),
+        "the replacement retires the parked read's ownership"
+    );
+    assert_eq!(
+        s.next_turns[&tid]
+            .protocol
+            .origin
+            .map(|origin| origin.control),
+        Some(ControlCapability::None),
+        "the parked capability no longer describes the request"
+    );
+    assert!(s.run_queue.contains_tid(tid));
+    s.unblock_guest(tid, &resumed).unwrap();
+    assert!(resumed.try_read().is_some());
+    assert!(!owns_parked_request(&s, tid));
+    assert!(!s.backend_failed());
+}
+
+/// The merge site's own retirement: a second signal batch merges into the
+/// queued restartable wake in place (`drain_pending_cross_task_signals`), and
+/// that substitution retires the parked ownership of the request it replaces.
+/// The first wake already retired the read's ownership, and no reachable path
+/// owns a signal wake, so the test gives the wake live waiting ownership
+/// (`own_current_request_for_test`) before the second batch: the merge must
+/// find and retire it, and the grant must leave none.
+#[test]
+fn a_merged_signal_wake_of_a_resumed_parked_read_leaves_no_ownership_after_its_grant() {
+    let (mut s, b) = fixture();
+    let (tid, mm, site) = add(&mut s, 100, 100);
+    let resumed = resumed_restartable_polled_read(&mut s, &b, tid, mm, site);
+    s.notify_signal_pending(tid, SigWrapper::from(Signal::SIGUSR2));
+    s.drain_pending_cross_task_signals();
+    assert!(!owns_parked_request(&s, tid));
+    assert!(s.run_queue.contains_tid(tid));
+    s.own_current_request_for_test(tid, site);
+    assert!(owns_parked_request(&s, tid));
+    let first = s.next_turns[&tid].req.clone();
+    s.notify_signal_pending(tid, SigWrapper::from(Signal::SIGUSR1));
+    s.drain_pending_cross_task_signals();
+    assert!(!s.backend_failed());
+    assert_ne!(s.next_turns[&tid].req, first, "the second batch merged");
+    assert!(
+        s.run_queue.contains_tid(tid),
+        "merged in place, still queued"
+    );
+    let merged = s.next_turns[&tid].req.try_read().unwrap().unwrap();
+    assert!(merged.resources.keys().any(|id| matches!(
+        id,
+        ResourceID::WaitidSignals(signals) if signals.len() == 2
+    )));
+    assert!(
+        !owns_parked_request(&s, tid),
+        "the merge retired the ownership it replaced"
+    );
+    assert_eq!(
+        s.next_turns[&tid]
+            .protocol
+            .origin
+            .map(|origin| origin.control),
+        Some(ControlCapability::None)
+    );
+    s.unblock_guest(tid, &resumed).unwrap();
+    assert!(resumed.try_read().is_some());
+    assert!(!owns_parked_request(&s, tid));
+    assert!(!s.backend_failed());
+}
+
+/// The state a test puts the resumed read's ownership in before the
+/// scheduler substitutes its request.
+#[derive(Clone, Copy, Debug)]
+enum ReplacedOwnership {
+    /// A plain waiting ownership, which the substitution retires.
+    Qualifying,
+    /// The turn's owner is not Ordinary.
+    NotOrdinaryOwner,
+    /// The thread holds a delivery permit.
+    LivePermit,
+    /// The turn's response is already answered.
+    AnsweredResponse,
+    /// The matching entry is not Waiting.
+    NotWaiting,
+    /// The matching entry names another response transport.
+    ForeignResponse,
+    /// The matching entry names another origin.
+    ForeignOrigin,
+}
+
+/// Substitutes the resumed read's request after putting its ownership in
+/// `state`, through `force_unblock_thread_at` or `substitute_request`, and
+/// checks the outcome: a qualifying ownership is retired with its capability
+/// and the request replaced; any other refuses with the named protocol
+/// failure and leaves the original request, capability, ownership, run queue
+/// and response exactly as they were, with no grant made.
+fn check_replaced_ownership(state: ReplacedOwnership, through_force_unblock: bool) {
+    let (mut s, b) = fixture();
+    let (tid, mm, site) = add(&mut s, 100, 100);
+    let resumed = resumed_restartable_polled_read(&mut s, &b, tid, mm, site);
+    let wait = *s
+        .parked
+        .requests
+        .keys()
+        .find(|id| id.dettid == tid)
+        .unwrap();
+    match state {
+        ReplacedOwnership::Qualifying => {}
+        ReplacedOwnership::NotOrdinaryOwner => {
+            s.next_turns.get_mut(&tid).unwrap().protocol.owner = NextTurnOwner::ReturningCaught {
+                completed_wait: wait,
+            };
+        }
+        ReplacedOwnership::LivePermit => {
+            s.parked.permits.insert(
+                tid,
+                SignalDeliveryPermit {
+                    task: task(100, 100),
+                    sequence: 999,
+                    site: None,
+                },
+            );
+        }
+        ReplacedOwnership::AnsweredResponse => resumed.put(SchedResponse::Go(None)),
+        ReplacedOwnership::NotWaiting => {
+            s.corrupt_owned_request_for_test(tid, OwnedRequestCorruption::NotWaiting)
+        }
+        ReplacedOwnership::ForeignResponse => {
+            s.corrupt_owned_request_for_test(tid, OwnedRequestCorruption::ForeignResponse)
+        }
+        ReplacedOwnership::ForeignOrigin => {
+            s.corrupt_owned_request_for_test(tid, OwnedRequestCorruption::ForeignOrigin)
+        }
+    }
+    if through_force_unblock {
+        // As the signal drain does before it force-unblocks a queued poll.
+        assert!(s.run_queue.remove_tid(tid));
+    }
+    let request = s.next_turns[&tid].req.clone();
+    let queue = format!("{:?}", s.run_queue);
+    let answer = format!("{:?}", resumed.try_read());
+    let owned: Vec<_> = s.parked.requests.keys().copied().collect();
+    let mut wake = Resources::new(tid);
+    wake.insert(
+        ResourceID::WaitidSignals(vec![SigWrapper::from(Signal::SIGUSR2)]),
+        Permission::W,
+    );
+    wake.set_signal_interrupt_errno(reverie::Errno::ERESTARTSYS);
+    let replaced = if through_force_unblock {
+        s.force_unblock_thread_at(tid, wake, false)
+    } else {
+        s.substitute_request(tid, wake)
+    };
+    let expected = match state {
+        ReplacedOwnership::Qualifying => None,
+        ReplacedOwnership::NotOrdinaryOwner
+        | ReplacedOwnership::LivePermit
+        | ReplacedOwnership::AnsweredResponse => Some(ProtocolFailure::Phase),
+        ReplacedOwnership::NotWaiting
+        | ReplacedOwnership::ForeignResponse
+        | ReplacedOwnership::ForeignOrigin => Some(ProtocolFailure::Identity),
+    };
+    let label = format!("{state:?} through_force_unblock={through_force_unblock}");
+    assert_eq!(s.parked.failure, expected, "{label}");
+    assert_eq!(
+        format!("{:?}", resumed.try_read()),
+        answer,
+        "{label}: no grant"
+    );
+    match expected {
+        None => {
+            assert!(replaced, "{label}");
+            assert_ne!(s.next_turns[&tid].req, request, "{label}");
+            assert!(!owns_parked_request(&s, tid), "{label}");
+            assert_eq!(
+                s.next_turns[&tid]
+                    .protocol
+                    .origin
+                    .map(|origin| origin.control),
+                Some(ControlCapability::None),
+                "{label}"
+            );
+            assert!(s.run_queue.contains_tid(tid), "{label}");
+        }
+        Some(_) => {
+            assert!(!replaced, "{label}");
+            assert_eq!(s.next_turns[&tid].req, request, "{label}: request kept");
+            assert_eq!(
+                s.next_turns[&tid]
+                    .protocol
+                    .origin
+                    .map(|origin| origin.control),
+                Some(ControlCapability::PolledRead { site }),
+                "{label}: capability kept"
+            );
+            assert_eq!(
+                s.parked.requests.keys().copied().collect::<Vec<_>>(),
+                owned,
+                "{label}: ownership kept"
+            );
+            assert_eq!(format!("{:?}", s.run_queue), queue, "{label}: queue kept");
+        }
+    }
+}
+
+/// `retire_replaced_parked_request` retires only a plain waiting ownership:
+/// owner Ordinary, no permit, the response unanswered (else Phase), and the
+/// entry Waiting with the turn's response and origin (else Identity). Each
+/// violation is refused before anything changes, through both substitution
+/// paths, beside the qualifying case. No reachable path builds these states;
+/// the checks guard against a later change that would.
+#[test]
+fn a_replaced_request_retires_only_plain_waiting_ownership() {
+    for through_force_unblock in [true, false] {
+        for state in [
+            ReplacedOwnership::Qualifying,
+            ReplacedOwnership::NotOrdinaryOwner,
+            ReplacedOwnership::LivePermit,
+            ReplacedOwnership::AnsweredResponse,
+            ReplacedOwnership::NotWaiting,
+            ReplacedOwnership::ForeignResponse,
+            ReplacedOwnership::ForeignOrigin,
+        ] {
+            check_replaced_ownership(state, through_force_unblock);
+        }
+    }
+}
+
 /// A sibling's exit waits while a thread of its process holds a delivery
 /// permit, rather than failing the protocol (`reserve_exit_boundary` refuses a
 /// second boundary of the process), and the permit's release records the

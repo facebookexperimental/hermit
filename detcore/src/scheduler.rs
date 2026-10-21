@@ -11253,6 +11253,34 @@ impl Scheduler {
                 })
     }
 
+    /// Replace `dettid`'s filed request, in place, with one the scheduler
+    /// substitutes, first retiring the parked ownership of the request it
+    /// replaces (`retire_replaced_parked_request`). Every replacement of a
+    /// thread's filed request outside its own grant goes through here or
+    /// through [`Scheduler::force_unblock_thread_at`]; the two exceptions keep
+    /// the same logical operation and move its ownership themselves
+    /// (`upgrade_polled_to_runnable` rebinds it; an observation and its
+    /// resume move it between phases). Returns whether it replaced the
+    /// request; a protocol failure leaves it, and the run, failed.
+    fn substitute_request(&mut self, dettid: DetTid, rsrcs: Resources) -> bool {
+        self.substitute_request_ivar(dettid, Ivar::full(Ok(rsrcs)))
+    }
+
+    /// [`Scheduler::substitute_request`] with the replacement transport given.
+    fn substitute_request_ivar(&mut self, dettid: DetTid, req: Ivar<SchedRequest>) -> bool {
+        if let Err(failure) = self.retire_replaced_parked_request(dettid) {
+            self.fail_parked(dettid, failure);
+            return false;
+        }
+        match self.next_turns.get_mut(&dettid) {
+            Some(next_turn) => {
+                next_turn.req = req;
+                true
+            }
+            None => false,
+        }
+    }
+
     // Force a thread out blocking and into the runnable state, replacing its resource request.
     fn force_unblock_thread(&mut self, dettid: DetTid, rsrcs: Resources) {
         let _ = self.force_unblock_thread_at(dettid, rsrcs, false);
@@ -11292,6 +11320,12 @@ impl Scheduler {
                 "[dtid {}] held at a happens-before gate; leaving it held, its signal pending",
                 dettid
             );
+            return false;
+        }
+        // The substitute ends the parked operation the old request stood for
+        // (`retire_replaced_parked_request`). Checked before anything changes.
+        if let Err(failure) = self.retire_replaced_parked_request(dettid) {
+            self.fail_parked(dettid, failure);
             return false;
         }
         info!(
@@ -13564,10 +13598,8 @@ impl Scheduler {
             "[dettid {}] Priority change point emplaced empty resource request at new {}",
             dettid, empty_req
         );
-        self.next_turns
-            .get_mut(&dettid)
-            .expect("nextturn present")
-            .req = empty_req;
+        assert!(self.next_turns.contains_key(&dettid), "nextturn present");
+        self.substitute_request_ivar(dettid, empty_req);
         info!(
             "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, dettid {} changed priority to {}",
             self.turn, dettid, new_priority
@@ -14657,10 +14689,7 @@ impl Scheduler {
                     // `WaitidSignals` reaches here, so nothing is discarded.
                     let mut resources = Resources::new(dettid);
                     resources.insert(ResourceID::WaitidSignals(signals), Permission::W);
-                    let Some(next_turn) = self.next_turns.get_mut(&dettid) else {
-                        continue;
-                    };
-                    next_turn.req = Ivar::full(Ok(resources));
+                    self.substitute_request(dettid, resources);
                 }
                 None if let Some(interrupting) =
                     self.parked_futex_interrupting_signals(dettid, 0) =>
@@ -14774,9 +14803,7 @@ impl Scheduler {
                         // turn always came first, so the poll never ran and
                         // never took the signal
                         // (https://github.com/rrnewton/hermit/issues/4504).
-                        if let Some(next_turn) = self.next_turns.get_mut(&dettid) {
-                            next_turn.req = Ivar::full(Ok(resources));
-                        }
+                        self.substitute_request(dettid, resources);
                         continue;
                     }
                     // Replace the polling request rather than adding a second

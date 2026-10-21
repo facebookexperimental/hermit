@@ -17615,7 +17615,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "89");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "91");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -17686,16 +17686,20 @@ mod nextest_timeout_tests {
         // (https://github.com/rrnewton/hermit/issues/4485): 87. And
         // run_kvm_a_grant_inside_a_handler_ends_its_delivery_continuation
         // (https://github.com/rrnewton/hermit/pull/4510): 88.
-        // The disabled-maximum acceptance case makes 89 declarations. The
-        // spinner is retained but ignored and excluded because its explicit
-        // maximum requests an unavailable timer: 88 selected CLI tests remain.
+        // The disabled-maximum acceptance case makes 89 declarations. And
+        // run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec (Detcore's
+        // empty-signal-boundary opt-in): 90. And
+        // run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec
+        // (replaced-request parked ownership): 91. The spinner is retained
+        // but ignored and excluded because its explicit maximum requests an
+        // unavailable timer: 90 selected CLI tests remain.
         assert_eq!(
             names.len(),
-            89,
+            91,
             "update the exact CI inventory with new KVM tests"
         );
         names.retain(|name| name != excluded);
-        assert_eq!(names.len(), 88);
+        assert_eq!(names.len(), 90);
         let required_cases = [
             "run_kvm_self_sigkill_from_nonleader_is_group_fatal",
             "run_kvm_synchronous_root_segv_preserves_guest_exit",
@@ -17717,6 +17721,8 @@ mod nextest_timeout_tests {
             "run_kvm_flock_is_a_named_refusal_where_ptrace_excludes",
             "run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills",
             "run_kvm_cpuid_rows_match_ptrace",
+            "run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec",
+            "run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -18798,7 +18804,11 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // declarations, 87 selected.
         // run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills
         // (https://github.com/rrnewton/hermit/issues/4485): 87 declarations, 88 selected.
-        ("privileged-only-test.cli_kvm", 89usize),
+        // run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec (Detcore's
+        // empty-signal-boundary opt-in): 90 selected.
+        // run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec
+        // (replaced-request parked ownership): 91 selected.
+        ("privileged-only-test.cli_kvm", 91usize),
     ] {
         let step = privileged
             .steps

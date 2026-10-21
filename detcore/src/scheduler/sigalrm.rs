@@ -47,7 +47,6 @@ use tracing::info;
 
 use super::Scheduler;
 use super::ThreadStatus;
-use crate::ivar::Ivar;
 use crate::resources::PAUSE_FYI;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
@@ -338,10 +337,7 @@ impl Scheduler {
             thread
         );
         let wake = Self::sigalrm_wake(thread);
-        if let Some(turn) = self.next_turns.get_mut(&thread) {
-            turn.req = Ivar::full(Ok(wake));
-        }
-        true
+        self.substitute_request(thread, wake)
     }
 
     /// Takes `process`'s entry for delivery, if it has one and it is due for

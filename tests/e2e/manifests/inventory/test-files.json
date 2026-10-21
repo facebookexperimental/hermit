@@ -1387,6 +1387,18 @@
       "why": "tests/c/parity_probe.h is owned by tests/c/fixture_mutation.py: This header gives every identity fixture in the family one contract -- check accumulation, a single canonical stdout line, nonzero exit on any failed check, and the parity_mutate_*() seam the harness perturbs. It is compiled into each fixture rather than run, so it is build input to the harness and never an executable guest in its own right."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/parked_read_signal_then_exec.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/parked_read_signal_then_exec.c is owned by hermit-cli/tests/cli.rs: run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec runs it on the KVM backend, where an ignored real-timer SIGALRM is observed in a parked pipe read and resumes it, a sibling's blocked SIGUSR2 then replaces the read's request with a signal wake, the read restarts and completes, and the reader execs. The parked ownership of the replaced request must not outlive it, or the exec fails the parked signal protocol. It requires a run --strict --verify --verify-strict run with exact output at bitwise parity, so it remains a guest fixture rather than a manifest cell."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/parked_wait_then_exec.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/parked_wait_then_exec.c is owned by hermit-cli/tests/cli.rs: run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec runs it on the KVM backend, where a parked nanosleep or pause that a real-timer SIGALRM interrupts, or that sleeps its full time with SIGALRM ignored, is followed by execve and another parked wait in the new image. Detcore lets reverie-kvm skip empty signal boundaries, and with them the receipt that clears a thread's parked requests; a request that outlived its wait would make the exec fail the parked signal protocol. It requires three run --strict --verify --verify-strict runs with exact per-mode output at bitwise parity, so it remains a guest fixture rather than a manifest cell."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/path_file_ops.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

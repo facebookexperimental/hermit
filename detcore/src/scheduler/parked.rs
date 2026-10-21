@@ -1793,6 +1793,90 @@ impl Scheduler {
         Ok(())
     }
 
+    /// The scheduler is about to replace `tid`'s filed request with one it
+    /// substitutes: a signal wake (`force_unblock_thread_at`), a signal batch
+    /// merged into such a wake, a pause answered by a due SIGALRM, or a
+    /// change point's empty request. The substitute ends the logical
+    /// operation the old request stood for: the thread's next grant answers
+    /// it, the parked call returns that answer (`capable_resource_request`
+    /// returns on any grant), and a restarted or retried call files a new
+    /// request with new ownership. Nothing reads the old ownership after the
+    /// replacement:
+    /// - an observation of the substitute is refused by the capability's
+    ///   resource checks (`begin_alarm_observation`);
+    /// - finish and resume intents need an Observing or
+    ///   AwaitingResumeRegistration phase, which hold a permit or an empty
+    ///   request, never the request being replaced;
+    /// - only exec (`complete_signal_exec`) and the grant read it, and the
+    ///   grant settles only ownership of the request it answers.
+    ///
+    /// So retire the exact waiting ownership of the old request, as
+    /// `retire_child_wait_signal_request` does for a child wait, rather than
+    /// rebinding it to a transport that no longer describes it, and drop the
+    /// parked capability, which cannot describe the substitute either.
+    /// Without this the grant left the ownership behind, and only the
+    /// thread's next signal-boundary receipt removed it. reverie-kvm skips
+    /// an empty boundary and sends no receipt there, so a later exec was
+    /// refused.
+    ///
+    /// Ownership of the replaced request must be a plain waiting one: owner
+    /// Ordinary, no permit, the response not yet answered, and the entry's
+    /// phase, response and origin those of the turn. Anything else is a
+    /// protocol failure, never silently retired. A request with no parked
+    /// capability (every request on a backend without process signal
+    /// control) is left untouched.
+    pub(crate) fn retire_replaced_parked_request(
+        &mut self,
+        tid: DetTid,
+    ) -> Result<(), ProtocolFailure> {
+        let Some(turn) = self.next_turns.get(&tid) else {
+            return Ok(());
+        };
+        let Some(origin) = turn.protocol.origin else {
+            return Ok(());
+        };
+        if !matches!(
+            origin.control,
+            ControlCapability::ParkedWait { .. }
+                | ControlCapability::PolledRead { .. }
+                | ControlCapability::ChildWait { .. }
+        ) {
+            return Ok(());
+        }
+        let mut owned = self
+            .parked
+            .requests
+            .values()
+            .filter(|owned| owned.request == turn.req)
+            .peekable();
+        if owned.peek().is_some()
+            && (turn.protocol.owner != NextTurnOwner::Ordinary
+                || self.parked.permits.contains_key(&tid)
+                || turn.resp.is_full())
+        {
+            return Err(ProtocolFailure::Phase);
+        }
+        for owned in owned {
+            if !matches!(owned.phase, ContinuationPhase::Waiting)
+                || owned.response != turn.resp
+                || owned.origin != origin
+            {
+                return Err(ProtocolFailure::Identity);
+            }
+        }
+        self.settle_parked_grant(tid);
+        let turn = self
+            .next_turns
+            .get_mut(&tid)
+            .expect("checked request owner");
+        turn.protocol
+            .origin
+            .as_mut()
+            .expect("checked request origin")
+            .control = ControlCapability::None;
+        Ok(())
+    }
+
     /// Normal polling replaces a request without completing its logical
     /// operation. Match the exact request, so a hook on the same task cannot
     /// change the suspended outer wait's ownership or resources.
@@ -1836,5 +1920,76 @@ impl Scheduler {
                 owned.ready_read = witness.clone();
             }
         }
+    }
+}
+
+/// How a test corrupts the waiting ownership of a thread's current request,
+/// to reach each refusal of `retire_replaced_parked_request`.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OwnedRequestCorruption {
+    /// The entry is no longer in the Waiting phase.
+    NotWaiting,
+    /// The entry names another response transport than the turn's.
+    ForeignResponse,
+    /// The entry names another origin than the turn's.
+    ForeignOrigin,
+}
+
+#[cfg(test)]
+impl Scheduler {
+    /// Corrupts the ownership of `tid`'s current request as `how` says.
+    pub(crate) fn corrupt_owned_request_for_test(
+        &mut self,
+        tid: DetTid,
+        how: OwnedRequestCorruption,
+    ) {
+        let request = self.next_turns[&tid].req.clone();
+        let owned = self
+            .parked
+            .requests
+            .values_mut()
+            .find(|owned| owned.request == request)
+            .expect("ownership of the current request");
+        match how {
+            OwnedRequestCorruption::NotWaiting => {
+                owned.phase =
+                    ContinuationPhase::Observing(ParkedObservationLease { nonce: u64::MAX });
+            }
+            OwnedRequestCorruption::ForeignResponse => owned.response = Ivar::new(),
+            OwnedRequestCorruption::ForeignOrigin => {
+                owned.origin.mm = MmId::initial(DetTid::from_raw(999_999));
+            }
+        }
+    }
+
+    /// Gives `tid`'s current request a waiting parked ownership again, with a
+    /// PolledRead capability at `site`, so that the next substitution of that
+    /// request (a merge in place, say) has live ownership to retire.
+    pub(crate) fn own_current_request_for_test(&mut self, tid: DetTid, site: CallbackSignalSite) {
+        let nonce = self.parked.nonce + 1;
+        self.parked.nonce = nonce;
+        let turn = self.next_turns.get_mut(&tid).expect("registered thread");
+        let origin = turn.protocol.origin.as_mut().expect("filed request origin");
+        origin.control = ControlCapability::PolledRead { site };
+        let origin = *origin;
+        let resources = turn
+            .req
+            .try_read()
+            .expect("filed request")
+            .expect("ordinary request");
+        let id = ContinuationId { dettid: tid, nonce };
+        let owned = OwnedRequest {
+            id,
+            request: turn.req.clone(),
+            response: turn.resp.clone(),
+            resources,
+            origin,
+            ready_read: None,
+            membership: None,
+            cycle: 0,
+            phase: ContinuationPhase::Waiting,
+        };
+        self.parked.requests.insert(id, owned);
     }
 }
