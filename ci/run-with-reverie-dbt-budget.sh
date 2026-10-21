@@ -2417,7 +2417,15 @@ fi
 # 204.04 job-seconds. Root Cargo.lock and Rust package versions have changed;
 # no Rust/package identity or old-head validation is carried. Fresh source-key
 # binding and runtime qualification are required. Preserve limits and histories.
-expected_pin=e3634c5119f365406362ee57ddcc684bd45a813e
+# CARRY TO 39f2f875709bc0830d16b3b53f8060c5fdb716d0 (2026-10-21): from
+# e3634c5119f365406362ee57ddcc684bd45a813e. One commit (exec-return SIGKILL race:
+# report a tracee a fatal signal moved into its PTRACE_EVENT_EXIT stop before
+# the exec-return check as a death). It changes reverie-ptrace/src/task.rs and
+# reverie-ptrace/src/tracer.rs only; git diff is empty under reverie-dbt/ and
+# third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so inventory 999, SDK and native inputs, calibrated
+# budget, job width and limits carry unchanged from the e3634c51 entry.
+expected_pin=39f2f875709bc0830d16b3b53f8060c5fdb716d0
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
