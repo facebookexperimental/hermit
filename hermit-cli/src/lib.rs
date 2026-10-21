@@ -3024,17 +3024,24 @@ fn prepare_kvm_mountinfo_config(
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3695): Review
 // host metadata timestamps for KVM runs.
-/// Whether a KVM run asks the backend for the timestamps the kernel stored
-/// rather than its fixed value.
+/// Whether a KVM run declares to the backend that Detcore rewrites every
+/// metadata timestamp (`set_host_metadata_timestamps`).
 ///
-/// With virtual metadata, Detcore rewrites every timestamp that a stat call
-/// returns to the guest, and it reads the stored host values for its own
-/// checks: `set_file_times` confirms that `utimensat` stored the requested
-/// mtime. KVM replaces those timestamps with a fixed value unless the run asks
-/// for the stored ones. The backend refuses this setting unless Detcore owns
-/// every guest thread, which `run_kvm` never opts out of. The stored values sit
-/// in the guest's buffer until Detcore rewrites them, so the run must also
-/// sequentialize threads: then no other guest thread runs in that interval.
+/// The backend reports the kernel's timestamps for host files in every run;
+/// Detcore decides what the guest sees, and with virtual metadata it rewrites
+/// every timestamp that a stat call returns and reads the stored host values
+/// for its own checks (`set_file_times` confirms that `utimensat` stored the
+/// requested mtime). The setting additionally makes the backend classify the
+/// carriers it makes for its own data (virtual files, `/proc` snapshots, the
+/// virtual signalfd's eventfd, the self-pidfd proxy) so that they keep fixed
+/// timestamps through every alias; without it they report the carrier's
+/// kernel timestamps. The backend refuses the setting unless Detcore owns
+/// every guest thread, which `run_kvm` never opts out of. It is enabled only
+/// with virtual metadata, so that something rewrites the timestamps, and with
+/// sequentialized threads. The setting no longer decides whether another
+/// guest thread can read a host file's kernel timestamps before Detcore
+/// rewrites them: the backend reports them either way, and sequentialization
+/// alone closes that window.
 fn kvm_reports_stored_metadata_timestamps(config: &DetConfig) -> bool {
     config.virtualize_metadata && config.sequentialize_threads
 }
@@ -7777,8 +7784,8 @@ mod tests {
         );
         assert!(super::kvm_reports_stored_metadata_timestamps(&sequential));
 
-        // Another guest thread could read the stored values before Detcore
-        // rewrites them.
+        // Without sequentialized threads the setting stays off; the
+        // backend reports host files' kernel timestamps either way.
         let concurrent = super::DetConfig {
             sequentialize_threads: false,
             ..sequential.clone()

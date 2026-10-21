@@ -16552,6 +16552,68 @@ mod inject_fstat_scratch {
             "a descriptor that failed registration must not be modeled"
         );
     }
+
+    /// The canonical statfs view: fixed caps on the free counts, clamped to
+    /// the mount's totals, and a zero `f_fsid`, with the totals kept. These
+    /// fabricated-input cases moved here from the KVM executor's copy of
+    /// this canonicalization, deleted in favour of this one.
+    #[test]
+    fn canonicalize_statfs_buf_caps_free_counts_and_zeroes_the_fsid() {
+        let (tool, mut guest) = ScriptedGuest::new(false, false);
+        let mut canonical = |mut statfs: libc::statfs| {
+            let buffer = AddrMut::from_raw(std::ptr::from_mut(&mut statfs) as usize);
+            tool.canonicalize_statfs_buf(&mut guest, buffer).unwrap();
+            statfs
+        };
+        // SAFETY: fsid_t is two initialized integer words on x86-64.
+        let fsid = |statfs: &libc::statfs| unsafe {
+            std::mem::transmute::<libc::fsid_t, [i32; 2]>(statfs.f_fsid)
+        };
+        // SAFETY: zero is a valid statfs.
+        let zero = unsafe { std::mem::zeroed::<libc::statfs>() };
+
+        // Totals above both caps: the free counts take the caps.
+        let mut large = zero;
+        large.f_blocks = 10_000_000;
+        large.f_bfree = 7_123_456;
+        large.f_bavail = 6_987_654;
+        large.f_files = 2_000_000;
+        large.f_ffree = 1_234_567;
+        // SAFETY: fsid_t is two integer words on x86-64.
+        large.f_fsid = unsafe { std::mem::transmute::<[i32; 2], libc::fsid_t>([0x1234, 0x5678]) };
+        let large = canonical(large);
+        assert_eq!(
+            (large.f_bfree, large.f_bavail, large.f_ffree),
+            (1_000_000, 1_000_000, 500_000)
+        );
+        assert_eq!(fsid(&large), [0, 0]);
+        assert_eq!((large.f_blocks, large.f_files), (10_000_000, 2_000_000));
+
+        // Totals under the caps: the free counts are the totals, never more.
+        let mut small = zero;
+        small.f_blocks = 42;
+        small.f_bfree = 40;
+        small.f_files = 300;
+        small.f_ffree = 7;
+        let small = canonical(small);
+        assert_eq!(
+            (small.f_bfree, small.f_bavail, small.f_ffree),
+            (42, 42, 300)
+        );
+        assert_eq!((small.f_blocks, small.f_files), (42, 300));
+
+        // A filesystem that keeps no inode count reports no free inodes, and
+        // its free blocks are still clamped to its total.
+        let mut no_inodes = zero;
+        no_inodes.f_blocks = 42;
+        no_inodes.f_ffree = 9;
+        let no_inodes = canonical(no_inodes);
+        assert_eq!((no_inodes.f_files, no_inodes.f_ffree), (0, 0));
+        assert_eq!((no_inodes.f_bfree, no_inodes.f_bavail), (42, 42));
+
+        // A null buffer is left alone.
+        tool.canonicalize_statfs_buf(&mut guest, None).unwrap();
+    }
 }
 
 #[cfg(test)]
