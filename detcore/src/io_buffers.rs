@@ -396,12 +396,84 @@ fn ret_gates_output(call: &Syscall) -> bool {
     !matches!(call, Syscall::Poll(_) | Syscall::Ppoll(_))
 }
 
+/// The structure a stat-family call fills: its guest address and size.
+///
+/// WHY THESE ARE HASHED. The INFO record shows a stat result as
+/// `{st_mode=..., st_size=..., ...}`, so two runs whose stat calls returned
+/// different devices, inodes, link counts or times produce identical records,
+/// and the first divergence a comparison can report is wherever that hidden
+/// value later changed the guest's behaviour. Measured 2026-10-21 on a dnf
+/// transaction run twice with the Python driver's directory on another
+/// subvolume: `hermit log-diff` first reported a heap pointer 32 bytes apart
+/// in rpm's `newfstatat("/etc/DIR_COLORS")`, and the run later opened
+/// `/sys/dev/block/0:7` instead of `0:6`; no record named the stat call that
+/// returned the other device. The structure is what Detcore left in guest
+/// memory, after it determinized the result.
+fn stat_buffer(call: &Syscall) -> Option<(Option<u64>, u64)> {
+    let stat = |p: Option<reverie::syscalls::StatPtr<'_>>| p.map(|p| p.0.as_raw() as u64);
+    let stat_len = std::mem::size_of::<libc::stat>() as u64;
+    Some(match call {
+        Syscall::Stat(c) => (stat(c.stat()), stat_len),
+        Syscall::Lstat(c) => (stat(c.stat()), stat_len),
+        Syscall::Fstat(c) => (stat(c.stat()), stat_len),
+        Syscall::Newfstatat(c) => (stat(c.stat()), stat_len),
+        Syscall::Statx(c) => (
+            c.statx().map(|p| p.0.as_raw() as u64),
+            std::mem::size_of::<reverie::syscalls::linux_abi::Statx>() as u64,
+        ),
+        _ => return None,
+    })
+}
+
+/// The fields of a stat-family result, decoded from the structure the guest
+/// received, so that a record that differs names the field that differs.
+/// `None` for any other call or a failed one.
+fn stat_fields<M: MemoryAccess>(memory: &M, call: &Syscall, ret: i64) -> Option<String> {
+    if ret != 0 {
+        return None;
+    }
+    let stat: crate::stat::DetStat = match call {
+        Syscall::Statx(c) => {
+            let addr = c.statx()?.0;
+            (&memory.read_value(addr).ok()?).into()
+        }
+        _ => {
+            let (addr, _) = stat_buffer(call)?;
+            let addr = AddrMut::<libc::stat>::from_raw(addr? as usize)?;
+            (&memory.read_value(addr).ok()?).into()
+        }
+    };
+    let time = |t: &reverie::syscalls::Timespec| format!("{}.{:09}", t.tv_sec, t.tv_nsec);
+    Some(format!(
+        "mask={:#x} dev={:#x} ino={} mode={:#o} nlink={} uid={} gid={} rdev={:#x} size={} blksize={} blocks={} atime={} mtime={} ctime={} btime={}",
+        stat.mask.bits(),
+        stat.dev,
+        stat.inode,
+        stat.mode,
+        stat.nlink,
+        stat.uid,
+        stat.gid,
+        stat.rdev,
+        stat.size,
+        stat.blksize,
+        stat.blocks,
+        time(&stat.atime),
+        time(&stat.mtime),
+        time(&stat.ctime),
+        time(&stat.btime),
+    ))
+}
+
 /// The extents a completed syscall moved, or `None` when this syscall has no
 /// output buffer worth hashing.
 ///
 /// Only syscalls whose buffer CONTENT the INFO record does not already show are
-/// listed. `clock_gettime` and `newfstatat`, for instance, are absent because
-/// Reverie's typed display already dereferences and prints their output.
+/// listed. `clock_gettime`, for instance, is absent because Reverie's typed
+/// display already dereferences and prints its output. The stat family is
+/// listed although its display dereferences the buffer too: that display
+/// prints only `st_mode` and `st_size` and then `...`, so a different device,
+/// inode, link count, block count or time is invisible in the record (see
+/// [`stat_buffer`]).
 fn extents<M: MemoryAccess>(
     memory: &M,
     call: &Syscall,
@@ -411,6 +483,15 @@ fn extents<M: MemoryAccess>(
     // return value is a byte count. `ret_gates_output` is what keeps the poll
     // family out of this, and it is a predicate rather than an arm placed above
     // so the exclusion cannot be undone by moving code.
+    // A stat-family call returns 0, not a byte count, and fills its whole
+    // structure, so the byte-count gate below does not apply to it.
+    if let Some((addr, len)) = stat_buffer(call) {
+        return Ok(if ret == 0 {
+            whole(addr, len)
+        } else {
+            Vec::new()
+        });
+    }
     if ret <= 0 && ret_gates_output(call) {
         return Ok(Vec::new());
     }
@@ -757,6 +838,9 @@ where
     let short = receive
         .is_some_and(|receive| receive.flags() & libc::MSG_TRUNC == 0 && covered < ret as u64);
     let records = matches!(call, Syscall::Getdents64(_));
+    // A stat result's fields go on its record, so a comparison names the field.
+    let fields = stat_fields(&guest.memory(), call, ret)
+        .map_or_else(String::new, |fields| format!(" {fields}"));
     for extent in moved_extents {
         let digests = extent_digests(
             guest,
@@ -793,7 +877,7 @@ where
             format!(" unread_padding={unread}")
         };
         crate::detlog!(
-            "[iobuf][dtid {}] {} {} fd={} {:#x}+{}->{}{}{}",
+            "[iobuf][dtid {}] {} {} fd={} {:#x}+{}->{}{}{}{}",
             dettid,
             name,
             dir,
@@ -802,7 +886,8 @@ where
             extent.len,
             whole,
             located,
-            unread
+            unread,
+            fields
         );
     }
     if short {
@@ -2422,6 +2507,150 @@ mod event_tests {
         assert!(
             message.contains(&expected),
             "expected {expected}, got {message}"
+        );
+    }
+
+    /// Writes `stat` into guest memory at `FIRST_DEST` and returns its bytes.
+    fn put_stat(memory: &EventMemory, stat: &libc::stat) -> Vec<u8> {
+        // SAFETY: `libc::stat` is plain old data; viewing it as bytes is sound.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (stat as *const libc::stat).cast::<u8>(),
+                std::mem::size_of::<libc::stat>(),
+            )
+        }
+        .to_vec();
+        memory.0.lock().unwrap()[FIRST_DEST..FIRST_DEST + bytes.len()].copy_from_slice(&bytes);
+        bytes
+    }
+
+    fn zeroed_stat() -> libc::stat {
+        // SAFETY: an all-zero `libc::stat` is a valid value.
+        unsafe { std::mem::zeroed() }
+    }
+
+    /// The INFO record shows a stat result only as `st_mode` and `st_size`.
+    /// Two results that differ in their device alone must still produce
+    /// different `[iobuf]` records, and the record must name the device.
+    #[test]
+    fn a_stat_result_is_hashed_and_its_fields_are_named() {
+        let call: Syscall = reverie::syscalls::Newfstatat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_stat(Some(reverie::syscalls::StatPtr(
+                AddrMut::from_raw(FIRST_DEST).unwrap(),
+            )))
+            .into();
+        let mut records = Vec::new();
+        for dev in [0x6, 0x7] {
+            let logs = BufferLog::default();
+            let _subscriber = tracing::subscriber::set_default(logs.clone());
+            let (_tool, mut guest) = event_guest(FdType::Regular, None);
+            let mut stat = zeroed_stat();
+            stat.st_dev = dev;
+            stat.st_ino = 11;
+            stat.st_mode = libc::S_IFDIR | 0o755;
+            stat.st_size = 4096;
+            let bytes = put_stat(&guest.memory, &stat);
+            digest(&mut guest, &call, 0).unwrap();
+            let messages = logs.0.lock().unwrap();
+            assert_eq!(messages.len(), 1, "{messages:?}");
+            let expected = format!(
+                "[iobuf][dtid 1] newfstatat in fd=-100 {FIRST_DEST:#x}+{}->{}",
+                bytes.len(),
+                Digest::new(&bytes)
+            );
+            assert!(
+                messages[0].contains(&expected),
+                "expected {expected}, got {}",
+                messages[0]
+            );
+            assert!(
+                messages[0].contains(&format!(" dev={dev:#x} ino=11 mode=0o40755 ")),
+                "{}",
+                messages[0]
+            );
+            records.push(messages[0].clone());
+        }
+        assert_ne!(
+            records[0], records[1],
+            "a different device must change the record"
+        );
+    }
+
+    /// A failed stat call wrote nothing, so nothing is hashed; `fstat` names
+    /// its descriptor; `statx` hashes its own, larger structure.
+    #[test]
+    fn stat_family_extents_follow_success_and_structure_size() {
+        let memory = EventMemory::new();
+        let stat_ptr = || {
+            Some(reverie::syscalls::StatPtr(
+                AddrMut::from_raw(FIRST_DEST).unwrap(),
+            ))
+        };
+        let stat_len = std::mem::size_of::<libc::stat>() as u64;
+        let calls: [(Syscall, u64); 5] = [
+            (
+                reverie::syscalls::Stat::new().with_stat(stat_ptr()).into(),
+                stat_len,
+            ),
+            (
+                reverie::syscalls::Lstat::new().with_stat(stat_ptr()).into(),
+                stat_len,
+            ),
+            (
+                reverie::syscalls::Fstat::new()
+                    .with_fd(FD)
+                    .with_stat(stat_ptr())
+                    .into(),
+                stat_len,
+            ),
+            (
+                reverie::syscalls::Newfstatat::new()
+                    .with_stat(stat_ptr())
+                    .into(),
+                stat_len,
+            ),
+            (
+                reverie::syscalls::Statx::new()
+                    .with_statx(Some(reverie::syscalls::StatxPtr(
+                        AddrMut::from_raw(FIRST_DEST).unwrap(),
+                    )))
+                    .into(),
+                std::mem::size_of::<reverie::syscalls::linux_abi::Statx>() as u64,
+            ),
+        ];
+        for (call, len) in calls {
+            assert_eq!(
+                extents(&memory, &call, 0).unwrap(),
+                vec![BufferExtent {
+                    addr: FIRST_DEST as u64,
+                    len
+                }],
+                "{}",
+                call.name()
+            );
+            assert!(
+                extents(&memory, &call, -2).unwrap().is_empty(),
+                "{}",
+                call.name()
+            );
+        }
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (_tool, mut guest) = event_guest(FdType::Regular, None);
+        put_stat(&guest.memory, &zeroed_stat());
+        let fstat: Syscall = reverie::syscalls::Fstat::new()
+            .with_fd(FD)
+            .with_stat(stat_ptr())
+            .into();
+        digest(&mut guest, &fstat, 0).unwrap();
+        digest(&mut guest, &fstat, -9).unwrap();
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains(&format!("fstat in fd={FD} ")),
+            "{}",
+            messages[0]
         );
     }
 
