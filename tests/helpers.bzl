@@ -13,7 +13,18 @@ load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:testpilot_defs.bzl", "tpx_labels")
 
 def build_test(
-    name, bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay, tracereplay_chaos
+    name,
+    bin_target,
+    raw,
+    run,
+    no_sequentialize_threads,
+    no_deterministic_io,
+    record_and_replay,
+    chaos,
+    chaosreplay,
+    tracereplay,
+    tracereplay_chaos,
+    chaos_long_running = False,
 ):
     # Used only by shell tests.
     common_env = {
@@ -107,6 +118,7 @@ def build_test(
             args = ["run", "--isolate-workdir"],
             hermit_args = ["--chaos", "--base-env=empty", "--env=HERMIT_MODE=chaos", "--max-timeslice=1000000"],
             env = {},
+            extra_labels = [tpx_labels.long_running] if chaos_long_running else [],
         )
     if chaosreplay:
         # Also run with replay of recorded preemptions.
@@ -158,7 +170,7 @@ def hermit_verify_c_bin(path, name_suffix, guest_args = [], args = [], hermit_ar
         name = "{}_{}".format(target, name_suffix), guest = "$(location :" + target + ")", guest_args = guest_args, env = env, hermit_args = hermit_args, args = args
     )
 
-def hermit_verify(name, guest, guest_args = [], args = [], hermit_args = [], env = {}):
+def hermit_verify(name, guest, guest_args = [], args = [], hermit_args = [], env = {}, extra_labels = []):
     buck_sh_test(
         # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
         target_compatible_with = ["ovr_config//cpu:x86_64"],
@@ -170,12 +182,22 @@ def hermit_verify(name, guest, guest_args = [], args = [], hermit_args = [], env
         + [guest]
         + guest_args,
         env = env,
-        labels = [tpx_labels.enable_artifact_reporting],
+        labels = [tpx_labels.enable_artifact_reporting] + extra_labels,
         test = "//hermetic_infra/hermit/hermit-verify:hermit-verify",
     )
 
 def hermit_shell_test(
-    path, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay, tracereplay = False, tracereplay_chaos = False
+    path,
+    raw,
+    run,
+    no_sequentialize_threads,
+    no_deterministic_io,
+    chaos,
+    record_and_replay,
+    chaosreplay,
+    tracereplay = False,
+    tracereplay_chaos = False,
+    chaos_long_running = False,
 ):
     basename = paths.replace_extension(paths.basename(path), "")
     export_file(name = "shellfile_" + basename, src = path)
@@ -191,6 +213,7 @@ def hermit_shell_test(
         chaosreplay,
         tracereplay,
         tracereplay_chaos,
+        chaos_long_running,
     )
 
 def hermit_python_test(
