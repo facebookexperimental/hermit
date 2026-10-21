@@ -58,3 +58,6 @@ mod validate_plan;
 #[path = "../../../scripts/lib/validate_super.rs"]
 mod validate_super;
 pub mod validation_inventory;
+
+#[path = "../../../hermit-cli/src/verify_run_record.rs"]
+pub mod verify_run_record;

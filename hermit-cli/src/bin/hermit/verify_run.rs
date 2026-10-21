@@ -30,16 +30,30 @@ use hermit::Backend;
 use hermit::Context;
 use hermit::Error;
 use hermit::SkidOvershootError;
-use hermit::canonical_verdict::BranchCounterVerdict;
-use hermit::canonical_verdict::ContainerDisposition;
+#[cfg(test)]
 use hermit::canonical_verdict::LogCompareStrictness;
 use hermit::canonical_verdict::RunFailure;
 use hermit::canonical_verdict::VerificationRun;
 use hermit::host_input_change::read_host_inputs;
+#[cfg(feature = "dbt")]
+pub(crate) use hermit::verify_run_record::DBT_STATS;
+pub(crate) use hermit::verify_run_record::DbtRunRecord;
+pub(crate) use hermit::verify_run_record::HOST_INPUTS;
+pub(crate) use hermit::verify_run_record::LOG;
+pub(crate) use hermit::verify_run_record::RECORD;
+pub(crate) use hermit::verify_run_record::RECORDING;
+pub(crate) use hermit::verify_run_record::RECORDING_EPOCH;
+pub(crate) use hermit::verify_run_record::RecordedComparison;
+pub(crate) use hermit::verify_run_record::RecordedStatus;
+pub(crate) use hermit::verify_run_record::RunRole;
+pub(crate) use hermit::verify_run_record::SCHEMA;
+pub(crate) use hermit::verify_run_record::STDERR;
+pub(crate) use hermit::verify_run_record::STDOUT;
+pub(crate) use hermit::verify_run_record::SUMMARY;
+pub(crate) use hermit::verify_run_record::VerifyRunOutcome;
+pub(crate) use hermit::verify_run_record::VerifyRunRecord;
 use reverie::process::ExitStatus;
 use reverie::process::Output;
-use serde::Deserialize;
-use serde::Serialize;
 
 use super::record_envelope::RecordEnvelope;
 use super::run::CompletedVerificationRun;
@@ -58,192 +72,53 @@ use super::verify::write_pending_verification_json;
 use super::verify::write_report_json;
 use super::verify::write_skid_overshoot_without_comparison_json;
 
-/// The record of how the run ended, written last: a directory without it is
-/// an execution that did not finish writing its evidence.
-pub(crate) const RECORD: &str = "verify-run.json";
-/// The run's verification log, the log `run --verify` compares.
-pub(crate) const LOG: &str = "run.log";
-/// The guest's standard output.
-pub(crate) const STDOUT: &str = "stdout";
-/// The guest's standard error.
-pub(crate) const STDERR: &str = "stderr";
-/// The run's summary (`--summary-json`), when Detcore wrote one.
-pub(crate) const SUMMARY: &str = "summary.json";
-/// The host files the run's guest opened (`hermit::host_input_change`).
-pub(crate) const HOST_INPUTS: &str = "host-inputs";
-/// The recording a `record start --verify-run` execution made, which a
-/// `--verify-replay-of` execution replays.
-pub(crate) const RECORDING: &str = "recording";
-/// The epoch a recording and its replay record: the replay runs at the
-/// recording's own epoch, so the pair agrees on it by construction.
-pub(crate) const RECORDING_EPOCH: &str = "recording";
-
-/// The DBT backend's typed whole-process statistics stream, as DynamoRIO's
-/// client wrote it (Reverie decodes it; `backends::require_dbt_stats` applies verification policy).
-#[cfg_attr(not(feature = "dbt"), allow(dead_code))]
-pub(crate) const DBT_STATS: &str = "dbt-stats.bin";
-
-/// The version of [`VerifyRunRecord`].
-pub(crate) const SCHEMA: u32 = 1;
-
-/// How one `--verify-run` execution ended, and the comparison it was run for.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct VerifyRunRecord {
-    pub(crate) schema: u32,
-    /// The backend, as `--backend` spells it.
-    pub(crate) backend: String,
-    pub(crate) comparison: RecordedComparison,
-    /// Whether the run used `--passthru-opt`, which decides whether a host
-    /// file change can be named as a divergence's cause.
-    pub(crate) passthru_opt: bool,
-    /// The virtual-time epoch the run started its clock at (`--epoch`). `run
-    /// --verify` gives its two runs one epoch; two separate runs agree only
-    /// when the caller gives them the same one.
-    pub(crate) epoch: String,
-    /// `hermit host-capabilities`'s `exact_branch_counter` verdict, for a run
-    /// on a backend that reads that counter.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) exact_branch_counter: Option<BranchCounterVerdict>,
-    /// What the DBT backend's comparison reads besides the log, for a DBT run.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) dbt: Option<DbtRunRecord>,
-    /// Which half of which verification this is.
-    #[serde(default, skip_serializing_if = "RunRole::is_run")]
-    pub(crate) role: RunRole,
-    pub(crate) outcome: VerifyRunOutcome,
-}
-
-/// Which half of which verification a `--verify-run` execution is.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RunRole {
-    /// One of `run --verify`'s two runs.
-    #[default]
-    Run,
-    /// `record start --verify`'s recording.
-    Record,
-    /// `record start --verify`'s replay of a recording.
-    Replay,
-}
-
-impl RunRole {
-    fn is_run(&self) -> bool {
-        *self == Self::Run
+pub(crate) fn recorded_comparison(options: &ComparisonOptions) -> RecordedComparison {
+    RecordedComparison {
+        strictness: options.strictness,
+        diagnostic_full_trace: options.diagnostic_full_trace,
+        compare_io_buffers: options.compare_io_buffers,
+        virtualize_time: options.virtualize_time,
     }
 }
 
-/// What a DBT run's comparison reads besides its log and [`DBT_STATS`].
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct DbtRunRecord {
-    /// How many process-image initialization records the run's evidence
-    /// held (`DbtEvidence::initialization_records`).
-    pub(crate) initialization_records: u64,
-}
-
-/// The comparison the run's flags select, as `run --verify` derives it
-/// (`RunOpts::verification_comparison_options`). Both runs of a comparison
-/// must record the same one.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RecordedComparison {
-    pub(crate) strictness: LogCompareStrictness,
-    /// `--verify-verbose`: the all-level diagnostic comparison.
-    pub(crate) diagnostic_full_trace: bool,
-    /// Whether the records carry syscall output-buffer content.
-    pub(crate) compare_io_buffers: bool,
-    pub(crate) virtualize_time: bool,
-}
-
-impl RecordedComparison {
-    pub(crate) fn from_options(options: &ComparisonOptions) -> Self {
-        Self {
-            strictness: options.strictness,
-            diagnostic_full_trace: options.diagnostic_full_trace,
-            compare_io_buffers: options.compare_io_buffers,
-            virtualize_time: options.virtualize_time,
-        }
-    }
-
-    /// The options `run --verify` compares with, for logs the caller owns.
-    fn options(self) -> ComparisonOptions {
-        ComparisonOptions {
-            verbose: self.diagnostic_full_trace,
-            strictness: self.strictness,
-            compare_logs: true,
-            diagnostic_full_trace: self.diagnostic_full_trace,
-            compare_io_buffers: self.compare_io_buffers,
-            keep_logs: false,
-            match_overridden: false,
-            failed_log_retention: None,
-            record_envelope: RecordEnvelope::all_records_v1(),
-            virtualize_time: self.virtualize_time,
-            caller_owns_logs: true,
-        }
+/// The options `run --verify` compares with, for logs the caller owns.
+fn comparison_options(recorded: RecordedComparison) -> ComparisonOptions {
+    ComparisonOptions {
+        verbose: recorded.diagnostic_full_trace,
+        strictness: recorded.strictness,
+        compare_logs: true,
+        diagnostic_full_trace: recorded.diagnostic_full_trace,
+        compare_io_buffers: recorded.compare_io_buffers,
+        keep_logs: false,
+        match_overridden: false,
+        failed_log_retention: None,
+        record_envelope: RecordEnvelope::all_records_v1(),
+        virtualize_time: recorded.virtualize_time,
+        caller_owns_logs: true,
     }
 }
 
-/// How one execution ended.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
-pub(crate) enum VerifyRunOutcome {
-    /// The guest ran to its end; its output is in [`STDOUT`] and [`STDERR`].
-    Completed {
-        status: RecordedStatus,
-        skid_overshoots: u64,
-        /// How many syscall DETLOG records an in-guest Tool forwarded into
-        /// the log (LiteInst, SaBRe); `None` on a backend that forwards none.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        forwarded_syscalls: Option<u64>,
-    },
-    /// A typed failure of the run stopped it ([`RunFailure`]).
-    RunFailed {
-        failure: RunFailure,
-        /// The failure's message, without the run's position in a pair, which
-        /// the comparison adds where `run --verify` names it.
-        detail: String,
-    },
-    /// The run's container child exited before returning the guest's output.
-    ContainerFailed { disposition: ContainerDisposition },
-    /// The run overshot its PMU skid this many times and returned no output.
-    SkidOvershoot { count: u64 },
-    /// An error that is none of the above stopped the run; `run --verify`
-    /// leaves its pending no-result for such an error.
-    Error { detail: String },
-}
-
-/// A guest's wait status.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
-pub(crate) enum RecordedStatus {
-    Exited { code: i32 },
-    Signaled { signal: i32, core_dumped: bool },
-}
-
-impl RecordedStatus {
-    pub(crate) fn of(status: ExitStatus) -> Self {
-        match status {
-            ExitStatus::Exited(code) => Self::Exited { code },
-            ExitStatus::Signaled(signal, core_dumped) => Self::Signaled {
-                signal: signal as i32,
-                core_dumped,
-            },
-            ExitStatus::SignaledRaw(signal, core_dumped) => Self::Signaled {
-                signal,
-                core_dumped,
-            },
-        }
+pub(crate) fn recorded_status(status: ExitStatus) -> RecordedStatus {
+    match status {
+        ExitStatus::Exited(code) => RecordedStatus::Exited { code },
+        ExitStatus::Signaled(signal, core_dumped) => RecordedStatus::Signaled {
+            signal: signal as i32,
+            core_dumped,
+        },
+        ExitStatus::SignaledRaw(signal, core_dumped) => RecordedStatus::Signaled {
+            signal,
+            core_dumped,
+        },
     }
+}
 
-    fn status(self) -> ExitStatus {
-        match self {
-            Self::Exited { code } => ExitStatus::Exited(code),
-            Self::Signaled {
-                signal,
-                core_dumped,
-            } => ExitStatus::SignaledRaw(signal, core_dumped),
-        }
+fn exit_status(status: RecordedStatus) -> ExitStatus {
+    match status {
+        RecordedStatus::Exited { code } => ExitStatus::Exited(code),
+        RecordedStatus::Signaled {
+            signal,
+            core_dumped,
+        } => ExitStatus::SignaledRaw(signal, core_dumped),
     }
 }
 
@@ -305,22 +180,7 @@ pub(crate) struct VerifyRunDirectory {
 
 impl VerifyRunDirectory {
     pub(crate) fn read(directory: &Path) -> Result<Self, Error> {
-        let path = directory.join(RECORD);
-        let bytes = fs::read(&path).with_context(|| {
-            format!(
-                "reading {}: a --verify-run directory without its record did not finish",
-                path.display()
-            )
-        })?;
-        let record: VerifyRunRecord = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing {}", path.display()))?;
-        if record.schema != SCHEMA {
-            anyhow::bail!(
-                "{} has schema {}, and this Hermit reads schema {SCHEMA}",
-                path.display(),
-                record.schema
-            );
-        }
+        let record = VerifyRunRecord::read(directory).map_err(Error::msg)?;
         Ok(Self {
             directory: directory.to_path_buf(),
             record,
@@ -360,14 +220,11 @@ impl VerifyRunDirectory {
     }
 
     fn output(&self, status: RecordedStatus) -> Result<Output, Error> {
-        let read = |name: &str| {
-            let path = self.directory.join(name);
-            fs::read(&path).with_context(|| format!("reading {}", path.display()))
-        };
+        let output = hermit::verify_run_record::read_output(&self.directory).map_err(Error::msg)?;
         Ok(Output {
-            status: status.status(),
-            stdout: read(STDOUT)?,
-            stderr: read(STDERR)?,
+            status: exit_status(status),
+            stdout: output.stdout,
+            stderr: output.stderr,
         })
     }
 }
@@ -590,7 +447,7 @@ pub(crate) fn compare(
         conclude_verification(
             VerificationConclusion {
                 verify_json,
-                comparison_options: record1.comparison.options(),
+                comparison_options: comparison_options(record1.comparison),
                 #[cfg(feature = "dbt")]
                 dbt: None,
                 backend,
@@ -812,11 +669,11 @@ mod tests {
             ExitStatus::SignaledRaw(9, false),
             ExitStatus::SignaledRaw(11, true),
         ] {
-            let recorded = RecordedStatus::of(status);
-            let back = recorded.status();
+            let recorded = recorded_status(status);
+            let back = exit_status(recorded);
             assert_eq!(back.code(), status.code(), "{status:?}");
             assert_eq!(back.signal(), status.signal(), "{status:?}");
-            assert_eq!(RecordedStatus::of(back), recorded, "{status:?}");
+            assert_eq!(recorded_status(back), recorded, "{status:?}");
         }
     }
 

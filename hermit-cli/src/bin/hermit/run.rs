@@ -9024,8 +9024,7 @@ impl RunOpts {
         options.summary_json = Some(summary_path.clone());
         options.host_input_log = Some(host_inputs_path.clone());
         options.fatal_core_run_label = Some("run");
-        let comparison =
-            verify_run::RecordedComparison::from_options(&self.verification_comparison_options());
+        let comparison = verify_run::recorded_comparison(&self.verification_comparison_options());
         let exact_branch_counter = self
             .arms_reverie_ptrace_pmu_timer()
             .then(branch_counter_verdict);
@@ -9059,7 +9058,7 @@ impl RunOpts {
                 writer.write(verify_run::STDERR, &output.stderr)?;
                 (
                     verify_run::VerifyRunOutcome::Completed {
-                        status: verify_run::RecordedStatus::of(output.status),
+                        status: verify_run::recorded_status(output.status),
                         skid_overshoots,
                         forwarded_syscalls: forwarded_syscalls.map(|count| count as u64),
                     },

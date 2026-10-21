@@ -148,6 +148,7 @@ const PUBLIC_EXECUTION_ENVIRONMENT: &str =
                                          repository root (default: target/debug/hermit)
   HERMIT_E2E_EMPTY_WORKDIR=/test         Use the isolated /test working directory
   E2E_KEEP_VERIFY_LOGS=1                 Retain verify logs (one golden log after a match)
+  E2E_CAPTURE_CUSTOM_RUNS=1             Opt in to canonical single-run custom captures (changes invocation)
   HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER=<N> Positive finite CPU-time multiplier
   HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER=<N> Positive finite wall-time multiplier";
 

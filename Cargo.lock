@@ -1128,6 +1128,7 @@ dependencies = [
 name = "hermit-manifest-plan"
 version = "0.5.1"
 dependencies = [
+ "chrono",
  "dagrun",
  "detcore-model",
  "libc",

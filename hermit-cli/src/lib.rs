@@ -9211,3 +9211,6 @@ mod tests {
         }
     }
 }
+
+/// Producer-owned record and raw streams for one retained verification run.
+pub mod verify_run_record;

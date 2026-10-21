@@ -12271,6 +12271,10 @@ fn fixture_attempt(outcome: &str, status: i32) -> AttemptResult {
         timed_out: false,
         duration_ms: 1,
         cpu_usage_usec: Some(1),
+        capture_custom_runs: false,
+        single_run_capture: None,
+        capture_adoption_cpu_usage_usec: None,
+        capture_adoption_timeout: None,
         observation_sha256: None,
         argv: vec!["hermit".into(), "run".into()],
         guest_argv: vec!["fixture".into()],
@@ -18478,6 +18482,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         .join(&sample_slug)
         .join("sample-a-verify-ptrace");
     let mut result_row = CellResult {
+        capture_custom_runs: false,
+        capture_adoption_cpu_usage_usec: None,
         cpu_observations: None,
         first_divergent_record: None,
         first_divergent_syscall: None,
@@ -21686,6 +21692,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     let first_repetition_slug = cell_run_slug(&green_id, Some(1));
     let second_repetition_slug = cell_run_slug(&green_id, Some(2));
     let repeated_result_row = CellResult {
+        capture_custom_runs: false,
+        capture_adoption_cpu_usage_usec: None,
         cpu_observations: None,
         first_divergent_record: None,
         first_divergent_syscall: None,

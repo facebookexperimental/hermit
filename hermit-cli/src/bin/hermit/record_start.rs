@@ -812,7 +812,7 @@ impl StartOpts {
                 writer.write(verify_run::STDERR, &output.stderr)?;
                 (
                     verify_run::VerifyRunOutcome::Completed {
-                        status: verify_run::RecordedStatus::of(output.status),
+                        status: verify_run::recorded_status(output.status),
                         skid_overshoots: 0,
                         forwarded_syscalls: None,
                     },

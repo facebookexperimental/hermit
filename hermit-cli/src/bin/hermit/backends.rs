@@ -1424,7 +1424,7 @@ fn dbt_verify_run(
             writer.write(verify_run::DBT_STATS, records.records()?)?;
             (
                 verify_run::VerifyRunOutcome::Completed {
-                    status: verify_run::RecordedStatus::of(output.status),
+                    status: verify_run::recorded_status(output.status),
                     skid_overshoots: 0,
                     forwarded_syscalls: None,
                 },

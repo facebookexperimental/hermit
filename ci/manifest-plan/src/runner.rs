@@ -2953,6 +2953,9 @@ pub struct CellRunSpec {
     /// attempt's two `--verify-run` directories (see `VERIFY_PAIR_SCRIPT`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify_runs: Option<PathBuf>,
+    /// One producer-owned capture, separate from paired verify/chaos evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub single_run_capture: Option<PathBuf>,
     pub sabre_path_evidence: Option<PathBuf>,
     pub cell_dir: PathBuf,
     /// The exact nonzero guest disposition this attempt requires, if any.
@@ -3119,6 +3122,17 @@ pub struct AttemptResult {
     /// cells execute concurrently.
     #[serde(default)]
     pub cpu_usage_usec: Option<u64>,
+    /// Explicit measurement mode; absence in historical rows means ordinary custom execution.
+    #[serde(default)]
+    pub capture_custom_runs: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub single_run_capture: Option<String>,
+    /// This worker thread's post-exit adoption/hash CPU, excluding child CPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_adoption_cpu_usage_usec: Option<u64>,
+    /// A post-exit bound, distinct from the child's `timed_out` fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_adoption_timeout: Option<String>,
     pub observation_sha256: Option<String>,
     pub argv: Vec<String>,
     pub guest_argv: Vec<String>,
@@ -3306,6 +3320,11 @@ pub struct CellResult {
         deserialize_with = "crate::cpu_evidence::deserialize_present"
     )]
     pub cpu_observations: Option<crate::cpu_evidence::CellCpuObservationsV1>,
+    #[serde(default)]
+    pub capture_custom_runs: bool,
+    /// Sum of worker-thread capture charges; `cpu_usage_usec` remains child CPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_adoption_cpu_usage_usec: Option<u64>,
     /// Runtime totals from the first attempt that produced them.
     pub runtime: Option<VerificationRuntime>,
     pub log_level: Option<String>,
@@ -3605,6 +3624,9 @@ pub struct RunContext {
     /// match and both logs after a divergence. Retention adds no process to
     /// the cell and cannot change its outcome.
     pub keep_logs: bool,
+    /// Opt in to one producer-owned capture per custom repetition.
+    /// Unlike keep_logs, this changes the invocation and can cause refusal.
+    pub capture_custom_runs: bool,
     /// `(test, backend)` verify cells whose logs are retained for the parity
     /// post-pass even without `keep_logs`. This is the selection closure of
     /// [`crate::parity::retention_closure`]: retention only, the same
@@ -3627,6 +3649,16 @@ pub use detcore_model::config::CANONICAL_TEST_EPOCH;
 /// canonical test epoch. Never the host clock: a run whose epoch came from the
 /// host could be reproduced only from a recording, and `hermit run --strict`
 /// refuses it.
+fn capture_custom_runs_from_env(value: Option<&OsStr>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == "1" => Ok(true),
+        Some(value) => Err(format!(
+            "E2E_CAPTURE_CUSTOM_RUNS must be unset or exactly 1, got {value:?}"
+        )),
+    }
+}
+
 fn resolve_run_epoch(explicit: Option<std::ffi::OsString>) -> Result<String, String> {
     match explicit {
         // Preserve the supported input exactly, including invalid values that
@@ -3791,6 +3823,9 @@ impl RunContext {
             binary_build_sha,
             prebuilt,
             keep_logs: std::env::var("E2E_KEEP_VERIFY_LOGS").as_deref() == Ok("1"),
+            capture_custom_runs: capture_custom_runs_from_env(
+                std::env::var_os("E2E_CAPTURE_CUSTOM_RUNS").as_deref(),
+            )?,
             parity_retained: BTreeSet::new(),
             run_verify_strict,
             record_verify_strict,
@@ -5409,6 +5444,8 @@ pub fn build_spec(
     let mut verification_log_dir = None;
     let verify_runs = matches!(cell.id.mode.as_str(), "verify" | "chaos" | "replay")
         .then(|| dir.join("verify-runs").join(attempt));
+    let single_run_capture = (cell.id.mode == "custom" && context.capture_custom_runs)
+        .then(|| dir.join("custom-capture/run"));
     let (argv, verdict_path) = match cell.id.mode.as_str() {
         "naked" => (guest_argv.clone(), None),
         mode @ ("verify" | "replay" | "chaos") => {
@@ -5455,6 +5492,13 @@ pub fn build_spec(
             ];
             argv.extend(cell.test.proc.map(|level| level.flag().to_string()));
             argv.extend(cell.test.modes["custom"].args.clone());
+            if let Some(stage) = &single_run_capture {
+                argv.extend([
+                    "--verify-strict".into(),
+                    "--verify-run".into(),
+                    stage.to_string_lossy().into_owned(),
+                ]);
+            }
             if isolated {
                 require_minimal_base_env(&mut argv)?;
                 append_guest_env_args(&mut argv, &env, true);
@@ -5486,6 +5530,7 @@ pub fn build_spec(
         verdict_path,
         verification_log_dir,
         verify_runs,
+        single_run_capture,
         sabre_path_evidence,
         cell_dir: dir,
         expected_guest_exit: cell_expected_guest_exit(cell),
@@ -6057,6 +6102,16 @@ fn execute_spec_until(
         fs::create_dir_all(verify_runs)
             .map_err(|e| format!("cannot create {}: {e}", verify_runs.display()))?;
     }
+    if let Some(stage) = &spec.single_run_capture {
+        let retained = single_run_retained_path(spec);
+        if stage.try_exists().map_err(|e| e.to_string())?
+            || retained.try_exists().map_err(|e| e.to_string())?
+        {
+            return Err("refusing stale custom capture stage or retained destination".into());
+        }
+        fs::create_dir_all(stage.parent().expect("capture stage has parent"))
+            .map_err(|e| e.to_string())?;
+    }
     let captures = spec.cell_dir.join("captures");
     fs::create_dir_all(&captures).map_err(|e| e.to_string())?;
     let stdout_path = captures.join(format!("{}-{index}.stdout", spec.id.mode));
@@ -6533,15 +6588,19 @@ fn execute_spec_until(
         error_kind = Some(timeout.error_kind().into());
         reason = Some(timeout.reason(cpu_timeout_seconds, wall_timeout_seconds));
     }
-    // After a match the two `--verify-run` directories hold nothing the
-    // report and any retained golden log do not, so they go, as `run
-    // --verify` deletes its logs after a match; otherwise they stay beside
-    // the report as its evidence.
+    // A raw INFO golden does not retain guest streams or the completed status
+    // record. Keep the pair when evidence retention was explicitly requested,
+    // so the existing directory comparator can later judge full observations.
+    // Ordinary matched pairs are still removed; unmatched pairs stay.
     let matched = report_json.as_deref().is_some_and(|json| {
         current_verification_report(json.as_bytes())
             .is_ok_and(|report| report.verdict == Verdict::Matched)
     });
-    if let Some(verify_runs) = spec.verify_runs.as_ref().filter(|_| matched) {
+    if let Some(verify_runs) = spec
+        .verify_runs
+        .as_ref()
+        .filter(|_| matched && spec.verification_log_dir.is_none())
+    {
         fs::remove_dir_all(verify_runs)
             .map_err(|e| format!("cannot remove {}: {e}", verify_runs.display()))?;
     }
@@ -6554,6 +6613,10 @@ fn execute_spec_until(
         timed_out: output.timeout.is_some(),
         duration_ms: started.elapsed().as_millis(),
         cpu_usage_usec: Some(output.cpu_usage_usec),
+        capture_custom_runs: spec.single_run_capture.is_some(),
+        single_run_capture: None,
+        capture_adoption_cpu_usage_usec: None,
+        capture_adoption_timeout: None,
         observation_sha256: None,
         argv: spec.argv.clone(),
         guest_argv: spec.guest_argv.clone(),
@@ -8077,6 +8140,10 @@ fn cell_timeout_attempt(
         timed_out: true,
         duration_ms: duration.as_millis(),
         cpu_usage_usec: None,
+        capture_custom_runs: spec.single_run_capture.is_some(),
+        single_run_capture: None,
+        capture_adoption_cpu_usage_usec: None,
+        capture_adoption_timeout: None,
         observation_sha256: None,
         argv: spec.argv.clone(),
         guest_argv: spec.guest_argv.clone(),
@@ -8247,7 +8314,21 @@ fn observed_result_from_typed_evidence(
     if non_product_failure_class(error_kind).is_some() {
         return None;
     }
-    if attempts.iter().any(|attempt| attempt.timed_out) {
+    if attempts.iter().any(|attempt| attempt.timed_out)
+        || (outcome == "FAIL"
+            && attempts
+                .iter()
+                .any(|attempt| attempt.capture_adoption_timeout.is_some())
+            && attempts
+                .iter()
+                .all(|attempt| attempt.status == Some(0) && attempt.signal.is_none())
+            && attempts
+                .iter()
+                .filter_map(|attempt| attempt.observation_sha256.as_ref())
+                .collect::<BTreeSet<_>>()
+                .len()
+                <= 1)
+    {
         return Some(ObservedResult::Timeout);
     }
     // A chaos attempt is a verify run under a perturbed schedule, so a
@@ -8688,15 +8769,24 @@ fn run_cell_inner(
                     },
                     observations,
                 )?);
+                let attempt = attempts.last_mut().unwrap();
+                let cpu = match effective_execution_cpu(attempt) {
+                    Ok(cpu) => cpu,
+                    Err(error) => {
+                        // Preserve the child failure and its evidence, but no
+                        // successor may run with an unknown cumulative charge.
+                        capture_error(attempt, error);
+                        break;
+                    }
+                };
                 execution_cpu_usage_usec = execution_cpu_usage_usec
-                    .checked_add(
-                        attempts
-                            .last()
-                            .and_then(|attempt| attempt.cpu_usage_usec)
-                            .unwrap_or(0),
-                    )
+                    .checked_add(cpu)
                     .ok_or_else(|| "cell execution CPU usage overflowed u64".to_string())?;
-                if attempts.last().is_some_and(|attempt| attempt.timed_out) {
+                if attempts.last().is_some_and(|attempt| {
+                    attempt.timed_out
+                        || attempt.capture_adoption_timeout.is_some()
+                        || (attempt.capture_custom_runs && attempt.outcome == "ERROR")
+                }) {
                     break;
                 }
             }
@@ -8764,6 +8854,7 @@ fn run_cell_inner(
         }
     }
     if cell.id.mode == "custom"
+        && !(context.capture_custom_runs && outcome == "ERROR")
         && mode.assert.as_ref().and_then(|a| a.repeat_identical) == Some(true)
         && distinct != 1
     {
@@ -8865,11 +8956,20 @@ fn run_cell_inner(
         .try_fold(preparation_cpu_usage_usec, |total, attempt| {
             checked_add_cpu_usage(Some(total), attempt.cpu_usage_usec)
         });
+    let capture_adoption_cpu_usage_usec = (cell.id.mode == "custom" && context.capture_custom_runs)
+        .then(|| {
+            attempts.iter().try_fold(0_u64, |total, attempt| {
+                total.checked_add(attempt.capture_adoption_cpu_usage_usec?)
+            })
+        })
+        .flatten();
     let declared_stdout = attempts
         .iter()
         .any(attempt_has_infrastructure_report)
         .then(|| cell_declared_stdout(cell));
     Ok(CellResult {
+        capture_custom_runs: cell.id.mode == "custom" && context.capture_custom_runs,
+        capture_adoption_cpu_usage_usec,
         cpu_observations: None,
         artifact_dir: dir.display().to_string(),
         expected_guest_exit: cell_expected_guest_exit(cell),
@@ -8955,6 +9055,8 @@ pub fn infrastructure_error_result(
     let dir = cell_artifact_dir(context, cell);
     let timeouts = cell_timeouts(context, cell).ok();
     CellResult {
+        capture_custom_runs: cell.id.mode == "custom" && context.capture_custom_runs,
+        capture_adoption_cpu_usage_usec: None,
         cpu_observations: Some(empty_cpu_observations(context, cell)),
         artifact_dir: dir.display().to_string(),
         expected_guest_exit: cell_expected_guest_exit(cell),
@@ -9032,6 +9134,8 @@ pub fn host_inapplicable_result(
     let dir = cell_artifact_dir(context, cell);
     let timeouts = cell_timeouts(context, cell).ok();
     CellResult {
+        capture_custom_runs: cell.id.mode == "custom" && context.capture_custom_runs,
+        capture_adoption_cpu_usage_usec: None,
         cpu_observations: Some(empty_cpu_observations(context, cell)),
         artifact_dir: dir.display().to_string(),
         expected_guest_exit: cell_expected_guest_exit(cell),
@@ -9955,16 +10059,32 @@ fn append_execution_root_args(
 }
 
 fn observation_hash(observation: &Observation, attempt: &AttemptResult, dir: &Path) -> String {
+    observation_hash_bytes(
+        observation,
+        attempt,
+        dir,
+        attempt.stdout.as_bytes(),
+        attempt.stderr.as_bytes(),
+    )
+}
+
+fn observation_hash_bytes(
+    observation: &Observation,
+    attempt: &AttemptResult,
+    dir: &Path,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> String {
     let mut digest = Sha256::new();
     if observation.status {
         digest.update(attempt.status.unwrap_or(-1).to_le_bytes());
         digest.update(attempt.signal.unwrap_or(0).to_le_bytes());
     }
     if observation.stdout {
-        digest.update(attempt.stdout.as_bytes());
+        digest.update(stdout);
     }
     if observation.stderr {
-        digest.update(attempt.stderr.as_bytes());
+        digest.update(stderr);
     }
     for artifact in &observation.artifacts {
         if let Ok(bytes) = fs::read(dir.join("tmp").join(artifact)) {
@@ -10124,6 +10244,185 @@ fn command_help_contains(program: &Path, args: &[&str], needle: &str) -> Result<
         || String::from_utf8_lossy(&output.stderr).contains(needle))
 }
 
+fn single_run_retained_path(spec: &CellRunSpec) -> PathBuf {
+    spec.cell_dir
+        .join("custom-capture/retained")
+        .join(&spec.attempt)
+}
+
+/// Move even incomplete evidence after process exit; never reuse an old record.
+fn adopt_single_run(
+    spec: &CellRunSpec,
+    attempt: &mut AttemptResult,
+) -> Result<crate::verify_run_record::RunOutput, String> {
+    use crate::verify_run_record::RecordedStatus;
+    use crate::verify_run_record::RunRole;
+    use crate::verify_run_record::VerifyRunOutcome;
+    use crate::verify_run_record::VerifyRunRecord;
+
+    let stage = spec.single_run_capture.as_ref().expect("capture requested");
+    let retained = single_run_retained_path(spec);
+    if retained.try_exists().map_err(|e| e.to_string())? {
+        return Err(format!("refusing stale capture {}", retained.display()));
+    }
+    fs::create_dir_all(retained.parent().expect("retained capture has parent"))
+        .map_err(|e| e.to_string())?;
+    fs::rename(stage, &retained)
+        .map_err(|e| format!("retaining custom capture {}: {e}", stage.display()))?;
+    attempt.single_run_capture = Some(retained.display().to_string());
+    let record = VerifyRunRecord::read(&retained)?;
+    if record.backend != spec.id.backend.as_deref().unwrap_or("native")
+        || record.role != RunRole::Run
+        || record.comparison.strictness != crate::canonical_verdict::LogCompareStrictness::Canonical
+    {
+        return Err(
+            "custom capture backend, role or canonical comparison does not match invocation".into(),
+        );
+    }
+    // The CLI gives an explicit --epoch precedence over HERMIT_EPOCH and
+    // serializes a DateTime. Compare instants, not Z versus +00:00 spelling.
+    let args = spec
+        .argv
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .collect::<Vec<_>>();
+    let epoch = args
+        .windows(2)
+        .rev()
+        .find(|pair| pair[0].as_str() == "--epoch")
+        .map(|pair| pair[1].as_str())
+        .or_else(|| {
+            args.iter()
+                .rev()
+                .find_map(|arg| arg.strip_prefix("--epoch="))
+        })
+        .or_else(|| spec.env.get("HERMIT_EPOCH").map(String::as_str))
+        .ok_or_else(|| "custom capture invocation has no explicit epoch".to_string())?;
+    let parse_epoch = |value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .map_err(|e| format!("invalid capture epoch {value:?}: {e}"))
+    };
+    if parse_epoch(&record.epoch)? != parse_epoch(epoch)? {
+        return Err("custom capture epoch does not match invocation".into());
+    }
+    let VerifyRunOutcome::Completed { status, .. } = record.outcome else {
+        return Err("custom capture has no completed guest outcome".into());
+    };
+    let reported_code = match status {
+        RecordedStatus::Exited { code } if (0..=255).contains(&code) => code,
+        RecordedStatus::Signaled { signal, .. } if (1..=64).contains(&signal) => 128 + signal,
+        _ => return Err("custom capture contains an invalid guest wait status".into()),
+    };
+    if attempt.timed_out || attempt.signal.is_some() || attempt.status != Some(reported_code) {
+        return Err("custom capture guest status disagrees with controller disposition".into());
+    }
+    // The full comparator later validates INFO, syscall buffers and backend
+    // statistics. Adoption checks readable evidence, not an L2 verdict.
+    let log = File::open(retained.join(crate::verify_run_record::LOG))
+        .map_err(|e| format!("reading custom capture run.log: {e}"))?;
+    if !log.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("custom capture run.log is not a regular file".into());
+    }
+    crate::verify_run_record::read_output(&retained)
+}
+
+fn capture_error(attempt: &mut AttemptResult, error: String) {
+    // An output file can never turn a controller failure into a pass.
+    if attempt.outcome == "PASS" {
+        attempt.outcome = "ERROR".into();
+        attempt.error_kind = Some("incomplete-custom-capture".into());
+    }
+    attempt.reason = Some(match attempt.reason.take() {
+        Some(previous) => format!("{previous}; custom capture: {error}"),
+        None => format!("custom capture: {error}"),
+    });
+}
+
+fn thread_cpu_usage_usec() -> Result<u64, String> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // RUSAGE_THREAD excludes children and other concurrently running cells.
+    if unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "reading capture thread CPU: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    rusage_cpu_usage_usec(&unsafe { usage.assume_init() })
+}
+
+fn effective_execution_cpu(attempt: &AttemptResult) -> Result<u64, String> {
+    // An unstarted timed-out child contributes zero. A requested capture needs
+    // an actual adoption charge regardless of the child's prior outcome.
+    let child_cpu = attempt
+        .cpu_usage_usec
+        .or_else(|| attempt.timed_out.then_some(0))
+        .ok_or_else(|| "custom child CPU measurement is missing".to_string())?;
+    let adoption_cpu = if attempt.capture_custom_runs {
+        attempt
+            .capture_adoption_cpu_usage_usec
+            .ok_or_else(|| "custom capture CPU measurement is missing".to_string())?
+    } else {
+        0
+    };
+    child_cpu
+        .checked_add(adoption_cpu)
+        .ok_or_else(|| "custom child plus capture CPU overflowed u64".into())
+}
+
+fn finish_capture_budget(
+    attempt: &mut AttemptResult,
+    budget: &ExecutionBudget,
+    charge: Result<u64, String>,
+    finished: Instant,
+) {
+    match charge {
+        Ok(charge) => attempt.capture_adoption_cpu_usage_usec = Some(charge),
+        Err(error) => {
+            attempt.capture_adoption_cpu_usage_usec = None;
+            capture_error(attempt, error);
+            return;
+        }
+    }
+    let total = match effective_execution_cpu(attempt) {
+        Ok(total) => total,
+        Err(error) => {
+            capture_error(attempt, error);
+            return;
+        }
+    };
+    let timeout = if finished >= budget.deadline {
+        Some(ProcessTimeout::Wall)
+    } else if budget
+        .remaining_cpu_usec
+        .is_some_and(|remaining| total >= remaining)
+    {
+        Some(ProcessTimeout::Cpu)
+    } else {
+        None
+    };
+    if let Some(timeout) = timeout {
+        attempt.capture_adoption_timeout = Some(
+            match timeout {
+                ProcessTimeout::Wall => "wall",
+                ProcessTimeout::Cpu => "cpu",
+            }
+            .into(),
+        );
+        if attempt.outcome == "PASS" {
+            attempt.outcome = "FAIL".into();
+            attempt.error_kind = Some(timeout.error_kind().into());
+        }
+        let error = format!(
+            "{} after custom capture adoption",
+            timeout.reason(budget.cpu_timeout_seconds, budget.wall_timeout_seconds)
+        );
+        attempt.reason = Some(match attempt.reason.take() {
+            Some(previous) => format!("{previous}; {error}"),
+            None => error,
+        });
+    }
+}
+
 fn execute_observed_until(
     spec: &CellRunSpec,
     observation: &Observation,
@@ -10139,7 +10438,39 @@ fn execute_observed_until(
         budget.remaining_cpu_usec,
         observations,
     )?;
-    attempt.observation_sha256 = Some(observation_hash(observation, &attempt, dir));
+    if spec.single_run_capture.is_none() {
+        attempt.observation_sha256 = Some(observation_hash(observation, &attempt, dir));
+        return Ok(attempt);
+    }
+    let started = Instant::now();
+    let before_cpu = thread_cpu_usage_usec();
+    let adopted = adopt_single_run(spec, &mut attempt);
+    match adopted {
+        Ok(output) => {
+            attempt.stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            // Classifiers consume the controller's stderr. Guest stderr stays
+            // in the retained capture and feeds the original raw observation.
+            attempt.observation_sha256 = Some(observation_hash_bytes(
+                observation,
+                &attempt,
+                dir,
+                &output.stdout,
+                &output.stderr,
+            ));
+        }
+        Err(error) => capture_error(&mut attempt, error),
+    }
+    let charge = before_cpu.and_then(|before| {
+        thread_cpu_usage_usec()?
+            .checked_sub(before)
+            .ok_or_else(|| "capture thread CPU moved backwards".into())
+    });
+    let finished = Instant::now();
+    #[cfg(test)]
+    let (charge, finished) =
+        tests::capture_budget_test_measurement(&attempt, &budget, charge, finished);
+    finish_capture_budget(&mut attempt, &budget, charge, finished);
+    attempt.duration_ms += started.elapsed().as_millis();
     Ok(attempt)
 }
 
@@ -11948,6 +12279,7 @@ corpus:
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
@@ -12316,6 +12648,7 @@ esac
             source_dirty: false,
             prebuilt: true,
             keep_logs: false,
+            capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
@@ -13024,6 +13357,7 @@ esac
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
@@ -13031,6 +13365,935 @@ esac
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
             exact_branch_counter: None,
+        }
+    }
+
+    #[test]
+    fn retained_custom_runs_adopt_guest_output_without_extra_invocations() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-custom-capture-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        // This is the producer's schema1 wire representation, including a
+        // completed status. The uncaptured route is valid too: the RED must
+        // be the missing capture, not a failed fixture invocation.
+        fs::write(
+            root.join("record.json"),
+            r#"{"schema":1,"backend":"ptrace","comparison":{"strictness":"canonical","diagnostic_full_trace":false,"compare_io_buffers":true,"virtualize_time":true},"passthru_opt":false,"epoch":"2026-01-01T00:00:00Z","outcome":{"kind":"completed","status":{"kind":"exited","code":0},"skid_overshoots":0}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("hermit"),
+            r#"#!/bin/sh
+set -eu
+stage=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --verify-run) stage=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s\n' "${stage:-ordinary}" >> "$PWD/invocations"
+printf 'launcher output\n'
+if [ -n "$stage" ]; then
+  mkdir "$stage"
+  printf 'guest output\n' > "$stage/stdout"
+  : > "$stage/stderr"
+  printf 'INFO detcore: fixture\n' > "$stage/run.log"
+  cp "$PWD/record.json" "$stage/verify-run.json"
+fi
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(root.join("hermit"), fs::Permissions::from_mode(0o755)).unwrap();
+        let mut context = run_context(&root);
+        context.capture_custom_runs = true;
+        let mut cell = ptrace_cell("custom");
+        cell.test.id = "fixture/custom-capture".into();
+        cell.id.test = cell.test.id.clone();
+        cell.timeout_seconds = 57;
+        cell.test.observation.stderr = false;
+        let mode = cell.test.modes.get_mut("custom").unwrap();
+        mode.args = vec!["--strict".into(), "--max-timeslice=disabled".into()];
+        mode.assert = Some(Assertions {
+            runs: Some(3),
+            repeat_identical: Some(true),
+            ..Assertions::default()
+        });
+
+        let result = run_cell(&context, &cell).unwrap();
+        assert_eq!(result.outcome, "PASS", "{result:?}");
+        assert_eq!(result.attempts.len(), 3);
+        let capture = Path::new(&result.artifact_dir).join("custom-capture");
+        for index in 1..=3 {
+            let retained = capture.join("retained").join(index.to_string());
+            assert!(
+                retained.join("verify-run.json").is_file(),
+                "custom repetition {index} did not retain its completed producer capture"
+            );
+            assert_eq!(
+                fs::read(retained.join("stdout")).unwrap(),
+                b"guest output\n"
+            );
+            assert_eq!(result.attempts[index - 1].stdout, "guest output\n");
+            assert_eq!(
+                fs::read(
+                    Path::new(&result.artifact_dir).join(format!("captures/custom-{index}.stdout"))
+                )
+                .unwrap(),
+                b"launcher output\n"
+            );
+        }
+        assert!(!capture.join("run").exists());
+        let invocations = fs::read_to_string(root.join("invocations")).unwrap();
+        let paths = invocations.lines().collect::<Vec<_>>();
+        assert_eq!(paths.len(), 3);
+        assert_eq!(paths[0], capture.join("run").to_str().unwrap());
+        assert!(paths.iter().all(|path| *path == paths[0]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn custom_capture_control_fixture(
+        label: &str,
+        scenario: &str,
+    ) -> (PathBuf, RunContext, SelectedCell) {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-custom-capture-control-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("scenario"), scenario).unwrap();
+        fs::write(
+            root.join("record.json"),
+            r#"{"schema":1,"backend":"ptrace","comparison":{"strictness":"canonical","diagnostic_full_trace":false,"compare_io_buffers":true,"virtualize_time":true},"passthru_opt":false,"epoch":"2026-01-01T00:00:00Z","outcome":{"kind":"completed","status":{"kind":"exited","code":0},"skid_overshoots":0}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("hermit"),
+            r#"#!/bin/sh
+    set -eu
+    stage=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --verify-run) stage=$2; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    count=0
+    if [ -f "$PWD/count" ]; then count=$(cat "$PWD/count"); fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$PWD/count"
+    printf '%s\n' "${stage:-ordinary}" >> "$PWD/invocations"
+    # A closed /dev/null stdin is part of the unchanged invocation contract.
+    if IFS= read -r unexpected; then
+      printf 'unexpected input on stdin\n' >&2
+      exit 92
+    fi
+    scenario=$(cat "$PWD/scenario")
+    if [ "$scenario" = ordinary-error ]; then
+      printf 'ordinary outcome %s\n' "$count"
+      printf 'HERMIT_INTERNAL_FAILURE class=cli-error\n' >&2
+      exit 7
+    fi
+    printf 'launcher output\n'
+    if [ "$scenario" = classified-stderr ]; then
+      printf 'HERMIT_INTERNAL_FAILURE class=cli-error\n' >&2
+    else
+      printf 'launcher diagnostics\n' >&2
+    fi
+    if [ -z "$stage" ]; then exit 0; fi
+    mkdir "$stage"
+    printf 'guest output\n' > "$stage/stdout"
+    : > "$stage/stderr"
+    printf 'INFO detcore: fixture\n' > "$stage/run.log"
+    cp "$PWD/record.json" "$stage/verify-run.json"
+    case "$scenario" in
+      stdout-same|stdout-different|stderr-same|stderr-different)
+        stream=${scenario%%-*}
+        if [ "${scenario#*-}" = different ] && [ "$count" -eq 2 ]; then
+          printf '\376\n' > "$stage/$stream"
+        else
+          printf '\377\n' > "$stage/$stream"
+        fi
+        ;;
+      malformed-record) printf '{' > "$stage/verify-run.json" ;;
+      missing-record) rm "$stage/verify-run.json" ;;
+      missing-stdout) rm "$stage/stdout" ;;
+      missing-stderr) rm "$stage/stderr" ;;
+      missing-log) rm "$stage/run.log" ;;
+      classified-stderr)
+        printf 'HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=dbt\n' > "$stage/stderr"
+        exit 7 ;;
+      controller-failure) exit 7 ;;
+      good) ;;
+      *) printf 'unknown fixture scenario\n' >&2; exit 93 ;;
+    esac
+    "#,
+        )
+        .unwrap();
+        fs::set_permissions(root.join("hermit"), fs::Permissions::from_mode(0o755)).unwrap();
+        let context = run_context(&root);
+        let mut cell = ptrace_cell("custom");
+        cell.test.id = format!("fixture/custom-capture-{label}");
+        cell.id.test = cell.test.id.clone();
+        cell.timeout_seconds = 57;
+        cell.test.observation.status = true;
+        cell.test.observation.stdout = true;
+        cell.test.observation.stderr = false;
+        let mode = cell.test.modes.get_mut("custom").unwrap();
+        mode.args = vec!["--strict".into(), "--max-timeslice=disabled".into()];
+        mode.assert = Some(Assertions {
+            runs: Some(3),
+            repeat_identical: Some(true),
+            ..Assertions::default()
+        });
+        (root, context, cell)
+    }
+
+    #[test]
+    fn custom_capture_ordinary_and_keep_logs_only_keep_the_original_route() {
+        for keep_logs in [false, true] {
+            let label = if keep_logs {
+                "keep-logs-only"
+            } else {
+                "ordinary"
+            };
+            let (root, mut context, cell) = custom_capture_control_fixture(label, "good");
+            context.keep_logs = keep_logs;
+            assert!(!context.capture_custom_runs);
+            let spec = build_spec(
+                &context,
+                &cell,
+                root.join("spec"),
+                vec!["/bin/true".into()],
+                "1",
+                None,
+                57,
+            )
+            .unwrap();
+            context.keep_logs = !keep_logs;
+            let other_spec = build_spec(
+                &context,
+                &cell,
+                root.join("spec"),
+                vec!["/bin/true".into()],
+                "1",
+                None,
+                57,
+            )
+            .unwrap();
+            assert_eq!(spec.argv, other_spec.argv);
+            assert_eq!(spec.env, other_spec.env);
+            assert_eq!(spec.cwd, other_spec.cwd);
+            assert!(!spec.argv.iter().any(|arg| arg == "--verify-run"));
+            context.keep_logs = keep_logs;
+            let result = run_cell(&context, &cell).unwrap();
+            assert_eq!(result.outcome, "PASS", "{result:?}");
+            assert_eq!(result.attempts.len(), 3);
+            assert!(result.attempts.iter().all(|attempt| {
+                attempt.stdout == "launcher output\n"
+                    && attempt.stderr == "launcher diagnostics\n"
+                    && attempt.status == Some(0)
+                    && !attempt.timed_out
+            }));
+            assert_eq!(
+                fs::read_to_string(root.join("invocations")).unwrap(),
+                "ordinary\nordinary\nordinary\n"
+            );
+            assert!(
+                !Path::new(&result.artifact_dir)
+                    .join("custom-capture")
+                    .exists()
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+        for keep_logs in [false, true] {
+            let (root, mut context, cell) =
+                custom_capture_control_fixture("ordinary-error", "ordinary-error");
+            context.keep_logs = keep_logs;
+            let result = run_cell(&context, &cell).unwrap();
+            assert_eq!(result.attempts.len(), 3);
+            assert!(result.attempts.iter().all(|attempt| {
+                attempt.outcome == "ERROR"
+                    && attempt.status == Some(7)
+                    && !attempt.capture_custom_runs
+            }));
+            // Preserve the pre-capture custom repeat assertion, including its
+            // classification of distinct ordinary ERROR observations as FAIL.
+            assert_eq!(result.outcome, "FAIL");
+            assert_eq!(
+                result.reason.as_deref(),
+                Some("custom observed 3 distinct outcomes")
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("invocations")).unwrap(),
+                "ordinary\nordinary\nordinary\n"
+            );
+            assert!(
+                !Path::new(&result.artifact_dir)
+                    .join("custom-capture")
+                    .exists()
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn custom_capture_raw_non_utf8_observations_are_not_display_strings() {
+        for stream in ["stdout", "stderr"] {
+            for different in [false, true] {
+                let scenario = format!("{stream}-{}", if different { "different" } else { "same" });
+                let (root, mut context, mut cell) =
+                    custom_capture_control_fixture(&scenario, &scenario);
+                context.capture_custom_runs = true;
+                // Cover each original observation switch separately. The other
+                // stream remains constant and cannot explain the differing hash.
+                cell.test.observation.stdout = stream == "stdout";
+                cell.test.observation.stderr = stream == "stderr";
+                let result = run_cell(&context, &cell).unwrap();
+                assert_eq!(result.attempts.len(), 3);
+                assert_eq!(
+                    result.outcome,
+                    if different { "FAIL" } else { "PASS" },
+                    "{result:?}"
+                );
+                let hashes = result
+                    .attempts
+                    .iter()
+                    .map(|attempt| attempt.observation_sha256.as_ref().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(hashes[0], hashes[2]);
+                if different {
+                    assert_ne!(
+                        hashes[0], hashes[1],
+                        "invalid bytes must not collapse to lossy UTF-8"
+                    );
+                    assert!(
+                        result
+                            .reason
+                            .as_deref()
+                            .unwrap()
+                            .contains("custom observed 2 distinct outcomes")
+                    );
+                } else {
+                    assert_eq!(
+                        hashes[0], hashes[1],
+                        "binary output is not itself a refusal"
+                    );
+                }
+                let capture = Path::new(&result.artifact_dir).join("custom-capture");
+                for index in 1..=3 {
+                    let expected = [if different && index == 2 { 0xfe } else { 0xff }, b'\n'];
+                    assert_eq!(
+                        fs::read(
+                            capture
+                                .join("retained")
+                                .join(index.to_string())
+                                .join(stream)
+                        )
+                        .unwrap(),
+                        expected
+                    );
+                    assert_eq!(
+                        fs::read(
+                            Path::new(&result.artifact_dir)
+                                .join(format!("captures/custom-{index}.stdout"))
+                        )
+                        .unwrap(),
+                        b"launcher output\n"
+                    );
+                }
+                let invocations = fs::read_to_string(root.join("invocations")).unwrap();
+                let paths = invocations.lines().collect::<Vec<_>>();
+                assert_eq!(paths.len(), 3);
+                assert!(
+                    paths
+                        .iter()
+                        .all(|path| *path == capture.join("run").to_str().unwrap())
+                );
+                assert!(!capture.join("run").exists());
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn custom_capture_refuses_malformed_and_incomplete_producer_evidence() {
+        for scenario in [
+            "malformed-record",
+            "missing-record",
+            "missing-stdout",
+            "missing-stderr",
+            "missing-log",
+        ] {
+            let (root, mut context, cell) = custom_capture_control_fixture(scenario, scenario);
+            context.capture_custom_runs = true;
+            let result = run_cell(&context, &cell)
+                .expect("a started malformed producer must retain a non-PASS cell receipt");
+            assert_eq!(result.outcome, "ERROR", "{scenario}: {result:?}");
+            assert!(!result.attempts.is_empty());
+            assert!(result.attempts.len() <= 3);
+            assert_eq!(result.attempts[0].outcome, "ERROR");
+            assert!(
+                result.attempts[0]
+                    .reason
+                    .as_ref()
+                    .is_some_and(|reason| !reason.is_empty())
+            );
+            let capture = Path::new(&result.artifact_dir).join("custom-capture");
+            let retained = capture.join("retained/1");
+            assert!(retained.is_dir(), "invalid evidence must not disappear");
+            let affected = match scenario {
+                "missing-record" | "malformed-record" => "verify-run.json",
+                "missing-stdout" => "stdout",
+                "missing-stderr" => "stderr",
+                "missing-log" => "run.log",
+                _ => unreachable!(),
+            };
+            if scenario == "malformed-record" {
+                assert_eq!(fs::read(retained.join(affected)).unwrap(), b"{");
+            } else {
+                assert!(!retained.join(affected).exists());
+            }
+            let invocations = fs::read_to_string(root.join("invocations")).unwrap();
+            assert_eq!(invocations.lines().count(), result.attempts.len());
+            assert!(
+                invocations
+                    .lines()
+                    .all(|path| path == capture.join("run").to_str().unwrap())
+            );
+            assert!(!capture.join("run").exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn custom_capture_cannot_upgrade_controller_failure_with_a_completed_record() {
+        let (root, mut context, cell) =
+            custom_capture_control_fixture("controller-failure", "controller-failure");
+        context.capture_custom_runs = true;
+        let result = run_cell(&context, &cell).unwrap();
+        assert_ne!(result.outcome, "PASS", "{result:?}");
+        assert!(!result.attempts.is_empty());
+        assert!(
+            result
+                .attempts
+                .iter()
+                .all(|attempt| attempt.outcome != "PASS")
+        );
+        let retained = Path::new(&result.artifact_dir).join("custom-capture/retained/1");
+        assert_eq!(
+            fs::read(retained.join("stdout")).unwrap(),
+            b"guest output\n"
+        );
+        assert_eq!(
+            fs::read(retained.join("verify-run.json")).unwrap(),
+            fs::read(root.join("record.json")).unwrap()
+        );
+        assert_eq!(
+            fs::read(Path::new(&result.artifact_dir).join("captures/custom-1.stderr")).unwrap(),
+            b"launcher diagnostics\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+
+        let (root, mut context, cell) =
+            custom_capture_control_fixture("classified-stderr", "classified-stderr");
+        context.capture_custom_runs = true;
+        let path = root.join("record.json");
+        let mut record: JsonValue = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["outcome"]["status"]["code"] = serde_json::json!(7);
+        fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let result = run_cell(&context, &cell).unwrap();
+        assert_eq!(result.outcome, "ERROR");
+        assert_eq!(result.attempts.len(), 1);
+        let attempt = &result.attempts[0];
+        assert_eq!(attempt.status, Some(7));
+        assert_eq!(attempt.stderr, "HERMIT_INTERNAL_FAILURE class=cli-error\n");
+        let guest_stderr = fs::read_to_string(
+            Path::new(attempt.single_run_capture.as_ref().unwrap()).join("stderr"),
+        )
+        .unwrap();
+        assert_eq!(
+            guest_stderr,
+            "HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=dbt\n"
+        );
+        assert_eq!(
+            producer_failure(
+                "custom",
+                Some("ptrace"),
+                false,
+                false,
+                &attempt.stdout,
+                &attempt.stderr
+            ),
+            Some(ProducerFailure::UnclassifiedInternal)
+        );
+        assert_eq!(
+            producer_failure(
+                "custom",
+                Some("ptrace"),
+                false,
+                false,
+                &attempt.stdout,
+                &guest_stderr
+            ),
+            Some(ProducerFailure::InvalidBackendEvidence)
+        );
+        assert!(attempt.observation_sha256.is_some());
+        let serialized = serde_json::to_value(attempt).unwrap();
+        assert_eq!(serialized["stderr"], attempt.stderr);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    thread_local! {
+        static CAPTURE_BUDGET_FAULT: std::cell::Cell<Option<(usize, ProcessTimeout)>> =
+            const { std::cell::Cell::new(None) };
+        static CAPTURE_CPU_MEASUREMENT_FAILURE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    // Inject only the post-adoption measurement; use the production finalizer,
+    // original repetition loop and cell result/CPU-evidence aggregation.
+    pub(super) fn capture_budget_test_measurement(
+        attempt: &AttemptResult,
+        budget: &ExecutionBudget,
+        charge: Result<u64, String>,
+        finished: Instant,
+    ) -> (Result<u64, String>, Instant) {
+        if CAPTURE_CPU_MEASUREMENT_FAILURE.get() {
+            return (Err("capture thread measurement failed".into()), finished);
+        }
+        match CAPTURE_BUDGET_FAULT
+            .get()
+            .filter(|(index, _)| attempt.index == index.to_string())
+        {
+            Some((_, ProcessTimeout::Wall)) => (charge, budget.deadline),
+            Some((_, ProcessTimeout::Cpu)) => (
+                Ok(budget
+                    .remaining_cpu_usec
+                    .unwrap()
+                    .checked_sub(attempt.cpu_usage_usec.unwrap())
+                    .unwrap()),
+                finished,
+            ),
+            None => (charge, finished),
+        }
+    }
+
+    #[test]
+    fn custom_capture_final_adoption_respects_both_aggregate_bounds() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                CAPTURE_BUDGET_FAULT.set(None);
+            }
+        }
+        for index in [2, 3] {
+            for timeout in [ProcessTimeout::Wall, ProcessTimeout::Cpu] {
+                let label = format!("budget-{index}-{timeout:?}");
+                let (root, mut context, cell) = custom_capture_control_fixture(&label, "good");
+                context.capture_custom_runs = true;
+                CAPTURE_BUDGET_FAULT.set(Some((index, timeout)));
+                let reset = Reset;
+                let result = run_cell(&context, &cell).unwrap();
+                drop(reset);
+                assert_eq!(result.outcome, "FAIL", "{result:?}");
+                assert_eq!(result.result, Some(ObservedResult::Timeout));
+                assert_eq!(result.failure_class, Some(FailureClass::NoResult));
+                assert_eq!(result.attempts.len(), index);
+                assert_eq!(
+                    fs::read_to_string(root.join("invocations"))
+                        .unwrap()
+                        .lines()
+                        .count(),
+                    index
+                );
+                let last = result.attempts.last().unwrap();
+                assert_eq!(
+                    last.capture_adoption_timeout.as_deref(),
+                    Some(if timeout == ProcessTimeout::Wall {
+                        "wall"
+                    } else {
+                        "cpu"
+                    })
+                );
+                assert!(
+                    !last.timed_out,
+                    "child completion must not become a timeout"
+                );
+                assert_eq!(last.status, Some(0));
+                assert_eq!(
+                    last.observation_sha256,
+                    result.attempts[0].observation_sha256
+                );
+                assert!(
+                    Path::new(last.single_run_capture.as_ref().unwrap())
+                        .join("verify-run.json")
+                        .is_file()
+                );
+                assert!(
+                    last.reason
+                        .as_deref()
+                        .unwrap()
+                        .contains("after custom capture adoption")
+                );
+                result.require_cpu_observations().unwrap();
+                assert_eq!(
+                    result.capture_adoption_cpu_usage_usec,
+                    Some(
+                        result
+                            .attempts
+                            .iter()
+                            .map(|a| a.capture_adoption_cpu_usage_usec.unwrap())
+                            .sum()
+                    )
+                );
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+        for timeout in [ProcessTimeout::Wall, ProcessTimeout::Cpu] {
+            let (root, mut context, cell) =
+                custom_capture_control_fixture("distinct-before-timeout", "stdout-different");
+            context.capture_custom_runs = true;
+            CAPTURE_BUDGET_FAULT.set(Some((2, timeout)));
+            let reset = Reset;
+            let result = run_cell(&context, &cell).unwrap();
+            drop(reset);
+            assert_eq!(result.outcome, "FAIL");
+            assert_eq!(result.result, Some(ObservedResult::CrashError));
+            assert_eq!(result.failure_class, Some(FailureClass::ProductFailure));
+            assert_eq!(result.attempts.len(), 2);
+            assert_eq!(
+                result.reason.as_deref(),
+                Some("custom observed 2 distinct outcomes")
+            );
+            assert_ne!(
+                result.attempts[0].observation_sha256,
+                result.attempts[1].observation_sha256
+            );
+            let last = &result.attempts[1];
+            assert_eq!(last.status, Some(0));
+            assert!(!last.timed_out);
+            assert_eq!(
+                last.capture_adoption_timeout.as_deref(),
+                Some(if timeout == ProcessTimeout::Wall {
+                    "wall"
+                } else {
+                    "cpu"
+                })
+            );
+            result.require_cpu_observations().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+        let (root, mut context, cell) =
+            custom_capture_control_fixture("failed-child-before-timeout", "good");
+        context.capture_custom_runs = true;
+        let path = root.join("record.json");
+        let mut record: JsonValue = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["outcome"]["status"]["code"] = serde_json::json!(7);
+        fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let script = root.join("hermit");
+        fs::write(
+            &script,
+            format!("{}\nexit 7\n", fs::read_to_string(&script).unwrap()),
+        )
+        .unwrap();
+        CAPTURE_BUDGET_FAULT.set(Some((1, ProcessTimeout::Cpu)));
+        let reset = Reset;
+        let result = run_cell(&context, &cell).unwrap();
+        drop(reset);
+        assert_eq!(result.outcome, "FAIL");
+        assert_eq!(result.result, Some(ObservedResult::CrashError));
+        assert_eq!(result.failure_class, Some(FailureClass::ProductFailure));
+        assert_eq!(result.attempts.len(), 1);
+        assert_eq!(result.attempts[0].status, Some(7));
+        assert!(!result.attempts[0].timed_out);
+        assert_eq!(
+            result.attempts[0].capture_adoption_timeout.as_deref(),
+            Some("cpu")
+        );
+        result.require_cpu_observations().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn custom_capture_accounting_refuses_missing_and_overflowing_measurements() {
+        let mut attempt = attempt_with_sabre_evidence("");
+        attempt.capture_custom_runs = true;
+        attempt.outcome = "PASS".into();
+        attempt.cpu_usage_usec = Some(40);
+        let budget = ExecutionBudget {
+            deadline: Instant::now() + Duration::from_secs(60),
+            cpu_timeout_seconds: 22,
+            wall_timeout_seconds: 57,
+            remaining_cpu_usec: Some(100),
+        };
+        finish_capture_budget(&mut attempt, &budget, Ok(59), Instant::now());
+        assert_eq!(attempt.outcome, "PASS");
+        assert_eq!(attempt.cpu_usage_usec, Some(40));
+        assert_eq!(effective_execution_cpu(&attempt).unwrap(), 99);
+        for child in [None, Some(u64::MAX)] {
+            let mut failed = attempt.clone();
+            failed.cpu_usage_usec = child;
+            finish_capture_budget(&mut failed, &budget, Ok(1), Instant::now());
+            assert_eq!(failed.outcome, "ERROR", "{failed:?}");
+            assert!(!failed.timed_out);
+        }
+        let mut failed = attempt.clone();
+        finish_capture_budget(
+            &mut failed,
+            &budget,
+            Err("thread measurement failed".into()),
+            Instant::now(),
+        );
+        assert_eq!(failed.outcome, "ERROR");
+        assert!(failed.capture_adoption_cpu_usage_usec.is_none());
+        assert!(effective_execution_cpu(&failed).is_err());
+        assert!(failed.reason.unwrap().contains("thread measurement failed"));
+        let mut prior = attempt;
+        prior.outcome = "ERROR".into();
+        prior.error_kind = Some("incomplete-verification-evidence".into());
+        prior.reason = Some("original controller error".into());
+        finish_capture_budget(&mut prior, &budget, Ok(60), Instant::now());
+        assert_eq!(prior.outcome, "ERROR");
+        assert!(
+            prior
+                .reason
+                .as_deref()
+                .unwrap()
+                .starts_with("original controller error")
+        );
+        assert_eq!(prior.capture_adoption_timeout.as_deref(), Some("cpu"));
+        assert_eq!(
+            observed_result_from_typed_evidence(
+                "custom",
+                "ERROR",
+                std::slice::from_ref(&prior),
+                prior.error_kind.as_deref()
+            ),
+            None,
+            "a later adoption timeout cannot replace a controller evidence error"
+        );
+
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                CAPTURE_CPU_MEASUREMENT_FAILURE.set(false);
+            }
+        }
+        let (root, mut context, cell) =
+            custom_capture_control_fixture("failed-child-accounting", "good");
+        context.capture_custom_runs = true;
+        let path = root.join("record.json");
+        let mut record: JsonValue = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["outcome"]["status"]["code"] = serde_json::json!(7);
+        fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let script = root.join("hermit");
+        fs::write(
+            &script,
+            format!("{}\nexit 7\n", fs::read_to_string(&script).unwrap()),
+        )
+        .unwrap();
+        CAPTURE_CPU_MEASUREMENT_FAILURE.set(true);
+        let reset = Reset;
+        let result = run_cell(&context, &cell).unwrap();
+        drop(reset);
+        assert_eq!(result.outcome, "FAIL", "{result:?}");
+        assert_eq!(result.attempts.len(), 1, "unknown CPU forbids a successor");
+        assert_eq!(
+            fs::read_to_string(root.join("invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let attempt = &result.attempts[0];
+        assert_eq!(attempt.status, Some(7));
+        assert_eq!(attempt.outcome, "FAIL");
+        assert!(!attempt.timed_out);
+        assert_eq!(attempt.stderr, "launcher diagnostics\n");
+        assert!(attempt.cpu_usage_usec.is_some());
+        assert!(attempt.capture_adoption_cpu_usage_usec.is_none());
+        assert!(result.capture_adoption_cpu_usage_usec.is_none());
+        assert!(
+            attempt
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("capture thread measurement failed")
+        );
+        assert!(attempt.observation_sha256.is_some());
+        assert!(effective_execution_cpu(attempt).is_err());
+        result.require_cpu_observations().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn custom_capture_validates_producer_identity_and_final_record() {
+        for invalid in [
+            "schema",
+            "unknown",
+            "backend",
+            "role",
+            "epoch",
+            "malformed-epoch",
+            "policy",
+            "outcome",
+        ] {
+            let (root, mut context, cell) = custom_capture_control_fixture(invalid, "good");
+            context.capture_custom_runs = true;
+            let path = root.join("record.json");
+            let mut record: JsonValue = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            match invalid {
+                "schema" => record["schema"] = serde_json::json!(2),
+                "unknown" => record["unknown"] = serde_json::json!(true),
+                "backend" => record["backend"] = serde_json::json!("kvm"),
+                "role" => record["role"] = serde_json::json!("record"),
+                "epoch" => record["epoch"] = serde_json::json!("2026-01-01T00:00:00.000000001Z"),
+                "malformed-epoch" => record["epoch"] = serde_json::json!("not-a-date"),
+                "policy" => record["comparison"]["strictness"] = serde_json::json!("stripped"),
+                "outcome" => {
+                    record["outcome"] =
+                        serde_json::json!({"kind":"error","detail":"producer failed"})
+                }
+                _ => unreachable!(),
+            }
+            fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+            let result = run_cell(&context, &cell).unwrap();
+            assert_eq!(result.outcome, "ERROR", "{invalid}: {result:?}");
+            assert_eq!(result.attempts.len(), 1);
+            assert!(result.attempts[0].single_run_capture.is_some());
+            assert!(result.attempts[0].observation_sha256.is_none());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn custom_capture_preserves_exact_epoch_precedence_and_completed_status_policy() {
+        use crate::verify_run_record::RecordedStatus;
+        use crate::verify_run_record::VerifyRunOutcome;
+        use crate::verify_run_record::VerifyRunRecord;
+        for (label, epoch, args, status, process_code) in [
+            (
+                "spelling",
+                "2026-01-01T01:00:00+01:00",
+                vec![],
+                RecordedStatus::Exited { code: 0 },
+                0,
+            ),
+            (
+                "explicit",
+                "2027-02-03T04:05:06.123456789+00:00",
+                vec!["--epoch=2027-02-03T04:05:06.123456789Z"],
+                RecordedStatus::Exited { code: 0 },
+                0,
+            ),
+            (
+                "nonzero",
+                "2026-01-01T00:00:00Z",
+                vec![],
+                RecordedStatus::Exited { code: 7 },
+                7,
+            ),
+            (
+                "signal",
+                "2026-01-01T00:00:00Z",
+                vec![],
+                RecordedStatus::Signaled {
+                    signal: 11,
+                    core_dumped: false,
+                },
+                139,
+            ),
+        ] {
+            let (root, mut context, mut cell) = custom_capture_control_fixture(label, "good");
+            context.capture_custom_runs = true;
+            cell.test
+                .modes
+                .get_mut("custom")
+                .unwrap()
+                .args
+                .extend(args.into_iter().map(str::to_owned));
+            let mut record: VerifyRunRecord =
+                serde_json::from_slice(&fs::read(root.join("record.json")).unwrap()).unwrap();
+            record.epoch = epoch.into();
+            record.outcome = VerifyRunOutcome::Completed {
+                status,
+                skid_overshoots: 0,
+                forwarded_syscalls: None,
+            };
+            fs::write(
+                root.join("record.json"),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+            let script = fs::read_to_string(root.join("hermit")).unwrap();
+            fs::write(
+                root.join("hermit"),
+                format!("{script}\nexit {process_code}\n"),
+            )
+            .unwrap();
+            let result = run_cell(&context, &cell).unwrap();
+            assert_eq!(
+                result.outcome,
+                if process_code == 0 { "PASS" } else { "FAIL" },
+                "{label}: {result:?}"
+            );
+            assert_eq!(result.attempts.len(), 3);
+            for attempt in &result.attempts {
+                assert_eq!(attempt.status, Some(process_code));
+                assert!(attempt.single_run_capture.is_some());
+                assert!(attempt.observation_sha256.is_some());
+                assert!(attempt.reason.is_none(), "{attempt:?}");
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn custom_capture_option_is_explicit_and_default_off() {
+        assert!(!capture_custom_runs_from_env(None).unwrap());
+        assert!(capture_custom_runs_from_env(Some(OsStr::new("1"))).unwrap());
+        for value in ["", "0", "true", "yes"] {
+            assert!(capture_custom_runs_from_env(Some(OsStr::new(value))).is_err());
+        }
+    }
+
+    #[test]
+    fn custom_capture_retention_keeps_full_verify_pairs_only_when_requested() {
+        for (keep, verdict) in [
+            (false, Verdict::Matched),
+            (true, Verdict::Matched),
+            (false, Verdict::Diverged),
+        ] {
+            run_production_verify_fixture_with_retention("ptrace", verdict, keep, |result| {
+                let pair = Path::new(&result.artifact_dir).join("verify-runs/1");
+                if keep || verdict == Verdict::Diverged {
+                    for run in ["run1", "run2"] {
+                        let dir = pair.join(run);
+                        assert!(dir.join("verify-run.json").is_file());
+                        assert_eq!(
+                            fs::read(dir.join("stdout")).unwrap(),
+                            b"pair guest output\n"
+                        );
+                        assert_eq!(
+                            fs::read(dir.join("stderr")).unwrap(),
+                            b"pair guest stderr\n"
+                        );
+                        assert_eq!(
+                            fs::read(dir.join("run.log")).unwrap(),
+                            b"INFO detcore: only\n"
+                        );
+                    }
+                } else {
+                    assert!(!pair.exists());
+                }
+            });
         }
     }
 
@@ -13206,6 +14469,7 @@ esac
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
@@ -13922,6 +15186,7 @@ esac
             verdict_path: Some(root.join("verdict.json")),
             verification_log_dir: None,
             verify_runs: None,
+            single_run_capture: None,
             sabre_path_evidence: None,
             cell_dir: root.clone(),
             expected_guest_exit: None,
@@ -15094,6 +16359,7 @@ esac
             verdict_path: None,
             verification_log_dir: None,
             verify_runs: None,
+            single_run_capture: None,
             sabre_path_evidence: None,
             cell_dir: root.join(label),
             expected_guest_exit: None,
@@ -17254,6 +18520,7 @@ int main(int argc, char **argv) {
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
@@ -17331,6 +18598,7 @@ int main(int argc, char **argv) {
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
@@ -17458,6 +18726,7 @@ int main(int argc, char **argv) {
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
@@ -17737,6 +19006,7 @@ backends_disabled:
                 source_dirty: false,
                 prebuilt: false,
                 keep_logs: false,
+                capture_custom_runs: false,
                 parity_retained: BTreeSet::new(),
                 run_verify_strict: true,
                 record_verify_strict: true,
@@ -17815,6 +19085,7 @@ backends_disabled:
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
@@ -17875,6 +19146,7 @@ backends_disabled:
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
@@ -18291,6 +19563,7 @@ backends_disabled:
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
@@ -18647,6 +19920,7 @@ backends_disabled:
             binary_build_sha: probe_binary_build_sha(&hermit_bin),
             prebuilt: false,
             keep_logs: true,
+            capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
             run_verify_strict: command_help_contains(
                 &hermit_bin,
@@ -18785,6 +20059,7 @@ backends_disabled:
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
@@ -19094,6 +20369,8 @@ backends_disabled:
     /// names is open is the failure this file is full of warnings about.
     fn cell_result_that_located_nothing() -> CellResult {
         CellResult {
+            capture_custom_runs: false,
+            capture_adoption_cpu_usage_usec: None,
             cpu_observations: None,
             schema: CELL_RESULT_SCHEMA,
             run_id: "fixture".into(),
@@ -19360,6 +20637,10 @@ backends_disabled:
             timed_out: false,
             duration_ms: 1,
             cpu_usage_usec: Some(1),
+            capture_custom_runs: false,
+            single_run_capture: None,
+            capture_adoption_cpu_usage_usec: None,
+            capture_adoption_timeout: None,
             observation_sha256: Some("a".into()),
             argv: vec![
                 "hermit".into(),
@@ -19934,6 +21215,15 @@ backends_disabled:
         backend: &str,
         verdict: Verdict,
     ) -> (CellResult, String, bool) {
+        run_production_verify_fixture_with_retention(backend, verdict, true, |_| {})
+    }
+
+    fn run_production_verify_fixture_with_retention(
+        backend: &str,
+        verdict: Verdict,
+        keep_logs: bool,
+        inspect: impl FnOnce(&CellResult),
+    ) -> (CellResult, String, bool) {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-production-verify-{}-{:?}-{backend}-{verdict:?}",
             std::process::id(),
@@ -19982,6 +21272,9 @@ if [ -n "$rundir" ]; then
   printf 'run:%s\n' "$backend" >> "$PWD/invocations"
   mkdir "$rundir"
   printf '{}\n' > "$rundir/verify-run.json"
+  printf 'pair guest output\n' > "$rundir/stdout"
+  printf 'pair guest stderr\n' > "$rundir/stderr"
+  printf 'INFO detcore: only\n' > "$rundir/run.log"
   if [ -n "${HERMIT_SABRE_PATH_EVIDENCE-}" ]; then
     printf '%s\n' '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' >> "$HERMIT_SABRE_PATH_EVIDENCE"
   fi
@@ -19992,8 +21285,10 @@ printf 'compare\n' >> "$PWD/invocations"
 # This log differs from anything a ptrace run of the same guest would write.
 # Before https://github.com/rrnewton/hermit/issues/3301 that difference was a
 # ParityFailure; now nothing compares it with another backend.
-mkdir -p "$logdir"
-printf 'INFO detcore: only\n' > "$logdir/run1_log_fixture.log"
+if [ -n "$logdir" ]; then
+  mkdir -p "$logdir"
+  printf 'INFO detcore: only\n' > "$logdir/run1_log_fixture.log"
+fi
 
 cp "$PWD/verification.json" "$verdict"
 exit "$(cat "$PWD/exit-status")"
@@ -20012,7 +21307,7 @@ exit "$(cat "$PWD/exit-status")"
         let mut context = run_context(&root);
         context.hermit_bin = hermit;
         context.run_verify_strict = true;
-        context.keep_logs = true;
+        context.keep_logs = keep_logs;
 
         let result = run_cell(&context, &cell).unwrap();
         assert_cpu_source_roundtrip(&result);
@@ -20027,6 +21322,7 @@ exit "$(cat "$PWD/exit-status")"
                     .to_string_lossy()
                     .contains("backend-parity")
             });
+        inspect(&result);
         fs::remove_dir_all(root).unwrap();
         (result, invocations, retained_parity_report)
     }
@@ -20259,6 +21555,7 @@ exit "$(cat "$PWD/exit-status")"
             verdict_path: Some(verdict),
             verification_log_dir: None,
             verify_runs: None,
+            single_run_capture: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: None,
@@ -20308,6 +21605,7 @@ exit "$(cat "$PWD/exit-status")"
             verdict_path: Some(verdict),
             verification_log_dir: None,
             verify_runs: None,
+            single_run_capture: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: None,
@@ -22597,6 +23895,7 @@ exit "$(cat "$PWD/exit-status")"
             verdict_path: Some(verdict),
             verification_log_dir: None,
             verify_runs: None,
+            single_run_capture: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: expected,
@@ -23802,6 +25101,7 @@ cp "{}" "$verdict"
             verdict_path: Some(verdict),
             verification_log_dir: None,
             verify_runs: None,
+            single_run_capture: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: None,
@@ -24722,6 +26022,7 @@ cp "{}" "$verdict"
             verdict_path: Some(verdict),
             verification_log_dir: None,
             verify_runs: None,
+            single_run_capture: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: None,
@@ -24988,6 +26289,7 @@ cp "{}" "$verdict"
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
@@ -25048,6 +26350,7 @@ cp "{}" "$verdict"
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
@@ -25234,6 +26537,7 @@ cp "{}" "$verdict"
             source_dirty: false,
             prebuilt: true,
             keep_logs: false,
+            capture_custom_runs: false,
             parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,

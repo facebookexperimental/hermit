@@ -622,6 +622,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         binary_build_sha: None,
         prebuilt: false,
         keep_logs: false,
+        capture_custom_runs: false,
         parity_retained: BTreeSet::new(),
         run_verify_strict: false,
         record_verify_strict: false,
