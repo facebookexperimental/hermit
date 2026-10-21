@@ -3168,7 +3168,6 @@ async fn run_kvm(
     // same synthetic identity that the namespace-backed ptrace path exposes.
     // TODO-HUMAN-REVIEW(PR-998): Review KVM UTS namespace parity.
     config.has_uts_namespace = false;
-    let random_seed = config.rng_seed();
     let mut backend = reverie_kvm::KvmBackend::new_with_stdin(KVM_GUEST_MEMORY_BYTES, stdin)
         .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))?;
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3199,9 +3198,6 @@ async fn run_kvm(
     // a second copy of the program in host memory for the whole run: 75 MB
     // for node (https://github.com/rrnewton/reverie/issues/1063).
     drop(image);
-    backend
-        .set_random_seed(random_seed)
-        .map_err(|error| anyhow!("failed to configure KVM guest random seed: {error}"))?;
     // The KVM backend defaults to Tool-owned guest threads: CLONE_THREAD
     // workers are driven through the Detcore tool loop and their futex/CLEARTID
     // synchronization routes to Detcore, matching the golden ptrace model

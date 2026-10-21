@@ -542,11 +542,12 @@ mod tests {
                 "/dev/{excluded} is host-coupled and must not be bound into an image guest"
             );
         }
-        // These two are present ONLY because detcore/src/syscalls/files.rs maps
-        // the paths "/dev/random" and "/dev/urandom" to FdType::Rng and serves
-        // reads from the deterministic PRNG. If that classification is ever
-        // keyed on something other than the path, this bind starts leaking host
-        // entropy and must be revisited.
+        // These two are present ONLY because detcore/src/syscalls/files.rs
+        // recognizes the random devices by device number (character 1:8 and
+        // 1:9) and serves their reads from the deterministic PRNG on every
+        // backend. A bind keeps the device number, so the bound nodes are
+        // recognized as well. If that recognition is ever removed, this bind
+        // starts leaking host entropy and must be revisited.
         assert!(DEV_BIND_TARGETS.contains(&"random"));
         assert!(DEV_BIND_TARGETS.contains(&"urandom"));
     }

@@ -17,7 +17,7 @@ detcore = { package = "hermit-detcore", version = "0.5.1", path = "../detcore" }
 hermit-resources = { version = "0.5.1", path = "../hermit-resources" }
 libc = "0.2.186"
 rand = "0.10.2"
-reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "39f2f875709bc0830d16b3b53f8060c5fdb716d0" }
-reverie-dbt = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "39f2f875709bc0830d16b3b53f8060c5fdb716d0", default-features = false }
+reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "b8c60f12365b2221d7d5ad251b22769ccdee95ac" }
+reverie-dbt = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "b8c60f12365b2221d7d5ad251b22769ccdee95ac", default-features = false }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 tracing = "0.1.41"
